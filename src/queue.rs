@@ -1,4 +1,4 @@
-use crate::{job::{Job, JobId}, Result};
+use crate::{job::{Job, JobId, JobStatus}, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{Database, Pool};
