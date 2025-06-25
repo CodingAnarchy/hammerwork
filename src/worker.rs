@@ -1,0 +1,179 @@
+use crate::{error::HammerworkError, job::Job, queue::{DatabaseQueue, JobQueue}, Result};
+use sqlx::Database;
+use std::{sync::Arc, time::Duration};
+use tokio::{sync::mpsc, time::sleep};
+use tracing::{debug, error, info, warn};
+
+pub type JobHandler = Arc<dyn Fn(Job) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> + Send + Sync>;
+
+pub struct Worker<DB: Database> {
+    queue: Arc<JobQueue<DB>>,
+    queue_name: String,
+    handler: JobHandler,
+    poll_interval: Duration,
+    max_retries: i32,
+    retry_delay: Duration,
+}
+
+impl<DB: Database + Send + Sync + 'static> Worker<DB>
+where
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync,
+{
+    pub fn new(queue: Arc<JobQueue<DB>>, queue_name: String, handler: JobHandler) -> Self {
+        Self {
+            queue,
+            queue_name,
+            handler,
+            poll_interval: Duration::from_secs(1),
+            max_retries: 3,
+            retry_delay: Duration::from_secs(30),
+        }
+    }
+
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    pub fn with_max_retries(mut self, max_retries: i32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    pub fn with_retry_delay(mut self, delay: Duration) -> Self {
+        self.retry_delay = delay;
+        self
+    }
+
+    pub async fn run(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
+        info!("Worker started for queue: {}", self.queue_name);
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    info!("Worker shutting down for queue: {}", self.queue_name);
+                    break;
+                }
+                _ = self.process_jobs() => {
+                    // Continue processing
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_jobs(&self) -> Result<()> {
+        match self.queue.dequeue(&self.queue_name).await {
+            Ok(Some(job)) => {
+                debug!("Processing job: {}", job.id);
+                self.process_job(job).await?;
+            }
+            Ok(None) => {
+                // No jobs available, wait before polling again
+                sleep(self.poll_interval).await;
+            }
+            Err(e) => {
+                error!("Error dequeuing job: {}", e);
+                sleep(self.poll_interval).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_job(&self, job: Job) -> Result<()> {
+        let job_id = job.id;
+        
+        match (self.handler)(job.clone()).await {
+            Ok(()) => {
+                debug!("Job {} completed successfully", job_id);
+                self.queue.complete_job(job_id).await?;
+            }
+            Err(e) => {
+                error!("Job {} failed: {}", job_id, e);
+                
+                if job.attempts >= self.max_retries {
+                    warn!("Job {} exceeded max retries, marking as failed", job_id);
+                    self.queue.fail_job(job_id, &e.to_string()).await?;
+                } else {
+                    let retry_at = chrono::Utc::now() + chrono::Duration::from_std(self.retry_delay).unwrap();
+                    info!("Retrying job {} at {}", job_id, retry_at);
+                    self.queue.retry_job(job_id, retry_at).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub struct WorkerPool<DB: Database> {
+    workers: Vec<Worker<DB>>,
+    shutdown_tx: Vec<mpsc::Sender<()>>,
+}
+
+impl<DB: Database + Send + Sync + 'static> WorkerPool<DB>
+where
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync,
+{
+    pub fn new() -> Self {
+        Self {
+            workers: Vec::new(),
+            shutdown_tx: Vec::new(),
+        }
+    }
+
+    pub fn add_worker(&mut self, worker: Worker<DB>) {
+        self.workers.push(worker);
+    }
+
+    pub async fn start(&mut self) -> Result<()> {
+        info!("Starting worker pool with {} workers", self.workers.len());
+
+        let mut handles = Vec::new();
+        self.shutdown_tx.clear();
+
+        for worker in self.workers.drain(..) {
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+            self.shutdown_tx.push(shutdown_tx);
+
+            let handle = tokio::spawn(async move {
+                if let Err(e) = worker.run(shutdown_rx).await {
+                    error!("Worker error: {}", e);
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all workers to complete
+        for handle in handles {
+            handle.await.map_err(|e| HammerworkError::Worker {
+                message: format!("Worker task failed: {}", e),
+            })?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        info!("Shutting down worker pool");
+        
+        for tx in &self.shutdown_tx {
+            if tx.send(()).await.is_err() {
+                warn!("Failed to send shutdown signal to worker");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<DB: Database + Send + Sync + 'static> Default for WorkerPool<DB>
+where
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
