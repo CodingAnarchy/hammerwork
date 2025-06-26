@@ -11,6 +11,8 @@ hammerwork = { path = "." }
 tokio = { version = "1.0", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.8"
+cron = "0.12"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -22,9 +24,9 @@ tokio-test = "0.4"
 
 [package]
 name = "hammerwork"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
-description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job timeouts, dead job management, and comprehensive statistics collection"
+description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring cron scheduling, job timeouts, dead job management, and comprehensive statistics collection"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
 authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
@@ -38,6 +40,8 @@ categories = ["database", "asynchronous", "concurrency"]
 tokio = { workspace = true }
 sqlx = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
+cron = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

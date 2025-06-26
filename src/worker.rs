@@ -160,7 +160,18 @@ where
                 
                 let processing_time_ms = (Utc::now() - start_time).num_milliseconds() as u64;
                 
-                self.queue.complete_job(job_id).await?;
+                // Handle cron job rescheduling
+                if job.is_recurring() {
+                    if let Some(next_run_time) = job.calculate_next_run() {
+                        info!("Rescheduling recurring job {} for next run at {}", job_id, next_run_time);
+                        self.queue.reschedule_cron_job(job_id, next_run_time).await?;
+                    } else {
+                        warn!("Could not calculate next run time for recurring job {}", job_id);
+                        self.queue.complete_job(job_id).await?;
+                    }
+                } else {
+                    self.queue.complete_job(job_id).await?;
+                }
                 
                 // Record job completed event
                 self.record_event(JobEvent {

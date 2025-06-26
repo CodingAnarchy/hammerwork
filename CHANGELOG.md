@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2025-06-26
+
+### Added
+- **🕐 Comprehensive Cron Job Scheduling**
+  - Full cron expression support with 6-field format (seconds, minutes, hours, day, month, weekday)
+  - `CronSchedule` struct with timezone-aware scheduling using `chrono-tz`
+  - Built-in presets for common schedules: `every_minute()`, `every_hour()`, `daily_at_midnight()`, `weekdays_at_9am()`, `mondays_at_noon()`
+  - Cron expression validation and error handling with detailed error messages
+  - Support for all standard timezones for global scheduling requirements
+
+- **📋 Enhanced Job Structure for Recurring Jobs**
+  - New fields: `cron_schedule`, `next_run_at`, `recurring`, `timezone`
+  - Builder methods: `with_cron()`, `with_cron_schedule()`, `as_recurring()`, `with_timezone()`
+  - Utility methods: `is_recurring()`, `has_cron_schedule()`, `calculate_next_run()`, `prepare_for_next_run()`
+  - Smart next execution calculation based on cron expressions and timezones
+  - Seamless integration with existing job timeout and retry mechanisms
+
+- **🗄️ Database Schema Enhancements**
+  - Added `cron_schedule`, `next_run_at`, `recurring`, `timezone` columns to both PostgreSQL and MySQL
+  - Optimized indexes for recurring job queries: `idx_recurring_next_run`, `idx_cron_schedule`
+  - Backward compatibility maintained with existing job records
+  - Enhanced database queries to handle cron-specific fields efficiently
+
+- **🔄 Intelligent Worker Integration**
+  - Automatic rescheduling of completed recurring jobs based on cron expressions
+  - Smart next-run calculation preserving timezone information
+  - Integration with existing statistics and monitoring systems
+  - Graceful handling of cron calculation errors with fallback to job completion
+  - No impact on existing one-time job processing performance
+
+- **📊 Comprehensive Management API**
+  - `enqueue_cron_job()` - Create and schedule recurring jobs
+  - `get_due_cron_jobs()` - Retrieve jobs ready for execution with optional queue filtering
+  - `get_recurring_jobs()` - List all recurring jobs for a specific queue
+  - `reschedule_cron_job()` - Manual rescheduling with automatic job state reset
+  - `disable_recurring_job()` / `enable_recurring_job()` - Job lifecycle management
+  - Full support in both PostgreSQL and MySQL implementations
+
+- **🧪 Comprehensive Testing Suite**
+  - 10 new cron-specific unit tests covering all functionality
+  - 9 additional job integration tests for cron features
+  - Timezone handling and edge case testing
+  - Cron expression validation and serialization testing
+  - Complete test coverage for recurring job lifecycle management
+
+- **📖 Documentation and Examples**
+  - Complete `cron_example.rs` demonstrating all cron functionality
+  - Examples of daily, weekly, monthly, and custom interval scheduling
+  - Timezone-aware scheduling examples (America/New_York)
+  - Cron job management and lifecycle examples
+  - Performance and monitoring integration examples
+
+### Technical Implementation
+- **Dependencies**: Added `cron` (0.12) and `chrono-tz` (0.8) for robust scheduling
+- **Performance**: Optimized database queries with specialized indexes for recurring jobs
+- **Memory**: Efficient cron schedule caching with lazy initialization
+- **Error Handling**: Comprehensive error types for cron validation and timezone handling
+- **Compatibility**: Full backward compatibility with existing jobs and database schemas
+
+### Breaking Changes
+- None - all changes are backward compatible with existing deployments
+
 ## [0.2.2] - 2025-06-26
 
 ### Added

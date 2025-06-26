@@ -59,6 +59,25 @@ pub trait DatabaseQueue: Send + Sync {
     
     /// Get error frequencies for failed jobs
     async fn get_error_frequencies(&self, queue_name: Option<&str>, since: DateTime<Utc>) -> Result<std::collections::HashMap<String, u64>>;
+
+    // Cron job management
+    /// Enqueue a cron job for recurring execution
+    async fn enqueue_cron_job(&self, job: Job) -> Result<JobId>;
+    
+    /// Get jobs that are ready to run based on their cron schedule
+    async fn get_due_cron_jobs(&self, queue_name: Option<&str>) -> Result<Vec<Job>>;
+    
+    /// Reschedule a completed cron job for its next execution
+    async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()>;
+    
+    /// Get all recurring jobs for a queue
+    async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>>;
+    
+    /// Disable a recurring job (stop future executions)
+    async fn disable_recurring_job(&self, job_id: JobId) -> Result<()>;
+    
+    /// Enable a previously disabled recurring job
+    async fn enable_recurring_job(&self, job_id: JobId) -> Result<()>;
 }
 
 pub struct JobQueue<DB: Database> {
@@ -80,8 +99,98 @@ impl<DB: Database> JobQueue<DB> {
 pub mod postgres {
     use super::*;
     use crate::job::JobStatus;
-    use sqlx::Postgres;
+    use sqlx::{Postgres, Row, FromRow};
     use std::time::Duration;
+
+    #[derive(FromRow)]
+    struct JobRow {
+        id: uuid::Uuid,
+        queue_name: String,
+        payload: serde_json::Value,
+        status: String,
+        attempts: i32,
+        max_attempts: i32,
+        timeout_seconds: Option<i32>,
+        created_at: DateTime<Utc>,
+        scheduled_at: DateTime<Utc>,
+        started_at: Option<DateTime<Utc>>,
+        completed_at: Option<DateTime<Utc>>,
+        failed_at: Option<DateTime<Utc>>,
+        timed_out_at: Option<DateTime<Utc>>,
+        error_message: Option<String>,
+        cron_schedule: Option<String>,
+        next_run_at: Option<DateTime<Utc>>,
+        recurring: bool,
+        timezone: Option<String>,
+    }
+
+    impl JobRow {
+        fn into_job(self) -> Result<Job> {
+            Ok(Job {
+                id: self.id,
+                queue_name: self.queue_name,
+                payload: self.payload,
+                status: serde_json::from_str(&self.status)?,
+                attempts: self.attempts,
+                max_attempts: self.max_attempts,
+                created_at: self.created_at,
+                scheduled_at: self.scheduled_at,
+                started_at: self.started_at,
+                completed_at: self.completed_at,
+                failed_at: self.failed_at,
+                timed_out_at: self.timed_out_at,
+                timeout: self.timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                error_message: self.error_message,
+                cron_schedule: self.cron_schedule,
+                next_run_at: self.next_run_at,
+                recurring: self.recurring,
+                timezone: self.timezone,
+            })
+        }
+    }
+
+    #[derive(FromRow)]
+    struct DeadJobRow {
+        id: uuid::Uuid,
+        queue_name: String,
+        payload: serde_json::Value,
+        status: String,
+        attempts: i32,
+        max_attempts: i32,
+        timeout_seconds: Option<i32>,
+        created_at: DateTime<Utc>,
+        scheduled_at: DateTime<Utc>,
+        started_at: Option<DateTime<Utc>>,
+        completed_at: Option<DateTime<Utc>>,
+        failed_at: Option<DateTime<Utc>>,
+        timed_out_at: Option<DateTime<Utc>>,
+        error_message: Option<String>,
+    }
+
+    impl DeadJobRow {
+        fn into_job(self) -> Job {
+            Job {
+                id: self.id,
+                queue_name: self.queue_name,
+                payload: self.payload,
+                status: serde_json::from_str(&self.status).unwrap_or(JobStatus::Dead),
+                attempts: self.attempts,
+                max_attempts: self.max_attempts,
+                created_at: self.created_at,
+                scheduled_at: self.scheduled_at,
+                started_at: self.started_at,
+                completed_at: self.completed_at,
+                failed_at: self.failed_at,
+                timed_out_at: self.timed_out_at,
+                timeout: self.timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                error_message: self.error_message,
+                cron_schedule: None,
+                next_run_at: None,
+                recurring: false,
+                timezone: None,
+            }
+        }
+    }
 
     #[async_trait]
     impl DatabaseQueue for JobQueue<Postgres> {
@@ -104,7 +213,11 @@ pub mod postgres {
                     completed_at TIMESTAMPTZ,
                     failed_at TIMESTAMPTZ,
                     timed_out_at TIMESTAMPTZ,
-                    error_message TEXT
+                    error_message TEXT,
+                    cron_schedule VARCHAR(100),
+                    next_run_at TIMESTAMPTZ,
+                    recurring BOOLEAN NOT NULL DEFAULT FALSE,
+                    timezone VARCHAR(50)
                 );
                 
                 CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_queue_status_scheduled 
@@ -115,6 +228,12 @@ pub mod postgres {
                 
                 CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_queue_status
                 ON hammerwork_jobs (queue_name, status);
+                
+                CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_recurring_next_run
+                ON hammerwork_jobs (recurring, next_run_at) WHERE recurring = TRUE;
+                
+                CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_cron_schedule
+                ON hammerwork_jobs (cron_schedule) WHERE cron_schedule IS NOT NULL;
                 "#,
             )
             .execute(&self.pool)
@@ -127,8 +246,8 @@ pub mod postgres {
             sqlx::query(
                 r#"
                 INSERT INTO hammerwork_jobs 
-                (id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                (id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                 "#
             )
             .bind(&job.id)
@@ -145,6 +264,10 @@ pub mod postgres {
             .bind(&job.failed_at)
             .bind(&job.timed_out_at)
             .bind(&job.error_message)
+            .bind(&job.cron_schedule)
+            .bind(&job.next_run_at)
+            .bind(&job.recurring)
+            .bind(&job.timezone)
             .execute(&self.pool)
             .await?;
 
@@ -152,7 +275,7 @@ pub mod postgres {
         }
 
         async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
-            let row = sqlx::query_as::<_, (uuid::Uuid, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)>(
+            let row = sqlx::query(
                 r#"
                 UPDATE hammerwork_jobs 
                 SET status = $1, started_at = $2, attempts = attempts + 1
@@ -165,7 +288,7 @@ pub mod postgres {
                     LIMIT 1 
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message
+                RETURNING id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
                 "#
             )
             .bind(serde_json::to_string(&JobStatus::Running)?)
@@ -175,23 +298,26 @@ pub mod postgres {
             .fetch_optional(&self.pool)
             .await?;
 
-            if let Some((
-                id,
-                queue_name,
-                payload,
-                status,
-                attempts,
-                max_attempts,
-                timeout_seconds,
-                created_at,
-                scheduled_at,
-                started_at,
-                completed_at,
-                failed_at,
-                timed_out_at,
-                error_message,
-            )) = row
-            {
+            if let Some(row) = row {
+                let id: uuid::Uuid = row.get("id");
+                let queue_name: String = row.get("queue_name");
+                let payload: serde_json::Value = row.get("payload");
+                let status: String = row.get("status");
+                let attempts: i32 = row.get("attempts");
+                let max_attempts: i32 = row.get("max_attempts");
+                let timeout_seconds: Option<i32> = row.get("timeout_seconds");
+                let created_at: DateTime<Utc> = row.get("created_at");
+                let scheduled_at: DateTime<Utc> = row.get("scheduled_at");
+                let started_at: Option<DateTime<Utc>> = row.get("started_at");
+                let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
+                let failed_at: Option<DateTime<Utc>> = row.get("failed_at");
+                let timed_out_at: Option<DateTime<Utc>> = row.get("timed_out_at");
+                let error_message: Option<String> = row.get("error_message");
+                let cron_schedule: Option<String> = row.get("cron_schedule");
+                let next_run_at: Option<DateTime<Utc>> = row.get("next_run_at");
+                let recurring: bool = row.get("recurring");
+                let timezone: Option<String> = row.get("timezone");
+
                 Ok(Some(Job {
                     id,
                     queue_name,
@@ -207,6 +333,10 @@ pub mod postgres {
                     timed_out_at,
                     timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
                     error_message,
+                    cron_schedule,
+                    next_run_at,
+                    recurring,
+                    timezone,
                 }))
             } else {
                 Ok(None)
@@ -252,48 +382,16 @@ pub mod postgres {
         }
 
         async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
-            let row = sqlx::query_as::<_, (uuid::Uuid, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)>(
-                "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE id = $1"
+            let row = sqlx::query_as::<_, JobRow>(
+                "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone FROM hammerwork_jobs WHERE id = $1"
             )
             .bind(job_id)
             .fetch_optional(&self.pool)
             .await?;
 
-            if let Some((
-                id,
-                queue_name,
-                payload,
-                status,
-                attempts,
-                max_attempts,
-                timeout_seconds,
-                created_at,
-                scheduled_at,
-                started_at,
-                completed_at,
-                failed_at,
-                timed_out_at,
-                error_message,
-            )) = row
-            {
-                Ok(Some(Job {
-                    id,
-                    queue_name,
-                    payload,
-                    status: serde_json::from_str(&status)?,
-                    attempts,
-                    max_attempts,
-                    created_at,
-                    scheduled_at,
-                    started_at,
-                    completed_at,
-                    failed_at,
-                    timed_out_at,
-                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                    error_message,
-                }))
-            } else {
-                Ok(None)
+            match row {
+                Some(job_row) => Ok(Some(job_row.into_job()?)),
+                None => Ok(None),
             }
         }
 
@@ -339,7 +437,7 @@ pub mod postgres {
             let limit = limit.unwrap_or(100) as i64;
             let offset = offset.unwrap_or(0) as i64;
             
-            let rows = sqlx::query_as::<_, (uuid::Uuid, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)>(
+            let rows = sqlx::query_as::<_, DeadJobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = $1 ORDER BY failed_at DESC LIMIT $2 OFFSET $3"
             )
             .bind(serde_json::to_string(&JobStatus::Dead)?)
@@ -348,31 +446,14 @@ pub mod postgres {
             .fetch_all(&self.pool)
             .await?;
 
-            Ok(rows.into_iter().map(|(id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message)| {
-                Job {
-                    id,
-                    queue_name,
-                    payload,
-                    status: serde_json::from_str(&status).unwrap_or(JobStatus::Dead),
-                    attempts,
-                    max_attempts,
-                    created_at,
-                    scheduled_at,
-                    started_at,
-                    completed_at,
-                    failed_at,
-                    timed_out_at,
-                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                    error_message,
-                }
-            }).collect())
+            Ok(rows.into_iter().map(|row| row.into_job()).collect())
         }
 
         async fn get_dead_jobs_by_queue(&self, queue_name: &str, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>> {
             let limit = limit.unwrap_or(100) as i64;
             let offset = offset.unwrap_or(0) as i64;
             
-            let rows = sqlx::query_as::<_, (uuid::Uuid, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)>(
+            let rows = sqlx::query_as::<_, DeadJobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = $1 AND queue_name = $2 ORDER BY failed_at DESC LIMIT $3 OFFSET $4"
             )
             .bind(serde_json::to_string(&JobStatus::Dead)?)
@@ -382,24 +463,7 @@ pub mod postgres {
             .fetch_all(&self.pool)
             .await?;
 
-            Ok(rows.into_iter().map(|(id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message)| {
-                Job {
-                    id,
-                    queue_name,
-                    payload,
-                    status: serde_json::from_str(&status).unwrap_or(JobStatus::Dead),
-                    attempts,
-                    max_attempts,
-                    created_at,
-                    scheduled_at,
-                    started_at,
-                    completed_at,
-                    failed_at,
-                    timed_out_at,
-                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                    error_message,
-                }
-            }).collect())
+            Ok(rows.into_iter().map(|row| row.into_job()).collect())
         }
 
         async fn retry_dead_job(&self, job_id: JobId) -> Result<()> {
@@ -612,6 +676,107 @@ pub mod postgres {
                 .map(|(error, count)| (error, count as u64))
                 .collect())
         }
+
+        // Cron job management
+        async fn enqueue_cron_job(&self, job: Job) -> Result<JobId> {
+            // For cron jobs, we use the regular enqueue method
+            // The job should already have the cron fields set
+            self.enqueue(job).await
+        }
+
+        async fn get_due_cron_jobs(&self, queue_name: Option<&str>) -> Result<Vec<Job>> {
+            let query = if queue_name.is_some() {
+                r#"
+                SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
+                FROM hammerwork_jobs 
+                WHERE recurring = TRUE 
+                AND queue_name = $1
+                AND (next_run_at IS NULL OR next_run_at <= $2)
+                AND status = $3
+                ORDER BY next_run_at ASC
+                "#
+            } else {
+                r#"
+                SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
+                FROM hammerwork_jobs 
+                WHERE recurring = TRUE 
+                AND (next_run_at IS NULL OR next_run_at <= $1)
+                AND status = $2
+                ORDER BY next_run_at ASC
+                "#
+            };
+
+            let rows = if let Some(queue) = queue_name {
+                sqlx::query_as::<_, JobRow>(query)
+                    .bind(queue)
+                    .bind(Utc::now())
+                    .bind(serde_json::to_string(&JobStatus::Pending)?)
+                    .fetch_all(&self.pool)
+                    .await?
+            } else {
+                sqlx::query_as::<_, JobRow>(query)
+                    .bind(Utc::now())
+                    .bind(serde_json::to_string(&JobStatus::Pending)?)
+                    .fetch_all(&self.pool)
+                    .await?
+            };
+
+            rows.into_iter().map(|row| row.into_job()).collect()
+        }
+
+        async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()> {
+            sqlx::query(
+                r#"
+                UPDATE hammerwork_jobs 
+                SET status = $1, 
+                    scheduled_at = $2, 
+                    next_run_at = $2,
+                    attempts = 0,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    failed_at = NULL,
+                    timed_out_at = NULL,
+                    error_message = NULL
+                WHERE id = $3 AND recurring = TRUE
+                "#
+            )
+            .bind(serde_json::to_string(&JobStatus::Pending)?)
+            .bind(next_run_at)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(())
+        }
+
+        async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
+            let rows = sqlx::query_as::<_, JobRow>(
+                "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone FROM hammerwork_jobs WHERE queue_name = $1 AND recurring = TRUE ORDER BY next_run_at ASC"
+            )
+            .bind(queue_name)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter().map(|row| row.into_job()).collect()
+        }
+
+        async fn disable_recurring_job(&self, job_id: JobId) -> Result<()> {
+            sqlx::query("UPDATE hammerwork_jobs SET recurring = FALSE WHERE id = $1")
+                .bind(job_id)
+                .execute(&self.pool)
+                .await?;
+
+            Ok(())
+        }
+
+        async fn enable_recurring_job(&self, job_id: JobId) -> Result<()> {
+            sqlx::query("UPDATE hammerwork_jobs SET recurring = TRUE WHERE id = $1")
+                .bind(job_id)
+                .execute(&self.pool)
+                .await?;
+
+            Ok(())
+        }
     }
 }
 
@@ -619,8 +784,98 @@ pub mod postgres {
 pub mod mysql {
     use super::*;
     use crate::job::JobStatus;
-    use sqlx::MySql;
+    use sqlx::{MySql, Row, FromRow};
     use std::time::Duration;
+
+    #[derive(FromRow)]
+    struct JobRow {
+        id: String, // MySQL uses CHAR(36) for UUID
+        queue_name: String,
+        payload: serde_json::Value,
+        status: String,
+        attempts: i32,
+        max_attempts: i32,
+        timeout_seconds: Option<i32>,
+        created_at: DateTime<Utc>,
+        scheduled_at: DateTime<Utc>,
+        started_at: Option<DateTime<Utc>>,
+        completed_at: Option<DateTime<Utc>>,
+        failed_at: Option<DateTime<Utc>>,
+        timed_out_at: Option<DateTime<Utc>>,
+        error_message: Option<String>,
+        cron_schedule: Option<String>,
+        next_run_at: Option<DateTime<Utc>>,
+        recurring: bool,
+        timezone: Option<String>,
+    }
+
+    impl JobRow {
+        fn into_job(self) -> Result<Job> {
+            Ok(Job {
+                id: uuid::Uuid::parse_str(&self.id)?,
+                queue_name: self.queue_name,
+                payload: self.payload,
+                status: serde_json::from_str(&self.status)?,
+                attempts: self.attempts,
+                max_attempts: self.max_attempts,
+                created_at: self.created_at,
+                scheduled_at: self.scheduled_at,
+                started_at: self.started_at,
+                completed_at: self.completed_at,
+                failed_at: self.failed_at,
+                timed_out_at: self.timed_out_at,
+                timeout: self.timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                error_message: self.error_message,
+                cron_schedule: self.cron_schedule,
+                next_run_at: self.next_run_at,
+                recurring: self.recurring,
+                timezone: self.timezone,
+            })
+        }
+    }
+
+    #[derive(FromRow)]
+    struct DeadJobRow {
+        id: String,
+        queue_name: String,
+        payload: serde_json::Value,
+        status: String,
+        attempts: i32,
+        max_attempts: i32,
+        timeout_seconds: Option<i32>,
+        created_at: DateTime<Utc>,
+        scheduled_at: DateTime<Utc>,
+        started_at: Option<DateTime<Utc>>,
+        completed_at: Option<DateTime<Utc>>,
+        failed_at: Option<DateTime<Utc>>,
+        timed_out_at: Option<DateTime<Utc>>,
+        error_message: Option<String>,
+    }
+
+    impl DeadJobRow {
+        fn into_job(self) -> Result<Job> {
+            Ok(Job {
+                id: uuid::Uuid::parse_str(&self.id)?,
+                queue_name: self.queue_name,
+                payload: self.payload,
+                status: serde_json::from_str(&self.status).unwrap_or(JobStatus::Dead),
+                attempts: self.attempts,
+                max_attempts: self.max_attempts,
+                created_at: self.created_at,
+                scheduled_at: self.scheduled_at,
+                started_at: self.started_at,
+                completed_at: self.completed_at,
+                failed_at: self.failed_at,
+                timed_out_at: self.timed_out_at,
+                timeout: self.timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                error_message: self.error_message,
+                cron_schedule: None,
+                next_run_at: None,
+                recurring: false,
+                timezone: None,
+            })
+        }
+    }
 
     #[async_trait]
     impl DatabaseQueue for JobQueue<MySql> {
@@ -644,9 +899,15 @@ pub mod mysql {
                     failed_at TIMESTAMP(6) NULL,
                     timed_out_at TIMESTAMP(6) NULL,
                     error_message TEXT NULL,
+                    cron_schedule VARCHAR(100) NULL,
+                    next_run_at TIMESTAMP(6) NULL,
+                    recurring BOOLEAN NOT NULL DEFAULT FALSE,
+                    timezone VARCHAR(50) NULL,
                     INDEX idx_queue_status_scheduled (queue_name, status, scheduled_at),
                     INDEX idx_status_failed_at (status, failed_at),
-                    INDEX idx_queue_status (queue_name, status)
+                    INDEX idx_queue_status (queue_name, status),
+                    INDEX idx_recurring_next_run (recurring, next_run_at),
+                    INDEX idx_cron_schedule (cron_schedule)
                 )
                 "#,
             )
@@ -660,8 +921,8 @@ pub mod mysql {
             sqlx::query(
                 r#"
                 INSERT INTO hammerwork_jobs 
-                (id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#
             )
             .bind(job.id.to_string())
@@ -678,6 +939,10 @@ pub mod mysql {
             .bind(&job.failed_at)
             .bind(&job.timed_out_at)
             .bind(&job.error_message)
+            .bind(&job.cron_schedule)
+            .bind(&job.next_run_at)
+            .bind(&job.recurring)
+            .bind(&job.timezone)
             .execute(&self.pool)
             .await?;
 
@@ -689,9 +954,9 @@ pub mod mysql {
             // This is a simplified version - in production you might want advisory locks
             let mut tx = self.pool.begin().await?;
 
-            let row = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)>(
+            let row = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(
                 r#"
-                SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message
+                SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
                 FROM hammerwork_jobs 
                 WHERE queue_name = ? 
                 AND status = ? 
@@ -722,6 +987,10 @@ pub mod mysql {
                 failed_at,
                 timed_out_at,
                 error_message,
+                cron_schedule,
+                next_run_at,
+                recurring,
+                timezone,
             )) = row
             {
                 let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
@@ -756,6 +1025,10 @@ pub mod mysql {
                     timed_out_at,
                     timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
                     error_message,
+                    cron_schedule,
+                    next_run_at,
+                    recurring,
+                    timezone,
                 }))
             } else {
                 tx.rollback().await?;
@@ -802,8 +1075,8 @@ pub mod mysql {
         }
 
         async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
-            let row = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)>(
-                "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE id = ?"
+            let row = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(
+                "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone FROM hammerwork_jobs WHERE id = ?"
             )
             .bind(job_id.to_string())
             .fetch_optional(&self.pool)
@@ -824,6 +1097,10 @@ pub mod mysql {
                 failed_at,
                 timed_out_at,
                 error_message,
+                cron_schedule,
+                next_run_at,
+                recurring,
+                timezone,
             )) = row
             {
                 let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
@@ -847,6 +1124,10 @@ pub mod mysql {
                     timed_out_at,
                     timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
                     error_message,
+                    cron_schedule,
+                    next_run_at,
+                    recurring,
+                    timezone,
                 }))
             } else {
                 Ok(None)
@@ -1185,6 +1466,168 @@ pub mod mysql {
                 .into_iter()
                 .map(|(error, count)| (error, count as u64))
                 .collect())
+        }
+
+        // Cron job management
+        async fn enqueue_cron_job(&self, job: Job) -> Result<JobId> {
+            // For cron jobs, we use the regular enqueue method
+            // The job should already have the cron fields set
+            self.enqueue(job).await
+        }
+
+        async fn get_due_cron_jobs(&self, queue_name: Option<&str>) -> Result<Vec<Job>> {
+            let query = if queue_name.is_some() {
+                r#"
+                SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
+                FROM hammerwork_jobs 
+                WHERE recurring = TRUE 
+                AND queue_name = ?
+                AND (next_run_at IS NULL OR next_run_at <= ?)
+                AND status = ?
+                ORDER BY next_run_at ASC
+                "#
+            } else {
+                r#"
+                SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
+                FROM hammerwork_jobs 
+                WHERE recurring = TRUE 
+                AND (next_run_at IS NULL OR next_run_at <= ?)
+                AND status = ?
+                ORDER BY next_run_at ASC
+                "#
+            };
+
+            let rows = if let Some(queue) = queue_name {
+                sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(query)
+                    .bind(queue)
+                    .bind(Utc::now())
+                    .bind(serde_json::to_string(&JobStatus::Pending)?)
+                    .fetch_all(&self.pool)
+                    .await?
+            } else {
+                sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(query)
+                    .bind(Utc::now())
+                    .bind(serde_json::to_string(&JobStatus::Pending)?)
+                    .fetch_all(&self.pool)
+                    .await?
+            };
+
+            let mut jobs = Vec::new();
+            for (id_str, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone) in rows {
+                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
+                    crate::error::HammerworkError::Queue {
+                        message: "Invalid UUID".to_string(),
+                    }
+                })?;
+
+                jobs.push(Job {
+                    id: job_id,
+                    queue_name,
+                    payload,
+                    status: serde_json::from_str(&status).unwrap_or(JobStatus::Pending),
+                    attempts,
+                    max_attempts,
+                    created_at,
+                    scheduled_at,
+                    started_at,
+                    completed_at,
+                    failed_at,
+                    timed_out_at,
+                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                    error_message,
+                    cron_schedule,
+                    next_run_at,
+                    recurring,
+                    timezone,
+                });
+            }
+
+            Ok(jobs)
+        }
+
+        async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()> {
+            sqlx::query(
+                r#"
+                UPDATE hammerwork_jobs 
+                SET status = ?, 
+                    scheduled_at = ?, 
+                    next_run_at = ?,
+                    attempts = 0,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    failed_at = NULL,
+                    timed_out_at = NULL,
+                    error_message = NULL
+                WHERE id = ? AND recurring = TRUE
+                "#
+            )
+            .bind(serde_json::to_string(&JobStatus::Pending)?)
+            .bind(next_run_at)
+            .bind(next_run_at)
+            .bind(job_id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+            Ok(())
+        }
+
+        async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
+            let rows = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(
+                "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone FROM hammerwork_jobs WHERE queue_name = ? AND recurring = TRUE ORDER BY next_run_at ASC"
+            )
+            .bind(queue_name)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let mut jobs = Vec::new();
+            for (id_str, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone) in rows {
+                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
+                    crate::error::HammerworkError::Queue {
+                        message: "Invalid UUID".to_string(),
+                    }
+                })?;
+
+                jobs.push(Job {
+                    id: job_id,
+                    queue_name,
+                    payload,
+                    status: serde_json::from_str(&status).unwrap_or(JobStatus::Pending),
+                    attempts,
+                    max_attempts,
+                    created_at,
+                    scheduled_at,
+                    started_at,
+                    completed_at,
+                    failed_at,
+                    timed_out_at,
+                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                    error_message,
+                    cron_schedule,
+                    next_run_at,
+                    recurring,
+                    timezone,
+                });
+            }
+
+            Ok(jobs)
+        }
+
+        async fn disable_recurring_job(&self, job_id: JobId) -> Result<()> {
+            sqlx::query("UPDATE hammerwork_jobs SET recurring = FALSE WHERE id = ?")
+                .bind(job_id.to_string())
+                .execute(&self.pool)
+                .await?;
+
+            Ok(())
+        }
+
+        async fn enable_recurring_job(&self, job_id: JobId) -> Result<()> {
+            sqlx::query("UPDATE hammerwork_jobs SET recurring = TRUE WHERE id = ?")
+                .bind(job_id.to_string())
+                .execute(&self.pool)
+                .await?;
+
+            Ok(())
         }
     }
 }

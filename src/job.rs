@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use crate::cron::CronSchedule;
 
 pub type JobId = Uuid;
 
@@ -31,6 +32,11 @@ pub struct Job {
     pub timed_out_at: Option<DateTime<Utc>>,
     pub timeout: Option<std::time::Duration>,
     pub error_message: Option<String>,
+    // Cron-related fields
+    pub cron_schedule: Option<String>,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub recurring: bool,
+    pub timezone: Option<String>,
 }
 
 impl Job {
@@ -51,6 +57,10 @@ impl Job {
             timed_out_at: None,
             timeout: None,
             error_message: None,
+            cron_schedule: None,
+            next_run_at: None,
+            recurring: false,
+            timezone: None,
         }
     }
 
@@ -75,6 +85,10 @@ impl Job {
             timed_out_at: None,
             timeout: None,
             error_message: None,
+            cron_schedule: None,
+            next_run_at: None,
+            recurring: false,
+            timezone: None,
         }
     }
 
@@ -85,6 +99,56 @@ impl Job {
 
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Create a recurring job with a cron schedule
+    pub fn with_cron_schedule(queue_name: String, payload: serde_json::Value, cron_schedule: CronSchedule) -> Result<Self, crate::cron::CronError> {
+        let now = Utc::now();
+        let next_run = cron_schedule.next_execution_from_now();
+        
+        Ok(Self {
+            id: Uuid::new_v4(),
+            queue_name,
+            payload,
+            status: JobStatus::Pending,
+            attempts: 0,
+            max_attempts: 3,
+            created_at: now,
+            scheduled_at: next_run.unwrap_or(now),
+            started_at: None,
+            completed_at: None,
+            failed_at: None,
+            timed_out_at: None,
+            timeout: None,
+            error_message: None,
+            cron_schedule: Some(cron_schedule.expression.clone()),
+            next_run_at: next_run,
+            recurring: true,
+            timezone: Some(cron_schedule.timezone.clone()),
+        })
+    }
+
+    /// Add a cron schedule to an existing job
+    pub fn with_cron(mut self, cron_schedule: CronSchedule) -> Result<Self, crate::cron::CronError> {
+        let next_run = cron_schedule.next_execution_from_now();
+        self.cron_schedule = Some(cron_schedule.expression.clone());
+        self.next_run_at = next_run;
+        self.recurring = true;
+        self.timezone = Some(cron_schedule.timezone.clone());
+        self.scheduled_at = next_run.unwrap_or(self.scheduled_at);
+        Ok(self)
+    }
+
+    /// Set the job as recurring without a cron schedule (for manual rescheduling)
+    pub fn as_recurring(mut self) -> Self {
+        self.recurring = true;
+        self
+    }
+
+    /// Set the timezone for the job
+    pub fn with_timezone(mut self, timezone: String) -> Self {
+        self.timezone = Some(timezone);
         self
     }
 
@@ -127,6 +191,63 @@ impl Job {
                 .or(self.timed_out_at)
                 .unwrap_or_else(Utc::now) - started
         })
+    }
+
+    /// Check if this is a recurring job
+    pub fn is_recurring(&self) -> bool {
+        self.recurring
+    }
+
+    /// Check if this job has a cron schedule
+    pub fn has_cron_schedule(&self) -> bool {
+        self.cron_schedule.is_some()
+    }
+
+    /// Get the cron schedule if it exists
+    pub fn get_cron_schedule(&self) -> Option<Result<CronSchedule, crate::cron::CronError>> {
+        self.cron_schedule.as_ref().map(|expr| {
+            match &self.timezone {
+                Some(tz) => CronSchedule::with_timezone(expr, tz),
+                None => CronSchedule::new(expr),
+            }
+        })
+    }
+
+    /// Calculate the next run time for a recurring job
+    pub fn calculate_next_run(&self) -> Option<DateTime<Utc>> {
+        if !self.recurring {
+            return None;
+        }
+
+        if let Some(cron_schedule) = self.get_cron_schedule() {
+            match cron_schedule {
+                Ok(schedule) => schedule.next_execution_from_now(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Update the job for the next run (for recurring jobs)
+    pub fn prepare_for_next_run(&mut self) -> Option<DateTime<Utc>> {
+        if !self.recurring {
+            return None;
+        }
+
+        let next_run = self.calculate_next_run();
+        if let Some(next_time) = next_run {
+            self.status = JobStatus::Pending;
+            self.attempts = 0;
+            self.scheduled_at = next_time;
+            self.next_run_at = Some(next_time);
+            self.started_at = None;
+            self.completed_at = None;
+            self.failed_at = None;
+            self.timed_out_at = None;
+            self.error_message = None;
+        }
+        next_run
     }
 }
 
