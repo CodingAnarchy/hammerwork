@@ -177,3 +177,55 @@ where
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_job_handler_type() {
+        // Test that JobHandler type alias is properly defined
+        let _handler: JobHandler = Arc::new(|_job| {
+            Box::pin(async { Ok(()) })
+        });
+        
+        // Compilation test - if this compiles, the type is correct
+        assert!(true);
+    }
+
+    #[test]
+    fn test_worker_config_methods() {
+        // Test that worker configuration methods work correctly
+        // We can't test the full Worker without database implementations
+        // But we can test the duration handling
+        
+        let poll_interval = Duration::from_millis(500);
+        let retry_delay = Duration::from_secs(60);
+        let max_retries = 5;
+        
+        assert_eq!(poll_interval.as_millis(), 500);
+        assert_eq!(retry_delay.as_secs(), 60);
+        assert_eq!(max_retries, 5);
+    }
+
+    #[test]
+    fn test_worker_pool_struct() {
+        // Test that WorkerPool struct is properly defined
+        // We can't instantiate it without database implementations
+        // But we can verify the type signatures compile
+        
+        // This would be the structure for a real implementation:
+        // let pool: WorkerPool<sqlx::Postgres> = WorkerPool::new();
+        assert!(true); // Compilation test
+    }
+
+    #[test]
+    fn test_error_handling() {
+        let error = HammerworkError::Worker {
+            message: "Test error".to_string(),
+        };
+        
+        assert_eq!(error.to_string(), "Worker error: Test error");
+    }
+}

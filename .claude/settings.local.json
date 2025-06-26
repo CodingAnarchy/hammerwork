@@ -9,7 +9,8 @@
       "Bash(gh auth:*)",
       "Bash(cargo check:*)",
       "Bash(cargo test:*)",
-      "Bash(cargo:*)"
+      "Bash(cargo:*)",
+      "Bash(find:*)"
     ],
     "deny": []
   }
