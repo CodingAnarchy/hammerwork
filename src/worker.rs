@@ -1,3 +1,10 @@
+//! Worker types for processing jobs from the job queue.
+//!
+//! This module provides the [`Worker`] and [`WorkerPool`] types that are responsible
+//! for polling the job queue for work and executing job handlers. Workers support
+//! extensive configuration including priority scheduling, rate limiting, timeouts,
+//! statistics collection, and monitoring.
+
 use crate::{
     error::HammerworkError,
     job::Job,
@@ -20,28 +27,140 @@ use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
 use tracing::{debug, error, info, warn};
 
+/// Type alias for job handler functions.
+///
+/// Job handlers are async functions that take a [`Job`] and return a [`Result`].
+/// The handler is responsible for processing the job's payload and performing
+/// the actual work. Handlers should return `Ok(())` on success or an error
+/// if the job should be retried or marked as failed.
+///
+/// # Examples
+///
+/// ```rust
+/// use hammerwork::{Job, Result, worker::JobHandler};
+/// use std::sync::Arc;
+///
+/// let handler: JobHandler = Arc::new(|job: Job| {
+///     Box::pin(async move {
+///         // Process the job
+///         println!("Processing job: {:?}", job.payload);
+///         
+///         // Return Ok(()) on success, Err(_) to trigger retry
+///         Ok(())
+///     })
+/// });
+/// ```
 pub type JobHandler = Arc<
     dyn Fn(Job) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         + Send
         + Sync,
 >;
 
+/// A worker that processes jobs from a specific queue.
+///
+/// Workers continuously poll their assigned queue for pending jobs and execute
+/// them using the provided handler function. They support extensive configuration
+/// for controlling job processing behavior.
+///
+/// # Features
+///
+/// - **Priority-aware job selection**: Configurable weighted or strict priority scheduling
+/// - **Rate limiting**: Token bucket rate limiting with configurable burst limits
+/// - **Automatic retries**: Configurable retry attempts with exponential backoff
+/// - **Timeout handling**: Per-job and worker-level timeout configuration
+/// - **Statistics collection**: Integration with statistics collectors for monitoring
+/// - **Metrics and alerting**: Optional Prometheus metrics and alerting support
+///
+/// # Examples
+///
+/// ## Basic Worker
+///
+/// ```rust,no_run
+/// use hammerwork::{Worker, JobQueue, Job};
+/// use std::sync::Arc;
+/// 
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
+/// let queue = Arc::new(JobQueue::new(pool));
+/// 
+/// let handler: hammerwork::worker::JobHandler = Arc::new(|job: Job| {
+///     Box::pin(async move {
+///         println!("Processing: {:?}", job.payload);
+///         Ok(())
+///     })
+/// });
+///
+/// let worker = Worker::new(queue, "email_queue".to_string(), handler)
+///     .with_poll_interval(std::time::Duration::from_millis(500))
+///     .with_max_retries(5);
+/// 
+/// // Start processing jobs
+/// let mut pool = hammerwork::WorkerPool::new();
+/// pool.add_worker(worker);
+/// pool.start().await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Worker with Priority and Rate Limiting
+///
+/// ```rust,no_run
+/// use hammerwork::{Worker, JobQueue, PriorityWeights, RateLimit};
+/// use std::sync::Arc;
+/// use std::time::Duration;
+/// 
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
+/// # let queue = Arc::new(JobQueue::new(pool));
+/// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+///
+/// let priority_weights = PriorityWeights::new()
+///     .with_weight(hammerwork::JobPriority::Critical, 50)
+///     .with_weight(hammerwork::JobPriority::High, 20);
+///
+/// let rate_limit = RateLimit::per_second(10).with_burst_limit(20);
+///
+/// let worker = Worker::new(queue, "api_queue".to_string(), handler)
+///     .with_priority_weights(priority_weights)
+///     .with_rate_limit(rate_limit)
+///     .with_default_timeout(Duration::from_secs(300));
+/// 
+/// let mut pool = hammerwork::WorkerPool::new();
+/// pool.add_worker(worker);
+/// pool.start().await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Worker<DB: Database> {
+    /// The job queue to poll for work
     queue: Arc<JobQueue<DB>>,
+    /// Name of the queue this worker processes
     queue_name: String,
+    /// Function to handle job processing
     handler: JobHandler,
+    /// How often to poll for new jobs
     poll_interval: Duration,
+    /// Maximum number of retry attempts for failed jobs
     max_retries: i32,
+    /// Delay between retry attempts
     retry_delay: Duration,
+    /// Default timeout for jobs (overridden by job-specific timeouts)
     default_timeout: Option<Duration>,
+    /// Priority weights for job selection
     priority_weights: Option<PriorityWeights>,
+    /// Statistics collector for monitoring
     stats_collector: Option<Arc<dyn StatisticsCollector>>,
+    /// Rate limiter for controlling job processing rate
     rate_limiter: Option<RateLimiter>,
+    /// Throttling configuration
     throttle_config: Option<ThrottleConfig>,
+    /// Prometheus metrics collector (when metrics feature is enabled)
     #[cfg(feature = "metrics")]
     metrics_collector: Option<Arc<PrometheusMetricsCollector>>,
+    /// Alert manager for notifications (when alerting feature is enabled)
     #[cfg(feature = "alerting")]
     alert_manager: Option<Arc<AlertManager>>,
+    /// Timestamp of the last processed job (for starvation detection)
     last_job_time: Arc<std::sync::RwLock<DateTime<Utc>>>,
 }
 
@@ -49,6 +168,52 @@ impl<DB: Database + Send + Sync + 'static> Worker<DB>
 where
     JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync,
 {
+    /// Creates a new worker with default configuration.
+    ///
+    /// The worker will be created with:
+    /// - 1 second polling interval
+    /// - 3 maximum retry attempts
+    /// - 30 second retry delay
+    /// - No timeout, rate limiting, or priority configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `queue` - The job queue to poll for work
+    /// * `queue_name` - Name of the queue this worker should process
+    /// * `handler` - Function to handle job processing
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{Worker, JobQueue, Job};
+    /// use std::sync::Arc;
+    /// 
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
+    /// let queue = Arc::new(JobQueue::new(pool));
+    /// 
+    /// let handler: hammerwork::worker::JobHandler = Arc::new(|job: Job| {
+    ///     Box::pin(async move {
+    ///         match job.payload.get("action").and_then(|v| v.as_str()) {
+    ///             Some("send_email") => {
+    ///                 // Send email logic
+    ///                 println!("Sending email to: {:?}", job.payload.get("to"));
+    ///                 Ok(())
+    ///             },
+    ///             Some("process_data") => {
+    ///                 // Data processing logic
+    ///                 println!("Processing data: {:?}", job.payload.get("data"));
+    ///                 Ok(())
+    ///             },
+    ///             _ => Err(hammerwork::HammerworkError::Processing("Unknown action".to_string())),
+    ///         }
+    ///     })
+    /// });
+    ///
+    /// let worker = Worker::new(queue, "default".to_string(), handler);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(queue: Arc<JobQueue<DB>>, queue_name: String, handler: JobHandler) -> Self {
         Self {
             queue,
@@ -70,26 +235,155 @@ where
         }
     }
 
+    /// Adds a statistics collector for monitoring job processing.
+    ///
+    /// The statistics collector will receive events for job start, completion,
+    /// failure, and timeout events, allowing for comprehensive monitoring
+    /// of worker performance.
+    ///
+    /// # Arguments
+    ///
+    /// * `stats_collector` - The statistics collector to use
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{Worker, JobQueue, InMemoryStatsCollector};
+    /// use std::sync::Arc;
+    /// 
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
+    /// # let queue = Arc::new(JobQueue::new(pool));
+    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+    ///
+    /// let stats = Arc::new(InMemoryStatsCollector::new_default());
+    /// let worker = Worker::new(queue, "monitored".to_string(), handler)
+    ///     .with_stats_collector(stats.clone());
+    /// 
+    /// // Later, check statistics  
+    /// use std::time::Duration;
+    /// use hammerwork::StatisticsCollector;
+    /// let queue_stats = stats.get_queue_statistics("monitored", Duration::from_secs(3600)).await?;
+    /// println!("Processed: {}", queue_stats.total_processed);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_stats_collector(mut self, stats_collector: Arc<dyn StatisticsCollector>) -> Self {
         self.stats_collector = Some(stats_collector);
         self
     }
 
+    /// Sets how often the worker polls for new jobs.
+    ///
+    /// Shorter intervals result in lower latency but higher database load.
+    /// Longer intervals reduce database load but increase job processing latency.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval` - Time between polling attempts
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::Worker;
+    /// use std::time::Duration;
+    /// # use std::sync::Arc;
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
+    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+    ///
+    /// // High-frequency polling for low latency
+    /// let fast_worker = Worker::new(queue.clone(), "fast".to_string(), handler.clone())
+    ///     .with_poll_interval(Duration::from_millis(100));
+    ///
+    /// // Lower frequency polling for reduced load
+    /// let slow_worker = Worker::new(queue, "slow".to_string(), handler)
+    ///     .with_poll_interval(Duration::from_secs(5));
+    /// ```
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
     }
 
+    /// Sets the maximum number of retry attempts for failed jobs.
+    ///
+    /// When a job handler returns an error, the job will be retried up to
+    /// this many times before being marked as dead. This overrides the
+    /// job's own max_attempts setting.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_retries` - Maximum retry attempts
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::Worker;
+    /// # use std::sync::Arc;
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
+    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+    ///
+    /// // Critical jobs get more retry attempts
+    /// let critical_worker = Worker::new(queue, "critical".to_string(), handler)
+    ///     .with_max_retries(10);
+    /// ```
     pub fn with_max_retries(mut self, max_retries: i32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
+    /// Sets the delay between retry attempts.
+    ///
+    /// When a job fails and is scheduled for retry, it will wait this
+    /// duration before becoming eligible for processing again.
+    ///
+    /// # Arguments
+    ///
+    /// * `delay` - Time to wait between retry attempts
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::Worker;
+    /// use std::time::Duration;
+    /// # use std::sync::Arc;
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
+    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+    ///
+    /// // Longer delay for API rate limit recovery
+    /// let api_worker = Worker::new(queue, "api".to_string(), handler)
+    ///     .with_retry_delay(Duration::from_secs(300)); // 5 minutes
+    /// ```
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.retry_delay = delay;
         self
     }
 
+    /// Sets a default timeout for all jobs processed by this worker.
+    ///
+    /// Jobs that don't have their own timeout setting will use this default.
+    /// Job-specific timeouts always take precedence over worker defaults.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time a job can run before being terminated
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::Worker;
+    /// use std::time::Duration;
+    /// # use std::sync::Arc;
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
+    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+    ///
+    /// // Set 5 minute default timeout for all jobs
+    /// let worker = Worker::new(queue, "processing".to_string(), handler)
+    ///     .with_default_timeout(Duration::from_secs(300));
+    /// ```
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = Some(timeout);
         self
