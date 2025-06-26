@@ -29,7 +29,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create statistics collector for monitoring job processing
-    let stats_collector = Arc::new(InMemoryStatsCollector::new_default()) as Arc<dyn StatisticsCollector>;
+    let stats_collector =
+        Arc::new(InMemoryStatsCollector::new_default()) as Arc<dyn StatisticsCollector>;
 
     // Create a job handler for image processing
     let image_handler = Arc::new(|job: Job| {
@@ -99,8 +100,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_default_timeout(tokio::time::Duration::from_secs(30)) // 30-second timeout for emails
         .with_stats_collector(Arc::clone(&stats_collector));
 
-    let mut worker_pool = WorkerPool::new()
-        .with_stats_collector(Arc::clone(&stats_collector));
+    let mut worker_pool = WorkerPool::new().with_stats_collector(Arc::clone(&stats_collector));
     worker_pool.add_worker(image_worker);
     worker_pool.add_worker(email_worker);
 
@@ -117,7 +117,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "resize": "800x600",
                 "format": "webp"
             }),
-        ).with_timeout(std::time::Duration::from_secs(60)); // Custom 1-minute timeout for this job
+        )
+        .with_timeout(std::time::Duration::from_secs(60)); // Custom 1-minute timeout for this job
 
         let failing_image_job = Job::new(
             "image_processing".to_string(),
@@ -135,7 +136,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "subject": "Your image has been processed",
                 "template": "image_ready"
             }),
-        ).with_timeout(std::time::Duration::from_secs(10)); // Quick timeout for email sending
+        )
+        .with_timeout(std::time::Duration::from_secs(10)); // Quick timeout for email sending
 
         // High-priority email with longer timeout and more retries
         let priority_email_job = Job::new(
@@ -146,8 +148,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "template": "vip_notification",
                 "priority": "high"
             }),
-        ).with_timeout(std::time::Duration::from_secs(45)) // Longer timeout for VIP
-         .with_max_attempts(5); // More retry attempts for important emails
+        )
+        .with_timeout(std::time::Duration::from_secs(45)) // Longer timeout for VIP
+        .with_max_attempts(5); // More retry attempts for important emails
 
         // Large image processing job with extended timeout
         let large_image_job = Job::new(
@@ -158,8 +161,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "format": "png",
                 "effects": ["sharpen", "color_correct", "denoise"]
             }),
-        ).with_timeout(std::time::Duration::from_secs(600)) // 10-minute timeout for large processing
-         .with_max_attempts(2); // Fewer retries for expensive operations
+        )
+        .with_timeout(std::time::Duration::from_secs(600)) // 10-minute timeout for large processing
+        .with_max_attempts(2); // Fewer retries for expensive operations
 
         // Schedule a delayed job
         let delayed_job = Job::with_delay(
@@ -181,7 +185,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         info!("Enqueued test jobs with various timeout configurations:");
         info!("  {} - image processing with 60s timeout", job1_id);
-        info!("  {} - failing image job (uses worker default 2min timeout)", job2_id);
+        info!(
+            "  {} - failing image job (uses worker default 2min timeout)",
+            job2_id
+        );
         info!("  {} - email with 10s timeout", job3_id);
         info!("  {} - VIP email with 45s timeout", job4_id);
         info!("  {} - large image with 10min timeout", job5_id);
@@ -192,7 +199,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         // Demonstrate statistics collection with timeout tracking
         info!("=== Job Processing Statistics (Including Timeouts) ===");
-        let system_stats = stats_collector.get_system_statistics(std::time::Duration::from_secs(300)).await?;
+        let system_stats = stats_collector
+            .get_system_statistics(std::time::Duration::from_secs(300))
+            .await?;
         info!("System Stats - Total: {}, Completed: {}, Failed: {}, Dead: {}, Timed Out: {}, Error Rate: {:.2}%",
             system_stats.total_processed,
             system_stats.completed,
@@ -203,7 +212,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
 
         // Get statistics for each queue
-        let image_stats = stats_collector.get_queue_statistics("image_processing", std::time::Duration::from_secs(300)).await?;
+        let image_stats = stats_collector
+            .get_queue_statistics("image_processing", std::time::Duration::from_secs(300))
+            .await?;
         info!("Image Processing Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Time: {:.2}ms",
             image_stats.total_processed,
             image_stats.completed,
@@ -212,7 +223,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             image_stats.avg_processing_time_ms
         );
 
-        let email_stats = stats_collector.get_queue_statistics("email_queue", std::time::Duration::from_secs(300)).await?;
+        let email_stats = stats_collector
+            .get_queue_statistics("email_queue", std::time::Duration::from_secs(300))
+            .await?;
         info!("Email Queue Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Time: {:.2}ms",
             email_stats.total_processed,
             email_stats.completed,
@@ -225,26 +238,26 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("=== Dead Job Management ===");
         let dead_jobs = queue.get_dead_jobs(Some(10), None).await?;
         info!("Found {} dead jobs", dead_jobs.len());
-        
+
         for dead_job in &dead_jobs {
-            info!("Dead Job {} in queue '{}': {:?}", 
-                dead_job.id, 
-                dead_job.queue_name, 
-                dead_job.error_message
+            info!(
+                "Dead Job {} in queue '{}': {:?}",
+                dead_job.id, dead_job.queue_name, dead_job.error_message
             );
         }
 
         // Get dead job summary
         let dead_summary = queue.get_dead_job_summary().await?;
-        info!("Dead Job Summary - Total: {}, By Queue: {:?}",
-            dead_summary.total_dead_jobs,
-            dead_summary.dead_jobs_by_queue
+        info!(
+            "Dead Job Summary - Total: {}, By Queue: {:?}",
+            dead_summary.total_dead_jobs, dead_summary.dead_jobs_by_queue
         );
 
         // Show queue statistics from database (including timeout counts)
         let all_queue_stats = queue.get_all_queue_stats().await?;
         for queue_stat in all_queue_stats {
-            info!("Queue '{}' - Pending: {}, Running: {}, Dead: {}, Timed Out: {}, Completed: {}",
+            info!(
+                "Queue '{}' - Pending: {}, Running: {}, Dead: {}, Timed Out: {}, Completed: {}",
                 queue_stat.queue_name,
                 queue_stat.pending_count,
                 queue_stat.running_count,
@@ -255,12 +268,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
 
         // Demonstrate error frequency analysis
-        let error_frequencies = queue.get_error_frequencies(
-            Some("image_processing"), 
-            chrono::Utc::now() - chrono::Duration::hours(1)
-        ).await?;
+        let error_frequencies = queue
+            .get_error_frequencies(
+                Some("image_processing"),
+                chrono::Utc::now() - chrono::Duration::hours(1),
+            )
+            .await?;
         if !error_frequencies.is_empty() {
-            info!("Error patterns for image_processing queue: {:?}", error_frequencies);
+            info!(
+                "Error patterns for image_processing queue: {:?}",
+                error_frequencies
+            );
         }
     }
 

@@ -1,5 +1,5 @@
 use hammerwork::{
-    cron::{CronSchedule, presets},
+    cron::{presets, CronSchedule},
     job::Job,
 };
 use serde_json::json;
@@ -48,7 +48,7 @@ fn test_job_with_cron() {
     let job = Job::new("test".to_string(), json!({"test": "data"}))
         .with_cron(schedule)
         .unwrap();
-    
+
     assert!(job.is_recurring());
     assert!(job.has_cron_schedule());
     assert_eq!(job.cron_schedule, Some("0 0 9 * * 1-5".to_string()));
@@ -58,12 +58,9 @@ fn test_job_with_cron() {
 #[test]
 fn test_job_with_cron_schedule_constructor() {
     let schedule = CronSchedule::new("0 0 9 * * 1-5").unwrap();
-    let job = Job::with_cron_schedule(
-        "test".to_string(),
-        json!({"test": "data"}),
-        schedule
-    ).unwrap();
-    
+    let job =
+        Job::with_cron_schedule("test".to_string(), json!({"test": "data"}), schedule).unwrap();
+
     assert!(job.is_recurring());
     assert!(job.has_cron_schedule());
     assert_eq!(job.cron_schedule, Some("0 0 9 * * 1-5".to_string()));
@@ -73,16 +70,13 @@ fn test_job_with_cron_schedule_constructor() {
 #[test]
 fn test_job_next_run_calculation() {
     let schedule = CronSchedule::new("0 0 9 * * 1-5").unwrap(); // Weekdays at 9 AM
-    let mut job = Job::with_cron_schedule(
-        "test".to_string(),
-        json!({"test": "data"}),
-        schedule
-    ).unwrap();
-    
+    let mut job =
+        Job::with_cron_schedule("test".to_string(), json!({"test": "data"}), schedule).unwrap();
+
     // Test that we can calculate next run
     let next_run = job.calculate_next_run();
     assert!(next_run.is_some());
-    
+
     // Test prepare_for_next_run
     let next_time = job.prepare_for_next_run();
     assert!(next_time.is_some());
@@ -104,10 +98,10 @@ fn test_cron_serialization() {
     let schedule = CronSchedule::with_timezone("0 0 9 * * 1-5", "America/New_York").unwrap();
     let json = serde_json::to_string(&schedule).unwrap();
     let mut deserialized: CronSchedule = serde_json::from_str(&json).unwrap();
-    
+
     // Need to reinitialize after deserialization
     deserialized.reinitialize().unwrap();
-    
+
     assert_eq!(deserialized.expression, schedule.expression);
     assert_eq!(deserialized.timezone, schedule.timezone);
 }
@@ -121,13 +115,12 @@ fn test_job_cron_fields() {
     assert!(regular_job.cron_schedule.is_none());
     assert!(regular_job.next_run_at.is_none());
     assert!(regular_job.timezone.is_none());
-    
+
     // Test job marked as recurring
-    let recurring_job = Job::new("test".to_string(), json!({"test": "data"}))
-        .as_recurring();
+    let recurring_job = Job::new("test".to_string(), json!({"test": "data"})).as_recurring();
     assert!(recurring_job.is_recurring());
     assert!(!recurring_job.has_cron_schedule()); // No cron schedule set
-    
+
     // Test job with timezone
     let tz_job = Job::new("test".to_string(), json!({"test": "data"}))
         .with_timezone("America/New_York".to_string());

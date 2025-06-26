@@ -1,6 +1,6 @@
 use hammerwork::queue::DatabaseQueue;
-use hammerwork::{HammerworkError, Job, JobQueue, JobStatus, Result, Worker, WorkerPool};
 use hammerwork::stats::{InMemoryStatsCollector, StatisticsCollector};
+use hammerwork::{HammerworkError, Job, JobQueue, JobStatus, Result, Worker, WorkerPool};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -366,12 +366,12 @@ where
                 self.queue
                     .fail_job(job_id, &format!("Simulated failure attempt {}", attempt))
                     .await?;
-                
+
                 // Retry the job
                 let retry_at = chrono::Utc::now() + chrono::Duration::seconds(1);
                 self.queue.retry_job(job_id, retry_at).await?;
                 info!("✅ Job failed and scheduled for retry, attempt {}", attempt);
-                
+
                 // Wait for retry
                 sleep(Duration::from_secs(2)).await;
             }
@@ -395,7 +395,9 @@ where
         // Test dead job summary
         let dead_summary = self.queue.get_dead_job_summary().await?;
         assert!(dead_summary.total_dead_jobs > 0);
-        assert!(dead_summary.dead_jobs_by_queue.contains_key("dead_job_test"));
+        assert!(dead_summary
+            .dead_jobs_by_queue
+            .contains_key("dead_job_test"));
         info!("✅ Dead job summary contains expected data");
 
         // Test retry dead job
@@ -420,7 +422,8 @@ where
         info!("🧪 Testing statistics collection");
 
         // Create statistics collector
-        let stats_collector = Arc::new(InMemoryStatsCollector::new_default()) as Arc<dyn StatisticsCollector>;
+        let stats_collector =
+            Arc::new(InMemoryStatsCollector::new_default()) as Arc<dyn StatisticsCollector>;
 
         // Create a job handler that records statistics
         let stats_clone = Arc::clone(&stats_collector);
@@ -428,30 +431,32 @@ where
             let stats = stats_clone.clone();
             Box::pin(async move {
                 info!("Processing statistics test job: {}", job.id);
-                
+
                 // Simulate some work
                 sleep(Duration::from_millis(100)).await;
 
                 // Fail some jobs for testing
-                if job.payload.get("should_fail").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if job
+                    .payload
+                    .get("should_fail")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     return Err(HammerworkError::Worker {
                         message: "Simulated failure for statistics test".to_string(),
                     });
                 }
 
                 Ok(())
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         });
 
         // Create worker with stats collector
-        let worker = Worker::new(
-            self.queue.clone(),
-            "stats_test".to_string(),
-            handler,
-        )
-        .with_poll_interval(Duration::from_millis(100))
-        .with_max_retries(2)
-        .with_stats_collector(Arc::clone(&stats_collector));
+        let worker = Worker::new(self.queue.clone(), "stats_test".to_string(), handler)
+            .with_poll_interval(Duration::from_millis(100))
+            .with_max_retries(2)
+            .with_stats_collector(Arc::clone(&stats_collector));
 
         // Enqueue test jobs (mix of successful and failing)
         let mut job_ids = Vec::new();
@@ -469,8 +474,7 @@ where
         info!("✅ Enqueued 5 jobs for statistics test");
 
         // Start worker pool with timeout
-        let mut pool = WorkerPool::new()
-            .with_stats_collector(Arc::clone(&stats_collector));
+        let mut pool = WorkerPool::new().with_stats_collector(Arc::clone(&stats_collector));
         pool.add_worker(worker);
 
         let pool_task = tokio::spawn(async move { pool.start().await });
@@ -482,24 +486,41 @@ where
         pool_task.abort();
 
         // Check statistics
-        let system_stats = stats_collector.get_system_statistics(Duration::from_secs(300)).await?;
-        info!("System stats - Total: {}, Completed: {}, Failed: {}", 
-            system_stats.total_processed, 
-            system_stats.completed, 
-            system_stats.failed
+        let system_stats = stats_collector
+            .get_system_statistics(Duration::from_secs(300))
+            .await?;
+        info!(
+            "System stats - Total: {}, Completed: {}, Failed: {}",
+            system_stats.total_processed, system_stats.completed, system_stats.failed
         );
-        
-        assert!(system_stats.total_processed > 0, "Should have processed some jobs");
-        
-        let queue_stats = stats_collector.get_queue_statistics("stats_test", Duration::from_secs(300)).await?;
-        assert!(queue_stats.total_processed > 0, "Queue should have processed some jobs");
+
+        assert!(
+            system_stats.total_processed > 0,
+            "Should have processed some jobs"
+        );
+
+        let queue_stats = stats_collector
+            .get_queue_statistics("stats_test", Duration::from_secs(300))
+            .await?;
+        assert!(
+            queue_stats.total_processed > 0,
+            "Queue should have processed some jobs"
+        );
         info!("✅ Queue-specific statistics collected successfully");
 
         // Test all queue statistics
-        let all_stats = stats_collector.get_all_statistics(Duration::from_secs(300)).await?;
-        assert!(!all_stats.is_empty(), "Should have statistics for at least one queue");
+        let all_stats = stats_collector
+            .get_all_statistics(Duration::from_secs(300))
+            .await?;
+        assert!(
+            !all_stats.is_empty(),
+            "Should have statistics for at least one queue"
+        );
         let stats_test_queue = all_stats.iter().find(|s| s.queue_name == "stats_test");
-        assert!(stats_test_queue.is_some(), "Should have statistics for stats_test queue");
+        assert!(
+            stats_test_queue.is_some(),
+            "Should have statistics for stats_test queue"
+        );
         info!("✅ All queue statistics collected successfully");
 
         // Cleanup
@@ -517,18 +538,15 @@ where
 
         // Create test jobs in multiple queues
         let mut job_ids = Vec::new();
-        
+
         // Queue 1: email_queue
         for i in 0..3 {
-            let job = Job::new(
-                "email_queue".to_string(),
-                json!({ "email_id": i }),
-            );
+            let job = Job::new("email_queue".to_string(), json!({ "email_id": i }));
             job_ids.push(job.id);
             self.queue.enqueue(job).await?;
         }
 
-        // Queue 2: notification_queue  
+        // Queue 2: notification_queue
         for i in 0..2 {
             let job = Job::new(
                 "notification_queue".to_string(),
@@ -552,18 +570,28 @@ where
         let email_stats = self.queue.get_queue_stats("email_queue").await?;
         assert_eq!(email_stats.queue_name, "email_queue");
         assert!(email_stats.pending_count > 0 || email_stats.completed_count > 0);
-        info!("✅ Email queue statistics: pending={}, completed={}", 
-            email_stats.pending_count, 
-            email_stats.completed_count
+        info!(
+            "✅ Email queue statistics: pending={}, completed={}",
+            email_stats.pending_count, email_stats.completed_count
         );
 
         // Test all queue statistics
         let all_queue_stats = self.queue.get_all_queue_stats().await?;
-        assert!(all_queue_stats.len() >= 2, "Should have stats for at least 2 queues");
-        
-        let email_found = all_queue_stats.iter().any(|s| s.queue_name == "email_queue");
-        let notification_found = all_queue_stats.iter().any(|s| s.queue_name == "notification_queue");
-        assert!(email_found && notification_found, "Should have stats for both queues");
+        assert!(
+            all_queue_stats.len() >= 2,
+            "Should have stats for at least 2 queues"
+        );
+
+        let email_found = all_queue_stats
+            .iter()
+            .any(|s| s.queue_name == "email_queue");
+        let notification_found = all_queue_stats
+            .iter()
+            .any(|s| s.queue_name == "notification_queue");
+        assert!(
+            email_found && notification_found,
+            "Should have stats for both queues"
+        );
         info!("✅ All queue statistics retrieved successfully");
 
         // Test job counts by status

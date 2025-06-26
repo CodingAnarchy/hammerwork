@@ -29,7 +29,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create statistics collector for monitoring job processing
-    let stats_collector = Arc::new(InMemoryStatsCollector::new_default()) as Arc<dyn StatisticsCollector>;
+    let stats_collector =
+        Arc::new(InMemoryStatsCollector::new_default()) as Arc<dyn StatisticsCollector>;
 
     // Create a job handler
     let handler = Arc::new(|job: Job| {
@@ -64,8 +65,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_default_timeout(tokio::time::Duration::from_secs(60)) // 60 second default timeout
         .with_stats_collector(Arc::clone(&stats_collector));
 
-    let mut worker_pool = WorkerPool::new()
-        .with_stats_collector(Arc::clone(&stats_collector));
+    let mut worker_pool = WorkerPool::new().with_stats_collector(Arc::clone(&stats_collector));
     worker_pool.add_worker(worker1);
     worker_pool.add_worker(worker2);
 
@@ -79,23 +79,25 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "email".to_string(),
             json!({"to": "user@example.com", "subject": "Hello"}),
         ); // Uses worker default timeout (30s)
-        
+
         let job2 = Job::new(
             "notifications".to_string(),
             json!({"message": "Welcome!", "user_id": 123}),
-        ).with_timeout(std::time::Duration::from_secs(10)); // Custom 10-second timeout
-        
+        )
+        .with_timeout(std::time::Duration::from_secs(10)); // Custom 10-second timeout
+
         let job3 = Job::new("email".to_string(), json!({"action": "fail"})); // This will fail
-        
+
         let job4 = Job::new("email".to_string(), json!({"action": "fail"})) // This will also fail and become dead
             .with_timeout(std::time::Duration::from_secs(5)); // Short timeout for demo
-        
+
         // Job with a very long timeout for heavy processing
         let job5 = Job::new(
             "email".to_string(),
             json!({"to": "admin@example.com", "subject": "Heavy Processing"}),
-        ).with_timeout(std::time::Duration::from_secs(300)) // 5-minute timeout
-         .with_max_attempts(5); // More retry attempts for important jobs
+        )
+        .with_timeout(std::time::Duration::from_secs(300)) // 5-minute timeout
+        .with_max_attempts(5); // More retry attempts for important jobs
 
         let job1_id = queue.enqueue(job1).await?;
         let job2_id = queue.enqueue(job2).await?;
@@ -115,7 +117,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         // Demonstrate statistics collection with timeout tracking
         info!("=== Job Processing Statistics (Including Timeouts) ===");
-        let system_stats = stats_collector.get_system_statistics(std::time::Duration::from_secs(300)).await?;
+        let system_stats = stats_collector
+            .get_system_statistics(std::time::Duration::from_secs(300))
+            .await?;
         info!("System Stats - Total: {}, Completed: {}, Failed: {}, Dead: {}, Timed Out: {}, Error Rate: {:.2}%",
             system_stats.total_processed,
             system_stats.completed,
@@ -126,7 +130,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         );
 
         // Get queue-specific statistics
-        let email_stats = stats_collector.get_queue_statistics("email", std::time::Duration::from_secs(300)).await?;
+        let email_stats = stats_collector
+            .get_queue_statistics("email", std::time::Duration::from_secs(300))
+            .await?;
         info!("Email Queue Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Processing Time: {:.2}ms",
             email_stats.total_processed,
             email_stats.completed,
@@ -135,7 +141,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             email_stats.avg_processing_time_ms
         );
 
-        let notifications_stats = stats_collector.get_queue_statistics("notifications", std::time::Duration::from_secs(300)).await?;
+        let notifications_stats = stats_collector
+            .get_queue_statistics("notifications", std::time::Duration::from_secs(300))
+            .await?;
         info!("Notifications Queue Stats - Total: {}, Completed: {}, Timed Out: {}, Avg Processing Time: {:.2}ms",
             notifications_stats.total_processed,
             notifications_stats.completed,
@@ -147,14 +155,18 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("=== Dead Job Management ===");
         let dead_jobs = queue.get_dead_jobs(Some(10), None).await?;
         info!("Found {} dead jobs", dead_jobs.len());
-        
+
         for dead_job in &dead_jobs {
-            info!("Dead Job {} in queue '{}': {:?}", dead_job.id, dead_job.queue_name, dead_job.error_message);
+            info!(
+                "Dead Job {} in queue '{}': {:?}",
+                dead_job.id, dead_job.queue_name, dead_job.error_message
+            );
         }
 
         // Get dead job summary
         let dead_summary = queue.get_dead_job_summary().await?;
-        info!("Dead Job Summary - Total: {}, By Queue: {:?}, Error Patterns: {:?}",
+        info!(
+            "Dead Job Summary - Total: {}, By Queue: {:?}, Error Patterns: {:?}",
             dead_summary.total_dead_jobs,
             dead_summary.dead_jobs_by_queue,
             dead_summary.error_patterns
@@ -174,7 +186,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let all_queue_stats = queue.get_all_queue_stats().await?;
         info!("=== All Queue Statistics ===");
         for stats in &all_queue_stats {
-            info!("Queue '{}' - Pending: {}, Running: {}, Dead: {}, Timed Out: {}, Completed: {}",
+            info!(
+                "Queue '{}' - Pending: {}, Running: {}, Dead: {}, Timed Out: {}, Completed: {}",
                 stats.queue_name,
                 stats.pending_count,
                 stats.running_count,

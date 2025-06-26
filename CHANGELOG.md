@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2025-06-26
+
+### Added
+- **🎯 Comprehensive Job Prioritization System**
+  - Five priority levels: `Background`, `Low`, `Normal` (default), `High`, `Critical`
+  - Enhanced `Job` struct with priority field and builder methods: `as_critical()`, `as_high_priority()`, `as_low_priority()`, `as_background()`, `with_priority()`
+  - Utility methods: `is_critical()`, `is_high_priority()`, `is_normal_priority()`, `is_low_priority()`, `is_background()`, `priority_value()`
+  - String parsing support with multiple aliases (e.g., "crit", "c" for Critical)
+  - Integer conversion methods for database storage: `as_i32()`, `from_i32()`
+
+- **⚖️ Advanced Priority-Aware Job Scheduling**
+  - Weighted priority scheduling with configurable weights per priority level
+  - Strict priority scheduling (highest priority jobs always first)
+  - Fairness factor to prevent low-priority job starvation
+  - Hash-based job selection for Send compatibility in async contexts
+  - `PriorityWeights` configuration with builder pattern
+
+- **🗄️ Database Schema and Query Enhancements**
+  - Added `priority` column to both PostgreSQL and MySQL schemas with default value `2` (Normal)
+  - Optimized database indexes: `idx_hammerwork_jobs_queue_status_priority_scheduled` for efficient priority-based querying
+  - Priority-aware `dequeue()` and `dequeue_with_priority_weights()` methods
+  - Backward compatibility with existing job records (default to Normal priority)
+
+- **👷 Worker Priority Configuration**
+  - `with_priority_weights()` - Configure custom priority weights
+  - `with_strict_priority()` - Enable strict priority mode
+  - `with_weighted_priority()` - Enable weighted priority scheduling (default)
+  - Worker pools support mixed priority configurations across workers
+  - Integration with existing timeout and statistics systems
+
+- **📊 Priority Statistics and Monitoring**
+  - `PriorityStats` tracking job counts, processing times, and throughput per priority
+  - Priority distribution percentage calculations
+  - Starvation detection with configurable thresholds
+  - Integration with `InMemoryStatsCollector` and `JobEvent` system
+  - Most active priority identification and trend analysis
+
+- **🧪 Comprehensive Testing Suite**
+  - 12 new priority-specific unit tests covering all functionality
+  - Priority ordering, serialization, and string parsing tests
+  - Worker configuration and edge case testing
+  - Statistics integration and starvation detection tests
+  - Example demonstrating weighted scheduling, strict priority, and statistics
+
+### Enhanced
+- Updated package description to highlight job prioritization capabilities
+- Added `priority_example.rs` demonstrating all priority features
+- Enhanced statistics collection to track priority-specific metrics
+- Worker pools now support heterogeneous priority configurations
+
+### Fixed
+- All stats module tests now include required priority field
+- Applied clippy suggestions for cleaner derive macro usage
+- Consistent code formatting across all files
+
 ## [0.3.0] - 2025-06-26
 
 ### Added

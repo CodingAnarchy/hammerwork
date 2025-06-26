@@ -1,6 +1,6 @@
 use crate::{
     job::{Job, JobId},
-    stats::{QueueStats, DeadJobSummary},
+    stats::{DeadJobSummary, QueueStats},
     Result,
 };
 use async_trait::async_trait;
@@ -16,6 +16,11 @@ pub trait DatabaseQueue: Send + Sync {
     async fn create_tables(&self) -> Result<()>;
     async fn enqueue(&self, job: Job) -> Result<JobId>;
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>>;
+    async fn dequeue_with_priority_weights(
+        &self,
+        queue_name: &str,
+        weights: &crate::priority::PriorityWeights,
+    ) -> Result<Option<Job>>;
     async fn complete_job(&self, job_id: JobId) -> Result<()>;
     async fn fail_job(&self, job_id: JobId, error_message: &str) -> Result<()>;
     async fn retry_job(&self, job_id: JobId, retry_at: DateTime<Utc>) -> Result<()>;
@@ -25,57 +30,73 @@ pub trait DatabaseQueue: Send + Sync {
     // Dead job management
     /// Mark a job as dead (exhausted all retries)
     async fn mark_job_dead(&self, job_id: JobId, error_message: &str) -> Result<()>;
-    
+
     /// Mark a job as timed out
     async fn mark_job_timed_out(&self, job_id: JobId, error_message: &str) -> Result<()>;
-    
+
     /// Get all dead jobs with optional pagination
     async fn get_dead_jobs(&self, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>>;
-    
+
     /// Get dead jobs for a specific queue
-    async fn get_dead_jobs_by_queue(&self, queue_name: &str, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>>;
-    
+    async fn get_dead_jobs_by_queue(
+        &self,
+        queue_name: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<Job>>;
+
     /// Retry a dead job (reset its status and retry count)
     async fn retry_dead_job(&self, job_id: JobId) -> Result<()>;
-    
+
     /// Purge dead jobs older than the specified date
     async fn purge_dead_jobs(&self, older_than: DateTime<Utc>) -> Result<u64>;
-    
+
     /// Get a summary of dead jobs across the system
     async fn get_dead_job_summary(&self) -> Result<DeadJobSummary>;
 
     // Statistics and monitoring
     /// Get queue statistics including job counts and processing metrics
     async fn get_queue_stats(&self, queue_name: &str) -> Result<QueueStats>;
-    
+
     /// Get statistics for all queues
     async fn get_all_queue_stats(&self) -> Result<Vec<QueueStats>>;
-    
+
     /// Get job counts by status for a specific queue
-    async fn get_job_counts_by_status(&self, queue_name: &str) -> Result<std::collections::HashMap<String, u64>>;
-    
+    async fn get_job_counts_by_status(
+        &self,
+        queue_name: &str,
+    ) -> Result<std::collections::HashMap<String, u64>>;
+
     /// Get processing times for completed jobs in a time window
-    async fn get_processing_times(&self, queue_name: &str, since: DateTime<Utc>) -> Result<Vec<i64>>;
-    
+    async fn get_processing_times(
+        &self,
+        queue_name: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<i64>>;
+
     /// Get error frequencies for failed jobs
-    async fn get_error_frequencies(&self, queue_name: Option<&str>, since: DateTime<Utc>) -> Result<std::collections::HashMap<String, u64>>;
+    async fn get_error_frequencies(
+        &self,
+        queue_name: Option<&str>,
+        since: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<String, u64>>;
 
     // Cron job management
     /// Enqueue a cron job for recurring execution
     async fn enqueue_cron_job(&self, job: Job) -> Result<JobId>;
-    
+
     /// Get jobs that are ready to run based on their cron schedule
     async fn get_due_cron_jobs(&self, queue_name: Option<&str>) -> Result<Vec<Job>>;
-    
+
     /// Reschedule a completed cron job for its next execution
     async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()>;
-    
+
     /// Get all recurring jobs for a queue
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>>;
-    
+
     /// Disable a recurring job (stop future executions)
     async fn disable_recurring_job(&self, job_id: JobId) -> Result<()>;
-    
+
     /// Enable a previously disabled recurring job
     async fn enable_recurring_job(&self, job_id: JobId) -> Result<()>;
 }
@@ -99,7 +120,8 @@ impl<DB: Database> JobQueue<DB> {
 pub mod postgres {
     use super::*;
     use crate::job::JobStatus;
-    use sqlx::{Postgres, Row, FromRow};
+    use crate::priority::JobPriority;
+    use sqlx::{FromRow, Postgres, Row};
     use std::time::Duration;
 
     #[derive(FromRow)]
@@ -108,6 +130,7 @@ pub mod postgres {
         queue_name: String,
         payload: serde_json::Value,
         status: String,
+        priority: i32,
         attempts: i32,
         max_attempts: i32,
         timeout_seconds: Option<i32>,
@@ -131,6 +154,7 @@ pub mod postgres {
                 queue_name: self.queue_name,
                 payload: self.payload,
                 status: serde_json::from_str(&self.status)?,
+                priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
                 attempts: self.attempts,
                 max_attempts: self.max_attempts,
                 created_at: self.created_at,
@@ -139,7 +163,9 @@ pub mod postgres {
                 completed_at: self.completed_at,
                 failed_at: self.failed_at,
                 timed_out_at: self.timed_out_at,
-                timeout: self.timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                timeout: self
+                    .timeout_seconds
+                    .map(|s| std::time::Duration::from_secs(s as u64)),
                 error_message: self.error_message,
                 cron_schedule: self.cron_schedule,
                 next_run_at: self.next_run_at,
@@ -155,6 +181,7 @@ pub mod postgres {
         queue_name: String,
         payload: serde_json::Value,
         status: String,
+        priority: i32,
         attempts: i32,
         max_attempts: i32,
         timeout_seconds: Option<i32>,
@@ -174,6 +201,7 @@ pub mod postgres {
                 queue_name: self.queue_name,
                 payload: self.payload,
                 status: serde_json::from_str(&self.status).unwrap_or(JobStatus::Dead),
+                priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
                 attempts: self.attempts,
                 max_attempts: self.max_attempts,
                 created_at: self.created_at,
@@ -182,7 +210,9 @@ pub mod postgres {
                 completed_at: self.completed_at,
                 failed_at: self.failed_at,
                 timed_out_at: self.timed_out_at,
-                timeout: self.timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                timeout: self
+                    .timeout_seconds
+                    .map(|s| std::time::Duration::from_secs(s as u64)),
                 error_message: self.error_message,
                 cron_schedule: None,
                 next_run_at: None,
@@ -204,6 +234,7 @@ pub mod postgres {
                     queue_name VARCHAR NOT NULL,
                     payload JSONB NOT NULL,
                     status VARCHAR NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 2,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL DEFAULT 3,
                     timeout_seconds INTEGER,
@@ -220,8 +251,8 @@ pub mod postgres {
                     timezone VARCHAR(50)
                 );
                 
-                CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_queue_status_scheduled 
-                ON hammerwork_jobs (queue_name, status, scheduled_at);
+                CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_queue_status_priority_scheduled 
+                ON hammerwork_jobs (queue_name, status, priority DESC, scheduled_at);
                 
                 CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_status_failed_at
                 ON hammerwork_jobs (status, failed_at);
@@ -246,14 +277,15 @@ pub mod postgres {
             sqlx::query(
                 r#"
                 INSERT INTO hammerwork_jobs 
-                (id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                 "#
             )
             .bind(job.id)
             .bind(&job.queue_name)
             .bind(&job.payload)
             .bind(serde_json::to_string(&job.status)?)
+            .bind(job.priority.as_i32())
             .bind(job.attempts)
             .bind(job.max_attempts)
             .bind(job.timeout.map(|t| t.as_secs() as i32))
@@ -284,11 +316,11 @@ pub mod postgres {
                     WHERE queue_name = $3 
                     AND status = $4 
                     AND scheduled_at <= $2
-                    ORDER BY scheduled_at ASC 
+                    ORDER BY priority DESC, scheduled_at ASC 
                     LIMIT 1 
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
+                RETURNING id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
                 "#
             )
             .bind(serde_json::to_string(&JobStatus::Running)?)
@@ -303,6 +335,7 @@ pub mod postgres {
                 let queue_name: String = row.get("queue_name");
                 let payload: serde_json::Value = row.get("payload");
                 let status: String = row.get("status");
+                let priority: i32 = row.get("priority");
                 let attempts: i32 = row.get("attempts");
                 let max_attempts: i32 = row.get("max_attempts");
                 let timeout_seconds: Option<i32> = row.get("timeout_seconds");
@@ -323,6 +356,7 @@ pub mod postgres {
                     queue_name,
                     payload,
                     status: serde_json::from_str(&status)?,
+                    priority: JobPriority::from_i32(priority).unwrap_or(JobPriority::Normal),
                     attempts,
                     max_attempts,
                     created_at,
@@ -341,6 +375,144 @@ pub mod postgres {
             } else {
                 Ok(None)
             }
+        }
+
+        async fn dequeue_with_priority_weights(
+            &self,
+            queue_name: &str,
+            weights: &crate::priority::PriorityWeights,
+        ) -> Result<Option<Job>> {
+            use crate::priority::JobPriority;
+
+            if weights.is_strict() {
+                // Use strict priority - same as regular dequeue
+                return self.dequeue(queue_name).await;
+            }
+
+            // Get available jobs by priority
+            let available_jobs = sqlx::query(
+                r#"
+                SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
+                FROM hammerwork_jobs 
+                WHERE queue_name = $1 
+                AND status = $2 
+                AND scheduled_at <= $3
+                ORDER BY priority DESC, scheduled_at ASC 
+                LIMIT 20
+                FOR UPDATE SKIP LOCKED
+                "#
+            )
+            .bind(queue_name)
+            .bind(serde_json::to_string(&JobStatus::Pending)?)
+            .bind(Utc::now())
+            .fetch_all(&self.pool)
+            .await?;
+
+            if available_jobs.is_empty() {
+                return Ok(None);
+            }
+
+            // Group jobs by priority and apply weighted selection
+            let mut priority_jobs: std::collections::HashMap<JobPriority, Vec<_>> =
+                std::collections::HashMap::new();
+
+            for row in available_jobs {
+                let priority_val: i32 = row.get("priority");
+                let priority = JobPriority::from_i32(priority_val).unwrap_or(JobPriority::Normal);
+                priority_jobs.entry(priority).or_default().push(row);
+            }
+
+            // Calculate weighted selection
+            let mut weighted_choices = Vec::new();
+            for (priority, _jobs) in &priority_jobs {
+                let weight = weights.get_weight(*priority);
+                for _ in 0..weight {
+                    weighted_choices.push(priority);
+                }
+            }
+
+            if weighted_choices.is_empty() {
+                return Ok(None);
+            }
+
+            // Use a simple hash-based selection instead of thread_rng for Send compatibility
+            let selection_index = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                queue_name.hash(&mut hasher);
+                Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(0)
+                    .hash(&mut hasher);
+                (hasher.finish() as usize) % weighted_choices.len()
+            };
+            let selected_priority = weighted_choices[selection_index];
+
+            // Select the oldest job from the selected priority
+            if let Some(jobs) = priority_jobs.get(selected_priority) {
+                if let Some(selected_row) = jobs.first() {
+                    let job_id: uuid::Uuid = selected_row.get("id");
+
+                    // Update the selected job
+                    let updated_row = sqlx::query(
+                        "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 WHERE id = $3 RETURNING id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone"
+                    )
+                    .bind(serde_json::to_string(&JobStatus::Running)?)
+                    .bind(Utc::now())
+                    .bind(job_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+
+                    if let Some(row) = updated_row {
+                        let id: uuid::Uuid = row.get("id");
+                        let queue_name: String = row.get("queue_name");
+                        let payload: serde_json::Value = row.get("payload");
+                        let status: String = row.get("status");
+                        let priority: i32 = row.get("priority");
+                        let attempts: i32 = row.get("attempts");
+                        let max_attempts: i32 = row.get("max_attempts");
+                        let timeout_seconds: Option<i32> = row.get("timeout_seconds");
+                        let created_at: DateTime<Utc> = row.get("created_at");
+                        let scheduled_at: DateTime<Utc> = row.get("scheduled_at");
+                        let started_at: Option<DateTime<Utc>> = row.get("started_at");
+                        let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
+                        let failed_at: Option<DateTime<Utc>> = row.get("failed_at");
+                        let timed_out_at: Option<DateTime<Utc>> = row.get("timed_out_at");
+                        let error_message: Option<String> = row.get("error_message");
+                        let cron_schedule: Option<String> = row.get("cron_schedule");
+                        let next_run_at: Option<DateTime<Utc>> = row.get("next_run_at");
+                        let recurring: bool = row.get("recurring");
+                        let timezone: Option<String> = row.get("timezone");
+
+                        return Ok(Some(Job {
+                            id,
+                            queue_name,
+                            payload,
+                            status: serde_json::from_str(&status)?,
+                            priority: JobPriority::from_i32(priority)
+                                .unwrap_or(JobPriority::Normal),
+                            attempts,
+                            max_attempts,
+                            created_at,
+                            scheduled_at,
+                            started_at,
+                            completed_at,
+                            failed_at,
+                            timed_out_at,
+                            timeout: timeout_seconds
+                                .map(|s| std::time::Duration::from_secs(s as u64)),
+                            error_message,
+                            cron_schedule,
+                            next_run_at,
+                            recurring,
+                            timezone,
+                        }));
+                    }
+                }
+            }
+
+            Ok(None)
         }
 
         async fn complete_job(&self, job_id: JobId) -> Result<()> {
@@ -436,7 +608,7 @@ pub mod postgres {
         async fn get_dead_jobs(&self, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>> {
             let limit = limit.unwrap_or(100) as i64;
             let offset = offset.unwrap_or(0) as i64;
-            
+
             let rows = sqlx::query_as::<_, DeadJobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = $1 ORDER BY failed_at DESC LIMIT $2 OFFSET $3"
             )
@@ -449,10 +621,15 @@ pub mod postgres {
             Ok(rows.into_iter().map(|row| row.into_job()).collect())
         }
 
-        async fn get_dead_jobs_by_queue(&self, queue_name: &str, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>> {
+        async fn get_dead_jobs_by_queue(
+            &self,
+            queue_name: &str,
+            limit: Option<u32>,
+            offset: Option<u32>,
+        ) -> Result<Vec<Job>> {
             let limit = limit.unwrap_or(100) as i64;
             let offset = offset.unwrap_or(0) as i64;
-            
+
             let rows = sqlx::query_as::<_, DeadJobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = $1 AND queue_name = $2 ORDER BY failed_at DESC LIMIT $3 OFFSET $4"
             )
@@ -481,13 +658,12 @@ pub mod postgres {
         }
 
         async fn purge_dead_jobs(&self, older_than: DateTime<Utc>) -> Result<u64> {
-            let result = sqlx::query(
-                "DELETE FROM hammerwork_jobs WHERE status = $1 AND failed_at < $2"
-            )
-            .bind(serde_json::to_string(&JobStatus::Dead)?)
-            .bind(older_than)
-            .execute(&self.pool)
-            .await?;
+            let result =
+                sqlx::query("DELETE FROM hammerwork_jobs WHERE status = $1 AND failed_at < $2")
+                    .bind(serde_json::to_string(&JobStatus::Dead)?)
+                    .bind(older_than)
+                    .execute(&self.pool)
+                    .await?;
 
             Ok(result.rows_affected())
         }
@@ -496,12 +672,11 @@ pub mod postgres {
             use std::collections::HashMap;
 
             // Get total dead job count
-            let total_dead_jobs: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM hammerwork_jobs WHERE status = $1"
-            )
-            .bind(serde_json::to_string(&JobStatus::Dead)?)
-            .fetch_one(&self.pool)
-            .await?;
+            let total_dead_jobs: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM hammerwork_jobs WHERE status = $1")
+                    .bind(serde_json::to_string(&JobStatus::Dead)?)
+                    .fetch_one(&self.pool)
+                    .await?;
 
             // Get dead jobs by queue
             let dead_jobs_by_queue_rows: Vec<(String, i64)> = sqlx::query_as(
@@ -569,17 +744,35 @@ pub mod postgres {
                 counts.insert(status, count as u64);
             }
 
-            let pending_count = counts.get(&serde_json::to_string(&JobStatus::Pending).unwrap()).copied().unwrap_or(0);
-            let running_count = counts.get(&serde_json::to_string(&JobStatus::Running).unwrap()).copied().unwrap_or(0);
-            let dead_count = counts.get(&serde_json::to_string(&JobStatus::Dead).unwrap()).copied().unwrap_or(0);
-            let timed_out_count = counts.get(&serde_json::to_string(&JobStatus::TimedOut).unwrap()).copied().unwrap_or(0);
-            let completed_count = counts.get(&serde_json::to_string(&JobStatus::Completed).unwrap()).copied().unwrap_or(0);
+            let pending_count = counts
+                .get(&serde_json::to_string(&JobStatus::Pending).unwrap())
+                .copied()
+                .unwrap_or(0);
+            let running_count = counts
+                .get(&serde_json::to_string(&JobStatus::Running).unwrap())
+                .copied()
+                .unwrap_or(0);
+            let dead_count = counts
+                .get(&serde_json::to_string(&JobStatus::Dead).unwrap())
+                .copied()
+                .unwrap_or(0);
+            let timed_out_count = counts
+                .get(&serde_json::to_string(&JobStatus::TimedOut).unwrap())
+                .copied()
+                .unwrap_or(0);
+            let completed_count = counts
+                .get(&serde_json::to_string(&JobStatus::Completed).unwrap())
+                .copied()
+                .unwrap_or(0);
 
             // Basic statistics (more detailed stats would require the statistics collector)
             let statistics = JobStatistics {
                 total_processed: completed_count + dead_count,
                 completed: completed_count,
-                failed: counts.get(&serde_json::to_string(&JobStatus::Failed).unwrap()).copied().unwrap_or(0),
+                failed: counts
+                    .get(&serde_json::to_string(&JobStatus::Failed).unwrap())
+                    .copied()
+                    .unwrap_or(0),
                 dead: dead_count,
                 timed_out: timed_out_count,
                 running: running_count,
@@ -601,11 +794,10 @@ pub mod postgres {
 
         async fn get_all_queue_stats(&self) -> Result<Vec<QueueStats>> {
             // Get all unique queue names
-            let queue_names: Vec<(String,)> = sqlx::query_as(
-                "SELECT DISTINCT queue_name FROM hammerwork_jobs"
-            )
-            .fetch_all(&self.pool)
-            .await?;
+            let queue_names: Vec<(String,)> =
+                sqlx::query_as("SELECT DISTINCT queue_name FROM hammerwork_jobs")
+                    .fetch_all(&self.pool)
+                    .await?;
 
             let mut results = Vec::new();
             for (queue_name,) in queue_names {
@@ -616,7 +808,10 @@ pub mod postgres {
             Ok(results)
         }
 
-        async fn get_job_counts_by_status(&self, queue_name: &str) -> Result<std::collections::HashMap<String, u64>> {
+        async fn get_job_counts_by_status(
+            &self,
+            queue_name: &str,
+        ) -> Result<std::collections::HashMap<String, u64>> {
             let status_counts: Vec<(String, i64)> = sqlx::query_as(
                 "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 GROUP BY status"
             )
@@ -630,7 +825,11 @@ pub mod postgres {
                 .collect())
         }
 
-        async fn get_processing_times(&self, queue_name: &str, since: DateTime<Utc>) -> Result<Vec<i64>> {
+        async fn get_processing_times(
+            &self,
+            queue_name: &str,
+            since: DateTime<Utc>,
+        ) -> Result<Vec<i64>> {
             let times: Vec<(Option<i64>,)> = sqlx::query_as(
                 r#"
                 SELECT EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000 as processing_time_ms
@@ -641,7 +840,7 @@ pub mod postgres {
                 AND completed_at >= $2
                 ORDER BY completed_at DESC
                 LIMIT 1000
-                "#
+                "#,
             )
             .bind(queue_name)
             .bind(since)
@@ -651,7 +850,11 @@ pub mod postgres {
             Ok(times.into_iter().filter_map(|(time,)| time).collect())
         }
 
-        async fn get_error_frequencies(&self, queue_name: Option<&str>, since: DateTime<Utc>) -> Result<std::collections::HashMap<String, u64>> {
+        async fn get_error_frequencies(
+            &self,
+            queue_name: Option<&str>,
+            since: DateTime<Utc>,
+        ) -> Result<std::collections::HashMap<String, u64>> {
             let query = if queue_name.is_some() {
                 "SELECT error_message, COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 AND error_message IS NOT NULL AND failed_at >= $2 GROUP BY error_message ORDER BY COUNT(*) DESC LIMIT 50"
             } else {
@@ -724,7 +927,11 @@ pub mod postgres {
             rows.into_iter().map(|row| row.into_job()).collect()
         }
 
-        async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()> {
+        async fn reschedule_cron_job(
+            &self,
+            job_id: JobId,
+            next_run_at: DateTime<Utc>,
+        ) -> Result<()> {
             sqlx::query(
                 r#"
                 UPDATE hammerwork_jobs 
@@ -738,7 +945,7 @@ pub mod postgres {
                     timed_out_at = NULL,
                     error_message = NULL
                 WHERE id = $3 AND recurring = TRUE
-                "#
+                "#,
             )
             .bind(serde_json::to_string(&JobStatus::Pending)?)
             .bind(next_run_at)
@@ -784,7 +991,8 @@ pub mod postgres {
 pub mod mysql {
     use super::*;
     use crate::job::JobStatus;
-    use sqlx::{MySql, FromRow};
+    use crate::priority::JobPriority;
+    use sqlx::{FromRow, MySql};
     use std::time::Duration;
 
     #[derive(FromRow)]
@@ -793,6 +1001,7 @@ pub mod mysql {
         queue_name: String,
         payload: serde_json::Value,
         status: String,
+        priority: i32,
         attempts: i32,
         max_attempts: i32,
         timeout_seconds: Option<i32>,
@@ -816,6 +1025,7 @@ pub mod mysql {
                 queue_name: self.queue_name,
                 payload: self.payload,
                 status: serde_json::from_str(&self.status)?,
+                priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
                 attempts: self.attempts,
                 max_attempts: self.max_attempts,
                 created_at: self.created_at,
@@ -824,7 +1034,9 @@ pub mod mysql {
                 completed_at: self.completed_at,
                 failed_at: self.failed_at,
                 timed_out_at: self.timed_out_at,
-                timeout: self.timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                timeout: self
+                    .timeout_seconds
+                    .map(|s| std::time::Duration::from_secs(s as u64)),
                 error_message: self.error_message,
                 cron_schedule: self.cron_schedule,
                 next_run_at: self.next_run_at,
@@ -840,6 +1052,7 @@ pub mod mysql {
         queue_name: String,
         payload: serde_json::Value,
         status: String,
+        priority: i32,
         attempts: i32,
         max_attempts: i32,
         timeout_seconds: Option<i32>,
@@ -859,6 +1072,7 @@ pub mod mysql {
                 queue_name: self.queue_name,
                 payload: self.payload,
                 status: serde_json::from_str(&self.status).unwrap_or(JobStatus::Dead),
+                priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
                 attempts: self.attempts,
                 max_attempts: self.max_attempts,
                 created_at: self.created_at,
@@ -867,7 +1081,9 @@ pub mod mysql {
                 completed_at: self.completed_at,
                 failed_at: self.failed_at,
                 timed_out_at: self.timed_out_at,
-                timeout: self.timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                timeout: self
+                    .timeout_seconds
+                    .map(|s| std::time::Duration::from_secs(s as u64)),
                 error_message: self.error_message,
                 cron_schedule: None,
                 next_run_at: None,
@@ -889,6 +1105,7 @@ pub mod mysql {
                     queue_name VARCHAR(255) NOT NULL,
                     payload JSON NOT NULL,
                     status VARCHAR(50) NOT NULL,
+                    priority INT NOT NULL DEFAULT 2,
                     attempts INT NOT NULL DEFAULT 0,
                     max_attempts INT NOT NULL DEFAULT 3,
                     timeout_seconds INT NULL,
@@ -903,7 +1120,7 @@ pub mod mysql {
                     next_run_at TIMESTAMP(6) NULL,
                     recurring BOOLEAN NOT NULL DEFAULT FALSE,
                     timezone VARCHAR(50) NULL,
-                    INDEX idx_queue_status_scheduled (queue_name, status, scheduled_at),
+                    INDEX idx_queue_status_priority_scheduled (queue_name, status, priority DESC, scheduled_at),
                     INDEX idx_status_failed_at (status, failed_at),
                     INDEX idx_queue_status (queue_name, status),
                     INDEX idx_recurring_next_run (recurring, next_run_at),
@@ -921,14 +1138,15 @@ pub mod mysql {
             sqlx::query(
                 r#"
                 INSERT INTO hammerwork_jobs 
-                (id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#
             )
             .bind(job.id.to_string())
             .bind(&job.queue_name)
             .bind(&job.payload)
             .bind(serde_json::to_string(&job.status)?)
+            .bind(job.priority.as_i32())
             .bind(job.attempts)
             .bind(job.max_attempts)
             .bind(job.timeout.map(|t| t.as_secs() as i32))
@@ -956,12 +1174,12 @@ pub mod mysql {
 
             let row = sqlx::query_as::<_, JobRow>(
                 r#"
-                SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
+                SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
                 FROM hammerwork_jobs 
                 WHERE queue_name = ? 
                 AND status = ? 
                 AND scheduled_at <= ?
-                ORDER BY scheduled_at ASC 
+                ORDER BY priority DESC, scheduled_at ASC 
                 LIMIT 1
                 FOR UPDATE
                 "#
@@ -996,6 +1214,110 @@ pub mod mysql {
                 tx.rollback().await?;
                 Ok(None)
             }
+        }
+
+        async fn dequeue_with_priority_weights(
+            &self,
+            queue_name: &str,
+            weights: &crate::priority::PriorityWeights,
+        ) -> Result<Option<Job>> {
+            use crate::priority::JobPriority;
+
+            if weights.is_strict() {
+                // Use strict priority - same as regular dequeue
+                return self.dequeue(queue_name).await;
+            }
+
+            let mut tx = self.pool.begin().await?;
+
+            // Get available jobs by priority
+            let available_jobs = sqlx::query_as::<_, JobRow>(
+                r#"
+                SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
+                FROM hammerwork_jobs 
+                WHERE queue_name = ? 
+                AND status = ? 
+                AND scheduled_at <= ?
+                ORDER BY priority DESC, scheduled_at ASC 
+                LIMIT 20
+                FOR UPDATE
+                "#
+            )
+            .bind(queue_name)
+            .bind(serde_json::to_string(&JobStatus::Pending)?)
+            .bind(Utc::now())
+            .fetch_all(&mut *tx)
+            .await?;
+
+            if available_jobs.is_empty() {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+
+            // Group jobs by priority and apply weighted selection
+            let mut priority_jobs: std::collections::HashMap<JobPriority, Vec<_>> =
+                std::collections::HashMap::new();
+
+            for job_row in available_jobs {
+                let priority =
+                    JobPriority::from_i32(job_row.priority).unwrap_or(JobPriority::Normal);
+                priority_jobs.entry(priority).or_default().push(job_row);
+            }
+
+            // Calculate weighted selection
+            let mut weighted_choices = Vec::new();
+            for (priority, jobs) in &priority_jobs {
+                let weight = weights.get_weight(*priority);
+                for _ in 0..weight {
+                    weighted_choices.push(priority);
+                }
+            }
+
+            if weighted_choices.is_empty() {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+
+            // Use a simple hash-based selection instead of thread_rng for Send compatibility
+            let selection_index = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                queue_name.hash(&mut hasher);
+                chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(0)
+                    .hash(&mut hasher);
+                (hasher.finish() as usize) % weighted_choices.len()
+            };
+            let selected_priority = weighted_choices[selection_index];
+
+            // Select the oldest job from the selected priority
+            if let Some(jobs) = priority_jobs.get(selected_priority) {
+                if let Some(selected_job) = jobs.first() {
+                    // Update the selected job
+                    sqlx::query(
+                        "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1 WHERE id = ?"
+                    )
+                    .bind(serde_json::to_string(&JobStatus::Running)?)
+                    .bind(Utc::now())
+                    .bind(&selected_job.id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    tx.commit().await?;
+
+                    let mut job = selected_job.clone().into_job()?;
+                    job.status = JobStatus::Running;
+                    job.attempts += 1;
+                    job.started_at = Some(Utc::now());
+
+                    return Ok(Some(job));
+                }
+            }
+
+            tx.rollback().await?;
+            Ok(None)
         }
 
         async fn complete_job(&self, job_id: JobId) -> Result<()> {
@@ -1091,7 +1413,7 @@ pub mod mysql {
         async fn get_dead_jobs(&self, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>> {
             let limit = limit.unwrap_or(100) as i64;
             let offset = offset.unwrap_or(0) as i64;
-            
+
             let rows = sqlx::query_as::<_, DeadJobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
             )
@@ -1104,10 +1426,15 @@ pub mod mysql {
             rows.into_iter().map(|row| row.into_job()).collect()
         }
 
-        async fn get_dead_jobs_by_queue(&self, queue_name: &str, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>> {
+        async fn get_dead_jobs_by_queue(
+            &self,
+            queue_name: &str,
+            limit: Option<u32>,
+            offset: Option<u32>,
+        ) -> Result<Vec<Job>> {
             let limit = limit.unwrap_or(100) as i64;
             let offset = offset.unwrap_or(0) as i64;
-            
+
             let rows = sqlx::query_as::<_, DeadJobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = ? AND queue_name = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
             )
@@ -1136,13 +1463,12 @@ pub mod mysql {
         }
 
         async fn purge_dead_jobs(&self, older_than: DateTime<Utc>) -> Result<u64> {
-            let result = sqlx::query(
-                "DELETE FROM hammerwork_jobs WHERE status = ? AND failed_at < ?"
-            )
-            .bind(serde_json::to_string(&JobStatus::Dead)?)
-            .bind(older_than)
-            .execute(&self.pool)
-            .await?;
+            let result =
+                sqlx::query("DELETE FROM hammerwork_jobs WHERE status = ? AND failed_at < ?")
+                    .bind(serde_json::to_string(&JobStatus::Dead)?)
+                    .bind(older_than)
+                    .execute(&self.pool)
+                    .await?;
 
             Ok(result.rows_affected())
         }
@@ -1151,12 +1477,11 @@ pub mod mysql {
             use std::collections::HashMap;
 
             // Get total dead job count
-            let total_dead_jobs: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM hammerwork_jobs WHERE status = ?"
-            )
-            .bind(serde_json::to_string(&JobStatus::Dead)?)
-            .fetch_one(&self.pool)
-            .await?;
+            let total_dead_jobs: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM hammerwork_jobs WHERE status = ?")
+                    .bind(serde_json::to_string(&JobStatus::Dead)?)
+                    .fetch_one(&self.pool)
+                    .await?;
 
             // Get dead jobs by queue
             let dead_jobs_by_queue_rows: Vec<(String, i64)> = sqlx::query_as(
@@ -1213,7 +1538,7 @@ pub mod mysql {
 
             // Get job counts by status
             let status_counts: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? GROUP BY status"
+                "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? GROUP BY status",
             )
             .bind(queue_name)
             .fetch_all(&self.pool)
@@ -1224,17 +1549,35 @@ pub mod mysql {
                 counts.insert(status, count as u64);
             }
 
-            let pending_count = counts.get(&serde_json::to_string(&JobStatus::Pending).unwrap()).copied().unwrap_or(0);
-            let running_count = counts.get(&serde_json::to_string(&JobStatus::Running).unwrap()).copied().unwrap_or(0);
-            let dead_count = counts.get(&serde_json::to_string(&JobStatus::Dead).unwrap()).copied().unwrap_or(0);
-            let timed_out_count = counts.get(&serde_json::to_string(&JobStatus::TimedOut).unwrap()).copied().unwrap_or(0);
-            let completed_count = counts.get(&serde_json::to_string(&JobStatus::Completed).unwrap()).copied().unwrap_or(0);
+            let pending_count = counts
+                .get(&serde_json::to_string(&JobStatus::Pending).unwrap())
+                .copied()
+                .unwrap_or(0);
+            let running_count = counts
+                .get(&serde_json::to_string(&JobStatus::Running).unwrap())
+                .copied()
+                .unwrap_or(0);
+            let dead_count = counts
+                .get(&serde_json::to_string(&JobStatus::Dead).unwrap())
+                .copied()
+                .unwrap_or(0);
+            let timed_out_count = counts
+                .get(&serde_json::to_string(&JobStatus::TimedOut).unwrap())
+                .copied()
+                .unwrap_or(0);
+            let completed_count = counts
+                .get(&serde_json::to_string(&JobStatus::Completed).unwrap())
+                .copied()
+                .unwrap_or(0);
 
             // Basic statistics (more detailed stats would require the statistics collector)
             let statistics = JobStatistics {
                 total_processed: completed_count + dead_count,
                 completed: completed_count,
-                failed: counts.get(&serde_json::to_string(&JobStatus::Failed).unwrap()).copied().unwrap_or(0),
+                failed: counts
+                    .get(&serde_json::to_string(&JobStatus::Failed).unwrap())
+                    .copied()
+                    .unwrap_or(0),
                 dead: dead_count,
                 timed_out: timed_out_count,
                 running: running_count,
@@ -1256,11 +1599,10 @@ pub mod mysql {
 
         async fn get_all_queue_stats(&self) -> Result<Vec<QueueStats>> {
             // Get all unique queue names
-            let queue_names: Vec<(String,)> = sqlx::query_as(
-                "SELECT DISTINCT queue_name FROM hammerwork_jobs"
-            )
-            .fetch_all(&self.pool)
-            .await?;
+            let queue_names: Vec<(String,)> =
+                sqlx::query_as("SELECT DISTINCT queue_name FROM hammerwork_jobs")
+                    .fetch_all(&self.pool)
+                    .await?;
 
             let mut results = Vec::new();
             for (queue_name,) in queue_names {
@@ -1271,9 +1613,12 @@ pub mod mysql {
             Ok(results)
         }
 
-        async fn get_job_counts_by_status(&self, queue_name: &str) -> Result<std::collections::HashMap<String, u64>> {
+        async fn get_job_counts_by_status(
+            &self,
+            queue_name: &str,
+        ) -> Result<std::collections::HashMap<String, u64>> {
             let status_counts: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? GROUP BY status"
+                "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? GROUP BY status",
             )
             .bind(queue_name)
             .fetch_all(&self.pool)
@@ -1285,7 +1630,11 @@ pub mod mysql {
                 .collect())
         }
 
-        async fn get_processing_times(&self, queue_name: &str, since: DateTime<Utc>) -> Result<Vec<i64>> {
+        async fn get_processing_times(
+            &self,
+            queue_name: &str,
+            since: DateTime<Utc>,
+        ) -> Result<Vec<i64>> {
             let times: Vec<(Option<i64>,)> = sqlx::query_as(
                 r#"
                 SELECT TIMESTAMPDIFF(MICROSECOND, started_at, completed_at) / 1000 as processing_time_ms
@@ -1306,7 +1655,11 @@ pub mod mysql {
             Ok(times.into_iter().filter_map(|(time,)| time).collect())
         }
 
-        async fn get_error_frequencies(&self, queue_name: Option<&str>, since: DateTime<Utc>) -> Result<std::collections::HashMap<String, u64>> {
+        async fn get_error_frequencies(
+            &self,
+            queue_name: Option<&str>,
+            since: DateTime<Utc>,
+        ) -> Result<std::collections::HashMap<String, u64>> {
             let query = if queue_name.is_some() {
                 "SELECT error_message, COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? AND error_message IS NOT NULL AND failed_at >= ? GROUP BY error_message ORDER BY COUNT(*) DESC LIMIT 50"
             } else {
@@ -1379,7 +1732,11 @@ pub mod mysql {
             rows.into_iter().map(|row| row.into_job()).collect()
         }
 
-        async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()> {
+        async fn reschedule_cron_job(
+            &self,
+            job_id: JobId,
+            next_run_at: DateTime<Utc>,
+        ) -> Result<()> {
             sqlx::query(
                 r#"
                 UPDATE hammerwork_jobs 
@@ -1393,7 +1750,7 @@ pub mod mysql {
                     timed_out_at = NULL,
                     error_message = NULL
                 WHERE id = ? AND recurring = TRUE
-                "#
+                "#,
             )
             .bind(serde_json::to_string(&JobStatus::Pending)?)
             .bind(next_run_at)
@@ -1463,17 +1820,17 @@ mod tests {
         use crate::job::{Job, JobId};
         use serde_json::json;
         use std::time::Duration;
-        
+
         // Test that timeout-related methods are part of the DatabaseQueue trait
         // This is a compilation test to ensure the trait includes timeout methods
-        
+
         // Create a job with timeout for testing
         let job = Job::new("timeout_test".to_string(), json!({"data": "test"}))
             .with_timeout(Duration::from_secs(30));
-        
+
         assert_eq!(job.timeout, Some(Duration::from_secs(30)));
         assert_eq!(job.timed_out_at, None);
-        
+
         // Test JobId type alias works with timeout methods
         let job_id: JobId = job.id;
         assert_eq!(job_id, job.id);
@@ -1483,26 +1840,26 @@ mod tests {
     fn test_timeout_database_schema_compatibility() {
         // Test that the database schema includes timeout-related columns
         // This verifies our schema design is consistent
-        
+
         use crate::job::{Job, JobStatus};
         use serde_json::json;
         use std::time::Duration;
-        
+
         // Create job with all timeout fields
         let mut job = Job::new("schema_test".to_string(), json!({"test": "data"}))
             .with_timeout(Duration::from_secs(120));
-        
+
         // Simulate timeout scenario
         job.status = JobStatus::TimedOut;
         job.timed_out_at = Some(chrono::Utc::now());
         job.error_message = Some("Timeout test".to_string());
-        
+
         // Verify all timeout-related fields are present
         assert!(job.timeout.is_some());
         assert!(job.timed_out_at.is_some());
         assert_eq!(job.status, JobStatus::TimedOut);
         assert!(job.error_message.is_some());
-        
+
         // Test timeout duration conversion to seconds (for database storage)
         let timeout_seconds = job.timeout.unwrap().as_secs() as i32;
         assert_eq!(timeout_seconds, 120);
@@ -1512,7 +1869,7 @@ mod tests {
     fn test_job_timeout_status_consistency() {
         use crate::job::{Job, JobStatus};
         use serde_json::json;
-        
+
         // Test that TimedOut status is distinct from other statuses
         let statuses = vec![
             JobStatus::Pending,
@@ -1523,17 +1880,17 @@ mod tests {
             JobStatus::TimedOut,
             JobStatus::Retrying,
         ];
-        
+
         // Verify TimedOut is included in all statuses
         assert!(statuses.contains(&JobStatus::TimedOut));
-        
+
         // Test status transitions for timeout scenarios
         let mut job = Job::new("status_test".to_string(), json!({"data": "test"}));
-        
+
         assert_eq!(job.status, JobStatus::Pending);
         assert!(!job.is_timed_out());
         assert!(!job.is_dead());
-        
+
         job.status = JobStatus::TimedOut;
         assert!(job.is_timed_out());
         assert!(!job.is_dead()); // TimedOut ≠ Dead
@@ -1543,29 +1900,29 @@ mod tests {
     fn test_timeout_database_operations_interface() {
         // Test that the DatabaseQueue trait includes all necessary timeout operations
         // This is a compilation test to verify method signatures
-        
+
         // Test that mark_job_timed_out method exists in the trait
         // This ensures our timeout functionality is properly integrated
         use crate::job::{Job, JobStatus};
         use serde_json::json;
         use std::time::Duration;
-        
+
         // Test job creation with timeout functionality
         let job = Job::new("trait_test".to_string(), json!({"data": "test"}))
             .with_timeout(Duration::from_secs(30));
-        
+
         assert!(job.timeout.is_some());
         assert_eq!(job.status, JobStatus::Pending);
-        
+
         // Test that TimedOut status is available
         let timed_out_status = JobStatus::TimedOut;
         assert_eq!(format!("{:?}", timed_out_status), "TimedOut");
-        
+
         // Test timeout-related job methods
         let mut test_job = job;
         test_job.status = JobStatus::TimedOut;
         test_job.timed_out_at = Some(chrono::Utc::now());
-        
+
         assert!(test_job.is_timed_out());
         assert!(!test_job.is_dead()); // TimedOut ≠ Dead
     }

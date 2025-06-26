@@ -36,8 +36,9 @@ impl CronSchedule {
     pub fn with_timezone(expression: &str, timezone: &str) -> Result<Self, CronError> {
         let schedule = Schedule::from_str(expression)
             .map_err(|e| CronError::InvalidExpression(format!("{}: {}", expression, e)))?;
-        
-        let tz = timezone.parse::<Tz>()
+
+        let tz = timezone
+            .parse::<Tz>()
             .map_err(|_| CronError::InvalidTimezone(timezone.to_string()))?;
 
         Ok(CronSchedule {
@@ -52,13 +53,13 @@ impl CronSchedule {
     pub fn next_execution(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let schedule = self.schedule.as_ref()?;
         let tz = self.tz.as_ref()?;
-        
+
         // Convert UTC to the cron's timezone
         let after_tz = after.with_timezone(tz);
-        
+
         // Get the next execution in the cron's timezone
         let next_tz = schedule.after(&after_tz).next()?;
-        
+
         // Convert back to UTC
         Some(next_tz.with_timezone(&Utc))
     }
@@ -74,15 +75,15 @@ impl CronSchedule {
             Some(s) => s,
             None => return false,
         };
-        
+
         let tz = match self.tz.as_ref() {
             Some(t) => t,
             None => return false,
         };
-        
+
         // Convert to cron's timezone
         let datetime_tz = datetime.with_timezone(tz);
-        
+
         // Check if this time matches the cron schedule
         // We get the next execution from a minute before to see if it matches our time
         let check_time = datetime_tz - chrono::Duration::minutes(1);
@@ -126,12 +127,17 @@ impl CronSchedule {
 
     /// Reinitialize the schedule and timezone after deserialization
     pub fn reinitialize(&mut self) -> Result<(), CronError> {
-        self.schedule = Some(Schedule::from_str(&self.expression)
-            .map_err(|e| CronError::InvalidExpression(format!("{}: {}", self.expression, e)))?);
-        
-        self.tz = Some(self.timezone.parse::<Tz>()
-            .map_err(|_| CronError::InvalidTimezone(self.timezone.clone()))?);
-        
+        self.schedule =
+            Some(Schedule::from_str(&self.expression).map_err(|e| {
+                CronError::InvalidExpression(format!("{}: {}", self.expression, e))
+            })?);
+
+        self.tz = Some(
+            self.timezone
+                .parse::<Tz>()
+                .map_err(|_| CronError::InvalidTimezone(self.timezone.clone()))?,
+        );
+
         Ok(())
     }
 }
@@ -172,7 +178,7 @@ pub mod presets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Datelike, Timelike};
+    use chrono::{Datelike, TimeZone, Timelike};
 
     #[test]
     fn test_cron_schedule_creation() {
@@ -205,7 +211,7 @@ mod tests {
         let schedule = CronSchedule::new("0 0 9 * * *").unwrap(); // Every day at 9 AM
         let now = Utc.with_ymd_and_hms(2023, 1, 1, 8, 0, 0).unwrap();
         let next = schedule.next_execution(now).unwrap();
-        
+
         // Should be 9 AM on the same day
         assert_eq!(next.hour(), 9);
         assert_eq!(next.minute(), 0);
@@ -251,10 +257,10 @@ mod tests {
         let schedule = CronSchedule::with_timezone("0 0 9 * * 1-5", "America/New_York").unwrap();
         let json = serde_json::to_string(&schedule).unwrap();
         let mut deserialized: CronSchedule = serde_json::from_str(&json).unwrap();
-        
+
         // Need to reinitialize after deserialization
         deserialized.reinitialize().unwrap();
-        
+
         assert_eq!(deserialized.expression, schedule.expression);
         assert_eq!(deserialized.timezone, schedule.timezone);
     }

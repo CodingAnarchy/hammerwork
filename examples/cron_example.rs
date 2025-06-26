@@ -1,5 +1,5 @@
 use hammerwork::{
-    cron::{CronSchedule, presets},
+    cron::{presets, CronSchedule},
     job::Job,
     queue::JobQueue,
     stats::{InMemoryStatsCollector, StatisticsCollector},
@@ -30,12 +30,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create statistics collector for monitoring job processing
-    let stats_collector = Arc::new(InMemoryStatsCollector::new_default()) as Arc<dyn StatisticsCollector>;
+    let stats_collector =
+        Arc::new(InMemoryStatsCollector::new_default()) as Arc<dyn StatisticsCollector>;
 
     // Create a job handler for report generation
     let report_handler = Arc::new(|job: Job| {
         Box::pin(async move {
-            info!("Generating report: {} with payload: {}", job.id, job.payload);
+            info!(
+                "Generating report: {} with payload: {}",
+                job.id, job.payload
+            );
 
             // Simulate report generation work
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -57,7 +61,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create a job handler for cleanup tasks
     let cleanup_handler = Arc::new(|job: Job| {
         Box::pin(async move {
-            info!("Running cleanup task: {} with payload: {}", job.id, job.payload);
+            info!(
+                "Running cleanup task: {} with payload: {}",
+                job.id, job.payload
+            );
 
             // Simulate cleanup work
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -89,8 +96,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_default_timeout(tokio::time::Duration::from_secs(30))
         .with_stats_collector(Arc::clone(&stats_collector));
 
-    let mut worker_pool = WorkerPool::new()
-        .with_stats_collector(Arc::clone(&stats_collector));
+    let mut worker_pool = WorkerPool::new().with_stats_collector(Arc::clone(&stats_collector));
     worker_pool.add_worker(report_worker);
     worker_pool.add_worker(cleanup_worker);
 
@@ -109,7 +115,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "report_type": "daily",
                 "description": "Daily sales report"
             }),
-            daily_report_schedule
+            daily_report_schedule,
         )?;
         let daily_job_id = queue.enqueue_cron_job(daily_report_job).await?;
         info!("Enqueued daily report job: {}", daily_job_id);
@@ -122,7 +128,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "report_type": "weekly",
                 "description": "Weekly analytics report"
             }),
-            weekly_report_schedule
+            weekly_report_schedule,
         )?;
         let weekly_job_id = queue.enqueue_cron_job(weekly_report_job).await?;
         info!("Enqueued weekly report job: {}", weekly_job_id);
@@ -135,7 +141,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "report_type": "monthly",
                 "description": "Monthly summary report"
             }),
-            monthly_report_schedule
+            monthly_report_schedule,
         )?;
         let monthly_job_id = queue.enqueue_cron_job(monthly_report_job).await?;
         info!("Enqueued monthly report job: {}", monthly_job_id);
@@ -148,7 +154,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "cleanup_type": "temp_files",
                 "description": "Clean up temporary files"
             }),
-            cleanup_schedule
+            cleanup_schedule,
         )?;
         let cleanup_job_id = queue.enqueue_cron_job(cleanup_job).await?;
         info!("Enqueued cleanup job: {}", cleanup_job_id);
@@ -159,8 +165,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             json!({
                 "cleanup_type": "logs",
                 "description": "Rotate log files"
-            })
-        ).with_cron(presets::every_hour())?;
+            }),
+        )
+        .with_cron(presets::every_hour())?;
         let log_job_id = queue.enqueue_cron_job(log_rotation_job).await?;
         info!("Enqueued log rotation job: {}", log_job_id);
 
@@ -173,7 +180,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "description": "Clear expired cache entries",
                 "timezone": "America/New_York"
             }),
-            ny_cleanup_schedule
+            ny_cleanup_schedule,
         )?;
         let cache_job_id = queue.enqueue_cron_job(cache_cleanup_job).await?;
         info!("Enqueued cache cleanup job (NY timezone): {}", cache_job_id);
@@ -186,7 +193,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "report_type": "demo",
                 "description": "Demo job that runs every minute"
             }),
-            demo_schedule
+            demo_schedule,
         )?;
         let demo_job_id = queue.enqueue_cron_job(demo_job).await?;
         info!("Enqueued demo job (every minute): {}", demo_job_id);
@@ -195,20 +202,28 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("=== Recurring Jobs ===");
         let recurring_reports = queue.get_recurring_jobs("reports").await?;
         let recurring_cleanup = queue.get_recurring_jobs("cleanup").await?;
-        
-        info!("Report queue has {} recurring jobs:", recurring_reports.len());
+
+        info!(
+            "Report queue has {} recurring jobs:",
+            recurring_reports.len()
+        );
         for job in &recurring_reports {
-            info!("  Job {}: {} (next run: {:?})", 
-                job.id, 
+            info!(
+                "  Job {}: {} (next run: {:?})",
+                job.id,
                 job.payload.get("description").unwrap_or(&json!("Unknown")),
                 job.next_run_at
             );
         }
 
-        info!("Cleanup queue has {} recurring jobs:", recurring_cleanup.len());
+        info!(
+            "Cleanup queue has {} recurring jobs:",
+            recurring_cleanup.len()
+        );
         for job in &recurring_cleanup {
-            info!("  Job {}: {} (next run: {:?})", 
-                job.id, 
+            info!(
+                "  Job {}: {} (next run: {:?})",
+                job.id,
                 job.payload.get("description").unwrap_or(&json!("Unknown")),
                 job.next_run_at
             );
@@ -219,8 +234,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let due_jobs = queue.get_due_cron_jobs(None).await?;
         info!("Found {} jobs due for execution", due_jobs.len());
         for job in &due_jobs {
-            info!("  Due job {}: {} (scheduled: {})", 
-                job.id, 
+            info!(
+                "  Due job {}: {} (scheduled: {})",
+                job.id,
                 job.payload.get("description").unwrap_or(&json!("Unknown")),
                 job.scheduled_at
             );
@@ -229,7 +245,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Let the workers process jobs for a bit
         info!("=== Processing Jobs ===");
         info!("Starting workers to process jobs...");
-        
+
         // Start workers in background
         let worker_handle = tokio::spawn(async move {
             // Run for 2 minutes to see some jobs execute
@@ -242,23 +258,32 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         // Show statistics
         info!("=== Job Processing Statistics ===");
-        let system_stats = stats_collector.get_system_statistics(std::time::Duration::from_secs(300)).await?;
-        info!("System Stats - Total: {}, Completed: {}, Failed: {}, Error Rate: {:.2}%",
+        let system_stats = stats_collector
+            .get_system_statistics(std::time::Duration::from_secs(300))
+            .await?;
+        info!(
+            "System Stats - Total: {}, Completed: {}, Failed: {}, Error Rate: {:.2}%",
             system_stats.total_processed,
             system_stats.completed,
             system_stats.failed,
             system_stats.error_rate * 100.0
         );
 
-        let report_stats = stats_collector.get_queue_statistics("reports", std::time::Duration::from_secs(300)).await?;
-        info!("Reports Queue - Total: {}, Completed: {}, Avg Processing Time: {:.2}ms",
+        let report_stats = stats_collector
+            .get_queue_statistics("reports", std::time::Duration::from_secs(300))
+            .await?;
+        info!(
+            "Reports Queue - Total: {}, Completed: {}, Avg Processing Time: {:.2}ms",
             report_stats.total_processed,
             report_stats.completed,
             report_stats.avg_processing_time_ms
         );
 
-        let cleanup_stats = stats_collector.get_queue_statistics("cleanup", std::time::Duration::from_secs(300)).await?;
-        info!("Cleanup Queue - Total: {}, Completed: {}, Avg Processing Time: {:.2}ms",
+        let cleanup_stats = stats_collector
+            .get_queue_statistics("cleanup", std::time::Duration::from_secs(300))
+            .await?;
+        info!(
+            "Cleanup Queue - Total: {}, Completed: {}, Avg Processing Time: {:.2}ms",
             cleanup_stats.total_processed,
             cleanup_stats.completed,
             cleanup_stats.avg_processing_time_ms
@@ -266,7 +291,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         // Demonstrate management operations
         info!("=== Cron Job Management ===");
-        
+
         // Disable the demo job (stop it from running)
         queue.disable_recurring_job(demo_job_id).await?;
         info!("Disabled demo job {} from further executions", demo_job_id);
@@ -274,7 +299,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Show updated recurring jobs
         let updated_reports = queue.get_recurring_jobs("reports").await?;
         let active_count = updated_reports.iter().filter(|j| j.recurring).count();
-        info!("Reports queue now has {} active recurring jobs", active_count);
+        info!(
+            "Reports queue now has {} active recurring jobs",
+            active_count
+        );
 
         // Wait for worker to finish
         worker_handle.await?;
