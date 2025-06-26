@@ -1,10 +1,19 @@
-use crate::{error::HammerworkError, job::Job, queue::{DatabaseQueue, JobQueue}, Result};
+use crate::{
+    error::HammerworkError,
+    job::Job,
+    queue::{DatabaseQueue, JobQueue},
+    Result,
+};
 use sqlx::Database;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
 use tracing::{debug, error, info, warn};
 
-pub type JobHandler = Arc<dyn Fn(Job) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> + Send + Sync>;
+pub type JobHandler = Arc<
+    dyn Fn(Job) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub struct Worker<DB: Database> {
     queue: Arc<JobQueue<DB>>,
@@ -84,7 +93,7 @@ where
 
     async fn process_job(&self, job: Job) -> Result<()> {
         let job_id = job.id;
-        
+
         match (self.handler)(job.clone()).await {
             Ok(()) => {
                 debug!("Job {} completed successfully", job_id);
@@ -92,12 +101,13 @@ where
             }
             Err(e) => {
                 error!("Job {} failed: {}", job_id, e);
-                
+
                 if job.attempts >= self.max_retries {
                     warn!("Job {} exceeded max retries, marking as failed", job_id);
                     self.queue.fail_job(job_id, &e.to_string()).await?;
                 } else {
-                    let retry_at = chrono::Utc::now() + chrono::Duration::from_std(self.retry_delay).unwrap();
+                    let retry_at =
+                        chrono::Utc::now() + chrono::Duration::from_std(self.retry_delay).unwrap();
                     info!("Retrying job {} at {}", job_id, retry_at);
                     self.queue.retry_job(job_id, retry_at).await?;
                 }
@@ -158,7 +168,7 @@ where
 
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down worker pool");
-        
+
         for tx in &self.shutdown_tx {
             if tx.send(()).await.is_err() {
                 warn!("Failed to send shutdown signal to worker");
@@ -186,10 +196,8 @@ mod tests {
     #[test]
     fn test_job_handler_type() {
         // Test that JobHandler type alias is properly defined
-        let _handler: JobHandler = Arc::new(|_job| {
-            Box::pin(async { Ok(()) })
-        });
-        
+        let _handler: JobHandler = Arc::new(|_job| Box::pin(async { Ok(()) }));
+
         // Compilation test - if this compiles, the type is correct
         assert!(true);
     }
@@ -199,11 +207,11 @@ mod tests {
         // Test that worker configuration methods work correctly
         // We can't test the full Worker without database implementations
         // But we can test the duration handling
-        
+
         let poll_interval = Duration::from_millis(500);
         let retry_delay = Duration::from_secs(60);
         let max_retries = 5;
-        
+
         assert_eq!(poll_interval.as_millis(), 500);
         assert_eq!(retry_delay.as_secs(), 60);
         assert_eq!(max_retries, 5);
@@ -214,7 +222,7 @@ mod tests {
         // Test that WorkerPool struct is properly defined
         // We can't instantiate it without database implementations
         // But we can verify the type signatures compile
-        
+
         // This would be the structure for a real implementation:
         // let pool: WorkerPool<sqlx::Postgres> = WorkerPool::new();
         assert!(true); // Compilation test
@@ -225,7 +233,7 @@ mod tests {
         let error = HammerworkError::Worker {
             message: "Test error".to_string(),
         };
-        
+
         assert_eq!(error.to_string(), "Worker error: Test error");
     }
 }

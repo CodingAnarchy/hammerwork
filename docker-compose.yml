@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hammerwork-postgres
+    environment:
+      POSTGRES_DB: hammerwork_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/init-postgres.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hammerwork_test"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - hammerwork-network
+
+  mysql:
+    image: mysql:8.0
+    container_name: hammerwork-mysql
+    environment:
+      MYSQL_DATABASE: hammerwork_test
+      MYSQL_USER: hammerwork
+      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: rootpassword
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./config/init-mysql.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - hammerwork-network
+
+  postgres-integration:
+    build:
+      context: .
+      dockerfile: integrations/postgres-integration/Dockerfile
+    container_name: hammerwork-postgres-integration
+    environment:
+      DATABASE_URL: "postgres://postgres:password@postgres:5432/hammerwork_test"
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - hammerwork-network
+    profiles:
+      - integration
+
+  mysql-integration:
+    build:
+      context: .
+      dockerfile: integrations/mysql-integration/Dockerfile
+    container_name: hammerwork-mysql-integration
+    environment:
+      DATABASE_URL: "mysql://hammerwork:password@mysql:3306/hammerwork_test"
+      RUST_LOG: info
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - hammerwork-network
+    profiles:
+      - integration
+
+volumes:
+  postgres_data:
+  mysql_data:
+
+networks:
+  hammerwork-network:
+    driver: bridge

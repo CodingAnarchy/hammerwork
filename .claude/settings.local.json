@@ -10,7 +10,9 @@
       "Bash(cargo check:*)",
       "Bash(cargo test:*)",
       "Bash(cargo:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(chmod:*)",
+      "Bash(./scripts/test-local.sh:*)"
     ],
     "deny": []
   }

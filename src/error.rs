@@ -4,16 +4,16 @@ use thiserror::Error;
 pub enum HammerworkError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    
+
     #[error("Job not found: {id}")]
     JobNotFound { id: String },
-    
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    
+
     #[error("Worker error: {message}")]
     Worker { message: String },
-    
+
     #[error("Queue error: {message}")]
     Queue { message: String },
 }
@@ -44,9 +44,12 @@ mod tests {
     fn test_error_from_serde_json() {
         let json_error = serde_json::from_str::<serde_json::Value>("invalid json");
         assert!(json_error.is_err());
-        
+
         let hammerwork_error: HammerworkError = json_error.unwrap_err().into();
-        assert!(matches!(hammerwork_error, HammerworkError::Serialization(_)));
+        assert!(matches!(
+            hammerwork_error,
+            HammerworkError::Serialization(_)
+        ));
     }
 
     #[test]
@@ -54,7 +57,7 @@ mod tests {
         let error = HammerworkError::Worker {
             message: "Debug test".to_string(),
         };
-        
+
         let debug_str = format!("{:?}", error);
         assert!(debug_str.contains("Worker"));
         assert!(debug_str.contains("Debug test"));

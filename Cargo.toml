@@ -1,7 +1,29 @@
+[workspace]
+members = [
+    ".",
+    "integrations/postgres-integration",
+    "integrations/mysql-integration",
+]
+resolver = "2"
+
+[workspace.dependencies]
+hammerwork = { path = "." }
+tokio = { version = "1.0", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+tokio-test = "0.4"
+
 [package]
 name = "hammerwork"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 description = "A database-driven job queue for Rust with Postgres and MySQL support"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
@@ -13,15 +35,15 @@ keywords = ["database", "job-queue", "async", "postgres", "mysql"]
 categories = ["database", "asynchronous", "concurrency"]
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "json"] }
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4", "serde"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-tracing = "0.1"
-async-trait = "0.1"
+tokio = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
 
 [features]
 default = []
@@ -29,5 +51,5 @@ postgres = ["sqlx/postgres"]
 mysql = ["sqlx/mysql"]
 
 [dev-dependencies]
-tokio-test = "0.4"
-tracing-subscriber = "0.3"
+tokio-test = { workspace = true }
+tracing-subscriber = { workspace = true }

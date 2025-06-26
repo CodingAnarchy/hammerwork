@@ -167,9 +167,125 @@ Hammerwork creates a single table `hammerwork_jobs` with the following structure
 - `completed_at`: When processing finished
 - `error_message`: Error details if job failed
 
+## Development & Testing
+
+### Local Development Setup
+
+Hammerwork includes comprehensive integration testing with Docker containers:
+
+```bash
+# Clone the repository
+git clone https://github.com/CodingAnarchy/hammerwork.git
+cd hammerwork
+
+# Start database containers and run all tests
+make integration-all
+
+# Or run specific database tests
+make integration-postgres  # PostgreSQL only
+make integration-mysql     # MySQL only
+
+# Run unit tests only
+make test-unit
+
+# Performance benchmarks
+make benchmark
+```
+
+### Prerequisites
+
+- **Docker & Docker Compose**: For database containers
+- **Rust 1.75+**: For building and running tests
+- **Make** (optional): For convenient commands
+
+### Available Commands
+
+```bash
+# Database management
+make start-db              # Start PostgreSQL and MySQL containers
+make stop-db               # Stop database containers
+make status-db             # Check database status
+make logs-db               # View database logs
+
+# Testing
+make test                  # Run all tests
+make test-unit             # Unit tests only
+make test-integration      # Integration tests (no database)
+make integration-postgres  # PostgreSQL integration tests
+make integration-mysql     # MySQL integration tests
+make performance           # Performance benchmarks
+
+# Development
+make build                 # Build the project
+make lint                  # Run clippy linting
+make format                # Format code
+make check                 # Run cargo check
+
+# Cleanup
+make clean                 # Clean build artifacts
+make cleanup               # Full cleanup (containers, volumes, images)
+```
+
+### Integration Testing
+
+The project includes comprehensive integration tests that validate:
+
+- ✅ Job queue functionality with real databases
+- ✅ PostgreSQL and MySQL compatibility
+- ✅ Worker pool management and job processing
+- ✅ Performance benchmarks and regression testing
+- ✅ Containerized deployment scenarios
+- ✅ End-to-end job lifecycle management
+
+See [docs/integration-testing.md](docs/integration-testing.md) for detailed testing documentation.
+
+### CI/CD Pipeline
+
+GitHub Actions automatically runs:
+
+- **Unit Tests**: Fast validation without dependencies
+- **PostgreSQL Integration**: Full database testing with PostgreSQL 16
+- **MySQL Integration**: Full database testing with MySQL 8.0
+- **Docker Tests**: Containerized deployment validation
+- **Security Audit**: Vulnerability scanning
+- **Performance Tests**: Benchmark regression detection (scheduled daily)
+
+## Examples
+
+Complete working examples are available in the `examples/` directory:
+
+- [`postgres_example.rs`](examples/postgres_example.rs): PostgreSQL job processing
+- [`mysql_example.rs`](examples/mysql_example.rs): MySQL job processing with multiple workers
+
+Run examples with:
+
+```bash
+# PostgreSQL example (requires running PostgreSQL)
+cargo run --example postgres_example --features postgres
+
+# MySQL example (requires running MySQL)
+cargo run --example mysql_example --features mysql
+```
+
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please follow these steps:
+
+1. **Fork the repository**
+2. **Create a feature branch**: `git checkout -b feature/amazing-feature`
+3. **Run tests**: `make integration-all`
+4. **Make your changes** with appropriate tests
+5. **Ensure all tests pass**: `make ci`
+6. **Commit your changes**: `git commit -m 'Add amazing feature'`
+7. **Push to the branch**: `git push origin feature/amazing-feature`
+8. **Create a Pull Request**
+
+Please ensure your code:
+- ✅ Includes appropriate tests
+- ✅ Follows Rust formatting (`cargo fmt`)
+- ✅ Passes all linting (`cargo clippy`)
+- ✅ Maintains or improves test coverage
+- ✅ Includes documentation for new features
 
 ## License
 

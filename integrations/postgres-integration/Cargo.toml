@@ -1,0 +1,15 @@
+[package]
+name = "postgres-integration"
+version = "0.1.0"
+edition = "2021"
+description = "PostgreSQL integration tests for Hammerwork job queue"
+
+[dependencies]
+hammerwork = { workspace = true, features = ["postgres"] }
+tokio = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

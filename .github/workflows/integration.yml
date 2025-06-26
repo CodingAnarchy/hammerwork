@@ -1,0 +1,412 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+  schedule:
+    # Run integration tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Unit tests and basic checks
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+        components: rustfmt, clippy
+        
+    - name: Cache Cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+          
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+      
+    - name: Run clippy
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      
+    - name: Build
+      run: cargo build --workspace
+      
+    - name: Run unit tests
+      run: cargo test --lib
+      
+    - name: Run integration tests (no database)
+      run: cargo test --test integration_tests
+
+  # PostgreSQL integration tests
+  postgres-integration:
+    name: PostgreSQL Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hammerwork_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+        
+    - name: Cache Cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-postgres-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+          
+    - name: Install PostgreSQL client
+      run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      
+    - name: Wait for PostgreSQL
+      run: |
+        until pg_isready -h localhost -p 5432 -U postgres; do
+          echo "Waiting for PostgreSQL..."
+          sleep 2
+        done
+        echo "PostgreSQL is ready"
+        
+    - name: Initialize PostgreSQL database
+      run: |
+        PGPASSWORD=password psql -h localhost -p 5432 -U postgres -d hammerwork_test -f config/init-postgres.sql
+        
+    - name: Build PostgreSQL integration
+      run: cargo build --bin postgres-integration --features postgres
+      
+    - name: Run PostgreSQL integration tests
+      env:
+        DATABASE_URL: postgres://postgres:password@localhost:5432/hammerwork_test
+        RUST_LOG: info
+      run: |
+        timeout 300 cargo run --bin postgres-integration --features postgres || {
+          echo "PostgreSQL integration tests failed or timed out"
+          exit 1
+        }
+        
+    - name: Run PostgreSQL-specific unit tests
+      env:
+        DATABASE_URL: postgres://postgres:password@localhost:5432/hammerwork_test
+      run: cargo test --features postgres postgres_tests -- --ignored
+
+  # MySQL integration tests
+  mysql-integration:
+    name: MySQL Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: hammerwork_test
+          MYSQL_USER: hammerwork
+          MYSQL_PASSWORD: password
+          MYSQL_ROOT_PASSWORD: rootpassword
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u root -prootpassword"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+        
+    - name: Cache Cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-mysql-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+          
+    - name: Install MySQL client
+      run: sudo apt-get update && sudo apt-get install -y mysql-client
+      
+    - name: Wait for MySQL
+      run: |
+        until mysqladmin ping -h localhost -P 3306 -u root -prootpassword --silent; do
+          echo "Waiting for MySQL..."
+          sleep 2
+        done
+        echo "MySQL is ready"
+        
+    - name: Initialize MySQL database
+      run: |
+        mysql -h localhost -P 3306 -u root -prootpassword hammerwork_test < config/init-mysql.sql
+        
+    - name: Build MySQL integration
+      run: cargo build --bin mysql-integration --features mysql
+      
+    - name: Run MySQL integration tests
+      env:
+        DATABASE_URL: mysql://hammerwork:password@localhost:3306/hammerwork_test
+        RUST_LOG: info
+      run: |
+        timeout 300 cargo run --bin mysql-integration --features mysql || {
+          echo "MySQL integration tests failed or timed out"
+          exit 1
+        }
+        
+    - name: Run MySQL-specific unit tests
+      env:
+        DATABASE_URL: mysql://hammerwork:password@localhost:3306/hammerwork_test
+      run: cargo test --features mysql mysql_tests -- --ignored
+
+  # Performance benchmarks
+  performance-tests:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    needs: [postgres-integration, mysql-integration]
+    if: github.event_name == 'schedule' || contains(github.event.head_commit.message, '[benchmark]')
+    
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hammerwork_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+          
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: hammerwork_test
+          MYSQL_USER: hammerwork
+          MYSQL_PASSWORD: password
+          MYSQL_ROOT_PASSWORD: rootpassword
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u root -prootpassword"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 3306:3306
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+        
+    - name: Cache Cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-perf-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+          
+    - name: Install database clients
+      run: sudo apt-get update && sudo apt-get install -y postgresql-client mysql-client
+      
+    - name: Wait for databases
+      run: |
+        until pg_isready -h localhost -p 5432 -U postgres; do
+          echo "Waiting for PostgreSQL..."
+          sleep 2
+        done
+        until mysqladmin ping -h localhost -P 3306 -u root -prootpassword --silent; do
+          echo "Waiting for MySQL..."
+          sleep 2
+        done
+        echo "Databases are ready"
+        
+    - name: Initialize databases
+      run: |
+        PGPASSWORD=password psql -h localhost -p 5432 -U postgres -d hammerwork_test -f config/init-postgres.sql
+        mysql -h localhost -P 3306 -u root -prootpassword hammerwork_test < config/init-mysql.sql
+        
+    - name: Build release binaries
+      run: |
+        cargo build --release --bin postgres-integration --features postgres
+        cargo build --release --bin mysql-integration --features mysql
+        
+    - name: Run PostgreSQL performance benchmarks
+      env:
+        DATABASE_URL: postgres://postgres:password@localhost:5432/hammerwork_test
+        RUST_LOG: info
+      run: |
+        echo "## PostgreSQL Performance Results" >> performance_results.md
+        timeout 300 cargo run --release --bin postgres-integration --features postgres | tee -a performance_results.md
+        
+    - name: Run MySQL performance benchmarks
+      env:
+        DATABASE_URL: mysql://hammerwork:password@localhost:3306/hammerwork_test
+        RUST_LOG: info
+      run: |
+        echo "## MySQL Performance Results" >> performance_results.md
+        timeout 300 cargo run --release --bin mysql-integration --features mysql | tee -a performance_results.md
+        
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results-${{ github.sha }}
+        path: performance_results.md
+        retention-days: 30
+
+  # Docker build tests
+  docker-tests:
+    name: Docker Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build Docker images
+      run: |
+        docker-compose build postgres-integration mysql-integration
+        
+    - name: Start database services
+      run: |
+        docker-compose up -d postgres mysql
+        
+    - name: Wait for databases
+      run: |
+        timeout 120 bash -c 'until docker exec hammerwork-postgres pg_isready -U postgres -d hammerwork_test; do sleep 2; done'
+        timeout 120 bash -c 'until docker exec hammerwork-mysql mysqladmin ping -h localhost -u root -prootpassword; do sleep 2; done'
+        
+    - name: Run PostgreSQL integration in Docker
+      run: |
+        docker-compose --profile integration up --exit-code-from postgres-integration postgres-integration
+        
+    - name: Run MySQL integration in Docker
+      run: |
+        docker-compose --profile integration up --exit-code-from mysql-integration mysql-integration
+        
+    - name: Cleanup
+      run: |
+        docker-compose down --volumes
+
+  # Security audit
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+        
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+      
+    - name: Run security audit
+      run: cargo audit
+      
+    - name: Check for known vulnerabilities
+      run: cargo audit --deny warnings
+
+  # Integration test summary
+  integration-summary:
+    name: Integration Test Summary
+    runs-on: ubuntu-latest
+    needs: [unit-tests, postgres-integration, mysql-integration, docker-tests, security-audit]
+    if: always()
+    
+    steps:
+    - name: Check test results
+      run: |
+        echo "Integration Test Summary:"
+        echo "========================"
+        echo "Unit Tests: ${{ needs.unit-tests.result }}"
+        echo "PostgreSQL Integration: ${{ needs.postgres-integration.result }}"
+        echo "MySQL Integration: ${{ needs.mysql-integration.result }}"
+        echo "Docker Tests: ${{ needs.docker-tests.result }}"
+        echo "Security Audit: ${{ needs.security-audit.result }}"
+        
+        if [[ "${{ needs.unit-tests.result }}" == "success" && 
+              "${{ needs.postgres-integration.result }}" == "success" && 
+              "${{ needs.mysql-integration.result }}" == "success" && 
+              "${{ needs.docker-tests.result }}" == "success" && 
+              "${{ needs.security-audit.result }}" == "success" ]]; then
+          echo "✅ All integration tests passed!"
+        else
+          echo "❌ Some integration tests failed"
+          exit 1
+        fi

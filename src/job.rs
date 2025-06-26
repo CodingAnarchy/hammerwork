@@ -46,7 +46,11 @@ impl Job {
         }
     }
 
-    pub fn with_delay(queue_name: String, payload: serde_json::Value, delay: chrono::Duration) -> Self {
+    pub fn with_delay(
+        queue_name: String,
+        payload: serde_json::Value,
+        delay: chrono::Duration,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -78,9 +82,9 @@ mod tests {
     fn test_job_new() {
         let queue_name = "test_queue".to_string();
         let payload = json!({"key": "value"});
-        
+
         let job = Job::new(queue_name.clone(), payload.clone());
-        
+
         assert_eq!(job.queue_name, queue_name);
         assert_eq!(job.payload, payload);
         assert_eq!(job.status, JobStatus::Pending);
@@ -97,9 +101,9 @@ mod tests {
         let queue_name = "test_queue".to_string();
         let payload = json!({"key": "value"});
         let delay = chrono::Duration::minutes(5);
-        
+
         let job = Job::with_delay(queue_name.clone(), payload.clone(), delay);
-        
+
         assert_eq!(job.queue_name, queue_name);
         assert_eq!(job.payload, payload);
         assert_eq!(job.status, JobStatus::Pending);
@@ -113,9 +117,9 @@ mod tests {
     fn test_job_with_max_attempts() {
         let queue_name = "test_queue".to_string();
         let payload = json!({"key": "value"});
-        
+
         let job = Job::new(queue_name, payload).with_max_attempts(5);
-        
+
         assert_eq!(job.max_attempts, 5);
     }
 
@@ -124,9 +128,9 @@ mod tests {
         let queue_name = "test_queue".to_string();
         let payload = json!({"key": "value"});
         let delay = chrono::Duration::hours(1);
-        
+
         let job = Job::with_delay(queue_name, payload, delay).with_max_attempts(10);
-        
+
         assert_eq!(job.max_attempts, 10);
         assert!(job.scheduled_at > job.created_at);
     }
@@ -138,7 +142,7 @@ mod tests {
         assert_eq!(JobStatus::Completed, JobStatus::Completed);
         assert_eq!(JobStatus::Failed, JobStatus::Failed);
         assert_eq!(JobStatus::Retrying, JobStatus::Retrying);
-        
+
         assert_ne!(JobStatus::Pending, JobStatus::Running);
         assert_ne!(JobStatus::Completed, JobStatus::Failed);
     }
@@ -146,10 +150,10 @@ mod tests {
     #[test]
     fn test_job_serialization() {
         let job = Job::new("test".to_string(), json!({"data": "test"}));
-        
+
         let serialized = serde_json::to_string(&job).unwrap();
         let deserialized: Job = serde_json::from_str(&serialized).unwrap();
-        
+
         assert_eq!(job.id, deserialized.id);
         assert_eq!(job.queue_name, deserialized.queue_name);
         assert_eq!(job.payload, deserialized.payload);
@@ -167,7 +171,7 @@ mod tests {
             JobStatus::Failed,
             JobStatus::Retrying,
         ];
-        
+
         for status in statuses {
             let serialized = serde_json::to_string(&status).unwrap();
             let deserialized: JobStatus = serde_json::from_str(&serialized).unwrap();

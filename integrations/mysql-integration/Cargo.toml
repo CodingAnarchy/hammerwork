@@ -1,0 +1,15 @@
+[package]
+name = "mysql-integration"
+version = "0.1.0"
+edition = "2021"
+description = "MySQL integration tests for Hammerwork job queue"
+
+[dependencies]
+hammerwork = { workspace = true, features = ["mysql"] }
+tokio = { workspace = true }
+sqlx = { workspace = true, features = ["mysql"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

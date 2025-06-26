@@ -6,6 +6,6 @@ pub mod worker;
 pub use error::HammerworkError;
 pub use job::{Job, JobId, JobStatus};
 pub use queue::JobQueue;
-pub use worker::Worker;
+pub use worker::{Worker, WorkerPool};
 
 pub type Result<T> = std::result::Result<T, HammerworkError>;

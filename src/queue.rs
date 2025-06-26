@@ -1,4 +1,7 @@
-use crate::{job::{Job, JobId}, Result};
+use crate::{
+    job::{Job, JobId},
+    Result,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{Database, Pool};
@@ -7,7 +10,7 @@ use std::marker::PhantomData;
 #[async_trait]
 pub trait DatabaseQueue: Send + Sync {
     type Database: Database;
-    
+
     async fn create_tables(&self) -> Result<()>;
     async fn enqueue(&self, job: Job) -> Result<JobId>;
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>>;
@@ -36,6 +39,7 @@ impl<DB: Database> JobQueue<DB> {
 #[cfg(feature = "postgres")]
 pub mod postgres {
     use super::*;
+    use crate::job::JobStatus;
     use sqlx::Postgres;
 
     #[async_trait]
@@ -61,11 +65,11 @@ pub mod postgres {
                 
                 CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_queue_status_scheduled 
                 ON hammerwork_jobs (queue_name, status, scheduled_at);
-                "#
+                "#,
             )
             .execute(&self.pool)
             .await?;
-            
+
             Ok(())
         }
 
@@ -118,7 +122,20 @@ pub mod postgres {
             .fetch_optional(&self.pool)
             .await?;
 
-            if let Some((id, queue_name, payload, status, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, error_message)) = row {
+            if let Some((
+                id,
+                queue_name,
+                payload,
+                status,
+                attempts,
+                max_attempts,
+                created_at,
+                scheduled_at,
+                started_at,
+                completed_at,
+                error_message,
+            )) = row
+            {
                 Ok(Some(Job {
                     id,
                     queue_name,
@@ -138,14 +155,12 @@ pub mod postgres {
         }
 
         async fn complete_job(&self, job_id: JobId) -> Result<()> {
-            sqlx::query(
-                "UPDATE hammerwork_jobs SET status = $1, completed_at = $2 WHERE id = $3"
-            )
-            .bind(serde_json::to_string(&JobStatus::Completed)?)
-            .bind(Utc::now())
-            .bind(job_id)
-            .execute(&self.pool)
-            .await?;
+            sqlx::query("UPDATE hammerwork_jobs SET status = $1, completed_at = $2 WHERE id = $3")
+                .bind(serde_json::to_string(&JobStatus::Completed)?)
+                .bind(Utc::now())
+                .bind(job_id)
+                .execute(&self.pool)
+                .await?;
 
             Ok(())
         }
@@ -185,7 +200,20 @@ pub mod postgres {
             .fetch_optional(&self.pool)
             .await?;
 
-            if let Some((id, queue_name, payload, status, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, error_message)) = row {
+            if let Some((
+                id,
+                queue_name,
+                payload,
+                status,
+                attempts,
+                max_attempts,
+                created_at,
+                scheduled_at,
+                started_at,
+                completed_at,
+                error_message,
+            )) = row
+            {
                 Ok(Some(Job {
                     id,
                     queue_name,
@@ -218,6 +246,7 @@ pub mod postgres {
 #[cfg(feature = "mysql")]
 pub mod mysql {
     use super::*;
+    use crate::job::JobStatus;
     use sqlx::MySql;
 
     #[async_trait]
@@ -241,11 +270,11 @@ pub mod mysql {
                     error_message TEXT NULL,
                     INDEX idx_queue_status_scheduled (queue_name, status, scheduled_at)
                 )
-                "#
+                "#,
             )
             .execute(&self.pool)
             .await?;
-            
+
             Ok(())
         }
 
@@ -278,7 +307,7 @@ pub mod mysql {
             // MySQL doesn't support FOR UPDATE SKIP LOCKED in the same way
             // This is a simplified version - in production you might want advisory locks
             let mut tx = self.pool.begin().await?;
-            
+
             let row = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)>(
                 r#"
                 SELECT id, queue_name, payload, status, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, error_message
@@ -297,9 +326,26 @@ pub mod mysql {
             .fetch_optional(&mut *tx)
             .await?;
 
-            if let Some((id_str, queue_name, payload, _status, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, error_message)) = row {
-                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| crate::error::HammerworkError::Queue { message: "Invalid UUID".to_string() })?;
-                
+            if let Some((
+                id_str,
+                queue_name,
+                payload,
+                _status,
+                attempts,
+                max_attempts,
+                created_at,
+                scheduled_at,
+                started_at,
+                completed_at,
+                error_message,
+            )) = row
+            {
+                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
+                    crate::error::HammerworkError::Queue {
+                        message: "Invalid UUID".to_string(),
+                    }
+                })?;
+
                 sqlx::query(
                     "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1 WHERE id = ?"
                 )
@@ -331,14 +377,12 @@ pub mod mysql {
         }
 
         async fn complete_job(&self, job_id: JobId) -> Result<()> {
-            sqlx::query(
-                "UPDATE hammerwork_jobs SET status = ?, completed_at = ? WHERE id = ?"
-            )
-            .bind(serde_json::to_string(&JobStatus::Completed)?)
-            .bind(Utc::now())
-            .bind(job_id.to_string())
-            .execute(&self.pool)
-            .await?;
+            sqlx::query("UPDATE hammerwork_jobs SET status = ?, completed_at = ? WHERE id = ?")
+                .bind(serde_json::to_string(&JobStatus::Completed)?)
+                .bind(Utc::now())
+                .bind(job_id.to_string())
+                .execute(&self.pool)
+                .await?;
 
             Ok(())
         }
@@ -378,9 +422,26 @@ pub mod mysql {
             .fetch_optional(&self.pool)
             .await?;
 
-            if let Some((id_str, queue_name, payload, status, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, error_message)) = row {
-                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| crate::error::HammerworkError::Queue { message: "Invalid UUID".to_string() })?;
-                
+            if let Some((
+                id_str,
+                queue_name,
+                payload,
+                status,
+                attempts,
+                max_attempts,
+                created_at,
+                scheduled_at,
+                started_at,
+                completed_at,
+                error_message,
+            )) = row
+            {
+                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
+                    crate::error::HammerworkError::Queue {
+                        message: "Invalid UUID".to_string(),
+                    }
+                })?;
+
                 Ok(Some(Job {
                     id: job_id,
                     queue_name,
