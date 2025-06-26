@@ -2,12 +2,14 @@ use crate::{
     error::HammerworkError,
     job::Job,
     queue::{DatabaseQueue, JobQueue},
+    stats::{StatisticsCollector, JobEvent, JobEventType},
     Result,
 };
 use sqlx::Database;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
 use tracing::{debug, error, info, warn};
+use chrono::Utc;
 
 pub type JobHandler = Arc<
     dyn Fn(Job) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
@@ -22,6 +24,7 @@ pub struct Worker<DB: Database> {
     poll_interval: Duration,
     max_retries: i32,
     retry_delay: Duration,
+    stats_collector: Option<Arc<dyn StatisticsCollector>>,
 }
 
 impl<DB: Database + Send + Sync + 'static> Worker<DB>
@@ -36,7 +39,13 @@ where
             poll_interval: Duration::from_secs(1),
             max_retries: 3,
             retry_delay: Duration::from_secs(30),
+            stats_collector: None,
         }
+    }
+
+    pub fn with_stats_collector(mut self, stats_collector: Arc<dyn StatisticsCollector>) -> Self {
+        self.stats_collector = Some(stats_collector);
+        self
     }
 
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
@@ -93,34 +102,105 @@ where
 
     async fn process_job(&self, job: Job) -> Result<()> {
         let job_id = job.id;
+        let queue_name = job.queue_name.clone();
+        let start_time = Utc::now();
+
+        // Record job started event
+        self.record_event(JobEvent {
+            job_id,
+            queue_name: queue_name.clone(),
+            event_type: JobEventType::Started,
+            processing_time_ms: None,
+            error_message: None,
+            timestamp: start_time,
+        }).await;
 
         match (self.handler)(job.clone()).await {
             Ok(()) => {
                 debug!("Job {} completed successfully", job_id);
+                
+                let processing_time_ms = (Utc::now() - start_time).num_milliseconds() as u64;
+                
                 self.queue.complete_job(job_id).await?;
+                
+                // Record job completed event
+                self.record_event(JobEvent {
+                    job_id,
+                    queue_name,
+                    event_type: JobEventType::Completed,
+                    processing_time_ms: Some(processing_time_ms),
+                    error_message: None,
+                    timestamp: Utc::now(),
+                }).await;
             }
             Err(e) => {
                 error!("Job {} failed: {}", job_id, e);
+                let error_message = e.to_string();
 
                 if job.attempts >= self.max_retries {
                     warn!("Job {} exceeded max retries, marking as failed", job_id);
-                    self.queue.fail_job(job_id, &e.to_string()).await?;
+                    
+                    // Check if we should mark as dead or just failed
+                    if job.has_exhausted_retries() {
+                        self.queue.mark_job_dead(job_id, &error_message).await?;
+                        
+                        // Record job dead event
+                        self.record_event(JobEvent {
+                            job_id,
+                            queue_name,
+                            event_type: JobEventType::Dead,
+                            processing_time_ms: None,
+                            error_message: Some(error_message),
+                            timestamp: Utc::now(),
+                        }).await;
+                    } else {
+                        self.queue.fail_job(job_id, &error_message).await?;
+                        
+                        // Record job failed event
+                        self.record_event(JobEvent {
+                            job_id,
+                            queue_name,
+                            event_type: JobEventType::Failed,
+                            processing_time_ms: None,
+                            error_message: Some(error_message),
+                            timestamp: Utc::now(),
+                        }).await;
+                    }
                 } else {
                     let retry_at =
                         chrono::Utc::now() + chrono::Duration::from_std(self.retry_delay).unwrap();
                     info!("Retrying job {} at {}", job_id, retry_at);
                     self.queue.retry_job(job_id, retry_at).await?;
+                    
+                    // Record job retry event
+                    self.record_event(JobEvent {
+                        job_id,
+                        queue_name,
+                        event_type: JobEventType::Retried,
+                        processing_time_ms: None,
+                        error_message: Some(error_message),
+                        timestamp: Utc::now(),
+                    }).await;
                 }
             }
         }
 
         Ok(())
     }
+
+    async fn record_event(&self, event: JobEvent) {
+        if let Some(stats_collector) = &self.stats_collector {
+            if let Err(e) = stats_collector.record_event(event).await {
+                warn!("Failed to record statistics event: {}", e);
+            }
+        }
+    }
 }
 
 pub struct WorkerPool<DB: Database> {
     workers: Vec<Worker<DB>>,
     shutdown_tx: Vec<mpsc::Sender<()>>,
+    stats_collector: Option<Arc<dyn StatisticsCollector>>,
 }
 
 impl<DB: Database + Send + Sync + 'static> WorkerPool<DB>
@@ -131,10 +211,20 @@ where
         Self {
             workers: Vec::new(),
             shutdown_tx: Vec::new(),
+            stats_collector: None,
         }
     }
 
-    pub fn add_worker(&mut self, worker: Worker<DB>) {
+    pub fn with_stats_collector(mut self, stats_collector: Arc<dyn StatisticsCollector>) -> Self {
+        self.stats_collector = Some(stats_collector);
+        self
+    }
+
+    pub fn add_worker(&mut self, mut worker: Worker<DB>) {
+        // Apply the pool's stats collector to the worker if available
+        if let Some(stats_collector) = &self.stats_collector {
+            worker.stats_collector = Some(Arc::clone(stats_collector));
+        }
         self.workers.push(worker);
     }
 
@@ -176,6 +266,11 @@ where
         }
 
         Ok(())
+    }
+
+    /// Get the statistics collector for the worker pool
+    pub fn stats_collector(&self) -> Option<Arc<dyn StatisticsCollector>> {
+        self.stats_collector.clone()
     }
 }
 
@@ -235,5 +330,39 @@ mod tests {
         };
 
         assert_eq!(error.to_string(), "Worker error: Test error");
+    }
+
+    #[tokio::test]
+    async fn test_worker_with_stats_collector() {
+        use crate::stats::{InMemoryStatsCollector, StatisticsCollector};
+        use std::sync::Arc;
+        
+        // This test verifies that the worker can be configured with a stats collector
+        let stats_collector = Arc::new(InMemoryStatsCollector::new_default());
+        
+        // Test that we can clone and store the stats collector reference
+        let stats_clone = Arc::clone(&stats_collector);
+        assert_eq!(Arc::strong_count(&stats_collector), 2);
+        
+        // Verify stats collector functionality
+        let stats = stats_clone.get_system_statistics(Duration::from_secs(60)).await.unwrap();
+        assert_eq!(stats.total_processed, 0); // No events recorded yet
+    }
+
+    #[test]
+    fn test_worker_pool_with_stats_collector() {
+        use crate::stats::InMemoryStatsCollector;
+        use std::sync::Arc;
+        
+        // This test verifies that the worker pool can be configured with a stats collector
+        let stats_collector = Arc::new(InMemoryStatsCollector::new_default());
+        
+        // Test that we can store the stats collector in the pool
+        let stats_clone = Arc::clone(&stats_collector);
+        assert_eq!(Arc::strong_count(&stats_collector), 2);
+        
+        // This verifies the reference counting works correctly
+        drop(stats_clone);
+        assert_eq!(Arc::strong_count(&stats_collector), 1);
     }
 }

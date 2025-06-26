@@ -22,9 +22,9 @@ tokio-test = "0.4"
 
 [package]
 name = "hammerwork"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A database-driven job queue for Rust with Postgres and MySQL support"
+description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring dead job management and comprehensive statistics collection"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
 authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
@@ -49,6 +49,7 @@ async-trait = { workspace = true }
 default = []
 postgres = ["sqlx/postgres"]
 mysql = ["sqlx/mysql"]
+full = ["postgres", "mysql"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

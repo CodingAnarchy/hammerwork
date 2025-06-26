@@ -10,6 +10,7 @@ pub enum JobStatus {
     Running,
     Completed,
     Failed,
+    Dead,
     Retrying,
 }
 
@@ -25,6 +26,7 @@ pub struct Job {
     pub scheduled_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub failed_at: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
 }
 
@@ -42,6 +44,7 @@ impl Job {
             scheduled_at: now,
             started_at: None,
             completed_at: None,
+            failed_at: None,
             error_message: None,
         }
     }
@@ -63,6 +66,7 @@ impl Job {
             scheduled_at: now + delay,
             started_at: None,
             completed_at: None,
+            failed_at: None,
             error_message: None,
         }
     }
@@ -70,6 +74,30 @@ impl Job {
     pub fn with_max_attempts(mut self, max_attempts: i32) -> Self {
         self.max_attempts = max_attempts;
         self
+    }
+
+    /// Check if the job is dead (failed all retry attempts)
+    pub fn is_dead(&self) -> bool {
+        self.status == JobStatus::Dead
+    }
+
+    /// Check if the job has exhausted all retry attempts
+    pub fn has_exhausted_retries(&self) -> bool {
+        self.attempts >= self.max_attempts
+    }
+
+    /// Get the duration since the job was created
+    pub fn age(&self) -> chrono::Duration {
+        Utc::now() - self.created_at
+    }
+
+    /// Get the processing duration if the job has started
+    pub fn processing_duration(&self) -> Option<chrono::Duration> {
+        self.started_at.map(|started| {
+            self.completed_at
+                .or(self.failed_at)
+                .unwrap_or_else(Utc::now) - started
+        })
     }
 }
 
@@ -92,6 +120,7 @@ mod tests {
         assert_eq!(job.max_attempts, 3);
         assert!(job.started_at.is_none());
         assert!(job.completed_at.is_none());
+        assert!(job.failed_at.is_none());
         assert!(job.error_message.is_none());
         assert_eq!(job.created_at, job.scheduled_at);
     }
@@ -141,10 +170,12 @@ mod tests {
         assert_eq!(JobStatus::Running, JobStatus::Running);
         assert_eq!(JobStatus::Completed, JobStatus::Completed);
         assert_eq!(JobStatus::Failed, JobStatus::Failed);
+        assert_eq!(JobStatus::Dead, JobStatus::Dead);
         assert_eq!(JobStatus::Retrying, JobStatus::Retrying);
 
         assert_ne!(JobStatus::Pending, JobStatus::Running);
         assert_ne!(JobStatus::Completed, JobStatus::Failed);
+        assert_ne!(JobStatus::Failed, JobStatus::Dead);
     }
 
     #[test]
@@ -169,6 +200,7 @@ mod tests {
             JobStatus::Running,
             JobStatus::Completed,
             JobStatus::Failed,
+            JobStatus::Dead,
             JobStatus::Retrying,
         ];
 
@@ -177,5 +209,59 @@ mod tests {
             let deserialized: JobStatus = serde_json::from_str(&serialized).unwrap();
             assert_eq!(status, deserialized);
         }
+    }
+
+    #[test]
+    fn test_job_dead_status_methods() {
+        let mut job = Job::new("test".to_string(), json!({"data": "test"}));
+        
+        // Initially not dead
+        assert!(!job.is_dead());
+        assert!(!job.has_exhausted_retries());
+        
+        // Simulate exhausting retries
+        job.attempts = 3;
+        job.max_attempts = 3;
+        assert!(job.has_exhausted_retries());
+        assert!(!job.is_dead()); // Still not dead until status is set
+        
+        // Mark as dead
+        job.status = JobStatus::Dead;
+        job.failed_at = Some(Utc::now());
+        assert!(job.is_dead());
+        assert!(job.has_exhausted_retries());
+    }
+
+    #[test]
+    fn test_job_processing_duration() {
+        let mut job = Job::new("test".to_string(), json!({"data": "test"}));
+        
+        // No processing duration when not started
+        assert!(job.processing_duration().is_none());
+        
+        // Set start time
+        let start_time = Utc::now();
+        job.started_at = Some(start_time);
+        
+        // Should have some duration now (very small)
+        let duration = job.processing_duration().unwrap();
+        assert!(duration.num_milliseconds() >= 0);
+        
+        // Set completion time
+        let completion_time = start_time + chrono::Duration::seconds(5);
+        job.completed_at = Some(completion_time);
+        
+        let final_duration = job.processing_duration().unwrap();
+        assert_eq!(final_duration.num_seconds(), 5);
+    }
+
+    #[test]
+    fn test_job_age() {
+        let job = Job::new("test".to_string(), json!({"data": "test"}));
+        let age = job.age();
+        
+        // Age should be very small (just created)
+        assert!(age.num_milliseconds() >= 0);
+        assert!(age.num_seconds() < 1);
     }
 }
