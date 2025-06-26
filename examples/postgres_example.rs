@@ -1,6 +1,7 @@
 use hammerwork::{
     job::Job,
     queue::JobQueue,
+    rate_limit::{RateLimit, ThrottleConfig},
     stats::{InMemoryStatsCollector, StatisticsCollector},
     worker::{Worker, WorkerPool},
     Result,
@@ -52,22 +53,38 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
     });
 
-    // Create and start workers with statistics collection and timeout configuration
+    // Create and start workers with statistics collection, timeout, and rate limiting configuration
     let worker1 = Worker::new(queue.clone(), "email".to_string(), handler.clone())
         .with_poll_interval(tokio::time::Duration::from_secs(1))
         .with_max_retries(3)
         .with_default_timeout(tokio::time::Duration::from_secs(30)) // 30 second default timeout
+        .with_rate_limit(RateLimit::per_second(2)) // Limit to 2 emails per second
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let worker2 = Worker::new(queue.clone(), "notifications".to_string(), handler.clone())
         .with_poll_interval(tokio::time::Duration::from_secs(2))
         .with_max_retries(2)
         .with_default_timeout(tokio::time::Duration::from_secs(60)) // 60 second default timeout
+        .with_throttle_config(
+            ThrottleConfig::new()
+                .rate_per_minute(30) // Max 30 notifications per minute
+                .backoff_on_error(tokio::time::Duration::from_secs(10)) // 10 second backoff on errors
+        )
+        .with_stats_collector(Arc::clone(&stats_collector));
+
+    // Create a high-throughput worker for API calls with burst support
+    let api_worker = Worker::new(queue.clone(), "api_calls".to_string(), handler.clone())
+        .with_poll_interval(tokio::time::Duration::from_millis(100))
+        .with_rate_limit(
+            RateLimit::per_second(10) // 10 calls per second
+                .with_burst_limit(50) // Allow bursts up to 50 calls
+        )
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let mut worker_pool = WorkerPool::new().with_stats_collector(Arc::clone(&stats_collector));
     worker_pool.add_worker(worker1);
     worker_pool.add_worker(worker2);
+    worker_pool.add_worker(api_worker);
 
     // Enqueue some test jobs
     #[cfg(feature = "postgres")]
@@ -99,11 +116,36 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_timeout(std::time::Duration::from_secs(300)) // 5-minute timeout
         .with_max_attempts(5); // More retry attempts for important jobs
 
+        // Demonstrate queue-level throttling configuration
+        queue.set_throttle("api_calls", 
+            ThrottleConfig::new()
+                .max_concurrent(5)
+                .rate_per_minute(300) // Global rate limit for API calls
+                .backoff_on_error(tokio::time::Duration::from_secs(30))
+        ).await?;
+
+        info!("Configured throttling for api_calls queue: max 5 concurrent, 300/min global rate");
+
         let job1_id = queue.enqueue(job1).await?;
         let job2_id = queue.enqueue(job2).await?;
         let job3_id = queue.enqueue(job3).await?;
         let job4_id = queue.enqueue(job4).await?;
         let job5_id = queue.enqueue(job5).await?;
+
+        // Enqueue some API call jobs to demonstrate rate limiting
+        for i in 1..=10 {
+            let api_job = Job::new(
+                "api_calls".to_string(),
+                json!({
+                    "endpoint": format!("/api/users/{}", i),
+                    "method": "GET",
+                    "user_id": i
+                })
+            );
+            queue.enqueue(api_job).await?;
+        }
+
+        info!("Enqueued 10 API call jobs to demonstrate rate limiting");
 
         info!("Enqueued test jobs with timeouts:");
         info!("  {} - uses worker default timeout (30s)", job1_id);
@@ -112,8 +154,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("  {} - will fail with 5s timeout", job4_id);
         info!("  {} - heavy processing with 5min timeout", job5_id);
 
-        // Let jobs process for a bit
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // Let jobs process for a bit to see rate limiting in action
+        info!("Processing jobs for 10 seconds to demonstrate rate limiting...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
         // Demonstrate statistics collection with timeout tracking
         info!("=== Job Processing Statistics (Including Timeouts) ===");
@@ -150,6 +193,28 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             notifications_stats.timed_out,
             notifications_stats.avg_processing_time_ms
         );
+
+        // Get API calls statistics to show rate limiting effects
+        let api_stats = stats_collector
+            .get_queue_statistics("api_calls", std::time::Duration::from_secs(300))
+            .await?;
+        info!("API Calls Queue Stats - Total: {}, Completed: {}, Rate Limiting Effects Visible: {}",
+            api_stats.total_processed,
+            api_stats.completed,
+            if api_stats.total_processed < 10 { "Yes (some jobs still processing due to rate limits)" } else { "No" }
+        );
+
+        // Show current throttling configurations
+        info!("=== Current Throttling Configurations ===");
+        let throttle_configs = queue.get_all_throttles().await;
+        for (queue_name, config) in throttle_configs {
+            info!("Queue '{}': max_concurrent={:?}, rate_per_minute={:?}, backoff_on_error={:?}",
+                queue_name,
+                config.max_concurrent,
+                config.rate_per_minute,
+                config.backoff_on_error
+            );
+        }
 
         // Demonstrate dead job management
         info!("=== Dead Job Management ===");

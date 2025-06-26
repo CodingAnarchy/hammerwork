@@ -1,12 +1,14 @@
 use crate::{
     job::{Job, JobId},
+    rate_limit::ThrottleConfig,
     stats::{DeadJobSummary, QueueStats},
     Result,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{Database, Pool};
-use std::marker::PhantomData;
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use tokio::sync::RwLock;
 
 #[async_trait]
 pub trait DatabaseQueue: Send + Sync {
@@ -99,12 +101,26 @@ pub trait DatabaseQueue: Send + Sync {
 
     /// Enable a previously disabled recurring job
     async fn enable_recurring_job(&self, job_id: JobId) -> Result<()>;
+
+    // Throttling configuration
+    /// Set throttling configuration for a specific queue
+    async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()>;
+
+    /// Get throttling configuration for a specific queue
+    async fn get_throttle_config(&self, queue_name: &str) -> Result<Option<ThrottleConfig>>;
+
+    /// Remove throttling configuration for a specific queue
+    async fn remove_throttle_config(&self, queue_name: &str) -> Result<()>;
+
+    /// Get all throttling configurations
+    async fn get_all_throttle_configs(&self) -> Result<HashMap<String, ThrottleConfig>>;
 }
 
 pub struct JobQueue<DB: Database> {
     #[allow(dead_code)] // Used in database-specific implementations
     pool: Pool<DB>,
     _phantom: PhantomData<DB>,
+    throttle_configs: Arc<RwLock<HashMap<String, ThrottleConfig>>>,
 }
 
 impl<DB: Database> JobQueue<DB> {
@@ -112,7 +128,34 @@ impl<DB: Database> JobQueue<DB> {
         Self {
             pool,
             _phantom: PhantomData,
+            throttle_configs: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Set throttling configuration for a queue
+    pub async fn set_throttle(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
+        let mut configs = self.throttle_configs.write().await;
+        configs.insert(queue_name.to_string(), config);
+        Ok(())
+    }
+
+    /// Get throttling configuration for a queue
+    pub async fn get_throttle(&self, queue_name: &str) -> Option<ThrottleConfig> {
+        let configs = self.throttle_configs.read().await;
+        configs.get(queue_name).cloned()
+    }
+
+    /// Remove throttling configuration for a queue
+    pub async fn remove_throttle(&self, queue_name: &str) -> Result<()> {
+        let mut configs = self.throttle_configs.write().await;
+        configs.remove(queue_name);
+        Ok(())
+    }
+
+    /// Get all throttling configurations
+    pub async fn get_all_throttles(&self) -> HashMap<String, ThrottleConfig> {
+        let configs = self.throttle_configs.read().await;
+        configs.clone()
     }
 }
 
@@ -984,6 +1027,22 @@ pub mod postgres {
 
             Ok(())
         }
+
+        async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
+            self.set_throttle(queue_name, config).await
+        }
+
+        async fn get_throttle_config(&self, queue_name: &str) -> Result<Option<ThrottleConfig>> {
+            Ok(self.get_throttle(queue_name).await)
+        }
+
+        async fn remove_throttle_config(&self, queue_name: &str) -> Result<()> {
+            self.remove_throttle(queue_name).await
+        }
+
+        async fn get_all_throttle_configs(&self) -> Result<HashMap<String, ThrottleConfig>> {
+            Ok(self.get_all_throttles().await)
+        }
     }
 }
 
@@ -1789,6 +1848,22 @@ pub mod mysql {
                 .await?;
 
             Ok(())
+        }
+
+        async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
+            self.set_throttle(queue_name, config).await
+        }
+
+        async fn get_throttle_config(&self, queue_name: &str) -> Result<Option<ThrottleConfig>> {
+            Ok(self.get_throttle(queue_name).await)
+        }
+
+        async fn remove_throttle_config(&self, queue_name: &str) -> Result<()> {
+            self.remove_throttle(queue_name).await
+        }
+
+        async fn get_all_throttle_configs(&self) -> Result<HashMap<String, ThrottleConfig>> {
+            Ok(self.get_all_throttles().await)
         }
     }
 }

@@ -3,6 +3,7 @@ pub mod error;
 pub mod job;
 pub mod priority;
 pub mod queue;
+pub mod rate_limit;
 pub mod stats;
 pub mod worker;
 
@@ -13,6 +14,7 @@ pub use priority::{
     JobPriority, PriorityError, PrioritySelectionStrategy, PriorityStats, PriorityWeights,
 };
 pub use queue::JobQueue;
+pub use rate_limit::{RateLimit, RateLimiter, ThrottleConfig};
 pub use stats::{
     DeadJobSummary, InMemoryStatsCollector, JobStatistics, QueueStats, StatisticsCollector,
 };

@@ -3,6 +3,7 @@ use crate::{
     job::Job,
     priority::PriorityWeights,
     queue::{DatabaseQueue, JobQueue},
+    rate_limit::{RateLimit, RateLimiter, ThrottleConfig},
     stats::{JobEvent, JobEventType, StatisticsCollector},
     Result,
 };
@@ -28,6 +29,8 @@ pub struct Worker<DB: Database> {
     default_timeout: Option<Duration>,
     priority_weights: Option<PriorityWeights>,
     stats_collector: Option<Arc<dyn StatisticsCollector>>,
+    rate_limiter: Option<RateLimiter>,
+    throttle_config: Option<ThrottleConfig>,
 }
 
 impl<DB: Database + Send + Sync + 'static> Worker<DB>
@@ -45,6 +48,8 @@ where
             default_timeout: None,
             priority_weights: None,
             stats_collector: None,
+            rate_limiter: None,
+            throttle_config: None,
         }
     }
 
@@ -91,6 +96,22 @@ where
         self
     }
 
+    /// Configure rate limiting for this worker
+    pub fn with_rate_limit(mut self, rate_limit: RateLimit) -> Self {
+        self.rate_limiter = Some(RateLimiter::new(rate_limit));
+        self
+    }
+
+    /// Configure throttling for this worker
+    pub fn with_throttle_config(mut self, throttle_config: ThrottleConfig) -> Self {
+        // If the throttle config has a rate limit, create a rate limiter
+        if let Some(rate_limit) = throttle_config.to_rate_limit() {
+            self.rate_limiter = Some(RateLimiter::new(rate_limit));
+        }
+        self.throttle_config = Some(throttle_config);
+        self
+    }
+
     pub async fn run(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
         info!("Worker started for queue: {}", self.queue_name);
 
@@ -110,6 +131,23 @@ where
     }
 
     async fn process_jobs(&self) -> Result<()> {
+        // Check rate limit before dequeuing jobs
+        if let Some(ref rate_limiter) = self.rate_limiter {
+            // Check if we can process a job (non-blocking)
+            if !rate_limiter.check() {
+                debug!(
+                    "Rate limit exceeded for queue: {}, waiting before retry",
+                    self.queue_name
+                );
+                // Wait for the rate limiter to allow processing
+                if let Err(e) = rate_limiter.acquire().await {
+                    warn!("Rate limiter error: {}", e);
+                    sleep(self.poll_interval).await;
+                    return Ok(());
+                }
+            }
+        }
+
         let job_result = if let Some(ref weights) = self.priority_weights {
             // Use priority-aware dequeuing
             self.queue
@@ -134,7 +172,15 @@ where
             }
             Err(e) => {
                 error!("Error dequeuing job: {}", e);
-                sleep(self.poll_interval).await;
+                
+                // If throttle config specifies backoff on error, apply it
+                let backoff_duration = if let Some(ref throttle_config) = self.throttle_config {
+                    throttle_config.backoff_on_error.unwrap_or(self.poll_interval)
+                } else {
+                    self.poll_interval
+                };
+                
+                sleep(backoff_duration).await;
             }
         }
 
@@ -606,5 +652,148 @@ mod tests {
         let effective_timeout_default =
             job_without_timeout.timeout.or(Some(worker_default_timeout));
         assert_eq!(effective_timeout_default, Some(worker_default_timeout)); // Worker default used
+    }
+
+    #[test]
+    fn test_worker_rate_limit_configuration() {
+        use crate::rate_limit::RateLimit;
+
+        // Test rate limit configuration
+        let rate_limit = RateLimit::per_second(10).with_burst_limit(20);
+        
+        assert_eq!(rate_limit.rate, 10);
+        assert_eq!(rate_limit.burst_limit, 20);
+        assert_eq!(rate_limit.per, Duration::from_secs(1));
+
+        // Test different time windows
+        let per_minute = RateLimit::per_minute(60);
+        assert_eq!(per_minute.rate, 60);
+        assert_eq!(per_minute.per, Duration::from_secs(60));
+
+        let per_hour = RateLimit::per_hour(3600);
+        assert_eq!(per_hour.rate, 3600);
+        assert_eq!(per_hour.per, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn test_throttle_config_configuration() {
+        use crate::rate_limit::ThrottleConfig;
+
+        let throttle_config = ThrottleConfig::new()
+            .max_concurrent(5)
+            .rate_per_minute(100)
+            .backoff_on_error(Duration::from_secs(30))
+            .enabled(true);
+
+        assert_eq!(throttle_config.max_concurrent, Some(5));
+        assert_eq!(throttle_config.rate_per_minute, Some(100));
+        assert_eq!(throttle_config.backoff_on_error, Some(Duration::from_secs(30)));
+        assert!(throttle_config.enabled);
+
+        // Test rate limit conversion
+        let rate_limit = throttle_config.to_rate_limit().unwrap();
+        assert_eq!(rate_limit.rate, 100);
+        assert_eq!(rate_limit.per, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_integration() {
+        use crate::rate_limit::{RateLimit, RateLimiter};
+
+        let rate_limit = RateLimit::per_second(5); // 5 operations per second
+        let rate_limiter = RateLimiter::new(rate_limit);
+
+        // Should initially allow operations
+        assert!(rate_limiter.try_acquire());
+        assert!(rate_limiter.try_acquire());
+        assert!(rate_limiter.try_acquire());
+        assert!(rate_limiter.try_acquire());
+        assert!(rate_limiter.try_acquire());
+
+        // Should block after consuming all tokens
+        assert!(!rate_limiter.try_acquire());
+
+        // Test acquire method (will wait for token refill)
+        let start = std::time::Instant::now();
+        rate_limiter.acquire().await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Should have waited some time for token refill (but not too long due to high test rate)
+        assert!(elapsed < Duration::from_millis(500)); // Should be fast for this test rate
+    }
+
+    #[test]
+    fn test_worker_backoff_configuration() {
+        use crate::rate_limit::ThrottleConfig;
+
+        // Test that backoff configuration is properly handled
+        let throttle_config = ThrottleConfig::new()
+            .backoff_on_error(Duration::from_secs(60));
+
+        assert_eq!(throttle_config.backoff_on_error, Some(Duration::from_secs(60)));
+
+        // Test default poll interval fallback
+        let poll_interval = Duration::from_secs(1);
+        let backoff_duration = throttle_config.backoff_on_error.unwrap_or(poll_interval);
+        assert_eq!(backoff_duration, Duration::from_secs(60));
+
+        // Test with no backoff configured
+        let no_backoff_config = ThrottleConfig::new();
+        let backoff_duration = no_backoff_config.backoff_on_error.unwrap_or(poll_interval);
+        assert_eq!(backoff_duration, poll_interval);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_token_availability() {
+        use crate::rate_limit::{RateLimit, RateLimiter};
+
+        let rate_limit = RateLimit::per_second(10); // 10 tokens per second
+        let rate_limiter = RateLimiter::new(rate_limit);
+
+        // Check initial token availability
+        let initial_tokens = rate_limiter.available_tokens();
+        assert_eq!(initial_tokens, 10.0); // Should start with full burst capacity
+
+        // Consume some tokens
+        assert!(rate_limiter.try_acquire());
+        assert!(rate_limiter.try_acquire());
+
+        // Check remaining tokens
+        let remaining_tokens = rate_limiter.available_tokens();
+        assert_eq!(remaining_tokens, 8.0);
+    }
+
+    #[test]
+    fn test_rate_limit_edge_cases() {
+        use crate::rate_limit::RateLimit;
+
+        // Test very low rate
+        let low_rate = RateLimit::per_hour(1);
+        assert_eq!(low_rate.rate, 1);
+        assert_eq!(low_rate.per, Duration::from_secs(3600));
+
+        // Test very high rate
+        let high_rate = RateLimit::per_second(1000);
+        assert_eq!(high_rate.rate, 1000);
+        assert_eq!(high_rate.burst_limit, 1000);
+
+        // Test custom burst limit
+        let custom_burst = RateLimit::per_second(10).with_burst_limit(50);
+        assert_eq!(custom_burst.burst_limit, 50);
+    }
+
+    #[test]
+    fn test_throttle_config_defaults() {
+        use crate::rate_limit::ThrottleConfig;
+
+        let default_config = ThrottleConfig::default();
+        assert!(default_config.enabled);
+        assert!(default_config.max_concurrent.is_none());
+        assert!(default_config.rate_per_minute.is_none());
+        assert!(default_config.backoff_on_error.is_none());
+
+        let new_config = ThrottleConfig::new();
+        assert_eq!(new_config.enabled, default_config.enabled);
+        assert_eq!(new_config.max_concurrent, default_config.max_concurrent);
     }
 }

@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2025-06-26
+
+### Added
+- **🚀 Comprehensive Rate Limiting & Throttling System**
+  - `RateLimit` struct with flexible time windows: `per_second()`, `per_minute()`, `per_hour()`
+  - Configurable burst limits with `with_burst_limit()` for handling traffic spikes
+  - Token bucket algorithm implementation for efficient and precise rate limiting
+  - `RateLimiter` with both blocking (`acquire()`) and non-blocking (`try_acquire()`) token acquisition
+
+- **⚖️ Advanced Worker Rate Limiting**
+  - Worker-level rate limiting with `with_rate_limit()` configuration method
+  - `with_throttle_config()` for advanced throttling with error backoff
+  - Automatic rate limit enforcement in job processing loop
+  - Configurable backoff periods when rate limits are exceeded or errors occur
+
+- **🎛️ Queue-Level Throttling Configuration**
+  - `ThrottleConfig` for queue-specific throttling policies
+  - Maximum concurrent job limits per queue
+  - Rate limiting with automatic conversion from throttle configs
+  - Error backoff configuration for resilient job processing
+  - In-memory throttling configuration storage with async access
+
+- **🔧 Production-Ready Features**
+  - Token availability monitoring for operational visibility
+  - Rate limiter cloning for shared rate limits across workers
+  - Integration with existing timeout and statistics systems
+  - Graceful handling of rate limit exhaustion with intelligent waiting
+
+- **🧪 Comprehensive Testing Suite**
+  - 17 rate limiting specific unit tests covering all functionality
+  - Token bucket algorithm validation and edge case testing
+  - Rate limiter integration tests with async behavior verification
+  - Worker integration tests ensuring seamless rate limiting integration
+  - Performance and timing validation for production reliability
+
+- **📖 Enhanced Documentation and Examples**
+  - Updated PostgreSQL example demonstrating worker and queue-level rate limiting
+  - Rate limiting configuration examples with realistic scenarios
+  - Throttling configuration with burst support and error handling
+  - Statistics integration showing rate limiting effects in monitoring
+
+### Enhanced
+- Extended `DatabaseQueue` trait with throttling configuration methods
+- Enhanced worker error handling with configurable backoff periods
+- Updated package exports to include all rate limiting types
+- Improved example documentation with rate limiting best practices
+
+### Technical Implementation
+- **Token Bucket Algorithm**: Efficient rate limiting with configurable capacity and refill rates
+- **Async-First Design**: Non-blocking rate limiting with `tokio::time::timeout` integration
+- **Memory Efficient**: Shared rate limiters with `Arc<Mutex<TokenBucket>>` for concurrent access
+- **Error Resilience**: Graceful degradation when rate limiters encounter errors
+- **Backward Compatibility**: All existing functionality preserved, rate limiting is opt-in
+
+### Breaking Changes
+- None - all changes are backward compatible with existing deployments
+
 ## [0.4.0] - 2025-06-26
 
 ### Added

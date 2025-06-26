@@ -19,6 +19,9 @@ pub enum HammerworkError {
 
     #[error("Queue error: {message}")]
     Queue { message: String },
+
+    #[error("Rate limit error: {message}")]
+    RateLimit { message: String },
 }
 
 #[cfg(test)]
