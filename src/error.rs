@@ -11,6 +11,9 @@ pub enum HammerworkError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    #[error("UUID parsing error: {0}")]
+    UuidParsing(#[from] uuid::Error),
+
     #[error("Worker error: {message}")]
     Worker { message: String },
 

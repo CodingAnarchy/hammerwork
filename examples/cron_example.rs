@@ -2,7 +2,7 @@ use hammerwork::{
     cron::{CronSchedule, presets},
     job::Job,
     queue::JobQueue,
-    stats::{InMemoryStatsCollector, StatisticsCollector, JobEvent, JobEventType},
+    stats::{InMemoryStatsCollector, StatisticsCollector},
     worker::{Worker, WorkerPool},
     Result,
 };
@@ -10,7 +10,6 @@ use serde_json::json;
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
 use tracing::info;
-use chrono::Utc;
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {

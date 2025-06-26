@@ -250,23 +250,23 @@ pub mod postgres {
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                 "#
             )
-            .bind(&job.id)
+            .bind(job.id)
             .bind(&job.queue_name)
             .bind(&job.payload)
             .bind(serde_json::to_string(&job.status)?)
-            .bind(&job.attempts)
-            .bind(&job.max_attempts)
+            .bind(job.attempts)
+            .bind(job.max_attempts)
             .bind(job.timeout.map(|t| t.as_secs() as i32))
-            .bind(&job.created_at)
-            .bind(&job.scheduled_at)
-            .bind(&job.started_at)
-            .bind(&job.completed_at)
-            .bind(&job.failed_at)
-            .bind(&job.timed_out_at)
+            .bind(job.created_at)
+            .bind(job.scheduled_at)
+            .bind(job.started_at)
+            .bind(job.completed_at)
+            .bind(job.failed_at)
+            .bind(job.timed_out_at)
             .bind(&job.error_message)
             .bind(&job.cron_schedule)
-            .bind(&job.next_run_at)
-            .bind(&job.recurring)
+            .bind(job.next_run_at)
+            .bind(job.recurring)
             .bind(&job.timezone)
             .execute(&self.pool)
             .await?;
@@ -784,7 +784,7 @@ pub mod postgres {
 pub mod mysql {
     use super::*;
     use crate::job::JobStatus;
-    use sqlx::{MySql, Row, FromRow};
+    use sqlx::{MySql, FromRow};
     use std::time::Duration;
 
     #[derive(FromRow)]
@@ -929,19 +929,19 @@ pub mod mysql {
             .bind(&job.queue_name)
             .bind(&job.payload)
             .bind(serde_json::to_string(&job.status)?)
-            .bind(&job.attempts)
-            .bind(&job.max_attempts)
+            .bind(job.attempts)
+            .bind(job.max_attempts)
             .bind(job.timeout.map(|t| t.as_secs() as i32))
-            .bind(&job.created_at)
-            .bind(&job.scheduled_at)
-            .bind(&job.started_at)
-            .bind(&job.completed_at)
-            .bind(&job.failed_at)
-            .bind(&job.timed_out_at)
+            .bind(job.created_at)
+            .bind(job.scheduled_at)
+            .bind(job.started_at)
+            .bind(job.completed_at)
+            .bind(job.failed_at)
+            .bind(job.timed_out_at)
             .bind(&job.error_message)
             .bind(&job.cron_schedule)
-            .bind(&job.next_run_at)
-            .bind(&job.recurring)
+            .bind(job.next_run_at)
+            .bind(job.recurring)
             .bind(&job.timezone)
             .execute(&self.pool)
             .await?;
@@ -954,7 +954,7 @@ pub mod mysql {
             // This is a simplified version - in production you might want advisory locks
             let mut tx = self.pool.begin().await?;
 
-            let row = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(
+            let row = sqlx::query_as::<_, JobRow>(
                 r#"
                 SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone
                 FROM hammerwork_jobs 
@@ -972,64 +972,26 @@ pub mod mysql {
             .fetch_optional(&mut *tx)
             .await?;
 
-            if let Some((
-                id_str,
-                queue_name,
-                payload,
-                _status,
-                attempts,
-                max_attempts,
-                timeout_seconds,
-                created_at,
-                scheduled_at,
-                started_at,
-                completed_at,
-                failed_at,
-                timed_out_at,
-                error_message,
-                cron_schedule,
-                next_run_at,
-                recurring,
-                timezone,
-            )) = row
-            {
-                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
-                    crate::error::HammerworkError::Queue {
-                        message: "Invalid UUID".to_string(),
-                    }
-                })?;
+            if let Some(job_row) = row {
+                let _job_id = uuid::Uuid::parse_str(&job_row.id)?;
 
                 sqlx::query(
                     "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1 WHERE id = ?"
                 )
                 .bind(serde_json::to_string(&JobStatus::Running)?)
                 .bind(Utc::now())
-                .bind(&id_str)
+                .bind(&job_row.id)
                 .execute(&mut *tx)
                 .await?;
 
                 tx.commit().await?;
 
-                Ok(Some(Job {
-                    id: job_id,
-                    queue_name,
-                    payload,
-                    status: JobStatus::Running,
-                    attempts: attempts + 1,
-                    max_attempts,
-                    created_at,
-                    scheduled_at,
-                    started_at: Some(Utc::now()),
-                    completed_at,
-                    failed_at,
-                    timed_out_at,
-                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                    error_message,
-                    cron_schedule,
-                    next_run_at,
-                    recurring,
-                    timezone,
-                }))
+                let mut job = job_row.into_job()?;
+                job.status = JobStatus::Running;
+                job.attempts += 1;
+                job.started_at = Some(Utc::now());
+
+                Ok(Some(job))
             } else {
                 tx.rollback().await?;
                 Ok(None)
@@ -1075,62 +1037,16 @@ pub mod mysql {
         }
 
         async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
-            let row = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(
+            let row = sqlx::query_as::<_, JobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone FROM hammerwork_jobs WHERE id = ?"
             )
             .bind(job_id.to_string())
             .fetch_optional(&self.pool)
             .await?;
 
-            if let Some((
-                id_str,
-                queue_name,
-                payload,
-                status,
-                attempts,
-                max_attempts,
-                timeout_seconds,
-                created_at,
-                scheduled_at,
-                started_at,
-                completed_at,
-                failed_at,
-                timed_out_at,
-                error_message,
-                cron_schedule,
-                next_run_at,
-                recurring,
-                timezone,
-            )) = row
-            {
-                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
-                    crate::error::HammerworkError::Queue {
-                        message: "Invalid UUID".to_string(),
-                    }
-                })?;
-
-                Ok(Some(Job {
-                    id: job_id,
-                    queue_name,
-                    payload,
-                    status: serde_json::from_str(&status)?,
-                    attempts,
-                    max_attempts,
-                    created_at,
-                    scheduled_at,
-                    started_at,
-                    completed_at,
-                    failed_at,
-                    timed_out_at,
-                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                    error_message,
-                    cron_schedule,
-                    next_run_at,
-                    recurring,
-                    timezone,
-                }))
-            } else {
-                Ok(None)
+            match row {
+                Some(job_row) => Ok(Some(job_row.into_job()?)),
+                None => Ok(None),
             }
         }
 
@@ -1176,7 +1092,7 @@ pub mod mysql {
             let limit = limit.unwrap_or(100) as i64;
             let offset = offset.unwrap_or(0) as i64;
             
-            let rows = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)>(
+            let rows = sqlx::query_as::<_, DeadJobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
             )
             .bind(serde_json::to_string(&JobStatus::Dead)?)
@@ -1185,40 +1101,14 @@ pub mod mysql {
             .fetch_all(&self.pool)
             .await?;
 
-            let mut jobs = Vec::new();
-            for (id_str, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message) in rows {
-                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
-                    crate::error::HammerworkError::Queue {
-                        message: "Invalid UUID".to_string(),
-                    }
-                })?;
-
-                jobs.push(Job {
-                    id: job_id,
-                    queue_name,
-                    payload,
-                    status: serde_json::from_str(&status).unwrap_or(JobStatus::Dead),
-                    attempts,
-                    max_attempts,
-                    created_at,
-                    scheduled_at,
-                    started_at,
-                    completed_at,
-                    failed_at,
-                    timed_out_at,
-                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                    error_message,
-                });
-            }
-
-            Ok(jobs)
+            rows.into_iter().map(|row| row.into_job()).collect()
         }
 
         async fn get_dead_jobs_by_queue(&self, queue_name: &str, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>> {
             let limit = limit.unwrap_or(100) as i64;
             let offset = offset.unwrap_or(0) as i64;
             
-            let rows = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>)>(
+            let rows = sqlx::query_as::<_, DeadJobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = ? AND queue_name = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
             )
             .bind(serde_json::to_string(&JobStatus::Dead)?)
@@ -1228,33 +1118,7 @@ pub mod mysql {
             .fetch_all(&self.pool)
             .await?;
 
-            let mut jobs = Vec::new();
-            for (id_str, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message) in rows {
-                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
-                    crate::error::HammerworkError::Queue {
-                        message: "Invalid UUID".to_string(),
-                    }
-                })?;
-
-                jobs.push(Job {
-                    id: job_id,
-                    queue_name,
-                    payload,
-                    status: serde_json::from_str(&status).unwrap_or(JobStatus::Dead),
-                    attempts,
-                    max_attempts,
-                    created_at,
-                    scheduled_at,
-                    started_at,
-                    completed_at,
-                    failed_at,
-                    timed_out_at,
-                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                    error_message,
-                });
-            }
-
-            Ok(jobs)
+            rows.into_iter().map(|row| row.into_job()).collect()
         }
 
         async fn retry_dead_job(&self, job_id: JobId) -> Result<()> {
@@ -1498,51 +1362,21 @@ pub mod mysql {
             };
 
             let rows = if let Some(queue) = queue_name {
-                sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(query)
+                sqlx::query_as::<_, JobRow>(query)
                     .bind(queue)
                     .bind(Utc::now())
                     .bind(serde_json::to_string(&JobStatus::Pending)?)
                     .fetch_all(&self.pool)
                     .await?
             } else {
-                sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(query)
+                sqlx::query_as::<_, JobRow>(query)
                     .bind(Utc::now())
                     .bind(serde_json::to_string(&JobStatus::Pending)?)
                     .fetch_all(&self.pool)
                     .await?
             };
 
-            let mut jobs = Vec::new();
-            for (id_str, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone) in rows {
-                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
-                    crate::error::HammerworkError::Queue {
-                        message: "Invalid UUID".to_string(),
-                    }
-                })?;
-
-                jobs.push(Job {
-                    id: job_id,
-                    queue_name,
-                    payload,
-                    status: serde_json::from_str(&status).unwrap_or(JobStatus::Pending),
-                    attempts,
-                    max_attempts,
-                    created_at,
-                    scheduled_at,
-                    started_at,
-                    completed_at,
-                    failed_at,
-                    timed_out_at,
-                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                    error_message,
-                    cron_schedule,
-                    next_run_at,
-                    recurring,
-                    timezone,
-                });
-            }
-
-            Ok(jobs)
+            rows.into_iter().map(|row| row.into_job()).collect()
         }
 
         async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()> {
@@ -1572,44 +1406,14 @@ pub mod mysql {
         }
 
         async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
-            let rows = sqlx::query_as::<_, (String, String, serde_json::Value, String, i32, i32, Option<i32>, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>, Option<String>, Option<DateTime<Utc>>, bool, Option<String>)>(
+            let rows = sqlx::query_as::<_, JobRow>(
                 "SELECT id, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone FROM hammerwork_jobs WHERE queue_name = ? AND recurring = TRUE ORDER BY next_run_at ASC"
             )
             .bind(queue_name)
             .fetch_all(&self.pool)
             .await?;
 
-            let mut jobs = Vec::new();
-            for (id_str, queue_name, payload, status, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone) in rows {
-                let job_id = uuid::Uuid::parse_str(&id_str).map_err(|_| {
-                    crate::error::HammerworkError::Queue {
-                        message: "Invalid UUID".to_string(),
-                    }
-                })?;
-
-                jobs.push(Job {
-                    id: job_id,
-                    queue_name,
-                    payload,
-                    status: serde_json::from_str(&status).unwrap_or(JobStatus::Pending),
-                    attempts,
-                    max_attempts,
-                    created_at,
-                    scheduled_at,
-                    started_at,
-                    completed_at,
-                    failed_at,
-                    timed_out_at,
-                    timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                    error_message,
-                    cron_schedule,
-                    next_run_at,
-                    recurring,
-                    timezone,
-                });
-            }
-
-            Ok(jobs)
+            rows.into_iter().map(|row| row.into_job()).collect()
         }
 
         async fn disable_recurring_job(&self, job_id: JobId) -> Result<()> {

@@ -57,3 +57,15 @@ mysql = ["sqlx/mysql"]
 [dev-dependencies]
 tokio-test = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "postgres_example"
+required-features = ["postgres"]
+
+[[example]]
+name = "mysql_example"
+required-features = ["mysql"]
+
+[[example]]
+name = "cron_example"
+required-features = ["postgres"]
