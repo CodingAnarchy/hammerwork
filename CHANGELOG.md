@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2025-06-26
+
+### Added
+- **Comprehensive Job Timeout Functionality**
+  - `TimedOut` job status for jobs that exceed their timeout duration
+  - Per-job timeout configuration with `Job::with_timeout()` builder method
+  - Worker-level default timeouts with `Worker::with_default_timeout()`
+  - Timeout detection using `tokio::time::timeout` for efficient async timeout handling
+  - `timeout` and `timed_out_at` fields added to `Job` struct for complete timeout tracking
+  - Automatic timeout event recording in statistics with `JobEventType::TimedOut`
+
+- **Enhanced Database Support for Timeouts**
+  - `timeout_seconds` and `timed_out_at` columns added to database schema
+  - `mark_job_timed_out()` method added to `DatabaseQueue` trait
+  - Complete timeout support in both PostgreSQL and MySQL implementations
+  - Database queries updated to handle timeout fields in job lifecycle operations
+  - Timeout counts integrated into queue statistics with `timed_out_count` field
+
+- **Timeout Statistics and Monitoring**
+  - `timed_out` field added to `JobStatistics` for timeout event tracking
+  - Timeout events included in error rate calculations for comprehensive metrics
+  - `timed_out_count` added to `QueueStats` for per-queue timeout monitoring
+  - Enhanced statistics display in examples showing timeout metrics
+  - Timeout event processing in `InMemoryStatsCollector`
+
+- **Comprehensive Testing**
+  - 14 new comprehensive tests covering timeout functionality
+  - Job timeout detection logic testing with edge cases
+  - Worker timeout configuration and precedence testing
+  - Timeout statistics integration testing
+  - Database operation interface testing for timeout methods
+  - Job lifecycle testing with timeout scenarios
+
+- **Enhanced Examples**
+  - Updated PostgreSQL example with timeout configuration demonstrations
+  - Updated MySQL example with various timeout scenarios (10s, 60s, 600s)
+  - Job timeout precedence examples (job-specific vs worker defaults)
+  - Priority-based timeout configuration examples (VIP vs standard jobs)
+  - Comprehensive timeout statistics display in both examples
+
+### Technical Implementation
+- Timeout precedence: job-specific timeout takes priority over worker default timeout
+- Graceful timeout handling: jobs are marked as `TimedOut` without affecting other jobs
+- Async timeout detection: uses `tokio::time::timeout` for efficient resource management
+- Database consistency: timeout information persisted and retrievable across job lifecycle
+- Statistics integration: timeout events fully integrated into existing statistics framework
+
 ## [0.2.1] - 2025-06-25
 
 ### Removed
@@ -107,6 +154,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## Release Links
+- [0.2.2](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.2.2)
 - [0.2.1](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.2.1)
 - [0.2.0](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.2.0)
 - [0.1.0](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.1.0)

@@ -86,15 +86,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
     });
 
-    // Create workers for different queues with statistics collection
+    // Create workers for different queues with statistics collection and timeout configuration
     let image_worker = Worker::new(queue.clone(), "image_processing".to_string(), image_handler)
         .with_poll_interval(tokio::time::Duration::from_secs(1))
         .with_max_retries(2)
+        .with_default_timeout(tokio::time::Duration::from_secs(120)) // 2-minute timeout for image processing
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let email_worker = Worker::new(queue.clone(), "email_queue".to_string(), email_handler)
         .with_poll_interval(tokio::time::Duration::from_millis(500))
         .with_max_retries(3)
+        .with_default_timeout(tokio::time::Duration::from_secs(30)) // 30-second timeout for emails
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let mut worker_pool = WorkerPool::new()
@@ -107,7 +109,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     {
         use hammerwork::queue::DatabaseQueue;
 
-        // Create various test jobs including some that will fail
+        // Create various test jobs with timeout configurations
         let successful_image_job = Job::new(
             "image_processing".to_string(),
             json!({
@@ -115,7 +117,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "resize": "800x600",
                 "format": "webp"
             }),
-        );
+        ).with_timeout(std::time::Duration::from_secs(60)); // Custom 1-minute timeout for this job
 
         let failing_image_job = Job::new(
             "image_processing".to_string(),
@@ -124,7 +126,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "resize": "800x600",
                 "format": "webp"
             }),
-        );
+        ); // Uses worker default timeout (2 minutes)
 
         let email_job = Job::new(
             "email_queue".to_string(),
@@ -133,7 +135,31 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "subject": "Your image has been processed",
                 "template": "image_ready"
             }),
-        );
+        ).with_timeout(std::time::Duration::from_secs(10)); // Quick timeout for email sending
+
+        // High-priority email with longer timeout and more retries
+        let priority_email_job = Job::new(
+            "email_queue".to_string(),
+            json!({
+                "to": "vip@example.com",
+                "subject": "VIP Image Processing Complete",
+                "template": "vip_notification",
+                "priority": "high"
+            }),
+        ).with_timeout(std::time::Duration::from_secs(45)) // Longer timeout for VIP
+         .with_max_attempts(5); // More retry attempts for important emails
+
+        // Large image processing job with extended timeout
+        let large_image_job = Job::new(
+            "image_processing".to_string(),
+            json!({
+                "image_url": "https://example.com/huge_photo.raw",
+                "resize": "4K",
+                "format": "png",
+                "effects": ["sharpen", "color_correct", "denoise"]
+            }),
+        ).with_timeout(std::time::Duration::from_secs(600)) // 10-minute timeout for large processing
+         .with_max_attempts(2); // Fewer retries for expensive operations
 
         // Schedule a delayed job
         let delayed_job = Job::with_delay(
@@ -149,38 +175,49 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let job1_id = queue.enqueue(successful_image_job).await?;
         let job2_id = queue.enqueue(failing_image_job).await?;
         let job3_id = queue.enqueue(email_job).await?;
-        let job4_id = queue.enqueue(delayed_job).await?;
+        let job4_id = queue.enqueue(priority_email_job).await?;
+        let job5_id = queue.enqueue(large_image_job).await?;
+        let job6_id = queue.enqueue(delayed_job).await?;
 
-        info!("Enqueued test jobs: {}, {}, {}, {}", job1_id, job2_id, job3_id, job4_id);
+        info!("Enqueued test jobs with various timeout configurations:");
+        info!("  {} - image processing with 60s timeout", job1_id);
+        info!("  {} - failing image job (uses worker default 2min timeout)", job2_id);
+        info!("  {} - email with 10s timeout", job3_id);
+        info!("  {} - VIP email with 45s timeout", job4_id);
+        info!("  {} - large image with 10min timeout", job5_id);
+        info!("  {} - delayed email (1min delay)", job6_id);
 
         // Let jobs process for a bit
         tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
 
-        // Demonstrate statistics collection
-        info!("=== Job Processing Statistics ===");
+        // Demonstrate statistics collection with timeout tracking
+        info!("=== Job Processing Statistics (Including Timeouts) ===");
         let system_stats = stats_collector.get_system_statistics(std::time::Duration::from_secs(300)).await?;
-        info!("System Stats - Total: {}, Completed: {}, Failed: {}, Dead: {}, Error Rate: {:.2}%",
+        info!("System Stats - Total: {}, Completed: {}, Failed: {}, Dead: {}, Timed Out: {}, Error Rate: {:.2}%",
             system_stats.total_processed,
             system_stats.completed,
             system_stats.failed,
             system_stats.dead,
+            system_stats.timed_out,
             system_stats.error_rate * 100.0
         );
 
         // Get statistics for each queue
         let image_stats = stats_collector.get_queue_statistics("image_processing", std::time::Duration::from_secs(300)).await?;
-        info!("Image Processing Stats - Total: {}, Completed: {}, Failed: {}, Avg Time: {:.2}ms",
+        info!("Image Processing Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Time: {:.2}ms",
             image_stats.total_processed,
             image_stats.completed,
             image_stats.failed,
+            image_stats.timed_out,
             image_stats.avg_processing_time_ms
         );
 
         let email_stats = stats_collector.get_queue_statistics("email_queue", std::time::Duration::from_secs(300)).await?;
-        info!("Email Queue Stats - Total: {}, Completed: {}, Failed: {}, Avg Time: {:.2}ms",
+        info!("Email Queue Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Time: {:.2}ms",
             email_stats.total_processed,
             email_stats.completed,
             email_stats.failed,
+            email_stats.timed_out,
             email_stats.avg_processing_time_ms
         );
 
@@ -204,14 +241,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             dead_summary.dead_jobs_by_queue
         );
 
-        // Show queue statistics from database
+        // Show queue statistics from database (including timeout counts)
         let all_queue_stats = queue.get_all_queue_stats().await?;
         for queue_stat in all_queue_stats {
-            info!("Queue '{}' - Pending: {}, Running: {}, Dead: {}, Completed: {}",
+            info!("Queue '{}' - Pending: {}, Running: {}, Dead: {}, Timed Out: {}, Completed: {}",
                 queue_stat.queue_name,
                 queue_stat.pending_count,
                 queue_stat.running_count,
                 queue_stat.dead_count,
+                queue_stat.timed_out_count,
                 queue_stat.completed_count
             );
         }
@@ -226,7 +264,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    info!("MySQL example completed successfully with statistics and dead job management.");
+    info!("MySQL example completed successfully!");
+    info!("Demonstrated features:");
+    info!("  ✓ Job timeout configuration (per-job and worker defaults)");
+    info!("  ✓ Various timeout scenarios (10s email, 60s image, 10min large jobs)");
+    info!("  ✓ Timeout statistics tracking and monitoring");
+    info!("  ✓ Dead job management and error analysis");
+    info!("  ✓ Comprehensive queue statistics with timeout counts");
+    info!("");
+    info!("Timeout Features Demonstrated:");
+    info!("  • Worker default timeouts (30s for email, 2min for image processing)");
+    info!("  • Job-specific timeouts (10s, 45s, 60s, 600s examples)");
+    info!("  • Priority-based timeout configuration (VIP vs standard jobs)");
+    info!("  • Timeout event tracking in statistics");
+    info!("  • Database timeout count tracking");
+    info!("");
     info!("In a real application, you would start the worker pool to run indefinitely:");
     info!("worker_pool.start().await?;");
 

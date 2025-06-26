@@ -13,6 +13,8 @@ pub struct JobStatistics {
     pub failed: u64,
     /// Number of dead jobs (exhausted all retries)
     pub dead: u64,
+    /// Number of timed out jobs
+    pub timed_out: u64,
     /// Number of currently running jobs
     pub running: u64,
     /// Average processing time in milliseconds
@@ -23,7 +25,7 @@ pub struct JobStatistics {
     pub max_processing_time_ms: u64,
     /// Job throughput per minute
     pub throughput_per_minute: f64,
-    /// Error rate (failed jobs / total processed)
+    /// Error rate (failed + dead + timed out jobs / total processed)
     pub error_rate: f64,
     /// Time window these statistics cover
     pub time_window: Duration,
@@ -38,6 +40,7 @@ impl Default for JobStatistics {
             completed: 0,
             failed: 0,
             dead: 0,
+            timed_out: 0,
             running: 0,
             avg_processing_time_ms: 0.0,
             min_processing_time_ms: 0,
@@ -61,6 +64,8 @@ pub struct QueueStats {
     pub running_count: u64,
     /// Number of dead jobs in the queue
     pub dead_count: u64,
+    /// Number of timed out jobs in the queue
+    pub timed_out_count: u64,
     /// Number of completed jobs (may be pruned)
     pub completed_count: u64,
     /// Job processing statistics
@@ -100,6 +105,7 @@ pub enum JobEventType {
     Failed,
     Retried,
     Dead,
+    TimedOut,
 }
 
 /// Trait for collecting and storing job statistics
@@ -190,6 +196,7 @@ impl InMemoryStatsCollector {
         let completed = events.iter().filter(|e| e.event_type == JobEventType::Completed).count() as u64;
         let failed = events.iter().filter(|e| e.event_type == JobEventType::Failed).count() as u64;
         let dead = events.iter().filter(|e| e.event_type == JobEventType::Dead).count() as u64;
+        let timed_out = events.iter().filter(|e| e.event_type == JobEventType::TimedOut).count() as u64;
         let running = events.iter().filter(|e| e.event_type == JobEventType::Started).count() as u64;
 
         let processing_times: Vec<u64> = events
@@ -209,7 +216,7 @@ impl InMemoryStatsCollector {
             };
 
         let error_rate = if total_processed > 0 {
-            (failed + dead) as f64 / total_processed as f64
+            (failed + dead + timed_out) as f64 / total_processed as f64
         } else {
             0.0
         };
@@ -225,6 +232,7 @@ impl InMemoryStatsCollector {
             completed,
             failed,
             dead,
+            timed_out,
             running,
             avg_processing_time_ms,
             min_processing_time_ms,
@@ -305,6 +313,7 @@ impl StatisticsCollector for InMemoryStatsCollector {
                 pending_count: 0, // Would be filled by database implementation
                 running_count: statistics.running,
                 dead_count: statistics.dead,
+                timed_out_count: statistics.timed_out,
                 completed_count: statistics.completed,
                 statistics,
             });
@@ -348,6 +357,7 @@ mod tests {
         assert_eq!(stats.completed, 0);
         assert_eq!(stats.failed, 0);
         assert_eq!(stats.dead, 0);
+        assert_eq!(stats.timed_out, 0);
         assert_eq!(stats.error_rate, 0.0);
     }
 
@@ -484,7 +494,7 @@ mod tests {
         assert_eq!(stats.avg_processing_time_ms, 1000.0); // (1500 + 500) / 2
         assert_eq!(stats.min_processing_time_ms, 500);
         assert_eq!(stats.max_processing_time_ms, 1500);
-        assert_eq!(stats.error_rate, 0.4); // (1 failed + 1 dead) / 5 total
+        assert_eq!(stats.error_rate, 0.4); // (1 failed + 1 dead + 0 timed out) / 5 total
     }
 
     #[tokio::test]
@@ -654,6 +664,7 @@ mod tests {
             completed: 80,
             failed: 15,
             dead: 5,
+            timed_out: 2,
             running: 2,
             avg_processing_time_ms: 1500.0,
             min_processing_time_ms: 100,
@@ -669,6 +680,7 @@ mod tests {
             pending_count: 5,
             running_count: 2,
             dead_count: 5,
+            timed_out_count: 3,
             completed_count: 80,
             statistics,
         };
@@ -677,8 +689,65 @@ mod tests {
         assert_eq!(queue_stats.pending_count, 5);
         assert_eq!(queue_stats.running_count, 2);
         assert_eq!(queue_stats.dead_count, 5);
+        assert_eq!(queue_stats.timed_out_count, 3);
         assert_eq!(queue_stats.completed_count, 80);
         assert_eq!(queue_stats.statistics.total_processed, 100);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_statistics() {
+        let collector = InMemoryStatsCollector::new_default();
+        
+        // Record events including timeout
+        let events = vec![
+            JobEvent {
+                job_id: uuid::Uuid::new_v4(),
+                queue_name: "test_queue".to_string(),
+                event_type: JobEventType::Started,
+                processing_time_ms: None,
+                error_message: None,
+                timestamp: Utc::now(),
+            },
+            JobEvent {
+                job_id: uuid::Uuid::new_v4(),
+                queue_name: "test_queue".to_string(),
+                event_type: JobEventType::Completed,
+                processing_time_ms: Some(1000),
+                error_message: None,
+                timestamp: Utc::now(),
+            },
+            JobEvent {
+                job_id: uuid::Uuid::new_v4(),
+                queue_name: "test_queue".to_string(),
+                event_type: JobEventType::TimedOut,
+                processing_time_ms: Some(5000),
+                error_message: Some("Job timed out after 5s".to_string()),
+                timestamp: Utc::now(),
+            },
+            JobEvent {
+                job_id: uuid::Uuid::new_v4(),
+                queue_name: "test_queue".to_string(),
+                event_type: JobEventType::Failed,
+                processing_time_ms: None,
+                error_message: Some("Processing error".to_string()),
+                timestamp: Utc::now(),
+            },
+        ];
+
+        for event in events {
+            collector.record_event(event).await.unwrap();
+        }
+        
+        // Get statistics
+        let stats = collector.get_queue_statistics("test_queue", Duration::from_secs(60)).await.unwrap();
+        
+        assert_eq!(stats.total_processed, 4);
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.timed_out, 1);
+        assert_eq!(stats.running, 1);
+        assert_eq!(stats.error_rate, 0.5); // (1 failed + 1 timed out) / 4 total
+        assert_eq!(stats.avg_processing_time_ms, 3000.0); // (1000 + 5000) / 2
     }
 
     #[test]
@@ -689,6 +758,7 @@ mod tests {
             JobEventType::Failed,
             JobEventType::Retried,
             JobEventType::Dead,
+            JobEventType::TimedOut,
         ];
         
         // Test equality
@@ -696,6 +766,6 @@ mod tests {
         assert_ne!(JobEventType::Started, JobEventType::Completed);
         
         // Test all variants exist
-        assert_eq!(event_types.len(), 5);
+        assert_eq!(event_types.len(), 6);
     }
 }

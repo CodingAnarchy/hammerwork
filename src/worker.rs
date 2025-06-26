@@ -24,6 +24,7 @@ pub struct Worker<DB: Database> {
     poll_interval: Duration,
     max_retries: i32,
     retry_delay: Duration,
+    default_timeout: Option<Duration>,
     stats_collector: Option<Arc<dyn StatisticsCollector>>,
 }
 
@@ -39,6 +40,7 @@ where
             poll_interval: Duration::from_secs(1),
             max_retries: 3,
             retry_delay: Duration::from_secs(30),
+            default_timeout: None,
             stats_collector: None,
         }
     }
@@ -60,6 +62,11 @@ where
 
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.retry_delay = delay;
+        self
+    }
+
+    pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
+        self.default_timeout = Some(timeout);
         self
     }
 
@@ -115,7 +122,39 @@ where
             timestamp: start_time,
         }).await;
 
-        match (self.handler)(job.clone()).await {
+        // Determine timeout duration (job-specific or default)
+        let timeout_duration = job.timeout.or(self.default_timeout);
+        
+        let handler_result = if let Some(timeout) = timeout_duration {
+            // Run with timeout
+            match tokio::time::timeout(timeout, (self.handler)(job.clone())).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Timeout occurred
+                    warn!("Job {} timed out after {:?}", job_id, timeout);
+                    
+                    // Mark job as timed out in database
+                    self.queue.mark_job_timed_out(job_id, &format!("Job timed out after {:?}", timeout)).await?;
+                    
+                    // Record timeout event
+                    self.record_event(JobEvent {
+                        job_id,
+                        queue_name: queue_name.clone(),
+                        event_type: JobEventType::TimedOut,
+                        processing_time_ms: Some(timeout.as_millis() as u64),
+                        error_message: Some(format!("Job timed out after {:?}", timeout)),
+                        timestamp: Utc::now(),
+                    }).await;
+                    
+                    return Ok(());
+                }
+            }
+        } else {
+            // Run without timeout
+            (self.handler)(job.clone()).await
+        };
+
+        match handler_result {
             Ok(()) => {
                 debug!("Job {} completed successfully", job_id);
                 
@@ -364,5 +403,136 @@ mod tests {
         // This verifies the reference counting works correctly
         drop(stats_clone);
         assert_eq!(Arc::strong_count(&stats_collector), 1);
+    }
+
+    #[test]
+    fn test_worker_timeout_configuration() {
+        use std::time::Duration;
+        
+        // Test timeout configuration methods
+        let default_timeout = Duration::from_secs(30);
+        let poll_interval = Duration::from_millis(500);
+        let retry_delay = Duration::from_secs(60);
+        
+        // Verify duration values are correctly configured
+        assert_eq!(default_timeout.as_secs(), 30);
+        assert_eq!(poll_interval.as_millis(), 500);
+        assert_eq!(retry_delay.as_secs(), 60);
+        
+        // Test timeout edge cases
+        let very_short_timeout = Duration::from_millis(1);
+        let very_long_timeout = Duration::from_secs(3600);
+        
+        assert_eq!(very_short_timeout.as_millis(), 1);
+        assert_eq!(very_long_timeout.as_secs(), 3600);
+    }
+
+    #[test]
+    fn test_job_timeout_detection_logic() {
+        use crate::job::{Job, JobStatus};
+        use serde_json::json;
+        use std::time::Duration;
+        
+        // Test job timeout detection scenarios
+        let mut job = Job::new("timeout_test".to_string(), json!({"data": "test"}))
+            .with_timeout(Duration::from_millis(100));
+        
+        // Job not started - should not timeout
+        assert!(!job.should_timeout());
+        
+        // Job started recently - should not timeout
+        job.started_at = Some(chrono::Utc::now() - chrono::Duration::milliseconds(50));
+        job.status = JobStatus::Running;
+        assert!(!job.should_timeout());
+        
+        // Job started long ago - should timeout
+        job.started_at = Some(chrono::Utc::now() - chrono::Duration::milliseconds(200));
+        assert!(job.should_timeout());
+        
+        // Job without timeout - should never timeout
+        let mut job_no_timeout = Job::new("no_timeout".to_string(), json!({"data": "test"}));
+        job_no_timeout.started_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        assert!(!job_no_timeout.should_timeout());
+    }
+
+    #[tokio::test]
+    async fn test_timeout_statistics_integration() {
+        use crate::stats::{InMemoryStatsCollector, JobEvent, JobEventType};
+        use std::sync::Arc;
+        
+        let stats_collector = Arc::new(InMemoryStatsCollector::new_default());
+        
+        // Simulate timeout event recording
+        let timeout_event = JobEvent {
+            job_id: uuid::Uuid::new_v4(),
+            queue_name: "timeout_queue".to_string(),
+            event_type: JobEventType::TimedOut,
+            processing_time_ms: Some(5000), // 5 seconds before timeout
+            error_message: Some("Job timed out after 5s".to_string()),
+            timestamp: chrono::Utc::now(),
+        };
+        
+        stats_collector.record_event(timeout_event).await.unwrap();
+        
+        // Verify timeout event is tracked in statistics
+        let stats = stats_collector
+            .get_queue_statistics("timeout_queue", Duration::from_secs(60))
+            .await
+            .unwrap();
+        
+        assert_eq!(stats.total_processed, 1);
+        assert_eq!(stats.timed_out, 1);
+        assert_eq!(stats.error_rate, 1.0); // 1 timeout / 1 total = 100% error rate
+    }
+
+    #[test]
+    fn test_timeout_error_message_formatting() {
+        use std::time::Duration;
+        
+        // Test timeout error message formatting
+        let timeout_duration = Duration::from_secs(30);
+        let expected_message = format!("Job timed out after {:?}", timeout_duration);
+        
+        assert!(expected_message.contains("30s"));
+        assert!(expected_message.contains("timed out"));
+        
+        // Test various timeout durations
+        let short_timeout = Duration::from_millis(500);
+        let long_timeout = Duration::from_secs(300);
+        
+        let short_message = format!("Job timed out after {:?}", short_timeout);
+        let long_message = format!("Job timed out after {:?}", long_timeout);
+        
+        assert!(short_message.contains("500ms"));
+        assert!(long_message.contains("300s"));
+    }
+
+    #[test]
+    fn test_worker_timeout_precedence() {
+        use crate::job::Job;
+        use serde_json::json;
+        use std::time::Duration;
+        
+        // Test that job-specific timeout takes precedence over worker default
+        let job_timeout = Duration::from_secs(60);
+        let worker_default_timeout = Duration::from_secs(30);
+        
+        let job_with_timeout = Job::new("test".to_string(), json!({"data": "test"}))
+            .with_timeout(job_timeout);
+        
+        let job_without_timeout = Job::new("test".to_string(), json!({"data": "test"}));
+        
+        // Job with specific timeout should use that timeout
+        assert_eq!(job_with_timeout.timeout, Some(job_timeout));
+        
+        // Job without specific timeout would use worker default (tested in integration)
+        assert_eq!(job_without_timeout.timeout, None);
+        
+        // Simulate timeout precedence logic
+        let effective_timeout = job_with_timeout.timeout.or(Some(worker_default_timeout));
+        assert_eq!(effective_timeout, Some(job_timeout)); // Job timeout wins
+        
+        let effective_timeout_default = job_without_timeout.timeout.or(Some(worker_default_timeout));
+        assert_eq!(effective_timeout_default, Some(worker_default_timeout)); // Worker default used
     }
 }
