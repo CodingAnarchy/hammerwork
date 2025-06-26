@@ -114,6 +114,9 @@ pub trait DatabaseQueue: Send + Sync {
 
     /// Get all throttling configurations
     async fn get_all_throttle_configs(&self) -> Result<HashMap<String, ThrottleConfig>>;
+
+    /// Get the current depth (pending job count) for a queue
+    async fn get_queue_depth(&self, queue_name: &str) -> Result<u64>;
 }
 
 pub struct JobQueue<DB: Database> {
@@ -1043,6 +1046,18 @@ pub mod postgres {
         async fn get_all_throttle_configs(&self) -> Result<HashMap<String, ThrottleConfig>> {
             Ok(self.get_all_throttles().await)
         }
+
+        async fn get_queue_depth(&self, queue_name: &str) -> Result<u64> {
+            let count: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 AND status = $2"
+            )
+            .bind(queue_name)
+            .bind(serde_json::to_string(&JobStatus::Pending)?)
+            .fetch_one(&self.pool)
+            .await?;
+
+            Ok(count.0 as u64)
+        }
     }
 }
 
@@ -1054,7 +1069,7 @@ pub mod mysql {
     use sqlx::{FromRow, MySql};
     use std::time::Duration;
 
-    #[derive(FromRow)]
+    #[derive(FromRow, Clone)]
     struct JobRow {
         id: String, // MySQL uses CHAR(36) for UUID
         queue_name: String,
@@ -1325,7 +1340,7 @@ pub mod mysql {
 
             // Calculate weighted selection
             let mut weighted_choices = Vec::new();
-            for (priority, jobs) in &priority_jobs {
+            for (priority, _jobs) in &priority_jobs {
                 let weight = weights.get_weight(*priority);
                 for _ in 0..weight {
                     weighted_choices.push(priority);
@@ -1864,6 +1879,18 @@ pub mod mysql {
 
         async fn get_all_throttle_configs(&self) -> Result<HashMap<String, ThrottleConfig>> {
             Ok(self.get_all_throttles().await)
+        }
+
+        async fn get_queue_depth(&self, queue_name: &str) -> Result<u64> {
+            let count: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? AND status = ?"
+            )
+            .bind(queue_name)
+            .bind(serde_json::to_string(&JobStatus::Pending)?)
+            .fetch_one(&self.pool)
+            .await?;
+
+            Ok(count.0 as u64)
         }
     }
 }

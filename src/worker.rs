@@ -7,7 +7,14 @@ use crate::{
     stats::{JobEvent, JobEventType, StatisticsCollector},
     Result,
 };
-use chrono::Utc;
+
+#[cfg(feature = "metrics")]
+use crate::metrics::PrometheusMetricsCollector;
+
+#[cfg(feature = "alerting")]
+use crate::alerting::{AlertManager, AlertingConfig};
+
+use chrono::{DateTime, Utc};
 use sqlx::Database;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
@@ -31,6 +38,11 @@ pub struct Worker<DB: Database> {
     stats_collector: Option<Arc<dyn StatisticsCollector>>,
     rate_limiter: Option<RateLimiter>,
     throttle_config: Option<ThrottleConfig>,
+    #[cfg(feature = "metrics")]
+    metrics_collector: Option<Arc<PrometheusMetricsCollector>>,
+    #[cfg(feature = "alerting")]
+    alert_manager: Option<Arc<AlertManager>>,
+    last_job_time: Arc<std::sync::RwLock<DateTime<Utc>>>,
 }
 
 impl<DB: Database + Send + Sync + 'static> Worker<DB>
@@ -50,6 +62,11 @@ where
             stats_collector: None,
             rate_limiter: None,
             throttle_config: None,
+            #[cfg(feature = "metrics")]
+            metrics_collector: None,
+            #[cfg(feature = "alerting")]
+            alert_manager: None,
+            last_job_time: Arc::new(std::sync::RwLock::new(Utc::now())),
         }
     }
 
@@ -112,8 +129,33 @@ where
         self
     }
 
+    /// Configure Prometheus metrics collection for this worker
+    #[cfg(feature = "metrics")]
+    pub fn with_metrics_collector(mut self, metrics_collector: Arc<PrometheusMetricsCollector>) -> Self {
+        self.metrics_collector = Some(metrics_collector);
+        self
+    }
+
+    /// Configure alerting for this worker
+    #[cfg(feature = "alerting")]
+    pub fn with_alerting_config(mut self, alerting_config: AlertingConfig) -> Self {
+        self.alert_manager = Some(Arc::new(AlertManager::new(alerting_config)));
+        self
+    }
+
+    /// Configure alert manager for this worker
+    #[cfg(feature = "alerting")]
+    pub fn with_alert_manager(mut self, alert_manager: Arc<AlertManager>) -> Self {
+        self.alert_manager = Some(alert_manager);
+        self
+    }
+
     pub async fn run(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
         info!("Worker started for queue: {}", self.queue_name);
+
+        // Start background monitoring task for metrics and alerting
+        #[cfg(any(feature = "metrics", feature = "alerting"))]
+        let monitoring_task = self.start_monitoring_task();
 
         loop {
             tokio::select! {
@@ -126,6 +168,10 @@ where
                 }
             }
         }
+
+        // Stop monitoring task
+        #[cfg(any(feature = "metrics", feature = "alerting"))]
+        monitoring_task.abort();
 
         Ok(())
     }
@@ -144,6 +190,16 @@ where
                     warn!("Rate limiter error: {}", e);
                     sleep(self.poll_interval).await;
                     return Ok(());
+                }
+            }
+        }
+
+        // Update queue depth metrics before dequeuing
+        #[cfg(feature = "metrics")]
+        if let Some(metrics_collector) = &self.metrics_collector {
+            if let Ok(queue_depth) = self.queue.get_queue_depth(&self.queue_name).await {
+                if let Err(e) = metrics_collector.update_queue_depth(&self.queue_name, queue_depth).await {
+                    warn!("Failed to update queue depth metrics: {}", e);
                 }
             }
         }
@@ -167,7 +223,24 @@ where
                 self.process_job(job).await?;
             }
             Ok(None) => {
-                // No jobs available, wait before polling again
+                // No jobs available, check for worker starvation
+                #[cfg(feature = "alerting")]
+                if let Some(alert_manager) = &self.alert_manager {
+                    let last_time_value = {
+                        if let Ok(last_time) = self.last_job_time.read() {
+                            Some(*last_time)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(last_time_value) = last_time_value {
+                        if let Err(e) = alert_manager.check_worker_starvation(&self.queue_name, last_time_value).await {
+                            warn!("Failed to check worker starvation: {}", e);
+                        }
+                    }
+                }
+                
+                // Wait before polling again
                 sleep(self.poll_interval).await;
             }
             Err(e) => {
@@ -181,6 +254,21 @@ where
                 };
                 
                 sleep(backoff_duration).await;
+            }
+        }
+
+        // Check statistics and alert thresholds periodically
+        #[cfg(feature = "alerting")]
+        if let (Some(alert_manager), Some(stats_collector)) = (&self.alert_manager, &self.stats_collector) {
+            match stats_collector.get_queue_statistics(&self.queue_name, Duration::from_secs(300)).await {
+                Ok(stats) => {
+                    if let Err(e) = alert_manager.check_thresholds(&self.queue_name, &stats).await {
+                        warn!("Failed to check alert thresholds: {}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to get queue statistics for alerting: {}", e);
+                }
             }
         }
 
@@ -341,11 +429,106 @@ where
     }
 
     async fn record_event(&self, event: JobEvent) {
+        // Record to statistics collector
         if let Some(stats_collector) = &self.stats_collector {
-            if let Err(e) = stats_collector.record_event(event).await {
+            if let Err(e) = stats_collector.record_event(event.clone()).await {
                 warn!("Failed to record statistics event: {}", e);
             }
         }
+
+        // Record to metrics collector
+        #[cfg(feature = "metrics")]
+        if let Some(metrics_collector) = &self.metrics_collector {
+            if let Err(e) = metrics_collector.record_job_event(&event).await {
+                warn!("Failed to record metrics event: {}", e);
+            }
+        }
+
+        // Update last job time for worker starvation detection
+        if matches!(event.event_type, JobEventType::Completed | JobEventType::Failed | JobEventType::Dead | JobEventType::TimedOut) {
+            if let Ok(mut last_time) = self.last_job_time.write() {
+                *last_time = event.timestamp;
+            }
+        }
+    }
+
+    /// Start a background monitoring task for metrics and alerting
+    #[cfg(any(feature = "metrics", feature = "alerting"))]
+    fn start_monitoring_task(&self) -> tokio::task::JoinHandle<()> {
+        let queue_name = self.queue_name.clone();
+        
+        #[cfg(feature = "metrics")]
+        let queue = Arc::clone(&self.queue);
+        
+        #[cfg(feature = "alerting")]
+        let last_job_time = Arc::clone(&self.last_job_time);
+        
+        #[cfg(feature = "metrics")]
+        let metrics_collector = self.metrics_collector.clone();
+        
+        #[cfg(feature = "alerting")]
+        let alert_manager = self.alert_manager.clone();
+        
+        #[cfg(feature = "alerting")]
+        let stats_collector = self.stats_collector.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30)); // Monitor every 30 seconds
+            
+            loop {
+                interval.tick().await;
+                
+                // Update queue depth metrics
+                #[cfg(feature = "metrics")]
+                if let Some(metrics_collector) = &metrics_collector {
+                    if let Ok(queue_depth) = queue.get_queue_depth(&queue_name).await {
+                        if let Err(e) = metrics_collector.update_queue_depth(&queue_name, queue_depth).await {
+                            warn!("Failed to update queue depth metrics: {}", e);
+                        }
+                        
+                        // Check queue depth for alerts
+                        #[cfg(feature = "alerting")]
+                        if let Some(alert_manager) = &alert_manager {
+                            if let Err(e) = alert_manager.check_queue_depth(&queue_name, queue_depth).await {
+                                warn!("Failed to check queue depth alerts: {}", e);
+                            }
+                        }
+                    }
+                }
+                
+                // Check worker starvation
+                #[cfg(feature = "alerting")]
+                if let Some(alert_manager) = &alert_manager {
+                    let last_time_value = {
+                        if let Ok(last_time) = last_job_time.read() {
+                            Some(*last_time)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(last_time_value) = last_time_value {
+                        if let Err(e) = alert_manager.check_worker_starvation(&queue_name, last_time_value).await {
+                            warn!("Failed to check worker starvation: {}", e);
+                        }
+                    }
+                }
+                
+                // Check statistics-based alerts
+                #[cfg(feature = "alerting")]
+                if let (Some(alert_manager), Some(stats_collector)) = (&alert_manager, &stats_collector) {
+                    match stats_collector.get_queue_statistics(&queue_name, Duration::from_secs(300)).await {
+                        Ok(stats) => {
+                            if let Err(e) = alert_manager.check_thresholds(&queue_name, &stats).await {
+                                warn!("Failed to check alert thresholds: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to get queue statistics for alerting: {}", e);
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 

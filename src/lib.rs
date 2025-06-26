@@ -7,6 +7,12 @@ pub mod rate_limit;
 pub mod stats;
 pub mod worker;
 
+#[cfg(feature = "metrics")]
+pub mod metrics;
+
+#[cfg(feature = "alerting")]
+pub mod alerting;
+
 pub use cron::{CronError, CronSchedule};
 pub use error::HammerworkError;
 pub use job::{Job, JobId, JobStatus};
@@ -19,5 +25,11 @@ pub use stats::{
     DeadJobSummary, InMemoryStatsCollector, JobStatistics, QueueStats, StatisticsCollector,
 };
 pub use worker::{Worker, WorkerPool};
+
+#[cfg(feature = "metrics")]
+pub use metrics::{MetricsConfig, PrometheusMetricsCollector};
+
+#[cfg(feature = "alerting")]
+pub use alerting::{Alert, AlertManager, AlertSeverity, AlertTarget, AlertType, AlertingConfig};
 
 pub type Result<T> = std::result::Result<T, HammerworkError>;

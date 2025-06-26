@@ -22,12 +22,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 tokio-test = "0.4"
 rand = "0.8"
+prometheus = { version = "0.13" }
+reqwest = { version = "0.12", features = ["json"] }
+warp = { version = "0.3" }
 
 [package]
 name = "hammerwork"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job prioritization, cron scheduling, timeouts, dead job management, and comprehensive statistics collection"
+description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job prioritization, cron scheduling, timeouts, rate limiting, Prometheus metrics, alerting, and comprehensive statistics collection"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
 authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
@@ -50,11 +53,16 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
+prometheus = { version = "0.13", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+warp = { version = "0.3", optional = true }
 
 [features]
-default = []
+default = ["metrics", "alerting"]
 postgres = ["sqlx/postgres"]
 mysql = ["sqlx/mysql"]
+metrics = ["prometheus", "warp"]
+alerting = ["reqwest"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

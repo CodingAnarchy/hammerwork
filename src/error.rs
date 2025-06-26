@@ -22,6 +22,12 @@ pub enum HammerworkError {
 
     #[error("Rate limit error: {message}")]
     RateLimit { message: String },
+
+    #[error("Metrics error: {message}")]
+    Metrics { message: String },
+
+    #[error("Alerting error: {message}")]
+    Alerting { message: String },
 }
 
 #[cfg(test)]

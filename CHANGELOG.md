@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2025-06-26
+
+### Added
+- **📊 Prometheus Metrics Integration** (enabled by default)
+  - `PrometheusMetricsCollector` with comprehensive job queue metrics
+  - Built-in metrics: job counts, duration histograms, failure rates, queue depth, worker utilization
+  - Custom gauge and histogram metrics support
+  - HTTP exposition server for Prometheus scraping using warp
+  - Real-time metrics collection integrated into worker event recording
+
+- **🚨 Advanced Alerting System** (enabled by default)
+  - `AlertingConfig` with configurable thresholds for error rates, queue depth, worker starvation, and processing times
+  - Multiple notification targets: Webhook, Slack (with rich formatting), and email alerts
+  - Cooldown periods to prevent alert storms
+  - Background monitoring task for real-time threshold checking
+  - Custom alert types and severity levels (Info, Warning, Critical)
+
+- **⚙️ Optional Feature Flags** 
+  - `metrics` feature flag for Prometheus integration (enabled by default)
+  - `alerting` feature flag for notification system (enabled by default)
+  - Backward compatible: existing users automatically get new features
+  - Opt-out available with `default-features = false` for minimal installations
+
+- **🔍 Background Monitoring**
+  - Automatic background task for metrics collection and alerting
+  - Queue depth monitoring every 30 seconds
+  - Worker starvation detection and alerts
+  - Statistics-based threshold monitoring
+
+### Changed
+- Default features now include `metrics` and `alerting` for enhanced monitoring capabilities
+- Enhanced worker integration with optional metrics and alerting components
+- Updated documentation with feature flag usage examples
+
+### Enhanced
+- Worker event recording now feeds both statistics collectors and metrics collectors
+- Thread-safe alerting with proper async handling and Send compatibility
+- Comprehensive test suite with 110 tests covering all features
+
 ## [0.5.0] - 2025-06-26
 
 ### Added

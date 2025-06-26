@@ -5,26 +5,6 @@ This roadmap outlines planned features for Hammerwork, prioritized by impact lev
 ## Phase 1: High Impact, Low-Medium Complexity
 *Essential features that provide significant value with reasonable implementation effort*
 
-### 📊 Advanced Metrics & Alerting
-**Impact: High** | **Complexity: Medium** | **Priority: Critical**
-
-Critical for production monitoring and operational visibility.
-
-```rust
-// Custom metrics collection
-let metrics = MetricsCollector::new()
-    .with_prometheus_exporter()
-    .with_custom_gauges(vec!["queue_depth", "worker_utilization"])
-    .with_histograms(vec!["job_duration", "queue_wait_time"]);
-
-// Built-in alerting
-let alerting = AlertingConfig::new()
-    .alert_on_high_error_rate(0.1) // 10% error rate
-    .alert_on_queue_depth(1000)
-    .alert_on_worker_starvation(Duration::from_minutes(5))
-    .webhook("https://alerts.example.com/webhook");
-```
-
 ### 📦 Job Batching & Bulk Operations
 **Impact: High** | **Complexity: Low-Medium** | **Priority: High**
 
@@ -315,10 +295,9 @@ let geo_config = GeoReplicationConfig::new()
 Features are ordered within each phase by priority and should generally be implemented in the following sequence:
 
 **Phase 1 (Foundation)**
-1. Advanced Metrics & Alerting
-2. Job Batching & Bulk Operations
-3. Job Result Storage & Retrieval
-4. Advanced Scheduling Patterns
+1. Job Batching & Bulk Operations
+2. Job Result Storage & Retrieval
+3. Advanced Scheduling Patterns
 
 **Phase 2 (Advanced Features)**
 1. Job Dependencies & Workflows
