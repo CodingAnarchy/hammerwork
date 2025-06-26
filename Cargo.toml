@@ -22,9 +22,9 @@ tokio-test = "0.4"
 
 [package]
 name = "hammerwork"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
-description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring dead job management and comprehensive statistics collection"
+description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job timeouts, dead job management, and comprehensive statistics collection"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
 authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
