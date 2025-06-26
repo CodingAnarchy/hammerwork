@@ -6,6 +6,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 - **Multi-database support**: PostgreSQL and MySQL backends
 - **Job prioritization**: Five priority levels with weighted and strict scheduling algorithms
+- **Batch operations**: High-performance bulk job enqueuing for improved throughput
 - **Cron scheduling**: Full cron expression support with timezone awareness
 - **Rate limiting**: Token bucket rate limiting with configurable burst limits
 - **Monitoring**: Prometheus metrics and advanced alerting (enabled by default)

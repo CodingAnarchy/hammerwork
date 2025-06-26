@@ -29,6 +29,19 @@ pub trait DatabaseQueue: Send + Sync {
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>>;
     async fn delete_job(&self, job_id: JobId) -> Result<()>;
 
+    // Batch operations
+    /// Enqueue multiple jobs as a batch for improved performance.
+    async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId>;
+    
+    /// Get the current status of a batch operation.
+    async fn get_batch_status(&self, batch_id: crate::batch::BatchId) -> Result<crate::batch::BatchResult>;
+    
+    /// Get all jobs belonging to a specific batch.
+    async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>>;
+    
+    /// Delete a batch and all its associated jobs.
+    async fn delete_batch(&self, batch_id: crate::batch::BatchId) -> Result<()>;
+
     // Dead job management
     /// Mark a job as dead (exhausted all retries)
     async fn mark_job_dead(&self, job_id: JobId, error_message: &str) -> Result<()>;
@@ -191,6 +204,7 @@ pub mod postgres {
         next_run_at: Option<DateTime<Utc>>,
         recurring: bool,
         timezone: Option<String>,
+        batch_id: Option<uuid::Uuid>,
     }
 
     impl JobRow {
@@ -217,6 +231,7 @@ pub mod postgres {
                 next_run_at: self.next_run_at,
                 recurring: self.recurring,
                 timezone: self.timezone,
+                batch_id: self.batch_id,
             })
         }
     }
@@ -264,6 +279,7 @@ pub mod postgres {
                 next_run_at: None,
                 recurring: false,
                 timezone: None,
+                batch_id: None, // DeadJobRow doesn't track batch_id
             }
         }
     }
@@ -294,7 +310,23 @@ pub mod postgres {
                     cron_schedule VARCHAR(100),
                     next_run_at TIMESTAMPTZ,
                     recurring BOOLEAN NOT NULL DEFAULT FALSE,
-                    timezone VARCHAR(50)
+                    timezone VARCHAR(50),
+                    batch_id UUID
+                );
+                
+                CREATE TABLE IF NOT EXISTS hammerwork_batches (
+                    id UUID PRIMARY KEY,
+                    batch_name VARCHAR NOT NULL,
+                    total_jobs INTEGER NOT NULL,
+                    completed_jobs INTEGER NOT NULL DEFAULT 0,
+                    failed_jobs INTEGER NOT NULL DEFAULT 0,
+                    pending_jobs INTEGER NOT NULL DEFAULT 0,
+                    status VARCHAR NOT NULL,
+                    failure_mode VARCHAR NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    completed_at TIMESTAMPTZ,
+                    error_summary TEXT,
+                    metadata JSONB
                 );
                 
                 CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_queue_status_priority_scheduled 
@@ -311,6 +343,15 @@ pub mod postgres {
                 
                 CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_cron_schedule
                 ON hammerwork_jobs (cron_schedule) WHERE cron_schedule IS NOT NULL;
+                
+                CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_batch_id
+                ON hammerwork_jobs (batch_id) WHERE batch_id IS NOT NULL;
+                
+                CREATE INDEX IF NOT EXISTS idx_hammerwork_batches_status
+                ON hammerwork_batches (status);
+                
+                CREATE INDEX IF NOT EXISTS idx_hammerwork_batches_created_at
+                ON hammerwork_batches (created_at);
                 "#,
             )
             .execute(&self.pool)
@@ -323,8 +364,8 @@ pub mod postgres {
             sqlx::query(
                 r#"
                 INSERT INTO hammerwork_jobs 
-                (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                 "#
             )
             .bind(job.id)
@@ -346,6 +387,7 @@ pub mod postgres {
             .bind(job.next_run_at)
             .bind(job.recurring)
             .bind(&job.timezone)
+            .bind(None::<uuid::Uuid>) // batch_id is None for individual jobs
             .execute(&self.pool)
             .await?;
 
@@ -396,6 +438,7 @@ pub mod postgres {
                 let next_run_at: Option<DateTime<Utc>> = row.get("next_run_at");
                 let recurring: bool = row.get("recurring");
                 let timezone: Option<String> = row.get("timezone");
+                let batch_id: Option<uuid::Uuid> = row.get("batch_id");
 
                 Ok(Some(Job {
                     id,
@@ -417,6 +460,7 @@ pub mod postgres {
                     next_run_at,
                     recurring,
                     timezone,
+                    batch_id,
                 }))
             } else {
                 Ok(None)
@@ -530,6 +574,7 @@ pub mod postgres {
                         let next_run_at: Option<DateTime<Utc>> = row.get("next_run_at");
                         let recurring: bool = row.get("recurring");
                         let timezone: Option<String> = row.get("timezone");
+                        let batch_id: Option<uuid::Uuid> = row.get("batch_id");
 
                         return Ok(Some(Job {
                             id,
@@ -553,6 +598,7 @@ pub mod postgres {
                             next_run_at,
                             recurring,
                             timezone,
+                            batch_id,
                         }));
                     }
                 }
@@ -1058,6 +1104,200 @@ pub mod postgres {
 
             Ok(count.0 as u64)
         }
+
+        // Batch operations
+        async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId> {
+            use crate::batch::{BatchStatus, PartialFailureMode};
+            
+            // Validate the batch first
+            batch.validate()?;
+            
+            let mut tx = self.pool.begin().await?;
+            
+            // Insert batch metadata
+            sqlx::query(
+                r#"
+                INSERT INTO hammerwork_batches 
+                (id, batch_name, total_jobs, completed_jobs, failed_jobs, pending_jobs, status, failure_mode, created_at, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                "#
+            )
+            .bind(batch.id)
+            .bind(&batch.name)
+            .bind(batch.jobs.len() as i32)
+            .bind(0i32) // completed_jobs
+            .bind(0i32) // failed_jobs  
+            .bind(batch.jobs.len() as i32) // pending_jobs
+            .bind(serde_json::to_string(&BatchStatus::Pending)?)
+            .bind(serde_json::to_string(&batch.failure_mode)?)
+            .bind(batch.created_at)
+            .bind(serde_json::to_value(&batch.metadata)?)
+            .execute(&mut *tx)
+            .await?;
+
+            // Bulk insert jobs using UNNEST for optimal performance
+            if !batch.jobs.is_empty() {
+                let mut job_ids = Vec::new();
+                let mut queue_names = Vec::new();
+                let mut payloads = Vec::new();
+                let mut statuses = Vec::new();
+                let mut priorities = Vec::new();
+                let mut attempts = Vec::new();
+                let mut max_attempts = Vec::new();
+                let mut timeout_seconds = Vec::new();
+                let mut created_ats = Vec::new();
+                let mut scheduled_ats = Vec::new();
+                let mut started_ats = Vec::new();
+                let mut completed_ats = Vec::new();
+                let mut failed_ats = Vec::new();
+                let mut timed_out_ats = Vec::new();
+                let mut error_messages = Vec::new();
+                let mut cron_schedules = Vec::new();
+                let mut next_run_ats = Vec::new();
+                let mut recurrings = Vec::new();
+                let mut timezones = Vec::new();
+                let mut batch_ids = Vec::new();
+
+                for job in &batch.jobs {
+                    job_ids.push(job.id);
+                    queue_names.push(&job.queue_name);
+                    payloads.push(&job.payload);
+                    statuses.push(serde_json::to_string(&job.status)?);
+                    priorities.push(job.priority.as_i32());
+                    attempts.push(job.attempts);
+                    max_attempts.push(job.max_attempts);
+                    timeout_seconds.push(job.timeout.map(|t| t.as_secs() as i32));
+                    created_ats.push(job.created_at);
+                    scheduled_ats.push(job.scheduled_at);
+                    started_ats.push(job.started_at);
+                    completed_ats.push(job.completed_at);
+                    failed_ats.push(job.failed_at);
+                    timed_out_ats.push(job.timed_out_at);
+                    error_messages.push(&job.error_message);
+                    cron_schedules.push(&job.cron_schedule);
+                    next_run_ats.push(job.next_run_at);
+                    recurrings.push(job.recurring);
+                    timezones.push(&job.timezone);
+                    batch_ids.push(Some(batch.id));
+                }
+
+                sqlx::query(
+                    r#"
+                    INSERT INTO hammerwork_jobs 
+                    (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id)
+                    SELECT * FROM UNNEST(
+                        $1::uuid[], $2::varchar[], $3::jsonb[], $4::varchar[], $5::integer[], $6::integer[], $7::integer[], $8::integer[], 
+                        $9::timestamptz[], $10::timestamptz[], $11::timestamptz[], $12::timestamptz[], $13::timestamptz[], $14::timestamptz[], 
+                        $15::text[], $16::varchar[], $17::timestamptz[], $18::boolean[], $19::varchar[], $20::uuid[]
+                    )
+                    "#
+                )
+                .bind(&job_ids)
+                .bind(&queue_names)
+                .bind(&payloads)
+                .bind(&statuses)
+                .bind(&priorities)
+                .bind(&attempts)
+                .bind(&max_attempts)
+                .bind(&timeout_seconds)
+                .bind(&created_ats)
+                .bind(&scheduled_ats)
+                .bind(&started_ats)
+                .bind(&completed_ats)
+                .bind(&failed_ats)
+                .bind(&timed_out_ats)
+                .bind(&error_messages)
+                .bind(&cron_schedules)
+                .bind(&next_run_ats)
+                .bind(&recurrings)
+                .bind(&timezones)
+                .bind(&batch_ids)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok(batch.id)
+        }
+
+        async fn get_batch_status(&self, batch_id: crate::batch::BatchId) -> Result<crate::batch::BatchResult> {
+            use crate::batch::{BatchStatus, BatchResult, PartialFailureMode};
+            use std::collections::HashMap;
+
+            // Get batch metadata
+            let batch_row = sqlx::query(
+                "SELECT batch_name, total_jobs, completed_jobs, failed_jobs, pending_jobs, status, failure_mode, created_at, completed_at, error_summary, metadata FROM hammerwork_batches WHERE id = $1"
+            )
+            .bind(batch_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            let batch_row = batch_row.ok_or_else(|| crate::HammerworkError::JobNotFound {
+                id: batch_id.to_string(),
+            })?;
+
+            let total_jobs: i32 = batch_row.get("total_jobs");
+            let completed_jobs: i32 = batch_row.get("completed_jobs");
+            let failed_jobs: i32 = batch_row.get("failed_jobs");
+            let pending_jobs: i32 = batch_row.get("pending_jobs");
+            let status: String = batch_row.get("status");
+            let created_at: DateTime<Utc> = batch_row.get("created_at");
+            let completed_at: Option<DateTime<Utc>> = batch_row.get("completed_at");
+            let error_summary: Option<String> = batch_row.get("error_summary");
+
+            // Get job errors for CollectErrors mode
+            let job_errors: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+                "SELECT id, error_message FROM hammerwork_jobs WHERE batch_id = $1 AND error_message IS NOT NULL"
+            )
+            .bind(batch_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let job_errors_map: HashMap<uuid::Uuid, String> = job_errors.into_iter().collect();
+
+            Ok(BatchResult {
+                batch_id,
+                total_jobs: total_jobs as u32,
+                completed_jobs: completed_jobs as u32,
+                failed_jobs: failed_jobs as u32,
+                pending_jobs: pending_jobs as u32,
+                status: serde_json::from_str(&status)?,
+                created_at,
+                completed_at,
+                error_summary,
+                job_errors: job_errors_map,
+            })
+        }
+
+        async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>> {
+            let rows = sqlx::query_as::<_, JobRow>(
+                "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id FROM hammerwork_jobs WHERE batch_id = $1 ORDER BY created_at ASC"
+            )
+            .bind(batch_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter().map(|row| row.into_job()).collect()
+        }
+
+        async fn delete_batch(&self, batch_id: crate::batch::BatchId) -> Result<()> {
+            let mut tx = self.pool.begin().await?;
+
+            // Delete all jobs in the batch
+            sqlx::query("DELETE FROM hammerwork_jobs WHERE batch_id = $1")
+                .bind(batch_id)
+                .execute(&mut *tx)
+                .await?;
+
+            // Delete the batch metadata
+            sqlx::query("DELETE FROM hammerwork_batches WHERE id = $1")
+                .bind(batch_id)
+                .execute(&mut *tx)
+                .await?;
+
+            tx.commit().await?;
+            Ok(())
+        }
     }
 }
 
@@ -1090,6 +1330,7 @@ pub mod mysql {
         next_run_at: Option<DateTime<Utc>>,
         recurring: bool,
         timezone: Option<String>,
+        batch_id: Option<String>,
     }
 
     impl JobRow {
@@ -1116,6 +1357,7 @@ pub mod mysql {
                 next_run_at: self.next_run_at,
                 recurring: self.recurring,
                 timezone: self.timezone,
+                batch_id: self.batch_id.map(|s| uuid::Uuid::parse_str(&s)).transpose()?,
             })
         }
     }
@@ -1194,12 +1436,31 @@ pub mod mysql {
                     next_run_at TIMESTAMP(6) NULL,
                     recurring BOOLEAN NOT NULL DEFAULT FALSE,
                     timezone VARCHAR(50) NULL,
+                    batch_id CHAR(36) NULL,
                     INDEX idx_queue_status_priority_scheduled (queue_name, status, priority DESC, scheduled_at),
                     INDEX idx_status_failed_at (status, failed_at),
                     INDEX idx_queue_status (queue_name, status),
                     INDEX idx_recurring_next_run (recurring, next_run_at),
-                    INDEX idx_cron_schedule (cron_schedule)
-                )
+                    INDEX idx_cron_schedule (cron_schedule),
+                    INDEX idx_batch_id (batch_id)
+                );
+                
+                CREATE TABLE IF NOT EXISTS hammerwork_batches (
+                    id CHAR(36) PRIMARY KEY,
+                    batch_name VARCHAR(255) NOT NULL,
+                    total_jobs INT NOT NULL,
+                    completed_jobs INT NOT NULL DEFAULT 0,
+                    failed_jobs INT NOT NULL DEFAULT 0,
+                    pending_jobs INT NOT NULL DEFAULT 0,
+                    status VARCHAR(50) NOT NULL,
+                    failure_mode VARCHAR(50) NOT NULL,
+                    created_at TIMESTAMP(6) NOT NULL,
+                    completed_at TIMESTAMP(6) NULL,
+                    error_summary TEXT NULL,
+                    metadata JSON NULL,
+                    INDEX idx_status (status),
+                    INDEX idx_created_at (created_at)
+                );
                 "#,
             )
             .execute(&self.pool)
@@ -1212,8 +1473,8 @@ pub mod mysql {
             sqlx::query(
                 r#"
                 INSERT INTO hammerwork_jobs 
-                (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#
             )
             .bind(job.id.to_string())
@@ -1235,6 +1496,7 @@ pub mod mysql {
             .bind(job.next_run_at)
             .bind(job.recurring)
             .bind(&job.timezone)
+            .bind(None::<String>) // batch_id is None for individual jobs
             .execute(&self.pool)
             .await?;
 
@@ -1891,6 +2153,192 @@ pub mod mysql {
             .await?;
 
             Ok(count.0 as u64)
+        }
+
+        // Batch operations
+        async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId> {
+            use crate::batch::{BatchStatus, PartialFailureMode};
+            
+            // Validate the batch first
+            batch.validate()?;
+            
+            let mut tx = self.pool.begin().await?;
+            
+            // Insert batch metadata
+            sqlx::query(
+                r#"
+                INSERT INTO hammerwork_batches 
+                (id, batch_name, total_jobs, completed_jobs, failed_jobs, pending_jobs, status, failure_mode, created_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#
+            )
+            .bind(batch.id.to_string())
+            .bind(&batch.name)
+            .bind(batch.jobs.len() as i32)
+            .bind(0i32) // completed_jobs
+            .bind(0i32) // failed_jobs  
+            .bind(batch.jobs.len() as i32) // pending_jobs
+            .bind(serde_json::to_string(&BatchStatus::Pending)?)
+            .bind(serde_json::to_string(&batch.failure_mode)?)
+            .bind(batch.created_at)
+            .bind(serde_json::to_value(&batch.metadata)?)
+            .execute(&mut *tx)
+            .await?;
+
+            // Bulk insert jobs using multiple-row VALUES syntax
+            if !batch.jobs.is_empty() {
+                let chunk_size = 100; // MySQL has limits on max_allowed_packet and query size
+                for chunk in batch.jobs.chunks(chunk_size) {
+                    let mut query = "INSERT INTO hammerwork_jobs (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id) VALUES ".to_string();
+                    
+                    let mut bindings = Vec::new();
+                    let mut value_parts = Vec::new();
+                    
+                    for (i, job) in chunk.iter().enumerate() {
+                        if i > 0 {
+                            query.push_str(", ");
+                        }
+                        query.push_str("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                        
+                        bindings.extend([
+                            job.id.to_string(),
+                            job.queue_name.clone(),
+                            serde_json::to_string(&job.payload)?,
+                            serde_json::to_string(&job.status)?,
+                            job.priority.as_i32().to_string(),
+                            job.attempts.to_string(),
+                            job.max_attempts.to_string(),
+                            job.timeout.map(|t| (t.as_secs() as i32).to_string()).unwrap_or_else(|| "NULL".to_string()),
+                            job.created_at.to_rfc3339(),
+                            job.scheduled_at.to_rfc3339(),
+                            job.started_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
+                            job.completed_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
+                            job.failed_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
+                            job.timed_out_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
+                            job.error_message.clone().unwrap_or_else(|| "NULL".to_string()),
+                            job.cron_schedule.clone().unwrap_or_else(|| "NULL".to_string()),
+                            job.next_run_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
+                            job.recurring.to_string(),
+                            job.timezone.clone().unwrap_or_else(|| "NULL".to_string()),
+                            batch.id.to_string(),
+                        ]);
+                    }
+                    
+                    // Build query with proper parameter bindings
+                    let mut prepared_query = sqlx::query(&query);
+                    for job in chunk {
+                        prepared_query = prepared_query
+                            .bind(job.id.to_string())
+                            .bind(&job.queue_name)
+                            .bind(&job.payload)
+                            .bind(serde_json::to_string(&job.status)?)
+                            .bind(job.priority.as_i32())
+                            .bind(job.attempts)
+                            .bind(job.max_attempts)
+                            .bind(job.timeout.map(|t| t.as_secs() as i32))
+                            .bind(job.created_at)
+                            .bind(job.scheduled_at)
+                            .bind(job.started_at)
+                            .bind(job.completed_at)
+                            .bind(job.failed_at)
+                            .bind(job.timed_out_at)
+                            .bind(&job.error_message)
+                            .bind(&job.cron_schedule)
+                            .bind(job.next_run_at)
+                            .bind(job.recurring)
+                            .bind(&job.timezone)
+                            .bind(batch.id.to_string());
+                    }
+                    
+                    prepared_query.execute(&mut *tx).await?;
+                }
+            }
+
+            tx.commit().await?;
+            Ok(batch.id)
+        }
+
+        async fn get_batch_status(&self, batch_id: crate::batch::BatchId) -> Result<crate::batch::BatchResult> {
+            use crate::batch::{BatchStatus, BatchResult, PartialFailureMode};
+            use std::collections::HashMap;
+
+            // Get batch metadata
+            let batch_row = sqlx::query(
+                "SELECT batch_name, total_jobs, completed_jobs, failed_jobs, pending_jobs, status, failure_mode, created_at, completed_at, error_summary, metadata FROM hammerwork_batches WHERE id = ?"
+            )
+            .bind(batch_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+
+            let batch_row = batch_row.ok_or_else(|| crate::HammerworkError::JobNotFound {
+                id: batch_id.to_string(),
+            })?;
+
+            let total_jobs: i32 = batch_row.get("total_jobs");
+            let completed_jobs: i32 = batch_row.get("completed_jobs");
+            let failed_jobs: i32 = batch_row.get("failed_jobs");
+            let pending_jobs: i32 = batch_row.get("pending_jobs");
+            let status: String = batch_row.get("status");
+            let created_at: DateTime<Utc> = batch_row.get("created_at");
+            let completed_at: Option<DateTime<Utc>> = batch_row.get("completed_at");
+            let error_summary: Option<String> = batch_row.get("error_summary");
+
+            // Get job errors for CollectErrors mode
+            let job_errors: Vec<(String, String)> = sqlx::query_as(
+                "SELECT id, error_message FROM hammerwork_jobs WHERE batch_id = ? AND error_message IS NOT NULL"
+            )
+            .bind(batch_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+
+            let job_errors_map: HashMap<uuid::Uuid, String> = job_errors.into_iter()
+                .filter_map(|(id_str, error)| {
+                    uuid::Uuid::parse_str(&id_str).ok().map(|id| (id, error))
+                })
+                .collect();
+
+            Ok(BatchResult {
+                batch_id,
+                total_jobs: total_jobs as u32,
+                completed_jobs: completed_jobs as u32,
+                failed_jobs: failed_jobs as u32,
+                pending_jobs: pending_jobs as u32,
+                status: serde_json::from_str(&status)?,
+                created_at,
+                completed_at,
+                error_summary,
+                job_errors: job_errors_map,
+            })
+        }
+
+        async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>> {
+            let rows = sqlx::query_as::<_, JobRow>(
+                "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id FROM hammerwork_jobs WHERE batch_id = ? ORDER BY created_at ASC"
+            )
+            .bind(batch_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter().map(|row| row.into_job()).collect()
+        }
+
+        async fn delete_batch(&self, batch_id: crate::batch::BatchId) -> Result<()> {
+            let mut tx = self.pool.begin().await?;
+
+            // Delete all jobs in the batch
+            sqlx::query("DELETE FROM hammerwork_jobs WHERE batch_id = ?")
+                .bind(batch_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+
+            // Delete the batch metadata
+            sqlx::query("DELETE FROM hammerwork_batches WHERE id = ?")
+                .bind(batch_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+
+            tx.commit().await?;
+            Ok(())
         }
     }
 }

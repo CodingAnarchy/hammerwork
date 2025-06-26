@@ -28,6 +28,12 @@ pub enum HammerworkError {
 
     #[error("Alerting error: {message}")]
     Alerting { message: String },
+
+    #[error("Batch operation error: {message}")]
+    Batch { message: String },
+
+    #[error("Processing error: {0}")]
+    Processing(String),
 }
 
 #[cfg(test)]

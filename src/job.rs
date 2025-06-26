@@ -151,6 +151,8 @@ pub struct Job {
     pub recurring: bool,
     /// Timezone for cron calculations.
     pub timezone: Option<String>,
+    /// Batch ID if this job is part of a batch operation.
+    pub batch_id: Option<crate::batch::BatchId>,
 }
 
 impl Job {
@@ -209,6 +211,7 @@ impl Job {
             next_run_at: None,
             recurring: false,
             timezone: None,
+            batch_id: None,
         }
     }
 
@@ -272,6 +275,7 @@ impl Job {
             next_run_at: None,
             recurring: false,
             timezone: None,
+            batch_id: None,
         }
     }
 
@@ -472,6 +476,7 @@ impl Job {
             next_run_at: next_run,
             recurring: true,
             timezone: Some(cron_schedule.timezone.clone()),
+            batch_id: None,
         })
     }
 
