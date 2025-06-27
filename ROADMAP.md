@@ -5,21 +5,6 @@ This roadmap outlines planned features for Hammerwork, prioritized by impact lev
 ## Phase 1: High Impact, Low-Medium Complexity
 *Essential features that provide significant value with reasonable implementation effort*
 
-### 🔄 Job Result Storage & Retrieval
-**Impact: High** | **Complexity: Medium** | **Priority: High**
-
-Essential for jobs that produce results needed by other systems or users.
-
-```rust
-// Store job results for later retrieval
-let job = Job::new("generate_report".to_string(), params)
-    .with_result_storage(ResultStorage::Database)
-    .with_result_ttl(Duration::from_days(30));
-
-// Retrieve job results
-let result = queue.get_job_result(&job_id).await?;
-```
-
 ### 📋 Advanced Scheduling Patterns
 **Impact: Medium-High** | **Complexity: Medium** | **Priority: High**
 
