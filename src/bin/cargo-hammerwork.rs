@@ -161,6 +161,7 @@ async fn show_migration_status(database_url: &str) -> Result<(), Box<dyn std::er
     process::exit(1);
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 async fn show_status<DB: sqlx::Database>(
     manager: &MigrationManager<DB>,
 ) -> Result<(), Box<dyn std::error::Error>> {
