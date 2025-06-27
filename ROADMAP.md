@@ -5,22 +5,6 @@ This roadmap outlines planned features for Hammerwork, prioritized by impact lev
 ## Phase 1: High Impact, Low-Medium Complexity
 *Essential features that provide significant value with reasonable implementation effort*
 
-### 📦 Job Batching & Bulk Operations
-**Impact: High** | **Complexity: Low-Medium** | **Priority: High**
-
-Significant performance improvement for high-throughput scenarios.
-
-```rust
-// Process multiple jobs as a single unit
-let batch = JobBatch::new("email_batch")
-    .with_jobs(email_jobs)
-    .with_batch_size(100)
-    .with_partial_failure_handling(PartialFailureMode::ContinueOnError);
-
-// Bulk enqueue operations
-queue.enqueue_batch(jobs).await?;
-```
-
 ### 🔄 Job Result Storage & Retrieval
 **Impact: High** | **Complexity: Medium** | **Priority: High**
 
@@ -295,9 +279,8 @@ let geo_config = GeoReplicationConfig::new()
 Features are ordered within each phase by priority and should generally be implemented in the following sequence:
 
 **Phase 1 (Foundation)**
-1. Job Batching & Bulk Operations
-2. Job Result Storage & Retrieval
-3. Advanced Scheduling Patterns
+1. Job Result Storage & Retrieval
+2. Advanced Scheduling Patterns
 
 **Phase 2 (Advanced Features)**
 1. Job Dependencies & Workflows

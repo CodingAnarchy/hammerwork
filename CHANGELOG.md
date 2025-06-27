@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2025-06-27
+
+### Added
+- **📦 Comprehensive Job Batching & Bulk Operations**
+  - `JobBatch` struct for creating and managing job batches with configurable batch sizes
+  - Three partial failure modes: `ContinueOnError`, `FailFast`, and `CollectErrors`
+  - Batch validation ensuring all jobs in a batch belong to the same queue
+  - Automatic chunking for large batches to respect database limits (10,000 jobs max)
+  - Batch metadata support for tracking and categorization
+  
+- **🚀 High-Performance Bulk Database Operations**
+  - PostgreSQL implementation using `UNNEST` for optimal bulk insertions
+  - MySQL implementation using multi-row `VALUES` with automatic 100-job chunking
+  - Atomic batch operations with transaction support
+  - New database tables: `hammerwork_batches` for batch metadata and tracking
+  - Batch status tracking with job counts (pending, completed, failed, total)
+  
+- **👷 Enhanced Worker Batch Processing**
+  - `with_batch_processing_enabled()` for optimized batch job handling
+  - `BatchProcessingStats` for comprehensive batch processing metrics
+  - Automatic batch completion detection and status updates
+  - Batch-aware job processing with enhanced monitoring
+  - Success rate tracking with configurable thresholds (>95% for successful batches)
+  
+- **📊 Batch Operations API**
+  - `enqueue_batch()` - Bulk enqueue jobs with optimized database operations
+  - `get_batch_status()` - Real-time batch progress and statistics
+  - `get_batch_jobs()` - Retrieve all jobs belonging to a batch
+  - `delete_batch()` - Clean up completed batches
+  - `BatchResult` with success/failure rates and job error tracking
+  
+- **🧪 Comprehensive Testing & Examples**
+  - 18 new batch-specific tests covering all functionality
+  - `batch_example.rs` demonstrating bulk job operations
+  - `worker_batch_example.rs` showcasing worker batch processing features
+  - Integration tests for both PostgreSQL and MySQL batch operations
+  - Edge case testing for large batches and failure scenarios
+  
+- **📖 Documentation**
+  - Complete batch operations documentation at `docs/batch-operations.md`
+  - Best practices for batch size selection and failure handling
+  - Performance considerations and database-specific optimizations
+  - Troubleshooting guide for common batch processing issues
+
+### Enhanced
+- Extended `DatabaseQueue` trait with batch operation methods
+- Worker event recording now tracks batch-specific metrics
+- Job struct enhanced with optional `batch_id` field
+- Statistics integration for batch job monitoring
+
+### Technical Implementation
+- **Memory Efficient**: Configurable batch sizes to manage memory usage
+- **Network Optimized**: Reduces database round trips from N to 1-10 for N jobs
+- **Type Safe**: Strongly typed batch operations with comprehensive validation
+- **Backward Compatible**: All existing functionality preserved, batching is opt-in
+
 ## [0.6.0] - 2025-06-26
 
 ### Added
@@ -367,6 +423,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## Release Links
+- [0.7.0](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.7.0)
+- [0.6.0](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.6.0)
+- [0.5.0](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.5.0)
+- [0.4.0](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.4.0)
+- [0.3.0](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.3.0)
 - [0.2.2](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.2.2)
 - [0.2.1](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.2.1)
 - [0.2.0](https://github.com/CodingAnarchy/hammerwork/releases/tag/v0.2.0)

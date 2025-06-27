@@ -20,12 +20,12 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "0.6", features = ["postgres"] }
+hammerwork = { version = "0.7", features = ["postgres"] }
 # or
-hammerwork = { version = "0.6", features = ["mysql"] }
+hammerwork = { version = "0.7", features = ["mysql"] }
 
 # Minimal installation
-hammerwork = { version = "0.6", features = ["postgres"], default-features = false }
+hammerwork = { version = "0.7", features = ["postgres"], default-features = false }
 ```
 
 **Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default)
@@ -41,6 +41,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 - **[Worker Configuration](docs/worker-configuration.md)** - Worker setup, rate limiting, statistics
 - **[Cron Scheduling](docs/cron-scheduling.md)** - Recurring jobs with timezone support  
 - **[Priority System](docs/priority-system.md)** - Five-level priority system with weighted scheduling
+- **[Batch Operations](docs/batch-operations.md)** - High-performance bulk job processing
 - **[Monitoring & Alerting](docs/monitoring.md)** - Prometheus metrics and notification systems
 
 ## Basic Example

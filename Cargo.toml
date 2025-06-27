@@ -28,7 +28,7 @@ warp = { version = "0.3" }
 
 [package]
 name = "hammerwork"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job prioritization, cron scheduling, timeouts, rate limiting, Prometheus metrics, alerting, and comprehensive statistics collection"
 license = "MIT"
