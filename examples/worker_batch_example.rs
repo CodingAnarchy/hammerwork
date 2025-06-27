@@ -23,10 +23,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let queue = Arc::new(JobQueue::new(pool));
 
     // Initialize database tables
-    #[cfg(feature = "postgres")]
-    {
-        queue.create_tables().await?;
-    }
+    // Run `cargo hammerwork migrate` to set up the database schema before running this example
 
     // Create statistics collector
     let stats_collector = Arc::new(InMemoryStatsCollector::new_default());

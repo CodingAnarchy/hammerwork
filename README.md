@@ -42,6 +42,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 - **[Cron Scheduling](docs/cron-scheduling.md)** - Recurring jobs with timezone support  
 - **[Priority System](docs/priority-system.md)** - Five-level priority system with weighted scheduling
 - **[Batch Operations](docs/batch-operations.md)** - High-performance bulk job processing
+- **[Database Migrations](docs/migrations.md)** - Progressive schema updates and database setup
 - **[Monitoring & Alerting](docs/monitoring.md)** - Prometheus metrics and notification systems
 
 ## Basic Example
@@ -53,10 +54,9 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup database and queue
+    // Setup database and queue (migrations should already be run)
     let pool = sqlx::PgPool::connect("postgresql://localhost/mydb").await?;
     let queue = Arc::new(JobQueue::new(pool));
-    queue.create_tables().await?;
 
     // Create job handler
     let handler = Arc::new(|job: Job| {
@@ -83,9 +83,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
 
-## Database Schema
+## Database Setup
 
-Hammerwork uses a single `hammerwork_jobs` table with optimized indexes for performance. The schema supports all features including priorities, timeouts, cron scheduling, and comprehensive job lifecycle tracking.
+### Using Migrations (Recommended)
+
+Hammerwork provides a migration system for progressive schema updates:
+
+```bash
+# Build the migration tool
+cargo build --bin cargo-hammerwork --features postgres
+
+# Run migrations
+cargo hammerwork migrate --database-url postgresql://localhost/hammerwork
+
+# Check migration status
+cargo hammerwork status --database-url postgresql://localhost/hammerwork
+```
+
+### Application Usage
+
+Once migrations are run, your application can use the queue directly:
+
+```rust
+// In your application - no setup needed, just use the queue
+let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
+let queue = Arc::new(JobQueue::new(pool));
+
+// Start enqueuing jobs immediately
+let job = Job::new("default".to_string(), json!({"task": "send_email"}));
+queue.enqueue(job).await?;
+```
+
+### Database Schema
+
+Hammerwork uses optimized tables with comprehensive indexing:
+- **`hammerwork_jobs`** - Main job table with priorities, timeouts, cron scheduling, and result storage
+- **`hammerwork_batches`** - Batch metadata and tracking (v0.7.0+)
+- **`hammerwork_migrations`** - Migration tracking for schema evolution
+
+The schema supports all features including job prioritization, timeouts, cron scheduling, batch processing, result storage, and comprehensive lifecycle tracking. See [Database Migrations](docs/migrations.md) for details.
 
 ## Development
 

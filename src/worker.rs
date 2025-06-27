@@ -106,6 +106,71 @@ pub type JobHandler = Arc<
         + Sync,
 >;
 
+/// Type alias for job handler functions that can return result data.
+///
+/// Enhanced job handlers are async functions that take a [`Job`] and return a [`Result<JobResult>`].
+/// They support returning optional result data that can be stored and retrieved later.
+///
+/// # Examples
+///
+/// ```rust
+/// use hammerwork::{Job, Result, worker::{JobHandlerWithResult, JobResult}};
+/// use std::sync::Arc;
+/// use serde_json::json;
+///
+/// let handler: JobHandlerWithResult = Arc::new(|job: Job| {
+///     Box::pin(async move {
+///         // Process the job
+///         let result_data = json!({
+///             "processed_items": 42,
+///             "status": "completed"
+///         });
+///         
+///         // Return result with data
+///         Ok(JobResult::with_data(result_data))
+///     })
+/// });
+/// ```
+pub type JobHandlerWithResult = Arc<
+    dyn Fn(Job) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobResult>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Result returned by job handlers, optionally containing result data.
+#[derive(Debug, Clone)]
+pub struct JobResult {
+    /// Optional result data to store for retrieval
+    pub data: Option<serde_json::Value>,
+}
+
+impl JobResult {
+    /// Create a JobResult with no data (equivalent to the old Ok(()) pattern)
+    pub fn success() -> Self {
+        Self { data: None }
+    }
+
+    /// Create a JobResult with result data
+    pub fn with_data(data: serde_json::Value) -> Self {
+        Self { data: Some(data) }
+    }
+}
+
+impl Default for JobResult {
+    fn default() -> Self {
+        Self::success()
+    }
+}
+
+/// Enum to support both original and enhanced job handlers
+#[derive(Clone)]
+pub enum JobHandlerType {
+    /// Original handler type that returns Result<()>
+    Legacy(JobHandler),
+    /// Enhanced handler type that returns Result<JobResult> with optional data
+    WithResult(JobHandlerWithResult),
+}
+
 /// A worker that processes jobs from a specific queue.
 ///
 /// Workers continuously poll their assigned queue for pending jobs and execute
@@ -187,7 +252,7 @@ pub struct Worker<DB: Database> {
     /// Name of the queue this worker processes
     queue_name: String,
     /// Function to handle job processing
-    handler: JobHandler,
+    handler: JobHandlerType,
     /// How often to poll for new jobs
     poll_interval: Duration,
     /// Maximum number of retry attempts for failed jobs
@@ -272,7 +337,73 @@ where
         Self {
             queue,
             queue_name,
-            handler,
+            handler: JobHandlerType::Legacy(handler),
+            poll_interval: Duration::from_secs(1),
+            max_retries: 3,
+            retry_delay: Duration::from_secs(30),
+            default_timeout: None,
+            priority_weights: None,
+            stats_collector: None,
+            rate_limiter: None,
+            throttle_config: None,
+            #[cfg(feature = "metrics")]
+            metrics_collector: None,
+            #[cfg(feature = "alerting")]
+            alert_manager: None,
+            last_job_time: Arc::new(std::sync::RwLock::new(Utc::now())),
+            batch_processing_enabled: false,
+            batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
+        }
+    }
+
+    /// Creates a new worker with an enhanced handler that can return result data.
+    ///
+    /// This method creates a worker that uses the enhanced job handler type,
+    /// which can return result data that will be automatically stored when
+    /// the job completes successfully.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue` - The job queue to poll for work
+    /// * `queue_name` - Name of the queue this worker will process
+    /// * `handler` - Enhanced handler function that can return result data
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{Worker, JobQueue, Job, worker::{JobHandlerWithResult, JobResult}};
+    /// use std::sync::Arc;
+    /// use serde_json::json;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
+    /// let queue = Arc::new(JobQueue::new(pool));
+    ///
+    /// let handler: JobHandlerWithResult = Arc::new(|job: Job| {
+    ///     Box::pin(async move {
+    ///         // Process the job and generate results
+    ///         let result_data = json!({
+    ///             "processed_items": 42,
+    ///             "status": "completed"
+    ///         });
+    ///         
+    ///         Ok(JobResult::with_data(result_data))
+    ///     })
+    /// });
+    ///
+    /// let worker = Worker::new_with_result_handler(queue, "default".to_string(), handler);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_with_result_handler(
+        queue: Arc<JobQueue<DB>>,
+        queue_name: String,
+        handler: JobHandlerWithResult,
+    ) -> Self {
+        Self {
+            queue,
+            queue_name,
+            handler: JobHandlerType::WithResult(handler),
             poll_interval: Duration::from_secs(1),
             max_retries: 3,
             retry_delay: Duration::from_secs(30),
@@ -701,7 +832,7 @@ where
 
         let handler_result = if let Some(timeout) = timeout_duration {
             // Run with timeout
-            match tokio::time::timeout(timeout, (self.handler)(job.clone())).await {
+            match tokio::time::timeout(timeout, self.execute_handler(job.clone())).await {
                 Ok(result) => result,
                 Err(_) => {
                     // Timeout occurred
@@ -729,11 +860,11 @@ where
             }
         } else {
             // Run without timeout
-            (self.handler)(job.clone()).await
+            self.execute_handler(job.clone()).await
         };
 
         match handler_result {
-            Ok(()) => {
+            Ok(job_result) => {
                 debug!("Job {} completed successfully", job_id);
 
                 let processing_time_ms = (Utc::now() - start_time).num_milliseconds() as u64;
@@ -776,6 +907,19 @@ where
                     }
                 } else {
                     self.queue.complete_job(job_id).await?;
+                }
+
+                // Store job result if enabled and data is provided
+                if let Some(result_data) = job_result.data {
+                    if let crate::job::ResultStorage::Database = job.result_config.storage {
+                        let expires_at = job.result_config.ttl.map(|ttl| Utc::now() + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(24)));
+                        
+                        if let Err(e) = self.queue.store_job_result(job_id, result_data, expires_at).await {
+                            warn!("Failed to store job result for job {}: {}", job_id, e);
+                        } else {
+                            debug!("Stored result for job {}", job_id);
+                        }
+                    }
                 }
 
                 // Record job completed event
@@ -869,6 +1013,20 @@ where
         }
 
         Ok(())
+    }
+
+    /// Execute a job handler based on its type, returning a unified result
+    async fn execute_handler(&self, job: Job) -> Result<JobResult> {
+        match &self.handler {
+            JobHandlerType::Legacy(handler) => {
+                // Execute legacy handler and convert () to JobResult
+                handler(job).await.map(|_| JobResult::success())
+            }
+            JobHandlerType::WithResult(handler) => {
+                // Execute enhanced handler directly
+                handler(job).await
+            }
+        }
     }
 
     /// Update batch processing statistics

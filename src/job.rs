@@ -49,6 +49,146 @@ pub enum JobStatus {
     Retrying,
 }
 
+/// Configuration for job result storage.
+///
+/// This enum determines where and how job results are stored when jobs complete successfully.
+/// Different storage backends offer different trade-offs between performance, persistence,
+/// and resource usage.
+///
+/// # Examples
+///
+/// ```rust
+/// use hammerwork::job::ResultStorage;
+///
+/// // Store results in the database
+/// let db_storage = ResultStorage::Database;
+///
+/// // Store results in memory (faster but not persistent)
+/// let memory_storage = ResultStorage::Memory;
+///
+/// // Don't store results (default behavior)
+/// let no_storage = ResultStorage::None;
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResultStorage {
+    /// Store results in the database (persistent across restarts).
+    Database,
+    /// Store results in memory (faster access but lost on restart).
+    Memory,
+    /// Don't store job results (default behavior).
+    None,
+}
+
+impl Default for ResultStorage {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Configuration for job result storage and management.
+///
+/// This struct contains settings that control how job results are stored,
+/// how long they're retained, and when they should be cleaned up.
+///
+/// # Examples
+///
+/// ```rust
+/// use hammerwork::job::{ResultConfig, ResultStorage};
+/// use std::time::Duration;
+///
+/// // Store results in database for 7 days
+/// let config = ResultConfig::new(ResultStorage::Database)
+///     .with_ttl(Duration::from_secs(7 * 24 * 60 * 60));
+///
+/// // Store results in memory for 1 hour
+/// let config = ResultConfig::new(ResultStorage::Memory)
+///     .with_ttl(Duration::from_secs(3600));
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResultConfig {
+    /// Where to store the job results.
+    pub storage: ResultStorage,
+    /// How long to keep results before expiring them.
+    pub ttl: Option<std::time::Duration>,
+    /// Maximum size of result data in bytes (for validation).
+    pub max_size_bytes: Option<usize>,
+}
+
+impl ResultConfig {
+    /// Creates a new result configuration with the specified storage backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - The storage backend to use for results
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::job::{ResultConfig, ResultStorage};
+    ///
+    /// let config = ResultConfig::new(ResultStorage::Database);
+    /// assert_eq!(config.storage, ResultStorage::Database);
+    /// assert!(config.ttl.is_none());
+    /// ```
+    pub fn new(storage: ResultStorage) -> Self {
+        Self {
+            storage,
+            ttl: None,
+            max_size_bytes: None,
+        }
+    }
+
+    /// Sets the time-to-live (TTL) for stored results.
+    ///
+    /// After this duration elapses, the result will be eligible for cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` - How long to keep results before they expire
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::job::{ResultConfig, ResultStorage};
+    /// use std::time::Duration;
+    ///
+    /// let config = ResultConfig::new(ResultStorage::Database)
+    ///     .with_ttl(Duration::from_secs(3600)); // 1 hour
+    /// ```
+    pub fn with_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Sets the maximum size for result data.
+    ///
+    /// This is used to validate result data before storage to prevent
+    /// extremely large results from impacting system performance.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_bytes` - Maximum allowed size for result data
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::job::{ResultConfig, ResultStorage};
+    ///
+    /// let config = ResultConfig::new(ResultStorage::Database)
+    ///     .with_max_size(1024 * 1024); // 1MB limit
+    /// ```
+    pub fn with_max_size(mut self, max_bytes: usize) -> Self {
+        self.max_size_bytes = Some(max_bytes);
+        self
+    }
+}
+
+impl Default for ResultConfig {
+    fn default() -> Self {
+        Self::new(ResultStorage::None)
+    }
+}
+
 /// A unit of work to be processed by the job queue.
 ///
 /// Jobs are the fundamental building blocks of the Hammerwork system. Each job contains:
@@ -153,6 +293,14 @@ pub struct Job {
     pub timezone: Option<String>,
     /// Batch ID if this job is part of a batch operation.
     pub batch_id: Option<crate::batch::BatchId>,
+    /// Configuration for how job results should be stored.
+    pub result_config: ResultConfig,
+    /// The actual result data from job execution (if stored).
+    pub result_data: Option<serde_json::Value>,
+    /// When the result was stored (if applicable).
+    pub result_stored_at: Option<DateTime<Utc>>,
+    /// When the stored result will expire (if applicable).
+    pub result_expires_at: Option<DateTime<Utc>>,
 }
 
 impl Job {
@@ -212,6 +360,10 @@ impl Job {
             recurring: false,
             timezone: None,
             batch_id: None,
+            result_config: ResultConfig::default(),
+            result_data: None,
+            result_stored_at: None,
+            result_expires_at: None,
         }
     }
 
@@ -276,6 +428,10 @@ impl Job {
             recurring: false,
             timezone: None,
             batch_id: None,
+            result_config: ResultConfig::default(),
+            result_data: None,
+            result_stored_at: None,
+            result_expires_at: None,
         }
     }
 
@@ -477,6 +633,10 @@ impl Job {
             recurring: true,
             timezone: Some(cron_schedule.timezone.clone()),
             batch_id: None,
+            result_config: ResultConfig::default(),
+            result_data: None,
+            result_stored_at: None,
+            result_expires_at: None,
         })
     }
 
@@ -504,6 +664,119 @@ impl Job {
     pub fn with_timezone(mut self, timezone: String) -> Self {
         self.timezone = Some(timezone);
         self
+    }
+
+    /// Configure how job results should be stored.
+    ///
+    /// This allows jobs to store their results for later retrieval by other systems.
+    /// Results can be stored in the database, memory, or not stored at all.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - The storage backend to use for results
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::{Job, job::ResultStorage};
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("data_processing".to_string(), json!({"input": "data"}))
+    ///     .with_result_storage(ResultStorage::Database);
+    /// ```
+    pub fn with_result_storage(mut self, storage: ResultStorage) -> Self {
+        self.result_config.storage = storage;
+        self
+    }
+
+    /// Set the time-to-live (TTL) for stored job results.
+    ///
+    /// After this duration elapses, the result will be eligible for cleanup.
+    /// This is useful for managing storage costs and compliance requirements.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` - How long to keep results before they expire
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    /// use std::time::Duration;
+    ///
+    /// let job = Job::new("report_generation".to_string(), json!({"type": "monthly"}))
+    ///     .with_result_ttl(Duration::from_secs(7 * 24 * 60 * 60)); // 7 days
+    /// ```
+    pub fn with_result_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.result_config.ttl = Some(ttl);
+        self
+    }
+
+    /// Configure complete result storage settings.
+    ///
+    /// This provides full control over how results are stored and managed.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Complete result configuration
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::{Job, job::{ResultConfig, ResultStorage}};
+    /// use serde_json::json;
+    /// use std::time::Duration;
+    ///
+    /// let config = ResultConfig::new(ResultStorage::Database)
+    ///     .with_ttl(Duration::from_secs(3600))
+    ///     .with_max_size(1024 * 1024); // 1MB
+    ///
+    /// let job = Job::new("large_processing".to_string(), json!({"data": "..."}))
+    ///     .with_result_config(config);
+    /// ```
+    pub fn with_result_config(mut self, config: ResultConfig) -> Self {
+        self.result_config = config;
+        self
+    }
+
+    /// Check if the job has result storage configured.
+    ///
+    /// Returns `true` if the job is configured to store results in any backend
+    /// other than `ResultStorage::None`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::{Job, job::ResultStorage};
+    /// use serde_json::json;
+    ///
+    /// let job1 = Job::new("test".to_string(), json!({}));
+    /// assert!(!job1.has_result_storage());
+    ///
+    /// let job2 = Job::new("test".to_string(), json!({}))
+    ///     .with_result_storage(ResultStorage::Database);
+    /// assert!(job2.has_result_storage());
+    /// ```
+    pub fn has_result_storage(&self) -> bool {
+        self.result_config.storage != ResultStorage::None
+    }
+
+    /// Check if the job has stored result data.
+    ///
+    /// Returns `true` if the job has result data available for retrieval.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("test".to_string(), json!({}));
+    /// assert!(!job.has_result_data());
+    /// ```
+    pub fn has_result_data(&self) -> bool {
+        self.result_data.is_some()
     }
 
     /// Check if the job is dead (failed all retry attempts)

@@ -5,6 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2025-06-27
+
+### Added
+- **🔧 Cargo Subcommand for Database Migrations**
+  - `cargo hammerwork migrate` command for running database migrations
+  - `cargo hammerwork status` command for checking migration status
+  - Progressive schema evolution with versioned migrations (001-006)
+  - Database-specific optimizations (PostgreSQL JSONB vs MySQL JSON)
+  - Migration tracking table for execution history and rollback safety
+- **💾 Comprehensive Job Result Storage**
+  - `ResultStorage` enum with `Database`, `Memory`, and `None` options for flexible result storage strategies
+  - `ResultConfig` struct with TTL support, max size limits, and configurable storage backends
+  - `JobResult` struct for structured result data returned by enhanced job handlers
+  - Automatic result storage when jobs complete successfully with configurable expiration
+  - Result retrieval, deletion, and cleanup operations integrated into the DatabaseQueue trait
+
+- **🔧 Enhanced Job Handler System**
+  - `JobHandlerWithResult` type for handlers that return result data alongside success/failure status
+  - Dual handler system maintaining 100% backward compatibility with existing `JobHandler` implementations
+  - `JobResult::success()` and `JobResult::with_data()` constructors for flexible result creation
+  - Automatic result storage integration in worker processing loop
+
+- **🗄️ Database Schema and Implementation Enhancements**
+  - Added `result_data`, `result_stored_at`, `result_expires_at` columns to job tables
+  - PostgreSQL implementation using JSONB for efficient result storage and queries
+  - MySQL implementation using JSON with string-based UUID handling
+  - Split monolithic queue implementation into separate PostgreSQL and MySQL modules for better maintainability
+  - Optimized queries for result storage, retrieval, and expiration cleanup
+
+- **⚡ Advanced Result Management API**
+  - `store_job_result()` - Store result data with optional TTL expiration
+  - `get_job_result()` - Retrieve stored results with automatic expiration checking
+  - `delete_job_result()` - Manual result cleanup
+  - `cleanup_expired_results()` - Batch cleanup of expired results returning count
+  - TTL support with automatic expiration based on configurable time-to-live settings
+
+- **👷 Worker Integration and Compatibility**
+  - `Worker::new_with_result_handler()` constructor for enhanced result-storing workers
+  - Automatic result storage when jobs complete successfully (respects job configuration)
+  - Legacy handler compatibility - existing workers continue to work unchanged
+  - `JobHandlerType` enum for internal handler type management and routing
+
+- **🧪 Comprehensive Testing Suite**
+  - 8 new result storage tests covering all functionality across PostgreSQL and MySQL
+  - Worker integration tests using WorkerPool approach for realistic testing scenarios
+  - Result expiration and TTL testing with time-based validation
+  - Legacy handler compatibility testing ensuring backward compatibility
+  - Configuration testing for all result storage modes and settings
+
+- **📖 Documentation and Examples**  
+  - Complete `result_storage_example.rs` demonstrating all result storage features
+  - Database-specific implementations to handle complex generic constraints
+  - Basic storage, enhanced workers, result expiration, and legacy compatibility examples
+  - Visual feedback using emoji indicators for clear demonstration output
+  - Comprehensive documentation for result storage configuration and usage
+
+### Enhanced
+- **Job Structure**: Added result configuration fields with builder methods
+  - `with_result_storage()` - Configure storage backend (Database, Memory, None)
+  - `with_result_ttl()` - Set time-to-live for result expiration
+  - `with_result_config()` - Apply complete result configuration
+- **Database Queue**: Extended trait with result storage operations
+- **Library Exports**: Added new result storage types to public API
+- **Architecture**: Modularized queue implementations for better code organization
+
+### Removed (Breaking Changes)
+- **BREAKING**: Removed `create_tables()` method from DatabaseQueue trait
+- **BREAKING**: Removed `run_migrations()` method from DatabaseQueue trait  
+- **BREAKING**: Removed standalone `migrate` binary
+- **BREAKING**: All examples now require running `cargo hammerwork migrate` before use
+- Database setup is now exclusively handled by the cargo subcommand for better separation of concerns
+
+### Enhanced
+- **Simplified API**: Cleaner DatabaseQueue trait focused on job operations only
+- **Standard Workflow**: Database migrations follow Rust ecosystem conventions
+- **Production Ready**: Migrations run during deployment, not application startup
+- **Better Testing**: Database setup is external to application code
+
+### Technical Implementation
+- **Single Source of Truth**: Only one way to run migrations (`cargo hammerwork migrate`)
+- **Idempotent Operations**: Safe to run migrations multiple times
+- **Progressive Schema**: 6 versioned migrations covering Hammerwork's evolution (v0.1.0 to v0.8.0)
+- **Database Optimizations**: PostgreSQL JSONB vs MySQL JSON with appropriate indexing
+- **Migration Tracking**: Comprehensive execution history and rollback safety
+
 ## [0.7.1] - 2025-06-27
 
 ### Fixed

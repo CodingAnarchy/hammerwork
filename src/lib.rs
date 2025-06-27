@@ -6,6 +6,7 @@
 //!
 //! - **Multi-database support**: PostgreSQL and MySQL backends with feature flags
 //! - **Job prioritization**: Five priority levels with weighted and strict scheduling algorithms
+//! - **Job result storage**: Store and retrieve job execution results with TTL support
 //! - **Cron scheduling**: Full cron expression support with timezone awareness
 //! - **Rate limiting**: Token bucket rate limiting with configurable burst limits
 //! - **Monitoring**: Prometheus metrics and advanced alerting (enabled by default)
@@ -105,6 +106,7 @@ pub mod batch;
 pub mod cron;
 pub mod error;
 pub mod job;
+pub mod migrations;
 pub mod priority;
 pub mod queue;
 pub mod rate_limit;
@@ -120,7 +122,7 @@ pub mod alerting;
 pub use batch::{BatchId, BatchResult, BatchStatus, JobBatch, PartialFailureMode};
 pub use cron::{CronError, CronSchedule};
 pub use error::HammerworkError;
-pub use job::{Job, JobId, JobStatus};
+pub use job::{Job, JobId, JobStatus, ResultConfig, ResultStorage};
 pub use priority::{
     JobPriority, PriorityError, PrioritySelectionStrategy, PriorityStats, PriorityWeights,
 };
@@ -129,7 +131,9 @@ pub use rate_limit::{RateLimit, RateLimiter, ThrottleConfig};
 pub use stats::{
     DeadJobSummary, InMemoryStatsCollector, JobStatistics, QueueStats, StatisticsCollector,
 };
-pub use worker::{BatchProcessingStats, Worker, WorkerPool};
+pub use worker::{
+    BatchProcessingStats, JobHandler, JobHandlerWithResult, JobResult, Worker, WorkerPool,
+};
 
 #[cfg(feature = "metrics")]
 pub use metrics::{MetricsConfig, PrometheusMetricsCollector};

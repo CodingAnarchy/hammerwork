@@ -22,11 +22,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let queue = Arc::new(JobQueue::new(pool));
 
     // Initialize database tables
-    #[cfg(feature = "mysql")]
-    {
-        use hammerwork::queue::DatabaseQueue;
-        queue.create_tables().await?;
-    }
+    // Before running this example, make sure to run the migration command to create the necessary tables:
+    // cargo hammerwork migrate --database-url mysql://localhost/hammerwork_test
 
     // Create statistics collector for monitoring job processing
     let stats_collector =

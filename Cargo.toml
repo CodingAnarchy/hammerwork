@@ -25,10 +25,11 @@ rand = "0.8"
 prometheus = { version = "0.13" }
 reqwest = { version = "0.12", features = ["json"] }
 warp = { version = "0.3" }
+clap = { version = "4.0", features = ["derive"] }
 
 [package]
 name = "hammerwork"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job prioritization, cron scheduling, timeouts, rate limiting, Prometheus metrics, alerting, and comprehensive statistics collection"
 license = "MIT"
@@ -57,6 +58,8 @@ rand = { workspace = true }
 prometheus = { version = "0.13", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 warp = { version = "0.3", optional = true }
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 default = ["metrics", "alerting"]
@@ -84,3 +87,7 @@ required-features = ["postgres"]
 [[example]]
 name = "priority_example"
 required-features = ["postgres"]
+
+[[bin]]
+name = "cargo-hammerwork"
+path = "src/bin/cargo-hammerwork.rs"

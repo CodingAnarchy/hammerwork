@@ -29,9 +29,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let queue = Arc::new(JobQueue::new(pool));
 
-    // Create tables
-    queue.create_tables().await?;
-    info!("✅ Database tables created");
+    // NOTE: Run `cargo hammerwork migrate` to create the necessary database tables
+    // before running this example
+    info!("📋 Make sure to run 'cargo hammerwork migrate' first to set up database tables");
 
     // Setup statistics collection
     let stats_collector = Arc::new(InMemoryStatsCollector::new_default());

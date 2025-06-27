@@ -23,11 +23,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let queue = Arc::new(JobQueue::new(pool));
 
     // Initialize database tables
-    #[cfg(feature = "postgres")]
-    {
-        use hammerwork::queue::DatabaseQueue;
-        queue.create_tables().await?;
-    }
+    // Note: Before running this example, ensure database tables are created by running:
+    // cargo hammerwork migrate
 
     // Create statistics collector for monitoring job processing
     let stats_collector =

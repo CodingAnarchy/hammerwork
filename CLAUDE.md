@@ -104,3 +104,120 @@ Both PostgreSQL and MySQL implementations use a single table `hammerwork_jobs` w
 - **Type-safe job handling**: Job handlers return `Result<()>` for error handling
 - **Priority-aware scheduling**: Weighted and strict priority algorithms prevent starvation
 - **Comprehensive monitoring**: Statistics track priority distribution and performance
+
+## Rust Library Development Best Practices
+
+### Pre-Commit Quality Checks (REQUIRED)
+
+**ALWAYS run these commands before committing and pushing any changes:**
+
+```bash
+# 1. Format code according to Rust standards
+cargo fmt
+
+# 2. Run all linting checks with strict warnings
+cargo clippy --all-features -- -D warnings
+
+# 3. Run complete test suite with all features
+cargo test --all-features
+
+# 4. Verify examples compile and work
+cargo check --examples --all-features
+
+# 5. Build release version to catch optimization issues
+cargo build --release --all-features
+```
+
+### Code Quality Standards
+
+1. **Code Formatting**
+   - Use `cargo fmt` for consistent formatting
+   - Follow Rust naming conventions (snake_case, PascalCase, SCREAMING_SNAKE_CASE)
+   - Keep line length reasonable (under 100 characters when possible)
+
+2. **Documentation**
+   - Document all public APIs with `///` doc comments
+   - Include examples in doc comments where helpful
+   - Update CHANGELOG.md for all user-facing changes
+   - Maintain CLAUDE.md for development guidance
+
+3. **Testing Strategy**
+   - Write unit tests for all core functionality
+   - Include integration tests for database operations
+   - Test with both PostgreSQL and MySQL features
+   - Cover edge cases and error conditions
+   - Use `#[ignore]` for tests requiring database connections
+
+4. **Error Handling**
+   - Use `thiserror` for structured error types
+   - Provide meaningful error messages
+   - Avoid unwrap() in library code
+   - Propagate errors using `?` operator
+
+5. **Dependencies & Features**
+   - Keep dependencies minimal and well-justified
+   - Use feature flags for optional functionality
+   - Ensure backward compatibility when possible
+   - Document MSRV (Minimum Supported Rust Version)
+
+6. **Performance Considerations**
+   - Profile database queries for efficiency
+   - Use appropriate indexes in schema
+   - Minimize allocations in hot paths
+   - Test with realistic data volumes
+
+### Release Process
+
+1. **Version Bumping**
+   - Follow Semantic Versioning (semver)
+   - Update version in Cargo.toml
+   - Update CHANGELOG.md with release notes
+   - Tag releases with `git tag vX.Y.Z`
+
+2. **Testing Before Release**
+   - Run full test suite: `cargo test --all-features`
+   - Test examples: `cargo run --example <name> --features <db>`
+   - Verify documentation: `cargo doc --all-features`
+   - Check packaging: `cargo package`
+
+3. **Publishing**
+   - Commit all changes with descriptive messages
+   - Push to origin: `git push origin main && git push origin --tags`
+   - Publish to crates.io: `cargo publish`
+
+### Database Development Guidelines
+
+1. **Schema Changes**
+   - Always provide migration paths
+   - Test with both PostgreSQL and MySQL
+   - Consider backward compatibility
+   - Document schema changes in CHANGELOG
+
+2. **Query Optimization**
+   - Use proper indexes for job polling
+   - Leverage database-specific features appropriately
+   - Test query performance under load
+   - Use `EXPLAIN` to analyze query plans
+
+3. **Feature Parity**
+   - Maintain functional equivalence between database backends
+   - Handle database-specific limitations gracefully
+   - Test all features with both databases
+
+### Git Workflow
+
+1. **Commit Messages**
+   - Use conventional commit format when appropriate
+   - Include clear, descriptive titles
+   - Reference issues/PRs when relevant
+   - Add co-authorship for AI-assisted development
+
+2. **Branch Management**
+   - Use descriptive branch names
+   - Keep commits focused and atomic
+   - Squash commits before merging when appropriate
+
+3. **Code Reviews**
+   - Review for correctness, performance, and maintainability
+   - Ensure tests pass on all supported platforms
+   - Verify documentation is updated
