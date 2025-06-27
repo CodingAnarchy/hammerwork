@@ -2,64 +2,7 @@
 
 This roadmap outlines planned features for Hammerwork, prioritized by impact level and implementation complexity. Features are organized into phases based on their value proposition to users and estimated development effort.
 
-## Phase 1: High Impact, Low-Medium Complexity ✅ COMPLETE
-*Essential features that provide significant value with reasonable implementation effort*
-
-### ✅ Advanced Scheduling Patterns (COMPLETED v1.0.0)
-**Impact: Medium-High** | **Complexity: Medium** | **Priority: High**
-
-**Status: ✅ Implemented** - Provides advanced retry strategies with exponential backoff, jitter, and custom scheduling patterns.
-
-```rust
-// Exponential backoff with jitter (prevents thundering herd)
-let job = Job::new("retry_job".to_string(), payload)
-    .with_exponential_backoff(
-        Duration::from_secs(1),      // base delay
-        2.0,                         // multiplier  
-        Duration::from_minutes(10)   // max delay
-    );
-
-// Fibonacci backoff for gentle growth
-let job = Job::new("scheduled_job".to_string(), payload)
-    .with_fibonacci_backoff(
-        Duration::from_secs(2),
-        Some(Duration::from_minutes(5))
-    );
-
-// Linear backoff for steady increase
-let job = Job::new("linear_job".to_string(), payload)
-    .with_linear_backoff(
-        Duration::from_secs(5),      // base delay
-        Duration::from_secs(10),     // increment
-        Some(Duration::from_secs(60)) // max delay
-    );
-
-// Custom retry logic for business rules
-let job = Job::new("custom_job".to_string(), payload)
-    .with_retry_strategy(RetryStrategy::custom(|attempt| {
-        match attempt {
-            1..=3 => Duration::from_secs(2),     // Quick retries
-            4..=6 => Duration::from_secs(30),    // Medium delays
-            _ => Duration::from_minutes(10),     // Long delays
-        }
-    }));
-
-// Worker-level default strategies
-let worker = Worker::new(queue, "api_tasks".to_string(), handler)
-    .with_default_retry_strategy(RetryStrategy::exponential(
-        Duration::from_secs(1), 2.0, Some(Duration::from_minutes(5))
-    ));
-```
-
-**Key Features Implemented:**
-- ✅ Fixed, Linear, Exponential, Fibonacci, and Custom retry strategies
-- ✅ Additive and Multiplicative jitter types to prevent thundering herd
-- ✅ Job-level retry strategy overrides
-- ✅ Worker-level default retry strategies
-- ✅ Full backward compatibility with existing fixed delay system
-- ✅ Comprehensive test coverage and examples
-
-## Phase 2: High Impact, Medium-High Complexity
+## Phase 1: High Impact, Medium-High Complexity
 *Features that provide significant value but require more substantial implementation effort*
 
 ### 🔗 Job Dependencies & Workflows
@@ -120,7 +63,7 @@ let admin_server = AdminServer::new()
 // hammerwork-cli worker scale <queue> <count>
 ```
 
-## Phase 3: Medium Impact, Variable Complexity
+## Phase 2: Medium Impact, Variable Complexity
 *Valuable features for specific use cases or operational efficiency*
 
 ### 🗄️ Job Archiving & Retention
@@ -193,7 +136,7 @@ let event_stream = EventStream::new()
     .with_filtering(|event| event.priority >= JobPriority::High);
 ```
 
-## Phase 4: Specialized Features
+## Phase 3: Specialized Features
 *Features for specific enterprise or compliance requirements*
 
 ### 🔐 Job Encryption & PII Protection
@@ -237,7 +180,7 @@ let bridge = MessageBridge::new()
     .with_transform(|msg| Job::from_message(msg));
 ```
 
-## Phase 5: Advanced Scaling Features
+## Phase 4: Advanced Scaling Features
 *Complex features primarily for large-scale deployments*
 
 ### 🚀 Zero-downtime Deployments
@@ -283,26 +226,23 @@ let geo_config = GeoReplicationConfig::new()
 
 Features are ordered within each phase by priority and should generally be implemented in the following sequence:
 
-**Phase 1 (Foundation) ✅ COMPLETE**
-1. ✅ Advanced Scheduling Patterns (v1.0.0)
-
-**Phase 2 (Advanced Features) - NEXT PRIORITIES**
+**Phase 1 (Advanced Features) - CURRENT PRIORITIES**
 1. Job Dependencies & Workflows
 2. Job Tracing & Correlation
 3. Admin Dashboard & CLI Tools
 
-**Phase 3 (Operational Features)**
+**Phase 2 (Operational Features)**
 1. Job Archiving & Retention
 2. Job Testing & Simulation
 3. Dynamic Job Spawning
 4. Webhook & Event Streaming
 
-**Phase 4 (Enterprise Features)**
+**Phase 3 (Enterprise Features)**
 1. Job Encryption & PII Protection
 2. Access Control & Auditing
 3. Message Queue Integration
 
-**Phase 5 (Scaling Features)**
+**Phase 4 (Scaling Features)**
 1. Zero-downtime Deployments
 2. Queue Partitioning & Sharding
 3. Multi-region Support
@@ -313,7 +253,7 @@ We welcome contributions to any of these roadmap items! Please:
 
 1. Open an issue to discuss the feature before implementation
 2. Review the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines
-3. Consider starting with Phase 1 features for maximum impact
+3. Consider starting with Phase 1 (Advanced Features) for maximum impact
 4. Ensure comprehensive tests and documentation for new features
 
 ## Feedback
