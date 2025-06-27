@@ -38,20 +38,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to database
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        #[cfg(feature = "postgres")]
+        #[cfg(all(feature = "postgres", not(feature = "mysql")))]
         return "postgresql://localhost/hammerwork".to_string();
-        #[cfg(feature = "mysql")]
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
         return "mysql://localhost/hammerwork".to_string();
+        #[cfg(all(feature = "postgres", feature = "mysql"))]
+        return "postgresql://localhost/hammerwork".to_string(); // Default to postgres when both enabled
         #[cfg(not(any(feature = "postgres", feature = "mysql")))]
         panic!("No database feature enabled. Use --features postgres or --features mysql");
     });
 
     println!("🔗 Connecting to database: {}", database_url);
 
-    #[cfg(feature = "postgres")]
+    #[cfg(all(feature = "postgres", not(feature = "mysql")))]
     let pool = sqlx::PgPool::connect(&database_url).await?;
-    #[cfg(feature = "mysql")]
+    #[cfg(all(feature = "mysql", not(feature = "postgres")))]
     let pool = sqlx::MySqlPool::connect(&database_url).await?;
+    #[cfg(all(feature = "postgres", feature = "mysql"))]
+    let pool = sqlx::PgPool::connect(&database_url).await?; // Default to postgres when both enabled
 
     let queue = Arc::new(JobQueue::new(pool));
 
@@ -60,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📋 Database tables should be initialized using 'cargo hammerwork migrate'");
 
     // Demonstrate different aspects of result storage
-    #[cfg(feature = "postgres")]
+    #[cfg(any(all(feature = "postgres", not(feature = "mysql")), all(feature = "postgres", feature = "mysql")))]
     {
         demonstrate_basic_result_storage_postgres(&queue).await?;
         demonstrate_enhanced_workers_postgres(&queue).await?;
@@ -68,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         demonstrate_legacy_compatibility_postgres(&queue).await?;
     }
 
-    #[cfg(feature = "mysql")]
+    #[cfg(all(feature = "mysql", not(feature = "postgres")))]
     {
         demonstrate_basic_result_storage_mysql(&queue).await?;
         demonstrate_enhanced_workers_mysql(&queue).await?;
@@ -369,7 +373,7 @@ async fn demonstrate_legacy_compatibility_postgres(
     println!("\n🔄 === Legacy Handler Compatibility ===");
 
     // Create a traditional job handler (returns ())
-    let legacy_handler: JobHandler = Arc::new(|job| {
+    let legacy_handler: JobHandler = Arc::new(|_job| {
         Box::pin(async move {
             println!("   🔧 Processing job with legacy handler...");
 

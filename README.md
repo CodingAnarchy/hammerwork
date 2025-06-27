@@ -5,7 +5,10 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ## Features
 
 - **Multi-database support**: PostgreSQL and MySQL backends
+- **Advanced retry strategies**: Exponential backoff, linear, Fibonacci, and custom retry patterns with jitter
 - **Job prioritization**: Five priority levels with weighted and strict scheduling algorithms
+- **Result storage**: Database and in-memory result storage with TTL and automatic cleanup
+- **Worker autoscaling**: Dynamic worker pool scaling based on queue depth and configurable thresholds
 - **Batch operations**: High-performance bulk job enqueuing with optimized worker processing
 - **Cron scheduling**: Full cron expression support with timezone awareness
 - **Rate limiting**: Token bucket rate limiting with configurable burst limits
@@ -20,12 +23,12 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "0.7", features = ["postgres"] }
+hammerwork = { version = "1.0", features = ["postgres"] }
 # or
-hammerwork = { version = "0.7", features = ["mysql"] }
+hammerwork = { version = "1.0", features = ["mysql"] }
 
 # Minimal installation
-hammerwork = { version = "0.7", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.0", features = ["postgres"], default-features = false }
 ```
 
 **Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default)
@@ -48,9 +51,9 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 ## Basic Example
 
 ```rust
-use hammerwork::{Job, Worker, WorkerPool, JobQueue};
+use hammerwork::{Job, Worker, WorkerPool, JobQueue, RetryStrategy};
 use serde_json::json;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,13 +69,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     });
 
-    // Start worker
-    let worker = Worker::new(queue.clone(), "default".to_string(), handler);
+    // Start worker with retry strategy
+    let worker = Worker::new(queue.clone(), "default".to_string(), handler)
+        .with_default_retry_strategy(RetryStrategy::exponential(
+            Duration::from_secs(1), 2.0, Some(Duration::from_secs(60))
+        ));
     let mut pool = WorkerPool::new();
     pool.add_worker(worker);
 
-    // Enqueue jobs
-    let job = Job::new("default".to_string(), json!({"task": "send_email"}));
+    // Enqueue jobs with advanced retry strategies
+    let job = Job::new("default".to_string(), json!({"task": "send_email"}))
+        .with_exponential_backoff(
+            Duration::from_secs(2),
+            2.0,
+            Duration::from_minutes(10)
+        );
     queue.enqueue(job).await?;
 
     pool.start().await
@@ -117,11 +128,12 @@ queue.enqueue(job).await?;
 ### Database Schema
 
 Hammerwork uses optimized tables with comprehensive indexing:
-- **`hammerwork_jobs`** - Main job table with priorities, timeouts, cron scheduling, and result storage
+- **`hammerwork_jobs`** - Main job table with priorities, timeouts, cron scheduling, retry strategies, and result storage
 - **`hammerwork_batches`** - Batch metadata and tracking (v0.7.0+)
+- **`hammerwork_job_results`** - Job result storage with TTL and expiration (v0.8.0+)
 - **`hammerwork_migrations`** - Migration tracking for schema evolution
 
-The schema supports all features including job prioritization, timeouts, cron scheduling, batch processing, result storage, and comprehensive lifecycle tracking. See [Database Migrations](docs/migrations.md) for details.
+The schema supports all features including job prioritization, advanced retry strategies, timeouts, cron scheduling, batch processing, result storage with TTL, worker autoscaling, and comprehensive lifecycle tracking. See [Database Migrations](docs/migrations.md) for details.
 
 ## Development
 
@@ -147,6 +159,8 @@ Working examples in `examples/`:
 - `priority_example.rs` - Priority system demonstration
 - `batch_example.rs` - Bulk job enqueuing and processing
 - `worker_batch_example.rs` - Worker batch processing features
+- `retry_strategies.rs` - Advanced retry patterns with exponential backoff and jitter
+- `result_storage_example.rs` - Job result storage and retrieval
 
 ```bash
 cargo run --example postgres_example --features postgres

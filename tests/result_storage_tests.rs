@@ -1,7 +1,9 @@
 //! Comprehensive tests for job result storage and retrieval functionality.
 
+mod test_utils;
+
 use hammerwork::{
-    Job, JobQueue, Worker, WorkerPool,
+    Job, Worker, WorkerPool,
     job::{ResultConfig, ResultStorage},
     queue::DatabaseQueue,
     worker::{JobHandler, JobHandlerWithResult, JobResult},
@@ -13,18 +15,9 @@ use std::{sync::Arc, time::Duration};
 mod postgres_tests {
     use super::*;
 
-    async fn setup_postgres() -> Arc<JobQueue<sqlx::Postgres>> {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://localhost/hammerwork_test".to_string());
-        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
-        let queue = Arc::new(JobQueue::new(pool));
-        queue.create_tables().await.unwrap();
-        queue
-    }
-
     #[tokio::test]
     async fn test_job_result_storage_and_retrieval() {
-        let queue = setup_postgres().await;
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create a job with result storage enabled
         let job = Job::new("test_queue".to_string(), json!({"task": "process_data"}))
@@ -59,7 +52,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn test_result_expiration() {
-        let queue = setup_postgres().await;
+        let queue = test_utils::setup_postgres_queue().await;
 
         let job = Job::new("test_queue".to_string(), json!({"task": "short_lived"}));
         let job_id = queue.enqueue(job).await.unwrap();
@@ -86,7 +79,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn test_cleanup_expired_results() {
-        let queue = setup_postgres().await;
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create multiple jobs with different expiration times
         let mut job_ids = Vec::new();
@@ -127,7 +120,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn test_worker_automatic_result_storage() {
-        let queue = setup_postgres().await;
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create a handler that returns result data
         let handler: JobHandlerWithResult = Arc::new(|job| {
@@ -178,7 +171,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn test_worker_legacy_handler_compatibility() {
-        let queue = setup_postgres().await;
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create a legacy handler (returns ())
         let legacy_handler: JobHandler = Arc::new(|_job| {
@@ -215,7 +208,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn test_result_storage_none_configuration() {
-        let queue = setup_postgres().await;
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create a handler that returns result data
         let handler: JobHandlerWithResult = Arc::new(|_job| {
@@ -277,18 +270,9 @@ mod postgres_tests {
 mod mysql_tests {
     use super::*;
 
-    async fn setup_mysql() -> Arc<JobQueue<sqlx::MySql>> {
-        let database_url = std::env::var("MYSQL_DATABASE_URL")
-            .unwrap_or_else(|_| "mysql://root@localhost/hammerwork_test".to_string());
-        let pool = sqlx::MySqlPool::connect(&database_url).await.unwrap();
-        let queue = Arc::new(JobQueue::new(pool));
-        queue.create_tables().await.unwrap();
-        queue
-    }
-
     #[tokio::test]
     async fn test_mysql_result_storage() {
-        let queue = setup_mysql().await;
+        let queue = test_utils::setup_mysql_queue().await;
 
         // Test basic result storage with MySQL
         let job = Job::new("test_queue".to_string(), json!({"task": "mysql_test"}))
@@ -314,7 +298,7 @@ mod mysql_tests {
 
     #[tokio::test]
     async fn test_mysql_worker_integration() {
-        let queue = setup_mysql().await;
+        let queue = test_utils::setup_mysql_queue().await;
 
         let handler: JobHandlerWithResult = Arc::new(|job| {
             Box::pin(async move {

@@ -1,34 +1,21 @@
+mod test_utils;
+
 use hammerwork::{
-    Job, JobQueue, JobStatus,
+    Job, JobStatus,
     batch::{BatchStatus, JobBatch, PartialFailureMode},
     queue::DatabaseQueue,
 };
 use serde_json::json;
-use std::sync::Arc;
+// use std::sync::Arc;
 
 #[cfg(feature = "postgres")]
 mod postgres_batch_tests {
     use super::*;
-    use sqlx::{Pool, Postgres};
-
-    async fn setup_postgres_pool() -> Pool<Postgres> {
-        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://postgres:password@localhost/hammerwork_test".to_string()
-        });
-
-        Pool::<Postgres>::connect(&database_url)
-            .await
-            .expect("Failed to connect to Postgres")
-    }
 
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_batch_enqueue() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        // Setup tables
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create a batch of jobs
         let jobs = vec![
@@ -80,10 +67,7 @@ mod postgres_batch_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_batch_validation() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Test empty batch validation
         let empty_batch = JobBatch::new("empty_batch");
@@ -111,10 +95,7 @@ mod postgres_batch_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_large_batch() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create a large batch of jobs
         let mut jobs = Vec::new();
@@ -153,10 +134,7 @@ mod postgres_batch_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_batch_partial_failure_modes() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Test ContinueOnError mode
         let jobs = vec![
@@ -193,10 +171,7 @@ mod postgres_batch_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_batch_metadata() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_postgres_queue().await;
 
         let job = Job::new("metadata_queue".to_string(), json!({"test": "data"}));
 
@@ -221,25 +196,10 @@ mod postgres_batch_tests {
 #[cfg(feature = "mysql")]
 mod mysql_batch_tests {
     use super::*;
-    use sqlx::{MySql, Pool};
-
-    async fn setup_mysql_pool() -> Pool<MySql> {
-        let database_url = std::env::var("MYSQL_DATABASE_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/hammerwork_test".to_string());
-
-        Pool::<MySql>::connect(&database_url)
-            .await
-            .expect("Failed to connect to MySQL")
-    }
-
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_mysql_batch_enqueue() {
-        let pool = setup_mysql_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        // Setup tables
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_mysql_queue().await;
 
         // Create a batch of jobs
         let jobs = vec![
@@ -291,10 +251,7 @@ mod mysql_batch_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_mysql_batch_chunking() {
-        let pool = setup_mysql_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_mysql_queue().await;
 
         // Create a batch larger than MySQL chunk size (100)
         let mut jobs = Vec::new();

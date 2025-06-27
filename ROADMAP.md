@@ -2,24 +2,62 @@
 
 This roadmap outlines planned features for Hammerwork, prioritized by impact level and implementation complexity. Features are organized into phases based on their value proposition to users and estimated development effort.
 
-## Phase 1: High Impact, Low-Medium Complexity
+## Phase 1: High Impact, Low-Medium Complexity ✅ COMPLETE
 *Essential features that provide significant value with reasonable implementation effort*
 
-### 📋 Advanced Scheduling Patterns
+### ✅ Advanced Scheduling Patterns (COMPLETED v1.0.0)
 **Impact: Medium-High** | **Complexity: Medium** | **Priority: High**
 
-Improves retry logic and reduces system load during failures.
+**Status: ✅ Implemented** - Provides advanced retry strategies with exponential backoff, jitter, and custom scheduling patterns.
 
 ```rust
-// Exponential backoff scheduling
+// Exponential backoff with jitter (prevents thundering herd)
 let job = Job::new("retry_job".to_string(), payload)
-    .with_exponential_backoff(Duration::from_secs(1), 2.0, Duration::from_minutes(10));
+    .with_exponential_backoff(
+        Duration::from_secs(1),      // base delay
+        2.0,                         // multiplier  
+        Duration::from_minutes(10)   // max delay
+    );
 
-// Custom scheduling strategies
+// Fibonacci backoff for gentle growth
 let job = Job::new("scheduled_job".to_string(), payload)
-    .with_schedule_strategy(ScheduleStrategy::Fibonacci) // 1, 1, 2, 3, 5, 8... seconds
-    .with_schedule_strategy(ScheduleStrategy::Linear(Duration::from_secs(30))); // 30, 60, 90... seconds
+    .with_fibonacci_backoff(
+        Duration::from_secs(2),
+        Some(Duration::from_minutes(5))
+    );
+
+// Linear backoff for steady increase
+let job = Job::new("linear_job".to_string(), payload)
+    .with_linear_backoff(
+        Duration::from_secs(5),      // base delay
+        Duration::from_secs(10),     // increment
+        Some(Duration::from_secs(60)) // max delay
+    );
+
+// Custom retry logic for business rules
+let job = Job::new("custom_job".to_string(), payload)
+    .with_retry_strategy(RetryStrategy::custom(|attempt| {
+        match attempt {
+            1..=3 => Duration::from_secs(2),     // Quick retries
+            4..=6 => Duration::from_secs(30),    // Medium delays
+            _ => Duration::from_minutes(10),     // Long delays
+        }
+    }));
+
+// Worker-level default strategies
+let worker = Worker::new(queue, "api_tasks".to_string(), handler)
+    .with_default_retry_strategy(RetryStrategy::exponential(
+        Duration::from_secs(1), 2.0, Some(Duration::from_minutes(5))
+    ));
 ```
+
+**Key Features Implemented:**
+- ✅ Fixed, Linear, Exponential, Fibonacci, and Custom retry strategies
+- ✅ Additive and Multiplicative jitter types to prevent thundering herd
+- ✅ Job-level retry strategy overrides
+- ✅ Worker-level default retry strategies
+- ✅ Full backward compatibility with existing fixed delay system
+- ✅ Comprehensive test coverage and examples
 
 ## Phase 2: High Impact, Medium-High Complexity
 *Features that provide significant value but require more substantial implementation effort*
@@ -245,11 +283,10 @@ let geo_config = GeoReplicationConfig::new()
 
 Features are ordered within each phase by priority and should generally be implemented in the following sequence:
 
-**Phase 1 (Foundation)**
-1. Job Result Storage & Retrieval
-2. Advanced Scheduling Patterns
+**Phase 1 (Foundation) ✅ COMPLETE**
+1. ✅ Advanced Scheduling Patterns (v1.0.0)
 
-**Phase 2 (Advanced Features)**
+**Phase 2 (Advanced Features) - NEXT PRIORITIES**
 1. Job Dependencies & Workflows
 2. Job Tracing & Correlation
 3. Admin Dashboard & CLI Tools

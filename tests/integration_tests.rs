@@ -1,32 +1,19 @@
+mod test_utils;
+
 use hammerwork::Job;
 use serde_json::json;
 
 #[cfg(feature = "postgres")]
 mod postgres_tests {
     use super::*;
-    use hammerwork::{JobQueue, queue::DatabaseQueue};
-    use sqlx::{Pool, Postgres};
-    use std::{sync::Arc, time::Duration};
+    use hammerwork::queue::DatabaseQueue;
+    use std::time::Duration;
     use tokio::time::sleep;
-
-    async fn setup_postgres_pool() -> Pool<Postgres> {
-        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://postgres:password@localhost/hammerwork_test".to_string()
-        });
-
-        Pool::<Postgres>::connect(&database_url)
-            .await
-            .expect("Failed to connect to Postgres")
-    }
 
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_full_workflow() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        // Setup tables
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create and enqueue a job
         let job = Job::new(
@@ -60,10 +47,7 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_retry_workflow() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create and enqueue a job
         let job = Job::new("retry_queue".to_string(), json!({"will_fail": true}));
@@ -93,10 +77,7 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_delayed_job() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create a delayed job (1 second in the future)
         let delay = chrono::Duration::seconds(1);
@@ -126,28 +107,14 @@ mod postgres_tests {
 #[cfg(feature = "mysql")]
 mod mysql_tests {
     use super::*;
-    use hammerwork::{JobQueue, queue::DatabaseQueue};
-    use sqlx::{MySql, Pool};
-    use std::{sync::Arc, time::Duration};
-    use tokio::time::sleep;
-
-    async fn setup_mysql_pool() -> Pool<MySql> {
-        let database_url = std::env::var("MYSQL_DATABASE_URL")
-            .unwrap_or_else(|_| "mysql://root:password@localhost/hammerwork_test".to_string());
-
-        Pool::<MySql>::connect(&database_url)
-            .await
-            .expect("Failed to connect to MySQL")
-    }
+    use hammerwork::queue::DatabaseQueue;
+    // use std::time::Duration;
+    // use tokio::time::sleep;
 
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_mysql_full_workflow() {
-        let pool = setup_mysql_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        // Setup tables
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_mysql_queue().await;
 
         // Create and enqueue a job
         let job = Job::new(
@@ -181,10 +148,7 @@ mod mysql_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_mysql_concurrent_dequeue() {
-        let pool = setup_mysql_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_mysql_queue().await;
 
         // Create multiple jobs
         for i in 0..5 {

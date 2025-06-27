@@ -74,6 +74,7 @@ impl JobRow {
             result_data: self.result_data,
             result_stored_at: self.result_stored_at,
             result_expires_at: self.result_expires_at,
+            retry_strategy: None,
         })
     }
 }
@@ -126,6 +127,7 @@ impl DeadJobRow {
             result_data: None,
             result_stored_at: None,
             result_expires_at: None,
+            retry_strategy: None,
         })
     }
 }

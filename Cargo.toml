@@ -29,7 +29,7 @@ clap = { version = "4.0", features = ["derive"] }
 
 [package]
 name = "hammerwork"
-version = "0.9.0"
+version = "1.0.0"
 edition = "2024"
 description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job prioritization, cron scheduling, timeouts, rate limiting, Prometheus metrics, alerting, and comprehensive statistics collection"
 license = "MIT"

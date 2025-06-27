@@ -6,6 +6,7 @@
 
 use crate::cron::CronSchedule;
 use crate::priority::JobPriority;
+use crate::retry::RetryStrategy;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -301,6 +302,8 @@ pub struct Job {
     pub result_stored_at: Option<DateTime<Utc>>,
     /// When the stored result will expire (if applicable).
     pub result_expires_at: Option<DateTime<Utc>>,
+    /// Retry strategy for this job (overrides worker default if specified).
+    pub retry_strategy: Option<RetryStrategy>,
 }
 
 impl Job {
@@ -364,6 +367,7 @@ impl Job {
             result_data: None,
             result_stored_at: None,
             result_expires_at: None,
+            retry_strategy: None,
         }
     }
 
@@ -432,6 +436,7 @@ impl Job {
             result_data: None,
             result_stored_at: None,
             result_expires_at: None,
+            retry_strategy: None,
         }
     }
 
@@ -603,6 +608,143 @@ impl Job {
         self
     }
 
+    /// Sets a custom retry strategy for this job.
+    ///
+    /// The retry strategy determines how long to wait between retry attempts
+    /// when the job fails. This overrides any default retry strategy configured
+    /// on the worker.
+    ///
+    /// # Arguments
+    ///
+    /// * `strategy` - The retry strategy to use for this job
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::{Job, retry::RetryStrategy};
+    /// use serde_json::json;
+    /// use std::time::Duration;
+    ///
+    /// // Use exponential backoff for API calls
+    /// let job = Job::new("api_call".to_string(), json!({"url": "https://api.example.com"}))
+    ///     .with_retry_strategy(RetryStrategy::exponential(
+    ///         Duration::from_secs(1),
+    ///         2.0,
+    ///         Some(Duration::from_minutes(10))
+    ///     ));
+    /// ```
+    pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
+        self.retry_strategy = Some(strategy);
+        self
+    }
+
+    /// Sets exponential backoff retry strategy for this job.
+    ///
+    /// This is a convenience method for the most common retry pattern.
+    /// Each retry attempt waits exponentially longer than the previous one.
+    ///
+    /// # Arguments
+    ///
+    /// * `base` - Base delay for the first retry attempt
+    /// * `multiplier` - Exponential growth multiplier (typically 2.0)
+    /// * `max_delay` - Maximum delay to cap exponential growth
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    /// use std::time::Duration;
+    ///
+    /// // Exponential backoff: 1s, 2s, 4s, 8s, 16s... (capped at 10 minutes)
+    /// let job = Job::new("network_request".to_string(), json!({"url": "https://example.com"}))
+    ///     .with_exponential_backoff(
+    ///         Duration::from_secs(1),
+    ///         2.0,
+    ///         Duration::from_minutes(10)
+    ///     );
+    /// ```
+    pub fn with_exponential_backoff(
+        mut self,
+        base: std::time::Duration,
+        multiplier: f64,
+        max_delay: std::time::Duration,
+    ) -> Self {
+        self.retry_strategy = Some(RetryStrategy::exponential(
+            base,
+            multiplier,
+            Some(max_delay),
+        ));
+        self
+    }
+
+    /// Sets linear backoff retry strategy for this job.
+    ///
+    /// Each retry attempt waits longer than the previous by a fixed increment.
+    ///
+    /// # Arguments
+    ///
+    /// * `base` - Base delay for the first retry attempt
+    /// * `increment` - Amount to add for each subsequent attempt
+    /// * `max_delay` - Optional maximum delay to cap growth
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    /// use std::time::Duration;
+    ///
+    /// // Linear backoff: 10s, 20s, 30s, 40s... (capped at 2 minutes)
+    /// let job = Job::new("database_operation".to_string(), json!({"query": "SELECT ..."}))
+    ///     .with_linear_backoff(
+    ///         Duration::from_secs(10),
+    ///         Duration::from_secs(10),
+    ///         Some(Duration::from_minutes(2))
+    ///     );
+    /// ```
+    pub fn with_linear_backoff(
+        mut self,
+        base: std::time::Duration,
+        increment: std::time::Duration,
+        max_delay: Option<std::time::Duration>,
+    ) -> Self {
+        self.retry_strategy = Some(RetryStrategy::linear(base, increment, max_delay));
+        self
+    }
+
+    /// Sets Fibonacci sequence backoff retry strategy for this job.
+    ///
+    /// Each retry waits according to the Fibonacci sequence multiplied by the base delay.
+    ///
+    /// # Arguments
+    ///
+    /// * `base` - Base delay multiplied by Fibonacci numbers
+    /// * `max_delay` - Optional maximum delay to cap growth
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    /// use std::time::Duration;
+    ///
+    /// // Fibonacci backoff: 2s, 2s, 4s, 6s, 10s, 16s, 26s...
+    /// let job = Job::new("file_processing".to_string(), json!({"file": "data.csv"}))
+    ///     .with_fibonacci_backoff(
+    ///         Duration::from_secs(2),
+    ///         Some(Duration::from_minutes(5))
+    ///     );
+    /// ```
+    pub fn with_fibonacci_backoff(
+        mut self,
+        base: std::time::Duration,
+        max_delay: Option<std::time::Duration>,
+    ) -> Self {
+        self.retry_strategy = Some(RetryStrategy::fibonacci(base, max_delay));
+        self
+    }
+
     /// Create a recurring job with a cron schedule
     pub fn with_cron_schedule(
         queue_name: String,
@@ -637,6 +779,7 @@ impl Job {
             result_data: None,
             result_stored_at: None,
             result_expires_at: None,
+            retry_strategy: None,
         })
     }
 

@@ -1,5 +1,7 @@
+mod test_utils;
+
 use hammerwork::{
-    Job, JobQueue,
+    Job,
     batch::{JobBatch, PartialFailureMode},
     queue::DatabaseQueue,
     stats::InMemoryStatsCollector,
@@ -13,27 +15,12 @@ use tokio::time::timeout;
 #[cfg(feature = "postgres")]
 mod postgres_worker_batch_tests {
     use super::*;
-    use sqlx::{Pool, Postgres};
-
-    async fn setup_postgres_pool() -> Pool<Postgres> {
-        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://postgres:password@localhost/hammerwork_test".to_string()
-        });
-
-        Pool::<Postgres>::connect(&database_url)
-            .await
-            .expect("Failed to connect to Postgres")
-    }
 
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_worker_batch_processing_enabled() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
+        let queue = test_utils::setup_postgres_queue().await;
         let stats_collector = Arc::new(InMemoryStatsCollector::new_default());
-
-        // Setup tables
-        queue.create_tables().await.unwrap();
 
         // Create job handler that simulates different processing times
         let handler: JobHandler = Arc::new(|job: Job| {
@@ -141,10 +128,7 @@ mod postgres_worker_batch_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_batch_statistics_tracking() {
-        let pool = setup_postgres_pool().await;
-        let queue = Arc::new(JobQueue::new(pool));
-
-        queue.create_tables().await.unwrap();
+        let queue = test_utils::setup_postgres_queue().await;
 
         // Create simple handler
         let handler: JobHandler = Arc::new(|_job: Job| {

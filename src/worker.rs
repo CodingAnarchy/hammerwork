@@ -13,6 +13,7 @@ use crate::{
     priority::PriorityWeights,
     queue::{DatabaseQueue, JobQueue},
     rate_limit::{RateLimit, RateLimiter, ThrottleConfig},
+    retry::RetryStrategy,
     stats::{JobEvent, JobEventType, StatisticsCollector},
 };
 
@@ -426,6 +427,8 @@ pub struct Worker<DB: Database> {
     max_retries: i32,
     /// Delay between retry attempts
     retry_delay: Duration,
+    /// Default retry strategy for failed jobs (overrides retry_delay if specified)
+    default_retry_strategy: Option<RetryStrategy>,
     /// Default timeout for jobs (overridden by job-specific timeouts)
     default_timeout: Option<Duration>,
     /// Priority weights for job selection
@@ -462,6 +465,7 @@ where
             poll_interval: self.poll_interval,
             max_retries: self.max_retries,
             retry_delay: self.retry_delay,
+            default_retry_strategy: self.default_retry_strategy.clone(),
             default_timeout: self.default_timeout,
             priority_weights: self.priority_weights.clone(),
             stats_collector: self.stats_collector.clone(),
@@ -537,6 +541,7 @@ where
             poll_interval: Duration::from_secs(1),
             max_retries: 3,
             retry_delay: Duration::from_secs(30),
+            default_retry_strategy: None,
             default_timeout: None,
             priority_weights: None,
             stats_collector: None,
@@ -603,6 +608,7 @@ where
             poll_interval: Duration::from_secs(1),
             max_retries: 3,
             retry_delay: Duration::from_secs(30),
+            default_retry_strategy: None,
             default_timeout: None,
             priority_weights: None,
             stats_collector: None,
@@ -741,6 +747,42 @@ where
     /// ```
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.retry_delay = delay;
+        self
+    }
+
+    /// Sets a default retry strategy for all jobs processed by this worker.
+    ///
+    /// This retry strategy will be used for jobs that don't have their own
+    /// retry strategy configured. Jobs with their own retry strategy will
+    /// use that instead of this default.
+    ///
+    /// If no default retry strategy is set, the worker will fall back to
+    /// using the fixed `retry_delay` for all retries.
+    ///
+    /// # Arguments
+    ///
+    /// * `strategy` - The default retry strategy to use for failed jobs
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{Worker, retry::RetryStrategy};
+    /// use std::time::Duration;
+    /// # use std::sync::Arc;
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
+    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+    ///
+    /// // Use exponential backoff as default for all jobs
+    /// let worker = Worker::new(queue, "api_calls".to_string(), handler)
+    ///     .with_default_retry_strategy(RetryStrategy::exponential(
+    ///         Duration::from_secs(1),
+    ///         2.0,
+    ///         Some(Duration::from_minutes(10))
+    ///     ));
+    /// ```
+    pub fn with_default_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
+        self.default_retry_strategy = Some(strategy);
         self
     }
 
@@ -1196,9 +1238,27 @@ where
                         .await;
                     }
                 } else {
+                    // Calculate retry delay using retry strategy priority:
+                    // 1. Job-specific retry strategy (if configured)
+                    // 2. Worker default retry strategy (if configured)
+                    // 3. Fixed retry delay (legacy fallback)
+                    let retry_delay = if let Some(ref job_strategy) = job.retry_strategy {
+                        job_strategy.calculate_delay((job.attempts + 1) as u32)
+                    } else if let Some(ref default_strategy) = self.default_retry_strategy {
+                        default_strategy.calculate_delay((job.attempts + 1) as u32)
+                    } else {
+                        self.retry_delay
+                    };
+
                     let retry_at =
-                        chrono::Utc::now() + chrono::Duration::from_std(self.retry_delay).unwrap();
-                    info!("Retrying job {} at {}", job_id, retry_at);
+                        chrono::Utc::now() + chrono::Duration::from_std(retry_delay).unwrap();
+                    info!(
+                        "Retrying job {} at {} (attempt {} of {})",
+                        job_id,
+                        retry_at,
+                        job.attempts + 1,
+                        self.max_retries
+                    );
                     self.queue.retry_job(job_id, retry_at).await?;
 
                     // Record job retry event
