@@ -6,7 +6,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 - **Multi-database support**: PostgreSQL and MySQL backends
 - **Job prioritization**: Five priority levels with weighted and strict scheduling algorithms
-- **Batch operations**: High-performance bulk job enqueuing for improved throughput
+- **Batch operations**: High-performance bulk job enqueuing with optimized worker processing
 - **Cron scheduling**: Full cron expression support with timezone awareness
 - **Rate limiting**: Token bucket rate limiting with configurable burst limits
 - **Monitoring**: Prometheus metrics and advanced alerting (enabled by default)
@@ -108,6 +108,8 @@ Working examples in `examples/`:
 - `mysql_example.rs` - MySQL with workers and priorities
 - `cron_example.rs` - Cron scheduling with timezones
 - `priority_example.rs` - Priority system demonstration
+- `batch_example.rs` - Bulk job enqueuing and processing
+- `worker_batch_example.rs` - Worker batch processing features
 
 ```bash
 cargo run --example postgres_example --features postgres

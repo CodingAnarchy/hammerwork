@@ -6,6 +6,7 @@
 //! statistics collection, and monitoring.
 
 use crate::{
+    batch::BatchId,
     error::HammerworkError,
     job::Job,
     priority::PriorityWeights,
@@ -26,6 +27,54 @@ use sqlx::Database;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
 use tracing::{debug, error, info, warn};
+
+/// Statistics for batch job processing by a worker.
+#[derive(Debug, Clone, Default)]
+pub struct BatchProcessingStats {
+    /// Total number of batch jobs processed
+    pub jobs_processed: u64,
+    /// Total number of batch jobs completed successfully
+    pub jobs_completed: u64,
+    /// Total number of batch jobs that failed
+    pub jobs_failed: u64,
+    /// Total number of batches completed
+    pub batches_completed: u64,
+    /// Total number of batches completed successfully (>95% success rate)
+    pub batches_successful: u64,
+    /// Total processing time for all batch jobs in milliseconds
+    pub total_processing_time_ms: u64,
+    /// Average processing time per job in milliseconds
+    pub average_processing_time_ms: f64,
+    /// Timestamp of the last processed batch job
+    pub last_processed_job: Option<DateTime<Utc>>,
+}
+
+impl BatchProcessingStats {
+    /// Calculate the success rate for batch jobs
+    pub fn success_rate(&self) -> f64 {
+        if self.jobs_processed == 0 {
+            0.0
+        } else {
+            self.jobs_completed as f64 / self.jobs_processed as f64
+        }
+    }
+    
+    /// Calculate the batch success rate
+    pub fn batch_success_rate(&self) -> f64 {
+        if self.batches_completed == 0 {
+            0.0
+        } else {
+            self.batches_successful as f64 / self.batches_completed as f64
+        }
+    }
+    
+    /// Update the average processing time
+    pub fn update_average_processing_time(&mut self) {
+        if self.jobs_completed > 0 {
+            self.average_processing_time_ms = self.total_processing_time_ms as f64 / self.jobs_completed as f64;
+        }
+    }
+}
 
 /// Type alias for job handler functions.
 ///
@@ -162,6 +211,10 @@ pub struct Worker<DB: Database> {
     alert_manager: Option<Arc<AlertManager>>,
     /// Timestamp of the last processed job (for starvation detection)
     last_job_time: Arc<std::sync::RwLock<DateTime<Utc>>>,
+    /// Enable optimized batch job processing
+    batch_processing_enabled: bool,
+    /// Track batch processing statistics
+    batch_stats: Arc<std::sync::RwLock<BatchProcessingStats>>,
 }
 
 impl<DB: Database + Send + Sync + 'static> Worker<DB>
@@ -232,6 +285,8 @@ where
             #[cfg(feature = "alerting")]
             alert_manager: None,
             last_job_time: Arc::new(std::sync::RwLock::new(Utc::now())),
+            batch_processing_enabled: false,
+            batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
         }
     }
 
@@ -444,6 +499,32 @@ where
         self
     }
 
+    /// Enable optimized batch job processing.
+    ///
+    /// When enabled, the worker will detect when jobs belong to batches and provide
+    /// enhanced monitoring, statistics, and error handling for batch operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - Whether to enable batch processing optimizations
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::Worker;
+    /// # use std::sync::Arc;
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
+    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+    ///
+    /// let worker = Worker::new(queue, "batch_queue".to_string(), handler)
+    ///     .with_batch_processing_enabled(true);
+    /// ```
+    pub fn with_batch_processing_enabled(mut self, enabled: bool) -> Self {
+        self.batch_processing_enabled = enabled;
+        self
+    }
+
     pub async fn run(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
         info!("Worker started for queue: {}", self.queue_name);
 
@@ -572,7 +653,16 @@ where
     async fn process_job(&self, job: Job) -> Result<()> {
         let job_id = job.id;
         let queue_name = job.queue_name.clone();
+        let batch_id = job.batch_id;
         let start_time = Utc::now();
+
+        // Update batch statistics if batch processing is enabled
+        if self.batch_processing_enabled && batch_id.is_some() {
+            self.update_batch_stats(|stats| {
+                stats.jobs_processed += 1;
+                stats.last_processed_job = Some(start_time);
+            });
+        }
 
         // Record job started event
         self.record_event(JobEvent {
@@ -628,6 +718,22 @@ where
 
                 let processing_time_ms = (Utc::now() - start_time).num_milliseconds() as u64;
 
+                // Update batch statistics for successful completion
+                if self.batch_processing_enabled && batch_id.is_some() {
+                    self.update_batch_stats(|stats| {
+                        stats.jobs_completed += 1;
+                        stats.total_processing_time_ms += processing_time_ms;
+                        stats.update_average_processing_time();
+                    });
+                    
+                    // Check if batch is complete and update batch status
+                    if let Some(batch_id) = batch_id {
+                        if let Err(e) = self.check_and_update_batch_status(batch_id).await {
+                            warn!("Failed to update batch status for batch {}: {}", batch_id, e);
+                        }
+                    }
+                }
+
                 // Handle cron job rescheduling
                 if job.is_recurring() {
                     if let Some(next_run_time) = job.calculate_next_run() {
@@ -664,6 +770,20 @@ where
             Err(e) => {
                 error!("Job {} failed: {}", job_id, e);
                 let error_message = e.to_string();
+
+                // Update batch statistics for failed job
+                if self.batch_processing_enabled && batch_id.is_some() {
+                    self.update_batch_stats(|stats| {
+                        stats.jobs_failed += 1;
+                    });
+                    
+                    // Check batch failure handling mode
+                    if let Some(batch_id) = batch_id {
+                        if let Err(e) = self.handle_batch_job_failure(batch_id, job_id, &error_message).await {
+                            warn!("Failed to handle batch job failure for batch {}: {}", batch_id, e);
+                        }
+                    }
+                }
 
                 if job.attempts >= self.max_retries {
                     warn!("Job {} exceeded max retries, marking as failed", job_id);
@@ -720,6 +840,69 @@ where
         }
 
         Ok(())
+    }
+
+    /// Update batch processing statistics
+    fn update_batch_stats<F>(&self, updater: F)
+    where
+        F: FnOnce(&mut BatchProcessingStats),
+    {
+        if let Ok(mut stats) = self.batch_stats.write() {
+            updater(&mut *stats);
+        }
+    }
+
+    /// Check and update the status of a batch after job completion
+    async fn check_and_update_batch_status(&self, batch_id: BatchId) -> Result<()> {
+        // Get current batch status
+        let batch_result = self.queue.get_batch_status(batch_id).await?;
+        
+        // If batch is complete, log success metrics
+        if batch_result.pending_jobs == 0 {
+            let completion_rate = batch_result.success_rate();
+            
+            if completion_rate >= 0.95 {
+                info!("Batch {} completed successfully with {:.1}% success rate", 
+                      batch_id, completion_rate * 100.0);
+            } else {
+                warn!("Batch {} completed with {:.1}% success rate ({} failures)", 
+                      batch_id, completion_rate * 100.0, batch_result.failed_jobs);
+            }
+            
+            // Update batch completion statistics
+            self.update_batch_stats(|stats| {
+                stats.batches_completed += 1;
+                if completion_rate >= 0.95 {
+                    stats.batches_successful += 1;
+                }
+            });
+        }
+        
+        Ok(())
+    }
+
+    /// Handle job failure within a batch context
+    async fn handle_batch_job_failure(&self, batch_id: BatchId, job_id: uuid::Uuid, error_message: &str) -> Result<()> {
+        // Get batch status to understand failure handling mode
+        let batch_result = self.queue.get_batch_status(batch_id).await?;
+        
+        // Log batch-specific failure information
+        warn!("Job {} in batch {} failed: {}. Batch status: {}/{} jobs remaining", 
+              job_id, batch_id, error_message, batch_result.pending_jobs, batch_result.total_jobs);
+        
+        // Note: Actual failure mode handling (FailFast, ContinueOnError, etc.) 
+        // is implemented in the queue layer during job processing
+        
+        Ok(())
+    }
+
+    /// Get current batch processing statistics
+    pub fn get_batch_stats(&self) -> BatchProcessingStats {
+        if let Ok(stats) = self.batch_stats.read() {
+            stats.clone()
+        } else {
+            BatchProcessingStats::default()
+        }
     }
 
     async fn record_event(&self, event: JobEvent) {

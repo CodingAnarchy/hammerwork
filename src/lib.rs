@@ -129,7 +129,7 @@ pub use rate_limit::{RateLimit, RateLimiter, ThrottleConfig};
 pub use stats::{
     DeadJobSummary, InMemoryStatsCollector, JobStatistics, QueueStats, StatisticsCollector,
 };
-pub use worker::{Worker, WorkerPool};
+pub use worker::{BatchProcessingStats, Worker, WorkerPool};
 
 #[cfg(feature = "metrics")]
 pub use metrics::{MetricsConfig, PrometheusMetricsCollector};
