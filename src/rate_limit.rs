@@ -142,7 +142,7 @@ impl TokenBucket {
     /// Returns true if successful, false if insufficient tokens
     pub fn try_consume(&mut self, tokens: f64) -> bool {
         self.refill();
-        
+
         if self.tokens >= tokens {
             self.tokens -= tokens;
             true
@@ -156,7 +156,7 @@ impl TokenBucket {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill);
         let tokens_to_add = self.refill_rate * elapsed.as_millis() as f64;
-        
+
         self.tokens = (self.tokens + tokens_to_add).min(self.capacity);
         self.last_refill = now;
     }
@@ -170,7 +170,7 @@ impl TokenBucket {
     /// Calculate time until the next token is available
     pub fn time_until_token(&mut self) -> Duration {
         self.refill();
-        
+
         if self.tokens >= 1.0 {
             Duration::from_millis(0)
         } else {
@@ -193,7 +193,7 @@ impl RateLimiter {
     pub fn new(rate_limit: RateLimit) -> Self {
         let capacity = rate_limit.burst_limit as f64;
         let refill_rate = rate_limit.refill_rate_per_ms();
-        
+
         Self {
             bucket: Arc::new(Mutex::new(TokenBucket::new(capacity, refill_rate))),
             rate_limit,
@@ -265,7 +265,7 @@ impl Clone for RateLimiter {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::time::{sleep, Instant};
+    use tokio::time::{Instant, sleep};
 
     #[test]
     fn test_rate_limit_creation() {
@@ -327,7 +327,7 @@ mod tests {
 
         // Wait for refill (1ms should add 10 tokens, bringing us back to capacity)
         sleep(Duration::from_millis(2)).await;
-        
+
         // Should have refilled to capacity
         let tokens = bucket.available_tokens();
         assert_eq!(tokens, 10.0);
@@ -337,7 +337,7 @@ mod tests {
     fn test_rate_limiter_creation() {
         let rate_limit = RateLimit::per_second(10);
         let limiter = RateLimiter::new(rate_limit);
-        
+
         assert_eq!(limiter.rate_limit().rate, 10);
         assert!(limiter.available_tokens() > 0.0);
     }
@@ -364,7 +364,7 @@ mod tests {
         let start = Instant::now();
         limiter.acquire().await.unwrap();
         let elapsed = start.elapsed();
-        
+
         // Should be very fast (less than 10ms)
         assert!(elapsed < Duration::from_millis(10));
     }
@@ -385,13 +385,13 @@ mod tests {
     fn test_rate_limit_refill_calculation() {
         let rate_limit = RateLimit::per_second(10);
         let refill_rate = rate_limit.refill_rate_per_ms();
-        
+
         // 10 tokens per 1000ms = 0.01 tokens per ms
         assert!((refill_rate - 0.01).abs() < 0.001);
 
         let rate_limit = RateLimit::per_minute(60);
         let refill_rate = rate_limit.refill_rate_per_ms();
-        
+
         // 60 tokens per 60000ms = 0.001 tokens per ms
         assert!((refill_rate - 0.001).abs() < 0.0001);
     }
@@ -405,7 +405,7 @@ mod tests {
         // Both limiters should share the same bucket
         assert!(limiter1.try_acquire());
         assert!(limiter2.try_acquire());
-        
+
         // Should be exhausted for both
         assert!(!limiter1.try_acquire());
         assert!(!limiter2.try_acquire());
@@ -425,11 +425,11 @@ mod tests {
         // Zero rate should still work
         let rate_limit = RateLimit::per_second(0);
         assert_eq!(rate_limit.rate, 0);
-        
+
         // Very high rate
         let rate_limit = RateLimit::per_second(1_000_000);
         assert_eq!(rate_limit.rate, 1_000_000);
-        
+
         // Very long duration
         let rate_limit = RateLimit::per_hour(1);
         assert_eq!(rate_limit.per, Duration::from_secs(3600));
@@ -438,13 +438,13 @@ mod tests {
     #[tokio::test]
     async fn test_token_bucket_time_until_token() {
         let mut bucket = TokenBucket::new(1.0, 1.0); // 1 token capacity, 1 token per ms
-        
+
         // Should have tokens available initially
         assert_eq!(bucket.time_until_token(), Duration::from_millis(0));
-        
+
         // Consume the token
         assert!(bucket.try_consume(1.0));
-        
+
         // Should need to wait for next token
         let wait_time = bucket.time_until_token();
         assert!(wait_time > Duration::from_millis(0));

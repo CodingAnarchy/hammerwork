@@ -1,7 +1,7 @@
 use hammerwork::{
+    Job,
     priority::{JobPriority, PriorityStats, PriorityWeights},
     stats::{InMemoryStatsCollector, JobEvent, JobEventType, StatisticsCollector},
-    Job,
 };
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
@@ -242,9 +242,11 @@ fn test_priority_display_and_descriptions() {
     // Test descriptions contain meaningful text
     assert!(JobPriority::Critical.description().contains("highest"));
     assert!(JobPriority::Normal.description().contains("default"));
-    assert!(JobPriority::Background
-        .description()
-        .contains("no other jobs"));
+    assert!(
+        JobPriority::Background
+            .description()
+            .contains("no other jobs")
+    );
 }
 
 /// Test priority weight edge cases
@@ -358,13 +360,19 @@ async fn test_priority_statistics_integration() {
     );
 
     // Check processing times are tracked by priority
-    assert!(priority_stats
-        .avg_processing_times
-        .contains_key(&JobPriority::Critical));
-    assert!(priority_stats
-        .avg_processing_times
-        .contains_key(&JobPriority::High));
-    assert!(priority_stats
-        .avg_processing_times
-        .contains_key(&JobPriority::Normal));
+    assert!(
+        priority_stats
+            .avg_processing_times
+            .contains_key(&JobPriority::Critical)
+    );
+    assert!(
+        priority_stats
+            .avg_processing_times
+            .contains_key(&JobPriority::High)
+    );
+    assert!(
+        priority_stats
+            .avg_processing_times
+            .contains_key(&JobPriority::Normal)
+    );
 }

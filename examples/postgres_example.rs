@@ -1,10 +1,10 @@
 use hammerwork::{
+    Result,
     job::Job,
     queue::JobQueue,
     rate_limit::{RateLimit, ThrottleConfig},
     stats::{InMemoryStatsCollector, StatisticsCollector},
     worker::{Worker, WorkerPool},
-    Result,
 };
 use serde_json::json;
 use sqlx::{Pool, Postgres};
@@ -68,7 +68,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_throttle_config(
             ThrottleConfig::new()
                 .rate_per_minute(30) // Max 30 notifications per minute
-                .backoff_on_error(tokio::time::Duration::from_secs(10)) // 10 second backoff on errors
+                .backoff_on_error(tokio::time::Duration::from_secs(10)), // 10 second backoff on errors
         )
         .with_stats_collector(Arc::clone(&stats_collector));
 
@@ -77,7 +77,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_poll_interval(tokio::time::Duration::from_millis(100))
         .with_rate_limit(
             RateLimit::per_second(10) // 10 calls per second
-                .with_burst_limit(50) // Allow bursts up to 50 calls
+                .with_burst_limit(50), // Allow bursts up to 50 calls
         )
         .with_stats_collector(Arc::clone(&stats_collector));
 
@@ -117,12 +117,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_max_attempts(5); // More retry attempts for important jobs
 
         // Demonstrate queue-level throttling configuration
-        queue.set_throttle("api_calls", 
-            ThrottleConfig::new()
-                .max_concurrent(5)
-                .rate_per_minute(300) // Global rate limit for API calls
-                .backoff_on_error(tokio::time::Duration::from_secs(30))
-        ).await?;
+        queue
+            .set_throttle(
+                "api_calls",
+                ThrottleConfig::new()
+                    .max_concurrent(5)
+                    .rate_per_minute(300) // Global rate limit for API calls
+                    .backoff_on_error(tokio::time::Duration::from_secs(30)),
+            )
+            .await?;
 
         info!("Configured throttling for api_calls queue: max 5 concurrent, 300/min global rate");
 
@@ -140,7 +143,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "endpoint": format!("/api/users/{}", i),
                     "method": "GET",
                     "user_id": i
-                })
+                }),
             );
             queue.enqueue(api_job).await?;
         }
@@ -163,7 +166,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let system_stats = stats_collector
             .get_system_statistics(std::time::Duration::from_secs(300))
             .await?;
-        info!("System Stats - Total: {}, Completed: {}, Failed: {}, Dead: {}, Timed Out: {}, Error Rate: {:.2}%",
+        info!(
+            "System Stats - Total: {}, Completed: {}, Failed: {}, Dead: {}, Timed Out: {}, Error Rate: {:.2}%",
             system_stats.total_processed,
             system_stats.completed,
             system_stats.failed,
@@ -176,7 +180,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let email_stats = stats_collector
             .get_queue_statistics("email", std::time::Duration::from_secs(300))
             .await?;
-        info!("Email Queue Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Processing Time: {:.2}ms",
+        info!(
+            "Email Queue Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Processing Time: {:.2}ms",
             email_stats.total_processed,
             email_stats.completed,
             email_stats.failed,
@@ -187,7 +192,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let notifications_stats = stats_collector
             .get_queue_statistics("notifications", std::time::Duration::from_secs(300))
             .await?;
-        info!("Notifications Queue Stats - Total: {}, Completed: {}, Timed Out: {}, Avg Processing Time: {:.2}ms",
+        info!(
+            "Notifications Queue Stats - Total: {}, Completed: {}, Timed Out: {}, Avg Processing Time: {:.2}ms",
             notifications_stats.total_processed,
             notifications_stats.completed,
             notifications_stats.timed_out,
@@ -198,21 +204,24 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let api_stats = stats_collector
             .get_queue_statistics("api_calls", std::time::Duration::from_secs(300))
             .await?;
-        info!("API Calls Queue Stats - Total: {}, Completed: {}, Rate Limiting Effects Visible: {}",
+        info!(
+            "API Calls Queue Stats - Total: {}, Completed: {}, Rate Limiting Effects Visible: {}",
             api_stats.total_processed,
             api_stats.completed,
-            if api_stats.total_processed < 10 { "Yes (some jobs still processing due to rate limits)" } else { "No" }
+            if api_stats.total_processed < 10 {
+                "Yes (some jobs still processing due to rate limits)"
+            } else {
+                "No"
+            }
         );
 
         // Show current throttling configurations
         info!("=== Current Throttling Configurations ===");
         let throttle_configs = queue.get_all_throttles().await;
         for (queue_name, config) in throttle_configs {
-            info!("Queue '{}': max_concurrent={:?}, rate_per_minute={:?}, backoff_on_error={:?}",
-                queue_name,
-                config.max_concurrent,
-                config.rate_per_minute,
-                config.backoff_on_error
+            info!(
+                "Queue '{}': max_concurrent={:?}, rate_per_minute={:?}, backoff_on_error={:?}",
+                queue_name, config.max_concurrent, config.rate_per_minute, config.backoff_on_error
             );
         }
 
@@ -239,7 +248,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         // Demonstrate queue statistics from database (including timeout counts)
         let queue_stats = queue.get_queue_stats("email").await?;
-        info!("Email Queue DB Stats - Pending: {}, Running: {}, Dead: {}, Timed Out: {}, Completed: {}",
+        info!(
+            "Email Queue DB Stats - Pending: {}, Running: {}, Dead: {}, Timed Out: {}, Completed: {}",
             queue_stats.pending_count,
             queue_stats.running_count,
             queue_stats.dead_count,

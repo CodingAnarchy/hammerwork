@@ -6,6 +6,7 @@
 //! statistics collection, and monitoring.
 
 use crate::{
+    Result,
     batch::BatchId,
     error::HammerworkError,
     job::Job,
@@ -13,7 +14,6 @@ use crate::{
     queue::{DatabaseQueue, JobQueue},
     rate_limit::{RateLimit, RateLimiter, ThrottleConfig},
     stats::{JobEvent, JobEventType, StatisticsCollector},
-    Result,
 };
 
 #[cfg(feature = "metrics")]
@@ -58,7 +58,7 @@ impl BatchProcessingStats {
             self.jobs_completed as f64 / self.jobs_processed as f64
         }
     }
-    
+
     /// Calculate the batch success rate
     pub fn batch_success_rate(&self) -> f64 {
         if self.batches_completed == 0 {
@@ -67,11 +67,12 @@ impl BatchProcessingStats {
             self.batches_successful as f64 / self.batches_completed as f64
         }
     }
-    
+
     /// Update the average processing time
     pub fn update_average_processing_time(&mut self) {
         if self.jobs_completed > 0 {
-            self.average_processing_time_ms = self.total_processing_time_ms as f64 / self.jobs_completed as f64;
+            self.average_processing_time_ms =
+                self.total_processing_time_ms as f64 / self.jobs_completed as f64;
         }
     }
 }
@@ -127,11 +128,11 @@ pub type JobHandler = Arc<
 /// ```rust,no_run
 /// use hammerwork::{Worker, JobQueue, Job};
 /// use std::sync::Arc;
-/// 
+///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
 /// let queue = Arc::new(JobQueue::new(pool));
-/// 
+///
 /// let handler: hammerwork::worker::JobHandler = Arc::new(|job: Job| {
 ///     Box::pin(async move {
 ///         println!("Processing: {:?}", job.payload);
@@ -142,7 +143,7 @@ pub type JobHandler = Arc<
 /// let worker = Worker::new(queue, "email_queue".to_string(), handler)
 ///     .with_poll_interval(std::time::Duration::from_millis(500))
 ///     .with_max_retries(5);
-/// 
+///
 /// // Start processing jobs
 /// let mut pool = hammerwork::WorkerPool::new();
 /// pool.add_worker(worker);
@@ -157,7 +158,7 @@ pub type JobHandler = Arc<
 /// use hammerwork::{Worker, JobQueue, PriorityWeights, RateLimit};
 /// use std::sync::Arc;
 /// use std::time::Duration;
-/// 
+///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
 /// # let queue = Arc::new(JobQueue::new(pool));
@@ -173,7 +174,7 @@ pub type JobHandler = Arc<
 ///     .with_priority_weights(priority_weights)
 ///     .with_rate_limit(rate_limit)
 ///     .with_default_timeout(Duration::from_secs(300));
-/// 
+///
 /// let mut pool = hammerwork::WorkerPool::new();
 /// pool.add_worker(worker);
 /// pool.start().await?;
@@ -240,11 +241,11 @@ where
     /// ```rust,no_run
     /// use hammerwork::{Worker, JobQueue, Job};
     /// use std::sync::Arc;
-    /// 
+    ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
     /// let queue = Arc::new(JobQueue::new(pool));
-    /// 
+    ///
     /// let handler: hammerwork::worker::JobHandler = Arc::new(|job: Job| {
     ///     Box::pin(async move {
     ///         match job.payload.get("action").and_then(|v| v.as_str()) {
@@ -305,7 +306,7 @@ where
     /// ```rust,no_run
     /// use hammerwork::{Worker, JobQueue, InMemoryStatsCollector};
     /// use std::sync::Arc;
-    /// 
+    ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
     /// # let queue = Arc::new(JobQueue::new(pool));
@@ -314,7 +315,7 @@ where
     /// let stats = Arc::new(InMemoryStatsCollector::new_default());
     /// let worker = Worker::new(queue, "monitored".to_string(), handler)
     ///     .with_stats_collector(stats.clone());
-    /// 
+    ///
     /// // Later, check statistics  
     /// use std::time::Duration;
     /// use hammerwork::StatisticsCollector;
@@ -480,7 +481,10 @@ where
 
     /// Configure Prometheus metrics collection for this worker
     #[cfg(feature = "metrics")]
-    pub fn with_metrics_collector(mut self, metrics_collector: Arc<PrometheusMetricsCollector>) -> Self {
+    pub fn with_metrics_collector(
+        mut self,
+        metrics_collector: Arc<PrometheusMetricsCollector>,
+    ) -> Self {
         self.metrics_collector = Some(metrics_collector);
         self
     }
@@ -573,7 +577,10 @@ where
         #[cfg(feature = "metrics")]
         if let Some(metrics_collector) = &self.metrics_collector {
             if let Ok(queue_depth) = self.queue.get_queue_depth(&self.queue_name).await {
-                if let Err(e) = metrics_collector.update_queue_depth(&self.queue_name, queue_depth).await {
+                if let Err(e) = metrics_collector
+                    .update_queue_depth(&self.queue_name, queue_depth)
+                    .await
+                {
                     warn!("Failed to update queue depth metrics: {}", e);
                 }
             }
@@ -609,35 +616,48 @@ where
                         }
                     };
                     if let Some(last_time_value) = last_time_value {
-                        if let Err(e) = alert_manager.check_worker_starvation(&self.queue_name, last_time_value).await {
+                        if let Err(e) = alert_manager
+                            .check_worker_starvation(&self.queue_name, last_time_value)
+                            .await
+                        {
                             warn!("Failed to check worker starvation: {}", e);
                         }
                     }
                 }
-                
+
                 // Wait before polling again
                 sleep(self.poll_interval).await;
             }
             Err(e) => {
                 error!("Error dequeuing job: {}", e);
-                
+
                 // If throttle config specifies backoff on error, apply it
                 let backoff_duration = if let Some(ref throttle_config) = self.throttle_config {
-                    throttle_config.backoff_on_error.unwrap_or(self.poll_interval)
+                    throttle_config
+                        .backoff_on_error
+                        .unwrap_or(self.poll_interval)
                 } else {
                     self.poll_interval
                 };
-                
+
                 sleep(backoff_duration).await;
             }
         }
 
         // Check statistics and alert thresholds periodically
         #[cfg(feature = "alerting")]
-        if let (Some(alert_manager), Some(stats_collector)) = (&self.alert_manager, &self.stats_collector) {
-            match stats_collector.get_queue_statistics(&self.queue_name, Duration::from_secs(300)).await {
+        if let (Some(alert_manager), Some(stats_collector)) =
+            (&self.alert_manager, &self.stats_collector)
+        {
+            match stats_collector
+                .get_queue_statistics(&self.queue_name, Duration::from_secs(300))
+                .await
+            {
                 Ok(stats) => {
-                    if let Err(e) = alert_manager.check_thresholds(&self.queue_name, &stats).await {
+                    if let Err(e) = alert_manager
+                        .check_thresholds(&self.queue_name, &stats)
+                        .await
+                    {
                         warn!("Failed to check alert thresholds: {}", e);
                     }
                 }
@@ -725,11 +745,14 @@ where
                         stats.total_processing_time_ms += processing_time_ms;
                         stats.update_average_processing_time();
                     });
-                    
+
                     // Check if batch is complete and update batch status
                     if let Some(batch_id) = batch_id {
                         if let Err(e) = self.check_and_update_batch_status(batch_id).await {
-                            warn!("Failed to update batch status for batch {}: {}", batch_id, e);
+                            warn!(
+                                "Failed to update batch status for batch {}: {}",
+                                batch_id, e
+                            );
                         }
                     }
                 }
@@ -776,11 +799,17 @@ where
                     self.update_batch_stats(|stats| {
                         stats.jobs_failed += 1;
                     });
-                    
+
                     // Check batch failure handling mode
                     if let Some(batch_id) = batch_id {
-                        if let Err(e) = self.handle_batch_job_failure(batch_id, job_id, &error_message).await {
-                            warn!("Failed to handle batch job failure for batch {}: {}", batch_id, e);
+                        if let Err(e) = self
+                            .handle_batch_job_failure(batch_id, job_id, &error_message)
+                            .await
+                        {
+                            warn!(
+                                "Failed to handle batch job failure for batch {}: {}",
+                                batch_id, e
+                            );
                         }
                     }
                 }
@@ -848,7 +877,7 @@ where
         F: FnOnce(&mut BatchProcessingStats),
     {
         if let Ok(mut stats) = self.batch_stats.write() {
-            updater(&mut *stats);
+            updater(&mut stats);
         }
     }
 
@@ -856,19 +885,26 @@ where
     async fn check_and_update_batch_status(&self, batch_id: BatchId) -> Result<()> {
         // Get current batch status
         let batch_result = self.queue.get_batch_status(batch_id).await?;
-        
+
         // If batch is complete, log success metrics
         if batch_result.pending_jobs == 0 {
             let completion_rate = batch_result.success_rate();
-            
+
             if completion_rate >= 0.95 {
-                info!("Batch {} completed successfully with {:.1}% success rate", 
-                      batch_id, completion_rate * 100.0);
+                info!(
+                    "Batch {} completed successfully with {:.1}% success rate",
+                    batch_id,
+                    completion_rate * 100.0
+                );
             } else {
-                warn!("Batch {} completed with {:.1}% success rate ({} failures)", 
-                      batch_id, completion_rate * 100.0, batch_result.failed_jobs);
+                warn!(
+                    "Batch {} completed with {:.1}% success rate ({} failures)",
+                    batch_id,
+                    completion_rate * 100.0,
+                    batch_result.failed_jobs
+                );
             }
-            
+
             // Update batch completion statistics
             self.update_batch_stats(|stats| {
                 stats.batches_completed += 1;
@@ -877,22 +913,29 @@ where
                 }
             });
         }
-        
+
         Ok(())
     }
 
     /// Handle job failure within a batch context
-    async fn handle_batch_job_failure(&self, batch_id: BatchId, job_id: uuid::Uuid, error_message: &str) -> Result<()> {
+    async fn handle_batch_job_failure(
+        &self,
+        batch_id: BatchId,
+        job_id: uuid::Uuid,
+        error_message: &str,
+    ) -> Result<()> {
         // Get batch status to understand failure handling mode
         let batch_result = self.queue.get_batch_status(batch_id).await?;
-        
+
         // Log batch-specific failure information
-        warn!("Job {} in batch {} failed: {}. Batch status: {}/{} jobs remaining", 
-              job_id, batch_id, error_message, batch_result.pending_jobs, batch_result.total_jobs);
-        
-        // Note: Actual failure mode handling (FailFast, ContinueOnError, etc.) 
+        warn!(
+            "Job {} in batch {} failed: {}. Batch status: {}/{} jobs remaining",
+            job_id, batch_id, error_message, batch_result.pending_jobs, batch_result.total_jobs
+        );
+
+        // Note: Actual failure mode handling (FailFast, ContinueOnError, etc.)
         // is implemented in the queue layer during job processing
-        
+
         Ok(())
     }
 
@@ -922,7 +965,13 @@ where
         }
 
         // Update last job time for worker starvation detection
-        if matches!(event.event_type, JobEventType::Completed | JobEventType::Failed | JobEventType::Dead | JobEventType::TimedOut) {
+        if matches!(
+            event.event_type,
+            JobEventType::Completed
+                | JobEventType::Failed
+                | JobEventType::Dead
+                | JobEventType::TimedOut
+        ) {
             if let Ok(mut last_time) = self.last_job_time.write() {
                 *last_time = event.timestamp;
             }
@@ -933,46 +982,52 @@ where
     #[cfg(any(feature = "metrics", feature = "alerting"))]
     fn start_monitoring_task(&self) -> tokio::task::JoinHandle<()> {
         let queue_name = self.queue_name.clone();
-        
+
         #[cfg(feature = "metrics")]
         let queue = Arc::clone(&self.queue);
-        
+
         #[cfg(feature = "alerting")]
         let last_job_time = Arc::clone(&self.last_job_time);
-        
+
         #[cfg(feature = "metrics")]
         let metrics_collector = self.metrics_collector.clone();
-        
+
         #[cfg(feature = "alerting")]
         let alert_manager = self.alert_manager.clone();
-        
+
         #[cfg(feature = "alerting")]
         let stats_collector = self.stats_collector.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30)); // Monitor every 30 seconds
-            
+
             loop {
                 interval.tick().await;
-                
+
                 // Update queue depth metrics
                 #[cfg(feature = "metrics")]
                 if let Some(metrics_collector) = &metrics_collector {
                     if let Ok(queue_depth) = queue.get_queue_depth(&queue_name).await {
-                        if let Err(e) = metrics_collector.update_queue_depth(&queue_name, queue_depth).await {
+                        if let Err(e) = metrics_collector
+                            .update_queue_depth(&queue_name, queue_depth)
+                            .await
+                        {
                             warn!("Failed to update queue depth metrics: {}", e);
                         }
-                        
+
                         // Check queue depth for alerts
                         #[cfg(feature = "alerting")]
                         if let Some(alert_manager) = &alert_manager {
-                            if let Err(e) = alert_manager.check_queue_depth(&queue_name, queue_depth).await {
+                            if let Err(e) = alert_manager
+                                .check_queue_depth(&queue_name, queue_depth)
+                                .await
+                            {
                                 warn!("Failed to check queue depth alerts: {}", e);
                             }
                         }
                     }
                 }
-                
+
                 // Check worker starvation
                 #[cfg(feature = "alerting")]
                 if let Some(alert_manager) = &alert_manager {
@@ -984,18 +1039,28 @@ where
                         }
                     };
                     if let Some(last_time_value) = last_time_value {
-                        if let Err(e) = alert_manager.check_worker_starvation(&queue_name, last_time_value).await {
+                        if let Err(e) = alert_manager
+                            .check_worker_starvation(&queue_name, last_time_value)
+                            .await
+                        {
                             warn!("Failed to check worker starvation: {}", e);
                         }
                     }
                 }
-                
+
                 // Check statistics-based alerts
                 #[cfg(feature = "alerting")]
-                if let (Some(alert_manager), Some(stats_collector)) = (&alert_manager, &stats_collector) {
-                    match stats_collector.get_queue_statistics(&queue_name, Duration::from_secs(300)).await {
+                if let (Some(alert_manager), Some(stats_collector)) =
+                    (&alert_manager, &stats_collector)
+                {
+                    match stats_collector
+                        .get_queue_statistics(&queue_name, Duration::from_secs(300))
+                        .await
+                    {
                         Ok(stats) => {
-                            if let Err(e) = alert_manager.check_thresholds(&queue_name, &stats).await {
+                            if let Err(e) =
+                                alert_manager.check_thresholds(&queue_name, &stats).await
+                            {
                                 warn!("Failed to check alert thresholds: {}", e);
                             }
                         }
@@ -1106,7 +1171,6 @@ mod tests {
         let _handler: JobHandler = Arc::new(|_job| Box::pin(async { Ok(()) }));
 
         // Compilation test - if this compiles, the type is correct
-        assert!(true);
     }
 
     #[test]
@@ -1132,7 +1196,7 @@ mod tests {
 
         // This would be the structure for a real implementation:
         // let pool: WorkerPool<sqlx::Postgres> = WorkerPool::new();
-        assert!(true); // Compilation test
+        // Compilation test
     }
 
     #[test]
@@ -1320,7 +1384,7 @@ mod tests {
 
         // Test rate limit configuration
         let rate_limit = RateLimit::per_second(10).with_burst_limit(20);
-        
+
         assert_eq!(rate_limit.rate, 10);
         assert_eq!(rate_limit.burst_limit, 20);
         assert_eq!(rate_limit.per, Duration::from_secs(1));
@@ -1347,7 +1411,10 @@ mod tests {
 
         assert_eq!(throttle_config.max_concurrent, Some(5));
         assert_eq!(throttle_config.rate_per_minute, Some(100));
-        assert_eq!(throttle_config.backoff_on_error, Some(Duration::from_secs(30)));
+        assert_eq!(
+            throttle_config.backoff_on_error,
+            Some(Duration::from_secs(30))
+        );
         assert!(throttle_config.enabled);
 
         // Test rate limit conversion
@@ -1387,10 +1454,12 @@ mod tests {
         use crate::rate_limit::ThrottleConfig;
 
         // Test that backoff configuration is properly handled
-        let throttle_config = ThrottleConfig::new()
-            .backoff_on_error(Duration::from_secs(60));
+        let throttle_config = ThrottleConfig::new().backoff_on_error(Duration::from_secs(60));
 
-        assert_eq!(throttle_config.backoff_on_error, Some(Duration::from_secs(60)));
+        assert_eq!(
+            throttle_config.backoff_on_error,
+            Some(Duration::from_secs(60))
+        );
 
         // Test default poll interval fallback
         let poll_interval = Duration::from_secs(1);

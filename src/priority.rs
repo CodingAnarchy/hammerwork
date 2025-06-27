@@ -62,26 +62,26 @@ pub enum JobPriority {
     /// Suitable for cleanup tasks, maintenance work, or any jobs that can wait
     /// indefinitely without impacting user experience.
     Background = 0,
-    
+
     /// Low priority jobs - execute after normal and higher priority jobs.
     ///
     /// Suitable for analytics, reporting, optimization tasks, or background
     /// processing that isn't time-sensitive.
     Low = 1,
-    
+
     /// Normal priority jobs - default priority level.
     ///
     /// The default priority for most application jobs. Suitable for standard
     /// business logic, regular data processing, and typical application workflows.
     #[default]
     Normal = 2,
-    
+
     /// High priority jobs - execute before normal and lower priority jobs.
     ///
     /// Suitable for user-facing operations, important notifications, API responses,
     /// or time-sensitive business operations.
     High = 3,
-    
+
     /// Critical priority jobs - highest priority, execute immediately.
     ///
     /// Should be used sparingly for truly urgent work like system alerts,
@@ -591,9 +591,11 @@ mod tests {
 
     #[test]
     fn test_priority_description() {
-        assert!(JobPriority::Critical
-            .description()
-            .contains("highest priority"));
+        assert!(
+            JobPriority::Critical
+                .description()
+                .contains("highest priority")
+        );
         assert!(JobPriority::Normal.description().contains("default"));
     }
 

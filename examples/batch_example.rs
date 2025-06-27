@@ -1,16 +1,15 @@
 use hammerwork::{
-    batch::{JobBatch, PartialFailureMode, BatchStatus},
+    HammerworkError, Result,
+    batch::{JobBatch, PartialFailureMode},
     job::Job,
     queue::{DatabaseQueue, JobQueue},
     stats::{InMemoryStatsCollector, StatisticsCollector},
     worker::{Worker, WorkerPool},
-    HammerworkError, JobPriority, Result,
 };
 use serde_json::json;
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
-use tracing::{info, warn, error};
-use uuid::Uuid;
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -67,7 +66,8 @@ async fn basic_batch_demo(queue: &Arc<JobQueue<Postgres>>) -> Result<()> {
                 "template": "welcome",
                 "user_id": "user_001"
             }),
-        ).as_high_priority(),
+        )
+        .as_high_priority(),
         Job::new(
             "email_notifications".to_string(),
             json!({
@@ -76,7 +76,8 @@ async fn basic_batch_demo(queue: &Arc<JobQueue<Postgres>>) -> Result<()> {
                 "template": "password_reset",
                 "user_id": "user_002"
             }),
-        ).as_critical(),
+        )
+        .as_critical(),
         Job::new(
             "email_notifications".to_string(),
             json!({
@@ -102,15 +103,23 @@ async fn basic_batch_demo(queue: &Arc<JobQueue<Postgres>>) -> Result<()> {
     // Check batch status
     let batch_result = queue.get_batch_status(batch_id).await?;
     info!("Batch status: {:?}", batch_result.status);
-    info!("Total jobs: {}, Pending: {}", batch_result.total_jobs, batch_result.pending_jobs);
+    info!(
+        "Total jobs: {}, Pending: {}",
+        batch_result.total_jobs, batch_result.pending_jobs
+    );
 
     // Get all jobs in the batch
     let batch_jobs = queue.get_batch_jobs(batch_id).await?;
     info!("Retrieved {} jobs from batch", batch_jobs.len());
 
     for (i, job) in batch_jobs.iter().enumerate() {
-        info!("Job {}: ID={}, Priority={:?}, Payload={}", 
-              i + 1, job.id, job.priority, job.payload);
+        info!(
+            "Job {}: ID={}, Priority={:?}, Payload={}",
+            i + 1,
+            job.id,
+            job.priority,
+            job.payload
+        );
     }
 
     // Clean up
@@ -136,7 +145,8 @@ async fn large_batch_demo(queue: &Arc<JobQueue<Postgres>>) -> Result<()> {
                     "file_path": format!("/data/analytics/file_{}.csv", i),
                     "priority": if i % 10 == 0 { "high" } else { "normal" }
                 }),
-            ).with_max_attempts(5),
+            )
+            .with_max_attempts(5),
         );
     }
 
@@ -147,26 +157,36 @@ async fn large_batch_demo(queue: &Arc<JobQueue<Postgres>>) -> Result<()> {
         .with_metadata("dataset", "q4_2024_analytics")
         .with_metadata("department", "data_science");
 
-    info!("Enqueueing large batch with {} jobs (will be processed in chunks)...", large_batch.job_count());
-    
+    info!(
+        "Enqueueing large batch with {} jobs (will be processed in chunks)...",
+        large_batch.job_count()
+    );
+
     let start_time = std::time::Instant::now();
     let batch_id = queue.enqueue_batch(large_batch).await?;
     let enqueue_duration = start_time.elapsed();
-    
-    info!("Large batch enqueued in {:?} with ID: {}", enqueue_duration, batch_id);
+
+    info!(
+        "Large batch enqueued in {:?} with ID: {}",
+        enqueue_duration, batch_id
+    );
 
     // Verify batch was created correctly
     let batch_result = queue.get_batch_status(batch_id).await?;
-    info!("Batch contains {} total jobs, {} pending", 
-          batch_result.total_jobs, batch_result.pending_jobs);
+    info!(
+        "Batch contains {} total jobs, {} pending",
+        batch_result.total_jobs, batch_result.pending_jobs
+    );
 
     // Sample some jobs to verify they were inserted correctly
     let sample_jobs = queue.get_batch_jobs(batch_id).await?;
     info!("First 5 jobs in batch:");
     for job in sample_jobs.iter().take(5) {
         let batch_index = job.payload["batch_index"].as_u64().unwrap();
-        info!("  Job {}: batch_index={}, file_path={}", 
-              job.id, batch_index, job.payload["file_path"]);
+        info!(
+            "  Job {}: batch_index={}, file_path={}",
+            job.id, batch_index, job.payload["file_path"]
+        );
     }
 
     // Clean up
@@ -186,8 +206,12 @@ async fn batch_worker_demo(
     // Create a job handler that processes different types of jobs
     let handler: hammerwork::worker::JobHandler = Arc::new(|job: Job| {
         Box::pin(async move {
-            let job_type = job.payload.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-            
+            let job_type = job
+                .payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
             match job_type {
                 "email" => {
                     let to = job.payload["to"].as_str().unwrap_or("unknown");
@@ -212,34 +236,32 @@ async fn batch_worker_demo(
                     // Simulate some webhook calls failing
                     if url.contains("example.com") {
                         warn!("🚨 Webhook failed for URL: {}", url);
-                        return Err(HammerworkError::Processing(
-                            format!("Failed to call webhook: {}", url)
-                        ));
+                        return Err(HammerworkError::Processing(format!(
+                            "Failed to call webhook: {}",
+                            url
+                        )));
                     }
                     info!("🌐 Calling webhook: {}", url);
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 }
                 _ => {
                     error!("❌ Unknown job type: {}", job_type);
-                    return Err(HammerworkError::Processing(
-                        format!("Unknown job type: {}", job_type)
-                    ));
+                    return Err(HammerworkError::Processing(format!(
+                        "Unknown job type: {}",
+                        job_type
+                    )));
                 }
             }
-            
+
             Ok(())
         })
     });
 
     // Create workers for different notification channels
-    let email_worker = Worker::new(
-        queue.clone(),
-        "notifications".to_string(),
-        handler.clone(),
-    )
-    .with_poll_interval(std::time::Duration::from_millis(100))
-    .with_max_retries(3)
-    .with_stats_collector(stats_collector.clone());
+    let email_worker = Worker::new(queue.clone(), "notifications".to_string(), handler.clone())
+        .with_poll_interval(std::time::Duration::from_millis(100))
+        .with_max_retries(3)
+        .with_stats_collector(stats_collector.clone());
 
     // Start worker pool
     let mut worker_pool = WorkerPool::new();
@@ -256,7 +278,8 @@ async fn batch_worker_demo(
                 "subject": "Order confirmation",
                 "order_id": "ORD-001"
             }),
-        ).as_high_priority(),
+        )
+        .as_high_priority(),
         Job::new(
             "notifications".to_string(),
             json!({
@@ -266,7 +289,6 @@ async fn batch_worker_demo(
                 "order_id": "ORD-002"
             }),
         ),
-        
         // SMS notifications
         Job::new(
             "notifications".to_string(),
@@ -275,8 +297,8 @@ async fn batch_worker_demo(
                 "phone": "+1234567890",
                 "message": "Your order is ready for pickup"
             }),
-        ).as_high_priority(),
-        
+        )
+        .as_high_priority(),
         // Push notifications
         Job::new(
             "notifications".to_string(),
@@ -287,7 +309,6 @@ async fn batch_worker_demo(
                 "body": "Get 20% off your next order"
             }),
         ),
-        
         // Webhook calls (some will fail)
         Job::new(
             "notifications".to_string(),
@@ -324,15 +345,18 @@ async fn batch_worker_demo(
     });
 
     // Monitor batch progress
-    for i in 0..30 { // Wait up to 30 seconds
+    for i in 0..30 {
+        // Wait up to 30 seconds
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        
+
         let batch_result = queue.get_batch_status(batch_id).await?;
-        info!("Batch progress: {}/{} completed, {} failed, {} pending", 
-              batch_result.completed_jobs, 
-              batch_result.total_jobs,
-              batch_result.failed_jobs,
-              batch_result.pending_jobs);
+        info!(
+            "Batch progress: {}/{} completed, {} failed, {} pending",
+            batch_result.completed_jobs,
+            batch_result.total_jobs,
+            batch_result.failed_jobs,
+            batch_result.pending_jobs
+        );
 
         if batch_result.pending_jobs == 0 {
             info!("✅ All jobs in batch have been processed!");
@@ -375,9 +399,15 @@ async fn failure_modes_demo(queue: &Arc<JobQueue<Postgres>>) -> Result<()> {
     // Demo PartialFailureMode::ContinueOnError
     info!("Testing ContinueOnError mode...");
     let continue_jobs = vec![
-        Job::new("test_queue".to_string(), json!({"action": "succeed", "id": 1})),
+        Job::new(
+            "test_queue".to_string(),
+            json!({"action": "succeed", "id": 1}),
+        ),
         Job::new("test_queue".to_string(), json!({"action": "fail", "id": 2})),
-        Job::new("test_queue".to_string(), json!({"action": "succeed", "id": 3})),
+        Job::new(
+            "test_queue".to_string(),
+            json!({"action": "succeed", "id": 3}),
+        ),
     ];
 
     let continue_batch = JobBatch::new("continue_on_error_batch")
@@ -385,14 +415,23 @@ async fn failure_modes_demo(queue: &Arc<JobQueue<Postgres>>) -> Result<()> {
         .with_partial_failure_handling(PartialFailureMode::ContinueOnError);
 
     let continue_batch_id = queue.enqueue_batch(continue_batch).await?;
-    info!("ContinueOnError batch created with ID: {}", continue_batch_id);
+    info!(
+        "ContinueOnError batch created with ID: {}",
+        continue_batch_id
+    );
 
     // Demo PartialFailureMode::FailFast
     info!("Testing FailFast mode...");
     let failfast_jobs = vec![
-        Job::new("test_queue".to_string(), json!({"action": "succeed", "id": 4})),
+        Job::new(
+            "test_queue".to_string(),
+            json!({"action": "succeed", "id": 4}),
+        ),
         Job::new("test_queue".to_string(), json!({"action": "fail", "id": 5})),
-        Job::new("test_queue".to_string(), json!({"action": "succeed", "id": 6})),
+        Job::new(
+            "test_queue".to_string(),
+            json!({"action": "succeed", "id": 6}),
+        ),
     ];
 
     let failfast_batch = JobBatch::new("fail_fast_batch")
@@ -405,10 +444,19 @@ async fn failure_modes_demo(queue: &Arc<JobQueue<Postgres>>) -> Result<()> {
     // Demo PartialFailureMode::CollectErrors
     info!("Testing CollectErrors mode...");
     let collect_jobs = vec![
-        Job::new("test_queue".to_string(), json!({"action": "succeed", "id": 7})),
+        Job::new(
+            "test_queue".to_string(),
+            json!({"action": "succeed", "id": 7}),
+        ),
         Job::new("test_queue".to_string(), json!({"action": "fail", "id": 8})),
-        Job::new("test_queue".to_string(), json!({"action": "timeout", "id": 9})),
-        Job::new("test_queue".to_string(), json!({"action": "succeed", "id": 10})),
+        Job::new(
+            "test_queue".to_string(),
+            json!({"action": "timeout", "id": 9}),
+        ),
+        Job::new(
+            "test_queue".to_string(),
+            json!({"action": "succeed", "id": 10}),
+        ),
     ];
 
     let collect_batch = JobBatch::new("collect_errors_batch")
@@ -424,7 +472,10 @@ async fn failure_modes_demo(queue: &Arc<JobQueue<Postgres>>) -> Result<()> {
     let collect_result = queue.get_batch_status(collect_batch_id).await?;
 
     info!("Batch failure modes configured:");
-    info!("  ContinueOnError batch: {} jobs", continue_result.total_jobs);
+    info!(
+        "  ContinueOnError batch: {} jobs",
+        continue_result.total_jobs
+    );
     info!("  FailFast batch: {} jobs", failfast_result.total_jobs);
     info!("  CollectErrors batch: {} jobs", collect_result.total_jobs);
 

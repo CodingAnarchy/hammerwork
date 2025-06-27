@@ -1,8 +1,8 @@
 use hammerwork::{
+    Job, JobQueue, Worker, WorkerPool,
     priority::{JobPriority, PriorityWeights},
     queue::DatabaseQueue,
     stats::{InMemoryStatsCollector, StatisticsCollector},
-    Job, JobQueue, Worker, WorkerPool,
 };
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;

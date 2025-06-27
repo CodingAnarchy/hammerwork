@@ -1,8 +1,8 @@
 use crate::{
+    Result,
     job::{Job, JobId},
     rate_limit::ThrottleConfig,
     stats::{DeadJobSummary, QueueStats},
-    Result,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -32,13 +32,16 @@ pub trait DatabaseQueue: Send + Sync {
     // Batch operations
     /// Enqueue multiple jobs as a batch for improved performance.
     async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId>;
-    
+
     /// Get the current status of a batch operation.
-    async fn get_batch_status(&self, batch_id: crate::batch::BatchId) -> Result<crate::batch::BatchResult>;
-    
+    async fn get_batch_status(
+        &self,
+        batch_id: crate::batch::BatchId,
+    ) -> Result<crate::batch::BatchResult>;
+
     /// Get all jobs belonging to a specific batch.
     async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>>;
-    
+
     /// Delete a batch and all its associated jobs.
     async fn delete_batch(&self, batch_id: crate::batch::BatchId) -> Result<()>;
 
@@ -514,7 +517,7 @@ pub mod postgres {
 
             // Calculate weighted selection
             let mut weighted_choices = Vec::new();
-            for (priority, _jobs) in &priority_jobs {
+            for priority in priority_jobs.keys() {
                 let weight = weights.get_weight(*priority);
                 for _ in 0..weight {
                     weighted_choices.push(priority);
@@ -1077,7 +1080,11 @@ pub mod postgres {
             Ok(())
         }
 
-        async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
+        async fn set_throttle_config(
+            &self,
+            queue_name: &str,
+            config: ThrottleConfig,
+        ) -> Result<()> {
             self.set_throttle(queue_name, config).await
         }
 
@@ -1095,7 +1102,7 @@ pub mod postgres {
 
         async fn get_queue_depth(&self, queue_name: &str) -> Result<u64> {
             let count: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 AND status = $2"
+                "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 AND status = $2",
             )
             .bind(queue_name)
             .bind(serde_json::to_string(&JobStatus::Pending)?)
@@ -1106,14 +1113,17 @@ pub mod postgres {
         }
 
         // Batch operations
-        async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId> {
-            use crate::batch::{BatchStatus, PartialFailureMode};
-            
+        async fn enqueue_batch(
+            &self,
+            batch: crate::batch::JobBatch,
+        ) -> Result<crate::batch::BatchId> {
+            use crate::batch::BatchStatus;
+
             // Validate the batch first
             batch.validate()?;
-            
+
             let mut tx = self.pool.begin().await?;
-            
+
             // Insert batch metadata
             sqlx::query(
                 r#"
@@ -1220,8 +1230,11 @@ pub mod postgres {
             Ok(batch.id)
         }
 
-        async fn get_batch_status(&self, batch_id: crate::batch::BatchId) -> Result<crate::batch::BatchResult> {
-            use crate::batch::{BatchStatus, BatchResult, PartialFailureMode};
+        async fn get_batch_status(
+            &self,
+            batch_id: crate::batch::BatchId,
+        ) -> Result<crate::batch::BatchResult> {
+            use crate::batch::BatchResult;
             use std::collections::HashMap;
 
             // Get batch metadata
@@ -1306,7 +1319,7 @@ pub mod mysql {
     use super::*;
     use crate::job::JobStatus;
     use crate::priority::JobPriority;
-    use sqlx::{FromRow, MySql};
+    use sqlx::{FromRow, MySql, Row};
     use std::time::Duration;
 
     #[derive(FromRow, Clone)]
@@ -1357,7 +1370,10 @@ pub mod mysql {
                 next_run_at: self.next_run_at,
                 recurring: self.recurring,
                 timezone: self.timezone,
-                batch_id: self.batch_id.map(|s| uuid::Uuid::parse_str(&s)).transpose()?,
+                batch_id: self
+                    .batch_id
+                    .map(|s| uuid::Uuid::parse_str(&s))
+                    .transpose()?,
             })
         }
     }
@@ -1405,6 +1421,7 @@ pub mod mysql {
                 next_run_at: None,
                 recurring: false,
                 timezone: None,
+                batch_id: None,
             })
         }
     }
@@ -2127,7 +2144,11 @@ pub mod mysql {
             Ok(())
         }
 
-        async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
+        async fn set_throttle_config(
+            &self,
+            queue_name: &str,
+            config: ThrottleConfig,
+        ) -> Result<()> {
             self.set_throttle(queue_name, config).await
         }
 
@@ -2145,7 +2166,7 @@ pub mod mysql {
 
         async fn get_queue_depth(&self, queue_name: &str) -> Result<u64> {
             let count: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? AND status = ?"
+                "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? AND status = ?",
             )
             .bind(queue_name)
             .bind(serde_json::to_string(&JobStatus::Pending)?)
@@ -2156,14 +2177,17 @@ pub mod mysql {
         }
 
         // Batch operations
-        async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId> {
-            use crate::batch::{BatchStatus, PartialFailureMode};
-            
+        async fn enqueue_batch(
+            &self,
+            batch: crate::batch::JobBatch,
+        ) -> Result<crate::batch::BatchId> {
+            use crate::batch::BatchStatus;
+
             // Validate the batch first
             batch.validate()?;
-            
+
             let mut tx = self.pool.begin().await?;
-            
+
             // Insert batch metadata
             sqlx::query(
                 r#"
@@ -2190,16 +2214,18 @@ pub mod mysql {
                 let chunk_size = 100; // MySQL has limits on max_allowed_packet and query size
                 for chunk in batch.jobs.chunks(chunk_size) {
                     let mut query = "INSERT INTO hammerwork_jobs (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id) VALUES ".to_string();
-                    
+
                     let mut bindings = Vec::new();
-                    let mut value_parts = Vec::new();
-                    
+                    // Note: value_parts variable was used for building query parts but is not needed in this implementation
+
                     for (i, job) in chunk.iter().enumerate() {
                         if i > 0 {
                             query.push_str(", ");
                         }
-                        query.push_str("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-                        
+                        query.push_str(
+                            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        );
+
                         bindings.extend([
                             job.id.to_string(),
                             job.queue_name.clone(),
@@ -2208,22 +2234,38 @@ pub mod mysql {
                             job.priority.as_i32().to_string(),
                             job.attempts.to_string(),
                             job.max_attempts.to_string(),
-                            job.timeout.map(|t| (t.as_secs() as i32).to_string()).unwrap_or_else(|| "NULL".to_string()),
+                            job.timeout
+                                .map(|t| (t.as_secs() as i32).to_string())
+                                .unwrap_or_else(|| "NULL".to_string()),
                             job.created_at.to_rfc3339(),
                             job.scheduled_at.to_rfc3339(),
-                            job.started_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
-                            job.completed_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
-                            job.failed_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
-                            job.timed_out_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
-                            job.error_message.clone().unwrap_or_else(|| "NULL".to_string()),
-                            job.cron_schedule.clone().unwrap_or_else(|| "NULL".to_string()),
-                            job.next_run_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "NULL".to_string()),
+                            job.started_at
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_else(|| "NULL".to_string()),
+                            job.completed_at
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_else(|| "NULL".to_string()),
+                            job.failed_at
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_else(|| "NULL".to_string()),
+                            job.timed_out_at
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_else(|| "NULL".to_string()),
+                            job.error_message
+                                .clone()
+                                .unwrap_or_else(|| "NULL".to_string()),
+                            job.cron_schedule
+                                .clone()
+                                .unwrap_or_else(|| "NULL".to_string()),
+                            job.next_run_at
+                                .map(|t| t.to_rfc3339())
+                                .unwrap_or_else(|| "NULL".to_string()),
                             job.recurring.to_string(),
                             job.timezone.clone().unwrap_or_else(|| "NULL".to_string()),
                             batch.id.to_string(),
                         ]);
                     }
-                    
+
                     // Build query with proper parameter bindings
                     let mut prepared_query = sqlx::query(&query);
                     for job in chunk {
@@ -2249,7 +2291,7 @@ pub mod mysql {
                             .bind(&job.timezone)
                             .bind(batch.id.to_string());
                     }
-                    
+
                     prepared_query.execute(&mut *tx).await?;
                 }
             }
@@ -2258,8 +2300,11 @@ pub mod mysql {
             Ok(batch.id)
         }
 
-        async fn get_batch_status(&self, batch_id: crate::batch::BatchId) -> Result<crate::batch::BatchResult> {
-            use crate::batch::{BatchStatus, BatchResult, PartialFailureMode};
+        async fn get_batch_status(
+            &self,
+            batch_id: crate::batch::BatchId,
+        ) -> Result<crate::batch::BatchResult> {
+            use crate::batch::BatchResult;
             use std::collections::HashMap;
 
             // Get batch metadata
@@ -2291,7 +2336,8 @@ pub mod mysql {
             .fetch_all(&self.pool)
             .await?;
 
-            let job_errors_map: HashMap<uuid::Uuid, String> = job_errors.into_iter()
+            let job_errors_map: HashMap<uuid::Uuid, String> = job_errors
+                .into_iter()
                 .filter_map(|(id_str, error)| {
                     uuid::Uuid::parse_str(&id_str).ok().map(|id| (id, error))
                 })
@@ -2362,7 +2408,7 @@ mod tests {
         // We can't instantiate it without a real database pool
         // This would be the structure if we had a real database type
         // let _phantom: PhantomData<sqlx::Postgres> = PhantomData;
-        assert!(true); // Compilation test
+        // Compilation test - if this compiles, the type is correct
     }
 
     #[test]
@@ -2421,7 +2467,7 @@ mod tests {
         use serde_json::json;
 
         // Test that TimedOut status is distinct from other statuses
-        let statuses = vec![
+        let statuses = [
             JobStatus::Pending,
             JobStatus::Running,
             JobStatus::Completed,

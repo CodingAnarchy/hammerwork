@@ -28,8 +28,8 @@ warp = { version = "0.3" }
 
 [package]
 name = "hammerwork"
-version = "0.7.0"
-edition = "2021"
+version = "0.7.1"
+edition = "2024"
 description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job prioritization, cron scheduling, timeouts, rate limiting, Prometheus metrics, alerting, and comprehensive statistics collection"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
@@ -39,6 +39,7 @@ documentation = "https://docs.rs/hammerwork"
 readme = "README.md"
 keywords = ["database", "job-queue", "async", "postgres", "mysql"]
 categories = ["database", "asynchronous", "concurrency"]
+rust-version = "1.86"
 
 [dependencies]
 tokio = { workspace = true }

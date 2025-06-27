@@ -1,6 +1,6 @@
 use hammerwork::{
-    batch::{JobBatch, PartialFailureMode, BatchStatus},
     Job, JobQueue, JobStatus,
+    batch::{BatchStatus, JobBatch, PartialFailureMode},
     queue::DatabaseQueue,
 };
 use serde_json::json;
@@ -32,9 +32,18 @@ mod postgres_batch_tests {
 
         // Create a batch of jobs
         let jobs = vec![
-            Job::new("email_queue".to_string(), json!({"to": "user1@example.com"})),
-            Job::new("email_queue".to_string(), json!({"to": "user2@example.com"})),
-            Job::new("email_queue".to_string(), json!({"to": "user3@example.com"})),
+            Job::new(
+                "email_queue".to_string(),
+                json!({"to": "user1@example.com"}),
+            ),
+            Job::new(
+                "email_queue".to_string(),
+                json!({"to": "user2@example.com"}),
+            ),
+            Job::new(
+                "email_queue".to_string(),
+                json!({"to": "user3@example.com"}),
+            ),
         ];
 
         let batch = JobBatch::new("test_email_batch")
@@ -56,7 +65,7 @@ mod postgres_batch_tests {
         // Get batch jobs
         let batch_jobs = queue.get_batch_jobs(batch_id).await.unwrap();
         assert_eq!(batch_jobs.len(), 3);
-        
+
         // All jobs should have the same batch_id
         for job in &batch_jobs {
             assert_eq!(job.batch_id, Some(batch_id));
@@ -80,14 +89,19 @@ mod postgres_batch_tests {
         let empty_batch = JobBatch::new("empty_batch");
         let result = queue.enqueue_batch(empty_batch).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Batch cannot be empty"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Batch cannot be empty")
+        );
 
         // Test mixed queue validation
         let mixed_jobs = vec![
             Job::new("queue1".to_string(), json!({"id": 1})),
             Job::new("queue2".to_string(), json!({"id": 2})),
         ];
-        
+
         let mixed_batch = JobBatch::new("mixed_batch").with_jobs(mixed_jobs);
         let result = queue.enqueue_batch(mixed_batch).await;
         assert!(result.is_err());
@@ -126,8 +140,8 @@ mod postgres_batch_tests {
         assert_eq!(batch_jobs.len(), 500);
 
         // Verify jobs are correctly ordered
-        for (i, job) in batch_jobs.iter().enumerate() {
-            let expected_index = job.payload["batch_index"].as_u64().unwrap() as usize;
+        for job in batch_jobs.iter() {
+            let _expected_index = job.payload["batch_index"].as_u64().unwrap() as usize;
             assert_eq!(job.batch_id, Some(batch_id));
             assert_eq!(job.queue_name, "large_queue");
         }
@@ -160,8 +174,11 @@ mod postgres_batch_tests {
         // Simulate processing: mark one job as failed
         let batch_jobs = queue.get_batch_jobs(batch_id).await.unwrap();
         let failing_job = &batch_jobs[1]; // The one with will_fail: true
-        
-        queue.fail_job(failing_job.id, "Simulated failure").await.unwrap();
+
+        queue
+            .fail_job(failing_job.id, "Simulated failure")
+            .await
+            .unwrap();
 
         // Verify batch still exists and shows partial failure
         let batch_result = queue.get_batch_status(batch_id).await.unwrap();
@@ -182,7 +199,7 @@ mod postgres_batch_tests {
         queue.create_tables().await.unwrap();
 
         let job = Job::new("metadata_queue".to_string(), json!({"test": "data"}));
-        
+
         let batch = JobBatch::new("metadata_batch")
             .with_jobs(vec![job])
             .with_metadata("user_id", "12345")
@@ -191,7 +208,7 @@ mod postgres_batch_tests {
 
         let batch_id = queue.enqueue_batch(batch).await.unwrap();
 
-        // Note: Metadata is stored in the batch table but not directly accessible 
+        // Note: Metadata is stored in the batch table but not directly accessible
         // through the current BatchResult API. This test verifies it doesn't break anything.
         let batch_result = queue.get_batch_status(batch_id).await.unwrap();
         assert_eq!(batch_result.total_jobs, 1);
@@ -204,12 +221,11 @@ mod postgres_batch_tests {
 #[cfg(feature = "mysql")]
 mod mysql_batch_tests {
     use super::*;
-    use sqlx::{Pool, MySql};
+    use sqlx::{MySql, Pool};
 
     async fn setup_mysql_pool() -> Pool<MySql> {
-        let database_url = std::env::var("MYSQL_DATABASE_URL").unwrap_or_else(|_| {
-            "mysql://root:password@localhost/hammerwork_test".to_string()
-        });
+        let database_url = std::env::var("MYSQL_DATABASE_URL")
+            .unwrap_or_else(|_| "mysql://root:password@localhost/hammerwork_test".to_string());
 
         Pool::<MySql>::connect(&database_url)
             .await
@@ -227,9 +243,18 @@ mod mysql_batch_tests {
 
         // Create a batch of jobs
         let jobs = vec![
-            Job::new("email_queue".to_string(), json!({"to": "user1@example.com"})),
-            Job::new("email_queue".to_string(), json!({"to": "user2@example.com"})),
-            Job::new("email_queue".to_string(), json!({"to": "user3@example.com"})),
+            Job::new(
+                "email_queue".to_string(),
+                json!({"to": "user1@example.com"}),
+            ),
+            Job::new(
+                "email_queue".to_string(),
+                json!({"to": "user2@example.com"}),
+            ),
+            Job::new(
+                "email_queue".to_string(),
+                json!({"to": "user3@example.com"}),
+            ),
         ];
 
         let batch = JobBatch::new("test_email_batch")
@@ -251,7 +276,7 @@ mod mysql_batch_tests {
         // Get batch jobs
         let batch_jobs = queue.get_batch_jobs(batch_id).await.unwrap();
         assert_eq!(batch_jobs.len(), 3);
-        
+
         // All jobs should have the same batch_id
         for job in &batch_jobs {
             assert_eq!(job.batch_id, Some(batch_id));
@@ -274,10 +299,7 @@ mod mysql_batch_tests {
         // Create a batch larger than MySQL chunk size (100)
         let mut jobs = Vec::new();
         for i in 0..250 {
-            jobs.push(Job::new(
-                "chunked_queue".to_string(),
-                json!({"index": i}),
-            ));
+            jobs.push(Job::new("chunked_queue".to_string(), json!({"index": i})));
         }
 
         let batch = JobBatch::new("chunked_batch").with_jobs(jobs);
@@ -356,7 +378,10 @@ mod batch_struct_tests {
         assert_eq!(batch.job_count(), 2);
         assert_eq!(batch.batch_size, Some(50));
         assert_eq!(batch.failure_mode, PartialFailureMode::CollectErrors);
-        assert_eq!(batch.metadata.get("test_key"), Some(&"test_value".to_string()));
+        assert_eq!(
+            batch.metadata.get("test_key"),
+            Some(&"test_value".to_string())
+        );
         assert_eq!(batch.metadata.get("priority"), Some(&"high".to_string()));
         assert!(!batch.is_empty());
     }
@@ -372,7 +397,12 @@ mod batch_struct_tests {
         let large_batch = JobBatch::new("too_large").with_jobs(large_jobs);
         let result = large_batch.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds maximum allowed size"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum allowed size")
+        );
 
         // Test valid large batch (just under limit)
         let mut valid_large_jobs = Vec::new();

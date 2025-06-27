@@ -1,10 +1,10 @@
 use hammerwork::{
-    cron::{presets, CronSchedule},
+    Result,
+    cron::{CronSchedule, presets},
     job::Job,
     queue::JobQueue,
     stats::{InMemoryStatsCollector, StatisticsCollector},
     worker::{Worker, WorkerPool},
-    Result,
 };
 use serde_json::json;
 use sqlx::{Pool, Postgres};

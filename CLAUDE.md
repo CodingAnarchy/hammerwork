@@ -6,6 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Hammerwork is a high-performance, database-driven job queue library for Rust with support for both PostgreSQL and MySQL. It provides async/await job processing with configurable retry logic, delayed jobs, job prioritization with weighted scheduling, and worker pools.
 
+## Development Notes
+
+- SQLx compile-time query checking requires database connections
+- PostgreSQL uses `FOR UPDATE SKIP LOCKED` for efficient job polling
+- MySQL implementation uses transaction-based locking (less optimal)
+- Priority-aware queries use `ORDER BY priority DESC, scheduled_at ASC`
+- Weighted selection uses hash-based algorithms for Send compatibility
+- Tracing is integrated for observability
+- Examples demonstrate database configurations, cron scheduling, and prioritization
+- Use edition 2024 as the preference
+
 ## Common Development Commands
 
 ### Building and Testing
@@ -93,13 +104,3 @@ Both PostgreSQL and MySQL implementations use a single table `hammerwork_jobs` w
 - **Type-safe job handling**: Job handlers return `Result<()>` for error handling
 - **Priority-aware scheduling**: Weighted and strict priority algorithms prevent starvation
 - **Comprehensive monitoring**: Statistics track priority distribution and performance
-
-## Development Notes
-
-- SQLx compile-time query checking requires database connections
-- PostgreSQL uses `FOR UPDATE SKIP LOCKED` for efficient job polling
-- MySQL implementation uses transaction-based locking (less optimal)
-- Priority-aware queries use `ORDER BY priority DESC, scheduled_at ASC`
-- Weighted selection uses hash-based algorithms for Send compatibility
-- Tracing is integrated for observability
-- Examples demonstrate database configurations, cron scheduling, and prioritization

@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_job_event_types() {
-        let event_types = vec![
+        let event_types = [
             JobEventType::Started,
             JobEventType::Completed,
             JobEventType::Failed,

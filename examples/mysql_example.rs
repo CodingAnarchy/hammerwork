@@ -1,9 +1,9 @@
 use hammerwork::{
+    Result,
     job::Job,
     queue::JobQueue,
     stats::{InMemoryStatsCollector, StatisticsCollector},
     worker::{Worker, WorkerPool},
-    Result,
 };
 use serde_json::json;
 use sqlx::{MySql, Pool};
@@ -202,7 +202,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let system_stats = stats_collector
             .get_system_statistics(std::time::Duration::from_secs(300))
             .await?;
-        info!("System Stats - Total: {}, Completed: {}, Failed: {}, Dead: {}, Timed Out: {}, Error Rate: {:.2}%",
+        info!(
+            "System Stats - Total: {}, Completed: {}, Failed: {}, Dead: {}, Timed Out: {}, Error Rate: {:.2}%",
             system_stats.total_processed,
             system_stats.completed,
             system_stats.failed,
@@ -215,7 +216,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let image_stats = stats_collector
             .get_queue_statistics("image_processing", std::time::Duration::from_secs(300))
             .await?;
-        info!("Image Processing Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Time: {:.2}ms",
+        info!(
+            "Image Processing Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Time: {:.2}ms",
             image_stats.total_processed,
             image_stats.completed,
             image_stats.failed,
@@ -226,7 +228,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let email_stats = stats_collector
             .get_queue_statistics("email_queue", std::time::Duration::from_secs(300))
             .await?;
-        info!("Email Queue Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Time: {:.2}ms",
+        info!(
+            "Email Queue Stats - Total: {}, Completed: {}, Failed: {}, Timed Out: {}, Avg Time: {:.2}ms",
             email_stats.total_processed,
             email_stats.completed,
             email_stats.failed,

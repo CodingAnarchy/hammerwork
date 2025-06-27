@@ -1,4 +1,4 @@
-use crate::{error::HammerworkError, stats::JobStatistics, Result};
+use crate::{Result, error::HammerworkError, stats::JobStatistics};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -421,9 +421,7 @@ impl AlertManager {
             AlertTarget::Webhook { url, headers } => {
                 self.send_webhook_alert(alert, url, headers).await
             }
-            AlertTarget::Email { recipient } => {
-                self.send_email_alert(alert, recipient).await
-            }
+            AlertTarget::Email { recipient } => self.send_email_alert(alert, recipient).await,
             AlertTarget::Slack {
                 webhook_url,
                 channel,
@@ -456,9 +454,12 @@ impl AlertManager {
             request = request.header(key, value);
         }
 
-        let response = request.send().await.map_err(|e| HammerworkError::Alerting {
-            message: format!("Failed to send webhook alert: {}", e),
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| HammerworkError::Alerting {
+                message: format!("Failed to send webhook alert: {}", e),
+            })?;
 
         if !response.status().is_success() {
             return Err(HammerworkError::Alerting {
@@ -501,9 +502,9 @@ impl AlertManager {
         channel: &str,
     ) -> Result<()> {
         let color = match alert.severity {
-            AlertSeverity::Info => "#36a64f",      // Green
-            AlertSeverity::Warning => "#ffaa00",   // Orange
-            AlertSeverity::Critical => "#ff0000",  // Red
+            AlertSeverity::Info => "#36a64f",     // Green
+            AlertSeverity::Warning => "#ffaa00",  // Orange
+            AlertSeverity::Critical => "#ff0000", // Red
         };
 
         let payload = serde_json::json!({
@@ -576,7 +577,10 @@ impl AlertManager {
     /// Build context information for alerts
     fn build_context(&self, stats: &JobStatistics) -> HashMap<String, String> {
         let mut context = HashMap::new();
-        context.insert("total_processed".to_string(), stats.total_processed.to_string());
+        context.insert(
+            "total_processed".to_string(),
+            stats.total_processed.to_string(),
+        );
         context.insert("completed".to_string(), stats.completed.to_string());
         context.insert("failed".to_string(), stats.failed.to_string());
         context.insert("dead".to_string(), stats.dead.to_string());

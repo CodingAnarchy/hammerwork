@@ -1,11 +1,9 @@
-use crate::{error::HammerworkError, stats::JobEvent, Result};
+use crate::{Result, error::HammerworkError, stats::JobEvent};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 #[cfg(feature = "metrics")]
-use prometheus::{
-    CounterVec, Encoder, GaugeVec, HistogramVec, Registry, TextEncoder,
-};
+use prometheus::{CounterVec, Encoder, GaugeVec, HistogramVec, Registry, TextEncoder};
 
 #[cfg(feature = "metrics")]
 use warp::Filter;
@@ -107,51 +105,65 @@ impl PrometheusMetricsCollector {
         // Register core job metrics
         let jobs_total = prometheus::CounterVec::new(
             prometheus::Opts::new("hammerwork_jobs_total", "Total number of jobs processed"),
-            &["queue", "status", "priority"]
+            &["queue", "status", "priority"],
         )
         .map_err(|e| HammerworkError::Metrics {
             message: format!("Failed to create jobs_total metric: {}", e),
         })?;
 
         let jobs_duration = prometheus::HistogramVec::new(
-            prometheus::HistogramOpts::new("hammerwork_job_duration_seconds", "Job processing duration in seconds")
-                .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
-            &["queue", "priority"]
+            prometheus::HistogramOpts::new(
+                "hammerwork_job_duration_seconds",
+                "Job processing duration in seconds",
+            )
+            .buckets(vec![
+                0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+            ]),
+            &["queue", "priority"],
         )
         .map_err(|e| HammerworkError::Metrics {
             message: format!("Failed to create jobs_duration metric: {}", e),
         })?;
 
         let jobs_failed_total = prometheus::CounterVec::new(
-            prometheus::Opts::new("hammerwork_jobs_failed_total", "Total number of failed jobs"),
-            &["queue", "error_type", "priority"]
+            prometheus::Opts::new(
+                "hammerwork_jobs_failed_total",
+                "Total number of failed jobs",
+            ),
+            &["queue", "error_type", "priority"],
         )
         .map_err(|e| HammerworkError::Metrics {
             message: format!("Failed to create jobs_failed_total metric: {}", e),
         })?;
 
         let queue_depth = prometheus::GaugeVec::new(
-            prometheus::Opts::new("hammerwork_queue_depth", "Current number of pending jobs in queue"),
-            &["queue"]
+            prometheus::Opts::new(
+                "hammerwork_queue_depth",
+                "Current number of pending jobs in queue",
+            ),
+            &["queue"],
         )
         .map_err(|e| HammerworkError::Metrics {
             message: format!("Failed to create queue_depth metric: {}", e),
         })?;
 
         let worker_utilization = prometheus::GaugeVec::new(
-            prometheus::Opts::new("hammerwork_worker_utilization", "Worker utilization percentage"),
-            &["queue", "worker_id"]
+            prometheus::Opts::new(
+                "hammerwork_worker_utilization",
+                "Worker utilization percentage",
+            ),
+            &["queue", "worker_id"],
         )
         .map_err(|e| HammerworkError::Metrics {
             message: format!("Failed to create worker_utilization metric: {}", e),
         })?;
 
         // Register with custom registry
-        registry.register(Box::new(jobs_total.clone())).map_err(|e| {
-            HammerworkError::Metrics {
+        registry
+            .register(Box::new(jobs_total.clone()))
+            .map_err(|e| HammerworkError::Metrics {
                 message: format!("Failed to register jobs_total with registry: {}", e),
-            }
-        })?;
+            })?;
 
         registry
             .register(Box::new(jobs_duration.clone()))
@@ -339,9 +351,9 @@ impl PrometheusMetricsCollector {
             let gauge = prometheus::GaugeVec::new(
                 prometheus::Opts::new(
                     format!("hammerwork_{}", gauge_name),
-                    format!("Custom gauge metric: {}", gauge_name)
+                    format!("Custom gauge metric: {}", gauge_name),
                 ),
-                &["queue"]
+                &["queue"],
             )
             .map_err(|e| HammerworkError::Metrics {
                 message: format!("Failed to create custom gauge {}: {}", gauge_name, e),
@@ -370,12 +382,15 @@ impl PrometheusMetricsCollector {
             let histogram = prometheus::HistogramVec::new(
                 prometheus::HistogramOpts::new(
                     format!("hammerwork_{}", histogram_name),
-                    format!("Custom histogram metric: {}", histogram_name)
+                    format!("Custom histogram metric: {}", histogram_name),
                 ),
-                &["queue"]
+                &["queue"],
             )
             .map_err(|e| HammerworkError::Metrics {
-                message: format!("Failed to create custom histogram {}: {}", histogram_name, e),
+                message: format!(
+                    "Failed to create custom histogram {}: {}",
+                    histogram_name, e
+                ),
             })?;
 
             self.registry
@@ -615,15 +630,23 @@ mod tests {
             .with_histograms(vec!["request_duration", "response_size"]);
 
         assert_eq!(config.custom_gauges.len(), 2);
-        assert!(config.custom_gauges.contains(&"active_connections".to_string()));
+        assert!(
+            config
+                .custom_gauges
+                .contains(&"active_connections".to_string())
+        );
         assert!(config.custom_gauges.contains(&"memory_usage".to_string()));
 
         assert_eq!(config.custom_histograms.len(), 2);
-        assert!(config
-            .custom_histograms
-            .contains(&"request_duration".to_string()));
-        assert!(config
-            .custom_histograms
-            .contains(&"response_size".to_string()));
+        assert!(
+            config
+                .custom_histograms
+                .contains(&"request_duration".to_string())
+        );
+        assert!(
+            config
+                .custom_histograms
+                .contains(&"response_size".to_string())
+        );
     }
 }

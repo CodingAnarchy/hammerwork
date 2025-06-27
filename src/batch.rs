@@ -4,7 +4,7 @@
 //! multiple jobs as a single unit, enabling significant performance improvements
 //! for high-volume job processing.
 
-use crate::{job::Job, Result};
+use crate::{Result, job::Job};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -268,7 +268,7 @@ impl JobBatch {
     /// This is useful for processing very large batches in manageable chunks.
     pub fn into_chunks(self) -> Vec<JobBatch> {
         let chunk_size = self.batch_size.unwrap_or(1000) as usize;
-        
+
         if self.jobs.len() <= chunk_size {
             return vec![self];
         }
@@ -276,16 +276,14 @@ impl JobBatch {
         self.jobs
             .chunks(chunk_size)
             .enumerate()
-            .map(|(i, chunk)| {
-                JobBatch {
-                    id: Uuid::new_v4(),
-                    name: format!("{}_chunk_{}", self.name, i + 1),
-                    jobs: chunk.to_vec(),
-                    batch_size: self.batch_size,
-                    failure_mode: self.failure_mode.clone(),
-                    created_at: self.created_at,
-                    metadata: self.metadata.clone(),
-                }
+            .map(|(i, chunk)| JobBatch {
+                id: Uuid::new_v4(),
+                name: format!("{}_chunk_{}", self.name, i + 1),
+                jobs: chunk.to_vec(),
+                batch_size: self.batch_size,
+                failure_mode: self.failure_mode.clone(),
+                created_at: self.created_at,
+                metadata: self.metadata.clone(),
             })
             .collect()
     }
@@ -343,10 +341,9 @@ mod tests {
     fn test_job_batch_with_jobs() {
         let job1 = Job::new("queue1".to_string(), json!({"id": 1}));
         let job2 = Job::new("queue1".to_string(), json!({"id": 2}));
-        
-        let batch = JobBatch::new("test_batch")
-            .with_jobs(vec![job1, job2]);
-        
+
+        let batch = JobBatch::new("test_batch").with_jobs(vec![job1, job2]);
+
         assert_eq!(batch.job_count(), 2);
         assert!(!batch.is_empty());
     }
@@ -354,10 +351,9 @@ mod tests {
     #[test]
     fn test_job_batch_add_job() {
         let job = Job::new("queue1".to_string(), json!({"id": 1}));
-        
-        let batch = JobBatch::new("test_batch")
-            .add_job(job);
-        
+
+        let batch = JobBatch::new("test_batch").add_job(job);
+
         assert_eq!(batch.job_count(), 1);
     }
 
@@ -368,7 +364,7 @@ mod tests {
             .with_partial_failure_handling(PartialFailureMode::FailFast)
             .with_metadata("user_id", "123")
             .with_metadata("campaign", "test");
-        
+
         assert_eq!(batch.batch_size, Some(50));
         assert_eq!(batch.failure_mode, PartialFailureMode::FailFast);
         assert_eq!(batch.metadata.get("user_id"), Some(&"123".to_string()));
@@ -380,7 +376,12 @@ mod tests {
         let batch = JobBatch::new("empty_batch");
         let result = batch.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Batch cannot be empty"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Batch cannot be empty")
+        );
     }
 
     #[test]
@@ -389,21 +390,25 @@ mod tests {
         for i in 0..10_001 {
             jobs.push(Job::new("queue1".to_string(), json!({"id": i})));
         }
-        
+
         let batch = JobBatch::new("large_batch").with_jobs(jobs);
         let result = batch.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds maximum allowed size"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds maximum allowed size")
+        );
     }
 
     #[test]
     fn test_batch_validation_mixed_queues() {
         let job1 = Job::new("queue1".to_string(), json!({"id": 1}));
         let job2 = Job::new("queue2".to_string(), json!({"id": 2}));
-        
-        let batch = JobBatch::new("mixed_batch")
-            .with_jobs(vec![job1, job2]);
-        
+
+        let batch = JobBatch::new("mixed_batch").with_jobs(vec![job1, job2]);
+
         let result = batch.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("same queue name"));
@@ -413,10 +418,9 @@ mod tests {
     fn test_batch_validation_success() {
         let job1 = Job::new("queue1".to_string(), json!({"id": 1}));
         let job2 = Job::new("queue1".to_string(), json!({"id": 2}));
-        
-        let batch = JobBatch::new("valid_batch")
-            .with_jobs(vec![job1, job2]);
-        
+
+        let batch = JobBatch::new("valid_batch").with_jobs(vec![job1, job2]);
+
         assert!(batch.validate().is_ok());
     }
 
@@ -426,11 +430,11 @@ mod tests {
         for i in 0..250 {
             jobs.push(Job::new("queue1".to_string(), json!({"id": i})));
         }
-        
+
         let batch = JobBatch::new("large_batch")
             .with_jobs(jobs)
             .with_batch_size(100);
-        
+
         let chunks = batch.into_chunks();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].job_count(), 100);
@@ -444,7 +448,7 @@ mod tests {
         let batch = JobBatch::new("small_batch")
             .with_jobs(vec![job])
             .with_batch_size(100);
-        
+
         let chunks = batch.into_chunks();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].job_count(), 1);
@@ -464,7 +468,7 @@ mod tests {
             error_summary: None,
             job_errors: HashMap::new(),
         };
-        
+
         assert_eq!(result.success_rate(), 80.0);
         assert_eq!(result.failure_rate(), 20.0);
         assert!(result.is_partially_failed());
@@ -486,26 +490,29 @@ mod tests {
             error_summary: None,
             job_errors: HashMap::new(),
         };
-        
+
         assert_eq!(result.success_rate(), 100.0);
         assert_eq!(result.failure_rate(), 0.0);
     }
 
     #[test]
     fn test_partial_failure_mode_default() {
-        assert_eq!(PartialFailureMode::default(), PartialFailureMode::ContinueOnError);
+        assert_eq!(
+            PartialFailureMode::default(),
+            PartialFailureMode::ContinueOnError
+        );
     }
 
     #[test]
     fn test_batch_status_variants() {
-        let statuses = vec![
+        let statuses = [
             BatchStatus::Pending,
             BatchStatus::Processing,
             BatchStatus::Completed,
             BatchStatus::PartiallyFailed,
             BatchStatus::Failed,
         ];
-        
+
         // Ensure all variants compile and are distinct
         for (i, status1) in statuses.iter().enumerate() {
             for (j, status2) in statuses.iter().enumerate() {

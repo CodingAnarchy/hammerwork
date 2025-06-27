@@ -4,7 +4,7 @@ use serde_json::json;
 #[cfg(feature = "postgres")]
 mod postgres_tests {
     use super::*;
-    use hammerwork::{queue::DatabaseQueue, JobQueue};
+    use hammerwork::{JobQueue, queue::DatabaseQueue};
     use sqlx::{Pool, Postgres};
     use std::{sync::Arc, time::Duration};
     use tokio::time::sleep;
@@ -126,7 +126,7 @@ mod postgres_tests {
 #[cfg(feature = "mysql")]
 mod mysql_tests {
     use super::*;
-    use hammerwork::{queue::DatabaseQueue, JobQueue};
+    use hammerwork::{JobQueue, queue::DatabaseQueue};
     use sqlx::{MySql, Pool};
     use std::{sync::Arc, time::Duration};
     use tokio::time::sleep;
