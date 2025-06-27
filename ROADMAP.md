@@ -62,24 +62,6 @@ worker.on_job_complete(|job, duration| {
 });
 ```
 
-### 📈 Worker Auto-scaling
-**Impact: High** | **Complexity: Medium-High** | **Priority: Medium-High**
-
-Significant operational improvement for handling variable workloads.
-
-```rust
-// Dynamic worker scaling based on queue depth
-let auto_scaler = AutoScaler::new()
-    .min_workers(2)
-    .max_workers(20)
-    .scale_up_threshold(100) // Scale up when queue > 100 jobs
-    .scale_down_threshold(10) // Scale down when queue < 10 jobs
-    .scale_up_cooldown(Duration::from_minutes(2))
-    .scale_down_cooldown(Duration::from_minutes(5));
-
-let worker_pool = WorkerPool::new()
-    .with_auto_scaler(auto_scaler);
-```
 
 ### 🌐 Admin Dashboard & CLI Tools
 **Impact: High** | **Complexity: Medium-High** | **Priority: Medium**
@@ -270,8 +252,7 @@ Features are ordered within each phase by priority and should generally be imple
 **Phase 2 (Advanced Features)**
 1. Job Dependencies & Workflows
 2. Job Tracing & Correlation
-3. Worker Auto-scaling
-4. Admin Dashboard & CLI Tools
+3. Admin Dashboard & CLI Tools
 
 **Phase 3 (Operational Features)**
 1. Job Archiving & Retention

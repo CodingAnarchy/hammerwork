@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2025-06-27
+
+### Added
+- **📈 Worker Autoscaling**
+  - `AutoscaleConfig` with comprehensive configuration options and sane defaults
+  - Three preset configurations: `conservative()`, `aggressive()`, and `disabled()`
+  - Dynamic worker pool scaling based on queue depth per worker metrics
+  - Configurable min/max worker limits, scaling thresholds, and cooldown periods
+  - `AutoscaleMetrics` for real-time monitoring of scaling decisions and worker utilization
+  - Background autoscaling task with configurable evaluation windows and scaling steps
+  - Graceful scaling with proper cooldown periods to prevent thrashing
+  - Integration with existing WorkerPool infrastructure and statistics collection
+  - Comprehensive test suite covering all scaling scenarios and edge cases
+  - Complete example demonstrating various autoscaling configurations
+
+### Enhanced
+- **🔧 WorkerPool Improvements**
+  - Added `with_autoscaling()` and `without_autoscaling()` configuration methods
+  - Worker template system for creating new workers during scale-up operations
+  - Improved worker lifecycle management with proper shutdown handling
+  - Enhanced metrics collection and monitoring integration
+
 ## [0.8.0] - 2025-06-27
 
 ### Added

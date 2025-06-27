@@ -11,7 +11,6 @@
 use clap::{Parser, Subcommand};
 use hammerwork::migrations::MigrationManager;
 use std::process;
-use tracing_subscriber;
 
 #[derive(Parser)]
 #[command(
@@ -48,14 +47,14 @@ enum HammerworkCommand {
             value_name = "URL"
         )]
         database_url: String,
-        
+
         #[arg(
             long = "status",
             help = "Show migration status instead of running migrations"
         )]
         status: bool,
     },
-    
+
     #[command(about = "Show migration status")]
     Status {
         #[arg(
@@ -77,7 +76,10 @@ async fn main() {
     match cli.command {
         CargoCommand::Hammerwork { command } => {
             let result = match command {
-                HammerworkCommand::Migrate { database_url, status } => {
+                HammerworkCommand::Migrate {
+                    database_url,
+                    status,
+                } => {
                     if status {
                         show_migration_status(&database_url).await
                     } else {
@@ -114,7 +116,9 @@ async fn run_migrations(database_url: &str) -> Result<(), Box<dyn std::error::Er
     #[cfg(feature = "mysql")]
     if database_url.starts_with("mysql") {
         let pool = sqlx::MySqlPool::connect(database_url).await?;
-        let runner = Box::new(hammerwork::migrations::mysql::MySqlMigrationRunner::new(pool));
+        let runner = Box::new(hammerwork::migrations::mysql::MySqlMigrationRunner::new(
+            pool,
+        ));
         let manager = MigrationManager::new(runner);
         manager.run_migrations().await?;
         println!("✅ MySQL migrations completed successfully!");
@@ -144,7 +148,9 @@ async fn show_migration_status(database_url: &str) -> Result<(), Box<dyn std::er
     #[cfg(feature = "mysql")]
     if database_url.starts_with("mysql") {
         let pool = sqlx::MySqlPool::connect(database_url).await?;
-        let runner = Box::new(hammerwork::migrations::mysql::MySqlMigrationRunner::new(pool));
+        let runner = Box::new(hammerwork::migrations::mysql::MySqlMigrationRunner::new(
+            pool,
+        ));
         let manager = MigrationManager::new(runner);
         show_status(&manager).await?;
         return Ok(());
@@ -162,35 +168,37 @@ async fn show_status<DB: sqlx::Database>(
 
     println!("Migration Status:");
     println!("================");
-    
+
     let mut executed_count = 0;
     let total_count = status.len();
-    
+
     for (migration, executed) in &status {
         let status_emoji = if *executed { "✅" } else { "⏳" };
         let status_text = if *executed { "EXECUTED" } else { "PENDING" };
-        
+
         if *executed {
             executed_count += 1;
         }
-        
-        println!("{} {} {} - {}", 
-                 status_emoji, 
-                 status_text, 
-                 migration.id, 
-                 migration.description);
+
+        println!(
+            "{} {} {} - {}",
+            status_emoji, status_text, migration.id, migration.description
+        );
     }
-    
+
     println!();
-    println!("📈 Progress: {}/{} migrations executed", executed_count, total_count);
-    
+    println!(
+        "📈 Progress: {}/{} migrations executed",
+        executed_count, total_count
+    );
+
     if executed_count == total_count {
         println!("🎉 All migrations up to date!");
     } else {
         println!("⚠️  {} pending migrations", total_count - executed_count);
         println!("💡 Run: cargo hammerwork migrate --database-url <URL>");
     }
-    
+
     println!();
     Ok(())
 }

@@ -202,10 +202,13 @@ pub struct Alert {
     pub context: HashMap<String, String>,
 }
 
+/// Type alias for last alerts storage
+type LastAlertsStorage = Arc<RwLock<HashMap<(String, AlertType), DateTime<Utc>>>>;
+
 /// Alert manager for monitoring thresholds and sending notifications
 pub struct AlertManager {
     config: AlertingConfig,
-    last_alerts: Arc<RwLock<HashMap<(String, AlertType), DateTime<Utc>>>>,
+    last_alerts: LastAlertsStorage,
     #[cfg(feature = "alerting")]
     http_client: reqwest::Client,
 }

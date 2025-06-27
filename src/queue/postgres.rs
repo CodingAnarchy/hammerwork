@@ -3,7 +3,7 @@
 //! This module provides the PostgreSQL-specific implementation of the `DatabaseQueue` trait,
 //! optimized for PostgreSQL's JSONB and advanced querying capabilities.
 
-use super::{DatabaseQueue, QueueStats, DeadJobSummary};
+use super::{DatabaseQueue, DeadJobSummary, QueueStats};
 use crate::{
     Result,
     job::{Job, JobId, JobStatus},
@@ -131,7 +131,6 @@ impl DeadJobRow {
 impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     type Database = Postgres;
 
-
     async fn enqueue(&self, job: Job) -> Result<JobId> {
         sqlx::query(
             r#"
@@ -140,7 +139,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 timeout_seconds, created_at, scheduled_at, error_message, 
                 cron_schedule, next_run_at, recurring, timezone, batch_id
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-            "#
+            "#,
         )
         .bind(job.id)
         .bind(&job.queue_name)
@@ -180,7 +179,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                      timeout_seconds, created_at, scheduled_at, started_at, completed_at, 
                      failed_at, timed_out_at, error_message, cron_schedule, next_run_at, 
                      recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at
-            "#
+            "#,
         )
         .bind(serde_json::to_string(&JobStatus::Running)?)
         .bind(Utc::now())
@@ -363,8 +362,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                         queue_name,
                         payload,
                         status: serde_json::from_str(&status)?,
-                        priority: JobPriority::from_i32(priority)
-                            .unwrap_or(JobPriority::Normal),
+                        priority: JobPriority::from_i32(priority).unwrap_or(JobPriority::Normal),
                         attempts,
                         max_attempts,
                         created_at,
@@ -373,8 +371,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                         completed_at,
                         failed_at,
                         timed_out_at,
-                        timeout: timeout_seconds
-                            .map(|s| std::time::Duration::from_secs(s as u64)),
+                        timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
                         error_message,
                         cron_schedule,
                         next_run_at,
@@ -454,10 +451,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         Ok(())
     }
 
-    async fn enqueue_batch(
-        &self,
-        batch: crate::batch::JobBatch,
-    ) -> Result<crate::batch::BatchId> {
+    async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId> {
         use crate::batch::BatchStatus;
 
         // Validate the batch first
@@ -809,7 +803,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
         // Get job counts by status
         let status_counts: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 GROUP BY status"
+            "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 GROUP BY status",
         )
         .bind(queue_name)
         .fetch_all(&self.pool)
@@ -889,7 +883,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         queue_name: &str,
     ) -> Result<std::collections::HashMap<String, u64>> {
         let status_counts: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 GROUP BY status"
+            "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 GROUP BY status",
         )
         .bind(queue_name)
         .fetch_all(&self.pool)
@@ -1002,11 +996,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         rows.into_iter().map(|row| row.into_job()).collect()
     }
 
-    async fn reschedule_cron_job(
-        &self,
-        job_id: JobId,
-        next_run_at: DateTime<Utc>,
-    ) -> Result<()> {
+    async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE hammerwork_jobs 
@@ -1060,11 +1050,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         Ok(())
     }
 
-    async fn set_throttle_config(
-        &self,
-        queue_name: &str,
-        config: ThrottleConfig,
-    ) -> Result<()> {
+    async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
         self.set_throttle(queue_name, config).await
     }
 

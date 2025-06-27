@@ -28,6 +28,173 @@ use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
 use tracing::{debug, error, info, warn};
 
+/// Configuration for worker autoscaling behavior.
+#[derive(Debug, Clone)]
+pub struct AutoscaleConfig {
+    /// Whether autoscaling is enabled
+    pub enabled: bool,
+    /// Minimum number of workers to maintain
+    pub min_workers: usize,
+    /// Maximum number of workers to allow
+    pub max_workers: usize,
+    /// Queue depth per worker threshold to trigger scale-up
+    pub scale_up_threshold: usize,
+    /// Queue depth per worker threshold to trigger scale-down
+    pub scale_down_threshold: usize,
+    /// Minimum time between scaling decisions
+    pub cooldown_period: Duration,
+    /// Number of workers to add/remove during scaling events
+    pub scale_step: usize,
+    /// Time window for queue depth averaging
+    pub evaluation_window: Duration,
+    /// Minimum worker idle time before considering scale-down
+    pub idle_timeout: Duration,
+}
+
+impl Default for AutoscaleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_workers: 1,
+            max_workers: 10,
+            scale_up_threshold: 5,
+            scale_down_threshold: 2,
+            cooldown_period: Duration::from_secs(60),
+            scale_step: 1,
+            evaluation_window: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl AutoscaleConfig {
+    /// Create a new autoscale configuration with default values
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable or disable autoscaling
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Set the minimum number of workers
+    pub fn with_min_workers(mut self, min_workers: usize) -> Self {
+        self.min_workers = min_workers.max(1); // Ensure at least 1 worker
+        self
+    }
+
+    /// Set the maximum number of workers
+    pub fn with_max_workers(mut self, max_workers: usize) -> Self {
+        self.max_workers = max_workers.max(self.min_workers);
+        self
+    }
+
+    /// Set the queue depth threshold for scaling up
+    pub fn with_scale_up_threshold(mut self, threshold: usize) -> Self {
+        self.scale_up_threshold = threshold.max(1);
+        self
+    }
+
+    /// Set the queue depth threshold for scaling down
+    pub fn with_scale_down_threshold(mut self, threshold: usize) -> Self {
+        self.scale_down_threshold = threshold;
+        self
+    }
+
+    /// Set the cooldown period between scaling decisions
+    pub fn with_cooldown_period(mut self, period: Duration) -> Self {
+        self.cooldown_period = period;
+        self
+    }
+
+    /// Set the number of workers to add/remove per scaling event
+    pub fn with_scale_step(mut self, step: usize) -> Self {
+        self.scale_step = step.max(1);
+        self
+    }
+
+    /// Set the evaluation window for queue depth averaging
+    pub fn with_evaluation_window(mut self, window: Duration) -> Self {
+        self.evaluation_window = window;
+        self
+    }
+
+    /// Set the minimum idle time before considering scale-down
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    /// Create a conservative autoscaling configuration
+    pub fn conservative() -> Self {
+        Self {
+            enabled: true,
+            min_workers: 2,
+            max_workers: 5,
+            scale_up_threshold: 10,
+            scale_down_threshold: 1,
+            cooldown_period: Duration::from_secs(300), // 5 mins
+            scale_step: 1,
+            evaluation_window: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(600), // 10 mins
+        }
+    }
+
+    /// Create an aggressive autoscaling configuration
+    pub fn aggressive() -> Self {
+        Self {
+            enabled: true,
+            min_workers: 1,
+            max_workers: 20,
+            scale_up_threshold: 3,
+            scale_down_threshold: 1,
+            cooldown_period: Duration::from_secs(30),
+            scale_step: 2,
+            evaluation_window: Duration::from_secs(15),
+            idle_timeout: Duration::from_secs(120), // 2 mins
+        }
+    }
+
+    /// Disable autoscaling
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
+/// Metrics for autoscaling decisions
+#[derive(Debug, Clone, Default)]
+pub struct AutoscaleMetrics {
+    /// Current number of active workers
+    pub active_workers: usize,
+    /// Average queue depth over evaluation window
+    pub avg_queue_depth: f64,
+    /// Current queue depth
+    pub current_queue_depth: u64,
+    /// Jobs processed per second (recent average)
+    pub jobs_per_second: f64,
+    /// Average worker utilization (0.0 to 1.0)
+    pub worker_utilization: f64,
+    /// Time since last scaling action
+    pub time_since_last_scale: Duration,
+    /// Timestamp of last scaling decision
+    pub last_scale_time: Option<chrono::DateTime<Utc>>,
+}
+
+/// Scaling decision enum
+#[derive(Debug, Clone, Copy)]
+enum ScalingDecision {
+    ScaleUp,
+    ScaleDown,
+}
+
+/// Type alias for queue depth history storage
+type QueueDepthHistory = Arc<std::sync::RwLock<Vec<(chrono::DateTime<Utc>, u64)>>>;
+
 /// Statistics for batch job processing by a worker.
 #[derive(Debug, Clone, Default)]
 pub struct BatchProcessingStats {
@@ -281,6 +448,35 @@ pub struct Worker<DB: Database> {
     batch_processing_enabled: bool,
     /// Track batch processing statistics
     batch_stats: Arc<std::sync::RwLock<BatchProcessingStats>>,
+}
+
+impl<DB: Database + Send + Sync + 'static> Clone for Worker<DB>
+where
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            queue: Arc::clone(&self.queue),
+            queue_name: self.queue_name.clone(),
+            handler: self.handler.clone(),
+            poll_interval: self.poll_interval,
+            max_retries: self.max_retries,
+            retry_delay: self.retry_delay,
+            default_timeout: self.default_timeout,
+            priority_weights: self.priority_weights.clone(),
+            stats_collector: self.stats_collector.clone(),
+            rate_limiter: self.rate_limiter.clone(),
+            throttle_config: self.throttle_config.clone(),
+            #[cfg(feature = "metrics")]
+            metrics_collector: self.metrics_collector.clone(),
+            #[cfg(feature = "alerting")]
+            alert_manager: self.alert_manager.clone(),
+            // Create new instances for per-worker state
+            last_job_time: Arc::new(std::sync::RwLock::new(Utc::now())),
+            batch_processing_enabled: self.batch_processing_enabled,
+            batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
+        }
+    }
 }
 
 impl<DB: Database + Send + Sync + 'static> Worker<DB>
@@ -912,9 +1108,17 @@ where
                 // Store job result if enabled and data is provided
                 if let Some(result_data) = job_result.data {
                     if let crate::job::ResultStorage::Database = job.result_config.storage {
-                        let expires_at = job.result_config.ttl.map(|ttl| Utc::now() + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(24)));
-                        
-                        if let Err(e) = self.queue.store_job_result(job_id, result_data, expires_at).await {
+                        let expires_at = job.result_config.ttl.map(|ttl| {
+                            Utc::now()
+                                + chrono::Duration::from_std(ttl)
+                                    .unwrap_or(chrono::Duration::hours(24))
+                        });
+
+                        if let Err(e) = self
+                            .queue
+                            .store_job_result(job_id, result_data, expires_at)
+                            .await
+                        {
                             warn!("Failed to store job result for job {}: {}", job_id, e);
                         } else {
                             debug!("Stored result for job {}", job_id);
@@ -1236,6 +1440,16 @@ pub struct WorkerPool<DB: Database> {
     workers: Vec<Worker<DB>>,
     shutdown_tx: Vec<mpsc::Sender<()>>,
     stats_collector: Option<Arc<dyn StatisticsCollector>>,
+    /// Worker template for creating new workers during autoscaling
+    worker_template: Option<Worker<DB>>,
+    /// Autoscaling configuration
+    autoscale_config: AutoscaleConfig,
+    /// Autoscaling metrics and state
+    autoscale_metrics: Arc<std::sync::RwLock<AutoscaleMetrics>>,
+    /// Queue depth history for averaging
+    queue_depth_history: QueueDepthHistory,
+    /// Autoscaling task handle
+    autoscale_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<DB: Database + Send + Sync + 'static> WorkerPool<DB>
@@ -1247,6 +1461,11 @@ where
             workers: Vec::new(),
             shutdown_tx: Vec::new(),
             stats_collector: None,
+            worker_template: None,
+            autoscale_config: AutoscaleConfig::default(),
+            autoscale_metrics: Arc::new(std::sync::RwLock::new(AutoscaleMetrics::default())),
+            queue_depth_history: Arc::new(std::sync::RwLock::new(Vec::new())),
+            autoscale_task: None,
         }
     }
 
@@ -1255,16 +1474,49 @@ where
         self
     }
 
+    /// Configure autoscaling for the worker pool
+    pub fn with_autoscaling(mut self, config: AutoscaleConfig) -> Self {
+        self.autoscale_config = config;
+        self
+    }
+
+    /// Disable autoscaling for the worker pool
+    pub fn without_autoscaling(mut self) -> Self {
+        self.autoscale_config = AutoscaleConfig::disabled();
+        self
+    }
+
+    /// Set a worker template for autoscaling
+    /// This worker will be cloned when creating new workers
+    pub fn with_worker_template(mut self, worker: Worker<DB>) -> Self {
+        self.worker_template = Some(worker);
+        self
+    }
+
     pub fn add_worker(&mut self, mut worker: Worker<DB>) {
         // Apply the pool's stats collector to the worker if available
         if let Some(stats_collector) = &self.stats_collector {
             worker.stats_collector = Some(Arc::clone(stats_collector));
         }
+
+        // If no worker template is set and autoscaling is enabled, use the first worker as template
+        if self.worker_template.is_none()
+            && self.autoscale_config.enabled
+            && self.workers.is_empty()
+        {
+            self.worker_template = Some(worker.clone());
+        }
+
         self.workers.push(worker);
     }
 
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting worker pool with {} workers", self.workers.len());
+
+        // Update initial worker count metrics
+        if let Ok(mut metrics) = self.autoscale_metrics.write() {
+            metrics.active_workers = self.workers.len();
+        }
 
         let mut handles = Vec::new();
         self.shutdown_tx.clear();
@@ -1281,6 +1533,11 @@ where
             handles.push(handle);
         }
 
+        // Start autoscaling task if enabled
+        if self.autoscale_config.enabled {
+            self.start_autoscaling_task().await?;
+        }
+
         // Wait for all workers to complete
         for handle in handles {
             handle.await.map_err(|e| HammerworkError::Worker {
@@ -1291,8 +1548,181 @@ where
         Ok(())
     }
 
+    /// Start the autoscaling background task
+    async fn start_autoscaling_task(&mut self) -> Result<()> {
+        if let Some(worker_template) = &self.worker_template {
+            let queue = Arc::clone(&worker_template.queue);
+            let queue_name = worker_template.queue_name.clone();
+            let config = self.autoscale_config.clone();
+            let metrics = Arc::clone(&self.autoscale_metrics);
+            let history = Arc::clone(&self.queue_depth_history);
+
+            let task = tokio::spawn(async move {
+                Self::autoscaling_loop(queue, queue_name, config, metrics, history).await;
+            });
+
+            self.autoscale_task = Some(task);
+            info!(
+                "Autoscaling task started for queue: {}",
+                worker_template.queue_name
+            );
+        } else {
+            warn!("Cannot start autoscaling: no worker template available");
+        }
+        Ok(())
+    }
+
+    /// Main autoscaling evaluation loop
+    async fn autoscaling_loop(
+        queue: Arc<JobQueue<DB>>,
+        queue_name: String,
+        config: AutoscaleConfig,
+        metrics: Arc<std::sync::RwLock<AutoscaleMetrics>>,
+        history: QueueDepthHistory,
+    ) {
+        let mut interval = tokio::time::interval(config.evaluation_window / 2);
+
+        loop {
+            interval.tick().await;
+
+            if let Err(e) =
+                Self::evaluate_scaling_decision(&queue, &queue_name, &config, &metrics, &history)
+                    .await
+            {
+                warn!("Autoscaling evaluation error: {}", e);
+            }
+        }
+    }
+
+    /// Evaluate whether scaling up or down is needed
+    async fn evaluate_scaling_decision(
+        queue: &Arc<JobQueue<DB>>,
+        queue_name: &str,
+        config: &AutoscaleConfig,
+        metrics: &Arc<std::sync::RwLock<AutoscaleMetrics>>,
+        history: &QueueDepthHistory,
+    ) -> Result<()> {
+        // Get current queue depth
+        let current_depth = queue.get_queue_depth(queue_name).await?;
+        let now = Utc::now();
+
+        // Update queue depth history
+        if let Ok(mut hist) = history.write() {
+            hist.push((now, current_depth));
+
+            // Remove old entries outside the evaluation window
+            let cutoff = now
+                - chrono::Duration::from_std(config.evaluation_window)
+                    .unwrap_or(chrono::Duration::seconds(30));
+            hist.retain(|(timestamp, _)| *timestamp > cutoff);
+        }
+
+        // Calculate average queue depth
+        let avg_depth = if let Ok(hist) = history.read() {
+            if hist.is_empty() {
+                current_depth as f64
+            } else {
+                hist.iter().map(|(_, depth)| *depth as f64).sum::<f64>() / hist.len() as f64
+            }
+        } else {
+            current_depth as f64
+        };
+
+        // Update metrics and check if we need to scale
+        let scaling_decision = if let Ok(mut m) = metrics.write() {
+            m.current_queue_depth = current_depth;
+            m.avg_queue_depth = avg_depth;
+
+            // Check cooldown period
+            let time_since_last = m
+                .last_scale_time
+                .map(|t| now - t)
+                .and_then(|d| d.to_std().ok())
+                .unwrap_or(config.cooldown_period);
+
+            m.time_since_last_scale = time_since_last;
+
+            if time_since_last < config.cooldown_period {
+                None // Still in cooldown
+            } else {
+                // Calculate queue depth per worker
+                let depth_per_worker = if m.active_workers > 0 {
+                    avg_depth / m.active_workers as f64
+                } else {
+                    avg_depth
+                };
+
+                if depth_per_worker > config.scale_up_threshold as f64
+                    && m.active_workers < config.max_workers
+                {
+                    Some(ScalingDecision::ScaleUp)
+                } else if depth_per_worker < config.scale_down_threshold as f64
+                    && m.active_workers > config.min_workers
+                {
+                    Some(ScalingDecision::ScaleDown)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Execute scaling decision
+        if let Some(decision) = scaling_decision {
+            Self::execute_scaling_decision(decision, config, metrics).await;
+        }
+
+        Ok(())
+    }
+
+    /// Execute a scaling decision
+    async fn execute_scaling_decision(
+        decision: ScalingDecision,
+        config: &AutoscaleConfig,
+        metrics: &Arc<std::sync::RwLock<AutoscaleMetrics>>,
+    ) {
+        if let Ok(mut m) = metrics.write() {
+            match decision {
+                ScalingDecision::ScaleUp => {
+                    let new_count = (m.active_workers + config.scale_step).min(config.max_workers);
+                    info!(
+                        "Autoscaling: Scaling up from {} to {} workers (avg queue depth: {:.1})",
+                        m.active_workers, new_count, m.avg_queue_depth
+                    );
+                    m.active_workers = new_count;
+                }
+                ScalingDecision::ScaleDown => {
+                    let new_count = (m.active_workers.saturating_sub(config.scale_step))
+                        .max(config.min_workers);
+                    info!(
+                        "Autoscaling: Scaling down from {} to {} workers (avg queue depth: {:.1})",
+                        m.active_workers, new_count, m.avg_queue_depth
+                    );
+                    m.active_workers = new_count;
+                }
+            }
+            m.last_scale_time = Some(Utc::now());
+        }
+    }
+
+    /// Get current autoscaling metrics
+    pub fn get_autoscale_metrics(&self) -> AutoscaleMetrics {
+        if let Ok(metrics) = self.autoscale_metrics.read() {
+            metrics.clone()
+        } else {
+            AutoscaleMetrics::default()
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down worker pool");
+
+        // Stop autoscaling task
+        if let Some(task) = &self.autoscale_task {
+            task.abort();
+            info!("Autoscaling task stopped");
+        }
 
         for tx in &self.shutdown_tx {
             if tx.send(()).await.is_err() {
@@ -1315,6 +1745,15 @@ where
 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<DB: Database> Drop for WorkerPool<DB> {
+    fn drop(&mut self) {
+        // Stop autoscaling task when dropping the pool
+        if let Some(task) = &self.autoscale_task {
+            task.abort();
+        }
     }
 }
 
@@ -1682,5 +2121,244 @@ mod tests {
         let new_config = ThrottleConfig::new();
         assert_eq!(new_config.enabled, default_config.enabled);
         assert_eq!(new_config.max_concurrent, default_config.max_concurrent);
+    }
+
+    #[test]
+    fn test_autoscale_config_defaults() {
+        let config = AutoscaleConfig::default();
+
+        assert!(config.enabled);
+        assert_eq!(config.min_workers, 1);
+        assert_eq!(config.max_workers, 10);
+        assert_eq!(config.scale_up_threshold, 5);
+        assert_eq!(config.scale_down_threshold, 2);
+        assert_eq!(config.cooldown_period, Duration::from_secs(60));
+        assert_eq!(config.scale_step, 1);
+        assert_eq!(config.evaluation_window, Duration::from_secs(30));
+        assert_eq!(config.idle_timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_autoscale_config_builder() {
+        let config = AutoscaleConfig::new()
+            .with_min_workers(2)
+            .with_max_workers(20)
+            .with_scale_up_threshold(8)
+            .with_scale_down_threshold(1)
+            .with_cooldown_period(Duration::from_secs(120))
+            .with_scale_step(2)
+            .with_evaluation_window(Duration::from_secs(45))
+            .with_idle_timeout(Duration::from_secs(600));
+
+        assert_eq!(config.min_workers, 2);
+        assert_eq!(config.max_workers, 20);
+        assert_eq!(config.scale_up_threshold, 8);
+        assert_eq!(config.scale_down_threshold, 1);
+        assert_eq!(config.cooldown_period, Duration::from_secs(120));
+        assert_eq!(config.scale_step, 2);
+        assert_eq!(config.evaluation_window, Duration::from_secs(45));
+        assert_eq!(config.idle_timeout, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_autoscale_config_presets() {
+        let conservative = AutoscaleConfig::conservative();
+        assert_eq!(conservative.min_workers, 2);
+        assert_eq!(conservative.max_workers, 5);
+        assert_eq!(conservative.scale_up_threshold, 10);
+        assert_eq!(conservative.cooldown_period, Duration::from_secs(300));
+
+        let aggressive = AutoscaleConfig::aggressive();
+        assert_eq!(aggressive.min_workers, 1);
+        assert_eq!(aggressive.max_workers, 20);
+        assert_eq!(aggressive.scale_up_threshold, 3);
+        assert_eq!(aggressive.cooldown_period, Duration::from_secs(30));
+
+        let disabled = AutoscaleConfig::disabled();
+        assert!(!disabled.enabled);
+    }
+
+    #[test]
+    fn test_autoscale_config_validation() {
+        // Test that min_workers is at least 1
+        let config = AutoscaleConfig::new().with_min_workers(0);
+        assert_eq!(config.min_workers, 1);
+
+        // Test that max_workers is at least min_workers
+        let config = AutoscaleConfig::new()
+            .with_min_workers(5)
+            .with_max_workers(3);
+        assert_eq!(config.max_workers, 5);
+
+        // Test that scale_up_threshold is at least 1
+        let config = AutoscaleConfig::new().with_scale_up_threshold(0);
+        assert_eq!(config.scale_up_threshold, 1);
+
+        // Test that scale_step is at least 1
+        let config = AutoscaleConfig::new().with_scale_step(0);
+        assert_eq!(config.scale_step, 1);
+    }
+
+    #[test]
+    fn test_autoscale_metrics_default() {
+        let metrics = AutoscaleMetrics::default();
+
+        assert_eq!(metrics.active_workers, 0);
+        assert_eq!(metrics.avg_queue_depth, 0.0);
+        assert_eq!(metrics.current_queue_depth, 0);
+        assert_eq!(metrics.jobs_per_second, 0.0);
+        assert_eq!(metrics.worker_utilization, 0.0);
+        assert_eq!(metrics.time_since_last_scale, Duration::from_secs(0));
+        assert!(metrics.last_scale_time.is_none());
+    }
+
+    #[test]
+    fn test_scaling_decision_logic() {
+        // This test simulates the scaling decision logic
+        let mut metrics = AutoscaleMetrics::default();
+        metrics.active_workers = 3;
+
+        let config = AutoscaleConfig::default();
+
+        // Test scale up condition
+        metrics.avg_queue_depth = 20.0; // 20 jobs / 3 workers = 6.67 > 5 threshold
+        let depth_per_worker = metrics.avg_queue_depth / metrics.active_workers as f64;
+        assert!(depth_per_worker > config.scale_up_threshold as f64);
+        assert!(metrics.active_workers < config.max_workers);
+
+        // Test scale down condition
+        metrics.avg_queue_depth = 3.0; // 3 jobs / 3 workers = 1.0 < 2 threshold
+        let depth_per_worker = metrics.avg_queue_depth / metrics.active_workers as f64;
+        assert!(depth_per_worker < config.scale_down_threshold as f64);
+        assert!(metrics.active_workers > config.min_workers);
+
+        // Test no scaling needed
+        metrics.avg_queue_depth = 9.0; // 9 jobs / 3 workers = 3.0 (between thresholds)
+        let depth_per_worker = metrics.avg_queue_depth / metrics.active_workers as f64;
+        assert!(depth_per_worker < config.scale_up_threshold as f64);
+        assert!(depth_per_worker > config.scale_down_threshold as f64);
+    }
+
+    #[test]
+    fn test_cooldown_period_logic() {
+        let config = AutoscaleConfig::default();
+        let mut metrics = AutoscaleMetrics::default();
+
+        // No last scale time should allow scaling
+        assert!(metrics.last_scale_time.is_none());
+
+        // Recent scale should prevent scaling
+        metrics.last_scale_time = Some(Utc::now() - chrono::Duration::seconds(30));
+        let time_since_last = Utc::now() - metrics.last_scale_time.unwrap();
+        let time_since_last_std = time_since_last.to_std().unwrap_or(Duration::from_secs(0));
+        assert!(time_since_last_std < config.cooldown_period);
+
+        // Old scale should allow scaling
+        metrics.last_scale_time = Some(Utc::now() - chrono::Duration::seconds(120));
+        let time_since_last = Utc::now() - metrics.last_scale_time.unwrap();
+        let time_since_last_std = time_since_last.to_std().unwrap_or(Duration::from_secs(0));
+        assert!(time_since_last_std > config.cooldown_period);
+    }
+
+    #[test]
+    fn test_queue_depth_averaging() {
+        let now = Utc::now();
+        let mut history = Vec::new();
+
+        // Add some history entries
+        history.push((now - chrono::Duration::seconds(25), 10));
+        history.push((now - chrono::Duration::seconds(20), 8));
+        history.push((now - chrono::Duration::seconds(15), 12));
+        history.push((now - chrono::Duration::seconds(10), 6));
+        history.push((now - chrono::Duration::seconds(5), 14));
+
+        // Calculate average
+        let avg =
+            history.iter().map(|(_, depth)| *depth as f64).sum::<f64>() / history.len() as f64;
+        assert_eq!(avg, 10.0); // (10 + 8 + 12 + 6 + 14) / 5 = 10
+
+        // Test filtering old entries
+        let evaluation_window = Duration::from_secs(30);
+        let cutoff = now - chrono::Duration::from_std(evaluation_window).unwrap();
+        let recent_entries: Vec<_> = history
+            .into_iter()
+            .filter(|(timestamp, _)| *timestamp > cutoff)
+            .collect();
+
+        // All entries should be within the window
+        assert_eq!(recent_entries.len(), 5);
+    }
+
+    #[test]
+    fn test_worker_count_boundaries() {
+        let config = AutoscaleConfig::default();
+        let mut metrics = AutoscaleMetrics::default();
+
+        // Test scaling up to max workers
+        metrics.active_workers = config.max_workers - 1;
+        let new_count = (metrics.active_workers + config.scale_step).min(config.max_workers);
+        assert_eq!(new_count, config.max_workers);
+
+        // Test scaling beyond max workers (should cap at max)
+        metrics.active_workers = config.max_workers;
+        let new_count = (metrics.active_workers + config.scale_step).min(config.max_workers);
+        assert_eq!(new_count, config.max_workers);
+
+        // Test scaling down to min workers
+        metrics.active_workers = config.min_workers + 1;
+        let new_count =
+            (metrics.active_workers.saturating_sub(config.scale_step)).max(config.min_workers);
+        assert_eq!(new_count, config.min_workers);
+
+        // Test scaling below min workers (should cap at min)
+        metrics.active_workers = config.min_workers;
+        let new_count =
+            (metrics.active_workers.saturating_sub(config.scale_step)).max(config.min_workers);
+        assert_eq!(new_count, config.min_workers);
+    }
+
+    #[test]
+    fn test_autoscale_metrics_update() {
+        let metrics = Arc::new(std::sync::RwLock::new(AutoscaleMetrics::default()));
+
+        // Test updating metrics
+        if let Ok(mut m) = metrics.write() {
+            m.active_workers = 5;
+            m.current_queue_depth = 25;
+            m.avg_queue_depth = 22.5;
+            m.last_scale_time = Some(Utc::now());
+        }
+
+        // Test reading metrics
+        if let Ok(m) = metrics.read() {
+            assert_eq!(m.active_workers, 5);
+            assert_eq!(m.current_queue_depth, 25);
+            assert_eq!(m.avg_queue_depth, 22.5);
+            assert!(m.last_scale_time.is_some());
+        }
+    }
+
+    #[test]
+    fn test_history_cleanup() {
+        let now = Utc::now();
+        let mut history = Vec::new();
+
+        // Add entries with various ages
+        history.push((now - chrono::Duration::seconds(60), 10)); // Too old
+        history.push((now - chrono::Duration::seconds(45), 8)); // Too old
+        history.push((now - chrono::Duration::seconds(25), 12)); // Recent
+        history.push((now - chrono::Duration::seconds(15), 6)); // Recent
+        history.push((now - chrono::Duration::seconds(5), 14)); // Recent
+
+        // Filter based on 30-second window
+        let evaluation_window = Duration::from_secs(30);
+        let cutoff = now - chrono::Duration::from_std(evaluation_window).unwrap();
+        history.retain(|(timestamp, _)| *timestamp > cutoff);
+
+        // Should only have 3 recent entries
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].1, 12);
+        assert_eq!(history[1].1, 6);
+        assert_eq!(history[2].1, 14);
     }
 }

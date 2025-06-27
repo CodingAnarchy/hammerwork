@@ -1,10 +1,10 @@
 //! Comprehensive tests for job result storage and retrieval functionality.
 
 use hammerwork::{
+    Job, JobQueue, Worker, WorkerPool,
     job::{ResultConfig, ResultStorage},
     queue::DatabaseQueue,
     worker::{JobHandler, JobHandlerWithResult, JobResult},
-    Job, JobQueue, Worker, WorkerPool,
 };
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
@@ -144,11 +144,8 @@ mod postgres_tests {
         });
 
         // Create worker with result handler
-        let worker = Worker::new_with_result_handler(
-            queue.clone(),
-            "test_queue".to_string(),
-            handler,
-        );
+        let worker =
+            Worker::new_with_result_handler(queue.clone(), "test_queue".to_string(), handler);
 
         // Create a job with result storage enabled
         let job = Job::new("test_queue".to_string(), json!({"task_id": 123}))
@@ -162,9 +159,7 @@ mod postgres_tests {
         worker_pool.add_worker(worker);
 
         // Start the worker pool for a short time to process the job
-        let worker_handle = tokio::spawn(async move {
-            worker_pool.start().await
-        });
+        let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
         // Wait a bit for job processing
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -206,9 +201,7 @@ mod postgres_tests {
         let mut worker_pool = WorkerPool::new();
         worker_pool.add_worker(worker);
 
-        let worker_handle = tokio::spawn(async move {
-            worker_pool.start().await
-        });
+        let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
         // Wait for job processing
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -232,11 +225,8 @@ mod postgres_tests {
             })
         });
 
-        let worker = Worker::new_with_result_handler(
-            queue.clone(),
-            "test_queue".to_string(),
-            handler,
-        );
+        let worker =
+            Worker::new_with_result_handler(queue.clone(), "test_queue".to_string(), handler);
 
         // Create a job with result storage disabled
         let job = Job::new("test_queue".to_string(), json!({"task": "no_storage"}))
@@ -248,9 +238,7 @@ mod postgres_tests {
         let mut worker_pool = WorkerPool::new();
         worker_pool.add_worker(worker);
 
-        let worker_handle = tokio::spawn(async move {
-            worker_pool.start().await
-        });
+        let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
         // Wait for job processing
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -265,16 +253,13 @@ mod postgres_tests {
     #[tokio::test]
     async fn test_result_config_builder_methods() {
         // Test the job builder methods for result configuration
-        let job1 = Job::new("test".to_string(), json!({}))
-            .with_result_storage(ResultStorage::Database);
+        let job1 =
+            Job::new("test".to_string(), json!({})).with_result_storage(ResultStorage::Database);
         assert_eq!(job1.result_config.storage, ResultStorage::Database);
 
-        let job2 = Job::new("test".to_string(), json!({}))
-            .with_result_ttl(Duration::from_secs(7200));
-        assert_eq!(
-            job2.result_config.ttl,
-            Some(Duration::from_secs(7200))
-        );
+        let job2 =
+            Job::new("test".to_string(), json!({})).with_result_ttl(Duration::from_secs(7200));
+        assert_eq!(job2.result_config.ttl, Some(Duration::from_secs(7200)));
 
         let config = ResultConfig {
             storage: ResultStorage::Database,
@@ -341,11 +326,8 @@ mod mysql_tests {
             })
         });
 
-        let worker = Worker::new_with_result_handler(
-            queue.clone(),
-            "mysql_queue".to_string(),
-            handler,
-        );
+        let worker =
+            Worker::new_with_result_handler(queue.clone(), "mysql_queue".to_string(), handler);
 
         let job = Job::new("mysql_queue".to_string(), json!({"test": "mysql"}))
             .with_result_storage(ResultStorage::Database);
@@ -356,9 +338,7 @@ mod mysql_tests {
         let mut worker_pool = WorkerPool::new();
         worker_pool.add_worker(worker);
 
-        let worker_handle = tokio::spawn(async move {
-            worker_pool.start().await
-        });
+        let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
         // Wait for job processing
         tokio::time::sleep(Duration::from_millis(500)).await;

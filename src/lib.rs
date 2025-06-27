@@ -132,7 +132,8 @@ pub use stats::{
     DeadJobSummary, InMemoryStatsCollector, JobStatistics, QueueStats, StatisticsCollector,
 };
 pub use worker::{
-    BatchProcessingStats, JobHandler, JobHandlerWithResult, JobResult, Worker, WorkerPool,
+    AutoscaleConfig, AutoscaleMetrics, BatchProcessingStats, JobHandler, JobHandlerWithResult,
+    JobResult, Worker, WorkerPool,
 };
 
 #[cfg(feature = "metrics")]

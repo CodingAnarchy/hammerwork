@@ -4,7 +4,7 @@
 //! to store and retrieve data from completed jobs.
 //!
 //! ## Features Demonstrated
-//! 
+//!
 //! - Creating jobs with result storage enabled
 //! - Using enhanced job handlers that return result data
 //! - Configuring TTL (time-to-live) for results
@@ -23,10 +23,10 @@
 //! ```
 
 use hammerwork::{
+    Job, JobQueue, Worker, WorkerPool,
     job::ResultStorage,
     queue::DatabaseQueue,
     worker::{JobHandler, JobHandlerWithResult, JobResult},
-    Job, JobQueue, Worker, WorkerPool,
 };
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         demonstrate_result_expiration_postgres(&queue).await?;
         demonstrate_legacy_compatibility_postgres(&queue).await?;
     }
-    
+
     #[cfg(feature = "mysql")]
     {
         demonstrate_basic_result_storage_mysql(&queue).await?;
@@ -128,7 +128,10 @@ async fn demonstrate_basic_result_storage_postgres(
     if let Some(stored_result) = queue.get_job_result(job_id).await? {
         println!("   ✅ Result retrieved successfully");
         println!("   📊 Processed {} records", stored_result["total_records"]);
-        println!("   ⏱️  Processing time: {}ms", stored_result["processing_time_ms"]);
+        println!(
+            "   ⏱️  Processing time: {}ms",
+            stored_result["processing_time_ms"]
+        );
         println!("   📁 Output files: {:?}", stored_result["output_files"]);
     } else {
         println!("   ❌ No result found");
@@ -161,8 +164,11 @@ async fn demonstrate_enhanced_workers_postgres(
                 _ => Duration::from_millis(300),
             };
 
-            println!("   🔄 Processing {} task (estimated {}ms)...", 
-                     task_type, processing_duration.as_millis());
+            println!(
+                "   🔄 Processing {} task (estimated {}ms)...",
+                task_type,
+                processing_duration.as_millis()
+            );
 
             // Simulate processing
             tokio::time::sleep(processing_duration).await;
@@ -204,7 +210,7 @@ async fn demonstrate_enhanced_workers_postgres(
                     "task_type": task_type,
                     "processing_time_ms": actual_duration.as_millis(),
                     "status": "completed"
-                })
+                }),
             };
 
             println!("   ✅ Task completed in {}ms", actual_duration.as_millis());
@@ -214,12 +220,9 @@ async fn demonstrate_enhanced_workers_postgres(
     });
 
     // Create worker with enhanced handler
-    let worker = Worker::new_with_result_handler(
-        queue.clone(),
-        "enhanced_processing".to_string(),
-        handler,
-    )
-    .with_poll_interval(Duration::from_millis(100));
+    let worker =
+        Worker::new_with_result_handler(queue.clone(), "enhanced_processing".to_string(), handler)
+            .with_poll_interval(Duration::from_millis(100));
 
     // Create different types of jobs
     let job_types = ["quick", "medium", "heavy"];
@@ -247,9 +250,7 @@ async fn demonstrate_enhanced_workers_postgres(
     worker_pool.add_worker(worker);
 
     // Run worker pool for a limited time
-    let worker_handle = tokio::spawn(async move {
-        worker_pool.start().await
-    });
+    let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
     // Wait for jobs to be processed
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -259,9 +260,12 @@ async fn demonstrate_enhanced_workers_postgres(
     for (i, &job_id) in job_ids.iter().enumerate() {
         if let Some(result) = queue.get_job_result(job_id).await? {
             println!("   📊 {} task result:", job_types[i]);
-            println!("      - Processing time: {}ms", result["processing_time_ms"]);
+            println!(
+                "      - Processing time: {}ms",
+                result["processing_time_ms"]
+            );
             println!("      - Status: {}", result["status"]);
-            
+
             // Show specific metrics based on task type
             match job_types[i] {
                 "quick" => {
@@ -297,7 +301,10 @@ async fn demonstrate_result_expiration_postgres(
     println!("\n⏰ === Result Expiration and Cleanup ===");
 
     // Create jobs with different expiration times
-    let job1 = Job::new("temp_processing".to_string(), json!({"task": "short_lived"}));
+    let job1 = Job::new(
+        "temp_processing".to_string(),
+        json!({"task": "short_lived"}),
+    );
     let job2 = Job::new("temp_processing".to_string(), json!({"task": "long_lived"}));
 
     let job_id1 = queue.enqueue(job1).await?;
@@ -365,7 +372,7 @@ async fn demonstrate_legacy_compatibility_postgres(
     let legacy_handler: JobHandler = Arc::new(|job| {
         Box::pin(async move {
             println!("   🔧 Processing job with legacy handler...");
-            
+
             // Simulate work
             let work_duration = Duration::from_millis(200);
             tokio::time::sleep(work_duration).await;
@@ -384,8 +391,11 @@ async fn demonstrate_legacy_compatibility_postgres(
     let job1 = Job::new("legacy_queue".to_string(), json!({"task": "no_storage"}))
         .with_result_storage(ResultStorage::None);
 
-    let job2 = Job::new("legacy_queue".to_string(), json!({"task": "storage_enabled"}))
-        .with_result_storage(ResultStorage::Database);
+    let job2 = Job::new(
+        "legacy_queue".to_string(),
+        json!({"task": "storage_enabled"}),
+    )
+    .with_result_storage(ResultStorage::Database);
 
     let job_id1 = queue.enqueue(job1).await?;
     let job_id2 = queue.enqueue(job2).await?;
@@ -398,15 +408,13 @@ async fn demonstrate_legacy_compatibility_postgres(
     let mut worker_pool = WorkerPool::new();
     worker_pool.add_worker(legacy_worker);
 
-    let worker_handle = tokio::spawn(async move {
-        worker_pool.start().await
-    });
+    let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Check results
     println!("🔍 Checking results from legacy handler:");
-    
+
     let result1 = queue.get_job_result(job_id1).await?;
     let result2 = queue.get_job_result(job_id2).await?;
 
@@ -467,7 +475,10 @@ async fn demonstrate_basic_result_storage_mysql(
     if let Some(stored_result) = queue.get_job_result(job_id).await? {
         println!("   ✅ Result retrieved successfully from MySQL");
         println!("   📊 Processed {} records", stored_result["total_records"]);
-        println!("   ⏱️  Processing time: {}ms", stored_result["processing_time_ms"]);
+        println!(
+            "   ⏱️  Processing time: {}ms",
+            stored_result["processing_time_ms"]
+        );
     } else {
         println!("   ❌ No result found");
     }
@@ -489,7 +500,7 @@ async fn demonstrate_enhanced_workers_mysql(
     let handler: JobHandlerWithResult = Arc::new(|job| {
         Box::pin(async move {
             let task_type = job.payload["task_type"].as_str().unwrap_or("default");
-            
+
             println!("   🔄 Processing {} task with MySQL backend...", task_type);
 
             // Simulate processing
@@ -508,11 +519,8 @@ async fn demonstrate_enhanced_workers_mysql(
     });
 
     // Create worker
-    let worker = Worker::new_with_result_handler(
-        queue.clone(),
-        "mysql_processing".to_string(),
-        handler,
-    );
+    let worker =
+        Worker::new_with_result_handler(queue.clone(), "mysql_processing".to_string(), handler);
 
     // Create a job
     let job = Job::new(
@@ -528,9 +536,7 @@ async fn demonstrate_enhanced_workers_mysql(
     let mut worker_pool = WorkerPool::new();
     worker_pool.add_worker(worker);
 
-    let worker_handle = tokio::spawn(async move {
-        worker_pool.start().await
-    });
+    let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -551,7 +557,10 @@ async fn demonstrate_result_expiration_mysql(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n⏰ === Result Expiration and Cleanup (MySQL) ===");
 
-    let job = Job::new("temp_processing".to_string(), json!({"task": "mysql_expiration"}));
+    let job = Job::new(
+        "temp_processing".to_string(),
+        json!({"task": "mysql_expiration"}),
+    );
     let job_id = queue.enqueue(job).await?;
 
     let result_data = json!({"data": "expires_soon", "database": "mysql"});
@@ -604,9 +613,7 @@ async fn demonstrate_legacy_compatibility_mysql(
     let mut worker_pool = WorkerPool::new();
     worker_pool.add_worker(legacy_worker);
 
-    let worker_handle = tokio::spawn(async move {
-        worker_pool.start().await
-    });
+    let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 

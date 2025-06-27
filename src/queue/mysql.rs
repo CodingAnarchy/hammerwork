@@ -3,7 +3,7 @@
 //! This module provides the MySQL-specific implementation of the `DatabaseQueue` trait,
 //! optimized for MySQL's JSON support and transactional capabilities.
 
-use super::{DatabaseQueue, QueueStats, DeadJobSummary};
+use super::{DatabaseQueue, DeadJobSummary, QueueStats};
 use crate::{
     Result,
     job::{Job, JobId, JobStatus},
@@ -134,7 +134,6 @@ impl DeadJobRow {
 impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     type Database = MySql;
 
-
     async fn enqueue(&self, job: Job) -> Result<JobId> {
         sqlx::query(
             r#"
@@ -171,7 +170,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
         use crate::job::JobStatus;
-        
+
         // MySQL doesn't support FOR UPDATE SKIP LOCKED in the same way
         // This is a simplified version - in production you might want advisory locks
         let mut tx = self.pool.begin().await?;
@@ -225,8 +224,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         queue_name: &str,
         weights: &crate::priority::PriorityWeights,
     ) -> Result<Option<Job>> {
-        use crate::priority::JobPriority;
         use crate::job::JobStatus;
+        use crate::priority::JobPriority;
 
         if weights.is_strict() {
             // Use strict priority - same as regular dequeue
@@ -264,14 +263,13 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             std::collections::HashMap::new();
 
         for job_row in available_jobs {
-            let priority =
-                JobPriority::from_i32(job_row.priority).unwrap_or(JobPriority::Normal);
+            let priority = JobPriority::from_i32(job_row.priority).unwrap_or(JobPriority::Normal);
             priority_jobs.entry(priority).or_default().push(job_row);
         }
 
         // Calculate weighted selection
         let mut weighted_choices = Vec::new();
-        for (priority, _jobs) in &priority_jobs {
+        for priority in priority_jobs.keys() {
             let weight = weights.get_weight(*priority);
             for _ in 0..weight {
                 weighted_choices.push(priority);
@@ -327,7 +325,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
         use crate::job::JobStatus;
-        
+
         sqlx::query("UPDATE hammerwork_jobs SET status = ?, completed_at = ? WHERE id = ?")
             .bind(serde_json::to_string(&JobStatus::Completed)?)
             .bind(Utc::now())
@@ -340,9 +338,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn fail_job(&self, job_id: JobId, error_message: &str) -> Result<()> {
         use crate::job::JobStatus;
-        
+
         sqlx::query(
-            "UPDATE hammerwork_jobs SET status = ?, error_message = ?, failed_at = ? WHERE id = ?"
+            "UPDATE hammerwork_jobs SET status = ?, error_message = ?, failed_at = ? WHERE id = ?",
         )
         .bind(serde_json::to_string(&JobStatus::Failed)?)
         .bind(error_message)
@@ -356,7 +354,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn retry_job(&self, job_id: JobId, retry_at: DateTime<Utc>) -> Result<()> {
         use crate::job::JobStatus;
-        
+
         sqlx::query(
             "UPDATE hammerwork_jobs SET status = ?, scheduled_at = ?, started_at = NULL WHERE id = ?"
         )
@@ -392,10 +390,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         Ok(())
     }
 
-    async fn enqueue_batch(
-        &self,
-        batch: crate::batch::JobBatch,
-    ) -> Result<crate::batch::BatchId> {
+    async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId> {
         use crate::batch::BatchStatus;
 
         // Validate the batch first
@@ -430,14 +425,12 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             for chunk in batch.jobs.chunks(chunk_size) {
                 // Build query with proper parameter bindings
                 let mut query = "INSERT INTO hammerwork_jobs (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id) VALUES ".to_string();
-                
+
                 for (i, _) in chunk.iter().enumerate() {
                     if i > 0 {
                         query.push_str(", ");
                     }
-                    query.push_str(
-                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    );
+                    query.push_str("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
                 }
 
                 let mut prepared_query = sqlx::query(&query);
@@ -511,9 +504,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         let job_errors_map: HashMap<uuid::Uuid, String> = job_errors
             .into_iter()
-            .filter_map(|(id_str, error)| {
-                uuid::Uuid::parse_str(&id_str).ok().map(|id| (id, error))
-            })
+            .filter_map(|(id_str, error)| uuid::Uuid::parse_str(&id_str).ok().map(|id| (id, error)))
             .collect();
 
         Ok(BatchResult {
@@ -562,9 +553,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn mark_job_dead(&self, job_id: JobId, error_message: &str) -> Result<()> {
         use crate::job::JobStatus;
-        
+
         sqlx::query(
-            "UPDATE hammerwork_jobs SET status = ?, error_message = ?, failed_at = ? WHERE id = ?"
+            "UPDATE hammerwork_jobs SET status = ?, error_message = ?, failed_at = ? WHERE id = ?",
         )
         .bind(serde_json::to_string(&JobStatus::Dead)?)
         .bind(error_message)
@@ -578,7 +569,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn mark_job_timed_out(&self, job_id: JobId, error_message: &str) -> Result<()> {
         use crate::job::JobStatus;
-        
+
         sqlx::query(
             "UPDATE hammerwork_jobs SET status = ?, error_message = ?, timed_out_at = ? WHERE id = ?"
         )
@@ -594,7 +585,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_dead_jobs(&self, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>> {
         use crate::job::JobStatus;
-        
+
         let limit = limit.unwrap_or(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
@@ -617,7 +608,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         offset: Option<u32>,
     ) -> Result<Vec<Job>> {
         use crate::job::JobStatus;
-        
+
         let limit = limit.unwrap_or(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
@@ -636,7 +627,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn retry_dead_job(&self, job_id: JobId) -> Result<()> {
         use crate::job::JobStatus;
-        
+
         sqlx::query(
             "UPDATE hammerwork_jobs SET status = ?, attempts = 0, scheduled_at = ?, started_at = NULL, failed_at = NULL WHERE id = ? AND status = ?"
         )
@@ -652,13 +643,12 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn purge_dead_jobs(&self, older_than: DateTime<Utc>) -> Result<u64> {
         use crate::job::JobStatus;
-        
-        let result =
-            sqlx::query("DELETE FROM hammerwork_jobs WHERE status = ? AND failed_at < ?")
-                .bind(serde_json::to_string(&JobStatus::Dead)?)
-                .bind(older_than)
-                .execute(&self.pool)
-                .await?;
+
+        let result = sqlx::query("DELETE FROM hammerwork_jobs WHERE status = ? AND failed_at < ?")
+            .bind(serde_json::to_string(&JobStatus::Dead)?)
+            .bind(older_than)
+            .execute(&self.pool)
+            .await?;
 
         Ok(result.rows_affected())
     }
@@ -676,7 +666,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         // Get dead jobs by queue
         let dead_jobs_by_queue_rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT queue_name, COUNT(*) FROM hammerwork_jobs WHERE status = ? GROUP BY queue_name"
+            "SELECT queue_name, COUNT(*) FROM hammerwork_jobs WHERE status = ? GROUP BY queue_name",
         )
         .bind(serde_json::to_string(&JobStatus::Dead)?)
         .fetch_all(&self.pool)
@@ -723,8 +713,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn get_queue_stats(&self, queue_name: &str) -> Result<QueueStats> {
-        use crate::stats::JobStatistics;
         use crate::job::JobStatus;
+        use crate::stats::JobStatistics;
         use std::collections::HashMap;
 
         // Get job counts by status
@@ -836,7 +826,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             AND completed_at >= ?
             ORDER BY completed_at DESC
             LIMIT 1000
-            "#
+            "#,
         )
         .bind(queue_name)
         .bind(since)
@@ -884,7 +874,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_due_cron_jobs(&self, queue_name: Option<&str>) -> Result<Vec<Job>> {
         use crate::job::JobStatus;
-        
+
         let query = if queue_name.is_some() {
             r#"
             SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at
@@ -924,13 +914,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         rows.into_iter().map(|row| row.into_job()).collect()
     }
 
-    async fn reschedule_cron_job(
-        &self,
-        job_id: JobId,
-        next_run_at: DateTime<Utc>,
-    ) -> Result<()> {
+    async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()> {
         use crate::job::JobStatus;
-        
+
         sqlx::query(
             r#"
             UPDATE hammerwork_jobs 
@@ -985,11 +971,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         Ok(())
     }
 
-    async fn set_throttle_config(
-        &self,
-        queue_name: &str,
-        config: ThrottleConfig,
-    ) -> Result<()> {
+    async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
         self.set_throttle(queue_name, config).await
     }
 
@@ -1007,7 +989,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_queue_depth(&self, queue_name: &str) -> Result<u64> {
         use crate::job::JobStatus;
-        
+
         let count: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? AND status = ?",
         )

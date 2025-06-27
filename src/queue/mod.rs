@@ -263,7 +263,7 @@ pub trait DatabaseQueue: Send + Sync {
 /// ```rust,no_run
 /// use hammerwork::{JobQueue, Job};
 /// use serde_json::json;
-/// 
+///
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # #[cfg(feature = "postgres")]
@@ -271,7 +271,7 @@ pub trait DatabaseQueue: Send + Sync {
 /// // Create a PostgreSQL-backed queue
 /// let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
 /// let queue = JobQueue::new(pool);
-/// 
+///
 /// // Create and enqueue a job
 /// let job = Job::new("email_queue".to_string(), json!({"to": "user@example.com"}));
 /// let job_id = queue.enqueue(job).await?;
@@ -297,7 +297,7 @@ impl<DB: Database> JobQueue<DB> {
     ///
     /// ```rust,no_run
     /// use hammerwork::JobQueue;
-    /// 
+    ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # #[cfg(feature = "postgres")]
@@ -331,18 +331,18 @@ impl<DB: Database> JobQueue<DB> {
     /// ```rust,no_run
     /// use hammerwork::{JobQueue, rate_limit::ThrottleConfig};
     /// use std::time::Duration;
-    /// 
+    ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # #[cfg(feature = "postgres")]
     /// # {
     /// let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
     /// let queue = JobQueue::new(pool);
-    /// 
+    ///
     /// let config = ThrottleConfig::new()
     ///     .max_concurrent(5)
     ///     .rate_per_minute(100);
-    /// 
+    ///
     /// queue.set_throttle("email_queue", config).await?;
     /// # }
     /// # Ok(())

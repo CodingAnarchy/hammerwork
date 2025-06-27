@@ -182,7 +182,7 @@ impl TokenBucket {
 }
 
 /// Rate limiter that enforces rate limits using token bucket algorithm
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RateLimiter {
     bucket: Arc<Mutex<TokenBucket>>,
     rate_limit: RateLimit,
@@ -252,14 +252,6 @@ impl RateLimiter {
     }
 }
 
-impl Clone for RateLimiter {
-    fn clone(&self) -> Self {
-        Self {
-            bucket: Arc::clone(&self.bucket),
-            rate_limit: self.rate_limit.clone(),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
