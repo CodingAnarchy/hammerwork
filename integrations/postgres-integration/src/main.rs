@@ -45,13 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create job queue
     let queue = Arc::new(JobQueue::new(pool));
 
-    // Initialize database tables
+    // Initialize database tables (use the migration system in production)
     info!("🛠️ Initializing database tables");
-    if let Err(e) = queue.create_tables().await {
-        error!("❌ Failed to create tables: {}", e);
-        return Err(e.into());
-    }
-    info!("✅ Database tables initialized");
+    // Note: In production, use the cargo-hammerwork migrate command instead
+    info!("✅ Database tables should be initialized via migrations");
 
     // Run database-specific tests
     if let Err(e) = run_postgres_specific_tests(&queue).await {

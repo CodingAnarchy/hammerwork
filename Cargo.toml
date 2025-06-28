@@ -1,10 +1,21 @@
 [workspace]
 members = [
     ".",
+    "cargo-hammerwork",
     "integrations/postgres-integration",
     "integrations/mysql-integration",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/CodingAnarchy/hammerwork"
+authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
+homepage = "https://github.com/CodingAnarchy/hammerwork"
+documentation = "https://docs.rs/hammerwork"
+rust-version = "1.86"
 
 [workspace.dependencies]
 hammerwork = { path = "." }
@@ -26,21 +37,27 @@ prometheus = { version = "0.13" }
 reqwest = { version = "0.12", features = ["json"] }
 warp = { version = "0.3" }
 clap = { version = "4.0", features = ["derive"] }
+anyhow = "1.0"
+comfy-table = "7.0"
+indicatif = "0.17"
+toml = "0.8"
+dirs = "5.0"
+tempfile = "3.8"
 
 [package]
 name = "hammerwork"
-version = "1.0.0"
-edition = "2024"
 description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job prioritization, cron scheduling, timeouts, rate limiting, Prometheus metrics, alerting, and comprehensive statistics collection"
-license = "MIT"
-repository = "https://github.com/CodingAnarchy/hammerwork"
-authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
-homepage = "https://github.com/CodingAnarchy/hammerwork"
-documentation = "https://docs.rs/hammerwork"
 readme = "README.md"
 keywords = ["database", "job-queue", "async", "postgres", "mysql"]
 categories = ["database", "asynchronous", "concurrency"]
-rust-version = "1.86"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
@@ -88,6 +105,3 @@ required-features = ["postgres"]
 name = "priority_example"
 required-features = ["postgres"]
 
-[[bin]]
-name = "cargo-hammerwork"
-path = "src/bin/cargo-hammerwork.rs"

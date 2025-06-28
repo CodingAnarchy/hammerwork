@@ -64,7 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📋 Database tables should be initialized using 'cargo hammerwork migrate'");
 
     // Demonstrate different aspects of result storage
-    #[cfg(any(all(feature = "postgres", not(feature = "mysql")), all(feature = "postgres", feature = "mysql")))]
+    #[cfg(any(
+        all(feature = "postgres", not(feature = "mysql")),
+        all(feature = "postgres", feature = "mysql")
+    ))]
     {
         demonstrate_basic_result_storage_postgres(&queue).await?;
         demonstrate_enhanced_workers_postgres(&queue).await?;

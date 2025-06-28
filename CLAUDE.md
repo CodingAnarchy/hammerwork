@@ -31,17 +31,36 @@ cargo test
 cargo test --features postgres
 cargo test --features mysql
 
+# Test CLI crate specifically
+cargo test -p cargo-hammerwork
+
 # Run examples
 cargo run --example postgres_example --features postgres
 cargo run --example mysql_example --features mysql
 cargo run --example cron_example --features postgres
 cargo run --example priority_example --features postgres
 
+# Test CLI functionality
+cargo run -p cargo-hammerwork -- --help
+cargo run -p cargo-hammerwork -- migration --help
+cargo run -p cargo-hammerwork -- config --help
+
 # Check code formatting
 cargo fmt --check
 
 # Run clippy for linting
 cargo clippy -- -D warnings
+
+# Set up test databases for integration testing
+./scripts/setup-test-databases.sh both
+
+# Run integration tests with databases
+./scripts/setup-test-databases.sh test
+
+# Development helper shortcuts
+./scripts/dev.sh check    # Run format + lint + test
+./scripts/dev.sh test-db  # Run all tests including database integration
+./scripts/dev.sh cli      # CLI development workflow
 ```
 
 ### Feature Flags
@@ -121,10 +140,16 @@ cargo clippy --all-features -- -D warnings
 # 3. Run complete test suite with all features
 cargo test --all-features
 
-# 4. Verify examples compile and work
+# 4. Test CLI crate specifically
+cargo test -p cargo-hammerwork
+
+# 5. Verify examples compile and work
 cargo check --examples --all-features
 
-# 5. Build release version to catch optimization issues
+# 6. Test CLI functionality
+cargo check -p cargo-hammerwork
+
+# 7. Build release version to catch optimization issues
 cargo build --release --all-features
 ```
 
@@ -147,6 +172,8 @@ cargo build --release --all-features
    - Test with both PostgreSQL and MySQL features
    - Cover edge cases and error conditions
    - Use `#[ignore]` for tests requiring database connections
+   - **CLI Testing**: Ensure cargo-hammerwork crate has comprehensive tests for all command modules
+   - **Test Organization**: Place unit tests in the same file as the code being tested using `#[cfg(test)]` modules at the bottom of each file. Only use separate test files for integration tests that span multiple modules.
 
 4. **Error Handling**
    - Use `thiserror` for structured error types
@@ -185,6 +212,39 @@ cargo build --release --all-features
    - Push to origin: `git push origin main && git push origin --tags`
    - Publish to crates.io: `cargo publish`
 
+### Test Database Setup
+
+The project includes scripts to easily set up PostgreSQL and MySQL test databases using Docker:
+
+```bash
+# Set up both PostgreSQL and MySQL test databases
+./scripts/setup-test-databases.sh both
+
+# Set up only PostgreSQL
+./scripts/setup-test-databases.sh postgres
+
+# Set up only MySQL
+./scripts/setup-test-databases.sh mysql
+
+# Check status of test databases
+./scripts/setup-test-databases.sh status
+
+# Run integration tests
+./scripts/setup-test-databases.sh test
+
+# Stop test databases
+./scripts/setup-test-databases.sh stop
+
+# Remove test databases
+./scripts/setup-test-databases.sh remove
+```
+
+Database connection details:
+- **PostgreSQL**: `postgres://postgres:hammerwork@localhost:5433/hammerwork`
+- **MySQL**: `mysql://root:hammerwork@localhost:3307/hammerwork`
+
+The CLI migrations are automatically run when setting up the databases.
+
 ### Database Development Guidelines
 
 1. **Schema Changes**
@@ -204,6 +264,50 @@ cargo build --release --all-features
    - Handle database-specific limitations gracefully
    - Test all features with both databases
 
+## CLI Development Guidelines
+
+### SQL Query Strategy
+
+The `cargo-hammerwork` crate uses **dynamic SQL queries** with `sqlx::query()` rather than compile-time `sqlx::query!()` macros to support:
+- Complex filtering with optional parameters
+- Database-agnostic queries (PostgreSQL and MySQL)
+- Runtime query building for CLI flexibility
+
+**Security**: All queries use parameterized statements to prevent SQL injection. Comprehensive tests in `tests/sql_query_tests.rs` validate query correctness.
+
+### Feature Integration with CLI Tooling
+
+**IMPORTANT**: When adding new features to the core Hammerwork library, ALWAYS consider and implement corresponding CLI tooling in the `cargo-hammerwork` crate:
+
+1. **New Core Features**
+   - Add appropriate CLI commands in `cargo-hammerwork/src/commands/`
+   - Expose new functionality through the CLI interface
+   - Update CLI help text and documentation
+   - Add CLI tests for the new functionality
+
+2. **CLI Command Categories**
+   - **Migration**: Database schema management
+   - **Job**: Job lifecycle management (enqueue, list, retry, cancel, inspect)
+   - **Queue**: Queue operations (list, clear, pause, resume, stats)
+   - **Worker**: Worker control (start, stop, status, pool management)
+   - **Monitor**: Real-time monitoring and health checks
+   - **Config**: Configuration management
+
+3. **CLI Testing Requirements**
+   - **Unit tests for command modules**: Each command module must have inline `#[cfg(test)]` modules
+   - **SQL Query Validation**: Comprehensive tests in `tests/sql_query_tests.rs` validate all dynamic SQL queries
+   - **Integration tests**: Database-backed tests with `#[ignore]` attribute for optional execution
+   - **CLI argument parsing tests**: Validate clap command structure and argument validation
+   - **Configuration loading tests**: Test config file loading, environment variable precedence
+   - **Error handling tests**: Include SQL injection prevention and input validation tests
+   - **Query Security**: All queries use parameterized statements (`sqlx::query(...).bind(...)`) to prevent SQL injection
+
+4. **CLI Documentation**
+   - Update CLI README when adding commands
+   - Include usage examples in help text
+   - Document configuration options
+   - Maintain command reference documentation
+
 ### Git Workflow
 
 1. **Commit Messages**
@@ -221,3 +325,4 @@ cargo build --release --all-features
    - Review for correctness, performance, and maintainability
    - Ensure tests pass on all supported platforms
    - Verify documentation is updated
+   - **CLI Review**: Verify that new core features have appropriate CLI tooling
