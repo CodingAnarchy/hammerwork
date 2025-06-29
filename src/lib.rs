@@ -18,7 +18,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use hammerwork::{Job, Worker, WorkerPool, JobQueue, Result, worker::JobHandler};
+//! use hammerwork::{Job, Worker, WorkerPool, JobQueue, Result, worker::JobHandler, queue::DatabaseQueue};
 //! use serde_json::json;
 //! use std::sync::Arc;
 //!
@@ -32,12 +32,8 @@
 //!     
 //!     let queue = Arc::new(JobQueue::new(pool));
 //!     
-//!     // Initialize database tables
-//!     # #[cfg(any(feature = "postgres", feature = "mysql"))]
-//!     {
-//!         use hammerwork::queue::DatabaseQueue;
-//!         queue.create_tables().await?;
-//!     }
+//!     // Note: Run database migrations first using `cargo hammerwork migrate`
+//!     // or use the migration manager programmatically
 //!
 //!     // Create job handler
 //!     let handler: JobHandler = Arc::new(|job: Job| {

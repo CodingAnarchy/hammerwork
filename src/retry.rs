@@ -26,7 +26,7 @@
 //!     .with_exponential_backoff(
 //!         Duration::from_secs(1),    // base delay
 //!         2.0,                       // multiplier
-//!         Duration::from_minutes(10) // max delay
+//!         Duration::from_secs(10 * 60) // max delay
 //!     );
 //! ```
 //!
@@ -41,7 +41,7 @@
 //! let strategy = RetryStrategy::Exponential {
 //!     base: Duration::from_secs(2),
 //!     multiplier: 1.5,
-//!     max_delay: Some(Duration::from_minutes(5)),
+//!     max_delay: Some(Duration::from_secs(5 * 60)),
 //!     jitter: Some(JitterType::Multiplicative(0.1)), // ±10% jitter
 //! };
 //!
@@ -160,14 +160,14 @@ impl JitterType {
 /// let linear = RetryStrategy::Linear {
 ///     base: Duration::from_secs(10),
 ///     increment: Duration::from_secs(10),
-///     max_delay: Some(Duration::from_minutes(5)),
+///     max_delay: Some(Duration::from_secs(5 * 60)),
 /// };
 ///
 /// // Exponential backoff: 1s, 2s, 4s, 8s, 16s...
 /// let exponential = RetryStrategy::Exponential {
 ///     base: Duration::from_secs(1),
 ///     multiplier: 2.0,
-///     max_delay: Some(Duration::from_minutes(10)),
+///     max_delay: Some(Duration::from_secs(10 * 60)),
 ///     jitter: None,
 /// };
 /// ```
@@ -213,7 +213,7 @@ pub enum RetryStrategy {
     /// let strategy = RetryStrategy::Linear {
     ///     base: Duration::from_secs(5),
     ///     increment: Duration::from_secs(10),
-    ///     max_delay: Some(Duration::from_minutes(2)),
+    ///     max_delay: Some(Duration::from_secs(2 * 60)),
     /// };
     ///
     /// // Delays: 5s, 15s, 25s, 35s, 45s, 55s, 65s, 75s, 85s, 95s, 120s (capped)...
@@ -248,7 +248,7 @@ pub enum RetryStrategy {
     /// let strategy = RetryStrategy::Exponential {
     ///     base: Duration::from_secs(1),
     ///     multiplier: 2.0,
-    ///     max_delay: Some(Duration::from_minutes(10)),
+    ///     max_delay: Some(Duration::from_secs(10 * 60)),
     ///     jitter: Some(JitterType::Multiplicative(0.1)), // ±10% jitter
     /// };
     ///
@@ -284,7 +284,7 @@ pub enum RetryStrategy {
     ///
     /// let strategy = RetryStrategy::Fibonacci {
     ///     base: Duration::from_secs(2),
-    ///     max_delay: Some(Duration::from_minutes(5)),
+    ///     max_delay: Some(Duration::from_secs(5 * 60)),
     /// };
     ///
     /// // Delays: 2s, 2s, 4s, 6s, 10s, 16s, 26s, 42s, 68s, 110s, 178s, 288s (capped at 300s)...
@@ -453,7 +453,7 @@ impl RetryStrategy {
     /// let strategy = RetryStrategy::linear(
     ///     Duration::from_secs(10),
     ///     Duration::from_secs(5),
-    ///     Some(Duration::from_minutes(2))
+    ///     Some(Duration::from_secs(2 * 60))
     /// );
     /// ```
     pub fn linear(base: Duration, increment: Duration, max_delay: Option<Duration>) -> Self {
@@ -481,7 +481,7 @@ impl RetryStrategy {
     /// let strategy = RetryStrategy::exponential(
     ///     Duration::from_secs(1),
     ///     2.0,
-    ///     Some(Duration::from_minutes(10))
+    ///     Some(Duration::from_secs(10 * 60))
     /// );
     /// ```
     pub fn exponential(base: Duration, multiplier: f64, max_delay: Option<Duration>) -> Self {
@@ -511,7 +511,7 @@ impl RetryStrategy {
     /// let strategy = RetryStrategy::exponential_with_jitter(
     ///     Duration::from_secs(1),
     ///     2.0,
-    ///     Some(Duration::from_minutes(10)),
+    ///     Some(Duration::from_secs(10 * 60)),
     ///     JitterType::Multiplicative(0.1)
     /// );
     /// ```
@@ -544,7 +544,7 @@ impl RetryStrategy {
     ///
     /// let strategy = RetryStrategy::fibonacci(
     ///     Duration::from_secs(2),
-    ///     Some(Duration::from_minutes(5))
+    ///     Some(Duration::from_secs(5 * 60))
     /// );
     /// ```
     pub fn fibonacci(base: Duration, max_delay: Option<Duration>) -> Self {

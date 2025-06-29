@@ -183,8 +183,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 id, queue_name, payload, status, priority, attempts, max_attempts, 
                 timeout_seconds, created_at, scheduled_at, error_message, 
                 cron_schedule, next_run_at, recurring, timezone, batch_id,
-                result_storage_type, result_ttl_seconds, result_max_size_bytes
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                result_storage_type, result_ttl_seconds, result_max_size_bytes,
+                depends_on, dependents, dependency_status, workflow_id, workflow_name
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
             "#,
         )
         .bind(job.id)
@@ -210,6 +211,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         })
         .bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
         .bind(job.result_config.max_size_bytes.map(|s| s as i64))
+        .bind(serde_json::to_value(&job.depends_on)?)
+        .bind(serde_json::to_value(&job.dependents)?)
+        .bind(job.dependency_status.as_str())
+        .bind(job.workflow_id)
+        .bind(&job.workflow_name)
         .execute(&self.pool)
         .await?;
 

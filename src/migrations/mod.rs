@@ -24,7 +24,7 @@
 //! Once migrations are complete, your application simply connects to the database:
 //!
 //! ```rust,no_run
-//! use hammerwork::{Job, JobQueue, DatabaseQueue};
+//! use hammerwork::{Job, JobQueue, queue::DatabaseQueue};
 //! use serde_json::json;
 //! use std::sync::Arc;
 //!

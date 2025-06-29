@@ -186,8 +186,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         sqlx::query(
             r#"
             INSERT INTO hammerwork_jobs 
-            (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#
         )
         .bind(job.id.to_string())
@@ -217,6 +217,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         })
         .bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
         .bind(job.result_config.max_size_bytes.map(|s| s as i64))
+        .bind(serde_json::to_value(&job.depends_on)?)
+        .bind(serde_json::to_value(&job.dependents)?)
+        .bind(job.dependency_status.as_str())
+        .bind(job.workflow_id.map(|id| id.to_string()))
+        .bind(&job.workflow_name)
         .execute(&self.pool)
         .await?;
 

@@ -23,9 +23,10 @@ mod jobrow_field_tests {
         #[tokio::test]
         async fn test_get_job_includes_all_fields() {
             let queue = test_utils::setup_postgres_queue().await;
+            let unique_queue = format!("pg_get_test_{}", uuid::Uuid::new_v4());
 
             // Create a job with all possible fields populated
-            let job = Job::new("test_queue".to_string(), json!({"test": "data"}))
+            let job = Job::new(unique_queue.clone(), json!({"test": "data"}))
                 .with_priority(JobPriority::High)
                 .with_timeout(Duration::from_secs(30))
                 .with_max_attempts(5)
@@ -39,7 +40,7 @@ mod jobrow_field_tests {
 
             let job = retrieved.unwrap();
             // Verify all fields are accessible (this would fail if any were missing)
-            assert_eq!(job.queue_name, "test_queue");
+            assert_eq!(job.queue_name, unique_queue);
             assert_eq!(job.priority, JobPriority::High);
             assert_eq!(job.max_attempts, 5);
             // Workflow fields should have default values
@@ -56,18 +57,19 @@ mod jobrow_field_tests {
         #[tokio::test]
         async fn test_dequeue_includes_all_fields() {
             let queue = test_utils::setup_postgres_queue().await;
+            let unique_queue = format!("pg_dequeue_test_{}", uuid::Uuid::new_v4());
 
-            let job = Job::new("dequeue_test".to_string(), json!({"test": "dequeue"}))
+            let job = Job::new(unique_queue.clone(), json!({"test": "dequeue"}))
                 .with_priority(JobPriority::Critical);
 
             queue.enqueue(job).await.unwrap();
 
             // This should not panic with missing field errors
-            let dequeued = queue.dequeue("dequeue_test").await.unwrap();
+            let dequeued = queue.dequeue(&unique_queue).await.unwrap();
             assert!(dequeued.is_some());
 
             let job = dequeued.unwrap();
-            assert_eq!(job.queue_name, "dequeue_test");
+            assert_eq!(job.queue_name, unique_queue);
             assert_eq!(job.priority, JobPriority::Critical);
             // Verify dependency fields are accessible
             assert!(job.depends_on.is_empty());
@@ -77,23 +79,24 @@ mod jobrow_field_tests {
         #[tokio::test]
         async fn test_dequeue_with_priority_weights_includes_all_fields() {
             let queue = test_utils::setup_postgres_queue().await;
+            let unique_queue = format!("pg_priority_test_{}", uuid::Uuid::new_v4());
 
             let weights = hammerwork::priority::PriorityWeights::default();
 
-            let job = Job::new("priority_test".to_string(), json!({"test": "priority"}))
+            let job = Job::new(unique_queue.clone(), json!({"test": "priority"}))
                 .with_priority(JobPriority::Low);
 
             queue.enqueue(job).await.unwrap();
 
             // This should not panic with missing field errors
             let dequeued = queue
-                .dequeue_with_priority_weights("priority_test", &weights)
+                .dequeue_with_priority_weights(&unique_queue, &weights)
                 .await
                 .unwrap();
             assert!(dequeued.is_some());
 
             let job = dequeued.unwrap();
-            assert_eq!(job.queue_name, "priority_test");
+            assert_eq!(job.queue_name, unique_queue);
             // Verify all fields are accessible
             assert!(job.workflow_id.is_none());
             assert!(job.workflow_name.is_none());
@@ -107,8 +110,9 @@ mod jobrow_field_tests {
         #[tokio::test]
         async fn test_mysql_get_job_includes_all_fields() {
             let queue = test_utils::setup_mysql_queue().await;
+            let unique_queue = format!("mysql_get_test_{}", uuid::Uuid::new_v4());
 
-            let job = Job::new("mysql_test".to_string(), json!({"test": "mysql"}))
+            let job = Job::new(unique_queue.clone(), json!({"test": "mysql"}))
                 .with_priority(JobPriority::High)
                 .with_timeout(Duration::from_secs(30));
 
@@ -119,7 +123,7 @@ mod jobrow_field_tests {
             assert!(retrieved.is_some());
 
             let job = retrieved.unwrap();
-            assert_eq!(job.queue_name, "mysql_test");
+            assert_eq!(job.queue_name, unique_queue);
             // Verify dependency fields are accessible
             assert!(job.depends_on.is_empty());
             assert!(job.dependents.is_empty());
@@ -132,15 +136,16 @@ mod jobrow_field_tests {
         #[tokio::test]
         async fn test_mysql_dequeue_includes_all_fields() {
             let queue = test_utils::setup_mysql_queue().await;
+            let unique_queue = format!("mysql_dequeue_test_{}", uuid::Uuid::new_v4());
 
-            let job = Job::new("mysql_dequeue".to_string(), json!({"test": "dequeue"}));
+            let job = Job::new(unique_queue.clone(), json!({"test": "dequeue"}));
             queue.enqueue(job).await.unwrap();
 
-            let dequeued = queue.dequeue("mysql_dequeue").await.unwrap();
+            let dequeued = queue.dequeue(&unique_queue).await.unwrap();
             assert!(dequeued.is_some());
 
             let job = dequeued.unwrap();
-            assert_eq!(job.queue_name, "mysql_dequeue");
+            assert_eq!(job.queue_name, unique_queue);
             // Verify workflow fields are accessible
             assert!(job.workflow_id.is_none());
             assert!(job.workflow_name.is_none());
@@ -149,19 +154,20 @@ mod jobrow_field_tests {
         #[tokio::test]
         async fn test_mysql_dequeue_with_priority_weights_includes_all_fields() {
             let queue = test_utils::setup_mysql_queue().await;
+            let unique_queue = format!("mysql_priority_test_{}", uuid::Uuid::new_v4());
 
             let weights = hammerwork::priority::PriorityWeights::default();
-            let job = Job::new("mysql_priority".to_string(), json!({"test": "priority"}));
+            let job = Job::new(unique_queue.clone(), json!({"test": "priority"}));
             queue.enqueue(job).await.unwrap();
 
             let dequeued = queue
-                .dequeue_with_priority_weights("mysql_priority", &weights)
+                .dequeue_with_priority_weights(&unique_queue, &weights)
                 .await
                 .unwrap();
             assert!(dequeued.is_some());
 
             let job = dequeued.unwrap();
-            assert_eq!(job.queue_name, "mysql_priority");
+            assert_eq!(job.queue_name, unique_queue);
             // Verify dependency fields are accessible
             assert!(job.depends_on.is_empty());
             assert_eq!(
@@ -183,12 +189,13 @@ mod workflow_field_tests {
     #[tokio::test]
     async fn test_postgres_job_with_dependencies() {
         let queue = test_utils::setup_postgres_queue().await;
+        let unique_queue = format!("postgres_deps_test_{}", Uuid::new_v4());
 
         // Create a job with dependencies
-        let dependency_job = Job::new("test_queue".to_string(), json!({"step": 1}));
+        let dependency_job = Job::new(unique_queue.clone(), json!({"step": 1}));
         let dep_id = queue.enqueue(dependency_job).await.unwrap();
 
-        let dependent_job = Job::new("test_queue".to_string(), json!({"step": 2}))
+        let dependent_job = Job::new(unique_queue, json!({"step": 2}))
             .depends_on_jobs(&[dep_id])
             .with_workflow(Uuid::new_v4(), "test_workflow");
 
@@ -206,12 +213,13 @@ mod workflow_field_tests {
     #[tokio::test]
     async fn test_mysql_job_with_dependencies() {
         let queue = test_utils::setup_mysql_queue().await;
+        let unique_queue = format!("mysql_deps_test_{}", Uuid::new_v4());
 
         // Create a job with dependencies
-        let dependency_job = Job::new("mysql_test".to_string(), json!({"step": 1}));
+        let dependency_job = Job::new(unique_queue.clone(), json!({"step": 1}));
         let dep_id = queue.enqueue(dependency_job).await.unwrap();
 
-        let dependent_job = Job::new("mysql_test".to_string(), json!({"step": 2}))
+        let dependent_job = Job::new(unique_queue, json!({"step": 2}))
             .depends_on_jobs(&[dep_id])
             .with_workflow(Uuid::new_v4(), "mysql_workflow");
 

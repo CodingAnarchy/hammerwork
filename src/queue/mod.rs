@@ -171,8 +171,9 @@ pub trait DatabaseQueue: Send + Sync {
     /// use chrono::{Utc, Duration};
     ///
     /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// # let job_id = uuid::Uuid::new_v4();
     /// let result_data = json!({"status": "success", "count": 42});
-    /// let expires_at = Some(Utc::now() + Duration::hours(24));
+    /// let expires_at = Some(Utc::now() + chrono::Duration::hours(24));
     ///
     /// queue.store_job_result(job_id, result_data, expires_at).await?;
     /// # Ok(())
@@ -302,7 +303,7 @@ pub trait DatabaseQueue: Send + Sync {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use hammerwork::{JobQueue, Job};
+/// use hammerwork::{JobQueue, Job, queue::DatabaseQueue};
 /// use serde_json::json;
 ///
 /// # #[tokio::main]

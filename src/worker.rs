@@ -677,7 +677,8 @@ where
     /// use hammerwork::Worker;
     /// use std::time::Duration;
     /// # use std::sync::Arc;
-    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
     /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
@@ -688,6 +689,8 @@ where
     /// // Lower frequency polling for reduced load
     /// let slow_worker = Worker::new(queue, "slow".to_string(), handler)
     ///     .with_poll_interval(Duration::from_secs(5));
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
@@ -709,13 +712,16 @@ where
     /// ```rust,no_run
     /// use hammerwork::Worker;
     /// # use std::sync::Arc;
-    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
     /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// // Critical jobs get more retry attempts
     /// let critical_worker = Worker::new(queue, "critical".to_string(), handler)
     ///     .with_max_retries(10);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_max_retries(mut self, max_retries: i32) -> Self {
         self.max_retries = max_retries;
@@ -737,13 +743,16 @@ where
     /// use hammerwork::Worker;
     /// use std::time::Duration;
     /// # use std::sync::Arc;
-    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
     /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// // Longer delay for API rate limit recovery
     /// let api_worker = Worker::new(queue, "api".to_string(), handler)
     ///     .with_retry_delay(Duration::from_secs(300)); // 5 minutes
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
         self.retry_delay = delay;
@@ -769,7 +778,8 @@ where
     /// use hammerwork::{Worker, retry::RetryStrategy};
     /// use std::time::Duration;
     /// # use std::sync::Arc;
-    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
     /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
@@ -778,8 +788,10 @@ where
     ///     .with_default_retry_strategy(RetryStrategy::exponential(
     ///         Duration::from_secs(1),
     ///         2.0,
-    ///         Some(Duration::from_minutes(10))
+    ///         Some(Duration::from_secs(10 * 60))
     ///     ));
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_default_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
         self.default_retry_strategy = Some(strategy);
@@ -801,13 +813,16 @@ where
     /// use hammerwork::Worker;
     /// use std::time::Duration;
     /// # use std::sync::Arc;
-    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
     /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// // Set 5 minute default timeout for all jobs
     /// let worker = Worker::new(queue, "processing".to_string(), handler)
     ///     .with_default_timeout(Duration::from_secs(300));
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = Some(timeout);
@@ -886,12 +901,15 @@ where
     /// ```rust,no_run
     /// use hammerwork::Worker;
     /// # use std::sync::Arc;
-    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await.unwrap();
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
     /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// let worker = Worker::new(queue, "batch_queue".to_string(), handler)
     ///     .with_batch_processing_enabled(true);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_batch_processing_enabled(mut self, enabled: bool) -> Self {
         self.batch_processing_enabled = enabled;

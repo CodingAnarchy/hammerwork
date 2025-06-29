@@ -650,7 +650,7 @@ impl Job {
     ///     .with_retry_strategy(RetryStrategy::exponential(
     ///         Duration::from_secs(1),
     ///         2.0,
-    ///         Some(Duration::from_minutes(10))
+    ///         Some(Duration::from_secs(10 * 60))
     ///     ));
     /// ```
     pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
@@ -681,7 +681,7 @@ impl Job {
     ///     .with_exponential_backoff(
     ///         Duration::from_secs(1),
     ///         2.0,
-    ///         Duration::from_minutes(10)
+    ///         Duration::from_secs(10 * 60)
     ///     );
     /// ```
     pub fn with_exponential_backoff(
@@ -720,7 +720,7 @@ impl Job {
     ///     .with_linear_backoff(
     ///         Duration::from_secs(10),
     ///         Duration::from_secs(10),
-    ///         Some(Duration::from_minutes(2))
+    ///         Some(Duration::from_secs(2 * 60))
     ///     );
     /// ```
     pub fn with_linear_backoff(
@@ -753,7 +753,7 @@ impl Job {
     /// let job = Job::new("file_processing".to_string(), json!({"file": "data.csv"}))
     ///     .with_fibonacci_backoff(
     ///         Duration::from_secs(2),
-    ///         Some(Duration::from_minutes(5))
+    ///         Some(Duration::from_secs(5 * 60))
     ///     );
     /// ```
     pub fn with_fibonacci_backoff(
@@ -1161,9 +1161,8 @@ impl Job {
     /// use serde_json::json;
     ///
     /// let job1 = Job::new("step1".to_string(), json!({"data": "step1"}));
-    /// let mut job2 = Job::new("step2".to_string(), json!({"data": "step2"}));
-    ///
-    /// job2.depends_on(&job1.id);
+    /// let job2 = Job::new("step2".to_string(), json!({"data": "step2"}))
+    ///     .depends_on(&job1.id);
     /// assert!(job2.has_dependencies());
     /// ```
     pub fn depends_on(mut self, job_id: &JobId) -> Self {
@@ -1188,9 +1187,8 @@ impl Job {
     ///
     /// let job1 = Job::new("step1".to_string(), json!({}));
     /// let job2 = Job::new("step2".to_string(), json!({}));
-    /// let mut final_job = Job::new("final".to_string(), json!({}));
-    ///
-    /// final_job.depends_on_jobs(&[job1.id, job2.id]);
+    /// let final_job = Job::new("final".to_string(), json!({}))
+    ///     .depends_on_jobs(&[job1.id, job2.id]);
     /// assert_eq!(final_job.depends_on.len(), 2);
     /// ```
     pub fn depends_on_jobs(mut self, job_ids: &[JobId]) -> Self {
