@@ -395,9 +395,11 @@ where
         // Test dead job summary
         let dead_summary = self.queue.get_dead_job_summary().await?;
         assert!(dead_summary.total_dead_jobs > 0);
-        assert!(dead_summary
-            .dead_jobs_by_queue
-            .contains_key("dead_job_test"));
+        assert!(
+            dead_summary
+                .dead_jobs_by_queue
+                .contains_key("dead_job_test")
+        );
         info!("✅ Dead job summary contains expected data");
 
         // Test retry dead job

@@ -138,9 +138,7 @@ pub use worker::{
     AutoscaleConfig, AutoscaleMetrics, BatchProcessingStats, JobHandler, JobHandlerWithResult,
     JobResult, Worker, WorkerPool,
 };
-pub use workflow::{
-    DependencyStatus, FailurePolicy, JobGroup, WorkflowId, WorkflowStatus,
-};
+pub use workflow::{DependencyStatus, FailurePolicy, JobGroup, WorkflowId, WorkflowStatus};
 
 #[cfg(feature = "metrics")]
 pub use metrics::{MetricsConfig, PrometheusMetricsCollector};

@@ -79,7 +79,8 @@ impl JobRow {
                 .map(|s| uuid::Uuid::parse_str(&s))
                 .transpose()?,
             result_config: crate::job::ResultConfig {
-                storage: self.result_storage_type
+                storage: self
+                    .result_storage_type
                     .as_ref()
                     .and_then(|s| match s.as_str() {
                         "database" => Some(crate::job::ResultStorage::Database),
@@ -88,24 +89,30 @@ impl JobRow {
                         _ => Some(crate::job::ResultStorage::None),
                     })
                     .unwrap_or(crate::job::ResultStorage::None),
-                ttl: self.result_ttl_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                ttl: self
+                    .result_ttl_seconds
+                    .map(|s| std::time::Duration::from_secs(s as u64)),
                 max_size_bytes: self.result_max_size_bytes.map(|b| b as usize),
             },
             result_data: self.result_data,
             result_stored_at: self.result_stored_at,
             result_expires_at: self.result_expires_at,
             retry_strategy: None,
-            depends_on: self.depends_on
+            depends_on: self
+                .depends_on
                 .map(|v| serde_json::from_value(v).unwrap_or_default())
                 .unwrap_or_default(),
-            dependents: self.dependents
+            dependents: self
+                .dependents
                 .map(|v| serde_json::from_value(v).unwrap_or_default())
                 .unwrap_or_default(),
-            dependency_status: self.dependency_status
+            dependency_status: self
+                .dependency_status
                 .as_ref()
                 .and_then(|s| crate::workflow::DependencyStatus::from_str(s).ok())
                 .unwrap_or(crate::workflow::DependencyStatus::None),
-            workflow_id: self.workflow_id
+            workflow_id: self
+                .workflow_id
                 .map(|s| uuid::Uuid::parse_str(&s))
                 .transpose()?,
             workflow_name: self.workflow_name,
@@ -478,7 +485,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                     if i > 0 {
                         query.push_str(", ");
                     }
-                    query.push_str("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                    query.push_str(
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    );
                 }
 
                 let mut prepared_query = sqlx::query(&query);
@@ -1117,11 +1126,17 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     // Workflow and dependency management methods
-    async fn enqueue_workflow(&self, _workflow: crate::workflow::JobGroup) -> Result<crate::workflow::WorkflowId> {
+    async fn enqueue_workflow(
+        &self,
+        _workflow: crate::workflow::JobGroup,
+    ) -> Result<crate::workflow::WorkflowId> {
         todo!("Workflow enqueuing will be implemented next")
     }
 
-    async fn get_workflow_status(&self, _workflow_id: crate::workflow::WorkflowId) -> Result<Option<crate::workflow::JobGroup>> {
+    async fn get_workflow_status(
+        &self,
+        _workflow_id: crate::workflow::WorkflowId,
+    ) -> Result<Option<crate::workflow::JobGroup>> {
         todo!("Workflow status retrieval will be implemented next")
     }
 
@@ -1137,7 +1152,10 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         todo!("Dependency failure propagation will be implemented next")
     }
 
-    async fn get_workflow_jobs(&self, _workflow_id: crate::workflow::WorkflowId) -> Result<Vec<Job>> {
+    async fn get_workflow_jobs(
+        &self,
+        _workflow_id: crate::workflow::WorkflowId,
+    ) -> Result<Vec<Job>> {
         todo!("Workflow jobs query will be implemented next")
     }
 

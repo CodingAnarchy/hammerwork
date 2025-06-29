@@ -57,7 +57,12 @@ pub enum CronCommand {
         database_url: Option<String>,
         #[arg(short = 'n', long, help = "Queue name filter")]
         queue: Option<String>,
-        #[arg(short = 'c', long, default_value = "10", help = "Number of upcoming executions to show")]
+        #[arg(
+            short = 'c',
+            long,
+            default_value = "10",
+            help = "Number of upcoming executions to show"
+        )]
         count: u32,
         #[arg(long, help = "Show next N hours of executions")]
         hours: Option<u32>,
@@ -141,9 +146,18 @@ impl CronCommand {
                 priority,
                 ..
             } => {
-                update_cron_job(pool, job_id, schedule.clone(), timezone.clone(), priority.clone()).await?;
+                update_cron_job(
+                    pool,
+                    job_id,
+                    schedule.clone(),
+                    timezone.clone(),
+                    priority.clone(),
+                )
+                .await?;
             }
-            CronCommand::Delete { job_id, confirm, .. } => {
+            CronCommand::Delete {
+                job_id, confirm, ..
+            } => {
                 delete_cron_job(&pool, job_id, *confirm).await?;
             }
         }
@@ -177,20 +191,21 @@ async fn list_cron_jobs(
 ) -> Result<()> {
     println!("📅 Cron Jobs");
     println!("═══════════");
-    
+
     // Simplified implementation - cron functionality coming soon
-    let mut query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE cron_schedule IS NOT NULL".to_string();
-    
+    let mut query =
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE cron_schedule IS NOT NULL".to_string();
+
     if let Some(queue_name) = &queue {
         query = format!("{} AND queue_name = '{}'", query, queue_name);
     }
-    
+
     if active_only {
         query = format!("{} AND recurring = true", query);
     }
 
     let count = execute_count_query(&pool, &query).await?;
-    
+
     if count == 0 {
         println!("📅 No cron jobs found");
         if let Some(q) = queue {
@@ -238,12 +253,14 @@ async fn create_cron_job(
 
     match &pool {
         DatabasePool::Postgres(pg_pool) => {
-            sqlx::query(r#"
+            sqlx::query(
+                r#"
                 INSERT INTO hammerwork_jobs (
                     id, queue_name, payload, status, priority, attempts, max_attempts,
                     created_at, scheduled_at, cron_schedule, next_run_at, recurring, timezone
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            "#)
+            "#,
+            )
             .bind(&job_id)
             .bind(queue)
             .bind(&payload_json)
@@ -261,12 +278,14 @@ async fn create_cron_job(
             .await?;
         }
         DatabasePool::MySQL(mysql_pool) => {
-            sqlx::query(r#"
+            sqlx::query(
+                r#"
                 INSERT INTO hammerwork_jobs (
                     id, queue_name, payload, status, priority, attempts, max_attempts,
                     created_at, scheduled_at, cron_schedule, next_run_at, recurring, timezone
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#)
+            "#,
+            )
             .bind(&job_id)
             .bind(queue)
             .bind(&payload_json)
@@ -301,7 +320,7 @@ async fn create_cron_job(
 
 async fn toggle_cron_job(pool: &DatabasePool, job_id: &str, enable: bool) -> Result<()> {
     let status = if enable { "enabled" } else { "disabled" };
-    
+
     let updated = match pool {
         DatabasePool::Postgres(pg_pool) => {
             let result = sqlx::query("UPDATE hammerwork_jobs SET recurring = $1 WHERE id = $2 AND cron_schedule IS NOT NULL")
@@ -327,7 +346,7 @@ async fn toggle_cron_job(pool: &DatabasePool, job_id: &str, enable: bool) -> Res
 
     println!("✅ Cron job {} successfully", status);
     println!("   Job ID: {}", job_id);
-    
+
     info!("Cron job {} {}", job_id, status);
     Ok(())
 }
@@ -340,21 +359,25 @@ async fn show_next_executions(
 ) -> Result<()> {
     println!("⏰ Upcoming Cron Job Executions");
     println!("═══════════════════════════════");
-    
+
     // Simplified implementation
     let mut query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE cron_schedule IS NOT NULL AND recurring = true".to_string();
-    
+
     if let Some(queue_name) = &queue {
         query = format!("{} AND queue_name = '{}'", query, queue_name);
     }
-    
+
     if let Some(hour_limit) = hours {
         let cutoff = chrono::Utc::now() + chrono::Duration::hours(hour_limit as i64);
-        query = format!("{} AND next_run_at <= '{}'", query, cutoff.format("%Y-%m-%d %H:%M:%S"));
+        query = format!(
+            "{} AND next_run_at <= '{}'",
+            query,
+            cutoff.format("%Y-%m-%d %H:%M:%S")
+        );
     }
 
     let total_jobs = execute_count_query(&pool, &query).await?;
-    
+
     if total_jobs == 0 {
         println!("📅 No upcoming cron job executions found");
     } else {
@@ -399,9 +422,10 @@ async fn update_cron_job(
     }
 
     // Simplified update - just check if job exists
-    let exists_query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE id = ? AND cron_schedule IS NOT NULL";
+    let exists_query =
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE id = ? AND cron_schedule IS NOT NULL";
     let exists = execute_count_query_with_param(&pool, exists_query, job_id).await? > 0;
-    
+
     if !exists {
         return Err(anyhow::anyhow!("Cron job not found: {}", job_id));
     }
@@ -431,17 +455,21 @@ async fn delete_cron_job(pool: &DatabasePool, job_id: &str, confirm: bool) -> Re
 
     let deleted = match &pool {
         DatabasePool::Postgres(pg_pool) => {
-            let result = sqlx::query("DELETE FROM hammerwork_jobs WHERE id = $1 AND cron_schedule IS NOT NULL")
-                .bind(job_id)
-                .execute(pg_pool)
-                .await?;
+            let result = sqlx::query(
+                "DELETE FROM hammerwork_jobs WHERE id = $1 AND cron_schedule IS NOT NULL",
+            )
+            .bind(job_id)
+            .execute(pg_pool)
+            .await?;
             result.rows_affected()
         }
         DatabasePool::MySQL(mysql_pool) => {
-            let result = sqlx::query("DELETE FROM hammerwork_jobs WHERE id = ? AND cron_schedule IS NOT NULL")
-                .bind(job_id)
-                .execute(mysql_pool)
-                .await?;
+            let result = sqlx::query(
+                "DELETE FROM hammerwork_jobs WHERE id = ? AND cron_schedule IS NOT NULL",
+            )
+            .bind(job_id)
+            .execute(mysql_pool)
+            .await?;
             result.rows_affected()
         }
     };

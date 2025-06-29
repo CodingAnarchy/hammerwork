@@ -15,10 +15,10 @@ use cargo_hammerwork::config::Config;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    
+
     #[arg(short, long, global = true, help = "Enable verbose logging")]
     verbose: bool,
-    
+
     #[arg(short, long, global = true, help = "Suppress output except errors")]
     quiet: bool,
 }
@@ -30,61 +30,61 @@ enum Commands {
         #[command(subcommand)]
         command: MigrationCommand,
     },
-    
+
     #[command(about = "Configuration management")]
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    
+
     #[command(about = "Job management operations")]
     Job {
         #[command(subcommand)]
         command: JobCommand,
     },
-    
+
     #[command(about = "Worker management operations")]
     Worker {
         #[command(subcommand)]
         command: WorkerCommand,
     },
-    
+
     #[command(about = "Queue management operations")]
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
     },
-    
+
     #[command(about = "Monitoring and observability")]
     Monitor {
         #[command(subcommand)]
         command: MonitorCommand,
     },
-    
+
     #[command(about = "Backup and restore operations")]
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
     },
-    
+
     #[command(about = "Batch operations for multiple jobs")]
     Batch {
         #[command(subcommand)]
         command: BatchCommand,
     },
-    
+
     #[command(about = "Cron job scheduling and management")]
     Cron {
         #[command(subcommand)]
         command: CronCommand,
     },
-    
+
     #[command(about = "Database maintenance operations")]
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,
     },
-    
+
     #[command(about = "Workflow and job dependency management")]
     Workflow {
         #[command(subcommand)]
@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
     // Parse arguments early to handle cargo subcommand invocation
     let args = env::args_os().collect::<Vec<_>>();
     let is_cargo_subcommand = args.get(1).map(|s| s == "hammerwork").unwrap_or(false);
-    
+
     let cli = if is_cargo_subcommand {
         Cli::parse_from(args.into_iter().skip(1))
     } else {

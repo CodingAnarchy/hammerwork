@@ -66,7 +66,9 @@ impl QueueCommand {
             QueueCommand::List { .. } => {
                 list_queues(pool).await?;
             }
-            QueueCommand::Stats { queue, detailed, .. } => {
+            QueueCommand::Stats {
+                queue, detailed, ..
+            } => {
                 show_queue_stats(pool, queue.clone(), *detailed).await?;
             }
             QueueCommand::Clear {
@@ -126,7 +128,13 @@ async fn list_queues(pool: DatabasePool) -> Result<()> {
 
     let mut table = comfy_table::Table::new();
     table.set_header(vec![
-        "Queue", "Total", "Pending", "Running", "Completed", "Failed", "Dead",
+        "Queue",
+        "Total",
+        "Pending",
+        "Running",
+        "Completed",
+        "Failed",
+        "Dead",
     ]);
 
     match pool {
@@ -190,14 +198,12 @@ async fn show_queue_stats(pool: DatabasePool, queue: Option<String>, detailed: b
 }
 
 async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<()> {
-    let mut base_query = String::from(
-        "SELECT status, COUNT(*) as count FROM hammerwork_jobs"
-    );
-    
+    let mut base_query = String::from("SELECT status, COUNT(*) as count FROM hammerwork_jobs");
+
     if let Some(queue_name) = &queue {
         base_query.push_str(&format!(" WHERE queue_name = '{}'", queue_name));
     }
-    
+
     base_query.push_str(" GROUP BY status ORDER BY status");
 
     let mut table = comfy_table::Table::new();
@@ -209,7 +215,7 @@ async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<(
             for row in rows {
                 let status: String = row.try_get("status")?;
                 let count: i64 = row.try_get("count")?;
-                
+
                 let status_icon = match status.as_str() {
                     "pending" => "🟡",
                     "running" => "🔵",
@@ -219,7 +225,7 @@ async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<(
                     "retrying" => "🟠",
                     _ => "❓",
                 };
-                
+
                 table.add_row(vec![
                     format!("{} {}", status_icon, status),
                     count.to_string(),
@@ -231,7 +237,7 @@ async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<(
             for row in rows {
                 let status: String = row.try_get("status")?;
                 let count: i64 = row.try_get("count")?;
-                
+
                 let status_icon = match status.as_str() {
                     "pending" => "🟡",
                     "running" => "🔵",
@@ -241,7 +247,7 @@ async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<(
                     "retrying" => "🟠",
                     _ => "❓",
                 };
-                
+
                 table.add_row(vec![
                     format!("{} {}", status_icon, status),
                     count.to_string(),
@@ -258,7 +264,10 @@ async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<(
 
     // Show total count
     let total_query = if let Some(queue_name) = &queue {
-        format!("SELECT COUNT(*) as total FROM hammerwork_jobs WHERE queue_name = '{}'", queue_name)
+        format!(
+            "SELECT COUNT(*) as total FROM hammerwork_jobs WHERE queue_name = '{}'",
+            queue_name
+        )
     } else {
         "SELECT COUNT(*) as total FROM hammerwork_jobs".to_string()
     };
@@ -280,14 +289,13 @@ async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<(
 }
 
 async fn show_detailed_stats(pool: DatabasePool, queue: Option<String>) -> Result<()> {
-    let mut base_query = String::from(
-        "SELECT status, priority, COUNT(*) as count FROM hammerwork_jobs"
-    );
-    
+    let mut base_query =
+        String::from("SELECT status, priority, COUNT(*) as count FROM hammerwork_jobs");
+
     if let Some(queue_name) = &queue {
         base_query.push_str(&format!(" WHERE queue_name = '{}'", queue_name));
     }
-    
+
     base_query.push_str(" GROUP BY status, priority ORDER BY status, priority");
 
     let mut stats_table = StatsTable::new();
@@ -299,7 +307,7 @@ async fn show_detailed_stats(pool: DatabasePool, queue: Option<String>) -> Resul
                 let status: String = row.try_get("status")?;
                 let priority: String = row.try_get("priority")?;
                 let count: i64 = row.try_get("count")?;
-                
+
                 stats_table.add_stats_row(&status, &priority, count);
             }
         }
@@ -309,7 +317,7 @@ async fn show_detailed_stats(pool: DatabasePool, queue: Option<String>) -> Resul
                 let status: String = row.try_get("status")?;
                 let priority: String = row.try_get("priority")?;
                 let count: i64 = row.try_get("count")?;
-                
+
                 stats_table.add_stats_row(&status, &priority, count);
             }
         }
@@ -324,9 +332,17 @@ async fn show_detailed_stats(pool: DatabasePool, queue: Option<String>) -> Resul
     Ok(())
 }
 
-async fn clear_queue(pool: DatabasePool, queue: &str, pending_only: bool, confirm: bool) -> Result<()> {
+async fn clear_queue(
+    pool: DatabasePool,
+    queue: &str,
+    pending_only: bool,
+    confirm: bool,
+) -> Result<()> {
     if !confirm {
-        println!("⚠️  This will permanently delete jobs from queue '{}'. Use --confirm to proceed.", queue);
+        println!(
+            "⚠️  This will permanently delete jobs from queue '{}'. Use --confirm to proceed.",
+            queue
+        );
         return Ok(());
     }
 
@@ -338,25 +354,28 @@ async fn clear_queue(pool: DatabasePool, queue: &str, pending_only: bool, confir
 
     let affected = match pool {
         DatabasePool::Postgres(ref pg_pool) => {
-            let query = format!("DELETE FROM hammerwork_jobs WHERE queue_name = $1{}", condition);
-            let result = sqlx::query(&query)
-                .bind(queue)
-                .execute(pg_pool)
-                .await?;
+            let query = format!(
+                "DELETE FROM hammerwork_jobs WHERE queue_name = $1{}",
+                condition
+            );
+            let result = sqlx::query(&query).bind(queue).execute(pg_pool).await?;
             result.rows_affected()
         }
         DatabasePool::MySQL(ref mysql_pool) => {
-            let query = format!("DELETE FROM hammerwork_jobs WHERE queue_name = ?{}", condition);
-            let result = sqlx::query(&query)
-                .bind(queue)
-                .execute(mysql_pool)
-                .await?;
+            let query = format!(
+                "DELETE FROM hammerwork_jobs WHERE queue_name = ?{}",
+                condition
+            );
+            let result = sqlx::query(&query).bind(queue).execute(mysql_pool).await?;
             result.rows_affected()
         }
     };
 
     let job_type = if pending_only { "pending" } else { "all" };
-    info!("✅ Cleared {} {} jobs from queue '{}'", affected, job_type, queue);
+    info!(
+        "✅ Cleared {} {} jobs from queue '{}'",
+        affected, job_type, queue
+    );
     Ok(())
 }
 
@@ -365,8 +384,11 @@ async fn pause_queue(_pool: DatabasePool, queue: &str) -> Result<()> {
     // 1. Add a queue_paused table or column
     // 2. Update worker logic to respect paused queues
     // 3. Store pause state in Redis or similar
-    
-    println!("⏸️  Queue '{}' paused (placeholder - implement pause logic)", queue);
+
+    println!(
+        "⏸️  Queue '{}' paused (placeholder - implement pause logic)",
+        queue
+    );
     info!("Queue '{}' has been paused", queue);
     Ok(())
 }
@@ -375,8 +397,11 @@ async fn resume_queue(_pool: DatabasePool, queue: &str) -> Result<()> {
     // Note: This is a placeholder. In a real implementation, you would:
     // 1. Remove from paused queues table/column
     // 2. Resume worker processing for this queue
-    
-    println!("▶️  Queue '{}' resumed (placeholder - implement resume logic)", queue);
+
+    println!(
+        "▶️  Queue '{}' resumed (placeholder - implement resume logic)",
+        queue
+    );
     info!("Queue '{}' has been resumed", queue);
     Ok(())
 }
@@ -395,7 +420,10 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
     match pool {
         DatabasePool::Postgres(pg_pool) => {
             // Total jobs
-            let total_query = format!("SELECT COUNT(*) as count FROM hammerwork_jobs{}", queue_filter);
+            let total_query = format!(
+                "SELECT COUNT(*) as count FROM hammerwork_jobs{}",
+                queue_filter
+            );
             let total_row = sqlx::query(&total_query).fetch_one(&pg_pool).await?;
             let total_jobs: i64 = total_row.try_get("count")?;
 
@@ -403,7 +431,11 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
             let failed_query = format!(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} failed_at > NOW() - INTERVAL '1 hour'",
                 queue_filter,
-                if queue_filter.is_empty() { "WHERE" } else { "AND" }
+                if queue_filter.is_empty() {
+                    "WHERE"
+                } else {
+                    "AND"
+                }
             );
             let failed_row = sqlx::query(&failed_query).fetch_one(&pg_pool).await?;
             let recent_failures: i64 = failed_row.try_get("count")?;
@@ -412,7 +444,11 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
             let long_running_query = format!(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} status = 'running' AND started_at < NOW() - INTERVAL '1 hour'",
                 queue_filter,
-                if queue_filter.is_empty() { "WHERE" } else { "AND" }
+                if queue_filter.is_empty() {
+                    "WHERE"
+                } else {
+                    "AND"
+                }
             );
             let long_running_row = sqlx::query(&long_running_query).fetch_one(&pg_pool).await?;
             let long_running: i64 = long_running_row.try_get("count")?;
@@ -421,31 +457,57 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
             health_table.add_row(vec![
                 "Total Jobs".to_string(),
                 total_jobs.to_string(),
-                if total_jobs < 10000 { "🟢 Good" } else { "🟡 High" }.to_string(),
+                if total_jobs < 10000 {
+                    "🟢 Good"
+                } else {
+                    "🟡 High"
+                }
+                .to_string(),
             ]);
 
             health_table.add_row(vec![
                 "Recent Failures (1h)".to_string(),
                 recent_failures.to_string(),
-                if recent_failures == 0 { "🟢 Good" } else if recent_failures < 10 { "🟡 Moderate" } else { "🔴 High" }.to_string(),
+                if recent_failures == 0 {
+                    "🟢 Good"
+                } else if recent_failures < 10 {
+                    "🟡 Moderate"
+                } else {
+                    "🔴 High"
+                }
+                .to_string(),
             ]);
 
             health_table.add_row(vec![
                 "Long-running Jobs (>1h)".to_string(),
                 long_running.to_string(),
-                if long_running == 0 { "🟢 Good" } else if long_running < 5 { "🟡 Moderate" } else { "🔴 High" }.to_string(),
+                if long_running == 0 {
+                    "🟢 Good"
+                } else if long_running < 5 {
+                    "🟡 Moderate"
+                } else {
+                    "🔴 High"
+                }
+                .to_string(),
             ]);
         }
         DatabasePool::MySQL(mysql_pool) => {
             // Similar implementation for MySQL with appropriate syntax
-            let total_query = format!("SELECT COUNT(*) as count FROM hammerwork_jobs{}", queue_filter);
+            let total_query = format!(
+                "SELECT COUNT(*) as count FROM hammerwork_jobs{}",
+                queue_filter
+            );
             let total_row = sqlx::query(&total_query).fetch_one(&mysql_pool).await?;
             let total_jobs: i64 = total_row.try_get("count")?;
 
             let failed_query = format!(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} failed_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)",
                 queue_filter,
-                if queue_filter.is_empty() { "WHERE" } else { "AND" }
+                if queue_filter.is_empty() {
+                    "WHERE"
+                } else {
+                    "AND"
+                }
             );
             let failed_row = sqlx::query(&failed_query).fetch_one(&mysql_pool).await?;
             let recent_failures: i64 = failed_row.try_get("count")?;
@@ -453,27 +515,52 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
             let long_running_query = format!(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} status = 'running' AND started_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)",
                 queue_filter,
-                if queue_filter.is_empty() { "WHERE" } else { "AND" }
+                if queue_filter.is_empty() {
+                    "WHERE"
+                } else {
+                    "AND"
+                }
             );
-            let long_running_row = sqlx::query(&long_running_query).fetch_one(&mysql_pool).await?;
+            let long_running_row = sqlx::query(&long_running_query)
+                .fetch_one(&mysql_pool)
+                .await?;
             let long_running: i64 = long_running_row.try_get("count")?;
 
             health_table.add_row(vec![
                 "Total Jobs".to_string(),
                 total_jobs.to_string(),
-                if total_jobs < 10000 { "🟢 Good" } else { "🟡 High" }.to_string(),
+                if total_jobs < 10000 {
+                    "🟢 Good"
+                } else {
+                    "🟡 High"
+                }
+                .to_string(),
             ]);
 
             health_table.add_row(vec![
                 "Recent Failures (1h)".to_string(),
                 recent_failures.to_string(),
-                if recent_failures == 0 { "🟢 Good" } else if recent_failures < 10 { "🟡 Moderate" } else { "🔴 High" }.to_string(),
+                if recent_failures == 0 {
+                    "🟢 Good"
+                } else if recent_failures < 10 {
+                    "🟡 Moderate"
+                } else {
+                    "🔴 High"
+                }
+                .to_string(),
             ]);
 
             health_table.add_row(vec![
                 "Long-running Jobs (>1h)".to_string(),
                 long_running.to_string(),
-                if long_running == 0 { "🟢 Good" } else if long_running < 5 { "🟡 Moderate" } else { "🔴 High" }.to_string(),
+                if long_running == 0 {
+                    "🟢 Good"
+                } else if long_running < 5 {
+                    "🟡 Moderate"
+                } else {
+                    "🔴 High"
+                }
+                .to_string(),
             ]);
         }
     }

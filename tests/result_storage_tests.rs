@@ -318,8 +318,7 @@ mod mysql_tests {
         });
 
         let test_queue = format!("mysql_worker_{}", chrono::Utc::now().timestamp_millis());
-        let worker =
-            Worker::new_with_result_handler(queue.clone(), test_queue.clone(), handler);
+        let worker = Worker::new_with_result_handler(queue.clone(), test_queue.clone(), handler);
 
         let job = Job::new(test_queue.clone(), json!({"test": "mysql"}))
             .with_result_storage(ResultStorage::Database);

@@ -1,4 +1,4 @@
-use cargo_hammerwork::commands::workflow::{WorkflowCommand, JobNode};
+use cargo_hammerwork::commands::workflow::{JobNode, WorkflowCommand};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -21,7 +21,10 @@ fn create_test_jobs() -> Vec<JobNode> {
             status: "Running".to_string(),
             dependency_status: "satisfied".to_string(),
             depends_on: vec!["12345678-1234-1234-1234-123456789012".to_string()],
-            dependents: vec!["abcdef12-abcd-abcd-abcd-abcdef123456".to_string(), "fedcba98-fedc-fedc-fedc-fedcba987654".to_string()],
+            dependents: vec![
+                "abcdef12-abcd-abcd-abcd-abcdef123456".to_string(),
+                "fedcba98-fedc-fedc-fedc-fedcba987654".to_string(),
+            ],
             workflow_id: Some("workflow-123".to_string()),
             workflow_name: Some("data-pipeline".to_string()),
         },
@@ -62,75 +65,105 @@ fn create_test_workflow_command() -> WorkflowCommand {
 #[test]
 fn test_json_array_parsing() {
     let cmd = create_test_workflow_command();
-    
+
     // Test various JSON array scenarios
     let test_cases = vec![
-        (serde_json::json!(["job1", "job2", "job3"]), vec!["job1", "job2", "job3"]),
+        (
+            serde_json::json!(["job1", "job2", "job3"]),
+            vec!["job1", "job2", "job3"],
+        ),
         (serde_json::json!([]), vec![]),
         (serde_json::json!(["single"]), vec!["single"]),
-        (serde_json::json!(["job1", 123, "job2", null, true, "job3"]), vec!["job1", "job2", "job3"]),
+        (
+            serde_json::json!(["job1", 123, "job2", null, true, "job3"]),
+            vec!["job1", "job2", "job3"],
+        ),
     ];
-    
+
     for (input, expected) in test_cases {
         let result = cmd.parse_json_array(Some(input)).unwrap();
         assert_eq!(result, expected);
     }
-    
+
     // Test None input
     assert!(cmd.parse_json_array(None).unwrap().is_empty());
-    
+
     // Test non-array JSON
-    assert!(cmd.parse_json_array(Some(serde_json::json!({"not": "array"}))).unwrap().is_empty());
+    assert!(
+        cmd.parse_json_array(Some(serde_json::json!({"not": "array"})))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn test_dependency_level_calculation_complex() {
     let cmd = create_test_workflow_command();
     let jobs = create_test_jobs();
-    
+
     let levels = cmd.calculate_dependency_levels(&jobs);
-    
+
     // Should have multiple levels
     assert!(!levels.is_empty());
-    
+
     // Verify level structure makes sense
     let mut level_numbers: Vec<usize> = levels.iter().map(|(level, _)| *level).collect();
     level_numbers.sort();
     level_numbers.dedup();
-    
+
     // Should start at level 0
     assert_eq!(level_numbers[0], 0);
-    
+
     // Should have reasonable number of levels for our test data
     assert!(level_numbers.len() <= 4); // Maximum possible levels for our test data
-    
+
     // Verify each level has jobs
     for (level, jobs_at_level) in &levels {
-        assert!(!jobs_at_level.is_empty(), "Level {} should have jobs", level);
+        assert!(
+            !jobs_at_level.is_empty(),
+            "Level {} should have jobs",
+            level
+        );
     }
 }
 
 #[test]
 fn test_dependency_tree_structure() {
     let jobs = create_test_jobs();
-    
+
     // Create a mapping for easier testing
-    let job_map: HashMap<String, &JobNode> = jobs.iter()
-        .map(|job| (job.id.clone(), job))
-        .collect();
-    
+    let job_map: HashMap<String, &JobNode> = jobs.iter().map(|job| (job.id.clone(), job)).collect();
+
     // Test parent-child relationships
     let root_job = job_map.get("12345678-1234-1234-1234-123456789012").unwrap();
-    assert!(root_job.depends_on.is_empty(), "Root job should have no dependencies");
-    assert!(!root_job.dependents.is_empty(), "Root job should have dependents");
-    
+    assert!(
+        root_job.depends_on.is_empty(),
+        "Root job should have no dependencies"
+    );
+    assert!(
+        !root_job.dependents.is_empty(),
+        "Root job should have dependents"
+    );
+
     let middle_job = job_map.get("87654321-4321-4321-4321-210987654321").unwrap();
-    assert!(!middle_job.depends_on.is_empty(), "Middle job should have dependencies");
-    assert!(!middle_job.dependents.is_empty(), "Middle job should have dependents");
-    
+    assert!(
+        !middle_job.depends_on.is_empty(),
+        "Middle job should have dependencies"
+    );
+    assert!(
+        !middle_job.dependents.is_empty(),
+        "Middle job should have dependents"
+    );
+
     let leaf_job = job_map.get("abcdef12-abcd-abcd-abcd-abcdef123456").unwrap();
-    assert!(!leaf_job.depends_on.is_empty(), "Leaf job should have dependencies");
-    assert!(leaf_job.dependents.is_empty(), "Leaf job should have no dependents");
+    assert!(
+        !leaf_job.depends_on.is_empty(),
+        "Leaf job should have dependencies"
+    );
+    assert!(
+        leaf_job.dependents.is_empty(),
+        "Leaf job should have no dependents"
+    );
 }
 
 #[test]
@@ -143,7 +176,7 @@ fn test_job_node_status_variations() {
         ("TimedOut", "failed"),
         ("Retrying", "waiting"),
     ];
-    
+
     for (job_status, dep_status) in statuses {
         let job = JobNode {
             id: format!("job-{}", job_status.to_lowercase()),
@@ -155,7 +188,7 @@ fn test_job_node_status_variations() {
             workflow_id: Some("test-workflow".to_string()),
             workflow_name: Some("test".to_string()),
         };
-        
+
         assert_eq!(job.status, job_status);
         assert_eq!(job.dependency_status, dep_status);
     }
@@ -164,7 +197,7 @@ fn test_job_node_status_variations() {
 #[test]
 fn test_workflow_command_database_url_priority() {
     use cargo_hammerwork::config::Config;
-    
+
     let config_with_url = Config {
         database_url: Some("postgres://config/db".to_string()),
         default_queue: None,
@@ -172,7 +205,7 @@ fn test_workflow_command_database_url_priority() {
         log_level: None,
         connection_pool_size: None,
     };
-    
+
     let config_without_url = Config {
         database_url: None,
         default_queue: None,
@@ -180,27 +213,27 @@ fn test_workflow_command_database_url_priority() {
         log_level: None,
         connection_pool_size: None,
     };
-    
+
     // Test command with URL overrides config
     let cmd_with_url = WorkflowCommand::Graph {
         database_url: Some("postgres://command/db".to_string()),
         workflow_id: "test".to_string(),
         format: None,
     };
-    
+
     let result = cmd_with_url.get_database_url(&config_with_url).unwrap();
     assert_eq!(result, "postgres://command/db");
-    
+
     // Test command without URL falls back to config
     let cmd_without_url = WorkflowCommand::Graph {
         database_url: None,
         workflow_id: "test".to_string(),
         format: None,
     };
-    
+
     let result = cmd_without_url.get_database_url(&config_with_url).unwrap();
     assert_eq!(result, "postgres://config/db");
-    
+
     // Test error when neither command nor config has URL
     let result = cmd_without_url.get_database_url(&config_without_url);
     assert!(result.is_err());
@@ -209,15 +242,18 @@ fn test_workflow_command_database_url_priority() {
 #[test]
 fn test_graph_format_options() {
     let formats = vec!["text", "dot", "mermaid", "json"];
-    
+
     for format in formats {
         let cmd = WorkflowCommand::Graph {
             database_url: None,
             workflow_id: "test-workflow".to_string(),
             format: Some(format.to_string()),
         };
-        
-        if let WorkflowCommand::Graph { format: cmd_format, .. } = cmd {
+
+        if let WorkflowCommand::Graph {
+            format: cmd_format, ..
+        } = cmd
+        {
             assert_eq!(cmd_format, Some(format.to_string()));
         } else {
             panic!("Expected Graph command");
@@ -229,42 +265,60 @@ fn test_graph_format_options() {
 fn test_all_workflow_command_variants_structure() {
     // Test that all command variants have the expected structure
     let commands = vec![
-        ("List", WorkflowCommand::List {
-            database_url: Some("postgres://test".to_string()),
-            limit: Some(100),
-            running: true,
-            completed: false,
-            failed: true,
-        }),
-        ("Show", WorkflowCommand::Show {
-            database_url: Some("postgres://test".to_string()),
-            workflow_id: "workflow-123".to_string(),
-            dependencies: true,
-        }),
-        ("Create", WorkflowCommand::Create {
-            database_url: Some("postgres://test".to_string()),
-            name: "test-workflow".to_string(),
-            failure_policy: Some("continue_on_failure".to_string()),
-            metadata: Some(r#"{"env": "production"}"#.to_string()),
-        }),
-        ("Cancel", WorkflowCommand::Cancel {
-            database_url: Some("postgres://test".to_string()),
-            workflow_id: "workflow-456".to_string(),
-            force: true,
-        }),
-        ("Dependencies", WorkflowCommand::Dependencies {
-            database_url: Some("postgres://test".to_string()),
-            job_id: "job-789".to_string(),
-            tree: true,
-            dependents: true,
-        }),
-        ("Graph", WorkflowCommand::Graph {
-            database_url: Some("postgres://test".to_string()),
-            workflow_id: "workflow-abc".to_string(),
-            format: Some("mermaid".to_string()),
-        }),
+        (
+            "List",
+            WorkflowCommand::List {
+                database_url: Some("postgres://test".to_string()),
+                limit: Some(100),
+                running: true,
+                completed: false,
+                failed: true,
+            },
+        ),
+        (
+            "Show",
+            WorkflowCommand::Show {
+                database_url: Some("postgres://test".to_string()),
+                workflow_id: "workflow-123".to_string(),
+                dependencies: true,
+            },
+        ),
+        (
+            "Create",
+            WorkflowCommand::Create {
+                database_url: Some("postgres://test".to_string()),
+                name: "test-workflow".to_string(),
+                failure_policy: Some("continue_on_failure".to_string()),
+                metadata: Some(r#"{"env": "production"}"#.to_string()),
+            },
+        ),
+        (
+            "Cancel",
+            WorkflowCommand::Cancel {
+                database_url: Some("postgres://test".to_string()),
+                workflow_id: "workflow-456".to_string(),
+                force: true,
+            },
+        ),
+        (
+            "Dependencies",
+            WorkflowCommand::Dependencies {
+                database_url: Some("postgres://test".to_string()),
+                job_id: "job-789".to_string(),
+                tree: true,
+                dependents: true,
+            },
+        ),
+        (
+            "Graph",
+            WorkflowCommand::Graph {
+                database_url: Some("postgres://test".to_string()),
+                workflow_id: "workflow-abc".to_string(),
+                format: Some("mermaid".to_string()),
+            },
+        ),
     ];
-    
+
     for (name, command) in commands {
         // Test that each command can be matched correctly
         match command {
@@ -356,23 +410,22 @@ fn test_complex_dependency_graph() {
             workflow_name: Some("complex-test".to_string()),
         },
     ];
-    
+
     let cmd = create_test_workflow_command();
     let levels = cmd.calculate_dependency_levels(&complex_jobs);
-    
+
     // Should have at least 3 levels for this complex graph
     assert!(levels.len() >= 3);
-    
+
     // Verify root jobs are at level 0
-    let level_0_jobs = levels.iter()
+    let level_0_jobs = levels
+        .iter()
         .find(|(level, _)| *level == 0)
         .map(|(_, jobs)| jobs)
         .unwrap();
-    
-    let level_0_ids: HashSet<String> = level_0_jobs.iter()
-        .map(|job| job.id.clone())
-        .collect();
-    
+
+    let level_0_ids: HashSet<String> = level_0_jobs.iter().map(|job| job.id.clone()).collect();
+
     assert!(level_0_ids.contains("root1"));
     assert!(level_0_ids.contains("root2"));
 }
@@ -402,10 +455,10 @@ fn test_disconnected_job_handling() {
             workflow_name: Some("isolated-test".to_string()),
         },
     ];
-    
+
     let cmd = create_test_workflow_command();
     let levels = cmd.calculate_dependency_levels(&disconnected_jobs);
-    
+
     // All disconnected jobs should be at level 0
     assert_eq!(levels.len(), 1);
     assert_eq!(levels[0].0, 0);
@@ -448,19 +501,17 @@ fn test_cyclic_dependency_detection() {
             workflow_name: Some("cyclic".to_string()),
         },
     ];
-    
+
     let cmd = create_test_workflow_command();
-    
+
     // Our algorithm should handle this gracefully without infinite loops
     let levels = cmd.calculate_dependency_levels(&potentially_cyclic_jobs);
-    
+
     // Should produce some levels without crashing
     assert!(!levels.is_empty());
-    
+
     // All jobs should be accounted for
-    let total_jobs_in_levels: usize = levels.iter()
-        .map(|(_, jobs)| jobs.len())
-        .sum();
+    let total_jobs_in_levels: usize = levels.iter().map(|(_, jobs)| jobs.len()).sum();
     assert_eq!(total_jobs_in_levels, potentially_cyclic_jobs.len());
 }
 
@@ -473,12 +524,12 @@ fn test_uuid_parsing_edge_cases() {
         "00000000-0000-0000-0000-000000000000",
         "ffffffff-ffff-ffff-ffff-ffffffffffff",
     ];
-    
+
     for uuid_str in valid_uuids {
         let parsed = Uuid::parse_str(uuid_str);
         assert!(parsed.is_ok(), "Failed to parse valid UUID: {}", uuid_str);
     }
-    
+
     let invalid_uuids = vec![
         "not-a-uuid",
         "550e8400-e29b-41d4-a716",
@@ -486,10 +537,14 @@ fn test_uuid_parsing_edge_cases() {
         "",
         "550e8400-e29b-41d4-a716-44665544000g", // invalid character
     ];
-    
+
     for uuid_str in invalid_uuids {
         let parsed = Uuid::parse_str(uuid_str);
-        assert!(parsed.is_err(), "Should have failed to parse invalid UUID: {}", uuid_str);
+        assert!(
+            parsed.is_err(),
+            "Should have failed to parse invalid UUID: {}",
+            uuid_str
+        );
     }
 }
 
@@ -506,19 +561,15 @@ fn test_job_node_edge_cases() {
         workflow_id: None,
         workflow_name: None,
     };
-    
+
     assert!(orphaned_job.workflow_id.is_none());
     assert!(orphaned_job.workflow_name.is_none());
-    
+
     // Test job with very long dependency lists
-    let many_deps: Vec<String> = (0..100)
-        .map(|i| format!("dep-{:03}", i))
-        .collect();
-    
-    let many_dependents: Vec<String> = (0..50)
-        .map(|i| format!("dependent-{:03}", i))
-        .collect();
-    
+    let many_deps: Vec<String> = (0..100).map(|i| format!("dep-{:03}", i)).collect();
+
+    let many_dependents: Vec<String> = (0..50).map(|i| format!("dependent-{:03}", i)).collect();
+
     let busy_job = JobNode {
         id: "busy-job".to_string(),
         queue_name: "busy-queue".to_string(),
@@ -529,7 +580,7 @@ fn test_job_node_edge_cases() {
         workflow_id: Some("busy-workflow".to_string()),
         workflow_name: Some("busy-test".to_string()),
     };
-    
+
     assert_eq!(busy_job.depends_on.len(), 100);
     assert_eq!(busy_job.dependents.len(), 50);
 }

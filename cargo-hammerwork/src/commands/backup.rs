@@ -178,8 +178,11 @@ async fn create_backup(
     match format {
         "csv" => {
             // CSV format
-            writeln!(writer, "id,queue_name,payload,status,priority,attempts,max_attempts,created_at,scheduled_at,started_at,completed_at,failed_at,error_message")?;
-            
+            writeln!(
+                writer,
+                "id,queue_name,payload,status,priority,attempts,max_attempts,created_at,scheduled_at,started_at,completed_at,failed_at,error_message"
+            )?;
+
             for job in &job_data {
                 writeln!(
                     writer,
@@ -308,7 +311,10 @@ async fn restore_backup(
         restored += 1;
     }
 
-    info!("✅ Restore completed: {} jobs restored, {} skipped", restored, skipped);
+    info!(
+        "✅ Restore completed: {} jobs restored, {} skipped",
+        restored, skipped
+    );
     println!("📥 Restore completed successfully");
     println!("   Restored: {} jobs", restored);
     if skipped > 0 {
@@ -345,13 +351,13 @@ async fn insert_job_from_backup(pool: &DatabasePool, job: &Value) -> Result<()> 
     let priority = job["priority"].as_str().unwrap_or("normal");
     let attempts = job["attempts"].as_i64().unwrap_or(0) as i32;
     let max_attempts = job["max_attempts"].as_i64().unwrap_or(3) as i32;
-    
+
     let created_at = job["created_at"]
         .as_str()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(chrono::Utc::now);
-    
+
     let scheduled_at = job["scheduled_at"]
         .as_str()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -360,13 +366,15 @@ async fn insert_job_from_backup(pool: &DatabasePool, job: &Value) -> Result<()> 
 
     match pool {
         DatabasePool::Postgres(pg_pool) => {
-            sqlx::query(r#"
+            sqlx::query(
+                r#"
                 INSERT INTO hammerwork_jobs (
                     id, queue_name, payload, status, priority, attempts, max_attempts,
                     created_at, scheduled_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (id) DO NOTHING
-            "#)
+            "#,
+            )
             .bind(id)
             .bind(queue_name)
             .bind(payload)
@@ -380,12 +388,14 @@ async fn insert_job_from_backup(pool: &DatabasePool, job: &Value) -> Result<()> 
             .await?;
         }
         DatabasePool::MySQL(mysql_pool) => {
-            sqlx::query(r#"
+            sqlx::query(
+                r#"
                 INSERT IGNORE INTO hammerwork_jobs (
                     id, queue_name, payload, status, priority, attempts, max_attempts,
                     created_at, scheduled_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#)
+            "#,
+            )
             .bind(id)
             .bind(queue_name)
             .bind(payload)
@@ -399,13 +409,13 @@ async fn insert_job_from_backup(pool: &DatabasePool, job: &Value) -> Result<()> 
             .await?;
         }
     }
-    
+
     Ok(())
 }
 
 async fn list_backups(path: Option<String>) -> Result<()> {
     let backup_dir = path.unwrap_or_else(|| "./backups".to_string());
-    
+
     if !std::path::Path::new(&backup_dir).exists() {
         println!("📂 No backup directory found at: {}", backup_dir);
         return Ok(());
@@ -417,7 +427,7 @@ async fn list_backups(path: Option<String>) -> Result<()> {
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        
+
         if path.is_file() {
             if let Some(ext) = path.extension() {
                 if ext == "json" || ext == "csv" {
@@ -425,7 +435,7 @@ async fn list_backups(path: Option<String>) -> Result<()> {
                     let size = metadata.len();
                     let modified = metadata.modified()?;
                     let modified_time = chrono::DateTime::<chrono::Utc>::from(modified);
-                    
+
                     backups.push((
                         path.file_name().unwrap().to_string_lossy().to_string(),
                         size,
@@ -445,7 +455,7 @@ async fn list_backups(path: Option<String>) -> Result<()> {
 
     println!("📋 Available Backups");
     println!("════════════════════");
-    
+
     for (name, size, modified) in backups {
         let size_str = if size > 1024 * 1024 {
             format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
@@ -454,8 +464,13 @@ async fn list_backups(path: Option<String>) -> Result<()> {
         } else {
             format!("{} bytes", size)
         };
-        
-        println!("📄 {} ({}) - {}", name, size_str, modified.format("%Y-%m-%d %H:%M:%S UTC"));
+
+        println!(
+            "📄 {} ({}) - {}",
+            name,
+            size_str,
+            modified.format("%Y-%m-%d %H:%M:%S UTC")
+        );
     }
 
     Ok(())

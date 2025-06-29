@@ -8,8 +8,9 @@ pub async fn setup_postgres_queue() -> Arc<JobQueue<sqlx::Postgres>> {
     use hammerwork::migrations::postgres::PostgresMigrationRunner;
     use sqlx::{Pool, Postgres};
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:hammerwork@localhost:5433/hammerwork_test".to_string());
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:hammerwork@localhost:5433/hammerwork_test".to_string()
+    });
 
     let pool = Pool::<Postgres>::connect(&database_url)
         .await

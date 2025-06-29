@@ -1222,7 +1222,11 @@ impl Job {
     /// assert_eq!(job.workflow_id, Some(workflow_id));
     /// assert_eq!(job.workflow_name, Some("data_pipeline".to_string()));
     /// ```
-    pub fn with_workflow(mut self, workflow_id: crate::workflow::WorkflowId, workflow_name: impl Into<String>) -> Self {
+    pub fn with_workflow(
+        mut self,
+        workflow_id: crate::workflow::WorkflowId,
+        workflow_name: impl Into<String>,
+    ) -> Self {
         self.workflow_id = Some(workflow_id);
         self.workflow_name = Some(workflow_name.into());
         self
@@ -1302,7 +1306,10 @@ impl Job {
     /// assert!(job.dependencies_failed());
     /// ```
     pub fn dependencies_failed(&self) -> bool {
-        matches!(self.dependency_status, crate::workflow::DependencyStatus::Failed)
+        matches!(
+            self.dependency_status,
+            crate::workflow::DependencyStatus::Failed
+        )
     }
 
     /// Gets the number of dependencies for this job.

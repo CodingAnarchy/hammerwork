@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Subcommand;
-use hammerwork::{JobGroup, FailurePolicy};
+use hammerwork::{FailurePolicy, JobGroup};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{info, warn};
@@ -101,70 +101,40 @@ impl WorkflowCommand {
                 failed,
                 ..
             } => {
-                self.list_workflows(
-                    pool,
-                    *limit,
-                    *running,
-                    *completed,
-                    *failed,
-                )
-                .await
+                self.list_workflows(pool, *limit, *running, *completed, *failed)
+                    .await
             }
             WorkflowCommand::Show {
                 workflow_id,
                 dependencies,
                 ..
-            } => {
-                self.show_workflow(pool, workflow_id, *dependencies)
-                    .await
-            }
+            } => self.show_workflow(pool, workflow_id, *dependencies).await,
             WorkflowCommand::Create {
                 name,
                 failure_policy,
                 metadata,
                 ..
             } => {
-                self.create_workflow(
-                    name,
-                    failure_policy.as_deref(),
-                    metadata.as_deref(),
-                )
-                .await
-            }
-            WorkflowCommand::Cancel {
-                workflow_id,
-                force,
-                ..
-            } => {
-                self.cancel_workflow(pool, workflow_id, *force)
+                self.create_workflow(name, failure_policy.as_deref(), metadata.as_deref())
                     .await
             }
+            WorkflowCommand::Cancel {
+                workflow_id, force, ..
+            } => self.cancel_workflow(pool, workflow_id, *force).await,
             WorkflowCommand::Dependencies {
                 job_id,
                 tree,
                 dependents,
                 ..
             } => {
-                self.show_dependencies(
-                    pool,
-                    job_id,
-                    *tree,
-                    *dependents,
-                )
-                .await
+                self.show_dependencies(pool, job_id, *tree, *dependents)
+                    .await
             }
             WorkflowCommand::Graph {
                 workflow_id,
                 format,
                 ..
-            } => {
-                self.show_graph(
-                    pool,
-                    workflow_id,
-                    format.as_deref(),
-                )
-                .await
-            }
+            } => self.show_graph(pool, workflow_id, format.as_deref()).await,
         }
     }
 
@@ -232,7 +202,8 @@ impl WorkflowCommand {
             Some("manual") => FailurePolicy::Manual,
             Some(p) => {
                 return Err(anyhow::anyhow!(
-                    "Invalid failure policy: {}. Use: fail_fast, continue_on_failure, manual", p
+                    "Invalid failure policy: {}. Use: fail_fast, continue_on_failure, manual",
+                    p
                 ));
             }
             None => FailurePolicy::FailFast,
@@ -253,10 +224,10 @@ impl WorkflowCommand {
         println!("  ID: {}", workflow.id);
         println!("  Name: {}", workflow.name);
         println!("  Failure Policy: {:?}", workflow.failure_policy);
-        
+
         info!("Created workflow '{}' with ID {}", name, workflow.id);
         println!("\nUse 'cargo hammerwork job enqueue' to add jobs to this workflow.");
-        
+
         Ok(())
     }
 
@@ -270,7 +241,7 @@ impl WorkflowCommand {
         println!("⚠️  Workflow cancellation is not fully implemented yet.");
         println!("    This would cancel workflow: {}", workflow_id);
         println!("    Force: {}", force);
-        
+
         Ok(())
     }
 
@@ -297,7 +268,7 @@ impl WorkflowCommand {
         println!("Queue: {}", target_job.queue_name);
         println!("Status: {}", target_job.status);
         println!("Dependency Status: {}", target_job.dependency_status);
-        
+
         if let Some(workflow_name) = &target_job.workflow_name {
             println!("Workflow: {}", workflow_name);
         }
@@ -335,7 +306,7 @@ impl WorkflowCommand {
         // Show full dependency tree if requested
         if show_tree {
             println!("\nDependency Tree:");
-            
+
             // Build dependency graph for the workflow or just this job
             let jobs = if let Some(workflow_id) = &target_job.workflow_id {
                 self.get_workflow_jobs(&pool, workflow_id).await?
@@ -361,10 +332,10 @@ impl WorkflowCommand {
         format: Option<&str>,
     ) -> Result<()> {
         let format = format.unwrap_or("text");
-        
+
         // Get all jobs in the workflow
         let jobs = self.get_workflow_jobs(&pool, workflow_id).await?;
-        
+
         if jobs.is_empty() {
             println!("No jobs found in workflow: {}", workflow_id);
             return Ok(());
@@ -380,22 +351,25 @@ impl WorkflowCommand {
             "mermaid" => self.print_mermaid_graph(&jobs, workflow_id),
             "json" => self.print_json_graph(&jobs)?,
             _ => {
-                println!("Unsupported format: {}. Use: text, dot, mermaid, json", format);
+                println!(
+                    "Unsupported format: {}. Use: text, dot, mermaid, json",
+                    format
+                );
                 return Ok(());
             }
         }
-        
+
         Ok(())
     }
 
     fn print_text_graph(&self, jobs: &[JobNode]) {
         println!("\nDependency Graph (Text Format):");
         println!("{}", "=".repeat(50));
-        
+
         // Group jobs by dependency level
         let mut levels = self.calculate_dependency_levels(jobs);
         levels.sort_by_key(|level| level.0);
-        
+
         for (level, jobs_at_level) in levels {
             println!("\nLevel {}: {} job(s)", level, jobs_at_level.len());
             for job in jobs_at_level {
@@ -404,12 +378,8 @@ impl WorkflowCommand {
                 } else {
                     format!("{} dependencies", job.depends_on.len())
                 };
-                
-                println!("  ├─ [{}] {} ({})", 
-                    &job.id[..8], 
-                    job.status, 
-                    deps_str
-                );
+
+                println!("  ├─ [{}] {} ({})", &job.id[..8], job.status, deps_str);
             }
         }
     }
@@ -420,7 +390,7 @@ impl WorkflowCommand {
         println!("digraph workflow_{} {{", workflow_id.replace('-', "_"));
         println!("  rankdir=TB;");
         println!("  node [shape=box];");
-        
+
         // Define nodes
         for job in jobs {
             let color = match job.status.as_str() {
@@ -430,24 +400,27 @@ impl WorkflowCommand {
                 "Pending" => "lightyellow",
                 _ => "lightgray",
             };
-            
-            println!("  \"{}\" [label=\"{}\\n{}\" fillcolor={} style=filled];",
+
+            println!(
+                "  \"{}\" [label=\"{}\\n{}\" fillcolor={} style=filled];",
                 job.id,
                 &job.id[..8],
                 job.status,
                 color
             );
         }
-        
+
         // Define edges (dependencies)
         for job in jobs {
             for dep_id in &job.depends_on {
                 println!("  \"{}\" -> \"{}\";", dep_id, job.id);
             }
         }
-        
+
         println!("}}");
-        println!("\nTo visualize: copy the above DOT code to https://dreampuf.github.io/GraphvizOnline/");
+        println!(
+            "\nTo visualize: copy the above DOT code to https://dreampuf.github.io/GraphvizOnline/"
+        );
     }
 
     fn print_mermaid_graph(&self, jobs: &[JobNode], workflow_id: &str) {
@@ -458,38 +431,34 @@ impl WorkflowCommand {
         println!("---");
         println!("graph TD");
         println!("    subgraph \"📋 Workflow: {}\"", &workflow_id[..8]);
-        
+
         // Define nodes with styling
         for job in jobs {
             let short_id = &job.id[..8];
             let status_class = match job.status.as_str() {
                 "Completed" => ":::completed",
-                "Failed" => ":::failed", 
+                "Failed" => ":::failed",
                 "Running" => ":::running",
                 "Pending" => ":::pending",
                 _ => ":::default",
             };
-            
+
             // Node definition with label inside subgraph
             let dependency_indicator = match job.dependency_status.as_str() {
                 "waiting" => "⏳",
-                "satisfied" => "✅", 
+                "satisfied" => "✅",
                 "failed" => "❌",
                 _ => "🔵",
             };
-            
-            println!("        {}[\"{}<br/>{}<br/>{} {}\"]{}",
-                short_id,
-                short_id,
-                job.status,
-                dependency_indicator,
-                job.queue_name,
-                status_class
+
+            println!(
+                "        {}[\"{}<br/>{}<br/>{} {}\"]{}",
+                short_id, short_id, job.status, dependency_indicator, job.queue_name, status_class
             );
         }
-        
+
         println!();
-        
+
         // Define edges (dependencies) inside subgraph
         for job in jobs {
             let job_short = &job.id[..8];
@@ -498,17 +467,19 @@ impl WorkflowCommand {
                 println!("        {} --> {}", dep_short, job_short);
             }
         }
-        
+
         println!("    end");
         println!();
-        
+
         // Define styling classes
-        println!("    classDef completed fill:#d4edda,stroke:#155724,stroke-width:2px,color:#155724");
+        println!(
+            "    classDef completed fill:#d4edda,stroke:#155724,stroke-width:2px,color:#155724"
+        );
         println!("    classDef failed fill:#f8d7da,stroke:#721c24,stroke-width:2px,color:#721c24");
         println!("    classDef running fill:#cce7ff,stroke:#004085,stroke-width:2px,color:#004085");
         println!("    classDef pending fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#856404");
         println!("    classDef default fill:#e2e3e5,stroke:#383d41,stroke-width:2px,color:#383d41");
-        
+
         println!("\nTo visualize: copy the above Mermaid code to:");
         println!("- GitHub/GitLab markdown (```mermaid ... ```)");
         println!("- https://mermaid.live/");
@@ -518,7 +489,7 @@ impl WorkflowCommand {
     pub fn print_json_graph(&self, jobs: &[JobNode]) -> Result<()> {
         println!("\nJSON Graph Format:");
         println!("{}", "=".repeat(50));
-        
+
         let graph = serde_json::json!({
             "nodes": jobs.iter().map(|job| {
                 serde_json::json!({
@@ -540,25 +511,27 @@ impl WorkflowCommand {
                 })
             }).collect::<Vec<_>>()
         });
-        
+
         println!("{}", serde_json::to_string_pretty(&graph)?);
         Ok(())
     }
 
-    pub fn calculate_dependency_levels<'a>(&self, jobs: &'a [JobNode]) -> Vec<(usize, Vec<&'a JobNode>)> {
-        let job_map: HashMap<String, &JobNode> = jobs.iter()
-            .map(|job| (job.id.clone(), job))
-            .collect();
-        
+    pub fn calculate_dependency_levels<'a>(
+        &self,
+        jobs: &'a [JobNode],
+    ) -> Vec<(usize, Vec<&'a JobNode>)> {
+        let job_map: HashMap<String, &JobNode> =
+            jobs.iter().map(|job| (job.id.clone(), job)).collect();
+
         let mut levels = HashMap::new();
         let mut visited = HashSet::new();
-        
+
         for job in jobs {
             if !visited.contains(&job.id) {
                 self.calculate_job_level(job, &job_map, &mut levels, &mut visited, 0);
             }
         }
-        
+
         // Group jobs by level
         let mut result: HashMap<usize, Vec<&JobNode>> = HashMap::new();
         for (job_id, level) in levels {
@@ -566,7 +539,7 @@ impl WorkflowCommand {
                 result.entry(level).or_insert_with(Vec::new).push(job);
             }
         }
-        
+
         result.into_iter().collect()
     }
 
@@ -581,11 +554,13 @@ impl WorkflowCommand {
         if visited.contains(&job.id) {
             return;
         }
-        
+
         visited.insert(job.id.clone());
-        
+
         // Calculate max dependency level
-        let max_dep_level = job.depends_on.iter()
+        let max_dep_level = job
+            .depends_on
+            .iter()
             .filter_map(|dep_id| {
                 if let Some(dep_job) = job_map.get(dep_id) {
                     if !visited.contains(dep_id) {
@@ -598,13 +573,13 @@ impl WorkflowCommand {
             })
             .max()
             .unwrap_or(0);
-        
+
         let job_level = max_dep_level + if job.depends_on.is_empty() { 0 } else { 1 };
         levels.insert(job.id.clone(), job_level);
     }
 
     // Helper methods for dependency tree visualization
-    
+
     async fn get_job_node(&self, pool: &DatabasePool, job_id: &Uuid) -> Result<Option<JobNode>> {
         let query = r#"
             SELECT id, queue_name, status, dependency_status, depends_on, dependents, workflow_id, workflow_name
@@ -617,7 +592,7 @@ impl WorkflowCommand {
                 if let Some(row) = sqlx::query(query)
                     .bind(job_id)
                     .fetch_optional(pg_pool)
-                    .await? 
+                    .await?
                 {
                     Ok(Some(self.postgres_row_to_job_node(&row)?))
                 } else {
@@ -633,7 +608,7 @@ impl WorkflowCommand {
                 if let Some(row) = sqlx::query(mysql_query)
                     .bind(job_id.to_string())
                     .fetch_optional(mysql_pool)
-                    .await? 
+                    .await?
                 {
                     Ok(Some(self.mysql_row_to_job_node(&row)?))
                 } else {
@@ -643,12 +618,20 @@ impl WorkflowCommand {
         }
     }
 
-    async fn get_job_node_by_string(&self, pool: &DatabasePool, job_id: &str) -> Result<Option<JobNode>> {
+    async fn get_job_node_by_string(
+        &self,
+        pool: &DatabasePool,
+        job_id: &str,
+    ) -> Result<Option<JobNode>> {
         let uuid = Uuid::parse_str(job_id)?;
         self.get_job_node(pool, &uuid).await
     }
 
-    async fn get_workflow_jobs(&self, pool: &DatabasePool, workflow_id: &str) -> Result<Vec<JobNode>> {
+    async fn get_workflow_jobs(
+        &self,
+        pool: &DatabasePool,
+        workflow_id: &str,
+    ) -> Result<Vec<JobNode>> {
         let query = r#"
             SELECT id, queue_name, status, dependency_status, depends_on, dependents, workflow_id, workflow_name
             FROM hammerwork_jobs 
@@ -663,7 +646,7 @@ impl WorkflowCommand {
                     .bind(workflow_uuid)
                     .fetch_all(pg_pool)
                     .await?;
-                
+
                 let mut jobs = Vec::new();
                 for row in rows {
                     jobs.push(self.postgres_row_to_job_node(&row)?);
@@ -681,7 +664,7 @@ impl WorkflowCommand {
                     .bind(workflow_id)
                     .fetch_all(mysql_pool)
                     .await?;
-                
+
                 let mut jobs = Vec::new();
                 for row in rows {
                     jobs.push(self.mysql_row_to_job_node(&row)?);
@@ -691,7 +674,11 @@ impl WorkflowCommand {
         }
     }
 
-    async fn collect_related_jobs(&self, pool: &DatabasePool, target_job: &JobNode) -> Result<Vec<JobNode>> {
+    async fn collect_related_jobs(
+        &self,
+        pool: &DatabasePool,
+        target_job: &JobNode,
+    ) -> Result<Vec<JobNode>> {
         let mut jobs = HashMap::new();
         let mut to_visit = VecDeque::new();
         let mut visited = HashSet::new();
@@ -735,11 +722,11 @@ impl WorkflowCommand {
 
     fn postgres_row_to_job_node(&self, row: &sqlx::postgres::PgRow) -> Result<JobNode> {
         use sqlx::Row;
-        
+
         let id: Uuid = row.get("id");
         let depends_on = self.parse_json_array(row.try_get("depends_on").ok())?;
         let dependents = self.parse_json_array(row.try_get("dependents").ok())?;
-        
+
         let workflow_id: Option<String> = match row.try_get::<Option<Uuid>, _>("workflow_id") {
             Ok(Some(uuid)) => Some(uuid.to_string()),
             Ok(None) => None,
@@ -750,7 +737,9 @@ impl WorkflowCommand {
             id: id.to_string(),
             queue_name: row.get("queue_name"),
             status: row.get("status"),
-            dependency_status: row.try_get("dependency_status").unwrap_or_else(|_| "none".to_string()),
+            dependency_status: row
+                .try_get("dependency_status")
+                .unwrap_or_else(|_| "none".to_string()),
             depends_on,
             dependents,
             workflow_id,
@@ -760,18 +749,20 @@ impl WorkflowCommand {
 
     fn mysql_row_to_job_node(&self, row: &sqlx::mysql::MySqlRow) -> Result<JobNode> {
         use sqlx::Row;
-        
+
         let id: String = row.get("id");
         let depends_on = self.parse_json_array(row.try_get("depends_on").ok())?;
         let dependents = self.parse_json_array(row.try_get("dependents").ok())?;
-        
+
         let workflow_id: Option<String> = row.try_get("workflow_id").ok();
 
         Ok(JobNode {
             id,
             queue_name: row.get("queue_name"),
             status: row.get("status"),
-            dependency_status: row.try_get("dependency_status").unwrap_or_else(|_| "none".to_string()),
+            dependency_status: row
+                .try_get("dependency_status")
+                .unwrap_or_else(|_| "none".to_string()),
             depends_on,
             dependents,
             workflow_id,
@@ -781,22 +772,21 @@ impl WorkflowCommand {
 
     pub fn parse_json_array(&self, json_value: Option<Value>) -> Result<Vec<String>> {
         match json_value {
-            Some(Value::Array(arr)) => {
-                Ok(arr.into_iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect())
-            }
+            Some(Value::Array(arr)) => Ok(arr
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()),
             _ => Ok(Vec::new()),
         }
     }
 
     fn print_dependency_tree(&self, jobs: &[JobNode], target_job_id: &str) {
-        let job_map: HashMap<String, &JobNode> = jobs.iter()
-            .map(|job| (job.id.clone(), job))
-            .collect();
+        let job_map: HashMap<String, &JobNode> =
+            jobs.iter().map(|job| (job.id.clone(), job)).collect();
 
         // Find root jobs (jobs with no dependencies)
-        let mut roots: Vec<&JobNode> = jobs.iter()
+        let mut roots: Vec<&JobNode> = jobs
+            .iter()
             .filter(|job| job.depends_on.is_empty())
             .collect();
 
@@ -810,7 +800,7 @@ impl WorkflowCommand {
 
         println!("  Tree Structure:");
         let mut visited = HashSet::new();
-        
+
         for root in &roots {
             if !visited.contains(&root.id) {
                 self.print_job_tree_node(root, &job_map, &mut visited, 0, target_job_id);
@@ -842,11 +832,13 @@ impl WorkflowCommand {
         let indent = "  ".repeat(depth + 1);
         let marker = if depth == 0 { "┌─" } else { "├─" };
         let highlight = if job.id == target_job_id { " ⭐" } else { "" };
-        
-        println!("{}{}[{}] {} ({}){}", 
-            indent, marker, 
+
+        println!(
+            "{}{}[{}] {} ({}){}",
+            indent,
+            marker,
             &job.id[..8], // Show first 8 chars of UUID
-            job.status, 
+            job.status,
             job.dependency_status,
             highlight
         );
@@ -855,7 +847,13 @@ impl WorkflowCommand {
         for dependent_id in &job.dependents {
             if let Some(dependent_job) = job_map.get(dependent_id) {
                 if !visited.contains(dependent_id) {
-                    self.print_job_tree_node(dependent_job, job_map, visited, depth + 1, target_job_id);
+                    self.print_job_tree_node(
+                        dependent_job,
+                        job_map,
+                        visited,
+                        depth + 1,
+                        target_job_id,
+                    );
                 }
             }
         }
@@ -988,17 +986,17 @@ mod tests {
         ];
 
         let levels = workflow_cmd.calculate_dependency_levels(&jobs);
-        
+
         // Should have 3 levels (0, 1, 2)
         assert!(levels.len() <= 3);
-        
+
         // Verify that we have some levels calculated
         assert!(!levels.is_empty());
-        
+
         // Check that levels are properly ordered
         let mut level_numbers: Vec<usize> = levels.iter().map(|(level, _)| *level).collect();
         level_numbers.sort();
-        
+
         // Should start from 0
         assert_eq!(level_numbers[0], 0);
     }
@@ -1028,7 +1026,13 @@ mod tests {
             dependents: true,
         };
 
-        if let WorkflowCommand::Dependencies { job_id, tree, dependents, .. } = deps_cmd {
+        if let WorkflowCommand::Dependencies {
+            job_id,
+            tree,
+            dependents,
+            ..
+        } = deps_cmd
+        {
             assert_eq!(job_id, "test-job-123");
             assert!(tree);
             assert!(dependents);
@@ -1046,7 +1050,13 @@ mod tests {
             metadata: Some(r#"{"key": "value"}"#.to_string()),
         };
 
-        if let WorkflowCommand::Create { name, failure_policy, metadata, .. } = create_cmd {
+        if let WorkflowCommand::Create {
+            name,
+            failure_policy,
+            metadata,
+            ..
+        } = create_cmd
+        {
             assert_eq!(name, "test-workflow");
             assert_eq!(failure_policy, Some("fail_fast".to_string()));
             assert!(metadata.is_some());
@@ -1189,7 +1199,7 @@ mod tests {
     #[test]
     fn test_job_status_classification() {
         let statuses = vec!["Completed", "Failed", "Running", "Pending", "Unknown"];
-        
+
         for status in statuses {
             let job = JobNode {
                 id: "test".to_string(),
@@ -1210,7 +1220,7 @@ mod tests {
     #[test]
     fn test_dependency_status_types() {
         let dep_statuses = vec!["none", "waiting", "satisfied", "failed"];
-        
+
         for dep_status in dep_statuses {
             let job = JobNode {
                 id: "test".to_string(),

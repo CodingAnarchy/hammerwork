@@ -25,7 +25,11 @@ pub enum MaintenanceCommand {
     DeadJobs {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(long, default_value = "24", help = "Hours without update to consider dead")]
+        #[arg(
+            long,
+            default_value = "24",
+            help = "Hours without update to consider dead"
+        )]
         stale_hours: u32,
         #[arg(long, help = "Confirm the cleanup operation")]
         confirm: bool,
@@ -66,7 +70,14 @@ impl MaintenanceCommand {
                 dry_run,
                 ..
             } => {
-                vacuum_jobs(pool, *keep_completed_days, *keep_failed_days, *confirm, *dry_run).await?;
+                vacuum_jobs(
+                    pool,
+                    *keep_completed_days,
+                    *keep_failed_days,
+                    *confirm,
+                    *dry_run,
+                )
+                .await?;
             }
             MaintenanceCommand::DeadJobs {
                 stale_hours,
@@ -114,7 +125,9 @@ async fn vacuum_jobs(
     dry_run: bool,
 ) -> Result<()> {
     if !confirm && !dry_run {
-        println!("⚠️  This will permanently delete old jobs. Use --confirm to proceed or --dry-run to preview.");
+        println!(
+            "⚠️  This will permanently delete old jobs. Use --confirm to proceed or --dry-run to preview."
+        );
         return Ok(());
     }
 
@@ -122,16 +135,28 @@ async fn vacuum_jobs(
     let failed_cutoff = chrono::Utc::now() - chrono::Duration::days(keep_failed_days as i64);
 
     // Count jobs to delete
-    let completed_query = format!("SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Completed' AND completed_at < '{}'", completed_cutoff.format("%Y-%m-%d %H:%M:%S"));
-    let failed_query = format!("SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Failed' AND failed_at < '{}'", failed_cutoff.format("%Y-%m-%d %H:%M:%S"));
+    let completed_query = format!(
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Completed' AND completed_at < '{}'",
+        completed_cutoff.format("%Y-%m-%d %H:%M:%S")
+    );
+    let failed_query = format!(
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Failed' AND failed_at < '{}'",
+        failed_cutoff.format("%Y-%m-%d %H:%M:%S")
+    );
 
     let completed_count = execute_count_query(&pool, &completed_query).await?;
     let failed_count = execute_count_query(&pool, &failed_query).await?;
 
     println!("🧹 Vacuum Analysis");
     println!("════════════════════");
-    println!("Completed jobs older than {} days: {}", keep_completed_days, completed_count);
-    println!("Failed jobs older than {} days: {}", keep_failed_days, failed_count);
+    println!(
+        "Completed jobs older than {} days: {}",
+        keep_completed_days, completed_count
+    );
+    println!(
+        "Failed jobs older than {} days: {}",
+        keep_failed_days, failed_count
+    );
     println!("Total jobs to delete: {}", completed_count + failed_count);
 
     if dry_run {
@@ -148,14 +173,20 @@ async fn vacuum_jobs(
 
     // Delete completed jobs
     if completed_count > 0 {
-        let delete_completed_query = format!("DELETE FROM hammerwork_jobs WHERE status = 'Completed' AND completed_at < '{}'", completed_cutoff.format("%Y-%m-%d %H:%M:%S"));
+        let delete_completed_query = format!(
+            "DELETE FROM hammerwork_jobs WHERE status = 'Completed' AND completed_at < '{}'",
+            completed_cutoff.format("%Y-%m-%d %H:%M:%S")
+        );
         execute_update_query(&pool, &delete_completed_query).await?;
         info!("Deleted {} completed jobs", completed_count);
     }
 
     // Delete failed jobs
     if failed_count > 0 {
-        let delete_failed_query = format!("DELETE FROM hammerwork_jobs WHERE status = 'Failed' AND failed_at < '{}'", failed_cutoff.format("%Y-%m-%d %H:%M:%S"));
+        let delete_failed_query = format!(
+            "DELETE FROM hammerwork_jobs WHERE status = 'Failed' AND failed_at < '{}'",
+            failed_cutoff.format("%Y-%m-%d %H:%M:%S")
+        );
         execute_update_query(&pool, &delete_failed_query).await?;
         info!("Deleted {} failed jobs", failed_count);
     }
@@ -174,19 +205,27 @@ async fn cleanup_dead_jobs(
     dry_run: bool,
 ) -> Result<()> {
     if !confirm && !dry_run {
-        println!("⚠️  This will mark stale jobs as dead. Use --confirm to proceed or --dry-run to preview.");
+        println!(
+            "⚠️  This will mark stale jobs as dead. Use --confirm to proceed or --dry-run to preview."
+        );
         return Ok(());
     }
 
     let stale_cutoff = chrono::Utc::now() - chrono::Duration::hours(stale_hours as i64);
 
     // Find stale running jobs
-    let query = format!("SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Running' AND started_at < '{}'", stale_cutoff.format("%Y-%m-%d %H:%M:%S"));
+    let query = format!(
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Running' AND started_at < '{}'",
+        stale_cutoff.format("%Y-%m-%d %H:%M:%S")
+    );
     let stale_count = execute_count_query(&pool, &query).await?;
 
     println!("🔍 Dead Jobs Analysis");
     println!("═══════════════════════");
-    println!("Stale running jobs (no update for {} hours): {}", stale_hours, stale_count);
+    println!(
+        "Stale running jobs (no update for {} hours): {}",
+        stale_hours, stale_count
+    );
 
     if dry_run {
         println!("\n💡 This was a dry run. Use --confirm to actually mark these jobs as dead.");
@@ -201,7 +240,10 @@ async fn cleanup_dead_jobs(
     info!("Marking {} stale jobs as dead", stale_count);
 
     // Mark stale jobs as dead
-    let update_query = format!("UPDATE hammerwork_jobs SET status = 'Dead', error_message = 'Job marked as dead due to inactivity' WHERE status = 'Running' AND started_at < '{}'", stale_cutoff.format("%Y-%m-%d %H:%M:%S"));
+    let update_query = format!(
+        "UPDATE hammerwork_jobs SET status = 'Dead', error_message = 'Job marked as dead due to inactivity' WHERE status = 'Running' AND started_at < '{}'",
+        stale_cutoff.format("%Y-%m-%d %H:%M:%S")
+    );
     execute_update_query(&pool, &update_query).await?;
 
     println!("✅ Dead jobs cleanup completed");
@@ -222,23 +264,39 @@ async fn reindex_database(pool: DatabasePool, confirm: bool) -> Result<()> {
         DatabasePool::Postgres(pg_pool) => {
             // PostgreSQL index rebuilding
             println!("🔄 Rebuilding PostgreSQL indexes...");
-            
-            sqlx::query("REINDEX INDEX idx_hammerwork_queue_priority").execute(pg_pool).await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_status").execute(pg_pool).await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_scheduled").execute(pg_pool).await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_cron").execute(pg_pool).await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_batch").execute(pg_pool).await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_failed_at").execute(pg_pool).await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_completed_at").execute(pg_pool).await?;
-            
+
+            sqlx::query("REINDEX INDEX idx_hammerwork_queue_priority")
+                .execute(pg_pool)
+                .await?;
+            sqlx::query("REINDEX INDEX idx_hammerwork_status")
+                .execute(pg_pool)
+                .await?;
+            sqlx::query("REINDEX INDEX idx_hammerwork_scheduled")
+                .execute(pg_pool)
+                .await?;
+            sqlx::query("REINDEX INDEX idx_hammerwork_cron")
+                .execute(pg_pool)
+                .await?;
+            sqlx::query("REINDEX INDEX idx_hammerwork_batch")
+                .execute(pg_pool)
+                .await?;
+            sqlx::query("REINDEX INDEX idx_hammerwork_failed_at")
+                .execute(pg_pool)
+                .await?;
+            sqlx::query("REINDEX INDEX idx_hammerwork_completed_at")
+                .execute(pg_pool)
+                .await?;
+
             println!("✅ PostgreSQL indexes rebuilt");
         }
         DatabasePool::MySQL(mysql_pool) => {
             // MySQL doesn't have REINDEX, but we can optimize tables
             println!("🔄 Optimizing MySQL tables...");
-            
-            sqlx::query("OPTIMIZE TABLE hammerwork_jobs").execute(mysql_pool).await?;
-            
+
+            sqlx::query("OPTIMIZE TABLE hammerwork_jobs")
+                .execute(mysql_pool)
+                .await?;
+
             println!("✅ MySQL tables optimized");
         }
     }
@@ -253,12 +311,16 @@ async fn analyze_database(pool: DatabasePool) -> Result<()> {
     match &pool {
         DatabasePool::Postgres(pg_pool) => {
             println!("📊 Updating PostgreSQL statistics...");
-            sqlx::query("ANALYZE hammerwork_jobs").execute(pg_pool).await?;
+            sqlx::query("ANALYZE hammerwork_jobs")
+                .execute(pg_pool)
+                .await?;
             println!("✅ PostgreSQL statistics updated");
         }
         DatabasePool::MySQL(mysql_pool) => {
             println!("📊 Updating MySQL statistics...");
-            sqlx::query("ANALYZE TABLE hammerwork_jobs").execute(mysql_pool).await?;
+            sqlx::query("ANALYZE TABLE hammerwork_jobs")
+                .execute(mysql_pool)
+                .await?;
             println!("✅ MySQL statistics updated");
         }
     }
@@ -293,11 +355,15 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
     if fix && invalid_priority_count > 0 {
         let fix_priority_query = "UPDATE hammerwork_jobs SET priority = 'normal' WHERE priority NOT IN ('background', 'low', 'normal', 'high', 'critical')";
         execute_update_query(&pool, fix_priority_query).await?;
-        println!("✅ Fixed {} jobs with invalid priority", invalid_priority_count);
+        println!(
+            "✅ Fixed {} jobs with invalid priority",
+            invalid_priority_count
+        );
     }
 
     // Check for negative attempts
-    let negative_attempts_query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE attempts < 0";
+    let negative_attempts_query =
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE attempts < 0";
     let negative_attempts_count = execute_count_query(&pool, negative_attempts_query).await?;
 
     println!("Jobs with negative attempts: {}", negative_attempts_count);
@@ -305,7 +371,10 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
     if fix && negative_attempts_count > 0 {
         let fix_attempts_query = "UPDATE hammerwork_jobs SET attempts = 0 WHERE attempts < 0";
         execute_update_query(&pool, fix_attempts_query).await?;
-        println!("✅ Fixed {} jobs with negative attempts", negative_attempts_count);
+        println!(
+            "✅ Fixed {} jobs with negative attempts",
+            negative_attempts_count
+        );
     }
 
     let total_issues = orphaned_count + invalid_priority_count + negative_attempts_count;
@@ -314,7 +383,10 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
     } else if fix {
         println!("\n✅ Database check completed with fixes applied");
     } else {
-        println!("\n⚠️  Found {} issues. Use --fix to automatically repair them.", total_issues);
+        println!(
+            "\n⚠️  Found {} issues. Use --fix to automatically repair them.",
+            total_issues
+        );
     }
 
     Ok(())

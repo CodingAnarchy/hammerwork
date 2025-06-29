@@ -256,10 +256,16 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// All jobs in the workflow are inserted with their dependency relationships,
     /// and the workflow metadata is stored for tracking purposes.
-    async fn enqueue_workflow(&self, workflow: crate::workflow::JobGroup) -> Result<crate::workflow::WorkflowId>;
+    async fn enqueue_workflow(
+        &self,
+        workflow: crate::workflow::JobGroup,
+    ) -> Result<crate::workflow::WorkflowId>;
 
     /// Get workflow status and statistics.
-    async fn get_workflow_status(&self, workflow_id: crate::workflow::WorkflowId) -> Result<Option<crate::workflow::JobGroup>>;
+    async fn get_workflow_status(
+        &self,
+        workflow_id: crate::workflow::WorkflowId,
+    ) -> Result<Option<crate::workflow::JobGroup>>;
 
     /// Update job dependencies when a job completes.
     ///
@@ -280,7 +286,8 @@ pub trait DatabaseQueue: Send + Sync {
     async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>>;
 
     /// Get all jobs in a workflow.
-    async fn get_workflow_jobs(&self, workflow_id: crate::workflow::WorkflowId) -> Result<Vec<Job>>;
+    async fn get_workflow_jobs(&self, workflow_id: crate::workflow::WorkflowId)
+    -> Result<Vec<Job>>;
 
     /// Cancel a workflow and all its pending jobs.
     async fn cancel_workflow(&self, workflow_id: crate::workflow::WorkflowId) -> Result<()>;

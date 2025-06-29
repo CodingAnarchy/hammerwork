@@ -25,7 +25,7 @@ impl JobTable {
         ]);
         Self { table }
     }
-    
+
     #[allow(clippy::too_many_arguments)]
     pub fn add_job_row(
         &mut self,
@@ -46,7 +46,7 @@ impl JobTable {
             "retrying" => format!("🟠 {}", status),
             _ => status.to_string(),
         };
-        
+
         let priority_colored = match priority {
             "critical" => format!("🚨 {}", priority),
             "high" => format!("⚡ {}", priority),
@@ -55,7 +55,7 @@ impl JobTable {
             "background" => format!("💤 {}", priority),
             _ => priority.to_string(),
         };
-        
+
         self.table.add_row(vec![
             &id[..8.min(id.len())],
             queue_name,
@@ -90,7 +90,7 @@ impl StatsTable {
         table.set_header(vec!["Status", "Priority", "Count"]);
         Self { table }
     }
-    
+
     pub fn add_stats_row(&mut self, status: &str, priority: &str, count: i64) {
         let status_icon = match status {
             "pending" => "🟡",
@@ -101,7 +101,7 @@ impl StatsTable {
             "retrying" => "🟠",
             _ => "❓",
         };
-        
+
         let priority_icon = match priority {
             "critical" => "🚨",
             "high" => "⚡",
@@ -110,7 +110,7 @@ impl StatsTable {
             "background" => "💤",
             _ => "❓",
         };
-        
+
         self.table.add_row(vec![
             &format!("{} {}", status_icon, status),
             &format!("{} {}", priority_icon, priority),

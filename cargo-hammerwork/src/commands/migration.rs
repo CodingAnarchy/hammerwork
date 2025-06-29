@@ -54,27 +54,27 @@ impl MigrationCommand {
 
 async fn check_migration_status(database_url: &str) -> Result<()> {
     let pool = DatabasePool::connect(database_url, 1).await?;
-    
+
     match pool {
         DatabasePool::Postgres(ref pg_pool) => {
             let result = sqlx::query(
                 "SELECT table_name FROM information_schema.tables 
-                 WHERE table_schema = 'public' AND table_name = 'hammerwork_jobs'"
+                 WHERE table_schema = 'public' AND table_name = 'hammerwork_jobs'",
             )
             .fetch_optional(pg_pool)
             .await?;
-            
+
             if result.is_some() {
                 println!("✅ PostgreSQL tables exist");
-                
+
                 // Check for specific columns to verify schema version
                 let columns = sqlx::query(
                     "SELECT column_name FROM information_schema.columns 
-                     WHERE table_name = 'hammerwork_jobs' ORDER BY column_name"
+                     WHERE table_name = 'hammerwork_jobs' ORDER BY column_name",
                 )
                 .fetch_all(pg_pool)
                 .await?;
-                
+
                 println!("📊 Schema columns: {}", columns.len());
                 for col in columns {
                     let column_name: String = col.try_get("column_name")?;
@@ -87,23 +87,23 @@ async fn check_migration_status(database_url: &str) -> Result<()> {
         DatabasePool::MySQL(ref mysql_pool) => {
             let result = sqlx::query(
                 "SELECT TABLE_NAME FROM information_schema.tables 
-                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hammerwork_jobs'"
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hammerwork_jobs'",
             )
             .fetch_optional(mysql_pool)
             .await?;
-            
+
             if result.is_some() {
                 println!("✅ MySQL tables exist");
-                
+
                 // Check for specific columns to verify schema version
                 let columns = sqlx::query(
                     "SELECT COLUMN_NAME FROM information_schema.columns 
                      WHERE TABLE_NAME = 'hammerwork_jobs' AND TABLE_SCHEMA = DATABASE() 
-                     ORDER BY COLUMN_NAME"
+                     ORDER BY COLUMN_NAME",
                 )
                 .fetch_all(mysql_pool)
                 .await?;
-                
+
                 println!("📊 Schema columns: {}", columns.len());
                 for col in columns {
                     let column_name: String = col.try_get("COLUMN_NAME")?;
@@ -114,24 +114,24 @@ async fn check_migration_status(database_url: &str) -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    
+
     #[test]
     fn test_migration_command_structure() {
         // Test that migration commands are properly structured
         let commands = vec!["run", "status"];
-        
+
         for cmd in commands {
             assert!(!cmd.is_empty());
             assert!(cmd.chars().all(|c| c.is_ascii_lowercase()));
         }
     }
-    
+
     #[test]
     fn test_migration_args_validation() {
         // Test database URL validation for migration commands
@@ -140,23 +140,18 @@ mod tests {
             "mysql://localhost/test",
             "postgres://user:pass@localhost:5432/db",
         ];
-        
+
         for url in valid_urls {
             assert!(is_valid_database_url(url));
         }
-        
-        let invalid_urls = vec![
-            "",
-            "invalid",
-            "http://localhost/db",
-            "file:///path/to/db",
-        ];
-        
+
+        let invalid_urls = vec!["", "invalid", "http://localhost/db", "file:///path/to/db"];
+
         for url in invalid_urls {
             assert!(!is_valid_database_url(url));
         }
     }
-    
+
     fn is_valid_database_url(url: &str) -> bool {
         !url.is_empty() && (url.starts_with("postgres://") || url.starts_with("mysql://"))
     }

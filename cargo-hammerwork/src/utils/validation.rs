@@ -18,7 +18,9 @@ pub fn validate_priority(priority: &str) -> Result<JobPriority> {
 
 pub fn validate_status(status: &str) -> Result<()> {
     match status.to_lowercase().as_str() {
-        "pending" | "running" | "completed" | "failed" | "dead" | "retrying" | "timed_out" => Ok(()),
+        "pending" | "running" | "completed" | "failed" | "dead" | "retrying" | "timed_out" => {
+            Ok(())
+        }
         _ => Err(anyhow::anyhow!(
             "Invalid status '{}'. Valid options: pending, running, completed, failed, dead, retrying, timed_out",
             status
@@ -27,13 +29,14 @@ pub fn validate_status(status: &str) -> Result<()> {
 }
 
 pub fn validate_json_payload(payload: &str) -> Result<serde_json::Value> {
-    serde_json::from_str(payload).map_err(|e| {
-        anyhow::anyhow!("Invalid JSON payload: {}", e)
-    })
+    serde_json::from_str(payload).map_err(|e| anyhow::anyhow!("Invalid JSON payload: {}", e))
 }
 
 pub fn validate_database_url(url: &str) -> Result<()> {
-    if url.starts_with("postgres://") || url.starts_with("postgresql://") || url.starts_with("mysql://") {
+    if url.starts_with("postgres://")
+        || url.starts_with("postgresql://")
+        || url.starts_with("mysql://")
+    {
         Ok(())
     } else {
         Err(anyhow::anyhow!(

@@ -129,7 +129,7 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_sql_statement_splitting() {
         let multi_statement_sql = r#"
@@ -143,16 +143,16 @@ ALTER TABLE test_table ADD COLUMN name VARCHAR(50);
 
 CREATE INDEX idx_test ON test_table (name);
 "#;
-        
+
         let statements: Vec<&str> = multi_statement_sql
             .split(";\n")
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
-        
+
         // Should split into 3 non-empty statements
         assert_eq!(statements.len(), 3);
-        
+
         // Verify each statement contains expected keywords
         assert!(statements[0].contains("CREATE TABLE"));
         assert!(statements[1].contains("ALTER TABLE"));

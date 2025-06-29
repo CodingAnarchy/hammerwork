@@ -217,7 +217,10 @@ async fn batch_enqueue(
                 total_errors += 1;
                 eprintln!("❌ Line {}: Invalid JSON - {}", line_num + 1, e);
                 if !continue_on_error {
-                    return Err(anyhow::anyhow!("JSON parsing failed at line {}", line_num + 1));
+                    return Err(anyhow::anyhow!(
+                        "JSON parsing failed at line {}",
+                        line_num + 1
+                    ));
                 }
                 continue;
             }
@@ -261,22 +264,32 @@ async fn batch_enqueue(
         println!("Total errors: {}", total_errors);
     }
 
-    info!("Batch enqueue completed: {} processed, {} errors", total_processed, total_errors);
+    info!(
+        "Batch enqueue completed: {} processed, {} errors",
+        total_processed, total_errors
+    );
     Ok(())
 }
 
-async fn insert_single_job(pool: &DatabasePool, queue: &str, payload: &Value, priority: &str) -> Result<()> {
+async fn insert_single_job(
+    pool: &DatabasePool,
+    queue: &str,
+    payload: &Value,
+    priority: &str,
+) -> Result<()> {
     let job_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
 
     match pool {
         DatabasePool::Postgres(pg_pool) => {
-            sqlx::query(r#"
+            sqlx::query(
+                r#"
                 INSERT INTO hammerwork_jobs (
                     id, queue_name, payload, status, priority, attempts, max_attempts,
                     created_at, scheduled_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            "#)
+            "#,
+            )
             .bind(&job_id)
             .bind(queue)
             .bind(payload)
@@ -290,12 +303,14 @@ async fn insert_single_job(pool: &DatabasePool, queue: &str, payload: &Value, pr
             .await?;
         }
         DatabasePool::MySQL(mysql_pool) => {
-            sqlx::query(r#"
+            sqlx::query(
+                r#"
                 INSERT INTO hammerwork_jobs (
                     id, queue_name, payload, status, priority, attempts, max_attempts,
                     created_at, scheduled_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#)
+            "#,
+            )
             .bind(&job_id)
             .bind(queue)
             .bind(payload)
@@ -309,7 +324,7 @@ async fn insert_single_job(pool: &DatabasePool, queue: &str, payload: &Value, pr
             .await?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -323,27 +338,36 @@ async fn batch_retry(
     dry_run: bool,
 ) -> Result<()> {
     if !confirm && !dry_run {
-        println!("⚠️  This will retry multiple jobs. Use --confirm to proceed or --dry-run to preview.");
+        println!(
+            "⚠️  This will retry multiple jobs. Use --confirm to proceed or --dry-run to preview."
+        );
         return Ok(());
     }
 
     // Build filter conditions
     let mut conditions = Vec::new();
-    
+
     if let Some(queue_name) = &queue {
         conditions.push(format!("queue_name = '{}'", queue_name));
     }
-    
+
     match status.as_deref() {
         Some("failed") => conditions.push("status = 'Failed'".to_string()),
         Some("dead") => conditions.push("status = 'Dead'".to_string()),
         None => conditions.push("status IN ('Failed', 'Dead')".to_string()),
-        _ => return Err(anyhow::anyhow!("Invalid status filter. Use 'failed' or 'dead'")),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Invalid status filter. Use 'failed' or 'dead'"
+            ));
+        }
     }
 
     if let Some(hours) = failed_since_hours {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-        conditions.push(format!("failed_at > '{}'", cutoff.format("%Y-%m-%d %H:%M:%S")));
+        conditions.push(format!(
+            "failed_at > '{}'",
+            cutoff.format("%Y-%m-%d %H:%M:%S")
+        ));
     }
 
     if max_attempts_reached {
@@ -357,7 +381,10 @@ async fn batch_retry(
     };
 
     // Count jobs to retry
-    let count_query = format!("SELECT COUNT(*) as count FROM hammerwork_jobs WHERE {}", where_clause);
+    let count_query = format!(
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE {}",
+        where_clause
+    );
     let job_count = execute_count_query(&pool, &count_query).await?;
 
     println!("🔄 Batch Retry Analysis");
@@ -406,27 +433,36 @@ async fn batch_cancel(
     dry_run: bool,
 ) -> Result<()> {
     if !confirm && !dry_run {
-        println!("⚠️  This will cancel multiple jobs. Use --confirm to proceed or --dry-run to preview.");
+        println!(
+            "⚠️  This will cancel multiple jobs. Use --confirm to proceed or --dry-run to preview."
+        );
         return Ok(());
     }
 
     // Build filter conditions
     let mut conditions = Vec::new();
-    
+
     if let Some(queue_name) = &queue {
         conditions.push(format!("queue_name = '{}'", queue_name));
     }
-    
+
     match status.as_deref() {
         Some("pending") => conditions.push("status = 'Pending'".to_string()),
         Some("running") => conditions.push("status = 'Running'".to_string()),
         None => conditions.push("status IN ('Pending', 'Running')".to_string()),
-        _ => return Err(anyhow::anyhow!("Invalid status filter. Use 'pending' or 'running'")),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Invalid status filter. Use 'pending' or 'running'"
+            ));
+        }
     }
 
     if let Some(hours) = older_than_hours {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-        conditions.push(format!("created_at < '{}'", cutoff.format("%Y-%m-%d %H:%M:%S")));
+        conditions.push(format!(
+            "created_at < '{}'",
+            cutoff.format("%Y-%m-%d %H:%M:%S")
+        ));
     }
 
     let where_clause = if conditions.is_empty() {
@@ -436,7 +472,10 @@ async fn batch_cancel(
     };
 
     // Count jobs to cancel
-    let count_query = format!("SELECT COUNT(*) as count FROM hammerwork_jobs WHERE {}", where_clause);
+    let count_query = format!(
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE {}",
+        where_clause
+    );
     let job_count = execute_count_query(&pool, &count_query).await?;
 
     println!("🚫 Batch Cancel Analysis");

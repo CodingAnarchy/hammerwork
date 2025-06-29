@@ -136,13 +136,19 @@ impl JobCommand {
                 timeout,
                 ..
             } => {
-                enqueue_job(pool, queue, payload, priority, *delay, *max_attempts, *timeout).await?;
+                enqueue_job(
+                    pool,
+                    queue,
+                    payload,
+                    priority,
+                    *delay,
+                    *max_attempts,
+                    *timeout,
+                )
+                .await?;
             }
             JobCommand::Retry {
-                job_id,
-                queue,
-                all,
-                ..
+                job_id, queue, all, ..
             } => {
                 retry_jobs(pool, job_id.clone(), queue.clone(), *all).await?;
             }
@@ -219,53 +225,59 @@ async fn list_jobs(
     // Build dynamic query conditions
     let mut conditions = Vec::new();
     // Dynamic query building for complex filtering
-    
+
     if let Some(queue_name) = &queue {
         // Escape single quotes to prevent SQL injection
         let escaped_queue = queue_name.replace("'", "''");
         conditions.push(format!("queue_name = '{}'", escaped_queue));
     }
-    
+
     if let Some(status_str) = &status {
         let escaped_status = status_str.replace("'", "''");
         conditions.push(format!("status = '{}'", escaped_status));
     }
-    
+
     if let Some(priority_str) = &priority {
         let escaped_priority = priority_str.replace("'", "''");
         conditions.push(format!("priority = '{}'", escaped_priority));
     }
-    
+
     if failed {
         conditions.push("status IN ('failed', 'dead')".to_string());
     }
-    
+
     if completed {
         conditions.push("status = 'completed'".to_string());
     }
 
     let mut job_table = JobTable::new();
-    
+
     match pool {
         DatabasePool::Postgres(pg_pool) => {
             // Build PostgreSQL query
             let mut query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs".to_string();
-            
+
             if !conditions.is_empty() {
                 query.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
             }
-            
+
             if let Some(hours) = last_hours {
                 if conditions.is_empty() {
-                    query.push_str(&format!(" WHERE created_at > NOW() - INTERVAL '{} hours'", hours));
+                    query.push_str(&format!(
+                        " WHERE created_at > NOW() - INTERVAL '{} hours'",
+                        hours
+                    ));
                 } else {
-                    query.push_str(&format!(" AND created_at > NOW() - INTERVAL '{} hours'", hours));
+                    query.push_str(&format!(
+                        " AND created_at > NOW() - INTERVAL '{} hours'",
+                        hours
+                    ));
                 }
             }
-            
+
             query.push_str(" ORDER BY created_at DESC");
             query.push_str(&format!(" LIMIT {}", limit));
-            
+
             let rows = sqlx::query(&query).fetch_all(&pg_pool).await?;
             for row in rows {
                 let id: uuid::Uuid = row.try_get("id")?;
@@ -275,7 +287,7 @@ async fn list_jobs(
                 let attempts: i32 = row.try_get("attempts")?;
                 let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
                 let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
-                
+
                 job_table.add_job_row(
                     &id.to_string(),
                     &queue_name,
@@ -290,22 +302,28 @@ async fn list_jobs(
         DatabasePool::MySQL(mysql_pool) => {
             // Build MySQL query with different interval syntax
             let mut query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs".to_string();
-            
+
             if !conditions.is_empty() {
                 query.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
             }
-            
+
             if let Some(hours) = last_hours {
                 if conditions.is_empty() {
-                    query.push_str(&format!(" WHERE created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)", hours));
+                    query.push_str(&format!(
+                        " WHERE created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)",
+                        hours
+                    ));
                 } else {
-                    query.push_str(&format!(" AND created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)", hours));
+                    query.push_str(&format!(
+                        " AND created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)",
+                        hours
+                    ));
                 }
             }
-            
+
             query.push_str(" ORDER BY created_at DESC");
             query.push_str(&format!(" LIMIT {}", limit));
-            
+
             let rows = sqlx::query(&query).fetch_all(&mysql_pool).await?;
             for row in rows {
                 let id: String = row.try_get("id")?;
@@ -315,7 +333,7 @@ async fn list_jobs(
                 let attempts: i32 = row.try_get("attempts")?;
                 let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
                 let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
-                
+
                 job_table.add_job_row(
                     &id,
                     &queue_name,
@@ -328,13 +346,12 @@ async fn list_jobs(
             }
         }
     }
-    
+
     println!("{}", job_table);
     Ok(())
 }
 
 async fn show_job_details(pool: DatabasePool, job_id: &str) -> Result<()> {
-    
     match pool {
         DatabasePool::Postgres(pg_pool) => {
             let job_uuid = uuid::Uuid::parse_str(job_id)?;
@@ -342,7 +359,7 @@ async fn show_job_details(pool: DatabasePool, job_id: &str) -> Result<()> {
                 .bind(job_uuid)
                 .fetch_optional(&pg_pool)
                 .await?;
-                
+
             if let Some(row) = row {
                 print_job_details_postgres(&row)?;
             } else {
@@ -354,7 +371,7 @@ async fn show_job_details(pool: DatabasePool, job_id: &str) -> Result<()> {
                 .bind(job_id)
                 .fetch_optional(&mysql_pool)
                 .await?;
-                
+
             if let Some(row) = row {
                 print_job_details_mysql(&row)?;
             } else {
@@ -362,7 +379,7 @@ async fn show_job_details(pool: DatabasePool, job_id: &str) -> Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -373,36 +390,43 @@ fn print_job_details_postgres(row: &sqlx::postgres::PgRow) -> Result<()> {
     println!("Queue: {}", row.try_get::<String, _>("queue_name")?);
     println!("Status: {}", row.try_get::<String, _>("status")?);
     println!("Priority: {}", row.try_get::<String, _>("priority")?);
-    println!("Attempts: {}/{}", 
-        row.try_get::<i32, _>("attempts")?, 
+    println!(
+        "Attempts: {}/{}",
+        row.try_get::<i32, _>("attempts")?,
         row.try_get::<i32, _>("max_attempts")?
     );
-    
+
     let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
     let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
-    
+
     println!("Created: {}", created_at.format("%Y-%m-%d %H:%M:%S UTC"));
-    println!("Scheduled: {}", scheduled_at.format("%Y-%m-%d %H:%M:%S UTC"));
-    
-    if let Ok(Some(started)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at") {
+    println!(
+        "Scheduled: {}",
+        scheduled_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+
+    if let Ok(Some(started)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")
+    {
         println!("Started: {}", started.format("%Y-%m-%d %H:%M:%S UTC"));
     }
-    
-    if let Ok(Some(completed)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at") {
+
+    if let Ok(Some(completed)) =
+        row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
+    {
         println!("Completed: {}", completed.format("%Y-%m-%d %H:%M:%S UTC"));
     }
-    
+
     if let Ok(Some(failed)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at") {
         println!("Failed: {}", failed.format("%Y-%m-%d %H:%M:%S UTC"));
     }
-    
+
     if let Ok(Some(error)) = row.try_get::<Option<String>, _>("error_message") {
         println!("Error: {}", error);
     }
-    
+
     let payload: serde_json::Value = row.try_get("payload")?;
     println!("Payload: {}", serde_json::to_string_pretty(&payload)?);
-    
+
     Ok(())
 }
 
@@ -413,36 +437,43 @@ fn print_job_details_mysql(row: &sqlx::mysql::MySqlRow) -> Result<()> {
     println!("Queue: {}", row.try_get::<String, _>("queue_name")?);
     println!("Status: {}", row.try_get::<String, _>("status")?);
     println!("Priority: {}", row.try_get::<String, _>("priority")?);
-    println!("Attempts: {}/{}", 
-        row.try_get::<i32, _>("attempts")?, 
+    println!(
+        "Attempts: {}/{}",
+        row.try_get::<i32, _>("attempts")?,
         row.try_get::<i32, _>("max_attempts")?
     );
-    
+
     let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
     let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
-    
+
     println!("Created: {}", created_at.format("%Y-%m-%d %H:%M:%S UTC"));
-    println!("Scheduled: {}", scheduled_at.format("%Y-%m-%d %H:%M:%S UTC"));
-    
-    if let Ok(Some(started)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at") {
+    println!(
+        "Scheduled: {}",
+        scheduled_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+
+    if let Ok(Some(started)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")
+    {
         println!("Started: {}", started.format("%Y-%m-%d %H:%M:%S UTC"));
     }
-    
-    if let Ok(Some(completed)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at") {
+
+    if let Ok(Some(completed)) =
+        row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
+    {
         println!("Completed: {}", completed.format("%Y-%m-%d %H:%M:%S UTC"));
     }
-    
+
     if let Ok(Some(failed)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at") {
         println!("Failed: {}", failed.format("%Y-%m-%d %H:%M:%S UTC"));
     }
-    
+
     if let Ok(Some(error)) = row.try_get::<Option<String>, _>("error_message") {
         println!("Error: {}", error);
     }
-    
+
     let payload: serde_json::Value = row.try_get("payload")?;
     println!("Payload: {}", serde_json::to_string_pretty(&payload)?);
-    
+
     Ok(())
 }
 
@@ -465,15 +496,15 @@ async fn enqueue_job(
     let job_queue = pool.create_job_queue();
     let mut job = Job::new(queue.to_string(), payload_value);
     job.priority = job_priority;
-    
+
     if let Some(max_att) = max_attempts {
         job.max_attempts = max_att as i32;
     }
-    
+
     if let Some(timeout_secs) = timeout {
         job.timeout = Some(std::time::Duration::from_secs(timeout_secs as u64));
     }
-    
+
     if let Some(delay_secs) = delay {
         let scheduled_at = chrono::Utc::now() + chrono::Duration::seconds(delay_secs as i64);
         job.scheduled_at = scheduled_at;
@@ -570,54 +601,56 @@ async fn cancel_jobs(
     all_pending: bool,
 ) -> Result<()> {
     if !all_pending && job_id.is_none() && queue.is_none() {
-        return Err(anyhow::anyhow!("Must specify --job-id, --queue, or --all-pending"));
+        return Err(anyhow::anyhow!(
+            "Must specify --job-id, --queue, or --all-pending"
+        ));
     }
 
     let (query, affected) = match pool {
         DatabasePool::Postgres(ref pg_pool) => {
             if let Some(id) = job_id {
                 let job_uuid = uuid::Uuid::parse_str(&id)?;
-                let result = sqlx::query(
-                    "DELETE FROM hammerwork_jobs WHERE id = $1 AND status = 'pending'"
-                )
-                .bind(job_uuid)
-                .execute(pg_pool).await?;
+                let result =
+                    sqlx::query("DELETE FROM hammerwork_jobs WHERE id = $1 AND status = 'pending'")
+                        .bind(job_uuid)
+                        .execute(pg_pool)
+                        .await?;
                 ("single job".to_string(), result.rows_affected())
             } else if let Some(queue_name) = queue {
                 let result = sqlx::query(
-                    "DELETE FROM hammerwork_jobs WHERE queue_name = $1 AND status = 'pending'"
+                    "DELETE FROM hammerwork_jobs WHERE queue_name = $1 AND status = 'pending'",
                 )
                 .bind(&queue_name)
-                .execute(pg_pool).await?;
+                .execute(pg_pool)
+                .await?;
                 (format!("queue '{}'", queue_name), result.rows_affected())
             } else {
-                let result = sqlx::query(
-                    "DELETE FROM hammerwork_jobs WHERE status = 'pending'"
-                )
-                .execute(pg_pool).await?;
+                let result = sqlx::query("DELETE FROM hammerwork_jobs WHERE status = 'pending'")
+                    .execute(pg_pool)
+                    .await?;
                 ("all pending jobs".to_string(), result.rows_affected())
             }
         }
         DatabasePool::MySQL(ref mysql_pool) => {
             if let Some(id) = job_id {
-                let result = sqlx::query(
-                    "DELETE FROM hammerwork_jobs WHERE id = ? AND status = 'pending'"
-                )
-                .bind(id)
-                .execute(mysql_pool).await?;
+                let result =
+                    sqlx::query("DELETE FROM hammerwork_jobs WHERE id = ? AND status = 'pending'")
+                        .bind(id)
+                        .execute(mysql_pool)
+                        .await?;
                 ("single job".to_string(), result.rows_affected())
             } else if let Some(queue_name) = queue {
                 let result = sqlx::query(
-                    "DELETE FROM hammerwork_jobs WHERE queue_name = ? AND status = 'pending'"
+                    "DELETE FROM hammerwork_jobs WHERE queue_name = ? AND status = 'pending'",
                 )
                 .bind(&queue_name)
-                .execute(mysql_pool).await?;
+                .execute(mysql_pool)
+                .await?;
                 (format!("queue '{}'", queue_name), result.rows_affected())
             } else {
-                let result = sqlx::query(
-                    "DELETE FROM hammerwork_jobs WHERE status = 'pending'"
-                )
-                .execute(mysql_pool).await?;
+                let result = sqlx::query("DELETE FROM hammerwork_jobs WHERE status = 'pending'")
+                    .execute(mysql_pool)
+                    .await?;
                 ("all pending jobs".to_string(), result.rows_affected())
             }
         }
@@ -637,7 +670,9 @@ async fn purge_jobs(
     confirm: bool,
 ) -> Result<()> {
     if !completed && !dead && !failed {
-        return Err(anyhow::anyhow!("Must specify at least one of: --completed, --dead, --failed"));
+        return Err(anyhow::anyhow!(
+            "Must specify at least one of: --completed, --dead, --failed"
+        ));
     }
 
     if !confirm {
@@ -646,7 +681,7 @@ async fn purge_jobs(
     }
 
     let mut conditions = Vec::new();
-    
+
     if completed {
         conditions.push("status = 'completed'");
     }
@@ -658,33 +693,39 @@ async fn purge_jobs(
     }
 
     let status_condition = format!("({})", conditions.join(" OR "));
-    
+
     let affected = match pool {
         DatabasePool::Postgres(ref pg_pool) => {
             let mut query = format!("DELETE FROM hammerwork_jobs WHERE {}", status_condition);
-            
+
             if let Some(queue_name) = queue {
                 query.push_str(&format!(" AND queue_name = '{}'", queue_name));
             }
-            
+
             if let Some(days) = older_than_days {
-                query.push_str(&format!(" AND created_at < NOW() - INTERVAL '{} days'", days));
+                query.push_str(&format!(
+                    " AND created_at < NOW() - INTERVAL '{} days'",
+                    days
+                ));
             }
-            
+
             let result = sqlx::query(&query).execute(pg_pool).await?;
             result.rows_affected()
         }
         DatabasePool::MySQL(ref mysql_pool) => {
             let mut query = format!("DELETE FROM hammerwork_jobs WHERE {}", status_condition);
-            
+
             if let Some(queue_name) = queue {
                 query.push_str(&format!(" AND queue_name = '{}'", queue_name));
             }
-            
+
             if let Some(days) = older_than_days {
-                query.push_str(&format!(" AND created_at < DATE_SUB(NOW(), INTERVAL {} DAY)", days));
+                query.push_str(&format!(
+                    " AND created_at < DATE_SUB(NOW(), INTERVAL {} DAY)",
+                    days
+                ));
             }
-            
+
             let result = sqlx::query(&query).execute(mysql_pool).await?;
             result.rows_affected()
         }

@@ -13,7 +13,12 @@ pub enum MonitorCommand {
     Dashboard {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'i', long, default_value = "5", help = "Refresh interval in seconds")]
+        #[arg(
+            short = 'i',
+            long,
+            default_value = "5",
+            help = "Refresh interval in seconds"
+        )]
         refresh: u64,
         #[arg(short = 'n', long, help = "Specific queue to monitor")]
         queue: Option<String>,
@@ -102,7 +107,7 @@ async fn run_dashboard(pool: DatabasePool, refresh_secs: u64, queue: Option<Stri
             _ = interval.tick() => {
                 // Clear screen
                 print!("\x1B[2J\x1B[1;1H");
-                
+
                 println!("📊 Hammerwork Dashboard - {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"));
                 if let Some(q) = &queue {
                     println!("🎯 Queue: {}", q);
@@ -112,7 +117,7 @@ async fn run_dashboard(pool: DatabasePool, refresh_secs: u64, queue: Option<Stri
                 if let Err(e) = display_dashboard_data(&pool, &queue).await {
                     println!("❌ Error updating dashboard: {}", e);
                 }
-                
+
                 println!("\nPress Ctrl+C to exit");
             }
             _ = tokio::signal::ctrl_c() => {
@@ -143,11 +148,11 @@ async fn display_dashboard_data(pool: &DatabasePool, queue: &Option<String>) -> 
                 queue_filter
             );
             let rows = sqlx::query(&query).fetch_all(pg_pool).await?;
-            
+
             for row in rows {
                 let status: String = row.try_get("status")?;
                 let count: i64 = row.try_get("count")?;
-                
+
                 let status_with_icon = match status.as_str() {
                     "pending" => format!("🟡 {}", status),
                     "running" => format!("🔵 {}", status),
@@ -156,7 +161,7 @@ async fn display_dashboard_data(pool: &DatabasePool, queue: &Option<String>) -> 
                     "dead" => format!("💀 {}", status),
                     _ => status,
                 };
-                
+
                 stats_table.add_row(vec![status_with_icon, count.to_string()]);
             }
         }
@@ -166,11 +171,11 @@ async fn display_dashboard_data(pool: &DatabasePool, queue: &Option<String>) -> 
                 queue_filter
             );
             let rows = sqlx::query(&query).fetch_all(mysql_pool).await?;
-            
+
             for row in rows {
                 let status: String = row.try_get("status")?;
                 let count: i64 = row.try_get("count")?;
-                
+
                 let status_with_icon = match status.as_str() {
                     "pending" => format!("🟡 {}", status),
                     "running" => format!("🔵 {}", status),
@@ -179,7 +184,7 @@ async fn display_dashboard_data(pool: &DatabasePool, queue: &Option<String>) -> 
                     "dead" => format!("💀 {}", status),
                     _ => status,
                 };
-                
+
                 stats_table.add_row(vec![status_with_icon, count.to_string()]);
             }
         }
@@ -206,7 +211,7 @@ async fn display_dashboard_data(pool: &DatabasePool, queue: &Option<String>) -> 
                 let status: String = row.try_get("status")?;
                 let priority: String = row.try_get("priority")?;
                 let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-                
+
                 recent_table.add_row(vec![
                     &id.to_string()[..8],
                     &queue_name,
@@ -224,7 +229,7 @@ async fn display_dashboard_data(pool: &DatabasePool, queue: &Option<String>) -> 
                 let status: String = row.try_get("status")?;
                 let priority: String = row.try_get("priority")?;
                 let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-                
+
                 recent_table.add_row(vec![
                     &id[..8],
                     &queue_name,
@@ -267,15 +272,19 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
         DatabasePool::Postgres(ref pg_pool) => {
             let result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE status = 'running' AND started_at < NOW() - INTERVAL '1 hour'"
-            ).fetch_one(pg_pool).await?;
+                 WHERE status = 'running' AND started_at < NOW() - INTERVAL '1 hour'",
+            )
+            .fetch_one(pg_pool)
+            .await?;
             result.try_get::<i64, _>("count").unwrap_or(0)
         }
         DatabasePool::MySQL(ref mysql_pool) => {
             let result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE status = 'running' AND started_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)"
-            ).fetch_one(mysql_pool).await?;
+                 WHERE status = 'running' AND started_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)",
+            )
+            .fetch_one(mysql_pool)
+            .await?;
             result.try_get::<i64, _>("count").unwrap_or(0)
         }
     };
@@ -294,28 +303,42 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
         DatabasePool::Postgres(ref pg_pool) => {
             let total_result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE created_at > NOW() - INTERVAL '1 hour'"
-            ).fetch_one(pg_pool).await?;
-            
+                 WHERE created_at > NOW() - INTERVAL '1 hour'",
+            )
+            .fetch_one(pg_pool)
+            .await?;
+
             let failed_result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE status = 'failed' AND failed_at > NOW() - INTERVAL '1 hour'"
-            ).fetch_one(pg_pool).await?;
-            
-            (total_result.try_get::<i64, _>("count").unwrap_or(0), failed_result.try_get::<i64, _>("count").unwrap_or(0))
+                 WHERE status = 'failed' AND failed_at > NOW() - INTERVAL '1 hour'",
+            )
+            .fetch_one(pg_pool)
+            .await?;
+
+            (
+                total_result.try_get::<i64, _>("count").unwrap_or(0),
+                failed_result.try_get::<i64, _>("count").unwrap_or(0),
+            )
         }
         DatabasePool::MySQL(ref mysql_pool) => {
             let total_result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)"
-            ).fetch_one(mysql_pool).await?;
-            
+                 WHERE created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)",
+            )
+            .fetch_one(mysql_pool)
+            .await?;
+
             let failed_result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE status = 'failed' AND failed_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)"
-            ).fetch_one(mysql_pool).await?;
-            
-            (total_result.try_get::<i64, _>("count").unwrap_or(0), failed_result.try_get::<i64, _>("count").unwrap_or(0))
+                 WHERE status = 'failed' AND failed_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)",
+            )
+            .fetch_one(mysql_pool)
+            .await?;
+
+            (
+                total_result.try_get::<i64, _>("count").unwrap_or(0),
+                failed_result.try_get::<i64, _>("count").unwrap_or(0),
+            )
         }
     };
 
@@ -352,11 +375,11 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
         _ => {
             let mut table = comfy_table::Table::new();
             table.set_header(vec!["Status", "Check", "Value"]);
-            
+
             for (status, check, value) in health_data {
                 table.add_row(vec![status, check, &value]);
             }
-            
+
             println!("🏥 System Health Check");
             println!("{}", table);
         }
@@ -365,7 +388,11 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
     Ok(())
 }
 
-async fn show_metrics(pool: DatabasePool, period: Option<String>, queue: Option<String>) -> Result<()> {
+async fn show_metrics(
+    pool: DatabasePool,
+    period: Option<String>,
+    queue: Option<String>,
+) -> Result<()> {
     let period_str = period.as_deref().unwrap_or("24h");
     let (pg_interval, mysql_interval) = match period_str {
         "1h" => ("1 hour", "1 HOUR"),
@@ -397,7 +424,9 @@ async fn show_metrics(pool: DatabasePool, period: Option<String>, queue: Option<
                  FROM hammerwork_jobs 
                  WHERE created_at > NOW() - INTERVAL '{}'{}",
                 pg_interval, queue_filter
-            )).fetch_one(&pg_pool).await?;
+            ))
+            .fetch_one(&pg_pool)
+            .await?;
 
             let total: i64 = throughput_result.try_get("total_jobs")?;
             let completed: i64 = throughput_result.try_get("completed_jobs")?;
@@ -405,8 +434,24 @@ async fn show_metrics(pool: DatabasePool, period: Option<String>, queue: Option<
 
             println!("📈 Throughput:");
             println!("   Total Jobs: {}", total);
-            println!("   Completed: {} ({:.1}%)", completed, if total > 0 { (completed as f64 / total as f64) * 100.0 } else { 0.0 });
-            println!("   Failed: {} ({:.1}%)", failed, if total > 0 { (failed as f64 / total as f64) * 100.0 } else { 0.0 });
+            println!(
+                "   Completed: {} ({:.1}%)",
+                completed,
+                if total > 0 {
+                    (completed as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
+            println!(
+                "   Failed: {} ({:.1}%)",
+                failed,
+                if total > 0 {
+                    (failed as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
 
             // Average processing time for completed jobs
             let avg_time_result = sqlx::query(&format!(
@@ -414,9 +459,13 @@ async fn show_metrics(pool: DatabasePool, period: Option<String>, queue: Option<
                  FROM hammerwork_jobs 
                  WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '{}'{}",
                 pg_interval, queue_filter
-            )).fetch_one(&pg_pool).await?;
+            ))
+            .fetch_one(&pg_pool)
+            .await?;
 
-            if let Ok(Some(avg_duration)) = avg_time_result.try_get::<Option<f64>, _>("avg_duration") {
+            if let Ok(Some(avg_duration)) =
+                avg_time_result.try_get::<Option<f64>, _>("avg_duration")
+            {
                 println!("   Avg Processing Time: {:.1}s", avg_duration);
             }
         }
@@ -429,7 +478,9 @@ async fn show_metrics(pool: DatabasePool, period: Option<String>, queue: Option<
                  FROM hammerwork_jobs 
                  WHERE created_at > DATE_SUB(NOW(), INTERVAL {}){}",
                 mysql_interval, queue_filter
-            )).fetch_one(&mysql_pool).await?;
+            ))
+            .fetch_one(&mysql_pool)
+            .await?;
 
             let total: i64 = throughput_result.try_get("total_jobs")?;
             let completed: i64 = throughput_result.try_get("completed_jobs")?;
@@ -437,8 +488,24 @@ async fn show_metrics(pool: DatabasePool, period: Option<String>, queue: Option<
 
             println!("📈 Throughput:");
             println!("   Total Jobs: {}", total);
-            println!("   Completed: {} ({:.1}%)", completed, if total > 0 { (completed as f64 / total as f64) * 100.0 } else { 0.0 });
-            println!("   Failed: {} ({:.1}%)", failed, if total > 0 { (failed as f64 / total as f64) * 100.0 } else { 0.0 });
+            println!(
+                "   Completed: {} ({:.1}%)",
+                completed,
+                if total > 0 {
+                    (completed as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
+            println!(
+                "   Failed: {} ({:.1}%)",
+                failed,
+                if total > 0 {
+                    (failed as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                }
+            );
 
             // Average processing time for completed jobs
             let avg_time_result = sqlx::query(&format!(
@@ -446,9 +513,13 @@ async fn show_metrics(pool: DatabasePool, period: Option<String>, queue: Option<
                  FROM hammerwork_jobs 
                  WHERE status = 'completed' AND completed_at > DATE_SUB(NOW(), INTERVAL {}){}",
                 mysql_interval, queue_filter
-            )).fetch_one(&mysql_pool).await?;
+            ))
+            .fetch_one(&mysql_pool)
+            .await?;
 
-            if let Ok(Some(avg_duration)) = avg_time_result.try_get::<Option<f64>, _>("avg_duration") {
+            if let Ok(Some(avg_duration)) =
+                avg_time_result.try_get::<Option<f64>, _>("avg_duration")
+            {
                 println!("   Avg Processing Time: {:.1}s", avg_duration);
             }
         }
@@ -457,9 +528,14 @@ async fn show_metrics(pool: DatabasePool, period: Option<String>, queue: Option<
     Ok(())
 }
 
-async fn show_logs(_pool: DatabasePool, lines: Option<u32>, queue: Option<String>, follow: bool) -> Result<()> {
+async fn show_logs(
+    _pool: DatabasePool,
+    lines: Option<u32>,
+    queue: Option<String>,
+    follow: bool,
+) -> Result<()> {
     let lines_count = lines.unwrap_or(50);
-    
+
     println!("📜 Job Logs (Placeholder)");
     if let Some(q) = &queue {
         println!("🎯 Queue: {}", q);
@@ -478,11 +554,36 @@ async fn show_logs(_pool: DatabasePool, lines: Option<u32>, queue: Option<String
 
     // Mock log entries
     let mock_logs = vec![
-        ("2024-06-28 10:30:15", "INFO", "emails", "Job 12345678 started processing"),
-        ("2024-06-28 10:30:14", "INFO", "emails", "Job 87654321 completed successfully"),
-        ("2024-06-28 10:30:12", "ERROR", "reports", "Job 11111111 failed: Connection timeout"),
-        ("2024-06-28 10:30:10", "INFO", "notifications", "Job 22222222 enqueued"),
-        ("2024-06-28 10:30:08", "WARN", "emails", "Job 33333333 retry attempt 2/3"),
+        (
+            "2024-06-28 10:30:15",
+            "INFO",
+            "emails",
+            "Job 12345678 started processing",
+        ),
+        (
+            "2024-06-28 10:30:14",
+            "INFO",
+            "emails",
+            "Job 87654321 completed successfully",
+        ),
+        (
+            "2024-06-28 10:30:12",
+            "ERROR",
+            "reports",
+            "Job 11111111 failed: Connection timeout",
+        ),
+        (
+            "2024-06-28 10:30:10",
+            "INFO",
+            "notifications",
+            "Job 22222222 enqueued",
+        ),
+        (
+            "2024-06-28 10:30:08",
+            "WARN",
+            "emails",
+            "Job 33333333 retry attempt 2/3",
+        ),
     ];
 
     for (timestamp, level, log_queue, message) in mock_logs.iter().take(lines_count as usize) {
@@ -499,13 +600,16 @@ async fn show_logs(_pool: DatabasePool, lines: Option<u32>, queue: Option<String
             _ => "📝",
         };
 
-        println!("{} {} [{}] {}: {}", timestamp, level_icon, level, log_queue, message);
+        println!(
+            "{} {} [{}] {}: {}",
+            timestamp, level_icon, level, log_queue, message
+        );
     }
 
     if follow {
         println!("\n👁️  Following logs (Ctrl+C to stop)...");
         println!("💡 This is a placeholder. Real implementation would stream live logs.");
-        
+
         // Simulate following logs
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {

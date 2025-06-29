@@ -1,5 +1,10 @@
 use anyhow::Result;
-use hammerwork::{JobQueue, migrations::{MigrationManager, postgres::PostgresMigrationRunner, mysql::MySqlMigrationRunner}};
+use hammerwork::{
+    JobQueue,
+    migrations::{
+        MigrationManager, mysql::MySqlMigrationRunner, postgres::PostgresMigrationRunner,
+    },
+};
 use sqlx::{MySqlPool, PgPool};
 use tracing::info;
 
@@ -23,17 +28,19 @@ impl DatabasePool {
                 .await?;
             Ok(DatabasePool::MySQL(pool))
         } else {
-            Err(anyhow::anyhow!("Unsupported database URL format. Use postgres:// or mysql://"))
+            Err(anyhow::anyhow!(
+                "Unsupported database URL format. Use postgres:// or mysql://"
+            ))
         }
     }
-    
+
     pub fn create_job_queue(self) -> JobQueueWrapper {
         match self {
             DatabasePool::Postgres(pool) => JobQueueWrapper::Postgres(JobQueue::new(pool)),
             DatabasePool::MySQL(pool) => JobQueueWrapper::MySQL(JobQueue::new(pool)),
         }
     }
-    
+
     pub async fn migrate(&self, drop_tables: bool) -> Result<()> {
         match self {
             DatabasePool::Postgres(pool) => {
@@ -49,7 +56,7 @@ impl DatabasePool {
                         .execute(pool)
                         .await?;
                 }
-                
+
                 info!("Running PostgreSQL migrations...");
                 let runner = Box::new(PostgresMigrationRunner::new(pool.clone()));
                 let manager = MigrationManager::new(runner);
@@ -69,7 +76,7 @@ impl DatabasePool {
                         .execute(pool)
                         .await?;
                 }
-                
+
                 info!("Running MySQL migrations...");
                 let runner = Box::new(MySqlMigrationRunner::new(pool.clone()));
                 let manager = MigrationManager::new(runner);
@@ -85,4 +92,3 @@ pub enum JobQueueWrapper {
     Postgres(JobQueue<sqlx::Postgres>),
     MySQL(JobQueue<sqlx::MySql>),
 }
-

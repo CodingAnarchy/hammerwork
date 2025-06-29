@@ -111,23 +111,30 @@ async fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result
             info!("✅ Set default_queue to: {}", value);
         }
         "default_limit" => {
-            let limit: u32 = value.parse()
+            let limit: u32 = value
+                .parse()
                 .map_err(|_| anyhow::anyhow!("default_limit must be a positive integer"))?;
             config.default_limit = Some(limit);
             info!("✅ Set default_limit to: {}", limit);
         }
         "log_level" => {
-            if !["trace", "debug", "info", "warn", "error"].contains(&value.to_lowercase().as_str()) {
-                return Err(anyhow::anyhow!("log_level must be one of: trace, debug, info, warn, error"));
+            if !["trace", "debug", "info", "warn", "error"].contains(&value.to_lowercase().as_str())
+            {
+                return Err(anyhow::anyhow!(
+                    "log_level must be one of: trace, debug, info, warn, error"
+                ));
             }
             config.log_level = Some(value.to_lowercase());
             info!("✅ Set log_level to: {}", value);
         }
         "connection_pool_size" => {
-            let size: u32 = value.parse()
+            let size: u32 = value
+                .parse()
                 .map_err(|_| anyhow::anyhow!("connection_pool_size must be a positive integer"))?;
             if size == 0 || size > 100 {
-                return Err(anyhow::anyhow!("connection_pool_size must be between 1 and 100"));
+                return Err(anyhow::anyhow!(
+                    "connection_pool_size must be between 1 and 100"
+                ));
             }
             config.connection_pool_size = Some(size);
             info!("✅ Set connection_pool_size to: {}", size);
@@ -149,21 +156,11 @@ async fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result
 
 async fn get_config_value(config: &Config, key: &str) -> Result<()> {
     let value = match key {
-        "database_url" => {
-            config.get_database_url().unwrap_or("Not set").to_string()
-        }
-        "default_queue" => {
-            config.get_default_queue().unwrap_or("Not set").to_string()
-        }
-        "default_limit" => {
-            config.get_default_limit().to_string()
-        }
-        "log_level" => {
-            config.get_log_level().to_string()
-        }
-        "connection_pool_size" => {
-            config.get_connection_pool_size().to_string()
-        }
+        "database_url" => config.get_database_url().unwrap_or("Not set").to_string(),
+        "default_queue" => config.get_default_queue().unwrap_or("Not set").to_string(),
+        "default_limit" => config.get_default_limit().to_string(),
+        "log_level" => config.get_log_level().to_string(),
+        "connection_pool_size" => config.get_connection_pool_size().to_string(),
         _ => {
             return Err(anyhow::anyhow!(
                 "Unknown configuration key: {}. Valid keys: database_url, default_queue, default_limit, log_level, connection_pool_size",
@@ -197,21 +194,24 @@ async fn show_config_path() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Cannot find config directory"))?;
 
     let config_path = config_dir.join("hammerwork").join("config.toml");
-    
+
     println!("📁 Configuration file path:");
     println!("{}", config_path.display());
-    
+
     if config_path.exists() {
         println!("✅ File exists");
-        
+
         // Show file size and modification time
         let metadata = std::fs::metadata(&config_path)?;
         let size = metadata.len();
         let modified = metadata.modified()?;
         let modified_time = chrono::DateTime::<chrono::Utc>::from(modified);
-        
+
         println!("📊 Size: {} bytes", size);
-        println!("📅 Last modified: {}", modified_time.format("%Y-%m-%d %H:%M:%S UTC"));
+        println!(
+            "📅 Last modified: {}",
+            modified_time.format("%Y-%m-%d %H:%M:%S UTC")
+        );
     } else {
         println!("❌ File does not exist (will be created when configuration is saved)");
     }
@@ -221,17 +221,17 @@ async fn show_config_path() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    
+
     #[test]
     fn test_config_command_structure() {
         let commands = vec!["show", "set", "get", "reset", "path"];
-        
+
         for cmd in commands {
             assert!(!cmd.is_empty());
             assert!(cmd.chars().all(|c| c.is_ascii_lowercase()));
         }
     }
-    
+
     #[test]
     fn test_config_key_validation() {
         let valid_keys = vec![
@@ -241,53 +241,55 @@ mod tests {
             "log_level",
             "connection_pool_size",
         ];
-        
+
         for key in valid_keys {
             assert!(is_valid_config_key(key));
         }
-        
-        let invalid_keys = vec![
-            "",
-            "invalid_key",
-            "key with spaces",
-            "key/with/slashes",
-        ];
-        
+
+        let invalid_keys = vec!["", "invalid_key", "key with spaces", "key/with/slashes"];
+
         for key in invalid_keys {
             assert!(!is_valid_config_key(key));
         }
     }
-    
+
     #[test]
     fn test_config_value_validation() {
         // Test database URL values
-        assert!(is_valid_config_value("database_url", "postgres://localhost/db"));
+        assert!(is_valid_config_value(
+            "database_url",
+            "postgres://localhost/db"
+        ));
         assert!(!is_valid_config_value("database_url", "invalid_url"));
-        
+
         // Test log level values
         assert!(is_valid_config_value("log_level", "info"));
         assert!(is_valid_config_value("log_level", "debug"));
         assert!(!is_valid_config_value("log_level", "invalid"));
-        
+
         // Test numeric values
         assert!(is_valid_config_value("default_limit", "100"));
         assert!(is_valid_config_value("connection_pool_size", "5"));
         assert!(!is_valid_config_value("default_limit", "not_a_number"));
     }
-    
+
     fn is_valid_config_key(key: &str) -> bool {
-        matches!(key, 
-            "database_url" | 
-            "default_queue" | 
-            "default_limit" | 
-            "log_level" | 
-            "connection_pool_size"
+        matches!(
+            key,
+            "database_url"
+                | "default_queue"
+                | "default_limit"
+                | "log_level"
+                | "connection_pool_size"
         )
     }
-    
+
     fn is_valid_config_value(key: &str, value: &str) -> bool {
         match key {
-            "database_url" => !value.is_empty() && (value.starts_with("postgres://") || value.starts_with("mysql://")),
+            "database_url" => {
+                !value.is_empty()
+                    && (value.starts_with("postgres://") || value.starts_with("mysql://"))
+            }
             "log_level" => matches!(value, "error" | "warn" | "info" | "debug" | "trace"),
             "default_limit" | "connection_pool_size" => value.parse::<u32>().is_ok(),
             "default_queue" => !value.is_empty() && !value.contains(' '),

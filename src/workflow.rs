@@ -4,7 +4,7 @@
 //! Jobs can depend on other jobs completing successfully before they are executed,
 //! enabling complex data pipelines and business workflows.
 
-use crate::{Job, JobId, Result, HammerworkError};
+use crate::{HammerworkError, Job, JobId, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -38,7 +38,7 @@ impl DependencyStatus {
         match self {
             Self::None => "none",
             Self::Waiting => "waiting",
-            Self::Satisfied => "satisfied", 
+            Self::Satisfied => "satisfied",
             Self::Failed => "failed",
         }
     }
@@ -50,10 +50,9 @@ impl DependencyStatus {
             "waiting" => Ok(Self::Waiting),
             "satisfied" => Ok(Self::Satisfied),
             "failed" => Ok(Self::Failed),
-            _ => Err(HammerworkError::Workflow { message: format!(
-                "Invalid dependency status: {}",
-                s
-            ) }),
+            _ => Err(HammerworkError::Workflow {
+                message: format!("Invalid dependency status: {}", s),
+            }),
         }
     }
 }
@@ -95,10 +94,9 @@ impl WorkflowStatus {
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
-            _ => Err(HammerworkError::Workflow { message: format!(
-                "Invalid workflow status: {}",
-                s
-            ) }),
+            _ => Err(HammerworkError::Workflow {
+                message: format!("Invalid workflow status: {}", s),
+            }),
         }
     }
 }
@@ -136,10 +134,9 @@ impl FailurePolicy {
             "fail_fast" => Ok(Self::FailFast),
             "continue_on_failure" => Ok(Self::ContinueOnFailure),
             "manual" => Ok(Self::Manual),
-            _ => Err(HammerworkError::Workflow { message: format!(
-                "Invalid failure policy: {}",
-                s
-            ) }),
+            _ => Err(HammerworkError::Workflow {
+                message: format!("Invalid failure policy: {}", s),
+            }),
         }
     }
 }
@@ -332,7 +329,7 @@ impl JobGroup {
     /// ```
     pub fn then(mut self, mut job: Job) -> Self {
         let dependencies: Vec<JobId> = self.jobs.iter().map(|j| j.id).collect();
-        
+
         job.workflow_id = Some(self.id);
         job.workflow_name = Some(self.name.clone());
         job.depends_on = dependencies.clone();
@@ -416,15 +413,14 @@ impl JobGroup {
     /// ```
     pub fn validate(&self) -> Result<()> {
         let job_ids: HashSet<JobId> = self.jobs.iter().map(|j| j.id).collect();
-        
+
         // Check that all dependency references are valid
         for job in &self.jobs {
             for dep_id in &job.depends_on {
                 if !job_ids.contains(dep_id) {
-                    return Err(HammerworkError::Workflow { message: format!(
-                        "Job {} depends on non-existent job {}",
-                        job.id, dep_id
-                    ) });
+                    return Err(HammerworkError::Workflow {
+                        message: format!("Job {} depends on non-existent job {}", job.id, dep_id),
+                    });
                 }
             }
         }
@@ -443,7 +439,7 @@ impl JobGroup {
         for job in &self.jobs {
             if !visited.contains(&job.id) {
                 if self.has_cycle_dfs(job.id, &mut visited, &mut rec_stack)? {
-                    return Err(HammerworkError::Workflow { 
+                    return Err(HammerworkError::Workflow {
                         message: "Circular dependency detected in workflow".to_string(),
                     });
                 }
@@ -513,12 +509,7 @@ impl JobGroup {
         self.completed_jobs = self
             .jobs
             .iter()
-            .filter(|job| {
-                matches!(
-                    job.status,
-                    crate::JobStatus::Completed
-                )
-            })
+            .filter(|job| matches!(job.status, crate::JobStatus::Completed))
             .count();
 
         self.failed_jobs = self
@@ -559,11 +550,23 @@ mod tests {
         assert_eq!(DependencyStatus::Satisfied.as_str(), "satisfied");
         assert_eq!(DependencyStatus::Failed.as_str(), "failed");
 
-        assert_eq!(DependencyStatus::from_str("none").unwrap(), DependencyStatus::None);
-        assert_eq!(DependencyStatus::from_str("waiting").unwrap(), DependencyStatus::Waiting);
-        assert_eq!(DependencyStatus::from_str("satisfied").unwrap(), DependencyStatus::Satisfied);
-        assert_eq!(DependencyStatus::from_str("failed").unwrap(), DependencyStatus::Failed);
-        
+        assert_eq!(
+            DependencyStatus::from_str("none").unwrap(),
+            DependencyStatus::None
+        );
+        assert_eq!(
+            DependencyStatus::from_str("waiting").unwrap(),
+            DependencyStatus::Waiting
+        );
+        assert_eq!(
+            DependencyStatus::from_str("satisfied").unwrap(),
+            DependencyStatus::Satisfied
+        );
+        assert_eq!(
+            DependencyStatus::from_str("failed").unwrap(),
+            DependencyStatus::Failed
+        );
+
         assert!(DependencyStatus::from_str("invalid").is_err());
     }
 
@@ -574,24 +577,48 @@ mod tests {
         assert_eq!(WorkflowStatus::Failed.as_str(), "failed");
         assert_eq!(WorkflowStatus::Cancelled.as_str(), "cancelled");
 
-        assert_eq!(WorkflowStatus::from_str("running").unwrap(), WorkflowStatus::Running);
-        assert_eq!(WorkflowStatus::from_str("completed").unwrap(), WorkflowStatus::Completed);
-        assert_eq!(WorkflowStatus::from_str("failed").unwrap(), WorkflowStatus::Failed);
-        assert_eq!(WorkflowStatus::from_str("cancelled").unwrap(), WorkflowStatus::Cancelled);
-        
+        assert_eq!(
+            WorkflowStatus::from_str("running").unwrap(),
+            WorkflowStatus::Running
+        );
+        assert_eq!(
+            WorkflowStatus::from_str("completed").unwrap(),
+            WorkflowStatus::Completed
+        );
+        assert_eq!(
+            WorkflowStatus::from_str("failed").unwrap(),
+            WorkflowStatus::Failed
+        );
+        assert_eq!(
+            WorkflowStatus::from_str("cancelled").unwrap(),
+            WorkflowStatus::Cancelled
+        );
+
         assert!(WorkflowStatus::from_str("invalid").is_err());
     }
 
     #[test]
     fn test_failure_policy_conversion() {
         assert_eq!(FailurePolicy::FailFast.as_str(), "fail_fast");
-        assert_eq!(FailurePolicy::ContinueOnFailure.as_str(), "continue_on_failure");
+        assert_eq!(
+            FailurePolicy::ContinueOnFailure.as_str(),
+            "continue_on_failure"
+        );
         assert_eq!(FailurePolicy::Manual.as_str(), "manual");
 
-        assert_eq!(FailurePolicy::from_str("fail_fast").unwrap(), FailurePolicy::FailFast);
-        assert_eq!(FailurePolicy::from_str("continue_on_failure").unwrap(), FailurePolicy::ContinueOnFailure);
-        assert_eq!(FailurePolicy::from_str("manual").unwrap(), FailurePolicy::Manual);
-        
+        assert_eq!(
+            FailurePolicy::from_str("fail_fast").unwrap(),
+            FailurePolicy::FailFast
+        );
+        assert_eq!(
+            FailurePolicy::from_str("continue_on_failure").unwrap(),
+            FailurePolicy::ContinueOnFailure
+        );
+        assert_eq!(
+            FailurePolicy::from_str("manual").unwrap(),
+            FailurePolicy::Manual
+        );
+
         assert!(FailurePolicy::from_str("invalid").is_err());
     }
 
@@ -609,11 +636,14 @@ mod tests {
     fn test_add_job() {
         let job = Job::new("test_queue".to_string(), json!({"data": "test"}));
         let workflow = JobGroup::new("test_workflow").add_job(job.clone());
-        
+
         assert_eq!(workflow.jobs.len(), 1);
         assert_eq!(workflow.total_jobs, 1);
         assert_eq!(workflow.jobs[0].workflow_id, Some(workflow.id));
-        assert_eq!(workflow.jobs[0].workflow_name, Some("test_workflow".to_string()));
+        assert_eq!(
+            workflow.jobs[0].workflow_name,
+            Some("test_workflow".to_string())
+        );
     }
 
     #[test]
@@ -623,12 +653,12 @@ mod tests {
             Job::new("queue2".to_string(), json!({"data": "2"})),
             Job::new("queue3".to_string(), json!({"data": "3"})),
         ];
-        
+
         let workflow = JobGroup::new("parallel_workflow").add_parallel_jobs(jobs);
-        
+
         assert_eq!(workflow.jobs.len(), 3);
         assert_eq!(workflow.total_jobs, 3);
-        
+
         // All jobs should have the workflow ID set
         for job in &workflow.jobs {
             assert_eq!(job.workflow_id, Some(workflow.id));
@@ -641,17 +671,17 @@ mod tests {
         let job1 = Job::new("step1".to_string(), json!({"step": 1}));
         let job2 = Job::new("step2".to_string(), json!({"step": 2}));
         let final_job = Job::new("final".to_string(), json!({"step": "final"}));
-        
+
         let job1_id = job1.id;
         let job2_id = job2.id;
-        
+
         let workflow = JobGroup::new("sequential_workflow")
             .add_job(job1)
             .add_job(job2)
             .then(final_job);
-        
+
         assert_eq!(workflow.jobs.len(), 3);
-        
+
         // The final job should depend on both previous jobs
         let final_job = &workflow.jobs[2];
         assert_eq!(final_job.depends_on.len(), 2);
@@ -664,11 +694,9 @@ mod tests {
     fn test_workflow_validation() {
         let job1 = Job::new("step1".to_string(), json!({}));
         let job2 = Job::new("step2".to_string(), json!({}));
-        
-        let workflow = JobGroup::new("valid_workflow")
-            .add_job(job1)
-            .then(job2);
-        
+
+        let workflow = JobGroup::new("valid_workflow").add_job(job1).then(job2);
+
         assert!(workflow.validate().is_ok());
     }
 
@@ -676,11 +704,9 @@ mod tests {
     fn test_get_ready_jobs() {
         let job1 = Job::new("independent".to_string(), json!({}));
         let job2 = Job::new("dependent".to_string(), json!({}));
-        
-        let workflow = JobGroup::new("test_workflow")
-            .add_job(job1)
-            .then(job2);
-        
+
+        let workflow = JobGroup::new("test_workflow").add_job(job1).then(job2);
+
         let ready_jobs = workflow.get_ready_jobs();
         assert_eq!(ready_jobs.len(), 1);
         assert_eq!(ready_jobs[0].queue_name, "independent");
@@ -692,10 +718,9 @@ mod tests {
             "owner": "data_team",
             "environment": "test"
         });
-        
-        let workflow = JobGroup::new("metadata_workflow")
-            .with_metadata(metadata.clone());
-        
+
+        let workflow = JobGroup::new("metadata_workflow").with_metadata(metadata.clone());
+
         assert_eq!(workflow.metadata, metadata);
     }
 
@@ -703,7 +728,7 @@ mod tests {
     fn test_workflow_with_failure_policy() {
         let workflow = JobGroup::new("resilient_workflow")
             .with_failure_policy(FailurePolicy::ContinueOnFailure);
-        
+
         assert_eq!(workflow.failure_policy, FailurePolicy::ContinueOnFailure);
     }
 }
