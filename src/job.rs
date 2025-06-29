@@ -314,6 +314,14 @@ pub struct Job {
     pub workflow_id: Option<crate::workflow::WorkflowId>,
     /// Name of the workflow this job belongs to (if any).
     pub workflow_name: Option<String>,
+    /// Distributed trace identifier for cross-service tracing.
+    pub trace_id: Option<String>,
+    /// Business correlation identifier for grouping related operations.
+    pub correlation_id: Option<String>,
+    /// Parent span identifier for hierarchical tracing.
+    pub parent_span_id: Option<String>,
+    /// Serialized span context for trace propagation.
+    pub span_context: Option<String>,
 }
 
 impl Job {
@@ -383,6 +391,10 @@ impl Job {
             dependency_status: crate::workflow::DependencyStatus::None,
             workflow_id: None,
             workflow_name: None,
+            trace_id: None,
+            correlation_id: None,
+            parent_span_id: None,
+            span_context: None,
         }
     }
 
@@ -457,6 +469,10 @@ impl Job {
             dependency_status: crate::workflow::DependencyStatus::None,
             workflow_id: None,
             workflow_name: None,
+            trace_id: None,
+            correlation_id: None,
+            parent_span_id: None,
+            span_context: None,
         }
     }
 
@@ -805,6 +821,10 @@ impl Job {
             dependency_status: crate::workflow::DependencyStatus::None,
             workflow_id: None,
             workflow_name: None,
+            trace_id: None,
+            correlation_id: None,
+            parent_span_id: None,
+            span_context: None,
         })
     }
 
@@ -1340,6 +1360,195 @@ impl Job {
     /// ```
     pub fn dependent_count(&self) -> usize {
         self.dependents.len()
+    }
+
+    /// Sets the distributed trace identifier for this job.
+    ///
+    /// The trace ID is used to track jobs across service boundaries in distributed
+    /// systems. All related operations should share the same trace ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `trace_id` - The distributed trace identifier
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("service_call".to_string(), json!({"data": "test"}))
+    ///     .with_trace_id("trace-123-456");
+    ///
+    /// assert_eq!(job.trace_id, Some("trace-123-456".to_string()));
+    /// ```
+    pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self
+    }
+
+    /// Sets the business correlation identifier for this job.
+    ///
+    /// The correlation ID groups related business operations together, even if they
+    /// span multiple traces or services. Use this to correlate jobs that process
+    /// the same business entity or workflow.
+    ///
+    /// # Arguments
+    ///
+    /// * `correlation_id` - The business correlation identifier
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("order_processing".to_string(), json!({"order_id": 12345}))
+    ///     .with_correlation_id("order-12345");
+    ///
+    /// assert_eq!(job.correlation_id, Some("order-12345".to_string()));
+    /// ```
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = Some(correlation_id.into());
+        self
+    }
+
+    /// Sets the parent span identifier for hierarchical tracing.
+    ///
+    /// Use this to create a parent-child relationship between spans, enabling
+    /// hierarchical trace visualization in tracing systems.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_span_id` - The parent span identifier
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("child_task".to_string(), json!({"data": "test"}))
+    ///     .with_parent_span_id("span-parent-123");
+    ///
+    /// assert_eq!(job.parent_span_id, Some("span-parent-123".to_string()));
+    /// ```
+    pub fn with_parent_span_id(mut self, parent_span_id: impl Into<String>) -> Self {
+        self.parent_span_id = Some(parent_span_id.into());
+        self
+    }
+
+    /// Sets the serialized span context for trace propagation.
+    ///
+    /// The span context contains all the information needed to propagate tracing
+    /// across service boundaries. This is typically a serialized representation
+    /// of the current span context.
+    ///
+    /// # Arguments
+    ///
+    /// * `span_context` - The serialized span context
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("distributed_task".to_string(), json!({"data": "test"}))
+    ///     .with_span_context("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    ///
+    /// assert_eq!(job.span_context, Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string()));
+    /// ```
+    pub fn with_span_context(mut self, span_context: impl Into<String>) -> Self {
+        self.span_context = Some(span_context.into());
+        self
+    }
+
+    /// Convenience method to set both trace ID and correlation ID.
+    ///
+    /// This is useful when the trace ID and correlation ID are the same,
+    /// which is common in simple tracing scenarios.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The identifier to use for both trace and correlation
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("task".to_string(), json!({"data": "test"}))
+    ///     .with_tracing_id("unified-id-123");
+    ///
+    /// assert_eq!(job.trace_id, Some("unified-id-123".to_string()));
+    /// assert_eq!(job.correlation_id, Some("unified-id-123".to_string()));
+    /// ```
+    pub fn with_tracing_id(mut self, id: impl Into<String>) -> Self {
+        let id_string = id.into();
+        self.trace_id = Some(id_string.clone());
+        self.correlation_id = Some(id_string);
+        self
+    }
+
+    /// Checks if this job has any tracing information.
+    ///
+    /// Returns `true` if any of the tracing fields (trace_id, correlation_id,
+    /// parent_span_id, or span_context) are set.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job1 = Job::new("untraced".to_string(), json!({}));
+    /// assert!(!job1.has_tracing_info());
+    ///
+    /// let job2 = Job::new("traced".to_string(), json!({}))
+    ///     .with_trace_id("trace-123");
+    /// assert!(job2.has_tracing_info());
+    /// ```
+    pub fn has_tracing_info(&self) -> bool {
+        self.trace_id.is_some()
+            || self.correlation_id.is_some()
+            || self.parent_span_id.is_some()
+            || self.span_context.is_some()
+    }
+
+    /// Gets the trace ID if available.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("test".to_string(), json!({}))
+    ///     .with_trace_id("trace-123");
+    ///
+    /// assert_eq!(job.get_trace_id(), Some("trace-123"));
+    /// ```
+    pub fn get_trace_id(&self) -> Option<&str> {
+        self.trace_id.as_deref()
+    }
+
+    /// Gets the correlation ID if available.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("test".to_string(), json!({}))
+    ///     .with_correlation_id("corr-456");
+    ///
+    /// assert_eq!(job.get_correlation_id(), Some("corr-456"));
+    /// ```
+    pub fn get_correlation_id(&self) -> Option<&str> {
+        self.correlation_id.as_deref()
     }
 }
 

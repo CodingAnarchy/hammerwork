@@ -4,6 +4,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 ## Features
 
+- **🔍 Job Tracing & Correlation**: Comprehensive distributed tracing with OpenTelemetry integration, trace IDs, correlation IDs, and lifecycle event hooks
 - **🔗 Job Dependencies & Workflows**: Create complex data processing pipelines with job dependencies, sequential chains, and parallel processing with synchronization barriers
 - **Multi-database support**: PostgreSQL and MySQL backends with optimized dependency queries
 - **Advanced retry strategies**: Exponential backoff, linear, Fibonacci, and custom retry patterns with jitter
@@ -24,15 +25,18 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "1.0", features = ["postgres"] }
+hammerwork = { version = "1.2", features = ["postgres"] }
 # or
-hammerwork = { version = "1.0", features = ["mysql"] }
+hammerwork = { version = "1.2", features = ["mysql"] }
+
+# With distributed tracing
+hammerwork = { version = "1.2", features = ["postgres", "tracing"] }
 
 # Minimal installation
-hammerwork = { version = "1.0", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.2", features = ["postgres"], default-features = false }
 ```
 
-**Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default)
+**Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `tracing` (optional)
 
 ## Quick Start
 
@@ -41,6 +45,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 ## Documentation
 
 - **[Quick Start Guide](docs/quick-start.md)** - Get started with PostgreSQL and MySQL
+- **[Job Tracing & Correlation](docs/tracing.md)** - Distributed tracing, correlation IDs, and OpenTelemetry integration
 - **[Job Dependencies & Workflows](docs/workflows.md)** - Complex pipelines, job dependencies, and orchestration
 - **[Job Types & Configuration](docs/job-types.md)** - Job creation, priorities, timeouts, cron jobs
 - **[Worker Configuration](docs/worker-configuration.md)** - Worker setup, rate limiting, statistics
@@ -126,6 +131,83 @@ queue.enqueue_workflow(workflow).await?;
 
 Jobs will only execute when their dependencies are satisfied, enabling sophisticated data processing pipelines and business workflows.
 
+## Tracing Example
+
+Enable comprehensive distributed tracing with OpenTelemetry integration:
+
+```rust
+use hammerwork::{Job, Worker, tracing::{TracingConfig, init_tracing}, queue::DatabaseQueue};
+use serde_json::json;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize distributed tracing
+    let tracing_config = TracingConfig::new()
+        .with_service_name("job-processor")
+        .with_service_version("1.0.0")
+        .with_environment("production")
+        .with_otlp_endpoint("http://jaeger:4317");
+    
+    init_tracing(tracing_config).await?;
+
+    let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
+    let queue = Arc::new(JobQueue::new(pool));
+
+    // Create traced jobs with correlation for business workflows
+    let trace_id = "trace-12345";
+    let correlation_id = "order-67890";
+    
+    let payment_job = Job::new("payment_queue".to_string(), json!({
+        "order_id": "67890",
+        "amount": 299.99
+    }))
+    .with_trace_id(trace_id)
+    .with_correlation_id(correlation_id);
+    
+    let email_job = Job::new("email_queue".to_string(), json!({
+        "order_id": "67890", 
+        "template": "order_confirmation"
+    }))
+    .with_trace_id(trace_id)
+    .with_correlation_id(correlation_id)
+    .depends_on(&payment_job.id);
+
+    // Worker with lifecycle event hooks for observability
+    let handler = Arc::new(|job: Job| Box::pin(async move {
+        println!("Processing: {:?}", job.payload);
+        // Your business logic here
+        Ok(())
+    }));
+
+    let worker = Worker::new(queue.clone(), "payment_queue".to_string(), handler)
+        .on_job_start(|event| {
+            println!("Job {} started (trace: {}, correlation: {})", 
+                event.job.id,
+                event.job.trace_id.unwrap_or_default(),
+                event.job.correlation_id.unwrap_or_default());
+        })
+        .on_job_complete(|event| {
+            println!("Job {} completed in {:?}", 
+                event.job.id, 
+                event.duration.unwrap_or_default());
+        })
+        .on_job_fail(|event| {
+            eprintln!("Job {} failed: {}", 
+                event.job.id, 
+                event.error.unwrap_or_default());
+        });
+
+    // Enqueue jobs - they'll be automatically traced
+    queue.enqueue(payment_job).await?;
+    queue.enqueue(email_job).await?;
+
+    Ok(())
+}
+```
+
+This enables end-to-end tracing across your entire job processing pipeline with automatic span creation, correlation tracking, and integration with observability platforms like Jaeger, Zipkin, or DataDog.
+
 ## Database Setup
 
 ### Using Migrations (Recommended)
@@ -160,12 +242,12 @@ queue.enqueue(job).await?;
 ### Database Schema
 
 Hammerwork uses optimized tables with comprehensive indexing:
-- **`hammerwork_jobs`** - Main job table with priorities, timeouts, cron scheduling, retry strategies, and result storage
+- **`hammerwork_jobs`** - Main job table with priorities, timeouts, cron scheduling, retry strategies, result storage, and distributed tracing fields
 - **`hammerwork_batches`** - Batch metadata and tracking (v0.7.0+)
 - **`hammerwork_job_results`** - Job result storage with TTL and expiration (v0.8.0+)
 - **`hammerwork_migrations`** - Migration tracking for schema evolution
 
-The schema supports all features including job prioritization, advanced retry strategies, timeouts, cron scheduling, batch processing, result storage with TTL, worker autoscaling, and comprehensive lifecycle tracking. See [Database Migrations](docs/migrations.md) for details.
+The schema supports all features including job prioritization, advanced retry strategies, timeouts, cron scheduling, batch processing, result storage with TTL, distributed tracing with trace/correlation IDs, worker autoscaling, and comprehensive lifecycle tracking. See [Database Migrations](docs/migrations.md) for details.
 
 ## Development
 
@@ -194,6 +276,7 @@ Working examples in `examples/`:
 - `retry_strategies.rs` - Advanced retry patterns with exponential backoff and jitter
 - `result_storage_example.rs` - Job result storage and retrieval
 - `autoscaling_example.rs` - Dynamic worker pool scaling based on queue depth
+- `tracing_example.rs` - Distributed tracing with OpenTelemetry and event hooks
 
 ```bash
 cargo run --example postgres_example --features postgres

@@ -5,6 +5,79 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2025-06-29
+
+### Added
+- **🔍 Job Tracing & Correlation** - Comprehensive distributed tracing system for production observability
+  - **Core Tracing Fields**: Added `trace_id`, `correlation_id`, `parent_span_id`, and `span_context` fields to Job struct
+  - **Database Migrations**: New migration 009_add_tracing for PostgreSQL and MySQL with optimized indexes for trace/correlation ID lookups
+  - **Job Builder Methods**: Added `.with_trace_id()`, `.with_correlation_id()`, `.with_parent_span_id()`, and `.with_span_context()` for easy job tracing configuration
+  - **TraceId and CorrelationId Types**: New strongly-typed identifiers with generation, conversion, and validation methods
+  - **OpenTelemetry Integration**: Feature-gated OpenTelemetry support with OTLP export to Jaeger, Zipkin, DataDog, etc.
+  - **TracingConfig**: Complete OpenTelemetry configuration with service metadata, resource attributes, and endpoint configuration
+  - **Automatic Span Creation**: `create_job_span()` function creates spans with rich job metadata and trace context propagation
+  - **Span Context Management**: `set_job_trace_context()` for extracting and storing trace context from OpenTelemetry spans
+
+- **🎯 Worker Event Hooks** - Lifecycle event system for custom tracing and monitoring integration
+  - **JobHookEvent**: Event data structure with job metadata, timestamps, duration, and error information
+  - **JobEventHooks**: Configurable lifecycle callbacks for job start, completion, failure, timeout, and retry events
+  - **Builder Pattern**: Convenient `.on_job_start()`, `.on_job_complete()`, `.on_job_fail()`, `.on_job_timeout()`, `.on_job_retry()` methods
+  - **Worker Integration**: Event hooks integrated into job processing pipeline with automatic event firing
+  - **Automatic Span Management**: OpenTelemetry spans automatically created and updated throughout job lifecycle
+
+- **⚡ Production-Ready Tracing Infrastructure**
+  - **Feature Gated**: All tracing functionality behind optional `tracing` feature flag for minimal overhead
+  - **Backward Compatible**: Existing jobs and workers continue working unchanged
+  - **Database Optimized**: Indexed trace and correlation ID columns for efficient querying
+  - **OpenTelemetry Standards**: Full OTLP support with configurable exporters and sampling
+  - **Span Attributes**: Rich span metadata including job ID, queue name, priority, status, and custom business data
+  - **Error Tracking**: Automatic span status updates for success, failure, and timeout scenarios
+
+- **🧪 Comprehensive Testing** - 177 total tests including 22 new tracing-specific tests
+  - **Unit Tests**: Complete coverage of TraceId, CorrelationId, TracingConfig, and span creation functionality
+  - **Integration Tests**: Event hook testing with realistic job processing scenarios
+  - **Feature Testing**: Validation of tracing feature flag behavior and optional inclusion
+  - **Span Testing**: OpenTelemetry span creation and attribute validation
+
+### Enhanced
+- **📖 Documentation Updates**
+  - **README.md**: Added Job Tracing & Correlation feature to main features list with comprehensive example
+  - **Installation Guide**: Updated to show tracing feature installation options
+  - **Tracing Example**: Complete OpenTelemetry setup example with worker event hooks and correlation tracking
+  - **Feature Flags**: Updated to include `tracing` (optional) feature flag documentation
+  - **Database Schema**: Updated schema documentation to mention distributed tracing fields
+
+- **🗺️ ROADMAP.md**: Removed completed "Job Tracing & Correlation" feature from Phase 1 priorities
+
+### Technical Implementation
+- **OpenTelemetry Dependencies**: Added feature-gated dependencies: `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `tracing-opentelemetry`
+- **Async Integration**: Full async/await support with tokio runtime integration
+- **Memory Efficient**: Trace context stored as optional strings with minimal memory overhead
+- **Type Safety**: Strongly typed trace and correlation IDs with comprehensive validation
+- **Database Agnostic**: Tracing works identically across PostgreSQL and MySQL backends
+- **Export Support**: OTLP export to all major observability platforms (Jaeger, Zipkin, DataDog, New Relic, etc.)
+
+### Usage Example
+```rust
+// Initialize tracing
+let config = TracingConfig::new()
+    .with_service_name("job-processor")
+    .with_otlp_endpoint("http://jaeger:4317");
+init_tracing(config).await?;
+
+// Create traced jobs  
+let job = Job::new("email_queue".to_string(), json!({"to": "user@example.com"}))
+    .with_trace_id("trace-123")
+    .with_correlation_id("order-456");
+
+// Worker with event hooks
+let worker = Worker::new(queue, "email_queue".to_string(), handler)
+    .on_job_start(|event| { /* custom tracing logic */ })
+    .on_job_complete(|event| { /* success tracking */ });
+```
+
+This release provides comprehensive distributed tracing capabilities essential for debugging and monitoring job processing in production distributed systems.
+
 ## [1.1.0] - 2025-06-29
 
 ### Added

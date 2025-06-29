@@ -48,6 +48,10 @@ pub(crate) struct JobRow {
     pub dependency_status: Option<String>,
     pub workflow_id: Option<String>,
     pub workflow_name: Option<String>,
+    pub trace_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub parent_span_id: Option<String>,
+    pub span_context: Option<String>,
 }
 
 impl JobRow {
@@ -116,6 +120,10 @@ impl JobRow {
                 .map(|s| uuid::Uuid::parse_str(&s))
                 .transpose()?,
             workflow_name: self.workflow_name,
+            trace_id: self.trace_id,
+            correlation_id: self.correlation_id,
+            parent_span_id: self.parent_span_id,
+            span_context: self.span_context,
         })
     }
 }
@@ -174,6 +182,10 @@ impl DeadJobRow {
             dependency_status: crate::workflow::DependencyStatus::None,
             workflow_id: None,
             workflow_name: None,
+            trace_id: None,
+            correlation_id: None,
+            parent_span_id: None,
+            span_context: None,
         })
     }
 }
@@ -186,8 +198,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         sqlx::query(
             r#"
             INSERT INTO hammerwork_jobs 
-            (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#
         )
         .bind(job.id.to_string())
@@ -222,6 +234,10 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         .bind(job.dependency_status.as_str())
         .bind(job.workflow_id.map(|id| id.to_string()))
         .bind(&job.workflow_name)
+        .bind(&job.trace_id)
+        .bind(&job.correlation_id)
+        .bind(&job.parent_span_id)
+        .bind(&job.span_context)
         .execute(&self.pool)
         .await?;
 
@@ -429,7 +445,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name FROM hammerwork_jobs WHERE id = ?"
+            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context FROM hammerwork_jobs WHERE id = ?"
         )
         .bind(job_id.to_string())
         .fetch_optional(&self.pool)
@@ -592,7 +608,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name FROM hammerwork_jobs WHERE batch_id = ? ORDER BY created_at ASC"
+            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context FROM hammerwork_jobs WHERE batch_id = ? ORDER BY created_at ASC"
         )
         .bind(batch_id.to_string())
         .fetch_all(&self.pool)
@@ -1013,7 +1029,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name FROM hammerwork_jobs WHERE queue_name = ? AND recurring = TRUE ORDER BY next_run_at ASC"
+            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context FROM hammerwork_jobs WHERE queue_name = ? AND recurring = TRUE ORDER BY next_run_at ASC"
         )
         .bind(queue_name)
         .fetch_all(&self.pool)

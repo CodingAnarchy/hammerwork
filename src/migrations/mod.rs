@@ -319,5 +319,19 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("008_add_result_config.postgres.sql").to_string(),
             include_str!("008_add_result_config.mysql.sql").to_string(),
         );
+
+        // Migration 009: Add job tracing and correlation support
+        self.register_migration(
+            Migration {
+                id: "009_add_tracing".to_string(),
+                description: "Add distributed tracing and correlation fields".to_string(),
+                version: 9,
+                created_at: chrono::DateTime::parse_from_rfc3339("2025-09-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("009_add_tracing.postgres.sql").to_string(),
+            include_str!("009_add_tracing.mysql.sql").to_string(),
+        );
     }
 }

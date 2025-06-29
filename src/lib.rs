@@ -108,6 +108,7 @@ pub mod queue;
 pub mod rate_limit;
 pub mod retry;
 pub mod stats;
+pub mod tracing;
 pub mod worker;
 pub mod workflow;
 
@@ -131,8 +132,8 @@ pub use stats::{
     DeadJobSummary, InMemoryStatsCollector, JobStatistics, QueueStats, StatisticsCollector,
 };
 pub use worker::{
-    AutoscaleConfig, AutoscaleMetrics, BatchProcessingStats, JobHandler, JobHandlerWithResult,
-    JobResult, Worker, WorkerPool,
+    AutoscaleConfig, AutoscaleMetrics, BatchProcessingStats, JobEventHooks, JobHandler,
+    JobHandlerWithResult, JobHookEvent, JobResult, Worker, WorkerPool,
 };
 pub use workflow::{DependencyStatus, FailurePolicy, JobGroup, WorkflowId, WorkflowStatus};
 
@@ -141,6 +142,13 @@ pub use metrics::{MetricsConfig, PrometheusMetricsCollector};
 
 #[cfg(feature = "alerting")]
 pub use alerting::{Alert, AlertManager, AlertSeverity, AlertTarget, AlertType, AlertingConfig};
+
+pub use tracing::{CorrelationId, TraceId};
+
+#[cfg(feature = "tracing")]
+pub use tracing::{
+    TracingConfig, create_job_span, init_tracing, set_job_trace_context, shutdown_tracing,
+};
 
 /// Convenient type alias for Results with [`HammerworkError`] as the error type.
 ///

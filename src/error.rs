@@ -37,6 +37,9 @@ pub enum HammerworkError {
 
     #[error("Workflow error: {message}")]
     Workflow { message: String },
+
+    #[error("Tracing error: {message}")]
+    Tracing { message: String },
 }
 
 #[cfg(test)]

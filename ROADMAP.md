@@ -2,59 +2,8 @@
 
 This roadmap outlines planned features for Hammerwork, prioritized by impact level and implementation complexity. Features are organized into phases based on their value proposition to users and estimated development effort.
 
-## ✅ Completed Features
-
-### 🔗 Job Dependencies & Workflows
-**Impact: Very High** | **Complexity: High** | **Status: ✅ COMPLETED**
-
-**Game-changing feature for complex data processing pipelines and business workflows.**
-
-✅ **Core Implementation Complete:**
-- Job dependency tracking with `depends_on()` and `depends_on_jobs()` methods
-- `JobGroup` workflow orchestration with sequential and parallel job execution
-- Dependency graph validation with cycle detection
-- Database schema with dependency fields for PostgreSQL and MySQL
-- Dependency-aware job polling (only executes jobs with satisfied dependencies)
-- Failure policy configuration (`FailFast`, `ContinueOnFailure`, `Manual`)
-
-```rust
-// Sequential job chains
-let job1 = Job::new("process_data".to_string(), data1);
-let job2 = Job::new("transform_data".to_string(), data2)
-    .depends_on(&job1.id);
-let job3 = Job::new("export_data".to_string(), data3)
-    .depends_on(&job2.id);
-
-// Parallel job groups with barriers
-let job_group = JobGroup::new("data_pipeline")
-    .add_parallel_jobs(vec![job_a, job_b, job_c])
-    .then(final_job); // Runs after all parallel jobs complete
-```
-
-🚧 **Remaining Work:** Full workflow method implementations, completion triggers, and CLI integration.
-
 ## Phase 1: High Impact, Medium-High Complexity
 *Features that provide significant value but require more substantial implementation effort*
-
-### 🔍 Job Tracing & Correlation
-**Impact: High** | **Complexity: Medium-High** | **Priority: Medium-High**
-
-Essential for debugging and monitoring in distributed systems.
-
-```rust
-// Distributed tracing support
-let job = Job::new("process_order".to_string(), order_data)
-    .with_trace_id("trace-123")
-    .with_correlation_id("order-456")
-    .with_span_context(span_context);
-
-// Job lifecycle events
-worker.on_job_start(|job| tracing::info!("Job started: {}", job.id));
-worker.on_job_complete(|job, duration| {
-    metrics::histogram!("job.duration", duration, "queue" => job.queue_name);
-});
-```
-
 
 ### 🌐 Admin Dashboard & CLI Tools
 **Impact: High** | **Complexity: Medium-High** | **Priority: Medium**
@@ -240,8 +189,7 @@ Features are ordered within each phase by priority and should generally be imple
 
 **Phase 1 (Advanced Features) - CURRENT PRIORITIES**
 1. Job Dependencies & Workflows
-2. Job Tracing & Correlation
-3. Admin Dashboard & CLI Tools
+2. Admin Dashboard & CLI Tools
 
 **Phase 2 (Operational Features)**
 1. Job Archiving & Retention
