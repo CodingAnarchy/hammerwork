@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2025-06-29
 
 ### Added
 - **🎨 Comprehensive CLI Workflow Management**
@@ -21,24 +21,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Workflow metadata support with JSON configuration and validation
   - Advanced dependency tree traversal and visualization algorithms
   - Professional status color coding for completed, failed, running, and pending jobs
+  - `depends_on()` and `depends_on_jobs()` builder methods for job dependencies
+  - `with_workflow()` method to associate jobs with workflows
 
-### Enhanced
-- **📖 Documentation Improvements**
-  - Updated README.md with comprehensive workflow examples and job dependency documentation
-  - Enhanced ROADMAP.md marking job dependencies and workflows as completed features
-  - Added workflow documentation section with pipeline examples and synchronization barriers
+- **🛠️ Comprehensive CLI Architecture**
+  - Full implementation of all cargo-hammerwork commands:
+    - Job management (list, show, enqueue, retry, cancel, delete)
+    - Worker control (start, stop, status, restart)
+    - Queue operations (list, stats, clear, pause, resume)
+    - Monitoring (dashboard, health, metrics, logs)
+    - Batch operations (create, status, retry, cancel)
+    - Cron scheduling (list, add, remove, enable, disable)
+    - Database maintenance (cleanup, vacuum, analyze, health)
+    - Backup & restore (create, restore, list, verify)
+  - Modular command structure with dedicated modules for each feature area
+  - Professional table formatting and display utilities
+  - Comprehensive error handling and validation
 
 ### Fixed
+- **🐛 Workflow Dependencies Storage**
+  - Fixed PostgreSQL and MySQL `enqueue` methods to properly store workflow fields (`depends_on`, `dependents`, `dependency_status`, `workflow_id`, `workflow_name`)
+  - Corrected `dependency_status` serialization to use `.as_str()` instead of JSON serialization to match database constraints
+  - Jobs with dependencies are now correctly stored and retrieved from the database
+
+- **📚 Documentation Tests**
+  - Fixed all 26 failing doc tests by correcting Duration API usage (`from_minutes` → `from_secs`)
+  - Added missing async contexts to doc test examples
+  - Added missing `DatabaseQueue` trait imports where needed
+  - Removed references to deprecated `create_tables()` method
+
+- **🧪 Test Isolation**
+  - Improved test isolation by using unique queue names with UUIDs to prevent intermittent failures
+  - Fixed test race conditions in workflow dependency tests
+
 - **🧹 Code Quality Improvements**
-  - Removed unused imports in CLI command test modules (config.rs, migration.rs)
-  - Cleaned up compilation warnings and improved code organization
-  - Enhanced CLI command module structure with proper workflow integration
+  - Removed unused imports in migration modules (postgres.rs, mysql.rs)
+  - Fixed unused variable warnings in examples
+  - Cleaned up compilation warnings across the codebase
+
+### Enhanced
+- **📖 Documentation Updates**
+  - Updated main README with comprehensive workflow examples and job dependency documentation
+  - Enhanced ROADMAP.md marking job dependencies and workflows as completed features
+  - Added workflow documentation section with pipeline examples and synchronization barriers
+  - Updated cargo-hammerwork README with complete command documentation for all features
+  - Added complete command documentation for job, worker, queue, monitor, batch, cron, maintenance, workflow, and backup commands
+  - Updated feature lists to accurately reflect all implemented functionality
 
 ### Technical Implementation
-- **CLI Architecture**: Comprehensive workflow command structure with database integration
+- **CLI Architecture**: Comprehensive command structure with database integration for all operations
 - **Visualization**: Multi-format graph output (text, DOT, Mermaid, JSON) for diverse integration needs
 - **Dependencies**: Complete dependency graph algorithms with cycle detection and level calculation
-- **Professional Output**: Bootstrap-inspired color schemes and professional formatting for workflow visualization
+- **Professional Output**: Bootstrap-inspired color schemes and professional formatting for all CLI output
 
 ## [1.0.0] - 2025-06-27
 

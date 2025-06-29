@@ -22,10 +22,15 @@ cargo-hammerwork provides a modern, modular CLI for managing Hammerwork-based ap
 - ⚙️  **Configuration Management** - Centralized config with file and environment support  
 - 🧩 **Modular Architecture** - Clean separation of concerns with dedicated command modules
 - 🐘 **Multi-Database Support** - PostgreSQL and MySQL compatibility
-- 📊 **Advanced Monitoring** - Real-time dashboards and health checks (framework included)
-- 👷 **Worker Management** - Control job processing workers (framework included)
-- 🎯 **Queue Operations** - Comprehensive queue management (framework included)
-- 📋 **Job Management** - Full job lifecycle control (framework included)
+- 📊 **Advanced Monitoring** - Real-time dashboards and health checks
+- 👷 **Worker Management** - Control job processing workers and pools
+- 🎯 **Queue Operations** - Comprehensive queue management and statistics
+- 📋 **Job Management** - Full job lifecycle control and management
+- 📦 **Batch Operations** - Bulk job processing and management
+- ⏰ **Cron Management** - Recurring job scheduling and management
+- 🔧 **Database Maintenance** - Cleanup, optimization, and health checks
+- 🔄 **Workflow Management** - Job dependencies and complex pipelines
+- 💾 **Backup & Restore** - Database backup and recovery operations
 
 ## Quick Start
 
@@ -70,10 +75,104 @@ cargo hammerwork migration status [--database-url URL]
 ```bash
 # Configuration management
 cargo hammerwork config show                    # View all settings
-cargo hammerwork config set <key> <value>     # Set a configuration value  
-cargo hammerwork config get <key>             # Get a specific value
-cargo hammerwork config reset --confirm       # Reset to defaults
-cargo hammerwork config path                  # Show config file location
+cargo hammerwork config set <key> <value>       # Set a configuration value  
+cargo hammerwork config get <key>               # Get a specific value
+cargo hammerwork config reset --confirm         # Reset to defaults
+cargo hammerwork config path                    # Show config file location
+```
+
+### Job Management Commands
+
+```bash
+# Job lifecycle management
+cargo hammerwork job list [--queue QUEUE] [--status STATUS] [--limit N]
+cargo hammerwork job show <JOB_ID>              # Detailed job information
+cargo hammerwork job enqueue --queue QUEUE --payload JSON [OPTIONS]
+cargo hammerwork job retry <JOB_ID>             # Retry a failed job
+cargo hammerwork job cancel <JOB_ID>            # Cancel a pending job
+cargo hammerwork job delete <JOB_ID>            # Remove a job
+```
+
+### Worker Management Commands
+
+```bash
+# Worker control and monitoring
+cargo hammerwork worker start [--queue QUEUE] [--workers N]
+cargo hammerwork worker stop [--queue QUEUE]    # Graceful shutdown
+cargo hammerwork worker status [--queue QUEUE]  # Worker pool status
+cargo hammerwork worker restart [--queue QUEUE] # Restart workers
+```
+
+### Queue Management Commands
+
+```bash
+# Queue operations and statistics
+cargo hammerwork queue list                     # List all queues
+cargo hammerwork queue stats [--queue QUEUE]    # Queue statistics
+cargo hammerwork queue clear --queue QUEUE      # Clear all jobs
+cargo hammerwork queue pause --queue QUEUE      # Pause processing
+cargo hammerwork queue resume --queue QUEUE     # Resume processing
+```
+
+### Monitoring Commands
+
+```bash
+# Real-time monitoring and health checks
+cargo hammerwork monitor dashboard              # Live dashboard
+cargo hammerwork monitor health [--format json] # System health check
+cargo hammerwork monitor metrics [--period 1h]  # Performance metrics
+cargo hammerwork monitor logs [--tail]          # Log streaming
+```
+
+### Batch Operation Commands
+
+```bash
+# Bulk job operations
+cargo hammerwork batch create --jobs FILE       # Create job batch
+cargo hammerwork batch status <BATCH_ID>        # Batch progress
+cargo hammerwork batch retry <BATCH_ID>         # Retry failed jobs
+cargo hammerwork batch cancel <BATCH_ID>        # Cancel batch
+```
+
+### Cron Management Commands
+
+```bash
+# Recurring job scheduling
+cargo hammerwork cron list                      # List cron jobs
+cargo hammerwork cron add --schedule "0 */6 * * *" --queue QUEUE --payload JSON
+cargo hammerwork cron remove <JOB_ID>           # Remove cron job
+cargo hammerwork cron enable <JOB_ID>           # Enable scheduling
+cargo hammerwork cron disable <JOB_ID>          # Disable scheduling
+```
+
+### Maintenance Commands
+
+```bash
+# Database maintenance and optimization
+cargo hammerwork maintenance cleanup            # Remove old completed jobs
+cargo hammerwork maintenance vacuum             # Optimize database
+cargo hammerwork maintenance analyze            # Update table statistics
+cargo hammerwork maintenance health             # Database health check
+```
+
+### Workflow Commands
+
+```bash
+# Job dependencies and complex pipelines
+cargo hammerwork workflow create --file WORKFLOW.json
+cargo hammerwork workflow list                  # List active workflows
+cargo hammerwork workflow status <WORKFLOW_ID>  # Workflow progress
+cargo hammerwork workflow cancel <WORKFLOW_ID>  # Cancel workflow
+```
+
+### Backup Commands
+
+```bash
+# Database backup and recovery
+cargo hammerwork backup create --output FILE    # Create backup
+cargo hammerwork backup restore --input FILE    # Restore from backup
+cargo hammerwork backup list                    # List available backups
+cargo hammerwork backup verify --input FILE     # Verify backup integrity
 ```
 
 ## Architecture & Design
@@ -99,33 +198,38 @@ cargo-hammerwork/
 │   └── main.rs           # CLI entry point
 ```
 
-### Framework Extensions (Implemented but Not Exposed)
+### Command Feature Highlights
 
-The codebase includes comprehensive implementations for advanced features that provide a solid foundation for extending the CLI:
-
-#### Job Management Framework
+#### Job Management
 - List jobs with advanced filtering (queue, status, priority, time-based)
 - Job enqueueing with priority, delays, timeouts, and retry configuration
 - Bulk operations (retry, cancel, purge) with safety confirmations
 - Detailed job inspection with full lifecycle tracking
 
-#### Queue Management Framework  
+#### Queue Management  
 - Queue listing with comprehensive statistics
 - Queue operations (clear, pause, resume)
 - Health monitoring with configurable thresholds
 - Detailed vs. summary statistics views
 
-#### Worker Management Framework
+#### Worker Management
 - Worker lifecycle control (start, stop, status)
 - Configurable worker pools with priority handling
 - Real-time worker monitoring and metrics
 - Graceful shutdown and resource management
 
-#### Monitoring & Observability Framework
+#### Monitoring & Observability
 - Real-time dashboard with auto-refresh
 - System health checks with JSON/table output
 - Performance metrics with configurable time periods
 - Log tailing and filtering capabilities
+
+#### Advanced Features
+- **Batch Operations**: Bulk job processing with progress tracking
+- **Cron Scheduling**: Time-based recurring job management
+- **Database Maintenance**: Cleanup, optimization, and health monitoring
+- **Workflow Management**: Complex job dependency orchestration
+- **Backup & Restore**: Complete database backup and recovery
 
 ### Configuration System
 
@@ -320,11 +424,11 @@ cargo hammerwork migration status
 
 Planned enhancements include:
 
-- **Job Scheduling**: Advanced cron-based job scheduling
-- **Metrics Export**: Prometheus/OpenTelemetry integration  
 - **Web Dashboard**: Browser-based monitoring interface
 - **Cluster Management**: Multi-node coordination features
 - **Plugin System**: Extensible plugin architecture
+- **Advanced Analytics**: Historical performance analysis and trending
+- **External Integrations**: Webhook notifications and third-party service integration
 
 ## License
 

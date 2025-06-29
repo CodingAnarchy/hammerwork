@@ -53,7 +53,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 ## Basic Example
 
 ```rust
-use hammerwork::{Job, Worker, WorkerPool, JobQueue, RetryStrategy};
+use hammerwork::{Job, Worker, WorkerPool, JobQueue, RetryStrategy, queue::DatabaseQueue};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 
@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_exponential_backoff(
             Duration::from_secs(2),
             2.0,
-            Duration::from_minutes(10)
+            Duration::from_secs(10 * 60)
         );
     queue.enqueue(job).await?;
 
@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Create complex data processing pipelines with job dependencies:
 
 ```rust
-use hammerwork::{Job, JobGroup, DependencyStatus, FailurePolicy};
+use hammerwork::{Job, JobGroup, FailurePolicy, queue::DatabaseQueue};
 use serde_json::json;
 
 // Sequential pipeline: job1 → job2 → job3
@@ -193,6 +193,7 @@ Working examples in `examples/`:
 - `worker_batch_example.rs` - Worker batch processing features
 - `retry_strategies.rs` - Advanced retry patterns with exponential backoff and jitter
 - `result_storage_example.rs` - Job result storage and retrieval
+- `autoscaling_example.rs` - Dynamic worker pool scaling based on queue depth
 
 ```bash
 cargo run --example postgres_example --features postgres
