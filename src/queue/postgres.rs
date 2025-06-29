@@ -40,6 +40,14 @@ pub(crate) struct JobRow {
     pub result_data: Option<serde_json::Value>,
     pub result_stored_at: Option<DateTime<Utc>>,
     pub result_expires_at: Option<DateTime<Utc>>,
+    pub result_storage_type: Option<String>,
+    pub result_ttl_seconds: Option<i64>,
+    pub result_max_size_bytes: Option<i64>,
+    pub depends_on: Option<serde_json::Value>,
+    pub dependents: Option<serde_json::Value>,
+    pub dependency_status: Option<String>,
+    pub workflow_id: Option<uuid::Uuid>,
+    pub workflow_name: Option<String>,
 }
 
 impl JobRow {
@@ -67,11 +75,35 @@ impl JobRow {
             recurring: self.recurring,
             timezone: self.timezone,
             batch_id: self.batch_id,
-            result_config: crate::job::ResultConfig::default(), // Will be populated when job handlers store results
+            result_config: crate::job::ResultConfig {
+                storage: self.result_storage_type
+                    .as_ref()
+                    .and_then(|s| match s.as_str() {
+                        "database" => Some(crate::job::ResultStorage::Database),
+                        "memory" => Some(crate::job::ResultStorage::Memory),
+                        "none" => Some(crate::job::ResultStorage::None),
+                        _ => Some(crate::job::ResultStorage::None),
+                    })
+                    .unwrap_or(crate::job::ResultStorage::None),
+                ttl: self.result_ttl_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                max_size_bytes: self.result_max_size_bytes.map(|b| b as usize),
+            },
             result_data: self.result_data,
             result_stored_at: self.result_stored_at,
             result_expires_at: self.result_expires_at,
             retry_strategy: None, // Will be populated from job data when needed
+            depends_on: self.depends_on
+                .map(|v| serde_json::from_value(v).unwrap_or_default())
+                .unwrap_or_default(),
+            dependents: self.dependents
+                .map(|v| serde_json::from_value(v).unwrap_or_default())
+                .unwrap_or_default(),
+            dependency_status: self.dependency_status
+                .as_ref()
+                .and_then(|s| crate::workflow::DependencyStatus::from_str(s).ok())
+                .unwrap_or(crate::workflow::DependencyStatus::None),
+            workflow_id: self.workflow_id,
+            workflow_name: self.workflow_name,
         })
     }
 }
@@ -125,6 +157,11 @@ impl DeadJobRow {
             result_stored_at: None,
             result_expires_at: None,
             retry_strategy: None,
+            depends_on: Vec::new(),
+            dependents: Vec::new(),
+            dependency_status: crate::workflow::DependencyStatus::None,
+            workflow_id: None,
+            workflow_name: None,
         }
     }
 }
@@ -139,8 +176,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             INSERT INTO hammerwork_jobs (
                 id, queue_name, payload, status, priority, attempts, max_attempts, 
                 timeout_seconds, created_at, scheduled_at, error_message, 
-                cron_schedule, next_run_at, recurring, timezone, batch_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                cron_schedule, next_run_at, recurring, timezone, batch_id,
+                result_storage_type, result_ttl_seconds, result_max_size_bytes
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
             "#,
         )
         .bind(job.id)
@@ -159,6 +197,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .bind(job.recurring)
         .bind(&job.timezone)
         .bind(job.batch_id)
+        .bind(match job.result_config.storage {
+            crate::job::ResultStorage::Database => "database",
+            crate::job::ResultStorage::Memory => "memory", 
+            crate::job::ResultStorage::None => "none",
+        })
+        .bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
+        .bind(job.result_config.max_size_bytes.map(|s| s as i64))
         .execute(&self.pool)
         .await?;
 
@@ -173,6 +218,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             WHERE id = (
                 SELECT id FROM hammerwork_jobs 
                 WHERE queue_name = $3 AND status = $4 AND scheduled_at <= $5
+                  AND (dependency_status = 'none' OR dependency_status = 'satisfied')
                 ORDER BY priority DESC, scheduled_at ASC 
                 FOR UPDATE SKIP LOCKED 
                 LIMIT 1
@@ -180,7 +226,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             RETURNING id, queue_name, payload, status, priority, attempts, max_attempts, 
                      timeout_seconds, created_at, scheduled_at, started_at, completed_at, 
                      failed_at, timed_out_at, error_message, cron_schedule, next_run_at, 
-                     recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at
+                     recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at,
+                     result_storage_type, result_ttl_seconds, result_max_size_bytes,
+                     depends_on, dependents, dependency_status, workflow_id, workflow_name
             "#,
         )
         .bind(serde_json::to_string(&JobStatus::Running)?)
@@ -215,6 +263,14 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             let result_data: Option<serde_json::Value> = row.get("result_data");
             let result_stored_at: Option<DateTime<Utc>> = row.get("result_stored_at");
             let result_expires_at: Option<DateTime<Utc>> = row.get("result_expires_at");
+            let result_storage_type: Option<String> = row.get("result_storage_type");
+            let result_ttl_seconds: Option<i64> = row.get("result_ttl_seconds");
+            let result_max_size_bytes: Option<i64> = row.get("result_max_size_bytes");
+            let depends_on: Option<serde_json::Value> = row.get("depends_on");
+            let dependents: Option<serde_json::Value> = row.get("dependents");
+            let dependency_status: Option<String> = row.get("dependency_status");
+            let workflow_id: Option<uuid::Uuid> = row.get("workflow_id");
+            let workflow_name: Option<String> = row.get("workflow_name");
 
             Ok(Some(Job {
                 id,
@@ -237,11 +293,35 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 recurring,
                 timezone,
                 batch_id,
-                result_config: crate::job::ResultConfig::default(),
+                result_config: crate::job::ResultConfig {
+                    storage: result_storage_type
+                        .as_ref()
+                        .and_then(|s| match s.as_str() {
+                            "database" => Some(crate::job::ResultStorage::Database),
+                            "memory" => Some(crate::job::ResultStorage::Memory),
+                            "none" => Some(crate::job::ResultStorage::None),
+                            _ => Some(crate::job::ResultStorage::None),
+                        })
+                        .unwrap_or(crate::job::ResultStorage::None),
+                    ttl: result_ttl_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
+                    max_size_bytes: result_max_size_bytes.map(|b| b as usize),
+                },
                 result_data,
                 result_stored_at,
                 result_expires_at,
                 retry_strategy: None,
+                depends_on: depends_on
+                    .map(|v| serde_json::from_value(v).unwrap_or_default())
+                    .unwrap_or_default(),
+                dependents: dependents
+                    .map(|v| serde_json::from_value(v).unwrap_or_default())
+                    .unwrap_or_default(),
+                dependency_status: dependency_status
+                    .as_ref()
+                    .and_then(|s| crate::workflow::DependencyStatus::from_str(s).ok())
+                    .unwrap_or(crate::workflow::DependencyStatus::None),
+                workflow_id,
+                workflow_name,
             }))
         } else {
             Ok(None)
@@ -263,7 +343,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         // Get available jobs by priority
         let available_jobs = sqlx::query(
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at
+            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
             FROM hammerwork_jobs 
             WHERE queue_name = $1 
             AND status = $2 
@@ -327,7 +407,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
                 // Update the selected job
                 let updated_row = sqlx::query(
-                    "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 WHERE id = $3 RETURNING id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at"
+                    "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 WHERE id = $3 RETURNING id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name"
                 )
                 .bind(serde_json::to_string(&JobStatus::Running)?)
                 .bind(Utc::now())
@@ -386,6 +466,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                         result_stored_at,
                         result_expires_at,
                         retry_strategy: None,
+                        depends_on: Vec::new(),
+                        dependents: Vec::new(),
+                        dependency_status: crate::workflow::DependencyStatus::None,
+                        workflow_id: None,
+                        workflow_name: None,
                     }));
                 }
             }
@@ -434,7 +519,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at FROM hammerwork_jobs WHERE id = $1"
+            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name FROM hammerwork_jobs WHERE id = $1"
         )
         .bind(job_id)
         .fetch_optional(&self.pool)
@@ -623,7 +708,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at FROM hammerwork_jobs WHERE batch_id = $1 ORDER BY created_at ASC"
+            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name FROM hammerwork_jobs WHERE batch_id = $1 ORDER BY created_at ASC"
         )
         .bind(batch_id)
         .fetch_all(&self.pool)
@@ -963,7 +1048,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     async fn get_due_cron_jobs(&self, queue_name: Option<&str>) -> Result<Vec<Job>> {
         let query = if queue_name.is_some() {
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at
+            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
             FROM hammerwork_jobs 
             WHERE recurring = TRUE 
             AND queue_name = $1
@@ -973,7 +1058,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             "#
         } else {
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at
+            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
             FROM hammerwork_jobs 
             WHERE recurring = TRUE 
             AND (next_run_at IS NULL OR next_run_at <= $1)
@@ -1027,7 +1112,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at FROM hammerwork_jobs WHERE queue_name = $1 AND recurring = TRUE ORDER BY next_run_at ASC"
+            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name FROM hammerwork_jobs WHERE queue_name = $1 AND recurring = TRUE ORDER BY next_run_at ASC"
         )
         .bind(queue_name)
         .fetch_all(&self.pool)
@@ -1140,5 +1225,34 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    // Workflow and dependency management methods
+    async fn enqueue_workflow(&self, _workflow: crate::workflow::JobGroup) -> Result<crate::workflow::WorkflowId> {
+        todo!("Workflow enqueuing will be implemented next")
+    }
+
+    async fn get_workflow_status(&self, _workflow_id: crate::workflow::WorkflowId) -> Result<Option<crate::workflow::JobGroup>> {
+        todo!("Workflow status retrieval will be implemented next")
+    }
+
+    async fn resolve_job_dependencies(&self, _completed_job_id: JobId) -> Result<Vec<JobId>> {
+        todo!("Dependency resolution will be implemented next")
+    }
+
+    async fn get_ready_jobs(&self, _queue_name: &str, _limit: u32) -> Result<Vec<Job>> {
+        todo!("Ready jobs query will be implemented next")
+    }
+
+    async fn fail_job_dependencies(&self, _failed_job_id: JobId) -> Result<Vec<JobId>> {
+        todo!("Dependency failure propagation will be implemented next")
+    }
+
+    async fn get_workflow_jobs(&self, _workflow_id: crate::workflow::WorkflowId) -> Result<Vec<Job>> {
+        todo!("Workflow jobs query will be implemented next")
+    }
+
+    async fn cancel_workflow(&self, _workflow_id: crate::workflow::WorkflowId) -> Result<()> {
+        todo!("Workflow cancellation will be implemented next")
     }
 }

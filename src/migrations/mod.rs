@@ -24,7 +24,7 @@
 //! Once migrations are complete, your application simply connects to the database:
 //!
 //! ```rust,no_run
-//! use hammerwork::{Job, JobQueue};
+//! use hammerwork::{Job, JobQueue, DatabaseQueue};
 //! use serde_json::json;
 //! use std::sync::Arc;
 //!
@@ -290,6 +290,34 @@ impl<DB: Database> MigrationManager<DB> {
             },
             include_str!("006_add_result_storage.postgres.sql").to_string(),
             include_str!("006_add_result_storage.mysql.sql").to_string(),
+        );
+
+        // Migration 007: Add job dependencies for workflow support
+        self.register_migration(
+            Migration {
+                id: "007_add_dependencies".to_string(),
+                description: "Add job dependencies and workflow support".to_string(),
+                version: 7,
+                created_at: chrono::DateTime::parse_from_rfc3339("2025-07-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("007_add_dependencies.postgres.sql").to_string(),
+            include_str!("007_add_dependencies.mysql.sql").to_string(),
+        );
+
+        // Migration 008: Add result configuration storage
+        self.register_migration(
+            Migration {
+                id: "008_add_result_config".to_string(),
+                description: "Add result configuration storage fields".to_string(),
+                version: 8,
+                created_at: chrono::DateTime::parse_from_rfc3339("2025-08-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("008_add_result_config.postgres.sql").to_string(),
+            include_str!("008_add_result_config.mysql.sql").to_string(),
         );
     }
 }

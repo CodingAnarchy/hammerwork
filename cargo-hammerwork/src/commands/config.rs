@@ -221,7 +221,6 @@ async fn show_config_path() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     
     #[test]
     fn test_config_command_structure() {

@@ -439,6 +439,7 @@ async fn demonstrate_legacy_compatibility_postgres(
 
 // MySQL versions of the demonstration functions
 #[cfg(feature = "mysql")]
+#[allow(dead_code)]
 async fn demonstrate_basic_result_storage_mysql(
     queue: &Arc<JobQueue<sqlx::MySql>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -498,6 +499,7 @@ async fn demonstrate_basic_result_storage_mysql(
 }
 
 #[cfg(feature = "mysql")]
+#[allow(dead_code)]
 async fn demonstrate_enhanced_workers_mysql(
     queue: &Arc<JobQueue<sqlx::MySql>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -559,6 +561,7 @@ async fn demonstrate_enhanced_workers_mysql(
 }
 
 #[cfg(feature = "mysql")]
+#[allow(dead_code)]
 async fn demonstrate_result_expiration_mysql(
     queue: &Arc<JobQueue<sqlx::MySql>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -596,6 +599,7 @@ async fn demonstrate_result_expiration_mysql(
 }
 
 #[cfg(feature = "mysql")]
+#[allow(dead_code)]
 async fn demonstrate_legacy_compatibility_mysql(
     queue: &Arc<JobQueue<sqlx::MySql>>,
 ) -> Result<(), Box<dyn std::error::Error>> {

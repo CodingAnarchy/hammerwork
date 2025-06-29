@@ -120,7 +120,6 @@ async fn check_migration_status(database_url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     
     #[test]
     fn test_migration_command_structure() {

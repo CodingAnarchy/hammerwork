@@ -84,6 +84,12 @@ enum Commands {
         #[command(subcommand)]
         command: MaintenanceCommand,
     },
+    
+    #[command(about = "Workflow and job dependency management")]
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
 }
 
 #[tokio::main]
@@ -181,6 +187,9 @@ async fn execute_command(command: &Commands, config: &mut Config) -> Result<()> 
         }
         Commands::Maintenance { command } => {
             command.execute(config).await?;
+        }
+        Commands::Workflow { command } => {
+            command.execute(config.clone()).await?;
         }
     }
 

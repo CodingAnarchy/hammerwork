@@ -24,14 +24,38 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
 
         let mut tx = self.pool.begin().await?;
 
-        // Execute the migration SQL
-        sqlx::query(sql).execute(&mut *tx).await?;
+        // Split SQL into individual statements and execute each one
+        // This is a simple split that handles most cases - splits on semicolon followed by newline
+        let statements: Vec<&str> = sql
+            .split(";\n")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        for (i, statement) in statements.iter().enumerate() {
+            // Add semicolon back if it was removed by split
+            let full_statement = if statement.ends_with(';') {
+                statement.to_string()
+            } else {
+                format!("{};", statement)
+            };
+
+            debug!(
+                "Executing statement {} of {} for migration {}",
+                i + 1,
+                statements.len(),
+                migration.id
+            );
+
+            sqlx::query(&full_statement).execute(&mut *tx).await?;
+        }
 
         tx.commit().await?;
 
         info!(
-            "Successfully executed PostgreSQL migration: {}",
-            migration.id
+            "Successfully executed PostgreSQL migration: {} ({} statements)",
+            migration.id,
+            statements.len()
         );
         Ok(())
     }
@@ -53,7 +77,7 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
     async fn create_migration_table(&self) -> Result<()> {
         sqlx::query(
             r#"
-            CREATE TABLE hammerwork_migrations (
+            CREATE TABLE IF NOT EXISTS hammerwork_migrations (
                 migration_id VARCHAR NOT NULL PRIMARY KEY,
                 executed_at TIMESTAMPTZ NOT NULL,
                 execution_time_ms BIGINT NOT NULL
@@ -101,5 +125,39 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
 
         debug!("Recorded PostgreSQL migration: {}", migration.id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_sql_statement_splitting() {
+        let multi_statement_sql = r#"
+-- Comment line
+CREATE TABLE test_table (
+    id INTEGER PRIMARY KEY
+);
+
+-- Another comment
+ALTER TABLE test_table ADD COLUMN name VARCHAR(50);
+
+CREATE INDEX idx_test ON test_table (name);
+"#;
+        
+        let statements: Vec<&str> = multi_statement_sql
+            .split(";\n")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        
+        // Should split into 3 non-empty statements
+        assert_eq!(statements.len(), 3);
+        
+        // Verify each statement contains expected keywords
+        assert!(statements[0].contains("CREATE TABLE"));
+        assert!(statements[1].contains("ALTER TABLE"));
+        assert!(statements[2].contains("CREATE INDEX"));
     }
 }

@@ -304,6 +304,16 @@ pub struct Job {
     pub result_expires_at: Option<DateTime<Utc>>,
     /// Retry strategy for this job (overrides worker default if specified).
     pub retry_strategy: Option<RetryStrategy>,
+    /// Job IDs this job depends on (must complete before this job can run).
+    pub depends_on: Vec<JobId>,
+    /// Job IDs that depend on this job (cached for performance).
+    pub dependents: Vec<JobId>,
+    /// Status of dependency resolution for this job.
+    pub dependency_status: crate::workflow::DependencyStatus,
+    /// ID of the workflow this job belongs to (if any).
+    pub workflow_id: Option<crate::workflow::WorkflowId>,
+    /// Name of the workflow this job belongs to (if any).
+    pub workflow_name: Option<String>,
 }
 
 impl Job {
@@ -368,6 +378,11 @@ impl Job {
             result_stored_at: None,
             result_expires_at: None,
             retry_strategy: None,
+            depends_on: Vec::new(),
+            dependents: Vec::new(),
+            dependency_status: crate::workflow::DependencyStatus::None,
+            workflow_id: None,
+            workflow_name: None,
         }
     }
 
@@ -437,6 +452,11 @@ impl Job {
             result_stored_at: None,
             result_expires_at: None,
             retry_strategy: None,
+            depends_on: Vec::new(),
+            dependents: Vec::new(),
+            dependency_status: crate::workflow::DependencyStatus::None,
+            workflow_id: None,
+            workflow_name: None,
         }
     }
 
@@ -780,6 +800,11 @@ impl Job {
             result_stored_at: None,
             result_expires_at: None,
             retry_strategy: None,
+            depends_on: Vec::new(),
+            dependents: Vec::new(),
+            dependency_status: crate::workflow::DependencyStatus::None,
+            workflow_id: None,
+            workflow_name: None,
         })
     }
 
@@ -1118,6 +1143,198 @@ impl Job {
             self.error_message = None;
         }
         next_run
+    }
+
+    /// Adds a dependency on another job.
+    ///
+    /// This job will not be executed until the specified job completes successfully.
+    /// If the dependency job fails, this job's dependency status will be set to Failed.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_id` - The ID of the job this job should depend on
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job1 = Job::new("step1".to_string(), json!({"data": "step1"}));
+    /// let mut job2 = Job::new("step2".to_string(), json!({"data": "step2"}));
+    ///
+    /// job2.depends_on(&job1.id);
+    /// assert!(job2.has_dependencies());
+    /// ```
+    pub fn depends_on(mut self, job_id: &JobId) -> Self {
+        self.depends_on.push(*job_id);
+        self.dependency_status = crate::workflow::DependencyStatus::Waiting;
+        self
+    }
+
+    /// Adds multiple dependencies on other jobs.
+    ///
+    /// This job will not be executed until all specified jobs complete successfully.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_ids` - The IDs of the jobs this job should depend on
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job1 = Job::new("step1".to_string(), json!({}));
+    /// let job2 = Job::new("step2".to_string(), json!({}));
+    /// let mut final_job = Job::new("final".to_string(), json!({}));
+    ///
+    /// final_job.depends_on_jobs(&[job1.id, job2.id]);
+    /// assert_eq!(final_job.depends_on.len(), 2);
+    /// ```
+    pub fn depends_on_jobs(mut self, job_ids: &[JobId]) -> Self {
+        self.depends_on.extend_from_slice(job_ids);
+        if !job_ids.is_empty() {
+            self.dependency_status = crate::workflow::DependencyStatus::Waiting;
+        }
+        self
+    }
+
+    /// Sets the workflow this job belongs to.
+    ///
+    /// # Arguments
+    ///
+    /// * `workflow_id` - The ID of the workflow
+    /// * `workflow_name` - The name of the workflow
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    /// use uuid::Uuid;
+    ///
+    /// let workflow_id = Uuid::new_v4();
+    /// let job = Job::new("test".to_string(), json!({}))
+    ///     .with_workflow(workflow_id, "data_pipeline");
+    ///
+    /// assert_eq!(job.workflow_id, Some(workflow_id));
+    /// assert_eq!(job.workflow_name, Some("data_pipeline".to_string()));
+    /// ```
+    pub fn with_workflow(mut self, workflow_id: crate::workflow::WorkflowId, workflow_name: impl Into<String>) -> Self {
+        self.workflow_id = Some(workflow_id);
+        self.workflow_name = Some(workflow_name.into());
+        self
+    }
+
+    /// Checks if this job has any dependencies.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job1 = Job::new("independent".to_string(), json!({}));
+    /// assert!(!job1.has_dependencies());
+    ///
+    /// let job2 = Job::new("dependent".to_string(), json!({}))
+    ///     .depends_on(&job1.id);
+    /// assert!(job2.has_dependencies());
+    /// ```
+    pub fn has_dependencies(&self) -> bool {
+        !self.depends_on.is_empty()
+    }
+
+    /// Checks if this job is part of a workflow.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    /// use uuid::Uuid;
+    ///
+    /// let job1 = Job::new("standalone".to_string(), json!({}));
+    /// assert!(!job1.is_part_of_workflow());
+    ///
+    /// let job2 = Job::new("workflow_job".to_string(), json!({}))
+    ///     .with_workflow(Uuid::new_v4(), "test_workflow");
+    /// assert!(job2.is_part_of_workflow());
+    /// ```
+    pub fn is_part_of_workflow(&self) -> bool {
+        self.workflow_id.is_some()
+    }
+
+    /// Checks if all dependencies for this job are satisfied.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job1 = Job::new("independent".to_string(), json!({}));
+    /// assert!(job1.dependencies_satisfied());
+    ///
+    /// let job2 = Job::new("dependent".to_string(), json!({}))
+    ///     .depends_on(&job1.id);
+    /// assert!(!job2.dependencies_satisfied()); // Dependencies not satisfied yet
+    /// ```
+    pub fn dependencies_satisfied(&self) -> bool {
+        matches!(
+            self.dependency_status,
+            crate::workflow::DependencyStatus::None | crate::workflow::DependencyStatus::Satisfied
+        )
+    }
+
+    /// Checks if any dependencies for this job have failed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let mut job = Job::new("test".to_string(), json!({}));
+    /// job.dependency_status = hammerwork::workflow::DependencyStatus::Failed;
+    /// assert!(job.dependencies_failed());
+    /// ```
+    pub fn dependencies_failed(&self) -> bool {
+        matches!(self.dependency_status, crate::workflow::DependencyStatus::Failed)
+    }
+
+    /// Gets the number of dependencies for this job.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    /// use uuid::Uuid;
+    ///
+    /// let job = Job::new("test".to_string(), json!({}))
+    ///     .depends_on_jobs(&[Uuid::new_v4(), Uuid::new_v4()]);
+    /// assert_eq!(job.dependency_count(), 2);
+    /// ```
+    pub fn dependency_count(&self) -> usize {
+        self.depends_on.len()
+    }
+
+    /// Gets the number of jobs that depend on this job.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("test".to_string(), json!({}));
+    /// assert_eq!(job.dependent_count(), 0);
+    /// ```
+    pub fn dependent_count(&self) -> usize {
+        self.dependents.len()
     }
 }
 

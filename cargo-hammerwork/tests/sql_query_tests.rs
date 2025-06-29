@@ -1,6 +1,5 @@
 use anyhow::Result;
 use sqlx::{PgPool, MySqlPool, Row};
-use tempfile::TempDir;
 
 /// Tests for SQL query validation and correctness
 /// These tests validate that our dynamic SQL queries are syntactically correct
@@ -64,13 +63,13 @@ mod postgres_tests {
         let query = "UPDATE hammerwork_jobs SET status = 'pending', attempts = 0, scheduled_at = NOW() WHERE status IN ('failed', 'dead')";
         let result = sqlx::query(query).execute(&pool).await?;
         // Should execute without error
-        assert!(result.rows_affected() >= 0);
+        let _rows_affected = result.rows_affected();
         
         // Test cancel query syntax
         let query = "DELETE FROM hammerwork_jobs WHERE status = 'pending'";
         let result = sqlx::query(query).execute(&pool).await?;
         // Should execute without error
-        assert!(result.rows_affected() >= 0);
+        let _rows_affected = result.rows_affected();
         
         // Test job detail query
         let test_uuid = uuid::Uuid::new_v4();
@@ -164,7 +163,6 @@ mod mysql_tests {
 
 #[cfg(test)]
 mod unit_tests {
-    use super::*;
     
     #[test]
     fn test_query_building_logic() {
@@ -299,7 +297,6 @@ mod unit_tests {
 
 #[cfg(test)]
 mod error_handling_tests {
-    use super::*;
     
     #[test]
     fn test_sql_injection_prevention() {

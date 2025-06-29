@@ -250,6 +250,40 @@ pub trait DatabaseQueue: Send + Sync {
     /// # }
     /// ```
     async fn cleanup_expired_results(&self) -> Result<u64>;
+
+    // Workflow and dependency management
+    /// Enqueue a job group/workflow as a single operation.
+    ///
+    /// All jobs in the workflow are inserted with their dependency relationships,
+    /// and the workflow metadata is stored for tracking purposes.
+    async fn enqueue_workflow(&self, workflow: crate::workflow::JobGroup) -> Result<crate::workflow::WorkflowId>;
+
+    /// Get workflow status and statistics.
+    async fn get_workflow_status(&self, workflow_id: crate::workflow::WorkflowId) -> Result<Option<crate::workflow::JobGroup>>;
+
+    /// Update job dependencies when a job completes.
+    ///
+    /// This method resolves dependencies for jobs that were waiting on the completed job,
+    /// potentially making them eligible for execution.
+    async fn resolve_job_dependencies(&self, completed_job_id: JobId) -> Result<Vec<JobId>>;
+
+    /// Get jobs that are ready to execute (dependencies satisfied).
+    ///
+    /// This method returns jobs that have either no dependencies or all dependencies
+    /// have been satisfied (completed successfully).
+    async fn get_ready_jobs(&self, queue_name: &str, limit: u32) -> Result<Vec<Job>>;
+
+    /// Mark job dependencies as failed when a job fails.
+    ///
+    /// This propagates failure through the dependency graph according to the
+    /// workflow's failure policy.
+    async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>>;
+
+    /// Get all jobs in a workflow.
+    async fn get_workflow_jobs(&self, workflow_id: crate::workflow::WorkflowId) -> Result<Vec<Job>>;
+
+    /// Cancel a workflow and all its pending jobs.
+    async fn cancel_workflow(&self, workflow_id: crate::workflow::WorkflowId) -> Result<()>;
 }
 
 /// A generic job queue implementation that works with multiple database backends.

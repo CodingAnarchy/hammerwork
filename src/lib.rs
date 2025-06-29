@@ -113,6 +113,7 @@ pub mod rate_limit;
 pub mod retry;
 pub mod stats;
 pub mod worker;
+pub mod workflow;
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -136,6 +137,9 @@ pub use stats::{
 pub use worker::{
     AutoscaleConfig, AutoscaleMetrics, BatchProcessingStats, JobHandler, JobHandlerWithResult,
     JobResult, Worker, WorkerPool,
+};
+pub use workflow::{
+    DependencyStatus, FailurePolicy, JobGroup, WorkflowId, WorkflowStatus,
 };
 
 #[cfg(feature = "metrics")]

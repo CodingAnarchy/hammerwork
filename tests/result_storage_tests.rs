@@ -81,10 +81,14 @@ mod postgres_tests {
     async fn test_cleanup_expired_results() {
         let queue = test_utils::setup_postgres_queue().await;
 
+        // Clear any existing expired results to ensure clean test state
+        let _ = queue.cleanup_expired_results().await;
+
         // Create multiple jobs with different expiration times
         let mut job_ids = Vec::new();
+        let test_queue = format!("test_cleanup_{}", chrono::Utc::now().timestamp_millis());
         for i in 0..5 {
-            let job = Job::new("test_queue".to_string(), json!({"task": i}));
+            let job = Job::new(test_queue.clone(), json!({"task": i}));
             let job_id = queue.enqueue(job).await.unwrap();
             job_ids.push(job_id);
 
@@ -300,6 +304,9 @@ mod mysql_tests {
     async fn test_mysql_worker_integration() {
         let queue = test_utils::setup_mysql_queue().await;
 
+        // Clear any existing test data
+        let _ = queue.cleanup_expired_results().await;
+
         let handler: JobHandlerWithResult = Arc::new(|job| {
             Box::pin(async move {
                 let result_data = json!({
@@ -310,10 +317,11 @@ mod mysql_tests {
             })
         });
 
+        let test_queue = format!("mysql_worker_{}", chrono::Utc::now().timestamp_millis());
         let worker =
-            Worker::new_with_result_handler(queue.clone(), "mysql_queue".to_string(), handler);
+            Worker::new_with_result_handler(queue.clone(), test_queue.clone(), handler);
 
-        let job = Job::new("mysql_queue".to_string(), json!({"test": "mysql"}))
+        let job = Job::new(test_queue.clone(), json!({"test": "mysql"}))
             .with_result_storage(ResultStorage::Database);
 
         let job_id = queue.enqueue(job).await.unwrap();
@@ -324,11 +332,16 @@ mod mysql_tests {
 
         let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
-        // Wait for job processing
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for job processing with longer timeout
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Check job status first
+        let job = queue.get_job(job_id).await.unwrap();
+        println!("Job status: {:?}", job.map(|j| j.status));
 
         // Verify result storage
         let result = queue.get_job_result(job_id).await.unwrap();
+        println!("Retrieved result: {:?}", result);
         assert!(result.is_some());
         assert_eq!(result.unwrap()["mysql_worker"], true);
 

@@ -1,6 +1,5 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
 use tempfile::TempDir;
 
 #[test]
@@ -84,7 +83,6 @@ fn is_valid_log_level(level: &str) -> bool {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::*;
     
     #[test]
     fn test_cli_structure() {

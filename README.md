@@ -4,7 +4,8 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 ## Features
 
-- **Multi-database support**: PostgreSQL and MySQL backends
+- **🔗 Job Dependencies & Workflows**: Create complex data processing pipelines with job dependencies, sequential chains, and parallel processing with synchronization barriers
+- **Multi-database support**: PostgreSQL and MySQL backends with optimized dependency queries
 - **Advanced retry strategies**: Exponential backoff, linear, Fibonacci, and custom retry patterns with jitter
 - **Job prioritization**: Five priority levels with weighted and strict scheduling algorithms
 - **Result storage**: Database and in-memory result storage with TTL and automatic cleanup
@@ -40,6 +41,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 ## Documentation
 
 - **[Quick Start Guide](docs/quick-start.md)** - Get started with PostgreSQL and MySQL
+- **[Job Dependencies & Workflows](docs/workflows.md)** - Complex pipelines, job dependencies, and orchestration
 - **[Job Types & Configuration](docs/job-types.md)** - Job creation, priorities, timeouts, cron jobs
 - **[Worker Configuration](docs/worker-configuration.md)** - Worker setup, rate limiting, statistics
 - **[Cron Scheduling](docs/cron-scheduling.md)** - Recurring jobs with timezone support  
@@ -90,9 +92,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Workflow Example
 
+Create complex data processing pipelines with job dependencies:
 
+```rust
+use hammerwork::{Job, JobGroup, DependencyStatus, FailurePolicy};
+use serde_json::json;
 
+// Sequential pipeline: job1 → job2 → job3
+let job1 = Job::new("process_data".to_string(), json!({"input": "raw_data.csv"}));
+let job2 = Job::new("transform_data".to_string(), json!({"format": "parquet"}))
+    .depends_on(&job1.id);
+let job3 = Job::new("export_data".to_string(), json!({"destination": "s3://bucket/"}))
+    .depends_on(&job2.id);
+
+// Parallel processing with synchronization barrier
+let parallel_jobs = vec![
+    Job::new("process_region_a".to_string(), json!({"region": "us-east"})),
+    Job::new("process_region_b".to_string(), json!({"region": "us-west"})),
+    Job::new("process_region_c".to_string(), json!({"region": "eu-west"})),
+];
+let final_job = Job::new("combine_results".to_string(), json!({"output": "summary.json"}));
+
+let workflow = JobGroup::new("data_pipeline")
+    .add_parallel_jobs(parallel_jobs)  // These run concurrently
+    .then(final_job)                   // This waits for all parallel jobs
+    .with_failure_policy(FailurePolicy::ContinueOnFailure);
+
+// Enqueue the entire workflow
+queue.enqueue_workflow(workflow).await?;
+```
+
+Jobs will only execute when their dependencies are satisfied, enabling sophisticated data processing pipelines and business workflows.
 
 ## Database Setup
 

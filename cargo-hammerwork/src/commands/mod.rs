@@ -8,6 +8,7 @@ pub mod migration;
 pub mod monitor;
 pub mod queue;
 pub mod worker;
+pub mod workflow;
 
 pub use backup::*;
 pub use batch::*;
@@ -19,3 +20,4 @@ pub use migration::*;
 pub use monitor::*;
 pub use queue::*;
 pub use worker::*;
+pub use workflow::*;

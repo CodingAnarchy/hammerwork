@@ -34,6 +34,9 @@ pub enum HammerworkError {
 
     #[error("Processing error: {0}")]
     Processing(String),
+
+    #[error("Workflow error: {message}")]
+    Workflow { message: String },
 }
 
 #[cfg(test)]
