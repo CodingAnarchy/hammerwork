@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2025-06-30
+
+### Fixed
+- **🐛 MySQL Query Field Completeness**
+  - Fixed `Database(ColumnNotFound("trace_id"))` errors in MySQL dequeue operations
+  - Updated MySQL `dequeue()` and `dequeue_with_priority_weights()` queries to include all tracing fields: `trace_id`, `correlation_id`, `parent_span_id`, `span_context`
+  - Ensures JobRow struct mapping works correctly with all database schema fields added in migration 009_add_tracing.mysql.sql
+  - Fixed two failing tests: `test_mysql_dequeue_includes_all_fields` and `test_mysql_dequeue_with_priority_weights_includes_all_fields`
+
+### Enhanced
+- **🧪 Test Infrastructure Improvements** 
+  - Improved test isolation using unique queue names to prevent test interference
+  - Fixed race conditions in result storage tests by implementing proper job completion polling
+  - Enhanced test database setup to use migration-based approach ensuring schema consistency
+  - Fixed 6 failing doctests in worker.rs by correcting async/await usage in documentation examples
+
+### Technical Implementation
+- MySQL dequeue queries now SELECT all 34 fields required by JobRow struct mapping
+- Complete field list includes: id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context
+- All tests now passing: 228 unit tests, 135 doctests, 0 failures
+
 ## [1.2.0] - 2025-06-29
 
 ### Added
