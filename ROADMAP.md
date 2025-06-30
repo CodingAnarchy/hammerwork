@@ -10,18 +10,35 @@ This roadmap outlines planned features for Hammerwork, prioritized by impact lev
 
 Critical for operational management and developer productivity.
 
+**✅ CLI Tools - COMPLETED v1.1.0+**
+The `cargo-hammerwork` CLI provides comprehensive job queue management:
+- Database migrations and setup
+- Job management (enqueue, list, retry, cancel, inspect)
+- Queue operations (list, clear, statistics)
+- Worker management and monitoring
+- Batch operations and cron scheduling
+- Workflow visualization and dependency management
+- Real-time monitoring and health checks
+
+```bash
+# Available CLI commands
+cargo hammerwork migration run
+cargo hammerwork job list --queue email
+cargo hammerwork queue stats
+cargo hammerwork worker start --queue default
+cargo hammerwork monitor dashboard
+```
+
+**🚧 Web Dashboard - REMAINING**
+Web-based admin interface for visual queue management:
+
 ```rust
-// Web-based admin interface
+// Future web-based admin interface
 let admin_server = AdminServer::new()
     .with_queue_monitoring()
     .with_job_management()
     .with_worker_controls()
     .bind("127.0.0.1:8080");
-
-// CLI tools for operations
-// hammerwork-cli queue status
-// hammerwork-cli job retry <job-id>
-// hammerwork-cli worker scale <queue> <count>
 ```
 
 ## Phase 2: Medium Impact, Variable Complexity
@@ -188,8 +205,8 @@ let geo_config = GeoReplicationConfig::new()
 Features are ordered within each phase by priority and should generally be implemented in the following sequence:
 
 **Phase 1 (Advanced Features) - CURRENT PRIORITIES**
-1. Job Dependencies & Workflows
-2. Admin Dashboard & CLI Tools
+1. ✅ Job Dependencies & Workflows (COMPLETED v1.1.0)
+2. 🚧 Admin Dashboard & CLI Tools (CLI completed v1.1.0, Web Dashboard remaining)
 
 **Phase 2 (Operational Features)**
 1. Job Archiving & Retention
