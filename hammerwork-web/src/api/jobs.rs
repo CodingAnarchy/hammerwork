@@ -79,8 +79,8 @@
 //! ```
 
 use super::{
-    with_filters, with_pagination, with_sort, ApiResponse, FilterParams,
-    PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
+    ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
+    with_filters, with_pagination, with_sort,
 };
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
@@ -226,29 +226,27 @@ where
     // For now, return a placeholder response
     // In a real implementation, this would query the database with filters and pagination
     let _ = (queue, filters, sort);
-    
-    let mock_jobs = vec![
-        JobInfo {
-            id: "job-1".to_string(),
-            queue_name: "default".to_string(),
-            status: "pending".to_string(),
-            priority: "normal".to_string(),
-            attempts: 0,
-            max_attempts: 3,
-            payload: serde_json::json!({"task": "send_email", "to": "user@example.com"}),
-            created_at: chrono::Utc::now(),
-            scheduled_at: chrono::Utc::now(),
-            started_at: None,
-            completed_at: None,
-            failed_at: None,
-            error_message: None,
-            processing_time_ms: None,
-            cron_schedule: None,
-            is_recurring: false,
-            trace_id: None,
-            correlation_id: None,
-        },
-    ];
+
+    let mock_jobs = vec![JobInfo {
+        id: "job-1".to_string(),
+        queue_name: "default".to_string(),
+        status: "pending".to_string(),
+        priority: "normal".to_string(),
+        attempts: 0,
+        max_attempts: 3,
+        payload: serde_json::json!({"task": "send_email", "to": "user@example.com"}),
+        created_at: chrono::Utc::now(),
+        scheduled_at: chrono::Utc::now(),
+        started_at: None,
+        completed_at: None,
+        failed_at: None,
+        error_message: None,
+        processing_time_ms: None,
+        cron_schedule: None,
+        is_recurring: false,
+        trace_id: None,
+        correlation_id: None,
+    }];
 
     let response = PaginatedResponse {
         items: mock_jobs,
@@ -277,8 +275,7 @@ where
         _ => JobPriority::Normal,
     };
 
-    let mut job = Job::new(request.queue_name, request.payload)
-        .with_priority(priority);
+    let mut job = Job::new(request.queue_name, request.payload).with_priority(priority);
 
     if let Some(scheduled_at) = request.scheduled_at {
         job.scheduled_at = scheduled_at;
@@ -312,10 +309,7 @@ where
 }
 
 /// Handler for getting a specific job
-async fn get_job_handler<T>(
-    job_id: String,
-    queue: Arc<T>,
-) -> Result<impl Reply, warp::Rejection>
+async fn get_job_handler<T>(job_id: String, queue: Arc<T>) -> Result<impl Reply, warp::Rejection>
 where
     T: DatabaseQueue + Send + Sync,
 {
@@ -343,10 +337,12 @@ where
                 completed_at: job.completed_at,
                 failed_at: job.failed_at,
                 error_message: job.error_message.clone(),
-                processing_time_ms: job.started_at.and_then(|start| 
-                    job.completed_at.or(job.failed_at).or(job.timed_out_at)
+                processing_time_ms: job.started_at.and_then(|start| {
+                    job.completed_at
+                        .or(job.failed_at)
+                        .or(job.timed_out_at)
                         .map(|end| (end - start).num_milliseconds())
-                ),
+                }),
                 cron_schedule: job.cron_schedule.clone(),
                 is_recurring: job.is_recurring(),
                 trace_id: job.trace_id.clone(),
@@ -384,36 +380,33 @@ where
     };
 
     match action_request.action.as_str() {
-        "retry" => {
-            match queue.retry_job(job_uuid, chrono::Utc::now()).await {
-                Ok(()) => {
-                    let response = ApiResponse::success(serde_json::json!({
-                        "message": format!("Job '{}' scheduled for retry", job_id)
-                    }));
-                    Ok(warp::reply::json(&response))
-                }
-                Err(e) => {
-                    let response = ApiResponse::<()>::error(format!("Failed to retry job: {}", e));
-                    Ok(warp::reply::json(&response))
-                }
+        "retry" => match queue.retry_job(job_uuid, chrono::Utc::now()).await {
+            Ok(()) => {
+                let response = ApiResponse::success(serde_json::json!({
+                    "message": format!("Job '{}' scheduled for retry", job_id)
+                }));
+                Ok(warp::reply::json(&response))
             }
-        }
-        "cancel" | "delete" => {
-            match queue.delete_job(job_uuid).await {
-                Ok(()) => {
-                    let response = ApiResponse::success(serde_json::json!({
-                        "message": format!("Job '{}' deleted", job_id)
-                    }));
-                    Ok(warp::reply::json(&response))
-                }
-                Err(e) => {
-                    let response = ApiResponse::<()>::error(format!("Failed to delete job: {}", e));
-                    Ok(warp::reply::json(&response))
-                }
+            Err(e) => {
+                let response = ApiResponse::<()>::error(format!("Failed to retry job: {}", e));
+                Ok(warp::reply::json(&response))
             }
-        }
+        },
+        "cancel" | "delete" => match queue.delete_job(job_uuid).await {
+            Ok(()) => {
+                let response = ApiResponse::success(serde_json::json!({
+                    "message": format!("Job '{}' deleted", job_id)
+                }));
+                Ok(warp::reply::json(&response))
+            }
+            Err(e) => {
+                let response = ApiResponse::<()>::error(format!("Failed to delete job: {}", e));
+                Ok(warp::reply::json(&response))
+            }
+        },
         _ => {
-            let response = ApiResponse::<()>::error(format!("Unknown action: {}", action_request.action));
+            let response =
+                ApiResponse::<()>::error(format!("Unknown action: {}", action_request.action));
             Ok(warp::reply::json(&response))
         }
     }
@@ -503,7 +496,7 @@ mod tests {
             "priority": "high",
             "max_attempts": 5
         }"#;
-        
+
         let request: CreateJobRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.queue_name, "email");
         assert_eq!(request.priority, Some("high".to_string()));
@@ -525,7 +518,7 @@ mod tests {
             "action": "delete",
             "reason": "Cleanup old jobs"
         }"#;
-        
+
         let request: BulkJobActionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.job_ids.len(), 3);
         assert_eq!(request.action, "delete");

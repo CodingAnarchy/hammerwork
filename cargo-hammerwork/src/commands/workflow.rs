@@ -563,7 +563,13 @@ impl WorkflowCommand {
             .filter_map(|dep_id| {
                 if let Some(dep_job) = job_map.get(dep_id) {
                     if !visited.contains(dep_id) {
-                        Self::calculate_job_level(dep_job, job_map, levels, visited, _current_level);
+                        Self::calculate_job_level(
+                            dep_job,
+                            job_map,
+                            levels,
+                            visited,
+                            _current_level,
+                        );
                     }
                     levels.get(dep_id).copied()
                 } else {

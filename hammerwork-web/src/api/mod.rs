@@ -186,10 +186,15 @@ impl SortParams {
 }
 
 /// Common error handling for API endpoints
-pub async fn handle_api_error(err: warp::Rejection) -> Result<impl warp::Reply, std::convert::Infallible> {
+pub async fn handle_api_error(
+    err: warp::Rejection,
+) -> Result<impl warp::Reply, std::convert::Infallible> {
     let response = if err.is_not_found() {
         ApiResponse::<()>::error("Resource not found".to_string())
-    } else if err.find::<warp::filters::body::BodyDeserializeError>().is_some() {
+    } else if err
+        .find::<warp::filters::body::BodyDeserializeError>()
+        .is_some()
+    {
         ApiResponse::<()>::error("Invalid request body".to_string())
     } else if err.find::<warp::reject::InvalidQuery>().is_some() {
         ApiResponse::<()>::error("Invalid query parameters".to_string())
@@ -199,8 +204,11 @@ pub async fn handle_api_error(err: warp::Rejection) -> Result<impl warp::Reply, 
 
     let status = if err.is_not_found() {
         warp::http::StatusCode::NOT_FOUND
-    } else if err.find::<warp::filters::body::BodyDeserializeError>().is_some() 
-        || err.find::<warp::reject::InvalidQuery>().is_some() {
+    } else if err
+        .find::<warp::filters::body::BodyDeserializeError>()
+        .is_some()
+        || err.find::<warp::reject::InvalidQuery>().is_some()
+    {
         warp::http::StatusCode::BAD_REQUEST
     } else {
         warp::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -213,12 +221,14 @@ pub async fn handle_api_error(err: warp::Rejection) -> Result<impl warp::Reply, 
 }
 
 /// Extract pagination parameters from query string
-pub fn with_pagination() -> impl warp::Filter<Extract = (PaginationParams,), Error = warp::Rejection> + Clone {
+pub fn with_pagination()
+-> impl warp::Filter<Extract = (PaginationParams,), Error = warp::Rejection> + Clone {
     warp::query::<PaginationParams>()
 }
 
 /// Extract filter parameters from query string  
-pub fn with_filters() -> impl warp::Filter<Extract = (FilterParams,), Error = warp::Rejection> + Clone {
+pub fn with_filters()
+-> impl warp::Filter<Extract = (FilterParams,), Error = warp::Rejection> + Clone {
     warp::query::<FilterParams>()
 }
 
@@ -273,7 +283,7 @@ mod tests {
             offset: None,
         };
         let meta = PaginationMeta::new(&params, 45);
-        
+
         assert_eq!(meta.page, 2);
         assert_eq!(meta.limit, 10);
         assert_eq!(meta.total, 45);

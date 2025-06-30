@@ -44,16 +44,15 @@
 //! ```
 
 use crate::{
-    api,
-    auth::{auth_filter, handle_auth_rejection, AuthState},
+    Result, api,
+    auth::{AuthState, auth_filter, handle_auth_rejection},
     config::DashboardConfig,
     websocket::WebSocketState,
-    Result,
 };
 use hammerwork::JobQueue;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::RwLock;
-use tracing::{info, error};
+use tracing::{error, info};
 use warp::{Filter, Reply};
 
 /// Main web dashboard server.
@@ -133,13 +132,16 @@ impl WebDashboard {
 
         // Create API routes
         let api_routes = Self::create_api_routes_static(queue.clone(), self.auth_state.clone());
-        
+
         // Create WebSocket routes
-        let websocket_routes = Self::create_websocket_routes_static(self.websocket_state.clone(), self.auth_state.clone());
-        
+        let websocket_routes = Self::create_websocket_routes_static(
+            self.websocket_state.clone(),
+            self.auth_state.clone(),
+        );
+
         // Create static file routes
         let static_routes = Self::create_static_routes_static(self.config.static_dir.clone())?;
-        
+
         // Combine all routes
         let routes = api_routes
             .or(websocket_routes)
@@ -147,19 +149,17 @@ impl WebDashboard {
             .recover(handle_auth_rejection);
 
         // Apply CORS if enabled (simplified approach)
-        let routes = routes
-            .with(if self.config.enable_cors {
-                warp::cors()
-                    .allow_any_origin()
-                    .allow_headers(vec!["content-type", "authorization"])
-                    .allow_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-            } else {
-                warp::cors()
-                    .allow_origin("none") // Effectively disable CORS
-            });
+        let routes = routes.with(if self.config.enable_cors {
+            warp::cors()
+                .allow_any_origin()
+                .allow_headers(vec!["content-type", "authorization"])
+                .allow_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+        } else {
+            warp::cors().allow_origin("none") // Effectively disable CORS
+        });
 
         info!("Starting web server on {}", bind_addr);
-        
+
         // Start cleanup task for auth state
         let auth_state_cleanup = self.auth_state.clone();
         tokio::spawn(async move {
@@ -195,12 +195,17 @@ impl WebDashboard {
             #[cfg(feature = "postgres")]
             {
                 let pg_pool = sqlx::PgPool::connect(&self.config.database_url).await?;
-                info!("Connected to PostgreSQL with {} connections", self.config.pool_size);
+                info!(
+                    "Connected to PostgreSQL with {} connections",
+                    self.config.pool_size
+                );
                 Ok(JobQueue::new(pg_pool))
             }
             #[cfg(not(feature = "postgres"))]
             {
-                return Err(anyhow::anyhow!("PostgreSQL support not enabled. Rebuild with --features postgres"));
+                return Err(anyhow::anyhow!(
+                    "PostgreSQL support not enabled. Rebuild with --features postgres"
+                ));
             }
         } else if self.config.database_url.starts_with("mysql") {
             #[cfg(feature = "mysql")]
@@ -208,17 +213,24 @@ impl WebDashboard {
                 #[cfg(all(feature = "mysql", not(feature = "postgres")))]
                 {
                     let mysql_pool = sqlx::MySqlPool::connect(&self.config.database_url).await?;
-                    info!("Connected to MySQL with {} connections", self.config.pool_size);
+                    info!(
+                        "Connected to MySQL with {} connections",
+                        self.config.pool_size
+                    );
                     Ok(JobQueue::new(mysql_pool))
                 }
                 #[cfg(all(feature = "postgres", feature = "mysql"))]
                 {
-                    return Err(anyhow::anyhow!("MySQL database URL provided but PostgreSQL is the default when both features are enabled"));
+                    return Err(anyhow::anyhow!(
+                        "MySQL database URL provided but PostgreSQL is the default when both features are enabled"
+                    ));
                 }
             }
             #[cfg(not(feature = "mysql"))]
             {
-                return Err(anyhow::anyhow!("MySQL support not enabled. Rebuild with --features mysql"));
+                return Err(anyhow::anyhow!(
+                    "MySQL support not enabled. Rebuild with --features mysql"
+                ));
             }
         } else {
             Err(anyhow::anyhow!("Unsupported database URL format"))
@@ -230,7 +242,6 @@ impl WebDashboard {
         queue: Arc<QueueType>,
         auth_state: AuthState,
     ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone {
-
         // Health check endpoint (no auth required)
         let health = warp::path("health")
             .and(warp::path::end())
@@ -262,36 +273,35 @@ impl WebDashboard {
         websocket_state: Arc<RwLock<WebSocketState>>,
         auth_state: AuthState,
     ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone {
-
         warp::path("ws")
             .and(warp::path::end())
             .and(auth_filter(auth_state))
             .and(warp::ws())
             .and(warp::any().map(move || websocket_state.clone()))
-            .map(|_: (), ws: warp::ws::Ws, websocket_state: Arc<RwLock<WebSocketState>>| {
-                ws.on_upgrade(move |socket| async move {
-                    let mut state = websocket_state.write().await;
-                    if let Err(e) = state.handle_connection(socket).await {
-                        error!("WebSocket error: {}", e);
-                    }
-                })
-            })
+            .map(
+                |_: (), ws: warp::ws::Ws, websocket_state: Arc<RwLock<WebSocketState>>| {
+                    ws.on_upgrade(move |socket| async move {
+                        let mut state = websocket_state.write().await;
+                        if let Err(e) = state.handle_connection(socket).await {
+                            error!("WebSocket error: {}", e);
+                        }
+                    })
+                },
+            )
     }
 
     /// Create static file serving routes
-    fn create_static_routes_static(static_dir: std::path::PathBuf) -> Result<impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone> {
-
+    fn create_static_routes_static(
+        static_dir: std::path::PathBuf,
+    ) -> Result<impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone> {
         // Serve static files
-        let static_files = warp::path("static")
-            .and(warp::fs::dir(static_dir.clone()));
+        let static_files = warp::path("static").and(warp::fs::dir(static_dir.clone()));
 
         // Serve index.html at root
-        let index = warp::path::end()
-            .and(warp::fs::file(static_dir.join("index.html")));
+        let index = warp::path::end().and(warp::fs::file(static_dir.join("index.html")));
 
         // Catch-all for SPA routing - serve index.html
-        let spa_routes = warp::any()
-            .and(warp::fs::file(static_dir.join("index.html")));
+        let spa_routes = warp::any().and(warp::fs::file(static_dir.join("index.html")));
 
         Ok(index.or(static_files).or(spa_routes))
     }
@@ -318,8 +328,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_creation() {
         let temp_dir = tempdir().unwrap();
-        let config = DashboardConfig::new()
-            .with_static_dir(temp_dir.path().to_path_buf());
+        let config = DashboardConfig::new().with_static_dir(temp_dir.path().to_path_buf());
 
         let dashboard = WebDashboard::new(config).await;
         assert!(dashboard.is_ok());

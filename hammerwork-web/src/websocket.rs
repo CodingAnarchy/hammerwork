@@ -61,7 +61,7 @@ pub struct WebSocketState {
 impl WebSocketState {
     pub fn new(config: WebSocketConfig) -> Self {
         let (broadcast_sender, broadcast_receiver) = mpsc::unbounded_channel();
-        
+
         Self {
             config,
             connections: HashMap::new(),
@@ -73,7 +73,7 @@ impl WebSocketState {
     /// Handle a new WebSocket connection
     pub async fn handle_connection(&mut self, websocket: warp::ws::WebSocket) -> crate::Result<()> {
         let connection_id = Uuid::new_v4();
-        
+
         if self.connections.len() >= self.config.max_connections {
             warn!("Maximum WebSocket connections reached, rejecting new connection");
             return Ok(());
@@ -81,7 +81,7 @@ impl WebSocketState {
 
         let (mut ws_sender, mut ws_receiver) = websocket.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        
+
         // Store the connection
         self.connections.insert(connection_id, tx);
         info!("WebSocket connection established: {}", connection_id);
@@ -91,7 +91,10 @@ impl WebSocketState {
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 if let Err(e) = ws_sender.send(message).await {
-                    debug!("Failed to send WebSocket message to {}: {}", connection_id_clone, e);
+                    debug!(
+                        "Failed to send WebSocket message to {}: {}",
+                        connection_id_clone, e
+                    );
                     break;
                 }
             }
@@ -99,12 +102,18 @@ impl WebSocketState {
 
         // Handle incoming messages from this client
         let broadcast_sender = self.broadcast_sender.clone();
-        
+
         while let Some(result) = ws_receiver.next().await {
             match result {
                 Ok(message) => {
-                    if let Err(e) = self.handle_client_message(connection_id, message, &broadcast_sender).await {
-                        error!("Error handling client message from {}: {}", connection_id, e);
+                    if let Err(e) = self
+                        .handle_client_message(connection_id, message, &broadcast_sender)
+                        .await
+                    {
+                        error!(
+                            "Error handling client message from {}: {}",
+                            connection_id, e
+                        );
                         break;
                     }
                 }
@@ -132,8 +141,12 @@ impl WebSocketState {
         if message.is_text() {
             if let Ok(text) = message.to_str() {
                 if let Ok(client_message) = serde_json::from_str::<ClientMessage>(text) {
-                    debug!("Received message from {}: {:?}", connection_id, client_message);
-                    self.handle_client_action(connection_id, client_message).await?;
+                    debug!(
+                        "Received message from {}: {:?}",
+                        connection_id, client_message
+                    );
+                    self.handle_client_action(connection_id, client_message)
+                        .await?;
                 } else {
                     warn!("Invalid message format from {}: {}", connection_id, text);
                 }
@@ -157,7 +170,11 @@ impl WebSocketState {
     }
 
     /// Handle a client action
-    async fn handle_client_action(&self, _connection_id: Uuid, message: ClientMessage) -> crate::Result<()> {
+    async fn handle_client_action(
+        &self,
+        _connection_id: Uuid,
+        message: ClientMessage,
+    ) -> crate::Result<()> {
         match message {
             ClientMessage::Subscribe { event_types } => {
                 info!("Client subscribed to events: {:?}", event_types);
@@ -208,7 +225,10 @@ impl WebSocketState {
         }
 
         if !disconnected.is_empty() {
-            debug!("Detected {} disconnected WebSocket clients during ping", disconnected.len());
+            debug!(
+                "Detected {} disconnected WebSocket clients during ping",
+                disconnected.len()
+            );
         }
     }
 
@@ -227,9 +247,7 @@ impl WebSocketState {
                         BroadcastMessage::QueueUpdate { queue_name, stats } => {
                             ServerMessage::QueueUpdate { queue_name, stats }
                         }
-                        BroadcastMessage::JobUpdate { job } => {
-                            ServerMessage::JobUpdate { job }
-                        }
+                        BroadcastMessage::JobUpdate { job } => ServerMessage::JobUpdate { job },
                         BroadcastMessage::SystemAlert { message, severity } => {
                             ServerMessage::SystemAlert { message, severity }
                         }
@@ -338,7 +356,7 @@ mod tests {
     fn test_client_message_deserialization() {
         let json = r#"{"type": "Subscribe", "event_types": ["queue_updates", "job_updates"]}"#;
         let message: ClientMessage = serde_json::from_str(json).unwrap();
-        
+
         match message {
             ClientMessage::Subscribe { event_types } => {
                 assert_eq!(event_types.len(), 2);

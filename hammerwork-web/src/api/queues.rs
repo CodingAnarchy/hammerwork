@@ -94,8 +94,8 @@
 //! ```
 
 use super::{
-    with_filters, with_pagination, with_sort, ApiResponse, FilterParams,
-    PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
+    ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
+    with_filters, with_pagination, with_sort,
 };
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
@@ -197,10 +197,7 @@ where
         .and(with_sort())
         .and_then(queue_jobs_handler);
 
-    list_queues
-        .or(get_queue)
-        .or(queue_action)
-        .or(queue_jobs)
+    list_queues.or(get_queue).or(queue_action).or(queue_jobs)
 }
 
 /// Handler for listing all queues
@@ -229,7 +226,7 @@ where
                     avg_processing_time_ms: stats.statistics.avg_processing_time_ms,
                     throughput_per_minute: stats.statistics.throughput_per_minute,
                     error_rate: stats.statistics.error_rate,
-                    last_job_at: None, // TODO: Get from database
+                    last_job_at: None,        // TODO: Get from database
                     oldest_pending_job: None, // TODO: Get from database
                 };
                 queue_infos.push(queue_info);
@@ -239,7 +236,7 @@ where
             let total = queue_infos.len() as u64;
             let offset = pagination.get_offset() as usize;
             let limit = pagination.get_limit() as usize;
-            
+
             let items = if offset < queue_infos.len() {
                 let end = (offset + limit).min(queue_infos.len());
                 queue_infos[offset..end].to_vec()
@@ -255,7 +252,8 @@ where
             Ok(warp::reply::json(&ApiResponse::success(response)))
         }
         Err(e) => {
-            let response = ApiResponse::<()>::error(format!("Failed to get queue statistics: {}", e));
+            let response =
+                ApiResponse::<()>::error(format!("Failed to get queue statistics: {}", e));
             Ok(warp::reply::json(&response))
         }
     }
@@ -302,12 +300,14 @@ where
 
                 Ok(warp::reply::json(&ApiResponse::success(detailed_stats)))
             } else {
-                let response = ApiResponse::<()>::error(format!("Queue '{}' not found", queue_name));
+                let response =
+                    ApiResponse::<()>::error(format!("Queue '{}' not found", queue_name));
                 Ok(warp::reply::json(&response))
             }
         }
         Err(e) => {
-            let response = ApiResponse::<()>::error(format!("Failed to get queue statistics: {}", e));
+            let response =
+                ApiResponse::<()>::error(format!("Failed to get queue statistics: {}", e));
             Ok(warp::reply::json(&response))
         }
     }
@@ -334,14 +334,16 @@ where
                     Ok(warp::reply::json(&response))
                 }
                 Err(e) => {
-                    let response = ApiResponse::<()>::error(format!("Failed to clear dead jobs: {}", e));
+                    let response =
+                        ApiResponse::<()>::error(format!("Failed to clear dead jobs: {}", e));
                     Ok(warp::reply::json(&response))
                 }
             }
         }
         "clear_completed" => {
             // TODO: Implement clear completed jobs
-            let response = ApiResponse::<()>::error("Clear completed jobs not yet implemented".to_string());
+            let response =
+                ApiResponse::<()>::error("Clear completed jobs not yet implemented".to_string());
             Ok(warp::reply::json(&response))
         }
         "pause" => {
@@ -355,7 +357,8 @@ where
             Ok(warp::reply::json(&response))
         }
         _ => {
-            let response = ApiResponse::<()>::error(format!("Unknown action: {}", action_request.action));
+            let response =
+                ApiResponse::<()>::error(format!("Unknown action: {}", action_request.action));
             Ok(warp::reply::json(&response))
         }
     }
@@ -375,12 +378,12 @@ where
     // This would delegate to the jobs API with queue filter
     // For now, return a simple response
     let _ = (queue, pagination, filters, sort);
-    
+
     let response = ApiResponse::success(serde_json::json!({
         "message": format!("Jobs for queue '{}' - implementation pending", queue_name),
         "queue": queue_name
     }));
-    
+
     Ok(warp::reply::json(&response))
 }
 

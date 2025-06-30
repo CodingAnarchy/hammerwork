@@ -94,28 +94,28 @@ use std::time::Duration;
 pub struct DashboardConfig {
     /// Server bind address
     pub bind_address: String,
-    
+
     /// Server port
     pub port: u16,
-    
+
     /// Database connection URL
     pub database_url: String,
-    
+
     /// Database connection pool size
     pub pool_size: u32,
-    
+
     /// Directory containing static assets (HTML, CSS, JS)
     pub static_dir: PathBuf,
-    
+
     /// Authentication configuration
     pub auth: AuthConfig,
-    
+
     /// WebSocket configuration
     pub websocket: WebSocketConfig,
-    
+
     /// Enable CORS for cross-origin requests
     pub enable_cors: bool,
-    
+
     /// Request timeout duration
     pub request_timeout: Duration,
 }
@@ -152,7 +152,7 @@ impl DashboardConfig {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Set the server bind address and port.
     ///
     /// # Examples
@@ -172,7 +172,7 @@ impl DashboardConfig {
         self.port = port;
         self
     }
-    
+
     /// Set the database URL.
     ///
     /// Supports both PostgreSQL and MySQL database URLs.
@@ -196,7 +196,7 @@ impl DashboardConfig {
         self.database_url = url.to_string();
         self
     }
-    
+
     /// Set the static assets directory.
     ///
     /// # Examples
@@ -214,7 +214,7 @@ impl DashboardConfig {
         self.static_dir = dir;
         self
     }
-    
+
     /// Enable authentication with username and password hash.
     ///
     /// The password should be a bcrypt hash for security. When authentication is enabled,
@@ -238,7 +238,7 @@ impl DashboardConfig {
         self.auth.password_hash = password_hash.to_string();
         self
     }
-    
+
     /// Enable or disable CORS support.
     ///
     /// When enabled, the server will accept cross-origin requests from any domain.
@@ -263,21 +263,21 @@ impl DashboardConfig {
         self.enable_cors = enabled;
         self
     }
-    
+
     /// Load configuration from a TOML file
     pub fn from_file(path: &str) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
         Ok(config)
     }
-    
+
     /// Save configuration to a TOML file
     pub fn save_to_file(&self, path: &str) -> crate::Result<()> {
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
     }
-    
+
     /// Get the full bind address (address:port)
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.bind_address, self.port)
@@ -318,19 +318,19 @@ impl DashboardConfig {
 pub struct AuthConfig {
     /// Whether authentication is enabled
     pub enabled: bool,
-    
+
     /// Username for basic authentication
     pub username: String,
-    
+
     /// Bcrypt hash of the password
     pub password_hash: String,
-    
+
     /// Session timeout duration
     pub session_timeout: Duration,
-    
+
     /// Maximum number of failed login attempts
     pub max_failed_attempts: u32,
-    
+
     /// Lockout duration after max failed attempts
     pub lockout_duration: Duration,
 }
@@ -353,13 +353,13 @@ impl Default for AuthConfig {
 pub struct WebSocketConfig {
     /// Ping interval to keep connections alive
     pub ping_interval: Duration,
-    
+
     /// Maximum number of concurrent WebSocket connections
     pub max_connections: usize,
-    
+
     /// Buffer size for WebSocket messages
     pub message_buffer_size: usize,
-    
+
     /// Maximum message size in bytes
     pub max_message_size: usize,
 }
@@ -379,41 +379,41 @@ impl Default for WebSocketConfig {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    
+
     #[test]
     fn test_config_creation() {
         let config = DashboardConfig::new()
             .with_bind_address("0.0.0.0", 9090)
             .with_database_url("mysql://localhost/test")
             .with_cors(true);
-            
+
         assert_eq!(config.bind_address, "0.0.0.0");
         assert_eq!(config.port, 9090);
         assert_eq!(config.database_url, "mysql://localhost/test");
         assert!(config.enable_cors);
         assert_eq!(config.bind_addr(), "0.0.0.0:9090");
     }
-    
+
     #[test]
     fn test_config_file_operations() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
-        
+
         let config = DashboardConfig::new()
             .with_bind_address("192.168.1.100", 8888)
             .with_database_url("postgresql://test/db");
-            
+
         // Save config
         config.save_to_file(config_path.to_str().unwrap()).unwrap();
-        
+
         // Load config
         let loaded_config = DashboardConfig::from_file(config_path.to_str().unwrap()).unwrap();
-        
+
         assert_eq!(loaded_config.bind_address, "192.168.1.100");
         assert_eq!(loaded_config.port, 8888);
         assert_eq!(loaded_config.database_url, "postgresql://test/db");
     }
-    
+
     #[test]
     fn test_auth_config_defaults() {
         let auth = AuthConfig::default();
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(auth.lockout_duration.as_secs(), 15 * 60); // 15 minutes
         assert_eq!(auth.session_timeout.as_secs(), 8 * 60 * 60); // 8 hours
     }
-    
+
     #[test]
     fn test_websocket_config_defaults() {
         let ws_config = WebSocketConfig::default();

@@ -40,11 +40,11 @@
 //! ```
 
 use crate::config::AuthConfig;
+use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use warp::{Filter, Rejection, Reply};
-use base64::Engine;
 
 /// Authentication middleware state
 #[derive(Clone)]
@@ -119,7 +119,10 @@ impl AuthState {
         let default_entry = (0, std::time::Instant::now());
         let (count, _) = attempts.get(username).unwrap_or(&default_entry);
         let new_count = *count;
-        attempts.insert(username.to_string(), (new_count + 1, std::time::Instant::now()));
+        attempts.insert(
+            username.to_string(),
+            (new_count + 1, std::time::Instant::now()),
+        );
     }
 
     /// Clear failed attempts for successful login
@@ -172,11 +175,11 @@ pub fn extract_basic_auth(auth_header: &str) -> Option<(String, String)> {
     let encoded = &auth_header[6..];
     let decoded = ::base64::prelude::BASE64_STANDARD.decode(encoded).ok()?;
     let decoded_str = String::from_utf8(decoded).ok()?;
-    
+
     let mut parts = decoded_str.splitn(2, ':');
     let username = parts.next()?.to_string();
     let password = parts.next()?.to_string();
-    
+
     Some((username, password))
 }
 
@@ -184,17 +187,16 @@ pub fn extract_basic_auth(auth_header: &str) -> Option<(String, String)> {
 pub fn auth_filter(
     auth_state: AuthState,
 ) -> impl Filter<Extract = ((),), Error = Rejection> + Clone {
-    warp::header::optional::<String>("authorization")
-        .and_then(move |auth_header: Option<String>| {
+    warp::header::optional::<String>("authorization").and_then(
+        move |auth_header: Option<String>| {
             let auth_state = auth_state.clone();
             async move {
                 if !auth_state.is_enabled() {
                     return Ok::<_, Rejection>(());
                 }
 
-                let auth_header = auth_header.ok_or_else(|| {
-                    warp::reject::custom(AuthError::MissingCredentials)
-                })?;
+                let auth_header = auth_header
+                    .ok_or_else(|| warp::reject::custom(AuthError::MissingCredentials))?;
 
                 let (username, password) = extract_basic_auth(&auth_header)
                     .ok_or_else(|| warp::reject::custom(AuthError::InvalidFormat))?;
@@ -205,7 +207,8 @@ pub fn auth_filter(
                     Err(warp::reject::custom(AuthError::InvalidCredentials))
                 }
             }
-        })
+        },
+    )
 }
 
 /// Custom authentication errors
@@ -220,7 +223,9 @@ pub enum AuthError {
 impl warp::reject::Reject for AuthError {}
 
 /// Handle authentication rejections
-pub async fn handle_auth_rejection(err: Rejection) -> Result<Box<dyn Reply>, std::convert::Infallible> {
+pub async fn handle_auth_rejection(
+    err: Rejection,
+) -> Result<Box<dyn Reply>, std::convert::Infallible> {
     if let Some(auth_error) = err.find::<AuthError>() {
         match auth_error {
             AuthError::MissingCredentials => {
@@ -266,7 +271,6 @@ pub async fn handle_auth_rejection(err: Rejection) -> Result<Box<dyn Reply>, std
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,7 +284,7 @@ mod tests {
             password_hash: "testhash".to_string(),
             ..Default::default()
         };
-        
+
         let auth_state = AuthState::new(config);
         assert!(auth_state.is_enabled());
     }
@@ -291,7 +295,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        
+
         let auth_state = AuthState::new(config);
         assert!(!auth_state.is_enabled());
         assert!(auth_state.verify_credentials("anyone", "anything").await);
@@ -307,14 +311,14 @@ mod tests {
             lockout_duration: Duration::from_secs(60),
             ..Default::default()
         };
-        
+
         let auth_state = AuthState::new(config);
-        
+
         // Verify multiple failed attempts
         for _ in 0..3 {
             assert!(!auth_state.verify_credentials("admin", "wrongpass").await);
         }
-        
+
         // Should be locked out now
         assert!(auth_state.is_locked_out("admin").await);
     }

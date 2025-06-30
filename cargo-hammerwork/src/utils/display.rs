@@ -70,7 +70,7 @@ use std::fmt;
 /// use cargo_hammerwork::utils::display::JobTable;
 ///
 /// let mut table = JobTable::new();
-/// 
+///
 /// // Add multiple jobs
 /// table.add_job_row(
 ///     "job-id-1", "email", "pending", "normal", 0,
@@ -80,7 +80,7 @@ use std::fmt;
 ///     "job-id-2", "data-processing", "running", "high", 1,
 ///     "2024-01-01 09:55:00", "2024-01-01 10:00:00"
 /// );
-/// 
+///
 /// // The table will display with color-coded status and priority
 /// ```
 pub struct JobTable {
@@ -189,7 +189,7 @@ impl fmt::Display for JobTable {
 /// stats.add_stats_row("pending", "normal", 100);
 /// stats.add_stats_row("running", "high", 10);
 /// stats.add_stats_row("failed", "critical", 2);
-/// 
+///
 /// // Display shows icons: 🟡 pending, 🔵 running, 🔴 failed
 /// ```
 pub struct StatsTable {

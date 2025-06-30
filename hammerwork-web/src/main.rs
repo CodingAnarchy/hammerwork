@@ -4,14 +4,16 @@ use anyhow::Result;
 use clap::{Arg, Command};
 use hammerwork_web::{DashboardConfig, WebDashboard};
 use std::path::PathBuf;
-use tracing::{info, error};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("hammerwork_web=info".parse()?))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("hammerwork_web=info".parse()?),
+        )
         .init();
 
     let matches = Command::new("hammerwork-web")
@@ -23,14 +25,14 @@ async fn main() -> Result<()> {
                 .short('c')
                 .long("config")
                 .value_name("FILE")
-                .help("Path to configuration file")
+                .help("Path to configuration file"),
         )
         .arg(
             Arg::new("database-url")
                 .short('d')
                 .long("database-url")
                 .value_name("URL")
-                .help("Database connection URL")
+                .help("Database connection URL"),
         )
         .arg(
             Arg::new("bind")
@@ -38,7 +40,7 @@ async fn main() -> Result<()> {
                 .long("bind")
                 .value_name("ADDRESS")
                 .help("Server bind address")
-                .default_value("127.0.0.1")
+                .default_value("127.0.0.1"),
         )
         .arg(
             Arg::new("port")
@@ -46,45 +48,45 @@ async fn main() -> Result<()> {
                 .long("port")
                 .value_name("PORT")
                 .help("Server port")
-                .default_value("8080")
+                .default_value("8080"),
         )
         .arg(
             Arg::new("static-dir")
                 .long("static-dir")
                 .value_name("DIR")
                 .help("Directory containing static assets")
-                .default_value("./assets")
+                .default_value("./assets"),
         )
         .arg(
             Arg::new("cors")
                 .long("cors")
                 .help("Enable CORS support")
-                .action(clap::ArgAction::SetTrue)
+                .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("auth")
                 .long("auth")
                 .help("Enable basic authentication")
-                .action(clap::ArgAction::SetTrue)
+                .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("username")
                 .long("username")
                 .value_name("USER")
                 .help("Username for authentication (requires --auth)")
-                .default_value("admin")
+                .default_value("admin"),
         )
         .arg(
             Arg::new("password")
                 .long("password")
                 .value_name("PASS")
-                .help("Password for authentication (requires --auth)")
+                .help("Password for authentication (requires --auth)"),
         )
         .arg(
             Arg::new("password-file")
                 .long("password-file")
                 .value_name("FILE")
-                .help("File containing password hash (requires --auth)")
+                .help("File containing password hash (requires --auth)"),
         )
         .get_matches();
 
@@ -102,7 +104,9 @@ async fn main() -> Result<()> {
     }
 
     if config.database_url.is_empty() {
-        error!("Database URL is required. Use --database-url or set DATABASE_URL environment variable.");
+        error!(
+            "Database URL is required. Use --database-url or set DATABASE_URL environment variable."
+        );
         std::process::exit(1);
     }
 
@@ -119,13 +123,14 @@ async fn main() -> Result<()> {
     // Handle authentication
     if matches.get_flag("auth") {
         config.auth.enabled = true;
-        
+
         if let Some(username) = matches.get_one::<String>("username") {
             config.auth.username = username.clone();
         }
 
         // Handle password or password file
-        let password_hash = if let Some(password_file) = matches.get_one::<String>("password-file") {
+        let password_hash = if let Some(password_file) = matches.get_one::<String>("password-file")
+        {
             std::fs::read_to_string(password_file)?.trim().to_string()
         } else if let Some(password) = matches.get_one::<String>("password") {
             // For simplicity, we'll use bcrypt if available, otherwise plain text (not recommended)
@@ -140,7 +145,9 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         } else {
-            error!("Authentication enabled but no password provided. Use --password or --password-file");
+            error!(
+                "Authentication enabled but no password provided. Use --password or --password-file"
+            );
             std::process::exit(1);
         };
 
@@ -151,7 +158,7 @@ async fn main() -> Result<()> {
     info!("Server: http://{}", config.bind_addr());
     info!("Database: {}", mask_database_url(&config.database_url));
     info!("Static assets: {}", config.static_dir.display());
-    
+
     if config.auth.enabled {
         info!("Authentication: enabled (user: {})", config.auth.username);
     } else {
@@ -160,7 +167,7 @@ async fn main() -> Result<()> {
 
     // Create and start the web dashboard
     let dashboard = WebDashboard::new(config).await?;
-    
+
     // Handle graceful shutdown
     let shutdown_signal = async {
         tokio::signal::ctrl_c()

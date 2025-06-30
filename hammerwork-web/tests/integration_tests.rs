@@ -7,7 +7,7 @@
 //! - WebSocket connections
 //! - Database integration
 
-use hammerwork_web::{DashboardConfig, WebDashboard, AuthConfig};
+use hammerwork_web::{AuthConfig, DashboardConfig, WebDashboard};
 use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -20,12 +20,13 @@ mod tests {
     #[ignore] // Requires database connection
     async fn test_dashboard_startup_with_postgres() {
         let temp_dir = tempdir().unwrap();
-        
+
         let config = DashboardConfig {
             bind_address: "127.0.0.1".to_string(),
             port: 0, // Use random port
-            database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgresql://postgres:hammerwork@localhost:5433/hammerwork".to_string()),
+            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgresql://postgres:hammerwork@localhost:5433/hammerwork".to_string()
+            }),
             pool_size: 2,
             static_dir: temp_dir.path().to_path_buf(),
             auth: AuthConfig {
@@ -41,23 +42,28 @@ mod tests {
         std::fs::create_dir_all(temp_dir.path()).unwrap();
         std::fs::write(
             temp_dir.path().join("index.html"),
-            "<html><body>Test Dashboard</body></html>"
-        ).unwrap();
+            "<html><body>Test Dashboard</body></html>",
+        )
+        .unwrap();
 
         let dashboard = WebDashboard::new(config).await;
-        assert!(dashboard.is_ok(), "Dashboard should be created successfully");
+        assert!(
+            dashboard.is_ok(),
+            "Dashboard should be created successfully"
+        );
     }
 
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_dashboard_startup_with_mysql() {
         let temp_dir = tempdir().unwrap();
-        
+
         let config = DashboardConfig {
             bind_address: "127.0.0.1".to_string(),
             port: 0, // Use random port
-            database_url: std::env::var("MYSQL_DATABASE_URL")
-                .unwrap_or_else(|_| "mysql://root:hammerwork@localhost:3307/hammerwork".to_string()),
+            database_url: std::env::var("MYSQL_DATABASE_URL").unwrap_or_else(|_| {
+                "mysql://root:hammerwork@localhost:3307/hammerwork".to_string()
+            }),
             pool_size: 2,
             static_dir: temp_dir.path().to_path_buf(),
             auth: AuthConfig {
@@ -73,17 +79,21 @@ mod tests {
         std::fs::create_dir_all(temp_dir.path()).unwrap();
         std::fs::write(
             temp_dir.path().join("index.html"),
-            "<html><body>Test Dashboard</body></html>"
-        ).unwrap();
+            "<html><body>Test Dashboard</body></html>",
+        )
+        .unwrap();
 
         let dashboard = WebDashboard::new(config).await;
-        assert!(dashboard.is_ok(), "Dashboard should be created successfully");
+        assert!(
+            dashboard.is_ok(),
+            "Dashboard should be created successfully"
+        );
     }
 
     #[test]
     fn test_config_validation() {
         let temp_dir = tempdir().unwrap();
-        
+
         let config = DashboardConfig::new()
             .with_bind_address("0.0.0.0", 8080)
             .with_database_url("postgresql://localhost/hammerwork")
@@ -98,8 +108,7 @@ mod tests {
 
     #[test]
     fn test_auth_config_validation() {
-        let config = DashboardConfig::new()
-            .with_auth("testuser", "testhash");
+        let config = DashboardConfig::new().with_auth("testuser", "testhash");
 
         assert!(config.auth.enabled);
         assert_eq!(config.auth.username, "testuser");
@@ -110,18 +119,20 @@ mod tests {
     async fn test_config_file_operations() {
         let temp_dir = tempdir().unwrap();
         let config_path = temp_dir.path().join("dashboard.toml");
-        
+
         let original_config = DashboardConfig::new()
             .with_bind_address("192.168.1.100", 9090)
             .with_database_url("postgresql://test/database")
             .with_cors(true);
 
         // Save configuration
-        original_config.save_to_file(config_path.to_str().unwrap()).unwrap();
-        
+        original_config
+            .save_to_file(config_path.to_str().unwrap())
+            .unwrap();
+
         // Load configuration
         let loaded_config = DashboardConfig::from_file(config_path.to_str().unwrap()).unwrap();
-        
+
         assert_eq!(loaded_config.bind_address, "192.168.1.100");
         assert_eq!(loaded_config.port, 9090);
         assert_eq!(loaded_config.database_url, "postgresql://test/database");
@@ -131,7 +142,7 @@ mod tests {
     #[test]
     fn test_invalid_database_url() {
         let temp_dir = tempdir().unwrap();
-        
+
         let config = DashboardConfig {
             database_url: "invalid://url".to_string(),
             static_dir: temp_dir.path().to_path_buf(),
@@ -146,7 +157,7 @@ mod tests {
     #[test]
     fn test_static_directory_validation() {
         let non_existent_dir = PathBuf::from("/non/existent/directory");
-        
+
         let config = DashboardConfig {
             static_dir: non_existent_dir,
             ..Default::default()
@@ -159,19 +170,22 @@ mod tests {
     #[test]
     fn test_auth_security_defaults() {
         let auth_config = AuthConfig::default();
-        
+
         // Authentication should be enabled by default for security
         assert!(auth_config.enabled);
         assert_eq!(auth_config.username, "admin");
         assert_eq!(auth_config.max_failed_attempts, 5);
         assert_eq!(auth_config.lockout_duration, Duration::from_secs(15 * 60));
-        assert_eq!(auth_config.session_timeout, Duration::from_secs(8 * 60 * 60));
+        assert_eq!(
+            auth_config.session_timeout,
+            Duration::from_secs(8 * 60 * 60)
+        );
     }
 
     #[tokio::test]
     async fn test_websocket_config_validation() {
         use hammerwork_web::config::WebSocketConfig;
-        
+
         let ws_config = WebSocketConfig {
             ping_interval: Duration::from_secs(10),
             max_connections: 50,
@@ -191,12 +205,12 @@ mod tests {
         unsafe {
             std::env::set_var("HAMMERWORK_DATABASE_URL", "postgresql://test/env");
         }
-        
+
         let database_url = std::env::var("HAMMERWORK_DATABASE_URL")
             .unwrap_or_else(|_| "postgresql://localhost/hammerwork".to_string());
-            
+
         assert_eq!(database_url, "postgresql://test/env");
-        
+
         // Cleanup
         unsafe {
             std::env::remove_var("HAMMERWORK_DATABASE_URL");
@@ -207,7 +221,7 @@ mod tests {
     fn test_cors_configuration() {
         let config_with_cors = DashboardConfig::new().with_cors(true);
         let config_without_cors = DashboardConfig::new().with_cors(false);
-        
+
         assert!(config_with_cors.enable_cors);
         assert!(!config_without_cors.enable_cors);
     }
@@ -218,7 +232,7 @@ mod tests {
         let config_low = DashboardConfig::new().with_bind_address("127.0.0.1", 1024);
         let config_high = DashboardConfig::new().with_bind_address("127.0.0.1", 65535);
         let config_standard = DashboardConfig::new().with_bind_address("127.0.0.1", 8080);
-        
+
         assert_eq!(config_low.port, 1024);
         assert_eq!(config_high.port, 65535);
         assert_eq!(config_standard.port, 8080);
@@ -241,7 +255,7 @@ mod test_helpers {
             .arg("-U")
             .arg("postgres")
             .output();
-            
+
         match output {
             Ok(output) => output.status.success(),
             Err(_) => false,
@@ -257,7 +271,7 @@ mod test_helpers {
             .arg("--password=hammerwork")
             .arg("--execute=SELECT 1")
             .output();
-            
+
         match output {
             Ok(output) => output.status.success(),
             Err(_) => false,
@@ -267,23 +281,25 @@ mod test_helpers {
     /// Create a test configuration with minimal setup
     pub fn create_test_config() -> DashboardConfig {
         let temp_dir = tempdir().expect("Failed to create temp directory");
-        
+
         // Create minimal static files
         std::fs::create_dir_all(temp_dir.path()).unwrap();
         std::fs::write(
             temp_dir.path().join("index.html"),
-            include_str!("../assets/index.html")
-        ).unwrap_or_else(|_| {
+            include_str!("../assets/index.html"),
+        )
+        .unwrap_or_else(|_| {
             // Fallback if assets don't exist
             std::fs::write(
                 temp_dir.path().join("index.html"),
-                "<html><body>Test Dashboard</body></html>"
-            ).unwrap();
+                "<html><body>Test Dashboard</body></html>",
+            )
+            .unwrap();
         });
 
         DashboardConfig {
             bind_address: "127.0.0.1".to_string(),
-            port: 0, // Random port for testing
+            port: 0,                                     // Random port for testing
             database_url: "sqlite::memory:".to_string(), // Use in-memory SQLite for basic tests
             pool_size: 1,
             static_dir: temp_dir.path().to_path_buf(),

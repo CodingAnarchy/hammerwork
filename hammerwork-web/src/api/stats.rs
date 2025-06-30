@@ -272,10 +272,7 @@ where
         .and(queue_filter)
         .and_then(health_handler);
 
-    overview
-        .or(detailed)
-        .or(trends)
-        .or(health)
+    overview.or(detailed).or(trends).or(health)
 }
 
 /// Handler for system overview statistics
@@ -387,8 +384,8 @@ where
                 jobs_per_second: 2.5,           // Mock value
                 memory_usage_mb: None,
                 cpu_usage_percent: None,
-                active_workers: 4,              // Mock value
-                worker_utilization: 0.75,       // Mock value
+                active_workers: 4,        // Mock value
+                worker_utilization: 0.75, // Mock value
             };
 
             // Generate overview from the stats
@@ -405,17 +402,15 @@ where
             Ok(warp::reply::json(&ApiResponse::success(detailed)))
         }
         Err(e) => {
-            let response = ApiResponse::<()>::error(format!("Failed to get detailed statistics: {}", e));
+            let response =
+                ApiResponse::<()>::error(format!("Failed to get detailed statistics: {}", e));
             Ok(warp::reply::json(&response))
         }
     }
 }
 
 /// Handler for trend analysis
-async fn trends_handler<T>(
-    queue: Arc<T>,
-    query: StatsQuery,
-) -> Result<impl Reply, warp::Rejection>
+async fn trends_handler<T>(queue: Arc<T>, query: StatsQuery) -> Result<impl Reply, warp::Rejection>
 where
     T: DatabaseQueue + Send + Sync,
 {

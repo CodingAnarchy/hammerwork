@@ -100,7 +100,7 @@ pub mod config;
 pub mod server;
 pub mod websocket;
 
-pub use config::{DashboardConfig, AuthConfig};
+pub use config::{AuthConfig, DashboardConfig};
 pub use server::WebDashboard;
 
 /// Result type alias for consistent error handling
@@ -117,7 +117,7 @@ mod tests {
             .with_bind_address("0.0.0.0", 3000)
             .with_database_url("postgresql://localhost/test")
             .with_cors(true);
-            
+
         assert_eq!(config.bind_addr(), "0.0.0.0:3000");
         assert_eq!(config.database_url, "postgresql://localhost/test");
         assert!(config.enable_cors);
@@ -126,9 +126,12 @@ mod tests {
     #[test]
     fn test_auth_config_security_defaults() {
         let auth_config = AuthConfig::default();
-        
+
         // Ensure secure defaults
-        assert!(auth_config.enabled, "Authentication should be enabled by default");
+        assert!(
+            auth_config.enabled,
+            "Authentication should be enabled by default"
+        );
         assert_eq!(auth_config.username, "admin");
         assert_eq!(auth_config.max_failed_attempts, 5);
         assert!(auth_config.lockout_duration.as_secs() > 0);
@@ -137,7 +140,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_creation_with_invalid_config() {
         let temp_dir = tempdir().unwrap();
-        
+
         let config = DashboardConfig {
             database_url: "invalid://url".to_string(),
             static_dir: temp_dir.path().to_path_buf(),
@@ -146,20 +149,23 @@ mod tests {
 
         // Dashboard creation should succeed, but starting would fail with invalid URL
         let result = WebDashboard::new(config).await;
-        assert!(result.is_ok(), "Dashboard creation should succeed, connection validation happens later");
+        assert!(
+            result.is_ok(),
+            "Dashboard creation should succeed, connection validation happens later"
+        );
     }
 
     #[test]
     fn test_config_builder_pattern() {
         let temp_dir = tempdir().unwrap();
-        
+
         let config = DashboardConfig::new()
             .with_bind_address("192.168.1.1", 8888)
             .with_database_url("mysql://root:pass@localhost/db")
             .with_static_dir(temp_dir.path().to_path_buf())
             .with_auth("user", "hash")
             .with_cors(false);
-            
+
         assert_eq!(config.bind_address, "192.168.1.1");
         assert_eq!(config.port, 8888);
         assert_eq!(config.database_url, "mysql://root:pass@localhost/db");

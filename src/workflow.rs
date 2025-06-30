@@ -437,7 +437,9 @@ impl JobGroup {
         let mut rec_stack = HashSet::new();
 
         for job in &self.jobs {
-            if !visited.contains(&job.id) && self.has_cycle_dfs(job.id, &mut visited, &mut rec_stack)? {
+            if !visited.contains(&job.id)
+                && self.has_cycle_dfs(job.id, &mut visited, &mut rec_stack)?
+            {
                 return Err(HammerworkError::Workflow {
                     message: "Circular dependency detected in workflow".to_string(),
                 });

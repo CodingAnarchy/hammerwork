@@ -199,7 +199,7 @@ pub struct ConfigUpdateRequest {
 /// Maintenance operation request
 #[derive(Debug, Deserialize)]
 pub struct MaintenanceRequest {
-    pub operation: String, // "vacuum", "reindex", "cleanup", "optimize"
+    pub operation: String,      // "vacuum", "reindex", "cleanup", "optimize"
     pub target: Option<String>, // table name or queue name
     pub dry_run: Option<bool>,
 }
@@ -245,10 +245,7 @@ where
         .and(warp::get())
         .and_then(version_handler);
 
-    info.or(config)
-        .or(metrics_info)
-        .or(maintenance)
-        .or(version)
+    info.or(config).or(metrics_info).or(maintenance).or(version)
 }
 
 /// Handler for system information
@@ -258,7 +255,7 @@ where
 {
     // Test database connection
     let database_healthy = queue.get_all_queue_stats().await.is_ok();
-    
+
     let build_info = BuildInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         git_commit: option_env!("GIT_COMMIT").map(|s| s.to_string()),
@@ -278,7 +275,7 @@ where
     let database_info = DatabaseInfo {
         database_type: "PostgreSQL/MySQL".to_string(), // TODO: Detect actual type
         connection_url: "***masked***".to_string(),
-        pool_size: 5, // TODO: Get from actual config
+        pool_size: 5,             // TODO: Get from actual config
         active_connections: None, // TODO: Get from pool
         connection_health: database_healthy,
         last_migration: None, // TODO: Get from migration table
@@ -299,7 +296,7 @@ where
         runtime_info,
         database_info,
         features,
-        uptime_seconds: 0, // TODO: Track actual uptime
+        uptime_seconds: 0,              // TODO: Track actual uptime
         started_at: chrono::Utc::now(), // TODO: Track actual start time
     };
 
@@ -311,9 +308,9 @@ async fn system_config_handler() -> Result<impl Reply, warp::Rejection> {
     let config = ServerConfig {
         bind_address: "127.0.0.1".to_string(), // TODO: Get from actual config
         port: 8080,                            // TODO: Get from actual config
-        authentication_enabled: false,        // TODO: Get from actual config
+        authentication_enabled: false,         // TODO: Get from actual config
         cors_enabled: false,                   // TODO: Get from actual config
-        websocket_max_connections: 100,       // TODO: Get from actual config
+        websocket_max_connections: 100,        // TODO: Get from actual config
         static_assets_path: "./assets".to_string(), // TODO: Get from actual config
     };
 
@@ -325,8 +322,8 @@ async fn metrics_info_handler() -> Result<impl Reply, warp::Rejection> {
     let metrics_info = MetricsInfo {
         prometheus_enabled: true, // TODO: Detect if metrics feature is enabled
         metrics_endpoint: "/metrics".to_string(),
-        custom_metrics_count: 0,  // TODO: Count actual custom metrics
-        last_scrape: None,        // TODO: Track last scrape time
+        custom_metrics_count: 0, // TODO: Count actual custom metrics
+        last_scrape: None,       // TODO: Track last scrape time
     };
 
     Ok(warp::reply::json(&ApiResponse::success(metrics_info)))
@@ -341,7 +338,7 @@ where
     T: DatabaseQueue + Send + Sync,
 {
     let dry_run = request.dry_run.unwrap_or(false);
-    
+
     match request.operation.as_str() {
         "cleanup" => {
             if dry_run {
@@ -374,21 +371,27 @@ where
         }
         "vacuum" => {
             // Database vacuum operation (PostgreSQL specific)
-            let response = ApiResponse::<()>::error("Vacuum operation not yet implemented".to_string());
+            let response =
+                ApiResponse::<()>::error("Vacuum operation not yet implemented".to_string());
             Ok(warp::reply::json(&response))
         }
         "reindex" => {
             // Database reindex operation
-            let response = ApiResponse::<()>::error("Reindex operation not yet implemented".to_string());
+            let response =
+                ApiResponse::<()>::error("Reindex operation not yet implemented".to_string());
             Ok(warp::reply::json(&response))
         }
         "optimize" => {
             // General optimization operation
-            let response = ApiResponse::<()>::error("Optimize operation not yet implemented".to_string());
+            let response =
+                ApiResponse::<()>::error("Optimize operation not yet implemented".to_string());
             Ok(warp::reply::json(&response))
         }
         _ => {
-            let response = ApiResponse::<()>::error(format!("Unknown maintenance operation: {}", request.operation));
+            let response = ApiResponse::<()>::error(format!(
+                "Unknown maintenance operation: {}",
+                request.operation
+            ));
             Ok(warp::reply::json(&response))
         }
     }
