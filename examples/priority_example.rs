@@ -404,14 +404,16 @@ async fn demonstrate_worker_pool_priorities(
     let mut pool = WorkerPool::new().with_stats_collector(stats_collector.clone());
 
     // Add workers with different priority configurations
-    let handler: Arc<
+    type JobHandler = Arc<
         dyn Fn(
                 Job,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = hammerwork::Result<()>> + Send>,
             > + Send
             + Sync,
-    > = Arc::new(|job: Job| {
+    >;
+
+    let handler: JobHandler = Arc::new(|job: Job| {
         Box::pin(async move {
             info!(
                 "🔄 Pool worker processing: {} (Priority: {:?})",

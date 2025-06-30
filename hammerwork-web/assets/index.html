@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hammerwork Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="dashboard">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1>🔨 Hammerwork Dashboard</h1>
+                <div class="header-actions">
+                    <span id="connectionStatus" class="status-indicator">Connected</span>
+                    <button id="refreshBtn" class="btn btn-secondary">Refresh</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- System Overview Cards -->
+            <section class="overview-section">
+                <h2>System Overview</h2>
+                <div class="cards-grid">
+                    <div class="card metric-card">
+                        <div class="card-header">
+                            <h3>Total Jobs</h3>
+                            <span class="card-icon">📊</span>
+                        </div>
+                        <div class="card-value" id="totalJobs">-</div>
+                        <div class="card-subtitle">All time</div>
+                    </div>
+
+                    <div class="card metric-card">
+                        <div class="card-header">
+                            <h3>Pending</h3>
+                            <span class="card-icon">⏳</span>
+                        </div>
+                        <div class="card-value" id="pendingJobs">-</div>
+                        <div class="card-subtitle">Waiting to process</div>
+                    </div>
+
+                    <div class="card metric-card">
+                        <div class="card-header">
+                            <h3>Running</h3>
+                            <span class="card-icon">⚡</span>
+                        </div>
+                        <div class="card-value" id="runningJobs">-</div>
+                        <div class="card-subtitle">Currently processing</div>
+                    </div>
+
+                    <div class="card metric-card">
+                        <div class="card-header">
+                            <h3>Error Rate</h3>
+                            <span class="card-icon">🚨</span>
+                        </div>
+                        <div class="card-value" id="errorRate">-</div>
+                        <div class="card-subtitle">Last 24 hours</div>
+                    </div>
+
+                    <div class="card metric-card">
+                        <div class="card-header">
+                            <h3>Throughput</h3>
+                            <span class="card-icon">📈</span>
+                        </div>
+                        <div class="card-value" id="throughput">-</div>
+                        <div class="card-subtitle">Jobs per minute</div>
+                    </div>
+
+                    <div class="card metric-card">
+                        <div class="card-header">
+                            <h3>Avg. Processing</h3>
+                            <span class="card-icon">⏱️</span>
+                        </div>
+                        <div class="card-value" id="avgProcessing">-</div>
+                        <div class="card-subtitle">Milliseconds</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Charts Section -->
+            <section class="charts-section">
+                <div class="charts-grid">
+                    <div class="card chart-card">
+                        <div class="card-header">
+                            <h3>Job Throughput</h3>
+                            <select id="throughputPeriod" class="period-selector">
+                                <option value="1h">Last Hour</option>
+                                <option value="24h" selected>Last 24 Hours</option>
+                                <option value="7d">Last 7 Days</option>
+                            </select>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="throughputChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="card chart-card">
+                        <div class="card-header">
+                            <h3>Queue Status</h3>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="queueStatusChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Queues Section -->
+            <section class="queues-section">
+                <div class="section-header">
+                    <h2>Queues</h2>
+                    <div class="section-actions">
+                        <input type="text" id="queueSearch" placeholder="Search queues..." class="search-input">
+                        <button id="addQueueBtn" class="btn btn-primary">+ Add Job</button>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <div class="table-container">
+                        <table class="data-table" id="queuesTable">
+                            <thead>
+                                <tr>
+                                    <th>Queue Name</th>
+                                    <th>Pending</th>
+                                    <th>Running</th>
+                                    <th>Completed</th>
+                                    <th>Failed</th>
+                                    <th>Throughput</th>
+                                    <th>Error Rate</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr class="loading-row">
+                                    <td colspan="8">Loading queues...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Recent Jobs Section -->
+            <section class="jobs-section">
+                <div class="section-header">
+                    <h2>Recent Jobs</h2>
+                    <div class="section-actions">
+                        <select id="jobStatusFilter" class="filter-select">
+                            <option value="">All Statuses</option>
+                            <option value="pending">Pending</option>
+                            <option value="running">Running</option>
+                            <option value="completed">Completed</option>
+                            <option value="failed">Failed</option>
+                            <option value="dead">Dead</option>
+                        </select>
+                        <select id="jobQueueFilter" class="filter-select">
+                            <option value="">All Queues</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="table-container">
+                        <table class="data-table" id="jobsTable">
+                            <thead>
+                                <tr>
+                                    <th>Job ID</th>
+                                    <th>Queue</th>
+                                    <th>Status</th>
+                                    <th>Priority</th>
+                                    <th>Attempts</th>
+                                    <th>Created</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr class="loading-row">
+                                    <td colspan="7">Loading jobs...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Modals -->
+    <div id="jobModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Job Details</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="jobDetails"></div>
+            </div>
+            <div class="modal-footer">
+                <button id="retryJobBtn" class="btn btn-primary">Retry Job</button>
+                <button id="deleteJobBtn" class="btn btn-danger">Delete Job</button>
+                <button class="btn btn-secondary modal-close">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="addJobModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Add New Job</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="addJobForm">
+                    <div class="form-group">
+                        <label for="jobQueue">Queue Name</label>
+                        <input type="text" id="jobQueue" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="jobPriority">Priority</label>
+                        <select id="jobPriority">
+                            <option value="background">Background</option>
+                            <option value="low">Low</option>
+                            <option value="normal" selected>Normal</option>
+                            <option value="high">High</option>
+                            <option value="critical">Critical</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="jobPayload">Payload (JSON)</label>
+                        <textarea id="jobPayload" rows="6" placeholder='{"key": "value"}'></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label for="jobScheduledAt">Scheduled At (optional)</label>
+                        <input type="datetime-local" id="jobScheduledAt">
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button id="submitJobBtn" class="btn btn-primary">Add Job</button>
+                <button class="btn btn-secondary modal-close">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>

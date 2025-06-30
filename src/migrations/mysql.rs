@@ -128,7 +128,7 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Tests for MySQL migration functionality
 
     #[test]
     fn test_sql_statement_splitting() {

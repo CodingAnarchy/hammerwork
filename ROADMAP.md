@@ -2,45 +2,6 @@
 
 This roadmap outlines planned features for Hammerwork, prioritized by impact level and implementation complexity. Features are organized into phases based on their value proposition to users and estimated development effort.
 
-## Phase 1: High Impact, Medium-High Complexity
-*Features that provide significant value but require more substantial implementation effort*
-
-### 🌐 Admin Dashboard & CLI Tools
-**Impact: High** | **Complexity: Medium-High** | **Priority: Medium**
-
-Critical for operational management and developer productivity.
-
-**✅ CLI Tools - COMPLETED v1.1.0+**
-The `cargo-hammerwork` CLI provides comprehensive job queue management:
-- Database migrations and setup
-- Job management (enqueue, list, retry, cancel, inspect)
-- Queue operations (list, clear, statistics)
-- Worker management and monitoring
-- Batch operations and cron scheduling
-- Workflow visualization and dependency management
-- Real-time monitoring and health checks
-
-```bash
-# Available CLI commands
-cargo hammerwork migration run
-cargo hammerwork job list --queue email
-cargo hammerwork queue stats
-cargo hammerwork worker start --queue default
-cargo hammerwork monitor dashboard
-```
-
-**🚧 Web Dashboard - REMAINING**
-Web-based admin interface for visual queue management:
-
-```rust
-// Future web-based admin interface
-let admin_server = AdminServer::new()
-    .with_queue_monitoring()
-    .with_job_management()
-    .with_worker_controls()
-    .bind("127.0.0.1:8080");
-```
-
 ## Phase 2: Medium Impact, Variable Complexity
 *Valuable features for specific use cases or operational efficiency*
 

@@ -1,23 +1,15 @@
 //! Simple test to verify result_config persistence
-use hammerwork::{
-    JobQueue,
-    job::{Job, ResultConfig, ResultStorage},
-    queue::DatabaseQueue,
-};
+
+mod test_utils;
+
+use hammerwork::{Job, ResultConfig, ResultStorage, queue::DatabaseQueue};
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn test_postgres_result_config_persistence() {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:hammerwork@localhost:5433/hammerwork".to_string());
-
-    let pool = sqlx::postgres::PgPool::connect(&database_url)
-        .await
-        .expect("Failed to connect to Postgres");
-
-    let queue = Arc::new(JobQueue::new(pool));
+    let queue = test_utils::setup_postgres_queue().await;
 
     // Create a job with result storage configuration
     let config = ResultConfig {
@@ -48,14 +40,7 @@ async fn test_postgres_result_config_persistence() {
 #[cfg(feature = "mysql")]
 #[tokio::test]
 async fn test_mysql_result_config_persistence() {
-    let database_url = std::env::var("MYSQL_DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:hammerwork@localhost:3307/hammerwork".to_string());
-
-    let pool = sqlx::mysql::MySqlPool::connect(&database_url)
-        .await
-        .expect("Failed to connect to MySQL");
-
-    let queue = Arc::new(JobQueue::new(pool));
+    let queue = test_utils::setup_mysql_queue().await;
 
     // Create a job with result storage configuration
     let config = ResultConfig {

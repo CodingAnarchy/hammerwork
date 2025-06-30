@@ -118,16 +118,16 @@ use std::path::PathBuf;
 pub struct Config {
     /// Database connection URL (e.g., "postgresql://localhost/hammerwork")
     pub database_url: Option<String>,
-    
+
     /// Default queue name for operations
     pub default_queue: Option<String>,
-    
+
     /// Default limit for list operations
     pub default_limit: Option<u32>,
-    
+
     /// Log level (error, warn, info, debug, trace)
     pub log_level: Option<String>,
-    
+
     /// Database connection pool size
     pub connection_pool_size: Option<u32>,
 }

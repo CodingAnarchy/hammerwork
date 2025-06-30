@@ -4,7 +4,6 @@ use sqlx::{MySqlPool, PgPool, Row};
 /// Tests for SQL query validation and correctness
 /// These tests validate that our dynamic SQL queries are syntactically correct
 /// and produce expected results
-
 #[cfg(test)]
 mod postgres_tests {
     use super::*;

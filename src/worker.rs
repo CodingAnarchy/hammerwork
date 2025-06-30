@@ -46,7 +46,7 @@ pub struct JobHookEvent {
 pub type JobHookHandler = Arc<dyn Fn(JobHookEvent) + Send + Sync>;
 
 /// Job lifecycle event hooks that can be registered with workers.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct JobEventHooks {
     /// Called when a job starts processing
     pub on_job_start: Option<JobHookHandler>,
@@ -58,18 +58,6 @@ pub struct JobEventHooks {
     pub on_job_timeout: Option<JobHookHandler>,
     /// Called when a job is retried
     pub on_job_retry: Option<JobHookHandler>,
-}
-
-impl Default for JobEventHooks {
-    fn default() -> Self {
-        Self {
-            on_job_start: None,
-            on_job_complete: None,
-            on_job_fail: None,
-            on_job_timeout: None,
-            on_job_retry: None,
-        }
-    }
 }
 
 impl JobEventHooks {
@@ -1094,10 +1082,11 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use hammerwork::{Worker, worker::{JobEventHooks, JobHookEvent}};
     /// # use std::sync::Arc;
-    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await.unwrap()));
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await?));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// let hooks = JobEventHooks::new()
@@ -1117,6 +1106,8 @@ where
     ///
     /// let worker = Worker::new(queue, "traced_queue".to_string(), handler)
     ///     .with_event_hooks(hooks);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn with_event_hooks(mut self, hooks: JobEventHooks) -> Self {
         self.event_hooks = hooks;
@@ -1134,16 +1125,19 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
-    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await.unwrap()));
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await?));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// let worker = Worker::new(queue, "queue".to_string(), handler)
     ///     .on_job_start(|event| {
     ///         println!("Starting job: {}", event.job.id);
     ///     });
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn on_job_start<F>(mut self, handler: F) -> Self
     where
@@ -1161,10 +1155,11 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
-    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await.unwrap()));
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await?));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// let worker = Worker::new(queue, "queue".to_string(), handler)
@@ -1173,6 +1168,8 @@ where
     ///             println!("Job {} completed in {:?}", event.job.id, duration);
     ///         }
     ///     });
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn on_job_complete<F>(mut self, handler: F) -> Self
     where
@@ -1190,10 +1187,11 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
-    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await.unwrap()));
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await?));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// let worker = Worker::new(queue, "queue".to_string(), handler)
@@ -1202,6 +1200,8 @@ where
     ///             eprintln!("Job {} failed: {}", event.job.id, error);
     ///         }
     ///     });
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn on_job_fail<F>(mut self, handler: F) -> Self
     where
@@ -1219,16 +1219,19 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
-    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await.unwrap()));
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await?));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// let worker = Worker::new(queue, "queue".to_string(), handler)
     ///     .on_job_timeout(|event| {
     ///         println!("Job {} timed out after {:?}", event.job.id, event.duration);
     ///     });
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn on_job_timeout<F>(mut self, handler: F) -> Self
     where
@@ -1246,16 +1249,19 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
-    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await.unwrap()));
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(sqlx::PgPool::connect("").await?));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
     /// let worker = Worker::new(queue, "queue".to_string(), handler)
     ///     .on_job_retry(|event| {
     ///         println!("Retrying job {} due to: {:?}", event.job.id, event.error);
     ///     });
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn on_job_retry<F>(mut self, handler: F) -> Self
     where
@@ -1463,7 +1469,7 @@ where
                         span.record("error.type", "timeout");
                         span.record(
                             "error.message",
-                            &format!("Job timed out after {:?}", timeout),
+                            format!("Job timed out after {:?}", timeout),
                         );
                     }
 
@@ -2699,8 +2705,10 @@ mod tests {
     #[test]
     fn test_scaling_decision_logic() {
         // This test simulates the scaling decision logic
-        let mut metrics = AutoscaleMetrics::default();
-        metrics.active_workers = 3;
+        let mut metrics = AutoscaleMetrics {
+            active_workers: 3,
+            ..Default::default()
+        };
 
         let config = AutoscaleConfig::default();
 
@@ -2747,14 +2755,13 @@ mod tests {
     #[test]
     fn test_queue_depth_averaging() {
         let now = Utc::now();
-        let mut history = Vec::new();
-
-        // Add some history entries
-        history.push((now - chrono::Duration::seconds(25), 10));
-        history.push((now - chrono::Duration::seconds(20), 8));
-        history.push((now - chrono::Duration::seconds(15), 12));
-        history.push((now - chrono::Duration::seconds(10), 6));
-        history.push((now - chrono::Duration::seconds(5), 14));
+        let history = vec![
+            (now - chrono::Duration::seconds(25), 10),
+            (now - chrono::Duration::seconds(20), 8),
+            (now - chrono::Duration::seconds(15), 12),
+            (now - chrono::Duration::seconds(10), 6),
+            (now - chrono::Duration::seconds(5), 14),
+        ];
 
         // Calculate average
         let avg =
@@ -2776,10 +2783,10 @@ mod tests {
     #[test]
     fn test_worker_count_boundaries() {
         let config = AutoscaleConfig::default();
-        let mut metrics = AutoscaleMetrics::default();
-
-        // Test scaling up to max workers
-        metrics.active_workers = config.max_workers - 1;
+        let mut metrics = AutoscaleMetrics {
+            active_workers: config.max_workers - 1,
+            ..Default::default()
+        };
         let new_count = (metrics.active_workers + config.scale_step).min(config.max_workers);
         assert_eq!(new_count, config.max_workers);
 
@@ -2825,14 +2832,13 @@ mod tests {
     #[test]
     fn test_history_cleanup() {
         let now = Utc::now();
-        let mut history = Vec::new();
-
-        // Add entries with various ages
-        history.push((now - chrono::Duration::seconds(60), 10)); // Too old
-        history.push((now - chrono::Duration::seconds(45), 8)); // Too old
-        history.push((now - chrono::Duration::seconds(25), 12)); // Recent
-        history.push((now - chrono::Duration::seconds(15), 6)); // Recent
-        history.push((now - chrono::Duration::seconds(5), 14)); // Recent
+        let mut history = vec![
+            (now - chrono::Duration::seconds(60), 10), // Too old
+            (now - chrono::Duration::seconds(45), 8),  // Too old
+            (now - chrono::Duration::seconds(25), 12), // Recent
+            (now - chrono::Duration::seconds(15), 6),  // Recent
+            (now - chrono::Duration::seconds(5), 14),  // Recent
+        ];
 
         // Filter based on 30-second window
         let evaluation_window = Duration::from_secs(30);

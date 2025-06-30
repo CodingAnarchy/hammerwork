@@ -44,7 +44,7 @@ impl DependencyStatus {
     }
 
     /// Parse from string from database
-    pub fn from_str(s: &str) -> Result<Self> {
+    pub fn parse_from_db(s: &str) -> Result<Self> {
         match s {
             "none" => Ok(Self::None),
             "waiting" => Ok(Self::Waiting),
@@ -88,7 +88,7 @@ impl WorkflowStatus {
     }
 
     /// Parse from string from database
-    pub fn from_str(s: &str) -> Result<Self> {
+    pub fn parse_from_db(s: &str) -> Result<Self> {
         match s {
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
@@ -129,7 +129,7 @@ impl FailurePolicy {
     }
 
     /// Parse from string from database
-    pub fn from_str(s: &str) -> Result<Self> {
+    pub fn parse_from_db(s: &str) -> Result<Self> {
         match s {
             "fail_fast" => Ok(Self::FailFast),
             "continue_on_failure" => Ok(Self::ContinueOnFailure),
@@ -437,12 +437,12 @@ impl JobGroup {
         let mut rec_stack = HashSet::new();
 
         for job in &self.jobs {
-            if !visited.contains(&job.id) {
-                if self.has_cycle_dfs(job.id, &mut visited, &mut rec_stack)? {
-                    return Err(HammerworkError::Workflow {
-                        message: "Circular dependency detected in workflow".to_string(),
-                    });
-                }
+            if !visited.contains(&job.id)
+                && self.has_cycle_dfs(job.id, &mut visited, &mut rec_stack)?
+            {
+                return Err(HammerworkError::Workflow {
+                    message: "Circular dependency detected in workflow".to_string(),
+                });
             }
         }
 
@@ -551,23 +551,23 @@ mod tests {
         assert_eq!(DependencyStatus::Failed.as_str(), "failed");
 
         assert_eq!(
-            DependencyStatus::from_str("none").unwrap(),
+            DependencyStatus::parse_from_db("none").unwrap(),
             DependencyStatus::None
         );
         assert_eq!(
-            DependencyStatus::from_str("waiting").unwrap(),
+            DependencyStatus::parse_from_db("waiting").unwrap(),
             DependencyStatus::Waiting
         );
         assert_eq!(
-            DependencyStatus::from_str("satisfied").unwrap(),
+            DependencyStatus::parse_from_db("satisfied").unwrap(),
             DependencyStatus::Satisfied
         );
         assert_eq!(
-            DependencyStatus::from_str("failed").unwrap(),
+            DependencyStatus::parse_from_db("failed").unwrap(),
             DependencyStatus::Failed
         );
 
-        assert!(DependencyStatus::from_str("invalid").is_err());
+        assert!(DependencyStatus::parse_from_db("invalid").is_err());
     }
 
     #[test]
@@ -578,23 +578,23 @@ mod tests {
         assert_eq!(WorkflowStatus::Cancelled.as_str(), "cancelled");
 
         assert_eq!(
-            WorkflowStatus::from_str("running").unwrap(),
+            WorkflowStatus::parse_from_db("running").unwrap(),
             WorkflowStatus::Running
         );
         assert_eq!(
-            WorkflowStatus::from_str("completed").unwrap(),
+            WorkflowStatus::parse_from_db("completed").unwrap(),
             WorkflowStatus::Completed
         );
         assert_eq!(
-            WorkflowStatus::from_str("failed").unwrap(),
+            WorkflowStatus::parse_from_db("failed").unwrap(),
             WorkflowStatus::Failed
         );
         assert_eq!(
-            WorkflowStatus::from_str("cancelled").unwrap(),
+            WorkflowStatus::parse_from_db("cancelled").unwrap(),
             WorkflowStatus::Cancelled
         );
 
-        assert!(WorkflowStatus::from_str("invalid").is_err());
+        assert!(WorkflowStatus::parse_from_db("invalid").is_err());
     }
 
     #[test]
@@ -607,19 +607,19 @@ mod tests {
         assert_eq!(FailurePolicy::Manual.as_str(), "manual");
 
         assert_eq!(
-            FailurePolicy::from_str("fail_fast").unwrap(),
+            FailurePolicy::parse_from_db("fail_fast").unwrap(),
             FailurePolicy::FailFast
         );
         assert_eq!(
-            FailurePolicy::from_str("continue_on_failure").unwrap(),
+            FailurePolicy::parse_from_db("continue_on_failure").unwrap(),
             FailurePolicy::ContinueOnFailure
         );
         assert_eq!(
-            FailurePolicy::from_str("manual").unwrap(),
+            FailurePolicy::parse_from_db("manual").unwrap(),
             FailurePolicy::Manual
         );
 
-        assert!(FailurePolicy::from_str("invalid").is_err());
+        assert!(FailurePolicy::parse_from_db("invalid").is_err());
     }
 
     #[test]

@@ -1,15 +1,11 @@
 mod test_utils;
 
 use hammerwork::{
-    Job,
-    batch::{JobBatch, PartialFailureMode},
-    queue::DatabaseQueue,
-    stats::InMemoryStatsCollector,
-    worker::{BatchProcessingStats, JobHandler, Worker, WorkerPool},
+    BatchProcessingStats, InMemoryStatsCollector, Job, JobBatch, PartialFailureMode, Worker,
+    WorkerPool, queue::DatabaseQueue, worker::JobHandler,
 };
 use serde_json::json;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
 
 #[cfg(feature = "postgres")]

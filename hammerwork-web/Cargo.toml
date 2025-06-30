@@ -1,0 +1,63 @@
+[package]
+name = "hammerwork-web"
+version = "1.2.0"
+edition = "2024"
+authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
+description = "Web-based admin dashboard for Hammerwork job queues with real-time monitoring and management"
+readme = "README.md"
+homepage = "https://github.com/CodingAnarchy/hammerwork"
+repository = "https://github.com/CodingAnarchy/hammerwork"
+license = "MIT"
+keywords = ["job-queue", "dashboard", "web", "monitoring", "admin"]
+categories = ["web-programming", "development-tools", "database"]
+
+[[bin]]
+name = "hammerwork-web"
+path = "src/main.rs"
+
+[dependencies]
+# Core Hammerwork functionality
+hammerwork = { path = "../", version = "1.2", features = ["metrics"] }
+
+# Web framework and HTTP
+warp = "0.3"
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI and configuration
+clap = { version = "4.0", features = ["derive"] }
+toml = "0.8"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid"] }
+
+# Utility
+anyhow = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Authentication (for future use)
+bcrypt = { version = "0.15", optional = true }
+base64 = "0.22"
+
+# HTTP client for health checks
+reqwest = { version = "0.12", features = ["json"] }
+
+[features]
+default = []
+postgres = ["hammerwork/postgres", "sqlx/postgres"]
+mysql = ["hammerwork/mysql", "sqlx/mysql"]
+auth = ["bcrypt"]
+
+[dev-dependencies]
+tempfile = "3.8"
+tokio-test = "0.4"

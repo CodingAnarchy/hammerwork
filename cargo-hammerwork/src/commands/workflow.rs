@@ -528,7 +528,7 @@ impl WorkflowCommand {
 
         for job in jobs {
             if !visited.contains(&job.id) {
-                self.calculate_job_level(job, &job_map, &mut levels, &mut visited, 0);
+                Self::calculate_job_level(job, &job_map, &mut levels, &mut visited, 0);
             }
         }
 
@@ -536,7 +536,7 @@ impl WorkflowCommand {
         let mut result: HashMap<usize, Vec<&JobNode>> = HashMap::new();
         for (job_id, level) in levels {
             if let Some(job) = job_map.get(&job_id) {
-                result.entry(level).or_insert_with(Vec::new).push(job);
+                result.entry(level).or_default().push(job);
             }
         }
 
@@ -544,12 +544,11 @@ impl WorkflowCommand {
     }
 
     fn calculate_job_level(
-        &self,
         job: &JobNode,
         job_map: &HashMap<String, &JobNode>,
         levels: &mut HashMap<String, usize>,
         visited: &mut HashSet<String>,
-        current_level: usize,
+        _current_level: usize,
     ) {
         if visited.contains(&job.id) {
             return;
@@ -564,7 +563,13 @@ impl WorkflowCommand {
             .filter_map(|dep_id| {
                 if let Some(dep_job) = job_map.get(dep_id) {
                     if !visited.contains(dep_id) {
-                        self.calculate_job_level(dep_job, job_map, levels, visited, current_level);
+                        Self::calculate_job_level(
+                            dep_job,
+                            job_map,
+                            levels,
+                            visited,
+                            _current_level,
+                        );
                     }
                     levels.get(dep_id).copied()
                 } else {
@@ -803,7 +808,7 @@ impl WorkflowCommand {
 
         for root in &roots {
             if !visited.contains(&root.id) {
-                self.print_job_tree_node(root, &job_map, &mut visited, 0, target_job_id);
+                Self::print_job_tree_node(root, &job_map, &mut visited, 0, target_job_id);
             }
         }
 
@@ -811,13 +816,12 @@ impl WorkflowCommand {
         for job in jobs {
             if !visited.contains(&job.id) {
                 println!("  [Disconnected]");
-                self.print_job_tree_node(job, &job_map, &mut visited, 0, target_job_id);
+                Self::print_job_tree_node(job, &job_map, &mut visited, 0, target_job_id);
             }
         }
     }
 
     fn print_job_tree_node(
-        &self,
         job: &JobNode,
         job_map: &HashMap<String, &JobNode>,
         visited: &mut HashSet<String>,
@@ -847,7 +851,7 @@ impl WorkflowCommand {
         for dependent_id in &job.dependents {
             if let Some(dependent_job) = job_map.get(dependent_id) {
                 if !visited.contains(dependent_id) {
-                    self.print_job_tree_node(
+                    Self::print_job_tree_node(
                         dependent_job,
                         job_map,
                         visited,

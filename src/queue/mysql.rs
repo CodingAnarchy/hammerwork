@@ -86,11 +86,11 @@ impl JobRow {
                 storage: self
                     .result_storage_type
                     .as_ref()
-                    .and_then(|s| match s.as_str() {
-                        "database" => Some(crate::job::ResultStorage::Database),
-                        "memory" => Some(crate::job::ResultStorage::Memory),
-                        "none" => Some(crate::job::ResultStorage::None),
-                        _ => Some(crate::job::ResultStorage::None),
+                    .map(|s| match s.as_str() {
+                        "database" => crate::job::ResultStorage::Database,
+                        "memory" => crate::job::ResultStorage::Memory,
+                        "none" => crate::job::ResultStorage::None,
+                        _ => crate::job::ResultStorage::None,
                     })
                     .unwrap_or(crate::job::ResultStorage::None),
                 ttl: self
@@ -113,7 +113,7 @@ impl JobRow {
             dependency_status: self
                 .dependency_status
                 .as_ref()
-                .and_then(|s| crate::workflow::DependencyStatus::from_str(s).ok())
+                .and_then(|s| crate::workflow::DependencyStatus::parse_from_db(s).ok())
                 .unwrap_or(crate::workflow::DependencyStatus::None),
             workflow_id: self
                 .workflow_id
@@ -253,7 +253,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         let row = sqlx::query_as::<_, JobRow>(
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
+            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context
             FROM hammerwork_jobs 
             WHERE queue_name = ? 
             AND status = ? 
@@ -313,7 +313,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         // Get available jobs by priority
         let available_jobs = sqlx::query_as::<_, JobRow>(
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
+            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context
             FROM hammerwork_jobs 
             WHERE queue_name = ? 
             AND status = ? 

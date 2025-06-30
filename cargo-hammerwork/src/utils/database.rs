@@ -21,7 +21,7 @@
 //!
 //! // Connect to MySQL
 //! let mysql_pool = DatabasePool::connect(
-//!     "mysql://localhost/hammerwork", 
+//!     "mysql://localhost/hammerwork",
 //!     5
 //! ).await?;
 //! # Ok(())

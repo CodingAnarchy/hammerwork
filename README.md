@@ -4,6 +4,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 ## Features
 
+- **📊 Web Dashboard**: Modern real-time web interface for monitoring queues, managing jobs, and system administration with authentication and WebSocket updates
 - **🔍 Job Tracing & Correlation**: Comprehensive distributed tracing with OpenTelemetry integration, trace IDs, correlation IDs, and lifecycle event hooks
 - **🔗 Job Dependencies & Workflows**: Create complex data processing pipelines with job dependencies, sequential chains, and parallel processing with synchronization barriers
 - **Multi-database support**: PostgreSQL and MySQL backends with optimized dependency queries
@@ -22,6 +23,8 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 ## Installation
 
+### Core Library
+
 ```toml
 [dependencies]
 # Default features include metrics and alerting
@@ -38,6 +41,24 @@ hammerwork = { version = "1.2", features = ["postgres"], default-features = fals
 
 **Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `tracing` (optional)
 
+### Web Dashboard (Optional)
+
+```bash
+# Install the web dashboard
+cargo install hammerwork-web --features postgres
+
+# Or add to your project
+[dependencies]
+hammerwork-web = { version = "1.2", features = ["postgres"] }
+```
+
+Start the dashboard:
+
+```bash
+hammerwork-web --database-url postgresql://localhost/hammerwork
+# Dashboard available at http://localhost:8080
+```
+
 ## Quick Start
 
 See the [Quick Start Guide](docs/quick-start.md) for complete examples with PostgreSQL and MySQL.
@@ -45,6 +66,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 ## Documentation
 
 - **[Quick Start Guide](docs/quick-start.md)** - Get started with PostgreSQL and MySQL
+- **[Web Dashboard](hammerwork-web/README.md)** - Real-time web interface for queue monitoring and job management
 - **[Job Tracing & Correlation](docs/tracing.md)** - Distributed tracing, correlation IDs, and OpenTelemetry integration
 - **[Job Dependencies & Workflows](docs/workflows.md)** - Complex pipelines, job dependencies, and orchestration
 - **[Job Types & Configuration](docs/job-types.md)** - Job creation, priorities, timeouts, cron jobs
@@ -208,6 +230,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 This enables end-to-end tracing across your entire job processing pipeline with automatic span creation, correlation tracking, and integration with observability platforms like Jaeger, Zipkin, or DataDog.
 
+## Web Dashboard
+
+Start the real-time web dashboard for monitoring and managing your job queues:
+
+```bash
+# Start with PostgreSQL
+hammerwork-web --database-url postgresql://localhost/hammerwork
+
+# Start with authentication
+hammerwork-web \
+  --database-url postgresql://localhost/hammerwork \
+  --auth \
+  --username admin \
+  --password mypassword
+
+# Start with custom configuration
+hammerwork-web --config dashboard.toml
+```
+
+The dashboard provides:
+
+- **Real-time Monitoring**: Live queue statistics, job counts, and throughput metrics
+- **Job Management**: View, retry, cancel, and inspect jobs with detailed payload information
+- **Queue Administration**: Clear queues, monitor performance, and manage priorities
+- **Interactive Charts**: Throughput graphs and job status distributions
+- **WebSocket Updates**: Real-time updates without page refresh
+- **REST API**: Complete programmatic access to all dashboard features
+- **Authentication**: Secure access with bcrypt password hashing and rate limiting
+
+Access the dashboard at `http://localhost:8080` after starting the server.
+
 ## Database Setup
 
 ### Using Migrations (Recommended)
@@ -223,6 +276,9 @@ cargo hammerwork migrate --database-url postgresql://localhost/hammerwork
 
 # Check migration status
 cargo hammerwork status --database-url postgresql://localhost/hammerwork
+
+# Start the web dashboard after migrations
+hammerwork-web --database-url postgresql://localhost/hammerwork
 ```
 
 ### Application Usage
