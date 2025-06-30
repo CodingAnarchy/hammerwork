@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Core Hammerwork functionality
-hammerwork = { path = "../", version = "1.2", features = ["metrics"] }
+hammerwork = { workspace = true, features = ["postgres", "mysql", "metrics"] }
 
 # Web framework and HTTP
 warp = "0.3"
