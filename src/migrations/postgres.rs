@@ -130,7 +130,7 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Tests for PostgreSQL migration functionality
 
     #[test]
     fn test_sql_statement_splitting() {

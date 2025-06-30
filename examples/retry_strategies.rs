@@ -47,11 +47,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = get_database_url();
     info!("🔗 Connecting to database: {}", database_url);
 
-    #[cfg(feature = "postgres")]
+    #[cfg(all(feature = "postgres", not(feature = "mysql")))]
     let pool = sqlx::PgPool::connect(&database_url).await?;
 
-    #[cfg(feature = "mysql")]
+    #[cfg(all(feature = "mysql", not(feature = "postgres")))]
     let pool = sqlx::MySqlPool::connect(&database_url).await?;
+
+    // Default to PostgreSQL when both features are enabled
+    #[cfg(all(feature = "postgres", feature = "mysql"))]
+    let pool = sqlx::PgPool::connect(&database_url).await?;
 
     let queue = Arc::new(JobQueue::new(pool));
 

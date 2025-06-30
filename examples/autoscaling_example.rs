@@ -25,14 +25,20 @@ async fn main() -> Result<()> {
     // Uncomment the appropriate line below based on your database setup
 
     // For PostgreSQL:
-    #[cfg(feature = "postgres")]
+    #[cfg(all(feature = "postgres", not(feature = "mysql")))]
     let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork")
         .await
         .map_err(hammerwork::HammerworkError::Database)?;
 
     // For MySQL:
-    #[cfg(feature = "mysql")]
+    #[cfg(all(feature = "mysql", not(feature = "postgres")))]
     let pool = sqlx::MySqlPool::connect("mysql://localhost/hammerwork")
+        .await
+        .map_err(hammerwork::HammerworkError::Database)?;
+
+    // Default to PostgreSQL when both features are enabled
+    #[cfg(all(feature = "postgres", feature = "mysql"))]
+    let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork")
         .await
         .map_err(hammerwork::HammerworkError::Database)?;
 

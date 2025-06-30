@@ -246,6 +246,7 @@ mod test_helpers {
     use std::process::Command;
 
     /// Check if PostgreSQL test database is available
+    #[allow(dead_code)]
     pub fn postgres_available() -> bool {
         let output = Command::new("pg_isready")
             .arg("-h")
@@ -263,6 +264,7 @@ mod test_helpers {
     }
 
     /// Check if MySQL test database is available
+    #[allow(dead_code)]
     pub fn mysql_available() -> bool {
         let output = Command::new("mysql")
             .arg("--host=127.0.0.1")
@@ -279,6 +281,7 @@ mod test_helpers {
     }
 
     /// Create a test configuration with minimal setup
+    #[allow(dead_code)]
     pub fn create_test_config() -> DashboardConfig {
         let temp_dir = tempdir().expect("Failed to create temp directory");
 

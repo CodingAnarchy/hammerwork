@@ -3,10 +3,14 @@
 mod test_utils;
 
 use hammerwork::{
+    Job, Worker, WorkerPool, JobStatus,
     job::{ResultConfig, ResultStorage},
-    worker::JobResult,
+    queue::DatabaseQueue,
+    worker::{JobHandler, JobHandlerWithResult, JobResult},
 };
 use serde_json::json;
+use std::{sync::Arc, time::Duration};
+use uuid;
 
 #[cfg(feature = "postgres")]
 mod postgres_tests {
@@ -122,6 +126,7 @@ mod postgres_tests {
     #[tokio::test]
     async fn test_worker_automatic_result_storage() {
         let queue = test_utils::setup_postgres_queue().await;
+        let unique_queue = format!("auto_result_test_{}", uuid::Uuid::new_v4());
 
         // Create a handler that returns result data
         let handler: JobHandlerWithResult = Arc::new(|job| {
@@ -139,10 +144,10 @@ mod postgres_tests {
 
         // Create worker with result handler
         let worker =
-            Worker::new_with_result_handler(queue.clone(), "test_queue".to_string(), handler);
+            Worker::new_with_result_handler(queue.clone(), unique_queue.clone(), handler);
 
         // Create a job with result storage enabled
-        let job = Job::new("test_queue".to_string(), json!({"task_id": 123}))
+        let job = Job::new(unique_queue, json!({"task_id": 123}))
             .with_result_storage(ResultStorage::Database)
             .with_result_ttl(Duration::from_secs(3600));
 
@@ -155,12 +160,30 @@ mod postgres_tests {
         // Start the worker pool for a short time to process the job
         let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
-        // Wait a bit for job processing
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for the job to be processed (check status periodically)
+        let mut attempts = 0;
+        let max_attempts = 40; // Wait up to 20 seconds
+        let mut job_completed = false;
+        
+        while attempts < max_attempts {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            
+            // Check if job is completed
+            if let Some(job) = queue.get_job(job_id).await.unwrap() {
+                if job.status == JobStatus::Completed {
+                    job_completed = true;
+                    break;
+                }
+            }
+            attempts += 1;
+        }
+        
+        // Ensure job was completed
+        assert!(job_completed, "Job should have completed within timeout");
 
         // Verify result was automatically stored
         let stored_result = queue.get_job_result(job_id).await.unwrap();
-        assert!(stored_result.is_some());
+        assert!(stored_result.is_some(), "Job result should be stored after completion");
 
         let result = stored_result.unwrap();
         assert_eq!(result["task_id"], 123);
@@ -173,6 +196,7 @@ mod postgres_tests {
     #[tokio::test]
     async fn test_worker_legacy_handler_compatibility() {
         let queue = test_utils::setup_postgres_queue().await;
+        let unique_queue = format!("legacy_test_{}", uuid::Uuid::new_v4());
 
         // Create a legacy handler (returns ())
         let legacy_handler: JobHandler = Arc::new(|_job| {
@@ -183,10 +207,10 @@ mod postgres_tests {
         });
 
         // Create worker with legacy handler
-        let worker = Worker::new(queue.clone(), "test_queue".to_string(), legacy_handler);
+        let worker = Worker::new(queue.clone(), unique_queue.clone(), legacy_handler);
 
         // Create a job (even with result storage enabled)
-        let job = Job::new("test_queue".to_string(), json!({"task": "legacy"}))
+        let job = Job::new(unique_queue, json!({"task": "legacy"}))
             .with_result_storage(ResultStorage::Database);
 
         let job_id = queue.enqueue(job).await.unwrap();
@@ -197,12 +221,24 @@ mod postgres_tests {
 
         let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
-        // Wait for job processing
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for the job to be processed (check status periodically)
+        let mut attempts = 0;
+        let max_attempts = 20; // Wait up to 10 seconds
+        while attempts < max_attempts {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            
+            // Check if job is completed
+            if let Some(job) = queue.get_job(job_id).await.unwrap() {
+                if job.status == JobStatus::Completed {
+                    break;
+                }
+            }
+            attempts += 1;
+        }
 
         // Verify no result was stored (legacy handler returns no data)
         let stored_result = queue.get_job_result(job_id).await.unwrap();
-        assert!(stored_result.is_none());
+        assert!(stored_result.is_none(), "Legacy handler should not store result data");
 
         worker_handle.abort();
     }

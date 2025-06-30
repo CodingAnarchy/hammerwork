@@ -2,6 +2,9 @@
 
 mod test_utils;
 
+use hammerwork::{Job, ResultStorage, queue::DatabaseQueue};
+use serde_json::json;
+
 #[tokio::test]
 #[cfg(feature = "mysql")]
 async fn test_mysql_direct_result_storage() {
@@ -66,7 +69,7 @@ async fn test_mysql_job_completion() {
     let job_id = queue.enqueue(job).await.unwrap();
 
     // Dequeue the job
-    let mut job = queue.dequeue("completion_test").await.unwrap().unwrap();
+    let job = queue.dequeue("completion_test").await.unwrap().unwrap();
     println!("Job result config: {:?}", job.result_config);
 
     // Mark job as completed with result
