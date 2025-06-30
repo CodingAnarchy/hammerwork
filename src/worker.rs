@@ -46,7 +46,7 @@ pub struct JobHookEvent {
 pub type JobHookHandler = Arc<dyn Fn(JobHookEvent) + Send + Sync>;
 
 /// Job lifecycle event hooks that can be registered with workers.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct JobEventHooks {
     /// Called when a job starts processing
     pub on_job_start: Option<JobHookHandler>,
@@ -58,18 +58,6 @@ pub struct JobEventHooks {
     pub on_job_timeout: Option<JobHookHandler>,
     /// Called when a job is retried
     pub on_job_retry: Option<JobHookHandler>,
-}
-
-impl Default for JobEventHooks {
-    fn default() -> Self {
-        Self {
-            on_job_start: None,
-            on_job_complete: None,
-            on_job_fail: None,
-            on_job_timeout: None,
-            on_job_retry: None,
-        }
-    }
 }
 
 impl JobEventHooks {

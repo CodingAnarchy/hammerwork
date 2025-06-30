@@ -1,4 +1,44 @@
 //! WebSocket implementation for real-time dashboard updates.
+//!
+//! This module provides WebSocket functionality for real-time communication between
+//! the dashboard frontend and backend. It supports connection management, message
+//! broadcasting, and automatic ping/pong for connection health.
+//!
+//! # Message Types
+//!
+//! The WebSocket API supports several message types for different events:
+//!
+//! ```rust
+//! use hammerwork_web::websocket::{ClientMessage, ServerMessage, AlertSeverity};
+//! use serde_json::json;
+//!
+//! // Client messages (sent from browser to server)
+//! let subscribe_msg = ClientMessage::Subscribe {
+//!     event_types: vec!["queue_updates".to_string(), "job_updates".to_string()],
+//! };
+//!
+//! let ping_msg = ClientMessage::Ping;
+//!
+//! // Server messages (sent from server to browser)
+//! let alert_msg = ServerMessage::SystemAlert {
+//!     message: "High error rate detected".to_string(),
+//!     severity: AlertSeverity::Warning,
+//! };
+//!
+//! let pong_msg = ServerMessage::Pong;
+//! ```
+//!
+//! # Connection Management
+//!
+//! ```rust
+//! use hammerwork_web::websocket::WebSocketState;
+//! use hammerwork_web::config::WebSocketConfig;
+//!
+//! let config = WebSocketConfig::default();
+//! let ws_state = WebSocketState::new(config);
+//!
+//! assert_eq!(ws_state.connection_count(), 0);
+//! ```
 
 use crate::config::WebSocketConfig;
 use futures_util::{SinkExt, StreamExt};
@@ -144,7 +184,7 @@ impl WebSocketState {
         let mut disconnected = Vec::new();
 
         for (&connection_id, sender) in &self.connections {
-            if let Err(_) = sender.send(ws_message.clone()) {
+            if sender.send(ws_message.clone()).is_err() {
                 disconnected.push(connection_id);
             }
         }
@@ -162,7 +202,7 @@ impl WebSocketState {
         let mut disconnected = Vec::new();
 
         for (&connection_id, sender) in &self.connections {
-            if let Err(_) = sender.send(ping_message.clone()) {
+            if sender.send(ping_message.clone()).is_err() {
                 disconnected.push(connection_id);
             }
         }

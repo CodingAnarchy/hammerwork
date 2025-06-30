@@ -12,6 +12,7 @@ class HammerworkDashboard {
         this.charts = {};
         this.lastUpdate = null;
         this.refreshInterval = null;
+        this.authCredentials = null; // Store auth credentials
         
         this.init();
     }
@@ -25,7 +26,7 @@ class HammerworkDashboard {
         // Initialize charts
         this.initializeCharts();
         
-        // Load initial data
+        // Try to load initial data (will prompt for auth if needed)
         await this.loadInitialData();
         
         // Connect WebSocket for real-time updates
@@ -35,6 +36,26 @@ class HammerworkDashboard {
         this.startPeriodicRefresh();
         
         console.log('Dashboard initialized successfully');
+    }
+
+    async promptForCredentials() {
+        return new Promise((resolve) => {
+            const username = prompt('Username:');
+            if (username === null) {
+                resolve(null);
+                return;
+            }
+            
+            const password = prompt('Password:');
+            if (password === null) {
+                resolve(null);
+                return;
+            }
+            
+            // Create base64 encoded credentials
+            const credentials = btoa(`${username}:${password}`);
+            resolve(credentials);
+        });
     }
 
     initializeEventListeners() {
@@ -651,17 +672,53 @@ class HammerworkDashboard {
             }
         };
         
+        // Add authentication header if credentials are available
+        if (this.authCredentials) {
+            options.headers['Authorization'] = `Basic ${this.authCredentials}`;
+        }
+        
         if (data) {
             options.body = JSON.stringify(data);
         }
         
-        const response = await fetch(url, options);
-        
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        try {
+            const response = await fetch(url, options);
+            
+            // Handle authentication errors
+            if (response.status === 401) {
+                // Clear invalid credentials
+                this.authCredentials = null;
+                
+                // Prompt for new credentials
+                const newCredentials = await this.promptForCredentials();
+                if (newCredentials) {
+                    this.authCredentials = newCredentials;
+                    // Retry the request with new credentials
+                    return this.apiCall(url, method, data);
+                } else {
+                    throw new Error('Authentication required');
+                }
+            }
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            return await response.json();
+        } catch (error) {
+            if (error.message === 'Authentication required') {
+                throw error;
+            }
+            // For network errors, also try to prompt for auth if we don't have credentials
+            if (!this.authCredentials && !url.includes('/health')) {
+                const credentials = await this.promptForCredentials();
+                if (credentials) {
+                    this.authCredentials = credentials;
+                    return this.apiCall(url, method, data);
+                }
+            }
+            throw error;
         }
-        
-        return await response.json();
     }
 
     formatNumber(num) {

@@ -430,7 +430,7 @@ where
         // Create a job handler that records statistics
         let stats_clone = Arc::clone(&stats_collector);
         let handler = Arc::new(move |job: Job| {
-            let stats = stats_clone.clone();
+            let _stats = stats_clone.clone();
             Box::pin(async move {
                 info!("Processing statistics test job: {}", job.id);
 

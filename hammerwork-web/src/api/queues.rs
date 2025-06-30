@@ -1,4 +1,97 @@
 //! Queue management API endpoints.
+//!
+//! This module provides REST API endpoints for managing and monitoring Hammerwork job queues,
+//! including queue statistics, actions, and job management within specific queues.
+//!
+//! # API Endpoints
+//!
+//! - `GET /api/queues` - List all queues with statistics
+//! - `GET /api/queues/{name}` - Get detailed statistics for a specific queue
+//! - `POST /api/queues/{name}/actions` - Perform actions on a queue (pause, resume, clear)
+//! - `GET /api/queues/{name}/jobs` - List jobs in a specific queue
+//!
+//! # Examples
+//!
+//! ## Queue Information Structure
+//!
+//! ```rust
+//! use hammerwork_web::api::queues::QueueInfo;
+//! use chrono::Utc;
+//!
+//! let queue_info = QueueInfo {
+//!     name: "email_queue".to_string(),
+//!     pending_count: 25,
+//!     running_count: 3,
+//!     completed_count: 1500,
+//!     failed_count: 12,
+//!     dead_count: 2,
+//!     avg_processing_time_ms: 250.5,
+//!     throughput_per_minute: 45.0,
+//!     error_rate: 0.008,
+//!     last_job_at: Some(Utc::now()),
+//!     oldest_pending_job: Some(Utc::now()),
+//! };
+//!
+//! assert_eq!(queue_info.name, "email_queue");
+//! assert_eq!(queue_info.pending_count, 25);
+//! assert_eq!(queue_info.running_count, 3);
+//! ```
+//!
+//! ## Queue Actions
+//!
+//! ```rust
+//! use hammerwork_web::api::queues::QueueActionRequest;
+//!
+//! let clear_dead_request = QueueActionRequest {
+//!     action: "clear_dead".to_string(),
+//!     confirm: Some(true),
+//! };
+//!
+//! let pause_request = QueueActionRequest {
+//!     action: "pause".to_string(),
+//!     confirm: None,
+//! };
+//!
+//! assert_eq!(clear_dead_request.action, "clear_dead");
+//! assert_eq!(pause_request.action, "pause");
+//! ```
+//!
+//! ## Detailed Queue Statistics
+//!
+//! ```rust
+//! use hammerwork_web::api::queues::{DetailedQueueStats, QueueInfo, HourlyThroughput, RecentError};
+//! use std::collections::HashMap;
+//! use chrono::Utc;
+//!
+//! let queue_info = QueueInfo {
+//!     name: "default".to_string(),
+//!     pending_count: 10,
+//!     running_count: 2,
+//!     completed_count: 500,
+//!     failed_count: 5,
+//!     dead_count: 1,
+//!     avg_processing_time_ms: 180.0,
+//!     throughput_per_minute: 30.0,
+//!     error_rate: 0.01,
+//!     last_job_at: None,
+//!     oldest_pending_job: None,
+//! };
+//!
+//! let mut priority_breakdown = HashMap::new();
+//! priority_breakdown.insert("high".to_string(), 5);
+//! priority_breakdown.insert("normal".to_string(), 15);
+//!
+//! let detailed_stats = DetailedQueueStats {
+//!     queue_info,
+//!     priority_breakdown,
+//!     status_breakdown: HashMap::new(),
+//!     hourly_throughput: vec![],
+//!     recent_errors: vec![],
+//! };
+//!
+//! assert_eq!(detailed_stats.queue_info.name, "default");
+//! assert_eq!(detailed_stats.priority_breakdown.get("high"), Some(&5));
+//! ```
 
 use super::{
     with_filters, with_pagination, with_sort, ApiResponse, FilterParams,

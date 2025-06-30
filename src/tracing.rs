@@ -108,8 +108,8 @@ impl TraceId {
     /// let trace_id = TraceId::from_string("test-trace");
     /// assert_eq!(trace_id.to_string(), "test-trace");
     /// ```
-    pub fn to_string(&self) -> String {
-        self.0.clone()
+    pub fn into_string(self) -> String {
+        self.0
     }
 
     /// Get the trace ID as a string slice.
@@ -183,8 +183,8 @@ impl CorrelationId {
     }
 
     /// Get the correlation ID as a string.
-    pub fn to_string(&self) -> String {
-        self.0.clone()
+    pub fn into_string(self) -> String {
+        self.0
     }
 
     /// Get the correlation ID as a string slice.

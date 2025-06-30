@@ -1,4 +1,124 @@
 //! System information and administration API endpoints.
+//!
+//! This module provides comprehensive system administration and information endpoints
+//! for monitoring the web dashboard service, runtime metrics, and maintenance operations.
+//!
+//! # API Endpoints
+//!
+//! - `GET /api/system/info` - Complete system information including build and runtime details
+//! - `GET /api/system/config` - Current server configuration
+//! - `GET /api/system/metrics` - Metrics and monitoring information
+//! - `POST /api/system/maintenance` - Perform maintenance operations
+//! - `GET /api/version` - Basic version information
+//!
+//! # Examples
+//!
+//! ## System Information
+//!
+//! ```rust
+//! use hammerwork_web::api::system::{SystemInfo, BuildInfo, RuntimeInfo, DatabaseInfo};
+//! use chrono::Utc;
+//!
+//! let build_info = BuildInfo {
+//!     version: "1.2.0".to_string(),
+//!     git_commit: Some("a1b2c3d".to_string()),
+//!     build_date: Some("2024-01-15".to_string()),
+//!     rust_version: "1.70.0".to_string(),
+//!     target_triple: "x86_64-unknown-linux-gnu".to_string(),
+//! };
+//!
+//! let runtime_info = RuntimeInfo {
+//!     process_id: 12345,
+//!     memory_usage_bytes: Some(134217728), // 128MB
+//!     cpu_usage_percent: Some(5.2),
+//!     thread_count: Some(8),
+//!     gc_collections: None, // Not applicable for Rust
+//! };
+//!
+//! let database_info = DatabaseInfo {
+//!     database_type: "PostgreSQL".to_string(),
+//!     connection_url: "***masked***".to_string(),
+//!     pool_size: 10,
+//!     active_connections: Some(3),
+//!     connection_health: true,
+//!     last_migration: Some("20240101_initial".to_string()),
+//! };
+//!
+//! let system_info = SystemInfo {
+//!     version: "1.2.0".to_string(),
+//!     build_info,
+//!     runtime_info,
+//!     database_info,
+//!     features: vec!["postgres".to_string(), "auth".to_string()],
+//!     uptime_seconds: 86400,
+//!     started_at: Utc::now(),
+//! };
+//!
+//! assert_eq!(system_info.version, "1.2.0");
+//! assert!(system_info.features.contains(&"postgres".to_string()));
+//! assert_eq!(system_info.runtime_info.process_id, 12345);
+//! ```
+//!
+//! ## Maintenance Operations
+//!
+//! ```rust
+//! use hammerwork_web::api::system::MaintenanceRequest;
+//! use serde_json::json;
+//!
+//! let cleanup_request = MaintenanceRequest {
+//!     operation: "cleanup".to_string(),
+//!     target: Some("old_jobs".to_string()),
+//!     dry_run: Some(true),
+//! };
+//!
+//! let vacuum_request = MaintenanceRequest {
+//!     operation: "vacuum".to_string(),
+//!     target: Some("hammerwork_jobs".to_string()),
+//!     dry_run: Some(false),
+//! };
+//!
+//! assert_eq!(cleanup_request.operation, "cleanup");
+//! assert_eq!(cleanup_request.dry_run, Some(true));
+//! assert_eq!(vacuum_request.operation, "vacuum");
+//! ```
+//!
+//! ## Server Configuration
+//!
+//! ```rust
+//! use hammerwork_web::api::system::ServerConfig;
+//!
+//! let config = ServerConfig {
+//!     bind_address: "0.0.0.0".to_string(),
+//!     port: 8080,
+//!     authentication_enabled: true,
+//!     cors_enabled: false,
+//!     websocket_max_connections: 100,
+//!     static_assets_path: "/var/www/dashboard".to_string(),
+//! };
+//!
+//! assert_eq!(config.bind_address, "0.0.0.0");
+//! assert_eq!(config.port, 8080);
+//! assert!(config.authentication_enabled);
+//! assert!(!config.cors_enabled);
+//! ```
+//!
+//! ## Metrics Information
+//!
+//! ```rust
+//! use hammerwork_web::api::system::MetricsInfo;
+//! use chrono::Utc;
+//!
+//! let metrics_info = MetricsInfo {
+//!     prometheus_enabled: true,
+//!     metrics_endpoint: "/metrics".to_string(),
+//!     custom_metrics_count: 15,
+//!     last_scrape: Some(Utc::now()),
+//! };
+//!
+//! assert!(metrics_info.prometheus_enabled);
+//! assert_eq!(metrics_info.metrics_endpoint, "/metrics");
+//! assert_eq!(metrics_info.custom_metrics_count, 15);
+//! ```
 
 use super::ApiResponse;
 use hammerwork::queue::DatabaseQueue;

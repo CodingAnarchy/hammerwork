@@ -1,10 +1,50 @@
 //! Authentication middleware for the web dashboard.
+//!
+//! This module provides authentication functionality including basic auth verification,
+//! rate limiting for failed attempts, and account lockout mechanisms.
+//!
+//! # Examples
+//!
+//! ## Basic Authentication Setup
+//!
+//! ```rust
+//! use hammerwork_web::auth::{AuthState, extract_basic_auth};
+//! use hammerwork_web::config::AuthConfig;
+//!
+//! let auth_config = AuthConfig {
+//!     enabled: true,
+//!     username: "admin".to_string(),
+//!     password_hash: "plain_password".to_string(), // Use bcrypt in production
+//!     ..Default::default()
+//! };
+//!
+//! let auth_state = AuthState::new(auth_config);
+//! assert!(auth_state.is_enabled());
+//! ```
+//!
+//! ## Extracting Basic Auth Credentials
+//!
+//! ```rust
+//! use hammerwork_web::auth::extract_basic_auth;
+//!
+//! // "admin:password" in base64 is "YWRtaW46cGFzc3dvcmQ="
+//! let auth_header = "Basic YWRtaW46cGFzc3dvcmQ=";
+//! let (username, password) = extract_basic_auth(auth_header).unwrap();
+//!
+//! assert_eq!(username, "admin");
+//! assert_eq!(password, "password");
+//!
+//! // Invalid format returns None
+//! let result = extract_basic_auth("Bearer token123");
+//! assert!(result.is_none());
+//! ```
 
 use crate::config::AuthConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use warp::{Filter, Rejection, Reply};
+use base64::Engine;
 
 /// Authentication middleware state
 #[derive(Clone)]
@@ -98,14 +138,39 @@ impl AuthState {
     }
 }
 
-/// Extract basic auth credentials from request
+/// Extract basic auth credentials from request.
+///
+/// Parses a Basic Authentication header and returns the username and password.
+/// The header format should be: `Basic <base64-encoded-credentials>`
+/// where credentials are in the format `username:password`.
+///
+/// # Examples
+///
+/// ```rust
+/// use hammerwork_web::auth::extract_basic_auth;
+///
+/// // Valid basic auth header
+/// let auth_header = "Basic YWRtaW46cGFzc3dvcmQ="; // admin:password
+/// let (username, password) = extract_basic_auth(auth_header).unwrap();
+/// assert_eq!(username, "admin");
+/// assert_eq!(password, "password");
+///
+/// // Invalid format returns None
+/// assert!(extract_basic_auth("Bearer token123").is_none());
+/// assert!(extract_basic_auth("Basic invalid_base64").is_none());
+/// ```
+///
+/// # Returns
+///
+/// - `Some((username, password))` if the header is valid
+/// - `None` if the header is malformed or not a Basic auth header
 pub fn extract_basic_auth(auth_header: &str) -> Option<(String, String)> {
     if !auth_header.starts_with("Basic ") {
         return None;
     }
 
     let encoded = &auth_header[6..];
-    let decoded = base64::decode(encoded).ok()?;
+    let decoded = ::base64::prelude::BASE64_STANDARD.decode(encoded).ok()?;
     let decoded_str = String::from_utf8(decoded).ok()?;
     
     let mut parts = decoded_str.splitn(2, ':');
@@ -154,63 +219,53 @@ pub enum AuthError {
 
 impl warp::reject::Reject for AuthError {}
 
-/// Handle authentication rejections (simplified version)
-pub async fn handle_auth_rejection(_err: Rejection) -> Result<impl Reply, std::convert::Infallible> {
-    // Simple error response
-    let error_response = serde_json::json!({"error": "Authentication required"});
-    Ok(warp::reply::with_status(
-        warp::reply::json(&error_response),
-        warp::http::StatusCode::UNAUTHORIZED,
-    ))
-}
-
-// Re-export base64 for credential encoding if needed
-#[cfg(not(feature = "auth"))]
-mod base64 {
-    pub fn decode(input: &str) -> Result<Vec<u8>, &'static str> {
-        // Simple base64 decoder for basic auth when bcrypt feature is not enabled
-        use std::collections::HashMap;
-        
-        let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut char_map = HashMap::new();
-        for (i, c) in chars.chars().enumerate() {
-            char_map.insert(c, i as u8);
-        }
-        
-        let input = input.trim_end_matches('=');
-        let mut result = Vec::new();
-        let mut buffer = 0u32;
-        let mut bits = 0;
-        
-        for c in input.chars() {
-            if let Some(&value) = char_map.get(&c) {
-                buffer = (buffer << 6) | (value as u32);
-                bits += 6;
-                
-                if bits >= 8 {
-                    result.push((buffer >> (bits - 8)) as u8);
-                    bits -= 8;
-                }
-            } else {
-                return Err("Invalid base64 character");
+/// Handle authentication rejections
+pub async fn handle_auth_rejection(err: Rejection) -> Result<Box<dyn Reply>, std::convert::Infallible> {
+    if let Some(auth_error) = err.find::<AuthError>() {
+        match auth_error {
+            AuthError::MissingCredentials => {
+                let response = warp::reply::with_header(
+                    warp::reply::with_status(
+                        "Authentication required",
+                        warp::http::StatusCode::UNAUTHORIZED,
+                    ),
+                    "WWW-Authenticate",
+                    "Basic realm=\"Hammerwork Dashboard\"",
+                );
+                Ok(Box::new(response))
+            }
+            AuthError::InvalidFormat => {
+                let error_response = serde_json::json!({"error": "Invalid authentication format"});
+                Ok(Box::new(warp::reply::with_status(
+                    warp::reply::json(&error_response),
+                    warp::http::StatusCode::BAD_REQUEST,
+                )))
+            }
+            AuthError::InvalidCredentials => {
+                let error_response = serde_json::json!({"error": "Invalid credentials"});
+                Ok(Box::new(warp::reply::with_status(
+                    warp::reply::json(&error_response),
+                    warp::http::StatusCode::UNAUTHORIZED,
+                )))
+            }
+            AuthError::AccountLocked => {
+                let error_response = serde_json::json!({"error": "Account temporarily locked"});
+                Ok(Box::new(warp::reply::with_status(
+                    warp::reply::json(&error_response),
+                    warp::http::StatusCode::UNAUTHORIZED,
+                )))
             }
         }
-        
-        Ok(result)
+    } else {
+        // Not an auth error, return generic error
+        let error_response = serde_json::json!({"error": "Internal server error"});
+        Ok(Box::new(warp::reply::with_status(
+            warp::reply::json(&error_response),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )))
     }
 }
 
-#[cfg(feature = "auth")]
-use base64::engine::general_purpose::STANDARD;
-#[cfg(feature = "auth")]
-use base64::Engine as _;
-
-#[cfg(feature = "auth")]
-mod base64 {
-    pub fn decode(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
-        super::STANDARD.decode(input)
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -86,11 +86,11 @@ impl JobRow {
                 storage: self
                     .result_storage_type
                     .as_ref()
-                    .and_then(|s| match s.as_str() {
-                        "database" => Some(crate::job::ResultStorage::Database),
-                        "memory" => Some(crate::job::ResultStorage::Memory),
-                        "none" => Some(crate::job::ResultStorage::None),
-                        _ => Some(crate::job::ResultStorage::None),
+                    .map(|s| match s.as_str() {
+                        "database" => crate::job::ResultStorage::Database,
+                        "memory" => crate::job::ResultStorage::Memory,
+                        "none" => crate::job::ResultStorage::None,
+                        _ => crate::job::ResultStorage::None,
                     })
                     .unwrap_or(crate::job::ResultStorage::None),
                 ttl: self
@@ -113,7 +113,7 @@ impl JobRow {
             dependency_status: self
                 .dependency_status
                 .as_ref()
-                .and_then(|s| crate::workflow::DependencyStatus::from_str(s).ok())
+                .and_then(|s| crate::workflow::DependencyStatus::parse_from_db(s).ok())
                 .unwrap_or(crate::workflow::DependencyStatus::None),
             workflow_id: self
                 .workflow_id

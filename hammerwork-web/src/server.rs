@@ -1,8 +1,51 @@
 //! Web server implementation for the Hammerwork dashboard.
+//!
+//! This module provides the main `WebDashboard` struct for starting and configuring
+//! the web server, including database connections, authentication, and route setup.
+//!
+//! # Examples
+//!
+//! ## Basic Server Setup
+//!
+//! ```rust,no_run
+//! use hammerwork_web::{WebDashboard, DashboardConfig};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = DashboardConfig::new()
+//!         .with_bind_address("127.0.0.1", 8080)
+//!         .with_database_url("postgresql://localhost/hammerwork");
+//!
+//!     let dashboard = WebDashboard::new(config).await?;
+//!     dashboard.start().await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Server with Authentication
+//!
+//! ```rust,no_run
+//! use hammerwork_web::{WebDashboard, DashboardConfig};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = DashboardConfig::new()
+//!         .with_bind_address("0.0.0.0", 9090)
+//!         .with_database_url("postgresql://localhost/hammerwork")
+//!         .with_auth("admin", "$2b$12$hash...")
+//!         .with_cors(true);
+//!
+//!     let dashboard = WebDashboard::new(config).await?;
+//!     dashboard.start().await?;
+//!
+//!     Ok(())
+//! }
+//! ```
 
 use crate::{
     api,
-    auth::AuthState,
+    auth::{auth_filter, handle_auth_rejection, AuthState},
     config::DashboardConfig,
     websocket::WebSocketState,
     Result,
@@ -13,7 +56,32 @@ use tokio::sync::RwLock;
 use tracing::{info, error};
 use warp::{Filter, Reply};
 
-/// Main web dashboard server
+/// Main web dashboard server.
+///
+/// The `WebDashboard` provides a complete web interface for monitoring and managing
+/// Hammerwork job queues. It includes REST API endpoints, WebSocket support for
+/// real-time updates, authentication, and a modern HTML/CSS/JS frontend.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use hammerwork_web::{WebDashboard, DashboardConfig};
+/// use std::path::PathBuf;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let config = DashboardConfig::new()
+///         .with_bind_address("127.0.0.1", 8080)
+///         .with_database_url("postgresql://localhost/hammerwork")
+///         .with_static_dir(PathBuf::from("./assets"))
+///         .with_cors(false);
+///
+///     let dashboard = WebDashboard::new(config).await?;
+///     dashboard.start().await?;
+///
+///     Ok(())
+/// }
+/// ```
 pub struct WebDashboard {
     config: DashboardConfig,
     auth_state: AuthState,
@@ -21,7 +89,30 @@ pub struct WebDashboard {
 }
 
 impl WebDashboard {
-    /// Create a new web dashboard instance
+    /// Create a new web dashboard instance.
+    ///
+    /// This initializes the dashboard with the provided configuration but does not
+    /// start the web server. Call `start()` to begin serving requests.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork_web::{WebDashboard, DashboardConfig};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let config = DashboardConfig::new()
+    ///         .with_database_url("postgresql://localhost/hammerwork");
+    ///
+    ///     let dashboard = WebDashboard::new(config).await?;
+    ///     // Dashboard is created but not yet started
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is invalid or if initialization fails.
     pub async fn new(config: DashboardConfig) -> Result<Self> {
         let auth_state = AuthState::new(config.auth.clone());
         let websocket_state = Arc::new(RwLock::new(WebSocketState::new(config.websocket.clone())));
@@ -41,10 +132,10 @@ impl WebDashboard {
         let queue = Arc::new(self.create_job_queue().await?);
 
         // Create API routes
-        let api_routes = Self::create_api_routes_static(queue.clone());
+        let api_routes = Self::create_api_routes_static(queue.clone(), self.auth_state.clone());
         
         // Create WebSocket routes
-        let websocket_routes = Self::create_websocket_routes_static(self.websocket_state.clone());
+        let websocket_routes = Self::create_websocket_routes_static(self.websocket_state.clone(), self.auth_state.clone());
         
         // Create static file routes
         let static_routes = Self::create_static_routes_static(self.config.static_dir.clone())?;
@@ -52,7 +143,8 @@ impl WebDashboard {
         // Combine all routes
         let routes = api_routes
             .or(websocket_routes)
-            .or(static_routes);
+            .or(static_routes)
+            .recover(handle_auth_rejection);
 
         // Apply CORS if enabled (simplified approach)
         let routes = routes
@@ -113,9 +205,16 @@ impl WebDashboard {
         } else if self.config.database_url.starts_with("mysql") {
             #[cfg(feature = "mysql")]
             {
-                let mysql_pool = sqlx::MySqlPool::connect(&self.config.database_url).await?;
-                info!("Connected to MySQL with {} connections", self.config.pool_size);
-                Ok(JobQueue::new(mysql_pool))
+                #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+                {
+                    let mysql_pool = sqlx::MySqlPool::connect(&self.config.database_url).await?;
+                    info!("Connected to MySQL with {} connections", self.config.pool_size);
+                    Ok(JobQueue::new(mysql_pool))
+                }
+                #[cfg(all(feature = "postgres", feature = "mysql"))]
+                {
+                    return Err(anyhow::anyhow!("MySQL database URL provided but PostgreSQL is the default when both features are enabled"));
+                }
             }
             #[cfg(not(feature = "mysql"))]
             {
@@ -126,9 +225,10 @@ impl WebDashboard {
         }
     }
 
-    /// Create API routes
+    /// Create API routes with authentication
     fn create_api_routes_static(
         queue: Arc<QueueType>,
+        auth_state: AuthState,
     ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone {
 
         // Health check endpoint (no auth required)
@@ -143,37 +243,39 @@ impl WebDashboard {
                 }))
             });
 
-        // API routes (auth disabled for now)
-        let api = warp::path("api")
-            .and(
-                api::queues::routes(queue.clone())
-                    .or(api::jobs::routes(queue.clone()))
-                    .or(api::stats::routes(queue.clone()))
-                    .or(api::system::routes(queue))
-            );
+        // API routes (require authentication)
+        let api_routes = api::queues::routes(queue.clone())
+            .or(api::jobs::routes(queue.clone()))
+            .or(api::stats::routes(queue.clone()))
+            .or(api::system::routes(queue));
 
-        health.or(api)
+        let authenticated_api = warp::path("api")
+            .and(auth_filter(auth_state))
+            .untuple_one()
+            .and(api_routes);
+
+        health.or(authenticated_api)
     }
 
-    /// Create WebSocket routes
+    /// Create WebSocket routes with authentication
     fn create_websocket_routes_static(
         websocket_state: Arc<RwLock<WebSocketState>>,
+        auth_state: AuthState,
     ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone {
 
-        let websocket = warp::path("ws")
+        warp::path("ws")
             .and(warp::path::end())
+            .and(auth_filter(auth_state))
             .and(warp::ws())
             .and(warp::any().map(move || websocket_state.clone()))
-            .map(|ws: warp::ws::Ws, websocket_state: Arc<RwLock<WebSocketState>>| {
+            .map(|_: (), ws: warp::ws::Ws, websocket_state: Arc<RwLock<WebSocketState>>| {
                 ws.on_upgrade(move |socket| async move {
                     let mut state = websocket_state.write().await;
                     if let Err(e) = state.handle_connection(socket).await {
                         error!("WebSocket error: {}", e);
                     }
                 })
-            });
-
-        websocket
+            })
     }
 
     /// Create static file serving routes
@@ -195,11 +297,14 @@ impl WebDashboard {
     }
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(all(feature = "postgres", not(feature = "mysql")))]
 type QueueType = JobQueue<sqlx::Postgres>;
 
-#[cfg(feature = "mysql")]
+#[cfg(all(feature = "mysql", not(feature = "postgres")))]
 type QueueType = JobQueue<sqlx::MySql>;
+
+#[cfg(all(feature = "postgres", feature = "mysql"))]
+type QueueType = JobQueue<sqlx::Postgres>; // Default to PostgreSQL when both are enabled
 
 #[cfg(all(not(feature = "postgres"), not(feature = "mysql")))]
 compile_error!("At least one database feature (postgres or mysql) must be enabled");

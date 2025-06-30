@@ -1,4 +1,52 @@
 //! REST API endpoints for the Hammerwork web dashboard.
+//!
+//! This module provides a comprehensive REST API for job queue management,
+//! including endpoints for jobs, queues, statistics, and system information.
+//! All API responses use a standardized format with proper error handling.
+//!
+//! # API Response Format
+//!
+//! All API endpoints return responses in a consistent format:
+//!
+//! ```rust
+//! use hammerwork_web::api::ApiResponse;
+//! use serde_json::json;
+//!
+//! // Success response
+//! let success_response = ApiResponse::success(json!({"count": 42}));
+//! assert!(success_response.success);
+//! assert!(success_response.data.is_some());
+//! assert!(success_response.error.is_none());
+//!
+//! // Error response
+//! let error_response: ApiResponse<()> = ApiResponse::error("Something went wrong".to_string());
+//! assert!(!error_response.success);
+//! assert!(error_response.data.is_none());
+//! assert!(error_response.error.is_some());
+//! ```
+//!
+//! # Pagination
+//!
+//! Many endpoints support pagination using query parameters:
+//!
+//! ```rust
+//! use hammerwork_web::api::{PaginationParams, PaginationMeta};
+//!
+//! let params = PaginationParams {
+//!     page: Some(2),
+//!     limit: Some(50),
+//!     offset: None,
+//! };
+//!
+//! assert_eq!(params.get_limit(), 50);
+//! assert_eq!(params.get_offset(), 50); // (page-1) * limit
+//!
+//! let meta = PaginationMeta::new(&params, 200); // 200 total items
+//! assert_eq!(meta.page, 2);
+//! assert_eq!(meta.total_pages, 4);
+//! assert!(meta.has_next);
+//! assert!(meta.has_prev);
+//! ```
 
 pub mod jobs;
 pub mod queues;
@@ -141,9 +189,9 @@ impl SortParams {
 pub async fn handle_api_error(err: warp::Rejection) -> Result<impl warp::Reply, std::convert::Infallible> {
     let response = if err.is_not_found() {
         ApiResponse::<()>::error("Resource not found".to_string())
-    } else if let Some(_) = err.find::<warp::filters::body::BodyDeserializeError>() {
+    } else if err.find::<warp::filters::body::BodyDeserializeError>().is_some() {
         ApiResponse::<()>::error("Invalid request body".to_string())
-    } else if let Some(_) = err.find::<warp::reject::InvalidQuery>() {
+    } else if err.find::<warp::reject::InvalidQuery>().is_some() {
         ApiResponse::<()>::error("Invalid query parameters".to_string())
     } else {
         ApiResponse::<()>::error("Internal server error".to_string())

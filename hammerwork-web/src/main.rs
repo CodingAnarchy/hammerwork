@@ -135,6 +135,7 @@ async fn main() -> Result<()> {
             }
             #[cfg(not(feature = "auth"))]
             {
+                let _ = password; // Silence unused variable warning
                 error!("Authentication feature not enabled. Rebuild with --features auth");
                 std::process::exit(1);
             }
