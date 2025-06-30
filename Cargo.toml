@@ -2,6 +2,7 @@
 members = [
     ".",
     "cargo-hammerwork",
+    "hammerwork-web",
     "integrations/postgres-integration",
     "integrations/mysql-integration",
 ]
