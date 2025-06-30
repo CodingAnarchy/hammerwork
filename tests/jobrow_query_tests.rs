@@ -4,17 +4,11 @@
 //! all the fields that the JobRow struct expects, preventing runtime errors
 //! due to missing columns.
 
-use hammerwork::queue::DatabaseQueue;
-use hammerwork::{Job, JobPriority, ResultStorage};
-use serde_json::json;
-use tokio::time::Duration;
-
 mod test_utils;
 
 /// Test that all JobRow queries include the complete field set
 #[cfg(test)]
 mod jobrow_field_tests {
-    use super::*;
 
     #[cfg(feature = "postgres")]
     mod postgres_tests {
@@ -181,9 +175,6 @@ mod jobrow_field_tests {
 /// Test that workflow-specific functionality works correctly
 #[cfg(test)]
 mod workflow_field_tests {
-    use super::*;
-    use hammerwork::workflow::DependencyStatus;
-    use uuid::Uuid;
 
     #[cfg(feature = "postgres")]
     #[tokio::test]

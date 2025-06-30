@@ -1,11 +1,4 @@
 //! Simple test to verify result_config persistence
-use hammerwork::{
-    JobQueue,
-    job::{Job, ResultConfig, ResultStorage},
-    queue::DatabaseQueue,
-};
-use serde_json::json;
-use std::{sync::Arc, time::Duration};
 
 #[cfg(feature = "postgres")]
 #[tokio::test]

@@ -2,9 +2,6 @@
 
 mod test_utils;
 
-use hammerwork::{Job, job::ResultStorage, queue::DatabaseQueue};
-use serde_json::json;
-
 #[tokio::test]
 #[cfg(feature = "mysql")]
 async fn test_mysql_direct_result_storage() {
