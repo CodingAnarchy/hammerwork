@@ -29,7 +29,7 @@ pub type JobId = Uuid;
 ///
 /// // Check if a job is in a final state
 /// let status = JobStatus::Completed;
-/// let is_final = matches!(status, JobStatus::Completed | JobStatus::Dead | JobStatus::TimedOut);
+/// let is_final = matches!(status, JobStatus::Completed | JobStatus::Dead | JobStatus::TimedOut | JobStatus::Archived);
 /// assert!(is_final);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -48,6 +48,8 @@ pub enum JobStatus {
     TimedOut,
     /// Job failed but is scheduled for retry.
     Retrying,
+    /// Job has been archived for long-term storage.
+    Archived,
 }
 
 /// Configuration for job result storage.

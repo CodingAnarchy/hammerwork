@@ -40,6 +40,12 @@ pub enum HammerworkError {
 
     #[error("Tracing error: {message}")]
     Tracing { message: String },
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Archive error: {message}")]
+    Archive { message: String },
 }
 
 #[cfg(test)]

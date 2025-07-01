@@ -142,6 +142,30 @@ impl JobPriority {
         }
     }
 
+    /// Gets the default weight for this priority level.
+    ///
+    /// Returns the numeric weight used for priority calculations.
+    /// This is primarily used internally for database storage and comparisons.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::JobPriority;
+    ///
+    /// assert_eq!(JobPriority::Background.weight(), 1);
+    /// assert_eq!(JobPriority::Normal.weight(), 5);
+    /// assert_eq!(JobPriority::Critical.weight(), 20);
+    /// ```
+    pub fn weight(self) -> u32 {
+        match self {
+            JobPriority::Background => 1,
+            JobPriority::Low => 2,
+            JobPriority::Normal => 5,
+            JobPriority::High => 10,
+            JobPriority::Critical => 20,
+        }
+    }
+
     /// Gets a human-readable description of the priority.
     ///
     /// Provides detailed information about when each priority level

@@ -1039,6 +1039,7 @@ impl DatabaseQueue for TestQueue {
                     }
                     JobStatus::Pending | JobStatus::Retrying => pending_jobs += 1,
                     JobStatus::Running => pending_jobs += 1, // Count running as pending
+                    JobStatus::Archived => {}, // Archived jobs don't count in workflow stats
                 }
             }
         }
@@ -1440,6 +1441,7 @@ impl DatabaseQueue for TestQueue {
                     JobStatus::Dead => "dead",
                     JobStatus::TimedOut => "timed_out",
                     JobStatus::Retrying => "retrying",
+                    JobStatus::Archived => "archived",
                 };
                 counts.insert(status_str.to_string(), jobs.len() as u64);
             }
@@ -2044,6 +2046,252 @@ impl DatabaseQueue for TestQueue {
         }
 
         Ok(())
+    }
+
+    // Archival methods
+    async fn archive_jobs(
+        &self,
+        queue_name: Option<&str>,
+        policy: &crate::archive::ArchivalPolicy,
+        _config: &crate::archive::ArchivalConfig,
+        _reason: crate::archive::ArchivalReason,
+        _archived_by: Option<&str>,
+    ) -> Result<crate::archive::ArchivalStats> {
+        let mut storage = self.storage.write().await;
+        let now = storage.clock.now();
+        let mut jobs_archived = 0u64;
+        let mut bytes_archived = 0u64;
+
+        // Find jobs to archive based on policy
+        let mut jobs_to_archive = Vec::new();
+
+        for job in storage.jobs.values() {
+            // Skip if queue_name filter doesn't match
+            if let Some(queue) = queue_name {
+                if job.queue_name != queue {
+                    continue;
+                }
+            }
+
+            // Check if job should be archived based on policy and status
+            let age = match job.status {
+                JobStatus::Completed => job.completed_at.map(|t| now - t),
+                JobStatus::Failed => job.failed_at.map(|t| now - t),
+                JobStatus::Dead => job.failed_at.map(|t| now - t), // Use failed_at for dead jobs
+                JobStatus::TimedOut => job.timed_out_at.map(|t| now - t),
+                _ => None,
+            };
+
+            if let Some(age) = age {
+                if policy.should_archive(&job.status, age) {
+                    jobs_to_archive.push(job.id);
+                }
+            }
+        }
+
+        // Archive jobs
+        for job_id in jobs_to_archive.iter().take(policy.batch_size) {
+            if let Some(job) = storage.jobs.get_mut(job_id) {
+                // Calculate payload size for stats
+                let payload_size = serde_json::to_string(&job.payload)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0);
+
+                // Update job status
+                job.status = JobStatus::Archived;
+                // In a real implementation, we'd move to archive table and compress
+                
+                jobs_archived += 1;
+                bytes_archived += payload_size;
+            }
+        }
+
+        // Update queue structure separately to avoid borrow checker issues
+        let queue_names: Vec<_> = jobs_to_archive.iter().take(policy.batch_size)
+            .filter_map(|job_id| storage.jobs.get(job_id).map(|job| (*job_id, job.queue_name.clone())))
+            .collect();
+            
+        for (job_id, queue_name) in queue_names {
+            if let Some(queue_jobs) = storage.queues.get_mut(&queue_name) {
+                // Remove from old status list
+                for jobs_list in queue_jobs.values_mut() {
+                    jobs_list.retain(|&id| id != job_id);
+                }
+                // Add to archived list
+                queue_jobs.entry(JobStatus::Archived).or_default().push(job_id);
+            }
+        }
+
+        // Calculate compression ratio (mock)
+        let compression_ratio = if policy.compress_payloads { 0.7 } else { 1.0 };
+
+        Ok(crate::archive::ArchivalStats {
+            jobs_archived,
+            jobs_purged: 0,
+            bytes_archived,
+            bytes_purged: 0,
+            compression_ratio,
+            last_run_at: now,
+            operation_duration: std::time::Duration::from_millis(100), // Mock duration
+        })
+    }
+
+    async fn restore_archived_job(&self, job_id: JobId) -> Result<Job> {
+        let mut storage = self.storage.write().await;
+
+        if let Some(job) = storage.jobs.get_mut(&job_id) {
+            if job.status == JobStatus::Archived {
+                let queue_name = job.queue_name.clone(); // Clone to avoid borrow checker issues
+                
+                // Restore job to pending status
+                job.status = JobStatus::Pending;
+                let restored_job = job.clone();
+
+                // Update queue structure
+                if let Some(queue_jobs) = storage.queues.get_mut(&queue_name) {
+                    // Remove from archived list
+                    if let Some(archived_jobs) = queue_jobs.get_mut(&JobStatus::Archived) {
+                        archived_jobs.retain(|&id| id != job_id);
+                    }
+                    // Add to pending list
+                    queue_jobs.entry(JobStatus::Pending).or_default().push(job_id);
+                }
+
+                Ok(restored_job)
+            } else {
+                Err(crate::HammerworkError::Queue {
+                    message: format!("Job {} is not archived", job_id),
+                })
+            }
+        } else {
+            Err(crate::HammerworkError::Queue {
+                message: format!("Job {} not found", job_id),
+            })
+        }
+    }
+
+    async fn list_archived_jobs(
+        &self,
+        queue_name: Option<&str>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<crate::archive::ArchivedJob>> {
+        let storage = self.storage.read().await;
+        let now = storage.clock.now();
+
+        let mut archived_jobs = Vec::new();
+
+        for job in storage.jobs.values() {
+            if job.status != JobStatus::Archived {
+                continue;
+            }
+
+            // Filter by queue if specified
+            if let Some(queue) = queue_name {
+                if job.queue_name != queue {
+                    continue;
+                }
+            }
+
+            let payload_size = serde_json::to_string(&job.payload)
+                .map(|s| s.len())
+                .unwrap_or(0);
+
+            archived_jobs.push(crate::archive::ArchivedJob {
+                id: job.id,
+                queue_name: job.queue_name.clone(),
+                status: job.status.clone(),
+                created_at: job.created_at,
+                archived_at: now, // Mock archived time
+                archival_reason: crate::archive::ArchivalReason::Manual, // Mock reason
+                original_payload_size: Some(payload_size),
+                payload_compressed: false, // Mock
+                archived_by: Some("test".to_string()), // Mock user
+            });
+        }
+
+        // Apply pagination
+        let offset = offset.unwrap_or(0) as usize;
+        let limit = limit.unwrap_or(100) as usize;
+
+        archived_jobs.sort_by(|a, b| b.archived_at.cmp(&a.archived_at));
+        
+        if offset < archived_jobs.len() {
+            let end = std::cmp::min(offset + limit, archived_jobs.len());
+            Ok(archived_jobs[offset..end].to_vec())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn purge_archived_jobs(&self, older_than: DateTime<Utc>) -> Result<u64> {
+        let mut storage = self.storage.write().await;
+        let mut purged_count = 0u64;
+
+        // Find archived jobs older than cutoff
+        let jobs_to_purge: Vec<JobId> = storage
+            .jobs
+            .values()
+            .filter(|job| {
+                job.status == JobStatus::Archived
+                    && job.created_at < older_than // Mock: use created_at as archived_at
+            })
+            .map(|job| job.id)
+            .collect();
+
+        // Remove jobs
+        for job_id in jobs_to_purge {
+            storage.jobs.remove(&job_id);
+            purged_count += 1;
+
+            // Clean up from queue structure
+            for queue_jobs in storage.queues.values_mut() {
+                for jobs_list in queue_jobs.values_mut() {
+                    jobs_list.retain(|&id| id != job_id);
+                }
+            }
+        }
+
+        Ok(purged_count)
+    }
+
+    async fn get_archival_stats(
+        &self,
+        queue_name: Option<&str>,
+    ) -> Result<crate::archive::ArchivalStats> {
+        let storage = self.storage.read().await;
+        let now = storage.clock.now();
+
+        let mut jobs_archived = 0u64;
+        let mut bytes_archived = 0u64;
+
+        for job in storage.jobs.values() {
+            if job.status != JobStatus::Archived {
+                continue;
+            }
+
+            // Filter by queue if specified
+            if let Some(queue) = queue_name {
+                if job.queue_name != queue {
+                    continue;
+                }
+            }
+
+            jobs_archived += 1;
+            bytes_archived += serde_json::to_string(&job.payload)
+                .map(|s| s.len() as u64)
+                .unwrap_or(0);
+        }
+
+        Ok(crate::archive::ArchivalStats {
+            jobs_archived,
+            jobs_purged: 0,
+            bytes_archived,
+            bytes_purged: 0,
+            compression_ratio: 0.8, // Mock compression ratio
+            last_run_at: now,
+            operation_duration: std::time::Duration::from_millis(50),
+        })
     }
 }
 

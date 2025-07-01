@@ -1,15 +1,17 @@
 [package]
 name = "hammerwork-web"
-version = "1.2.0"
-edition = "2024"
-authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
 description = "Web-based admin dashboard for Hammerwork job queues with real-time monitoring and management"
 readme = "README.md"
-homepage = "https://github.com/CodingAnarchy/hammerwork"
-repository = "https://github.com/CodingAnarchy/hammerwork"
-license = "MIT"
 keywords = ["job-queue", "dashboard", "web", "monitoring", "admin"]
 categories = ["web-programming", "development-tools", "database"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "hammerwork-web"
@@ -20,37 +22,37 @@ path = "src/main.rs"
 hammerwork = { workspace = true, features = ["postgres", "mysql", "metrics"] }
 
 # Web framework and HTTP
-warp = "0.3"
-tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = "0.21"
-futures-util = "0.3"
+warp = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # CLI and configuration
-clap = { version = "4.0", features = ["derive"] }
-toml = "0.8"
+clap = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid"] }
+sqlx = { workspace = true, features = ["postgres", "mysql"] }
 
 # Utility
-anyhow = "1.0"
-uuid = { version = "1.0", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
 
 # Logging and tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Authentication (for future use)
-bcrypt = { version = "0.15", optional = true }
-base64 = "0.22"
+bcrypt = { workspace = true, optional = true }
+base64 = { workspace = true }
 
 # HTTP client for health checks
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { workspace = true }
 
 [features]
 default = ["postgres"]
@@ -59,5 +61,5 @@ mysql = ["hammerwork/mysql", "sqlx/mysql"]
 auth = ["bcrypt"]
 
 [dev-dependencies]
-tempfile = "3.8"
-tokio-test = "0.4"
+tempfile = { workspace = true }
+tokio-test = { workspace = true }

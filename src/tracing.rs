@@ -29,20 +29,16 @@
 //!
 //! ### OpenTelemetry Integration
 //!
-//! ```rust,no_run
-//! # #[cfg(feature = "tracing")]
-//! use hammerwork::tracing::{TracingConfig, init_tracing};
+//! ```rust
+//! use hammerwork::tracing::{TraceId, CorrelationId};
 //!
-//! # #[cfg(feature = "tracing")]
-//! # #[tokio::main]
-//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = TracingConfig::new()
-//!     .with_service_name("my-job-processor")
-//!     .with_otlp_endpoint("http://localhost:4317");
-//!     
-//! init_tracing(config).await?;
-//! # Ok(())
-//! # }
+//! // Create tracing identifiers
+//! let trace_id = TraceId::new();
+//! let correlation_id = CorrelationId::new();
+//!
+//! // These can be used to track jobs across services
+//! println!("Trace ID: {}", trace_id);
+//! println!("Correlation ID: {}", correlation_id);
 //! ```
 
 use std::fmt;

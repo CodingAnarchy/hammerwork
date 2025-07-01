@@ -295,6 +295,182 @@ pub trait DatabaseQueue: Send + Sync {
 
     /// Cancel a workflow and all its pending jobs.
     async fn cancel_workflow(&self, workflow_id: crate::workflow::WorkflowId) -> Result<()>;
+
+    // Job archival operations
+    /// Archive jobs based on the given archival policy.
+    ///
+    /// This method moves jobs from the main jobs table to the archive table
+    /// based on the specified archival policy. Jobs that meet the archival
+    /// criteria will be compressed (if enabled) and moved to long-term storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - Optional queue name to limit archival to specific queue
+    /// * `policy` - Archival policy defining which jobs to archive
+    /// * `config` - Configuration for archival process (compression, etc.)
+    /// * `reason` - Reason for archival (automatic, manual, etc.)
+    /// * `archived_by` - Optional identifier of who initiated the archival
+    ///
+    /// # Returns
+    ///
+    /// Statistics about the archival operation including number of jobs archived
+    /// and compression ratios achieved.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{queue::DatabaseQueue, archive::{ArchivalPolicy, ArchivalConfig, ArchivalReason}};
+    /// use chrono::Duration;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// let policy = ArchivalPolicy::new()
+    ///     .archive_completed_after(Duration::days(7));
+    /// let config = ArchivalConfig::new();
+    ///
+    /// let stats = queue.archive_jobs(
+    ///     Some("my-queue"),
+    ///     &policy,
+    ///     &config,
+    ///     ArchivalReason::Automatic,
+    ///     Some("system")
+    /// ).await?;
+    ///
+    /// println!("Archived {} jobs", stats.jobs_archived);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn archive_jobs(
+        &self,
+        queue_name: Option<&str>,
+        policy: &crate::archive::ArchivalPolicy,
+        config: &crate::archive::ArchivalConfig,
+        reason: crate::archive::ArchivalReason,
+        archived_by: Option<&str>,
+    ) -> Result<crate::archive::ArchivalStats>;
+
+    /// Restore an archived job back to the active queue.
+    ///
+    /// This method moves a job from the archive table back to the main jobs table,
+    /// decompressing the payload if necessary and resetting the job to pending status.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_id` - Unique identifier of the job to restore
+    ///
+    /// # Returns
+    ///
+    /// The restored job with its original payload and metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue, job_id: hammerwork::JobId) -> hammerwork::Result<()> {
+    /// let restored_job = queue.restore_archived_job(job_id).await?;
+    /// println!("Restored job: {:?}", restored_job.id);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn restore_archived_job(&self, job_id: JobId) -> Result<Job>;
+
+    /// List archived jobs with optional filtering.
+    ///
+    /// This method retrieves information about archived jobs without restoring them.
+    /// It supports filtering by queue name and pagination for large result sets.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - Optional queue name to filter results
+    /// * `limit` - Maximum number of results to return
+    /// * `offset` - Number of results to skip (for pagination)
+    ///
+    /// # Returns
+    ///
+    /// List of archived job information including archival metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// let archived_jobs = queue.list_archived_jobs(
+    ///     Some("my-queue"),
+    ///     Some(100),
+    ///     Some(0)
+    /// ).await?;
+    ///
+    /// for job in archived_jobs {
+    ///     println!("Archived job: {} at {}", job.id, job.archived_at);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn list_archived_jobs(
+        &self,
+        queue_name: Option<&str>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<crate::archive::ArchivedJob>>;
+
+    /// Permanently delete archived jobs older than the specified date.
+    ///
+    /// This method removes archived jobs from the database completely.
+    /// This operation is irreversible and should be used carefully.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Delete archived jobs older than this date
+    ///
+    /// # Returns
+    ///
+    /// Number of archived jobs that were permanently deleted.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    /// use chrono::{Utc, Duration};
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// let one_year_ago = Utc::now() - Duration::days(365);
+    /// let deleted_count = queue.purge_archived_jobs(one_year_ago).await?;
+    /// println!("Permanently deleted {} archived jobs", deleted_count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn purge_archived_jobs(&self, older_than: DateTime<Utc>) -> Result<u64>;
+
+    /// Get statistics about archived jobs.
+    ///
+    /// This method returns comprehensive statistics about the archival system
+    /// including counts, storage usage, and performance metrics.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - Optional queue name to filter statistics
+    ///
+    /// # Returns
+    ///
+    /// Archival statistics including job counts and storage metrics.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// let stats = queue.get_archival_stats(Some("my-queue")).await?;
+    /// println!("Total archived jobs: {}", stats.jobs_archived);
+    /// println!("Compression ratio: {:.2}", stats.compression_ratio);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn get_archival_stats(
+        &self,
+        queue_name: Option<&str>,
+    ) -> Result<crate::archive::ArchivalStats>;
 }
 
 /// A generic job queue implementation that works with multiple database backends.

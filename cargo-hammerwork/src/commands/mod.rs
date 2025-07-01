@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod backup;
 pub mod batch;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod queue;
 pub mod worker;
 pub mod workflow;
 
+pub use archive::*;
 pub use backup::*;
 pub use batch::*;
 pub use config::*;

@@ -98,6 +98,7 @@
 //! - `metrics` - Enable Prometheus metrics collection (default)
 //! - `alerting` - Enable webhook/Slack/email alerting (default)
 
+pub mod archive;
 pub mod batch;
 pub mod cron;
 pub mod error;
@@ -118,6 +119,9 @@ pub mod metrics;
 #[cfg(feature = "alerting")]
 pub mod alerting;
 
+pub use archive::{
+    ArchivalConfig, ArchivalPolicy, ArchivalReason, ArchivalStats, ArchivedJob, JobArchiver,
+};
 pub use batch::{BatchId, BatchResult, BatchStatus, JobBatch, PartialFailureMode};
 pub use cron::{CronError, CronSchedule};
 pub use error::HammerworkError;

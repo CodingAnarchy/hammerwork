@@ -90,6 +90,12 @@ enum Commands {
         #[command(subcommand)]
         command: WorkflowCommand,
     },
+
+    #[command(about = "Job archival and retention management")]
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommand,
+    },
 }
 
 #[tokio::main]
@@ -190,6 +196,9 @@ async fn execute_command(command: &Commands, config: &mut Config) -> Result<()> 
         }
         Commands::Workflow { command } => {
             command.execute(config.clone()).await?;
+        }
+        Commands::Archive { command } => {
+            command.execute(config).await?;
         }
     }
 

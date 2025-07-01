@@ -20,7 +20,7 @@
 //! use chrono::Utc;
 //!
 //! let build_info = BuildInfo {
-//!     version: "1.2.0".to_string(),
+//!     version: "1.3.0".to_string(),
 //!     git_commit: Some("a1b2c3d".to_string()),
 //!     build_date: Some("2024-01-15".to_string()),
 //!     rust_version: "1.70.0".to_string(),
@@ -45,7 +45,7 @@
 //! };
 //!
 //! let system_info = SystemInfo {
-//!     version: "1.2.0".to_string(),
+//!     version: "1.3.0".to_string(),
 //!     build_info,
 //!     runtime_info,
 //!     database_info,
@@ -54,7 +54,7 @@
 //!     started_at: Utc::now(),
 //! };
 //!
-//! assert_eq!(system_info.version, "1.2.0");
+//! assert_eq!(system_info.version, "1.3.0");
 //! assert!(system_info.features.contains(&"postgres".to_string()));
 //! assert_eq!(system_info.runtime_info.process_id, 12345);
 //! ```

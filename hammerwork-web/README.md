@@ -6,7 +6,9 @@ A modern, real-time web-based admin dashboard for monitoring and managing [Hamme
 
 - **Real-time Monitoring**: Live updates via WebSockets for queue statistics, job status, and system health
 - **Job Management**: View, retry, cancel, and inspect jobs with detailed payload and error information
+- **Job Archive Management**: Archive, restore, and purge jobs with configurable retention policies
 - **Queue Administration**: Monitor queue performance, clear queues, and manage queue priorities
+- **Archive Statistics**: Track storage savings, compression ratios, and archival operations
 - **Multi-Database Support**: Works with both PostgreSQL and MySQL backends
 - **Security**: Built-in authentication with bcrypt password hashing and rate limiting
 - **Modern UI**: Responsive dashboard with charts, tables, and real-time indicators
@@ -19,6 +21,7 @@ The dashboard provides:
 - **Overview Cards**: Total jobs, pending/running counts, error rates, and throughput
 - **Queue Table**: Real-time queue statistics with actions (clear, pause, resume)
 - **Jobs Table**: Filterable job listing with status, priority, and actions
+- **Archive Section**: Archived jobs management with statistics and restoration capabilities
 - **Charts**: Throughput over time and job status distribution
 - **Real-time Updates**: WebSocket connections for live data updates
 
@@ -97,9 +100,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hammerwork-web = { version = "1.2", features = ["postgres"] }
+hammerwork-web = { version = "1.3", features = ["postgres"] }
 # or for MySQL:
-# hammerwork-web = { version = "1.2", features = ["mysql"] }
+# hammerwork-web = { version = "1.3", features = ["mysql"] }
 ```
 
 ### Programmatic Usage
@@ -174,6 +177,13 @@ curl -u admin:password http://localhost:8080/api/stats/overview
 - `POST /api/jobs` - Create new job
 - `POST /api/jobs/{id}/retry` - Retry failed job
 - `DELETE /api/jobs/{id}` - Delete job
+
+#### Archive Management
+- `GET /api/archive/jobs?queue=email&limit=50` - List archived jobs with filters
+- `POST /api/archive/jobs` - Archive jobs based on configurable policy
+- `POST /api/archive/jobs/{id}/restore` - Restore an archived job to pending status
+- `DELETE /api/archive/purge` - Permanently purge old archived jobs
+- `GET /api/archive/stats?queue=email` - Get archive statistics and metrics
 
 ### WebSocket API
 
@@ -287,6 +297,36 @@ assets/
 2. **WebSocket Message**: Update `ServerMessage` enum in `src/websocket.rs`
 3. **Frontend Component**: Add to `assets/dashboard.js` and update UI in `index.html`
 4. **Tests**: Add unit tests in module and integration tests in `tests/`
+
+### Archive API Examples
+
+```bash
+# List archived jobs
+curl -u admin:password "http://localhost:8080/api/archive/jobs?queue=email&limit=10"
+
+# Archive completed jobs older than 7 days
+curl -u admin:password -X POST http://localhost:8080/api/archive/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue_name": "email",
+    "reason": "automatic",
+    "archived_by": "scheduler",
+    "dry_run": false,
+    "policy": {
+      "archive_completed_after": 604800000000000,
+      "compress_payloads": true,
+      "enabled": true
+    }
+  }'
+
+# Restore an archived job
+curl -u admin:password -X POST http://localhost:8080/api/archive/jobs/12345/restore \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "data recovery", "restored_by": "admin"}'
+
+# Get archive statistics
+curl -u admin:password http://localhost:8080/api/archive/stats?queue=email
+```
 
 ## Security
 
@@ -456,6 +496,8 @@ We welcome contributions! Please see the main [CONTRIBUTING.md](../CONTRIBUTING.
 - Additional database backends (SQLite, CockroachDB)
 - Enhanced security features (OAuth, JWT)
 - More visualization options (metrics dashboards)
+- Archive management enhancements (scheduled policies, bulk operations)
+- Real-time WebSocket events for archive operations
 - Mobile-responsive improvements
 - Internationalization (i18n)
 - Plugin system for custom integrations

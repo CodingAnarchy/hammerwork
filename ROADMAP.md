@@ -5,23 +5,6 @@ This roadmap outlines planned features for Hammerwork, prioritized by impact lev
 ## Phase 2: Medium Impact, Variable Complexity
 *Valuable features for specific use cases or operational efficiency*
 
-### 🗄️ Job Archiving & Retention
-**Impact: Medium** | **Complexity: Medium** | **Priority: Medium**
-
-Important for compliance and database performance in high-volume systems.
-
-```rust
-// Automatic job archiving
-let archival_policy = ArchivalPolicy::new()
-    .archive_completed_after(Duration::from_days(7))
-    .archive_failed_after(Duration::from_days(30))
-    .purge_archived_after(Duration::from_days(365))
-    .compress_archived_payloads(true);
-
-queue.set_archival_policy(archival_policy).await?;
-```
-
-
 ### ⚡ Dynamic Job Spawning
 **Impact: Medium** | **Complexity: Medium-High** | **Priority: Medium**
 
@@ -56,6 +39,37 @@ let event_stream = EventStream::new()
     .to_kinesis("job-stream")
     .with_filtering(|event| event.priority >= JobPriority::High);
 ```
+
+### 📡 Real-time Archive WebSocket Events
+**Impact: Low-Medium** | **Complexity: Low** | **Priority: Low**
+
+Enhance the web dashboard with real-time updates for archive operations.
+
+```rust
+// WebSocket events for archive operations
+#[derive(Serialize)]
+enum ArchiveEvent {
+    JobArchived { job_id: JobId, queue: String, reason: ArchivalReason },
+    JobRestored { job_id: JobId, queue: String, restored_by: Option<String> },
+    BulkArchiveStarted { operation_id: String, estimated_jobs: u64 },
+    BulkArchiveProgress { operation_id: String, jobs_processed: u64, total: u64 },
+    BulkArchiveCompleted { operation_id: String, stats: ArchivalStats },
+    JobsPurged { count: u64, older_than: DateTime<Utc> },
+}
+
+// Real-time dashboard updates
+websocket.send_event(ArchiveEvent::JobArchived {
+    job_id: job.id,
+    queue: job.queue_name.clone(),
+    reason: ArchivalReason::Automatic,
+});
+```
+
+**Benefits:**
+- Live archive operation progress tracking
+- Instant UI updates when jobs are archived/restored
+- Real-time compression ratio and storage statistics
+- Enhanced user experience during bulk operations
 
 ## Phase 3: Specialized Features
 *Features for specific enterprise or compliance requirements*
@@ -147,22 +161,16 @@ let geo_config = GeoReplicationConfig::new()
 
 Features are ordered within each phase by priority and should generally be implemented in the following sequence:
 
-**Phase 1 (Advanced Features) - CURRENT PRIORITIES**
-1. ✅ Job Dependencies & Workflows (COMPLETED v1.1.0)
-2. 🚧 Admin Dashboard & CLI Tools (CLI completed v1.1.0, Web Dashboard remaining)
+**Phase 1 (Operational Features)**
+1. Dynamic Job Spawning
+2. Webhook & Event Streaming
 
-**Phase 2 (Operational Features)**
-1. Job Archiving & Retention
-2. Job Testing & Simulation
-3. Dynamic Job Spawning
-4. Webhook & Event Streaming
-
-**Phase 3 (Enterprise Features)**
+**Phase 2 (Enterprise Features)**
 1. Job Encryption & PII Protection
 2. Access Control & Auditing
 3. Message Queue Integration
 
-**Phase 4 (Scaling Features)**
+**Phase 3 (Scaling Features)**
 1. Zero-downtime Deployments
 2. Queue Partitioning & Sharding
 3. Multi-region Support

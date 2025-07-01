@@ -187,6 +187,87 @@
                     </div>
                 </div>
             </section>
+
+            <!-- Archive Section -->
+            <section class="archive-section">
+                <div class="section-header">
+                    <h2>Job Archive</h2>
+                    <div class="section-actions">
+                        <select id="archiveReasonFilter" class="filter-select">
+                            <option value="">All Reasons</option>
+                            <option value="automatic">Automatic</option>
+                            <option value="manual">Manual</option>
+                            <option value="compliance">Compliance</option>
+                            <option value="maintenance">Maintenance</option>
+                        </select>
+                        <select id="archiveQueueFilter" class="filter-select">
+                            <option value="">All Queues</option>
+                        </select>
+                        <button id="archiveJobsBtn" class="btn btn-primary">Archive Jobs</button>
+                        <button id="archiveStatsBtn" class="btn btn-secondary">View Stats</button>
+                    </div>
+                </div>
+
+                <!-- Archive Statistics Cards -->
+                <div class="archive-stats-grid">
+                    <div class="card metric-card">
+                        <div class="card-header">
+                            <h3>Total Archived</h3>
+                            <span class="card-icon">🗄️</span>
+                        </div>
+                        <div class="card-value" id="totalArchived">-</div>
+                        <div class="card-subtitle">All time</div>
+                    </div>
+
+                    <div class="card metric-card">
+                        <div class="card-header">
+                            <h3>Storage Saved</h3>
+                            <span class="card-icon">💾</span>
+                        </div>
+                        <div class="card-value" id="storageSaved">-</div>
+                        <div class="card-subtitle">Compression ratio</div>
+                    </div>
+
+                    <div class="card metric-card">
+                        <div class="card-header">
+                            <h3>Last Archive</h3>
+                            <span class="card-icon">📅</span>
+                        </div>
+                        <div class="card-value" id="lastArchive">-</div>
+                        <div class="card-subtitle">Most recent operation</div>
+                    </div>
+                </div>
+
+                <!-- Archived Jobs Table -->
+                <div class="card">
+                    <div class="table-container">
+                        <table class="data-table" id="archivedJobsTable">
+                            <thead>
+                                <tr>
+                                    <th>Job ID</th>
+                                    <th>Queue</th>
+                                    <th>Original Status</th>
+                                    <th>Archived At</th>
+                                    <th>Reason</th>
+                                    <th>Size</th>
+                                    <th>Compressed</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr class="loading-row">
+                                    <td colspan="8">Loading archived jobs...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="pagination-controls">
+                        <button id="archivePrevPage" class="btn btn-secondary" disabled>Previous</button>
+                        <span id="archivePageInfo">Page 1 of 1</span>
+                        <button id="archiveNextPage" class="btn btn-secondary" disabled>Next</button>
+                    </div>
+                </div>
+            </section>
         </main>
     </div>
 
@@ -242,6 +323,145 @@
             </div>
             <div class="modal-footer">
                 <button id="submitJobBtn" class="btn btn-primary">Add Job</button>
+                <button class="btn btn-secondary modal-close">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Archive Modals -->
+    <div id="archiveModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Archive Jobs</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="archiveForm">
+                    <div class="form-group">
+                        <label for="archiveQueue">Queue (optional)</label>
+                        <select id="archiveQueue">
+                            <option value="">All Queues</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="archiveReason">Reason</label>
+                        <select id="archiveReason" required>
+                            <option value="manual">Manual</option>
+                            <option value="automatic">Automatic</option>
+                            <option value="compliance">Compliance</option>
+                            <option value="maintenance">Maintenance</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="archivedBy">Archived By</label>
+                        <input type="text" id="archivedBy" placeholder="admin">
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="archiveDryRun" checked> Dry Run (preview only)
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <h4>Archive Policy</h4>
+                        <div class="policy-settings">
+                            <label>
+                                <input type="number" id="completedAfterDays" min="1" value="7">
+                                Archive completed jobs after (days)
+                            </label>
+                            <label>
+                                <input type="number" id="failedAfterDays" min="1" value="30">
+                                Archive failed jobs after (days)
+                            </label>
+                            <label>
+                                <input type="number" id="deadAfterDays" min="1" value="14">
+                                Archive dead jobs after (days)
+                            </label>
+                            <label>
+                                <input type="checkbox" id="compressPayloads" checked>
+                                Compress payloads
+                            </label>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button id="submitArchiveBtn" class="btn btn-primary">Archive Jobs</button>
+                <button class="btn btn-secondary modal-close">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="archiveStatsModal" class="modal">
+        <div class="modal-content large">
+            <div class="modal-header">
+                <h3>Archive Statistics</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="archiveStatsContent">
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <h4>Jobs Archived</h4>
+                            <span id="statsJobsArchived">-</span>
+                        </div>
+                        <div class="stat-item">
+                            <h4>Jobs Purged</h4>
+                            <span id="statsJobsPurged">-</span>
+                        </div>
+                        <div class="stat-item">
+                            <h4>Bytes Archived</h4>
+                            <span id="statsBytesArchived">-</span>
+                        </div>
+                        <div class="stat-item">
+                            <h4>Compression Ratio</h4>
+                            <span id="statsCompressionRatio">-</span>
+                        </div>
+                        <div class="stat-item">
+                            <h4>Last Operation</h4>
+                            <span id="statsLastRun">-</span>
+                        </div>
+                        <div class="stat-item">
+                            <h4>Operation Duration</h4>
+                            <span id="statsOperationDuration">-</span>
+                        </div>
+                    </div>
+                    <div class="recent-operations">
+                        <h4>Recent Operations</h4>
+                        <div id="recentOperationsList">
+                            <p>Loading recent operations...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="purgeOldBtn" class="btn btn-warning">Purge Old Archives</button>
+                <button class="btn btn-secondary modal-close">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="restoreJobModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Restore Archived Job</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Are you sure you want to restore this job back to the pending queue?</p>
+                <div id="restoreJobDetails"></div>
+                <form id="restoreForm">
+                    <div class="form-group">
+                        <label for="restoreReason">Reason (optional)</label>
+                        <input type="text" id="restoreReason" placeholder="Data recovery, reprocessing needed, etc.">
+                    </div>
+                    <div class="form-group">
+                        <label for="restoredBy">Restored By</label>
+                        <input type="text" id="restoredBy" placeholder="admin">
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button id="confirmRestoreBtn" class="btn btn-primary">Restore Job</button>
                 <button class="btn btn-secondary modal-close">Cancel</button>
             </div>
         </div>

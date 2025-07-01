@@ -8,6 +8,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 - **🧪 TestQueue Framework**: Complete in-memory testing implementation with MockClock for deterministic testing of time-dependent features, workflows, and job processing
 - **🔍 Job Tracing & Correlation**: Comprehensive distributed tracing with OpenTelemetry integration, trace IDs, correlation IDs, and lifecycle event hooks
 - **🔗 Job Dependencies & Workflows**: Create complex data processing pipelines with job dependencies, sequential chains, and parallel processing with synchronization barriers
+- **🗄️ Job Archiving & Retention**: Policy-driven archival with configurable retention periods, payload compression, and automated cleanup for compliance and performance
 - **Multi-database support**: PostgreSQL and MySQL backends with optimized dependency queries
 - **Advanced retry strategies**: Exponential backoff, linear, Fibonacci, and custom retry patterns with jitter
 - **Job prioritization**: Five priority levels with weighted and strict scheduling algorithms
@@ -29,15 +30,15 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "1.2", features = ["postgres"] }
+hammerwork = { version = "1.3", features = ["postgres"] }
 # or
-hammerwork = { version = "1.2", features = ["mysql"] }
+hammerwork = { version = "1.3", features = ["mysql"] }
 
 # With distributed tracing
-hammerwork = { version = "1.2", features = ["postgres", "tracing"] }
+hammerwork = { version = "1.3", features = ["postgres", "tracing"] }
 
 # Minimal installation
-hammerwork = { version = "1.2", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.3", features = ["postgres"], default-features = false }
 ```
 
 **Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `tracing` (optional), `test` (for TestQueue)
@@ -50,7 +51,7 @@ cargo install hammerwork-web --features postgres
 
 # Or add to your project
 [dependencies]
-hammerwork-web = { version = "1.2", features = ["postgres"] }
+hammerwork-web = { version = "1.3", features = ["postgres"] }
 ```
 
 Start the dashboard:
@@ -71,6 +72,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 - **[Web Dashboard](hammerwork-web/README.md)** - Real-time web interface for queue monitoring and job management
 - **[Job Tracing & Correlation](docs/tracing.md)** - Distributed tracing, correlation IDs, and OpenTelemetry integration
 - **[Job Dependencies & Workflows](docs/workflows.md)** - Complex pipelines, job dependencies, and orchestration
+- **[Job Archiving & Retention](docs/archiving.md)** - Policy-driven archival, compression, and compliance management
 - **[Job Types & Configuration](docs/job-types.md)** - Job creation, priorities, timeouts, cron jobs
 - **[Worker Configuration](docs/worker-configuration.md)** - Worker setup, rate limiting, statistics
 - **[Cron Scheduling](docs/cron-scheduling.md)** - Recurring jobs with timezone support  
@@ -275,6 +277,65 @@ async fn test_delayed_job_processing() {
 
 The `TestQueue` provides complete compatibility with the `DatabaseQueue` trait while offering deterministic time control through `MockClock`, making it perfect for testing complex workflows, retry logic, and time-dependent job processing.
 
+## Job Archiving Example
+
+Configure automatic job archival for compliance and database performance:
+
+```rust
+use hammerwork::{
+    archive::{ArchivalPolicy, ArchivalConfig, ArchivalReason},
+    queue::DatabaseQueue
+};
+use chrono::Duration;
+
+// Configure archival policy
+let policy = ArchivalPolicy::new()
+    .archive_completed_after(Duration::days(7))      // Archive completed jobs after 7 days
+    .archive_failed_after(Duration::days(30))        // Keep failed jobs for 30 days
+    .archive_dead_after(Duration::days(14))         // Archive dead jobs after 14 days
+    .archive_timed_out_after(Duration::days(21))    // Archive timed out jobs after 21 days
+    .purge_archived_after(Duration::days(365))      // Purge archived jobs after 1 year
+    .compress_archived_payloads(true)               // Enable gzip compression
+    .with_batch_size(1000)                          // Process up to 1000 jobs per batch
+    .enabled(true);
+
+let config = ArchivalConfig::new()
+    .with_compression_level(6)                      // Balanced compression
+    .with_compression_verification(true);           // Verify compression integrity
+
+// Run archival (typically scheduled as a cron job)
+let stats = queue.archive_jobs(
+    Some("payment_queue"),                          // Optional: archive specific queue
+    &policy,
+    &config,
+    ArchivalReason::Automatic,                      // Automatic, Manual, Compliance, Maintenance
+    Some("scheduler")                               // Who initiated the archival
+).await?;
+
+println!("Archived {} jobs, saved {} bytes (compression ratio: {:.2})",
+    stats.jobs_archived,
+    stats.bytes_archived,
+    stats.compression_ratio
+);
+
+// Restore an archived job if needed
+let job = queue.restore_archived_job(job_id).await?;
+
+// List archived jobs with filtering
+let archived_jobs = queue.list_archived_jobs(
+    Some("payment_queue"),     // Optional queue filter
+    Some(100),                // Limit
+    Some(0)                   // Offset for pagination
+).await?;
+
+// Purge old archived jobs for GDPR compliance
+let purged = queue.purge_archived_jobs(
+    Utc::now() - Duration::days(730)  // Delete jobs archived over 2 years ago
+).await?;
+```
+
+Archival moves completed/failed jobs to a separate table with compressed payloads, reducing the main table size while maintaining compliance requirements.
+
 ## Web Dashboard
 
 Start the real-time web dashboard for monitoring and managing your job queues:
@@ -344,11 +405,12 @@ queue.enqueue(job).await?;
 
 Hammerwork uses optimized tables with comprehensive indexing:
 - **`hammerwork_jobs`** - Main job table with priorities, timeouts, cron scheduling, retry strategies, result storage, and distributed tracing fields
+- **`hammerwork_jobs_archive`** - Archive table for completed/failed jobs with compressed payloads (v1.3.0+)
 - **`hammerwork_batches`** - Batch metadata and tracking (v0.7.0+)
 - **`hammerwork_job_results`** - Job result storage with TTL and expiration (v0.8.0+)
 - **`hammerwork_migrations`** - Migration tracking for schema evolution
 
-The schema supports all features including job prioritization, advanced retry strategies, timeouts, cron scheduling, batch processing, result storage with TTL, distributed tracing with trace/correlation IDs, worker autoscaling, and comprehensive lifecycle tracking. See [Database Migrations](docs/migrations.md) for details.
+The schema supports all features including job prioritization, advanced retry strategies, timeouts, cron scheduling, batch processing, result storage with TTL, distributed tracing with trace/correlation IDs, worker autoscaling, job archival with compression, and comprehensive lifecycle tracking. See [Database Migrations](docs/migrations.md) for details.
 
 ## Development
 

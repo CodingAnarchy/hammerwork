@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2025-07-01
+
+### Added
+- **🗄️ Job Archiving & Retention System**
+  - Policy-driven job archival with configurable retention periods per job status
+  - Payload compression using gzip for efficient long-term storage
+  - Archive table (`hammerwork_jobs_archive`) with compressed payloads
+  - Restore archived jobs back to pending status when needed
+  - Purge old archived jobs for compliance requirements (GDPR, data retention)
+  - Comprehensive archival statistics and monitoring
+  - CLI commands for archive management in `cargo-hammerwork`
+
+### Enhanced
+- **⚡ Archive Management Features**
+  - Automatic archival based on job age and status (Completed, Failed, Dead, TimedOut)
+  - Configurable compression levels (0-9) with integrity verification
+  - Batch processing for efficient large-scale archival operations
+  - Archive metadata tracking (reason, timestamp, who initiated)
+  - List and search archived jobs with pagination support
+  - Database schema migration (010) for archive table setup
+
+### Technical Implementation
+- New `archive` module with `ArchivalPolicy`, `ArchivalConfig`, and `JobArchiver` types
+- Extended `DatabaseQueue` trait with archival methods for all database backends
+- PostgreSQL and MySQL implementations with optimized archive queries
+- Comprehensive doctests and unit tests for all archival functionality
+- Archive CLI commands: `archive`, `restore`, `list-archived`, `purge-archived`
+
 ## [1.2.2] - 2025-07-01
 
 ### Added

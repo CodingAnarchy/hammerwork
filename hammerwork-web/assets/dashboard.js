@@ -109,6 +109,45 @@ class HammerworkDashboard {
             this.submitNewJob();
         });
 
+        // Archive event listeners
+        document.getElementById('archiveJobsBtn').addEventListener('click', () => {
+            this.showArchiveModal();
+        });
+
+        document.getElementById('archiveStatsBtn').addEventListener('click', () => {
+            this.showArchiveStatsModal();
+        });
+
+        document.getElementById('submitArchiveBtn').addEventListener('click', () => {
+            this.submitArchiveRequest();
+        });
+
+        document.getElementById('confirmRestoreBtn').addEventListener('click', () => {
+            this.confirmRestoreJob();
+        });
+
+        document.getElementById('purgeOldBtn').addEventListener('click', () => {
+            this.showPurgeConfirmation();
+        });
+
+        // Archive filters
+        document.getElementById('archiveReasonFilter').addEventListener('change', () => {
+            this.loadArchivedJobs();
+        });
+
+        document.getElementById('archiveQueueFilter').addEventListener('change', () => {
+            this.loadArchivedJobs();
+        });
+
+        // Archive pagination
+        document.getElementById('archivePrevPage').addEventListener('click', () => {
+            this.previousArchivePage();
+        });
+
+        document.getElementById('archiveNextPage').addEventListener('click', () => {
+            this.nextArchivePage();
+        });
+
         // Job action buttons (will be added dynamically)
         document.addEventListener('click', (e) => {
             if (e.target.classList.contains('retry-job-btn')) {
@@ -117,6 +156,10 @@ class HammerworkDashboard {
                 this.deleteJob(e.target.dataset.jobId);
             } else if (e.target.classList.contains('view-job-btn')) {
                 this.showJobDetails(e.target.dataset.jobId);
+            } else if (e.target.classList.contains('restore-btn')) {
+                this.showRestoreJobModal(e.target.dataset.jobId);
+            } else if (e.target.classList.contains('view-details-btn')) {
+                this.showArchivedJobDetails(e.target.dataset.jobId);
             }
         });
 
@@ -203,7 +246,9 @@ class HammerworkDashboard {
                 this.loadSystemOverview(),
                 this.loadQueues(),
                 this.loadJobs(),
-                this.updateThroughputChart('24h')
+                this.updateThroughputChart('24h'),
+                this.loadArchivedJobs(),
+                this.loadArchiveStats()
             ]);
             
             this.lastUpdate = new Date();
@@ -799,6 +844,307 @@ class HammerworkDashboard {
                 notification.parentNode.removeChild(notification);
             }
         }, 5000);
+    }
+
+    // Archive functionality
+    currentArchivePage = 1;
+    archivePageSize = 50;
+    selectedJobForRestore = null;
+
+    async loadArchivedJobs(page = 1) {
+        try {
+            const reasonFilter = document.getElementById('archiveReasonFilter').value;
+            const queueFilter = document.getElementById('archiveQueueFilter').value;
+            
+            const params = new URLSearchParams({
+                page: page.toString(),
+                limit: this.archivePageSize.toString()
+            });
+
+            if (reasonFilter) params.append('reason', reasonFilter);
+            if (queueFilter) params.append('queue', queueFilter);
+
+            const response = await this.apiCall(`/api/archive/jobs?${params}`);
+            
+            if (response.success) {
+                this.displayArchivedJobs(response.data.items);
+                this.updateArchivePagination(response.data.pagination);
+                this.currentArchivePage = page;
+            } else {
+                this.showNotification(response.error || 'Failed to load archived jobs', 'error');
+            }
+        } catch (error) {
+            console.error('Error loading archived jobs:', error);
+            this.showNotification('Error loading archived jobs', 'error');
+        }
+    }
+
+    displayArchivedJobs(jobs) {
+        const tbody = document.querySelector('#archivedJobsTable tbody');
+        
+        if (jobs.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No archived jobs found</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = jobs.map(job => `
+            <tr>
+                <td><code>${job.id.slice(0, 8)}...</code></td>
+                <td>${job.queue_name}</td>
+                <td><span class="status-badge status-${job.status.toLowerCase()}">${job.status}</span></td>
+                <td>${this.formatDate(job.archived_at)}</td>
+                <td><span class="reason-badge reason-${job.archival_reason.toLowerCase()}">${job.archival_reason}</span></td>
+                <td>
+                    ${job.original_payload_size ? `<span class="size-badge">${this.formatBytes(job.original_payload_size)}</span>` : '-'}
+                </td>
+                <td>
+                    <span class="compressed-indicator ${job.payload_compressed ? 'compressed-yes' : 'compressed-no'}">
+                        ${job.payload_compressed ? '✓ Yes' : '✗ No'}
+                    </span>
+                </td>
+                <td>
+                    <button class="restore-btn" data-job-id="${job.id}">Restore</button>
+                    <button class="view-details-btn" data-job-id="${job.id}">Details</button>
+                </td>
+            </tr>
+        `).join('');
+    }
+
+    updateArchivePagination(pagination) {
+        document.getElementById('archivePageInfo').textContent = 
+            `Page ${pagination.page} of ${pagination.total_pages}`;
+        
+        document.getElementById('archivePrevPage').disabled = !pagination.has_prev;
+        document.getElementById('archiveNextPage').disabled = !pagination.has_next;
+    }
+
+    previousArchivePage() {
+        if (this.currentArchivePage > 1) {
+            this.loadArchivedJobs(this.currentArchivePage - 1);
+        }
+    }
+
+    nextArchivePage() {
+        this.loadArchivedJobs(this.currentArchivePage + 1);
+    }
+
+    async loadArchiveStats() {
+        try {
+            const response = await this.apiCall('/api/archive/stats');
+            
+            if (response.success) {
+                this.displayArchiveStats(response.data.stats);
+            }
+        } catch (error) {
+            console.error('Error loading archive stats:', error);
+        }
+    }
+
+    displayArchiveStats(stats) {
+        document.getElementById('totalArchived').textContent = 
+            stats.jobs_archived.toLocaleString();
+        
+        document.getElementById('storageSaved').textContent = 
+            stats.compression_ratio ? `${(stats.compression_ratio * 100).toFixed(1)}%` : '-';
+        
+        document.getElementById('lastArchive').textContent = 
+            stats.last_run_at ? this.formatDate(stats.last_run_at) : 'Never';
+    }
+
+    showArchiveModal() {
+        // Populate queue options
+        this.populateQueueSelect('archiveQueue');
+        this.showModal('archiveModal');
+    }
+
+    async showArchiveStatsModal() {
+        this.showModal('archiveStatsModal');
+        
+        try {
+            const response = await this.apiCall('/api/archive/stats');
+            
+            if (response.success) {
+                const stats = response.data.stats;
+                
+                document.getElementById('statsJobsArchived').textContent = 
+                    stats.jobs_archived.toLocaleString();
+                document.getElementById('statsJobsPurged').textContent = 
+                    stats.jobs_purged.toLocaleString();
+                document.getElementById('statsBytesArchived').textContent = 
+                    this.formatBytes(stats.bytes_archived);
+                document.getElementById('statsCompressionRatio').textContent = 
+                    `${(stats.compression_ratio * 100).toFixed(1)}%`;
+                document.getElementById('statsLastRun').textContent = 
+                    this.formatDate(stats.last_run_at);
+                document.getElementById('statsOperationDuration').textContent = 
+                    `${(stats.operation_duration / 1000).toFixed(2)}s`;
+
+                // Show recent operations
+                this.displayRecentOperations(response.data.recent_operations || []);
+            }
+        } catch (error) {
+            console.error('Error loading archive stats:', error);
+        }
+    }
+
+    displayRecentOperations(operations) {
+        const container = document.getElementById('recentOperationsList');
+        
+        if (operations.length === 0) {
+            container.innerHTML = '<p>No recent operations</p>';
+            return;
+        }
+
+        container.innerHTML = operations.map(op => `
+            <div class="operation-item">
+                <div class="operation-info">
+                    <div class="operation-type">${op.operation_type}</div>
+                    <div class="operation-details">
+                        ${op.queue_name ? `Queue: ${op.queue_name} • ` : ''}
+                        ${op.jobs_affected} jobs affected
+                        ${op.reason ? ` • ${op.reason}` : ''}
+                    </div>
+                </div>
+                <div class="operation-time">${this.formatDate(op.executed_at)}</div>
+            </div>
+        `).join('');
+    }
+
+    async submitArchiveRequest() {
+        try {
+            const formData = {
+                queue_name: document.getElementById('archiveQueue').value || null,
+                reason: document.getElementById('archiveReason').value,
+                archived_by: document.getElementById('archivedBy').value || null,
+                dry_run: document.getElementById('archiveDryRun').checked,
+                policy: {
+                    archive_completed_after: parseInt(document.getElementById('completedAfterDays').value) * 86400000000000, // nanoseconds
+                    archive_failed_after: parseInt(document.getElementById('failedAfterDays').value) * 86400000000000,
+                    archive_dead_after: parseInt(document.getElementById('deadAfterDays').value) * 86400000000000,
+                    compress_payloads: document.getElementById('compressPayloads').checked,
+                    enabled: true
+                }
+            };
+
+            const response = await this.apiCall('/api/archive/jobs', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(formData)
+            });
+
+            if (response.success) {
+                const stats = response.data.stats;
+                const message = formData.dry_run 
+                    ? `Dry run complete: ${stats.jobs_archived} jobs would be archived`
+                    : `Successfully archived ${stats.jobs_archived} jobs`;
+                
+                this.showNotification(message, 'success');
+                this.hideModal(document.getElementById('archiveModal'));
+                
+                if (!formData.dry_run) {
+                    this.loadArchivedJobs();
+                    this.loadArchiveStats();
+                }
+            } else {
+                this.showNotification(response.error || 'Failed to archive jobs', 'error');
+            }
+        } catch (error) {
+            console.error('Error submitting archive request:', error);
+            this.showNotification('Error submitting archive request', 'error');
+        }
+    }
+
+    showRestoreJobModal(jobId) {
+        this.selectedJobForRestore = jobId;
+        // TODO: Load job details and show in modal
+        this.showModal('restoreJobModal');
+    }
+
+    async confirmRestoreJob() {
+        if (!this.selectedJobForRestore) return;
+
+        try {
+            const formData = {
+                reason: document.getElementById('restoreReason').value || null,
+                restored_by: document.getElementById('restoredBy').value || null
+            };
+
+            const response = await this.apiCall(`/api/archive/jobs/${this.selectedJobForRestore}/restore`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(formData)
+            });
+
+            if (response.success) {
+                this.showNotification('Job restored successfully', 'success');
+                this.hideModal(document.getElementById('restoreJobModal'));
+                this.loadArchivedJobs();
+                this.loadJobs(); // Refresh main jobs list
+            } else {
+                this.showNotification(response.error || 'Failed to restore job', 'error');
+            }
+        } catch (error) {
+            console.error('Error restoring job:', error);
+            this.showNotification('Error restoring job', 'error');
+        }
+    }
+
+    showArchivedJobDetails(jobId) {
+        // TODO: Implement archived job details modal
+        console.log('Show archived job details for:', jobId);
+    }
+
+    showPurgeConfirmation() {
+        const confirmMsg = 'Are you sure you want to purge old archived jobs? This action cannot be undone.';
+        if (confirm(confirmMsg)) {
+            this.purgeOldArchivedJobs();
+        }
+    }
+
+    async purgeOldArchivedJobs() {
+        try {
+            const oneYearAgo = new Date();
+            oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+
+            const response = await this.apiCall('/api/archive/purge', {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    older_than: oneYearAgo.toISOString(),
+                    dry_run: false,
+                    purged_by: 'admin'
+                })
+            });
+
+            if (response.success) {
+                this.showNotification(`Purged ${response.data.jobs_purged} old archived jobs`, 'success');
+                this.hideModal(document.getElementById('archiveStatsModal'));
+                this.loadArchivedJobs();
+                this.loadArchiveStats();
+            } else {
+                this.showNotification(response.error || 'Failed to purge archived jobs', 'error');
+            }
+        } catch (error) {
+            console.error('Error purging archived jobs:', error);
+            this.showNotification('Error purging archived jobs', 'error');
+        }
+    }
+
+    populateQueueSelect(selectId) {
+        // Get unique queue names from current data and populate select
+        const select = document.getElementById(selectId);
+        const currentOptions = Array.from(select.options).map(opt => opt.value);
+        
+        // This would ideally be populated from actual queue data
+        // For now, we'll leave it as is and let it be populated when queues are loaded
+    }
+
+    formatBytes(bytes) {
+        if (!bytes) return '0 B';
+        const k = 1024;
+        const sizes = ['B', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
 
     destroy() {
