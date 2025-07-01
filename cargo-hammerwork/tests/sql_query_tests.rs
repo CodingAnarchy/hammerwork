@@ -443,9 +443,8 @@ mod spawn_query_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_mysql_spawn_list_queries() -> Result<()> {
-        let database_url = std::env::var("MYSQL_DATABASE_URL").unwrap_or_else(|_| {
-            "mysql://root:hammerwork@localhost:3307/hammerwork".to_string()
-        });
+        let database_url = std::env::var("MYSQL_DATABASE_URL")
+            .unwrap_or_else(|_| "mysql://root:hammerwork@localhost:3307/hammerwork".to_string());
 
         let pool = MySqlPool::connect(&database_url).await?;
 
@@ -493,9 +492,8 @@ mod spawn_query_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_mysql_spawn_stats_queries() -> Result<()> {
-        let database_url = std::env::var("MYSQL_DATABASE_URL").unwrap_or_else(|_| {
-            "mysql://root:hammerwork@localhost:3307/hammerwork".to_string()
-        });
+        let database_url = std::env::var("MYSQL_DATABASE_URL")
+            .unwrap_or_else(|_| "mysql://root:hammerwork@localhost:3307/hammerwork".to_string());
 
         let pool = MySqlPool::connect(&database_url).await?;
 
@@ -545,10 +543,12 @@ mod spawn_query_tests {
             query.push_str(&format!(" AND parent.queue_name = '{}'", queue));
         }
 
-        query.push_str(r#"
+        query.push_str(
+            r#"
             GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
-            ORDER BY parent.created_at DESC"#);
-        
+            ORDER BY parent.created_at DESC"#,
+        );
+
         query.push_str(&format!(" LIMIT {}", limit));
 
         // Verify query structure
@@ -583,10 +583,12 @@ mod spawn_query_tests {
             query.push_str(&format!(" AND parent.queue_name = '{}'", queue));
         }
 
-        query.push_str(r#"
+        query.push_str(
+            r#"
             GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
-            ORDER BY parent.created_at DESC"#);
-        
+            ORDER BY parent.created_at DESC"#,
+        );
+
         query.push_str(&format!(" LIMIT {}", limit));
 
         // Verify query structure
@@ -601,7 +603,7 @@ mod spawn_query_tests {
     fn test_spawn_tree_query_building() {
         // Test spawn tree query construction
         let job_id = "550e8400-e29b-41d4-a716-446655440000";
-        
+
         let postgres_query = format!(
             r#"
             SELECT id, queue_name, status, depends_on,
@@ -629,7 +631,7 @@ mod spawn_query_tests {
         // Verify both queries contain the job ID
         assert!(postgres_query.contains(&job_id));
         assert!(mysql_query.contains(&job_id));
-        
+
         // Verify database-specific syntax
         assert!(postgres_query.contains("@>"));
         assert!(mysql_query.contains("JSON_CONTAINS"));
