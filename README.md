@@ -5,6 +5,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ## Features
 
 - **📊 Web Dashboard**: Modern real-time web interface for monitoring queues, managing jobs, and system administration with authentication and WebSocket updates
+- **🧪 TestQueue Framework**: Complete in-memory testing implementation with MockClock for deterministic testing of time-dependent features, workflows, and job processing
 - **🔍 Job Tracing & Correlation**: Comprehensive distributed tracing with OpenTelemetry integration, trace IDs, correlation IDs, and lifecycle event hooks
 - **🔗 Job Dependencies & Workflows**: Create complex data processing pipelines with job dependencies, sequential chains, and parallel processing with synchronization barriers
 - **Multi-database support**: PostgreSQL and MySQL backends with optimized dependency queries
@@ -39,7 +40,7 @@ hammerwork = { version = "1.2", features = ["postgres", "tracing"] }
 hammerwork = { version = "1.2", features = ["postgres"], default-features = false }
 ```
 
-**Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `tracing` (optional)
+**Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `tracing` (optional), `test` (for TestQueue)
 
 ### Web Dashboard (Optional)
 
@@ -66,6 +67,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 ## Documentation
 
 - **[Quick Start Guide](docs/quick-start.md)** - Get started with PostgreSQL and MySQL
+- **[TestQueue Framework](docs/testing.md)** - In-memory testing with MockClock for unit tests and time control
 - **[Web Dashboard](hammerwork-web/README.md)** - Real-time web interface for queue monitoring and job management
 - **[Job Tracing & Correlation](docs/tracing.md)** - Distributed tracing, correlation IDs, and OpenTelemetry integration
 - **[Job Dependencies & Workflows](docs/workflows.md)** - Complex pipelines, job dependencies, and orchestration
@@ -229,6 +231,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 This enables end-to-end tracing across your entire job processing pipeline with automatic span creation, correlation tracking, and integration with observability platforms like Jaeger, Zipkin, or DataDog.
+
+## Testing Example
+
+Test your job processing logic with the in-memory `TestQueue` framework:
+
+```rust
+use hammerwork::queue::test::{TestQueue, MockClock};
+use hammerwork::{Job, JobStatus, queue::DatabaseQueue};
+use serde_json::json;
+use chrono::Duration;
+
+#[tokio::test]
+async fn test_delayed_job_processing() {
+    let clock = MockClock::new();
+    let queue = TestQueue::with_clock(clock.clone());
+    
+    // Schedule a job for 1 hour from now
+    let future_time = clock.now() + Duration::hours(1);
+    let job = Job::new("test_queue".to_string(), json!({"task": "delayed_task"}))
+        .with_scheduled_at(future_time);
+    
+    let job_id = queue.enqueue(job).await.unwrap();
+    
+    // Job shouldn't be available immediately
+    assert!(queue.dequeue("test_queue").await.unwrap().is_none());
+    
+    // Advance time past scheduled time
+    clock.advance(Duration::hours(2));
+    
+    // Now job should be available for processing
+    let dequeued = queue.dequeue("test_queue").await.unwrap().unwrap();
+    assert_eq!(dequeued.id, job_id);
+    
+    // Complete the job
+    queue.complete_job(job_id).await.unwrap();
+    
+    // Verify completion
+    let completed = queue.get_job(job_id).await.unwrap().unwrap();
+    assert_eq!(completed.status, JobStatus::Completed);
+}
+```
+
+The `TestQueue` provides complete compatibility with the `DatabaseQueue` trait while offering deterministic time control through `MockClock`, making it perfect for testing complex workflows, retry logic, and time-dependent job processing.
 
 ## Web Dashboard
 

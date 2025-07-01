@@ -42,6 +42,10 @@ async fn main() -> Result<()> {
         .await
         .map_err(hammerwork::HammerworkError::Database)?;
 
+    // Error if no database features are enabled
+    #[cfg(not(any(feature = "postgres", feature = "mysql")))]
+    compile_error!("This example requires either 'postgres' or 'mysql' feature to be enabled");
+
     let queue = Arc::new(JobQueue::new(pool));
 
     // Initialize database tables

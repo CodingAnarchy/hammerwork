@@ -112,3 +112,27 @@ required-features = ["postgres"]
 name = "priority_example"
 required-features = ["postgres"]
 
+[[example]]
+name = "batch_example"
+required-features = ["postgres"]
+
+[[example]]
+name = "worker_batch_example"
+required-features = ["postgres"]
+
+[[example]]
+name = "retry_strategies"
+required-features = ["postgres"]
+
+[[example]]
+name = "result_storage_example"
+required-features = ["postgres"]
+
+[[example]]
+name = "autoscaling_example"
+required-features = ["postgres"]
+
+[[example]]
+name = "test_queue_example"
+required-features = ["test"]
+

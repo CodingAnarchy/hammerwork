@@ -12,19 +12,18 @@
 
 use chrono::Duration;
 use hammerwork::{
-    Job, JobPriority, JobStatus, Worker, WorkerPool,
+    Job, JobPriority, JobStatus,
     batch::JobBatch,
     priority::PriorityWeights,
     queue::{
         DatabaseQueue,
         test::{MockClock, TestQueue},
     },
-    rate_limit::ThrottleConfig,
     workflow::{FailurePolicy, JobGroup},
 };
 use serde_json::json;
-use std::{collections::HashMap, sync::Arc};
-use tracing::{error, info, warn};
+use std::sync::Arc;
+use tracing::info;
 
 // Sample job handler for email processing
 async fn email_handler(job: Job) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -35,7 +34,7 @@ async fn email_handler(job: Job) -> Result<(), Box<dyn std::error::Error + Send 
     let subject = payload["subject"]
         .as_str()
         .ok_or("Missing 'subject' field")?;
-    let body = payload["body"].as_str().unwrap_or("(no body)");
+    let _body = payload["body"].as_str().unwrap_or("(no body)");
 
     // Simulate email sending
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -245,15 +244,15 @@ async fn priority_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enqueue jobs with different priorities
     let low_job =
-        Job::new("priority_queue".to_string(), json!({"task": "cleanup"})).as_low_priority();
+        Job::new("priority_queue".to_string(), json!({"task": "cleanup"})).with_priority(JobPriority::Low);
     let normal_job = Job::new("priority_queue".to_string(), json!({"task": "processing"}));
     let high_job =
-        Job::new("priority_queue".to_string(), json!({"task": "urgent_fix"})).as_high_priority();
+        Job::new("priority_queue".to_string(), json!({"task": "urgent_fix"})).with_priority(JobPriority::High);
     let critical_job = Job::new(
         "priority_queue".to_string(),
         json!({"task": "security_patch"}),
     )
-    .as_critical_priority();
+    .with_priority(JobPriority::Critical);
 
     let low_id = queue.enqueue(low_job).await?;
     let normal_id = queue.enqueue(normal_job).await?;
@@ -325,7 +324,8 @@ async fn batch_example() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let batch = JobBatch::new("image_batch".to_string(), jobs);
+    let batch = JobBatch::new("image_batch".to_string())
+        .with_jobs(jobs);
     let batch_id = queue.enqueue_batch(batch).await?;
 
     println!("📦 Created batch: {}", batch_id);
@@ -399,7 +399,7 @@ async fn workflow_example() -> Result<(), Box<dyn std::error::Error>> {
             "step": "clean",
             "operations": ["remove_duplicates", "fill_nulls"]
         }),
-    );
+    ).depends_on(&extract_job.id);
 
     let analyze_job = Job::new(
         "data_pipeline".to_string(),
@@ -407,7 +407,7 @@ async fn workflow_example() -> Result<(), Box<dyn std::error::Error>> {
             "step": "analyze",
             "analysis_type": "ml"
         }),
-    );
+    ).depends_on(&clean_job.id);
 
     let report_job = Job::new(
         "data_pipeline".to_string(),
@@ -415,22 +415,14 @@ async fn workflow_example() -> Result<(), Box<dyn std::error::Error>> {
             "step": "report",
             "format": "pdf"
         }),
-    );
+    ).depends_on(&analyze_job.id);
 
-    // Set up dependencies
-    let mut dependencies = HashMap::new();
-    dependencies.insert(clean_job.id, vec![extract_job.id]);
-    dependencies.insert(analyze_job.id, vec![clean_job.id]);
-    dependencies.insert(report_job.id, vec![analyze_job.id]);
 
     let workflow = JobGroup::new("data_processing_workflow".to_string())
-        .with_jobs(vec![
-            extract_job.clone(),
-            clean_job.clone(),
-            analyze_job.clone(),
-            report_job.clone(),
-        ])
-        .with_dependencies(dependencies)
+        .add_job(extract_job.clone())
+        .add_job(clean_job.clone())
+        .add_job(analyze_job.clone())
+        .add_job(report_job.clone())
         .with_failure_policy(FailurePolicy::FailFast);
 
     let workflow_id = queue.enqueue_workflow(workflow).await?;
@@ -449,7 +441,7 @@ async fn workflow_example() -> Result<(), Box<dyn std::error::Error>> {
             println!("   Processing: {}", job_step);
 
             // Simulate processing
-            match step {
+            match *step {
                 "extract" => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     println!("   📥 Data extracted successfully");
@@ -459,7 +451,9 @@ async fn workflow_example() -> Result<(), Box<dyn std::error::Error>> {
                     println!("   🧹 Data cleaned successfully");
                 }
                 "analyze" => {
-                    analysis_handler(job.clone()).await?;
+                    if let Err(e) = analysis_handler(job.clone()).await {
+                        eprintln!("Analysis error: {}", e);
+                    }
                 }
                 "report" => {
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -574,8 +568,8 @@ async fn error_handling_example() -> Result<(), Box<dyn std::error::Error>> {
     // Check dead job summary
     let dead_summary = queue.get_dead_job_summary().await?;
     println!("\n💀 Dead jobs summary:");
-    println!("   Total dead jobs: {}", dead_summary.total_count);
-    println!("   By queue: {:?}", dead_summary.by_queue);
+    println!("   Total dead jobs: {}", dead_summary.total_dead_jobs);
+    println!("   By queue: {:?}", dead_summary.dead_jobs_by_queue);
 
     Ok(())
 }
@@ -595,7 +589,7 @@ async fn cron_job_example() -> Result<(), Box<dyn std::error::Error>> {
             "max_age_hours": 24
         }),
     )
-    .with_cron_schedule("0 * * * *".to_string()) // Every hour at minute 0
+    .with_cron("0 0 * * * *".parse()?)? // Every hour at minute 0
     .with_timezone("UTC".to_string());
 
     let job_id = queue.enqueue_cron_job(cron_job).await?;
@@ -719,40 +713,37 @@ async fn worker_integration_example() -> Result<(), Box<dyn std::error::Error>> 
         queue.enqueue(job).await?;
     }
 
-    println!("📋 Enqueued 5 jobs for worker processing");
+    println!("📋 Enqueued 5 jobs for processing");
 
-    // Create a worker to process the jobs
-    let worker = Worker::new(
-        queue.clone(),
-        "worker_queue".to_string(),
-        |job| async move {
-            let batch_id = job.payload["batch_id"].as_u64().unwrap();
-            let data = job.payload["data"].as_str().unwrap();
+    // NOTE: TestQueue is designed for testing job logic and queue operations,
+    // not for testing Worker functionality. Workers are tightly coupled to JobQueue<DB>
+    // and cannot be directly used with TestQueue. For testing job processing logic,
+    // manually dequeue and process jobs as shown below.
+    
+    println!("🔄 Processing jobs manually (TestQueue doesn't support Worker):");
+    
+    let mut processed_count = 0;
+    while let Some(job) = queue.dequeue("worker_queue").await? {
+        let batch_id = job.payload["batch_id"].as_u64().unwrap();
+        let data = job.payload["data"].as_str().unwrap();
 
-            info!("Worker processing batch {} with data: {}", batch_id, data);
+        info!("Processing batch {} with data: {}", batch_id, data);
 
-            // Simulate processing
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Simulate processing (this is where your job handler logic would go)
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-            info!("Batch {} processing completed", batch_id);
-            Ok(())
-        },
-    );
-
-    // Start the worker in a background task
-    let worker_handle = tokio::spawn(async move {
-        // Process for a short time
-        let mut worker = worker;
-        for _ in 0..5 {
-            if let Err(e) = worker.run_once().await {
-                error!("Worker error: {}", e);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        queue.complete_job(job.id).await?;
+        processed_count += 1;
+        
+        info!("Batch {} processing completed", batch_id);
+        
+        // Process only a few jobs for demonstration
+        if processed_count >= 3 {
+            break;
         }
-    });
-
-    // Wait for processing
-    worker_handle.await?;
+    }
+    
+    println!("✅ Processed {} jobs manually", processed_count);
 
     // Check results
     let completed = queue
@@ -816,11 +807,12 @@ async fn performance_testing_example() -> Result<(), Box<dyn std::error::Error>>
     // Get final statistics
     let stats = queue.get_queue_stats("perf_queue").await?;
     println!("\n📈 Final statistics:");
-    println!("   Total jobs: {}", stats.total);
-    println!("   Completed: {}", stats.completed);
+    println!("   Pending: {}", stats.pending_count);
+    println!("   Running: {}", stats.running_count);
+    println!("   Completed: {}", stats.statistics.completed);
     println!(
         "   Average processing time: {:?}ms",
-        stats.avg_processing_time_ms
+        stats.statistics.avg_processing_time_ms
     );
 
     Ok(())

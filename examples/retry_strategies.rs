@@ -23,6 +23,16 @@ use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tracing::{info, warn};
 
+// Conditional type aliases for database-specific JobQueue types
+#[cfg(all(feature = "postgres", not(feature = "mysql")))]
+type ExampleJobQueue = JobQueue<sqlx::Postgres>;
+
+#[cfg(all(feature = "mysql", not(feature = "postgres")))]
+type ExampleJobQueue = JobQueue<sqlx::MySql>;
+
+#[cfg(all(feature = "postgres", feature = "mysql"))]
+type ExampleJobQueue = JobQueue<sqlx::Postgres>; // Default to postgres when both enabled
+
 /// Helper function to get database URL based on feature flags
 fn get_database_url() -> String {
     #[cfg(all(feature = "postgres", not(feature = "mysql")))]
@@ -47,15 +57,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = get_database_url();
     info!("🔗 Connecting to database: {}", database_url);
 
+    let pool;
     #[cfg(all(feature = "postgres", not(feature = "mysql")))]
-    let pool = sqlx::PgPool::connect(&database_url).await?;
+    {
+        pool = sqlx::PgPool::connect(&database_url).await?;
+    }
 
     #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-    let pool = sqlx::MySqlPool::connect(&database_url).await?;
+    {
+        pool = sqlx::MySqlPool::connect(&database_url).await?;
+    }
 
     // Default to PostgreSQL when both features are enabled
     #[cfg(all(feature = "postgres", feature = "mysql"))]
-    let pool = sqlx::PgPool::connect(&database_url).await?;
+    {
+        pool = sqlx::PgPool::connect(&database_url).await?;
+    }
 
     let queue = Arc::new(JobQueue::new(pool));
 
@@ -83,13 +100,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Demonstrate fixed delay retry strategy (original Hammerwork behavior)
-async fn demonstrate_fixed_retry_strategy<DB>(
-    queue: &Arc<JobQueue<DB>>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue,
-{
+async fn demonstrate_fixed_retry_strategy(
+    queue: &Arc<ExampleJobQueue>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("🔧 FIXED RETRY STRATEGY");
     info!("Uses the same delay for every retry attempt (classic behavior)");
 
@@ -122,13 +135,9 @@ where
 }
 
 /// Demonstrate linear backoff retry strategy
-async fn demonstrate_linear_backoff_strategy<DB>(
-    queue: &Arc<JobQueue<DB>>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue,
-{
+async fn demonstrate_linear_backoff_strategy(
+    queue: &Arc<ExampleJobQueue>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("📈 LINEAR BACKOFF STRATEGY");
     info!("Increases delay by a fixed amount for each retry attempt");
 
@@ -171,13 +180,9 @@ where
 }
 
 /// Demonstrate exponential backoff retry strategy
-async fn demonstrate_exponential_backoff_strategy<DB>(
-    queue: &Arc<JobQueue<DB>>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue,
-{
+async fn demonstrate_exponential_backoff_strategy(
+    queue: &Arc<ExampleJobQueue>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("🚀 EXPONENTIAL BACKOFF STRATEGY");
     info!("Doubles the delay for each retry attempt (most common for network operations)");
 
@@ -223,13 +228,9 @@ where
 }
 
 /// Demonstrate exponential backoff with jitter to prevent thundering herd
-async fn demonstrate_exponential_with_jitter<DB>(
-    queue: &Arc<JobQueue<DB>>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue,
-{
+async fn demonstrate_exponential_with_jitter(
+    queue: &Arc<ExampleJobQueue>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("🎲 EXPONENTIAL BACKOFF WITH JITTER");
     info!("Adds randomness to prevent all jobs from retrying at the same time");
 
@@ -283,13 +284,9 @@ where
 }
 
 /// Demonstrate Fibonacci sequence backoff strategy
-async fn demonstrate_fibonacci_backoff_strategy<DB>(
-    queue: &Arc<JobQueue<DB>>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue,
-{
+async fn demonstrate_fibonacci_backoff_strategy(
+    queue: &Arc<ExampleJobQueue>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("🌀 FIBONACCI BACKOFF STRATEGY");
     info!("Uses Fibonacci sequence for retry delays (gentle exponential growth)");
 
@@ -333,13 +330,9 @@ where
 }
 
 /// Demonstrate custom retry strategy with business logic
-async fn demonstrate_custom_retry_strategy<DB>(
-    queue: &Arc<JobQueue<DB>>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue,
-{
+async fn demonstrate_custom_retry_strategy(
+    queue: &Arc<ExampleJobQueue>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("⚙️  CUSTOM RETRY STRATEGY");
     info!("Uses business-specific logic to determine retry delays");
 
@@ -398,13 +391,9 @@ where
 }
 
 /// Demonstrate worker-level default retry strategies
-async fn demonstrate_worker_default_strategies<DB>(
-    queue: &Arc<JobQueue<DB>>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue,
-{
+async fn demonstrate_worker_default_strategies(
+    queue: &Arc<ExampleJobQueue>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("🏭 WORKER DEFAULT RETRY STRATEGIES");
     info!(
         "Workers can have default retry strategies that apply to all jobs without specific strategies"
@@ -454,12 +443,9 @@ where
 }
 
 /// Demonstrate multiple strategies working together in a realistic scenario
-async fn demonstrate_mixed_strategies_in_action<DB>(
-    queue: &Arc<JobQueue<DB>>,
+async fn demonstrate_mixed_strategies_in_action(
+    queue: &Arc<ExampleJobQueue>,
 ) -> Result<(), Box<dyn std::error::Error>>
-where
-    DB: sqlx::Database + Send + Sync + 'static,
-    JobQueue<DB>: DatabaseQueue<Database = DB>,
 {
     info!("🎪 MIXED STRATEGIES IN ACTION");
     info!("Realistic example showing different retry strategies for different job types");

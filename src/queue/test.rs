@@ -16,7 +16,7 @@
 //!
 //! ```rust
 //! use hammerwork::queue::test::TestQueue;
-//! use hammerwork::{Job, JobStatus};
+//! use hammerwork::{Job, JobStatus, queue::DatabaseQueue};
 //! use serde_json::json;
 //!
 //! # #[tokio::main]
@@ -66,32 +66,164 @@ type TestDatabaseType = sqlx::MySql;
 #[cfg(all(not(feature = "postgres"), not(feature = "mysql")))]
 type TestDatabaseType = sqlx::Any; // Fallback
 
-/// Mock clock for controlling time in tests
+/// Mock clock for controlling time in tests.
+///
+/// The `MockClock` allows you to control time flow in your tests, making it possible
+/// to test time-dependent functionality like delayed jobs, cron schedules, and timeouts
+/// in a deterministic and fast manner.
+///
+/// # Examples
+///
+/// ## Basic time manipulation
+///
+/// ```rust
+/// use hammerwork::queue::test::MockClock;
+/// use chrono::Duration;
+///
+/// let clock = MockClock::new();
+/// let initial_time = clock.now();
+///
+/// // Advance time by 1 hour
+/// clock.advance(Duration::hours(1));
+/// 
+/// let after_advance = clock.now();
+/// assert_eq!((after_advance - initial_time).num_hours(), 1);
+/// ```
+///
+/// ## Testing delayed jobs
+///
+/// ```rust
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use hammerwork::queue::test::{MockClock, TestQueue};
+/// use hammerwork::{Job, queue::DatabaseQueue};
+/// use serde_json::json;
+/// use chrono::Duration;
+///
+/// let clock = MockClock::new();
+/// let queue = TestQueue::with_clock(clock.clone());
+///
+/// // Create a delayed job (runs in 2 hours)
+/// let delayed_job = Job::with_delay(
+///     "delayed_queue".to_string(),
+///     json!({"message": "Hello future!"}),
+///     Duration::hours(2)
+/// );
+/// 
+/// let job_id = queue.enqueue(delayed_job).await?;
+///
+/// // Job should not be available immediately
+/// assert!(queue.dequeue("delayed_queue").await?.is_none());
+///
+/// // Advance time by 2 hours
+/// clock.advance(Duration::hours(2));
+///
+/// // Now the job should be available
+/// let job = queue.dequeue("delayed_queue").await?.unwrap();
+/// assert_eq!(job.id, job_id);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 pub struct MockClock {
     current_time: Arc<Mutex<DateTime<Utc>>>,
 }
 
 impl MockClock {
-    /// Create a new mock clock starting at the current time
+    /// Create a new mock clock starting at the current time.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::queue::test::MockClock;
+    ///
+    /// let clock = MockClock::new();
+    /// let now = clock.now();
+    /// println!("Mock clock started at: {}", now);
+    /// ```
     pub fn new() -> Self {
         Self {
             current_time: Arc::new(Mutex::new(Utc::now())),
         }
     }
 
-    /// Get the current mock time
+    /// Get the current mock time.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::queue::test::MockClock;
+    /// use chrono::Duration;
+    ///
+    /// let clock = MockClock::new();
+    /// let time1 = clock.now();
+    /// 
+    /// clock.advance(Duration::minutes(30));
+    /// let time2 = clock.now();
+    /// 
+    /// assert_eq!((time2 - time1).num_minutes(), 30);
+    /// ```
     pub fn now(&self) -> DateTime<Utc> {
         *self.current_time.lock().unwrap()
     }
 
-    /// Advance the mock time by the given duration
+    /// Advance the mock time by the given duration.
+    ///
+    /// This is useful for testing time-dependent functionality without
+    /// waiting for real time to pass.
+    ///
+    /// # Arguments
+    ///
+    /// * `duration` - The amount of time to advance the clock
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::queue::test::MockClock;
+    /// use chrono::Duration;
+    ///
+    /// let clock = MockClock::new();
+    /// let start_time = clock.now();
+    ///
+    /// // Advance by 1 day, 2 hours, and 30 minutes
+    /// clock.advance(Duration::days(1));
+    /// clock.advance(Duration::hours(2));
+    /// clock.advance(Duration::minutes(30));
+    ///
+    /// let end_time = clock.now();
+    /// let total_duration = end_time - start_time;
+    /// 
+    /// assert_eq!(total_duration.num_hours(), 26); // 24 + 2
+    /// assert_eq!(total_duration.num_minutes(), 1590); // 26 * 60 + 30
+    /// ```
     pub fn advance(&self, duration: chrono::Duration) {
         let mut time = self.current_time.lock().unwrap();
         *time += duration;
     }
 
-    /// Set the mock time to a specific instant
+    /// Set the mock time to a specific instant.
+    ///
+    /// This allows you to set the clock to any specific time, which can be
+    /// useful for testing scenarios that depend on absolute times.
+    ///
+    /// # Arguments
+    ///
+    /// * `time` - The specific time to set the clock to
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::queue::test::MockClock;
+    /// use chrono::{Utc, TimeZone};
+    ///
+    /// let clock = MockClock::new();
+    /// 
+    /// // Set to a specific date and time
+    /// let specific_time = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap();
+    /// clock.set_time(specific_time);
+    /// 
+    /// assert_eq!(clock.now(), specific_time);
+    /// ```
     pub fn set_time(&self, time: DateTime<Utc>) {
         *self.current_time.lock().unwrap() = time;
     }
@@ -274,7 +406,118 @@ impl TestStorage {
     }
 }
 
-/// In-memory test implementation of the job queue
+/// In-memory test implementation of the job queue.
+///
+/// `TestQueue` provides a complete implementation of the `DatabaseQueue` trait
+/// that runs entirely in memory, making it perfect for unit testing your job
+/// processing logic without requiring a database connection.
+///
+/// # Features
+///
+/// - **Full DatabaseQueue compatibility**: Drop-in replacement for testing
+/// - **Time control**: MockClock integration for testing time-dependent features
+/// - **Deterministic behavior**: Predictable ordering and timing for reliable tests
+/// - **Complete feature support**: Batches, workflows, cron jobs, priorities, and more
+/// - **Thread-safe**: Safe to use in concurrent test scenarios
+///
+/// # Examples
+///
+/// ## Basic job processing test
+///
+/// ```rust
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use hammerwork::queue::test::TestQueue;
+/// use hammerwork::{Job, JobStatus, queue::DatabaseQueue};
+/// use serde_json::json;
+///
+/// let queue = TestQueue::new();
+///
+/// // Enqueue a job
+/// let job = Job::new("test_queue".to_string(), json!({"task": "process_data"}));
+/// let job_id = queue.enqueue(job).await?;
+///
+/// // Dequeue and process the job
+/// let job = queue.dequeue("test_queue").await?.unwrap();
+/// assert_eq!(job.status, JobStatus::Running);
+///
+/// // Mark job as completed
+/// queue.complete_job(job_id).await?;
+///
+/// // Verify completion
+/// let completed_job = queue.get_job(job_id).await?.unwrap();
+/// assert_eq!(completed_job.status, JobStatus::Completed);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Testing job priorities
+///
+/// ```rust
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use hammerwork::queue::test::TestQueue;
+/// use hammerwork::{Job, JobPriority, queue::DatabaseQueue};
+/// use serde_json::json;
+///
+/// let queue = TestQueue::new();
+///
+/// // Enqueue jobs with different priorities
+/// let low_job = Job::new("priority_queue".to_string(), json!({"priority": "low"}))
+///     .as_low_priority();
+/// let high_job = Job::new("priority_queue".to_string(), json!({"priority": "high"}))
+///     .as_high_priority();
+///
+/// let low_id = queue.enqueue(low_job).await?;
+/// let high_id = queue.enqueue(high_job).await?;
+///
+/// // High priority job should be dequeued first
+/// let first_job = queue.dequeue("priority_queue").await?.unwrap();
+/// assert_eq!(first_job.id, high_id);
+/// assert_eq!(first_job.priority, JobPriority::High);
+///
+/// let second_job = queue.dequeue("priority_queue").await?.unwrap();
+/// assert_eq!(second_job.id, low_id);
+/// assert_eq!(second_job.priority, JobPriority::Low);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Testing job failures and retries
+///
+/// ```rust
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use hammerwork::queue::test::TestQueue;
+/// use hammerwork::{Job, JobStatus, queue::DatabaseQueue};
+/// use serde_json::json;
+///
+/// let queue = TestQueue::new();
+///
+/// // Create a job with custom retry settings
+/// let job = Job::new("retry_queue".to_string(), json!({"data": "test"}))
+///     .with_max_attempts(3);
+/// let job_id = queue.enqueue(job).await?;
+///
+/// // Dequeue and fail the job
+/// let job = queue.dequeue("retry_queue").await?.unwrap();
+/// queue.fail_job(job_id, "Temporary network error").await?;
+///
+/// // Job should be in retrying state
+/// let retrying_job = queue.get_job(job_id).await?.unwrap();
+/// assert_eq!(retrying_job.status, JobStatus::Retrying);
+/// assert_eq!(retrying_job.attempts, 1);
+///
+/// // After 3 failures, job becomes dead
+/// queue.fail_job(job_id, "Still failing").await?;
+/// queue.fail_job(job_id, "Final failure").await?;
+///
+/// let dead_job = queue.get_job(job_id).await?.unwrap();
+/// assert_eq!(dead_job.status, JobStatus::Dead);
+/// assert_eq!(dead_job.attempts, 3);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct TestQueue {
     storage: Arc<RwLock<TestStorage>>,
@@ -282,7 +525,19 @@ pub struct TestQueue {
 }
 
 impl TestQueue {
-    /// Create a new test queue
+    /// Create a new test queue with a fresh MockClock.
+    ///
+    /// This is the most common way to create a TestQueue for testing.
+    /// Each TestQueue gets its own isolated storage and time control.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::queue::test::TestQueue;
+    ///
+    /// let queue = TestQueue::new();
+    /// // Queue is ready to use for testing
+    /// ```
     pub fn new() -> Self {
         let clock = MockClock::new();
         Self {
@@ -291,7 +546,32 @@ impl TestQueue {
         }
     }
 
-    /// Create a new test queue with a custom clock
+    /// Create a new test queue with a custom MockClock.
+    ///
+    /// This allows you to share time control across multiple test components
+    /// or start with a specific time state.
+    ///
+    /// # Arguments
+    ///
+    /// * `clock` - The MockClock instance to use for time control
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::queue::test::{MockClock, TestQueue};
+    /// use chrono::{Utc, TimeZone};
+    ///
+    /// // Create a clock set to a specific time
+    /// let clock = MockClock::new();
+    /// let specific_time = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+    /// clock.set_time(specific_time);
+    ///
+    /// // Create queue with this clock
+    /// let queue = TestQueue::with_clock(clock);
+    ///
+    /// // Queue will use the specified time
+    /// assert_eq!(queue.clock().now(), specific_time);
+    /// ```
     pub fn with_clock(clock: MockClock) -> Self {
         Self {
             storage: Arc::new(RwLock::new(TestStorage::new(clock.clone()))),
@@ -299,12 +579,78 @@ impl TestQueue {
         }
     }
 
-    /// Get the mock clock for time manipulation
+    /// Get access to the mock clock for time manipulation.
+    ///
+    /// This allows you to control time flow in your tests, which is essential
+    /// for testing time-dependent features like delayed jobs, cron schedules,
+    /// and timeouts.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::queue::test::TestQueue;
+    /// use chrono::Duration;
+    ///
+    /// let queue = TestQueue::new();
+    /// let initial_time = queue.clock().now();
+    ///
+    /// // Advance time by 1 hour
+    /// queue.clock().advance(Duration::hours(1));
+    ///
+    /// let later_time = queue.clock().now();
+    /// assert_eq!((later_time - initial_time).num_hours(), 1);
+    /// ```
     pub fn clock(&self) -> &MockClock {
         &self.clock
     }
 
-    /// Get the number of jobs in a specific status for a queue
+    /// Get the number of jobs in a specific status for a queue.
+    ///
+    /// This is a testing utility that helps you verify the state of your
+    /// job queue during tests.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - The name of the queue to check
+    /// * `status` - The job status to count
+    ///
+    /// # Returns
+    ///
+    /// The number of jobs in the specified status
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use hammerwork::queue::test::TestQueue;
+    /// use hammerwork::{Job, JobStatus, queue::DatabaseQueue};
+    /// use serde_json::json;
+    ///
+    /// let queue = TestQueue::new();
+    ///
+    /// // Initially no jobs
+    /// assert_eq!(queue.get_job_count("test_queue", &JobStatus::Pending).await, 0);
+    ///
+    /// // Add some jobs
+    /// for i in 0..5 {
+    ///     let job = Job::new("test_queue".to_string(), json!({"index": i}));
+    ///     queue.enqueue(job).await?;
+    /// }
+    ///
+    /// // Should have 5 pending jobs
+    /// assert_eq!(queue.get_job_count("test_queue", &JobStatus::Pending).await, 5);
+    ///
+    /// // Process one job
+    /// let job = queue.dequeue("test_queue").await?.unwrap();
+    /// queue.complete_job(job.id).await?;
+    ///
+    /// // Should have 4 pending and 1 completed
+    /// assert_eq!(queue.get_job_count("test_queue", &JobStatus::Pending).await, 4);
+    /// assert_eq!(queue.get_job_count("test_queue", &JobStatus::Completed).await, 1);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn get_job_count(&self, queue_name: &str, status: &JobStatus) -> usize {
         let storage = self.storage.read().await;
         storage
@@ -315,7 +661,47 @@ impl TestQueue {
             .unwrap_or(0)
     }
 
-    /// Get all jobs for testing purposes
+    /// Get all jobs for testing purposes.
+    ///
+    /// This returns all jobs stored in the TestQueue, regardless of their
+    /// queue name or status. This is useful for comprehensive testing and
+    /// debugging.
+    ///
+    /// # Returns
+    ///
+    /// A vector containing all jobs in the TestQueue
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use hammerwork::queue::test::TestQueue;
+    /// use hammerwork::{Job, queue::DatabaseQueue};
+    /// use serde_json::json;
+    ///
+    /// let queue = TestQueue::new();
+    ///
+    /// // Add jobs to different queues
+    /// let job1 = Job::new("queue_a".to_string(), json!({"type": "a"}));
+    /// let job2 = Job::new("queue_b".to_string(), json!({"type": "b"}));
+    ///
+    /// queue.enqueue(job1).await?;
+    /// queue.enqueue(job2).await?;
+    ///
+    /// // Get all jobs
+    /// let all_jobs = queue.get_all_jobs().await;
+    /// assert_eq!(all_jobs.len(), 2);
+    ///
+    /// // Jobs from different queues are included
+    /// let queue_names: Vec<String> = all_jobs.iter()
+    ///     .map(|job| job.queue_name.clone())
+    ///     .collect();
+    /// assert!(queue_names.contains(&"queue_a".to_string()));
+    /// assert!(queue_names.contains(&"queue_b".to_string()));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn get_all_jobs(&self) -> Vec<Job> {
         let storage = self.storage.read().await;
         storage.jobs.values().cloned().collect()
@@ -1882,7 +2268,7 @@ mod tests {
 
         // Create a cron job that runs every hour
         let mut job = Job::new("cron_queue".to_string(), json!({"cron": true}));
-        job.cron_schedule = Some("0 * * * *".to_string());
+        job.cron_schedule = Some("0 0 * * * *".to_string());
 
         let job_id = queue.enqueue_cron_job(job).await.unwrap();
 
@@ -1891,7 +2277,12 @@ mod tests {
         assert!(job.recurring);
         assert!(job.next_run_at.is_some());
 
-        // Process the job
+        // Advance clock to make the cron job ready for execution
+        // Since the cron is "0 0 * * * *" (every hour at minute 0), 
+        // advance to the next hour boundary
+        clock.advance(chrono::Duration::hours(1));
+        
+        // Now the job should be available for dequeue
         let dequeued = queue.dequeue("cron_queue").await.unwrap();
         assert!(dequeued.is_some());
         queue.complete_job(job_id).await.unwrap();
