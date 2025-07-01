@@ -85,7 +85,7 @@ type TestDatabaseType = sqlx::Any; // Fallback
 ///
 /// // Advance time by 1 hour
 /// clock.advance(Duration::hours(1));
-/// 
+///
 /// let after_advance = clock.now();
 /// assert_eq!((after_advance - initial_time).num_hours(), 1);
 /// ```
@@ -109,7 +109,7 @@ type TestDatabaseType = sqlx::Any; // Fallback
 ///     json!({"message": "Hello future!"}),
 ///     Duration::hours(2)
 /// );
-/// 
+///
 /// let job_id = queue.enqueue(delayed_job).await?;
 ///
 /// // Job should not be available immediately
@@ -157,10 +157,10 @@ impl MockClock {
     ///
     /// let clock = MockClock::new();
     /// let time1 = clock.now();
-    /// 
+    ///
     /// clock.advance(Duration::minutes(30));
     /// let time2 = clock.now();
-    /// 
+    ///
     /// assert_eq!((time2 - time1).num_minutes(), 30);
     /// ```
     pub fn now(&self) -> DateTime<Utc> {
@@ -192,7 +192,7 @@ impl MockClock {
     ///
     /// let end_time = clock.now();
     /// let total_duration = end_time - start_time;
-    /// 
+    ///
     /// assert_eq!(total_duration.num_hours(), 26); // 24 + 2
     /// assert_eq!(total_duration.num_minutes(), 1590); // 26 * 60 + 30
     /// ```
@@ -217,11 +217,11 @@ impl MockClock {
     /// use chrono::{Utc, TimeZone};
     ///
     /// let clock = MockClock::new();
-    /// 
+    ///
     /// // Set to a specific date and time
     /// let specific_time = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap();
     /// clock.set_time(specific_time);
-    /// 
+    ///
     /// assert_eq!(clock.now(), specific_time);
     /// ```
     pub fn set_time(&self, time: DateTime<Utc>) {
@@ -728,7 +728,7 @@ impl DatabaseQueue for TestQueue {
 
         // Calculate the delay from the original creation
         let delay = original_scheduled_at - original_created_at;
-        
+
         job.created_at = now;
 
         // For immediate jobs (where scheduled_at was set to created_at in Job::new()),
@@ -889,7 +889,9 @@ impl DatabaseQueue for TestQueue {
                         && workflow.jobs.iter().any(|j| j.id == job_id)
                 })
                 .map(|workflow| {
-                    workflow.jobs.iter()
+                    workflow
+                        .jobs
+                        .iter()
                         .filter(|j| j.id != job_id)
                         .map(|j| j.id)
                         .collect()
@@ -900,9 +902,12 @@ impl DatabaseQueue for TestQueue {
             for other_job_id in other_job_ids {
                 if let Some(j) = storage.jobs.get(&other_job_id) {
                     if j.status == JobStatus::Pending || j.status == JobStatus::Retrying {
-                        storage.update_job_status(other_job_id, JobStatus::Failed).ok();
+                        storage
+                            .update_job_status(other_job_id, JobStatus::Failed)
+                            .ok();
                         if let Some(j) = storage.jobs.get_mut(&other_job_id) {
-                            j.error_message = Some("Workflow failed (fail-fast policy)".to_string());
+                            j.error_message =
+                                Some("Workflow failed (fail-fast policy)".to_string());
                             j.failed_at = Some(now);
                         }
                     }
@@ -974,7 +979,7 @@ impl DatabaseQueue for TestQueue {
         let mut job_ids = Vec::new();
         for mut job in batch.jobs.iter().cloned() {
             job.batch_id = Some(batch_id);
-            
+
             // Apply the same timestamp logic as regular enqueue
             let now = storage.clock.now();
             let original_scheduled_at = job.scheduled_at;
@@ -982,7 +987,7 @@ impl DatabaseQueue for TestQueue {
 
             // Calculate the delay from the original creation
             let delay = original_scheduled_at - original_created_at;
-            
+
             job.created_at = now;
 
             // For immediate jobs (where scheduled_at was set to created_at in Job::new()),
@@ -1039,7 +1044,7 @@ impl DatabaseQueue for TestQueue {
                     }
                     JobStatus::Pending | JobStatus::Retrying => pending_jobs += 1,
                     JobStatus::Running => pending_jobs += 1, // Count running as pending
-                    JobStatus::Archived => {}, // Archived jobs don't count in workflow stats
+                    JobStatus::Archived => {} // Archived jobs don't count in workflow stats
                 }
             }
         }
@@ -1376,7 +1381,8 @@ impl DatabaseQueue for TestQueue {
         let failed_count = queue_jobs
             .get(&JobStatus::Failed)
             .map(|j| j.len())
-            .unwrap_or(0) as u64 + dead_count;
+            .unwrap_or(0) as u64
+            + dead_count;
         let error_rate = if total_processed > 0 {
             (failed_count + timed_out_count) as f64 / total_processed as f64
         } else {
@@ -1819,7 +1825,7 @@ impl DatabaseQueue for TestQueue {
 
             // Calculate the delay from the original creation
             let delay = original_scheduled_at - original_created_at;
-            
+
             job.created_at = now;
 
             // Check if job has dependencies
@@ -2100,17 +2106,24 @@ impl DatabaseQueue for TestQueue {
                 // Update job status
                 job.status = JobStatus::Archived;
                 // In a real implementation, we'd move to archive table and compress
-                
+
                 jobs_archived += 1;
                 bytes_archived += payload_size;
             }
         }
 
         // Update queue structure separately to avoid borrow checker issues
-        let queue_names: Vec<_> = jobs_to_archive.iter().take(policy.batch_size)
-            .filter_map(|job_id| storage.jobs.get(job_id).map(|job| (*job_id, job.queue_name.clone())))
+        let queue_names: Vec<_> = jobs_to_archive
+            .iter()
+            .take(policy.batch_size)
+            .filter_map(|job_id| {
+                storage
+                    .jobs
+                    .get(job_id)
+                    .map(|job| (*job_id, job.queue_name.clone()))
+            })
             .collect();
-            
+
         for (job_id, queue_name) in queue_names {
             if let Some(queue_jobs) = storage.queues.get_mut(&queue_name) {
                 // Remove from old status list
@@ -2118,7 +2131,10 @@ impl DatabaseQueue for TestQueue {
                     jobs_list.retain(|&id| id != job_id);
                 }
                 // Add to archived list
-                queue_jobs.entry(JobStatus::Archived).or_default().push(job_id);
+                queue_jobs
+                    .entry(JobStatus::Archived)
+                    .or_default()
+                    .push(job_id);
             }
         }
 
@@ -2142,7 +2158,7 @@ impl DatabaseQueue for TestQueue {
         if let Some(job) = storage.jobs.get_mut(&job_id) {
             if job.status == JobStatus::Archived {
                 let queue_name = job.queue_name.clone(); // Clone to avoid borrow checker issues
-                
+
                 // Restore job to pending status
                 job.status = JobStatus::Pending;
                 let restored_job = job.clone();
@@ -2154,7 +2170,10 @@ impl DatabaseQueue for TestQueue {
                         archived_jobs.retain(|&id| id != job_id);
                     }
                     // Add to pending list
-                    queue_jobs.entry(JobStatus::Pending).or_default().push(job_id);
+                    queue_jobs
+                        .entry(JobStatus::Pending)
+                        .or_default()
+                        .push(job_id);
                 }
 
                 Ok(restored_job)
@@ -2205,7 +2224,7 @@ impl DatabaseQueue for TestQueue {
                 archived_at: now, // Mock archived time
                 archival_reason: crate::archive::ArchivalReason::Manual, // Mock reason
                 original_payload_size: Some(payload_size),
-                payload_compressed: false, // Mock
+                payload_compressed: false,             // Mock
                 archived_by: Some("test".to_string()), // Mock user
             });
         }
@@ -2215,7 +2234,7 @@ impl DatabaseQueue for TestQueue {
         let limit = limit.unwrap_or(100) as usize;
 
         archived_jobs.sort_by(|a, b| b.archived_at.cmp(&a.archived_at));
-        
+
         if offset < archived_jobs.len() {
             let end = std::cmp::min(offset + limit, archived_jobs.len());
             Ok(archived_jobs[offset..end].to_vec())
@@ -2233,8 +2252,7 @@ impl DatabaseQueue for TestQueue {
             .jobs
             .values()
             .filter(|job| {
-                job.status == JobStatus::Archived
-                    && job.created_at < older_than // Mock: use created_at as archived_at
+                job.status == JobStatus::Archived && job.created_at < older_than // Mock: use created_at as archived_at
             })
             .map(|job| job.id)
             .collect();
@@ -2526,10 +2544,10 @@ mod tests {
         assert!(job.next_run_at.is_some());
 
         // Advance clock to make the cron job ready for execution
-        // Since the cron is "0 0 * * * *" (every hour at minute 0), 
+        // Since the cron is "0 0 * * * *" (every hour at minute 0),
         // advance to the next hour boundary
         clock.advance(chrono::Duration::hours(1));
-        
+
         // Now the job should be available for dequeue
         let dequeued = queue.dequeue("cron_queue").await.unwrap();
         assert!(dequeued.is_some());

@@ -243,11 +243,11 @@ async fn priority_example() -> Result<(), Box<dyn std::error::Error>> {
     let queue = TestQueue::new();
 
     // Enqueue jobs with different priorities
-    let low_job =
-        Job::new("priority_queue".to_string(), json!({"task": "cleanup"})).with_priority(JobPriority::Low);
+    let low_job = Job::new("priority_queue".to_string(), json!({"task": "cleanup"}))
+        .with_priority(JobPriority::Low);
     let normal_job = Job::new("priority_queue".to_string(), json!({"task": "processing"}));
-    let high_job =
-        Job::new("priority_queue".to_string(), json!({"task": "urgent_fix"})).with_priority(JobPriority::High);
+    let high_job = Job::new("priority_queue".to_string(), json!({"task": "urgent_fix"}))
+        .with_priority(JobPriority::High);
     let critical_job = Job::new(
         "priority_queue".to_string(),
         json!({"task": "security_patch"}),
@@ -324,8 +324,7 @@ async fn batch_example() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let batch = JobBatch::new("image_batch".to_string())
-        .with_jobs(jobs);
+    let batch = JobBatch::new("image_batch".to_string()).with_jobs(jobs);
     let batch_id = queue.enqueue_batch(batch).await?;
 
     println!("📦 Created batch: {}", batch_id);
@@ -399,7 +398,8 @@ async fn workflow_example() -> Result<(), Box<dyn std::error::Error>> {
             "step": "clean",
             "operations": ["remove_duplicates", "fill_nulls"]
         }),
-    ).depends_on(&extract_job.id);
+    )
+    .depends_on(&extract_job.id);
 
     let analyze_job = Job::new(
         "data_pipeline".to_string(),
@@ -407,7 +407,8 @@ async fn workflow_example() -> Result<(), Box<dyn std::error::Error>> {
             "step": "analyze",
             "analysis_type": "ml"
         }),
-    ).depends_on(&clean_job.id);
+    )
+    .depends_on(&clean_job.id);
 
     let report_job = Job::new(
         "data_pipeline".to_string(),
@@ -415,8 +416,8 @@ async fn workflow_example() -> Result<(), Box<dyn std::error::Error>> {
             "step": "report",
             "format": "pdf"
         }),
-    ).depends_on(&analyze_job.id);
-
+    )
+    .depends_on(&analyze_job.id);
 
     let workflow = JobGroup::new("data_processing_workflow".to_string())
         .add_job(extract_job.clone())
@@ -719,9 +720,9 @@ async fn worker_integration_example() -> Result<(), Box<dyn std::error::Error>> 
     // not for testing Worker functionality. Workers are tightly coupled to JobQueue<DB>
     // and cannot be directly used with TestQueue. For testing job processing logic,
     // manually dequeue and process jobs as shown below.
-    
+
     println!("🔄 Processing jobs manually (TestQueue doesn't support Worker):");
-    
+
     let mut processed_count = 0;
     while let Some(job) = queue.dequeue("worker_queue").await? {
         let batch_id = job.payload["batch_id"].as_u64().unwrap();
@@ -734,15 +735,15 @@ async fn worker_integration_example() -> Result<(), Box<dyn std::error::Error>> 
 
         queue.complete_job(job.id).await?;
         processed_count += 1;
-        
+
         info!("Batch {} processing completed", batch_id);
-        
+
         // Process only a few jobs for demonstration
         if processed_count >= 3 {
             break;
         }
     }
-    
+
     println!("✅ Processed {} jobs manually", processed_count);
 
     // Check results

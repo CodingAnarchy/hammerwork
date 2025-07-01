@@ -26,7 +26,7 @@
 //!
 //! let config = ArchivalConfig::new().with_compression_level(9);
 //! let reason = ArchivalReason::Automatic;
-//! 
+//!
 //! // These can be used with queue.archive_jobs() method
 //! assert!(policy.enabled);
 //! assert_eq!(config.compression_level, 9);
@@ -377,7 +377,7 @@ pub struct ArchivalConfig {
 impl Default for ArchivalConfig {
     fn default() -> Self {
         Self {
-            compression_level: 6, // Balanced compression/speed
+            compression_level: 6,          // Balanced compression/speed
             max_payload_size: 1024 * 1024, // 1MB
             verify_compression: true,
         }

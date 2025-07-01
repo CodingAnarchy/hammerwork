@@ -30,6 +30,7 @@ cargo-hammerwork provides a modern, modular CLI for managing Hammerwork-based ap
 - ⏰ **Cron Management** - Recurring job scheduling and management
 - 🔧 **Database Maintenance** - Cleanup, optimization, and health checks
 - 🔄 **Workflow Management** - Job dependencies and complex pipelines
+- 🚀 **Spawn Operations** - Dynamic job spawning, parent-child relationships, and tree visualization
 - 💾 **Backup & Restore** - Database backup and recovery operations
 
 ## Quick Start
@@ -165,6 +166,18 @@ cargo hammerwork workflow status <WORKFLOW_ID>  # Workflow progress
 cargo hammerwork workflow cancel <WORKFLOW_ID>  # Cancel workflow
 ```
 
+### Spawn Operation Commands
+
+```bash
+# Dynamic job spawning and parent-child relationships
+cargo hammerwork spawn list [--queue QUEUE] [--recent] [--limit N]
+cargo hammerwork spawn tree <JOB_ID> [--format text|json|mermaid] [--full]
+cargo hammerwork spawn stats [--queue QUEUE] [--hours N] [--detailed]
+cargo hammerwork spawn lineage <JOB_ID> [--ancestors] [--descendants] [--depth N]
+cargo hammerwork spawn pending [--queue QUEUE] [--show-config]
+cargo hammerwork spawn monitor [--queue QUEUE] [--interval N]
+```
+
 ### Backup Commands
 
 ```bash
@@ -188,6 +201,7 @@ cargo-hammerwork/
 │   │   ├── job.rs         # Job management (framework)
 │   │   ├── queue.rs       # Queue operations (framework)
 │   │   ├── worker.rs      # Worker control (framework)
+│   │   ├── spawn.rs       # Spawn operations and tree visualization
 │   │   └── monitor.rs     # Monitoring & observability (framework)
 │   ├── config/            # Configuration system
 │   │   └── mod.rs         # Config loading and management

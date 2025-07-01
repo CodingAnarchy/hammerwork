@@ -65,9 +65,9 @@
 
 use super::{ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams};
 use hammerwork::{
+    JobId, JobStatus,
     archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason, ArchivalStats, ArchivedJob},
     queue::DatabaseQueue,
-    JobId, JobStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -326,7 +326,8 @@ where
 }
 
 /// Extract archive filter parameters from query string
-fn with_archive_filters() -> impl Filter<Extract = (ArchiveFilterParams,), Error = warp::Rejection> + Clone {
+fn with_archive_filters()
+-> impl Filter<Extract = (ArchiveFilterParams,), Error = warp::Rejection> + Clone {
     warp::query::<ArchiveFilterParams>()
 }
 
@@ -371,9 +372,10 @@ where
             };
             Ok(warp::reply::json(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(
-            format!("Failed to archive jobs: {}", e),
-        ))),
+        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
+            "Failed to archive jobs: {}",
+            e
+        )))),
     }
 }
 
@@ -397,22 +399,23 @@ where
         Ok(archived_jobs) => {
             // Convert to API format
             let jobs: Vec<ArchivedJobInfo> = archived_jobs.into_iter().map(Into::into).collect();
-            
+
             // For simplicity, we'll use the returned count as total
             // In a real implementation, you'd want a separate count query
             let total = jobs.len() as u64;
-            
+
             let pagination_meta = PaginationMeta::new(&pagination, total);
             let response = PaginatedResponse {
                 items: jobs,
                 pagination: pagination_meta,
             };
-            
+
             Ok(warp::reply::json(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(
-            format!("Failed to list archived jobs: {}", e),
-        ))),
+        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
+            "Failed to list archived jobs: {}",
+            e
+        )))),
     }
 }
 
@@ -443,9 +446,10 @@ where
             };
             Ok(warp::reply::json(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(
-            format!("Failed to restore job: {}", e),
-        ))),
+        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
+            "Failed to restore job: {}",
+            e
+        )))),
     }
 }
 
@@ -477,9 +481,10 @@ where
             };
             Ok(warp::reply::json(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(
-            format!("Failed to purge archived jobs: {}", e),
-        ))),
+        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
+            "Failed to purge archived jobs: {}",
+            e
+        )))),
     }
 }
 
@@ -502,9 +507,10 @@ where
             };
             Ok(warp::reply::json(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(
-            format!("Failed to get archive stats: {}", e),
-        ))),
+        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
+            "Failed to get archive stats: {}",
+            e
+        )))),
     }
 }
 

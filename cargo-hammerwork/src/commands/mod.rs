@@ -8,6 +8,7 @@ pub mod maintenance;
 pub mod migration;
 pub mod monitor;
 pub mod queue;
+pub mod spawn;
 pub mod worker;
 pub mod workflow;
 
@@ -21,5 +22,6 @@ pub use maintenance::*;
 pub use migration::*;
 pub use monitor::*;
 pub use queue::*;
+pub use spawn::*;
 pub use worker::*;
 pub use workflow::*;

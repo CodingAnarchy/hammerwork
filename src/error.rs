@@ -46,6 +46,12 @@ pub enum HammerworkError {
 
     #[error("Archive error: {message}")]
     Archive { message: String },
+
+    #[error("Spawn error: {0}")]
+    SpawnError(#[from] crate::spawn::SpawnError),
+
+    #[error("Invalid job payload: {message}")]
+    InvalidJobPayload { message: String },
 }
 
 #[cfg(test)]

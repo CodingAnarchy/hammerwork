@@ -401,17 +401,21 @@ async fn test_workflow_failure_policies() {
 
     // Other jobs should have been failed due to fail-fast policy
     let failed_job_id = dequeued.id;
-    
+
     // Check that the failed job is dead
     let failed_job_status = queue.get_job(failed_job_id).await.unwrap().unwrap();
     assert_eq!(failed_job_status.status, JobStatus::Dead);
-    
+
     // Check that all other jobs are failed
     for job in [&job1, &job2, &job3] {
         if job.id != failed_job_id {
             let job_status = queue.get_job(job.id).await.unwrap().unwrap();
-            assert_eq!(job_status.status, JobStatus::Failed, 
-                      "Job {} should be Failed due to fail-fast policy", job.id);
+            assert_eq!(
+                job_status.status,
+                JobStatus::Failed,
+                "Job {} should be Failed due to fail-fast policy",
+                job.id
+            );
         }
     }
 

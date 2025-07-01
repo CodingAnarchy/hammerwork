@@ -1194,8 +1194,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         archived_by: Option<&str>,
     ) -> Result<crate::archive::ArchivalStats> {
         use crate::archive::ArchivalStats;
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         if !policy.enabled {
@@ -1217,21 +1217,30 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         // Add status-based conditions for archival eligibility
         let mut status_conditions = Vec::new();
-        
+
         if policy.archive_completed_after.is_some() {
-            status_conditions.push("(status = 'Completed' AND completed_at IS NOT NULL AND completed_at <= ?)".to_string());
+            status_conditions.push(
+                "(status = 'Completed' AND completed_at IS NOT NULL AND completed_at <= ?)"
+                    .to_string(),
+            );
         }
 
         if policy.archive_failed_after.is_some() {
-            status_conditions.push("(status = 'Failed' AND failed_at IS NOT NULL AND failed_at <= ?)".to_string());
+            status_conditions.push(
+                "(status = 'Failed' AND failed_at IS NOT NULL AND failed_at <= ?)".to_string(),
+            );
         }
 
         if policy.archive_dead_after.is_some() {
-            status_conditions.push("(status = 'Dead' AND failed_at IS NOT NULL AND failed_at <= ?)".to_string());
+            status_conditions
+                .push("(status = 'Dead' AND failed_at IS NOT NULL AND failed_at <= ?)".to_string());
         }
 
         if policy.archive_timed_out_after.is_some() {
-            status_conditions.push("(status = 'TimedOut' AND timed_out_at IS NOT NULL AND timed_out_at <= ?)".to_string());
+            status_conditions.push(
+                "(status = 'TimedOut' AND timed_out_at IS NOT NULL AND timed_out_at <= ?)"
+                    .to_string(),
+            );
         }
 
         if status_conditions.is_empty() {
@@ -1245,7 +1254,10 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             query.push_str(&conditions.join(" AND "));
         }
 
-        query.push_str(&format!(" ORDER BY created_at ASC LIMIT {}", policy.batch_size));
+        query.push_str(&format!(
+            " ORDER BY created_at ASC LIMIT {}",
+            policy.batch_size
+        ));
 
         // Start transaction
         let mut tx = self.pool.begin().await?;
@@ -1285,10 +1297,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             let original_size = payload_json.len();
 
             let (final_payload, is_compressed) = if policy.compress_payloads {
-                let mut encoder = GzEncoder::new(Vec::new(), Compression::new(config.compression_level));
+                let mut encoder =
+                    GzEncoder::new(Vec::new(), Compression::new(config.compression_level));
                 encoder.write_all(&payload_json)?;
                 let compressed = encoder.finish()?;
-                
+
                 if compressed.len() < original_size {
                     total_compression_ratio += original_size as f64 / compressed.len() as f64;
                     (compressed, true)
@@ -1300,7 +1313,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             };
 
             // Insert into archive table
-            sqlx::query(r#"
+            sqlx::query(
+                r#"
                 INSERT INTO hammerwork_jobs_archive (
                     id, queue_name, payload, payload_compressed, original_payload_size,
                     status, priority, attempts, max_attempts, created_at, scheduled_at,
@@ -1315,7 +1329,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?
                 )
-            "#)
+            "#,
+            )
             .bind(job.id.to_string())
             .bind(&job.queue_name)
             .bind(&final_payload)
@@ -1335,7 +1350,10 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .bind(job.error_message)
             .bind(job.result_data)
             .bind(job.result_expires_at)
-            .bind(job.retry_strategy.map(|rs| serde_json::to_string(&rs).unwrap_or_default()))
+            .bind(
+                job.retry_strategy
+                    .map(|rs| serde_json::to_string(&rs).unwrap_or_default()),
+            )
             .bind(job.timeout.map(|t| t.as_secs() as i32))
             .bind(job.priority.weight() as i32)
             .bind(job.cron_schedule)
@@ -1343,7 +1361,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .bind(job.recurring)
             .bind(job.timezone)
             .bind(job.batch_id.map(|id| id.to_string()))
-            .bind(if job.depends_on.is_empty() { None } else { Some(serde_json::to_value(&job.depends_on)?) })
+            .bind(if job.depends_on.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&job.depends_on)?)
+            })
             .bind(serde_json::to_string(&job.dependency_status)?)
             .bind(serde_json::to_value(&job.result_config)?)
             .bind(job.trace_id)
@@ -1398,7 +1420,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         let mut tx = self.pool.begin().await?;
 
         // Get archived job
-        let archived_row = sqlx::query(r#"
+        let archived_row = sqlx::query(
+            r#"
             SELECT 
                 id, queue_name, payload, payload_compressed, original_payload_size,
                 status, priority, attempts, max_attempts, created_at, scheduled_at,
@@ -1409,7 +1432,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 trace_id, correlation_id, parent_span_id, span_context
             FROM hammerwork_jobs_archive 
             WHERE id = ?
-        "#)
+        "#,
+        )
         .bind(job_id.to_string())
         .fetch_one(&mut *tx)
         .await?;
@@ -1435,7 +1459,10 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             queue_name: archived_row.get("queue_name"),
             payload,
             status: JobStatus::Pending, // Reset to pending for re-processing
-            priority: archived_row.get::<String, _>("priority").parse().unwrap_or(JobPriority::Normal),
+            priority: archived_row
+                .get::<String, _>("priority")
+                .parse()
+                .unwrap_or(JobPriority::Normal),
             attempts: 0, // Reset attempts
             max_attempts: archived_row.get("max_attempts"),
             created_at: archived_row.get("created_at"),
@@ -1444,28 +1471,34 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             completed_at: None,
             failed_at: None,
             timed_out_at: None,
-            timeout: archived_row.get::<Option<i32>, _>("timeout_seconds")
+            timeout: archived_row
+                .get::<Option<i32>, _>("timeout_seconds")
                 .map(|s| std::time::Duration::from_secs(s as u64)),
             error_message: None, // Clear error message
             cron_schedule: archived_row.get("cron_schedule"),
             next_run_at: archived_row.get("next_run_at"),
             recurring: archived_row.get("recurring"),
             timezone: archived_row.get("timezone"),
-            batch_id: archived_row.get::<Option<String>, _>("batch_id")
+            batch_id: archived_row
+                .get::<Option<String>, _>("batch_id")
                 .and_then(|s| uuid::Uuid::parse_str(&s).ok()),
-            result_config: archived_row.get::<Option<serde_json::Value>, _>("result_config")
+            result_config: archived_row
+                .get::<Option<serde_json::Value>, _>("result_config")
                 .map(|v| serde_json::from_value(v).unwrap_or_default())
                 .unwrap_or_default(),
             result_data: None, // Clear result data
             result_stored_at: None,
             result_expires_at: None,
-            retry_strategy: archived_row.get::<Option<String>, _>("retry_strategy")
+            retry_strategy: archived_row
+                .get::<Option<String>, _>("retry_strategy")
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            depends_on: archived_row.get::<Option<serde_json::Value>, _>("depends_on")
+            depends_on: archived_row
+                .get::<Option<serde_json::Value>, _>("depends_on")
                 .map(|v| serde_json::from_value(v).unwrap_or_default())
                 .unwrap_or_default(),
             dependents: Vec::new(),
-            dependency_status: archived_row.get::<Option<String>, _>("dependency_status")
+            dependency_status: archived_row
+                .get::<Option<String>, _>("dependency_status")
                 .map(|s| serde_json::from_str(&s).unwrap_or_default())
                 .unwrap_or_default(),
             workflow_id: None,
@@ -1545,7 +1578,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 archived_at: row.get("archived_at"),
                 archival_reason: serde_json::from_str(&row.get::<String, _>("archival_reason"))
                     .unwrap_or(crate::archive::ArchivalReason::Automatic),
-                original_payload_size: row.get::<Option<i32>, _>("original_payload_size").map(|s| s as usize),
+                original_payload_size: row
+                    .get::<Option<i32>, _>("original_payload_size")
+                    .map(|s| s as usize),
                 payload_compressed: row.get("payload_compressed"),
                 archived_by: row.get("archived_by"),
             });
@@ -1574,7 +1609,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             COALESCE(SUM(original_payload_size), 0) as total_original_size,
             COALESCE(SUM(LENGTH(payload)), 0) as total_compressed_size,
             MAX(archived_at) as last_archived_at
-            FROM hammerwork_jobs_archive".to_string();
+            FROM hammerwork_jobs_archive"
+            .to_string();
 
         if queue_name.is_some() {
             base_query.push_str(" WHERE queue_name = ?");
@@ -1612,7 +1648,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
 // Helper method for enqueueing with an existing transaction
 impl crate::queue::JobQueue<sqlx::MySql> {
-    async fn enqueue_with_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::MySql>, job: Job) -> Result<JobId> {
+    async fn enqueue_with_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        job: Job,
+    ) -> Result<JobId> {
         sqlx::query(
             r#"
             INSERT INTO hammerwork_jobs (
@@ -1651,8 +1691,16 @@ impl crate::queue::JobQueue<sqlx::MySql> {
         })
         .bind(job.result_config.ttl.map(|t| t.as_secs() as i64))
         .bind(job.result_config.max_size_bytes.map(|s| s as i64))
-        .bind(if job.depends_on.is_empty() { None } else { Some(serde_json::to_value(&job.depends_on)?) })
-        .bind(if job.dependents.is_empty() { None } else { Some(serde_json::to_value(&job.dependents)?) })
+        .bind(if job.depends_on.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&job.depends_on)?)
+        })
+        .bind(if job.dependents.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&job.dependents)?)
+        })
         .bind(serde_json::to_string(&job.dependency_status)?)
         .bind(job.workflow_id.map(|id| id.to_string()))
         .bind(job.workflow_name)

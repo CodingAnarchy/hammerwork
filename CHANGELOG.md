@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2025-07-01
+
+### Added
+- **🚀 Dynamic Job Spawning System**
+  - Complete trait-based spawn system with `SpawnHandler`, `SpawnManager`, and `SpawnConfig`
+  - Jobs can dynamically create child jobs during execution with configurable spawning rules
+  - Fan-out processing patterns: single jobs spawning multiple workers for parallel processing
+  - Parent-child job relationships with dependency tracking and lineage management
+  - Spawn operation monitoring with statistics and performance tracking
+  - Configurable spawn limits, inheritance rules, and batch processing capabilities
+
+- **🔧 Comprehensive CLI Spawn Management**
+  - Six new CLI commands in `cargo-hammerwork` for complete spawn operation management:
+    - `spawn list` - List active spawn operations with filtering and queue-specific views
+    - `spawn tree` - Visualize spawn hierarchies in text, JSON, or Mermaid formats
+    - `spawn stats` - Detailed spawn statistics with queue breakdowns and time-based analysis
+    - `spawn lineage` - Track ancestor and descendant chains for any job
+    - `spawn pending` - Monitor jobs awaiting spawn execution with configuration details
+    - `spawn monitor` - Real-time monitoring of spawn operations with auto-refresh
+  - Full MySQL and PostgreSQL support with database-specific optimized queries
+  - Multiple output formats: human-readable text, structured JSON, Mermaid diagrams
+
+- **🌐 Web API Spawn Endpoints**
+  - RESTful API endpoints for spawn operations management via `hammerwork-web`
+  - Spawn tree visualization API with hierarchical data structures
+  - Spawn statistics API for monitoring and dashboard integration
+  - Parent-child relationship tracking with metadata support
+
+### Enhanced
+- **⚡ Database Compatibility & Performance**
+  - PostgreSQL implementation using `@>` operator and JSONB queries for optimal performance
+  - MySQL implementation using `JSON_CONTAINS()` and `JSON_EXTRACT()` functions
+  - Cross-database spawn operation queries with proper parameterization for security
+  - Efficient dependency tracking using database-native JSON operations
+
+- **🧪 Comprehensive Testing Suite**
+  - 15 new unit tests for CLI spawn commands covering all functionality paths
+  - 7 SQL query integration tests validating both PostgreSQL and MySQL implementations
+  - Spawn-specific example (`spawn_cli_example.rs`) demonstrating real-world usage patterns
+  - Comprehensive edge case testing for spawn tree structures and complex hierarchies
+
+### Technical Implementation
+- New `spawn` module with complete trait-based architecture for extensible spawn handlers
+- Enhanced `Worker` integration with automatic spawn execution during job completion
+- `JobSpawnExt` trait for adding spawn capabilities to existing job structures
+- Spawn operation tracking with operation IDs, timestamps, and success/failure metrics
+- Database schema support for spawn configurations stored in job payload metadata
+
+### Breaking Changes
+- None - all spawn functionality is additive and backward compatible
+
 ## [1.3.0] - 2025-07-01
 
 ### Added

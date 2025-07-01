@@ -4,6 +4,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 ## Features
 
+- **🚀 Dynamic Job Spawning**: Jobs can dynamically create child jobs during execution for fan-out processing patterns, with full parent-child relationship tracking and lineage management
 - **📊 Web Dashboard**: Modern real-time web interface for monitoring queues, managing jobs, and system administration with authentication and WebSocket updates
 - **🧪 TestQueue Framework**: Complete in-memory testing implementation with MockClock for deterministic testing of time-dependent features, workflows, and job processing
 - **🔍 Job Tracing & Correlation**: Comprehensive distributed tracing with OpenTelemetry integration, trace IDs, correlation IDs, and lifecycle event hooks
@@ -30,15 +31,15 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "1.3", features = ["postgres"] }
+hammerwork = { version = "1.4", features = ["postgres"] }
 # or
-hammerwork = { version = "1.3", features = ["mysql"] }
+hammerwork = { version = "1.4", features = ["mysql"] }
 
 # With distributed tracing
-hammerwork = { version = "1.3", features = ["postgres", "tracing"] }
+hammerwork = { version = "1.4", features = ["postgres", "tracing"] }
 
 # Minimal installation
-hammerwork = { version = "1.3", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.4", features = ["postgres"], default-features = false }
 ```
 
 **Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `tracing` (optional), `test` (for TestQueue)
@@ -51,7 +52,7 @@ cargo install hammerwork-web --features postgres
 
 # Or add to your project
 [dependencies]
-hammerwork-web = { version = "1.3", features = ["postgres"] }
+hammerwork-web = { version = "1.4", features = ["postgres"] }
 ```
 
 Start the dashboard:
@@ -72,6 +73,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 - **[Web Dashboard](hammerwork-web/README.md)** - Real-time web interface for queue monitoring and job management
 - **[Job Tracing & Correlation](docs/tracing.md)** - Distributed tracing, correlation IDs, and OpenTelemetry integration
 - **[Job Dependencies & Workflows](docs/workflows.md)** - Complex pipelines, job dependencies, and orchestration
+- **[Dynamic Job Spawning](docs/job-spawning.md)** - Fan-out processing, parent-child relationships, and spawn tree visualization
 - **[Job Archiving & Retention](docs/archiving.md)** - Policy-driven archival, compression, and compliance management
 - **[Job Types & Configuration](docs/job-types.md)** - Job creation, priorities, timeouts, cron jobs
 - **[Worker Configuration](docs/worker-configuration.md)** - Worker setup, rate limiting, statistics

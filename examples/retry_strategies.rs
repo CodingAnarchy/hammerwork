@@ -445,8 +445,7 @@ async fn demonstrate_worker_default_strategies(
 /// Demonstrate multiple strategies working together in a realistic scenario
 async fn demonstrate_mixed_strategies_in_action(
     queue: &Arc<ExampleJobQueue>,
-) -> Result<(), Box<dyn std::error::Error>>
-{
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("🎪 MIXED STRATEGIES IN ACTION");
     info!("Realistic example showing different retry strategies for different job types");
 

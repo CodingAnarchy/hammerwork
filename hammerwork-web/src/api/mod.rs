@@ -51,6 +51,7 @@
 pub mod archive;
 pub mod jobs;
 pub mod queues;
+pub mod spawn;
 pub mod stats;
 pub mod system;
 

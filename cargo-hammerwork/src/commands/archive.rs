@@ -11,19 +11,47 @@ pub enum ArchiveCommand {
     Run {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'q', long, help = "Queue name to archive (all queues if not specified)")]
+        #[arg(
+            short = 'q',
+            long,
+            help = "Queue name to archive (all queues if not specified)"
+        )]
         queue_name: Option<String>,
-        #[arg(long, default_value = "7", help = "Days to keep completed jobs before archiving")]
+        #[arg(
+            long,
+            default_value = "7",
+            help = "Days to keep completed jobs before archiving"
+        )]
         completed_after_days: u32,
-        #[arg(long, default_value = "30", help = "Days to keep failed jobs before archiving")]
+        #[arg(
+            long,
+            default_value = "30",
+            help = "Days to keep failed jobs before archiving"
+        )]
         failed_after_days: u32,
-        #[arg(long, default_value = "30", help = "Days to keep dead jobs before archiving")]
+        #[arg(
+            long,
+            default_value = "30",
+            help = "Days to keep dead jobs before archiving"
+        )]
         dead_after_days: u32,
-        #[arg(long, default_value = "30", help = "Days to keep timed out jobs before archiving")]
+        #[arg(
+            long,
+            default_value = "30",
+            help = "Days to keep timed out jobs before archiving"
+        )]
         timed_out_after_days: u32,
-        #[arg(long, default_value = "1000", help = "Maximum number of jobs to archive in one batch")]
+        #[arg(
+            long,
+            default_value = "1000",
+            help = "Maximum number of jobs to archive in one batch"
+        )]
         batch_size: usize,
-        #[arg(long, default_value = "true", help = "Whether to compress archived payloads")]
+        #[arg(
+            long,
+            default_value = "true",
+            help = "Whether to compress archived payloads"
+        )]
         compress: bool,
         #[arg(long, default_value = "6", help = "Compression level (0-9)")]
         compression_level: u32,
@@ -47,9 +75,19 @@ pub enum ArchiveCommand {
         database_url: Option<String>,
         #[arg(short = 'q', long, help = "Filter by queue name")]
         queue_name: Option<String>,
-        #[arg(short = 'l', long, default_value = "100", help = "Maximum number of jobs to list")]
+        #[arg(
+            short = 'l',
+            long,
+            default_value = "100",
+            help = "Maximum number of jobs to list"
+        )]
         limit: u32,
-        #[arg(short = 'o', long, default_value = "0", help = "Number of jobs to skip")]
+        #[arg(
+            short = 'o',
+            long,
+            default_value = "0",
+            help = "Number of jobs to skip"
+        )]
         offset: u32,
         #[arg(long, help = "Output format (table, json, csv)")]
         format: Option<String>,
@@ -215,15 +253,12 @@ impl ArchiveCommand {
             ArchiveCommand::GetPolicy {
                 queue_name, format, ..
             } => {
-                get_archival_policy(
-                    pool,
-                    queue_name,
-                    format.as_deref().unwrap_or("table"),
-                )
-                .await?;
+                get_archival_policy(pool, queue_name, format.as_deref().unwrap_or("table")).await?;
             }
             ArchiveCommand::RemovePolicy {
-                queue_name, confirm, ..
+                queue_name,
+                confirm,
+                ..
             } => {
                 remove_archival_policy(pool, queue_name, *confirm).await?;
             }
@@ -246,9 +281,7 @@ impl ArchiveCommand {
         .cloned()
         .or_else(|| config.get_database_url().map(|s| s.to_string()))
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Database URL not provided. Use --database-url or set in config file"
-            )
+            anyhow::anyhow!("Database URL not provided. Use --database-url or set in config file")
         })
     }
 }
@@ -268,9 +301,9 @@ async fn archive_jobs(
     reason: Option<&str>,
     archived_by: Option<&str>,
 ) -> Result<()> {
+    use chrono::Duration;
     use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason};
     use hammerwork::queue::DatabaseQueue;
-    use chrono::Duration;
 
     info!("Running job archival...");
 
@@ -392,7 +425,9 @@ async fn list_archived_jobs(
             println!("{}", serde_json::to_string_pretty(&archived_jobs)?);
         }
         "csv" => {
-            println!("id,queue_name,status,created_at,archived_at,reason,payload_compressed,archived_by");
+            println!(
+                "id,queue_name,status,created_at,archived_at,reason,payload_compressed,archived_by"
+            );
             for job in archived_jobs {
                 println!(
                     "{},{},{:?},{},{},{:?},{},{}",
@@ -409,7 +444,7 @@ async fn list_archived_jobs(
         }
         _ => {
             // Table format
-            use comfy_table::{presets::UTF8_FULL, Attribute, Cell, ContentArrangement, Table};
+            use comfy_table::{Attribute, Cell, ContentArrangement, Table, presets::UTF8_FULL};
 
             let mut table = Table::new();
             table
@@ -499,7 +534,10 @@ async fn purge_archived_jobs(
     use chrono::{Duration, Utc};
     use hammerwork::queue::DatabaseQueue;
 
-    info!("Purging archived jobs older than {} days...", older_than_days);
+    info!(
+        "Purging archived jobs older than {} days...",
+        older_than_days
+    );
 
     let cutoff_date = Utc::now() - Duration::days(older_than_days as i64);
 
@@ -510,7 +548,10 @@ async fn purge_archived_jobs(
     }
 
     if dry_run {
-        println!("DRY RUN: Would permanently delete archived jobs older than {}", cutoff_date);
+        println!(
+            "DRY RUN: Would permanently delete archived jobs older than {}",
+            cutoff_date
+        );
         return Ok(());
     }
 
@@ -606,11 +647,8 @@ mod tests {
             command: ArchiveCommand,
         }
 
-        let app = TestApp::try_parse_from(&[
-            "test",
-            "restore",
-            "550e8400-e29b-41d4-a716-446655440000",
-        ]);
+        let app =
+            TestApp::try_parse_from(&["test", "restore", "550e8400-e29b-41d4-a716-446655440000"]);
 
         assert!(app.is_ok());
     }

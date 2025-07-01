@@ -259,7 +259,8 @@ impl WebDashboard {
             .or(api::jobs::routes(queue.clone()))
             .or(api::stats::routes(queue.clone()))
             .or(api::system::routes(queue.clone()))
-            .or(api::archive::archive_routes(queue));
+            .or(api::archive::archive_routes(queue.clone()))
+            .or(api::spawn::spawn_routes(queue));
 
         let authenticated_api = warp::path("api")
             .and(auth_filter(auth_state))

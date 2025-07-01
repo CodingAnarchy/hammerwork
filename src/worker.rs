@@ -601,6 +601,8 @@ pub struct Worker<DB: Database> {
     batch_stats: Arc<std::sync::RwLock<BatchProcessingStats>>,
     /// Job lifecycle event hooks
     event_hooks: JobEventHooks,
+    /// Spawn manager for dynamic job spawning
+    spawn_manager: Option<Arc<crate::spawn::SpawnManager<DB>>>,
 }
 
 impl<DB: Database + Send + Sync + 'static> Clone for Worker<DB>
@@ -630,6 +632,7 @@ where
             batch_processing_enabled: self.batch_processing_enabled,
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
             event_hooks: self.event_hooks.clone(),
+            spawn_manager: self.spawn_manager.clone(),
         }
     }
 }
@@ -706,6 +709,7 @@ where
             batch_processing_enabled: false,
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
             event_hooks: JobEventHooks::default(),
+            spawn_manager: None,
         }
     }
 
@@ -774,6 +778,7 @@ where
             batch_processing_enabled: false,
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
             event_hooks: JobEventHooks::default(),
+            spawn_manager: None,
         }
     }
 
@@ -1111,6 +1116,44 @@ where
     /// ```
     pub fn with_event_hooks(mut self, hooks: JobEventHooks) -> Self {
         self.event_hooks = hooks;
+        self
+    }
+
+    /// Set a spawn manager for dynamic job spawning.
+    ///
+    /// The spawn manager handles creating child jobs when parent jobs complete successfully.
+    /// Jobs with registered spawn handlers will automatically spawn child jobs based on
+    /// their payload and configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `spawn_manager` - The spawn manager to use for this worker
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{Worker, spawn::SpawnManager};
+    /// use std::sync::Arc;
+    ///
+    /// # #[cfg(feature = "postgres")]
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // In real usage, you'd create a database connection pool
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
+    /// let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+    /// let mut spawn_manager: SpawnManager<sqlx::Postgres> = SpawnManager::new();
+    /// // Register spawn handlers...
+    ///
+    /// let worker = Worker::new(queue, "queue".to_string(), handler)
+    ///     .with_spawn_manager(Arc::new(spawn_manager));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_spawn_manager(
+        mut self,
+        spawn_manager: Arc<crate::spawn::SpawnManager<DB>>,
+    ) -> Self {
+        self.spawn_manager = Some(spawn_manager);
         self
     }
 
@@ -1559,6 +1602,54 @@ where
                             warn!("Failed to store job result for job {}: {}", job_id, e);
                         } else {
                             debug!("Stored result for job {}", job_id);
+                        }
+                    }
+                }
+
+                // Handle job spawning if spawn manager is configured
+                if let Some(spawn_manager) = &self.spawn_manager {
+                    // Check if spawn config is present in job payload
+                    if let Some(spawn_config_value) = job.payload.get("_spawn_config") {
+                        if let Ok(spawn_config) = serde_json::from_value::<crate::spawn::SpawnConfig>(
+                            spawn_config_value.clone(),
+                        ) {
+                            match spawn_manager
+                                .execute_spawn(job.clone(), spawn_config, self.queue.clone())
+                                .await
+                            {
+                                Ok(Some(spawn_result)) => {
+                                    info!(
+                                        "Job {} spawned {} child jobs: {:?}",
+                                        job_id,
+                                        spawn_result.spawned_jobs.len(),
+                                        spawn_result.spawned_jobs
+                                    );
+
+                                    // Call spawn completion hook if present
+                                    if let Some(ref hook) = self.event_hooks.on_job_complete {
+                                        let hook_event = JobHookEvent {
+                                            job: job.clone(),
+                                            timestamp: Utc::now(),
+                                            duration: Some(Duration::from_millis(
+                                                processing_time_ms,
+                                            )),
+                                            error: None,
+                                        };
+                                        hook(hook_event);
+                                    }
+                                }
+                                Ok(None) => {
+                                    debug!(
+                                        "No spawn handler registered for job type: {}",
+                                        job.queue_name
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Failed to spawn child jobs for job {}: {}", job_id, e);
+                                }
+                            }
+                        } else {
+                            debug!("Invalid spawn config in job payload for job {}", job_id);
                         }
                     }
                 }

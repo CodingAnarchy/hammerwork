@@ -6,6 +6,7 @@ A modern, real-time web-based admin dashboard for monitoring and managing [Hamme
 
 - **Real-time Monitoring**: Live updates via WebSockets for queue statistics, job status, and system health
 - **Job Management**: View, retry, cancel, and inspect jobs with detailed payload and error information
+- **Spawn Operation Management**: Monitor job spawning, visualize parent-child relationships, and track spawn trees
 - **Job Archive Management**: Archive, restore, and purge jobs with configurable retention policies
 - **Queue Administration**: Monitor queue performance, clear queues, and manage queue priorities
 - **Archive Statistics**: Track storage savings, compression ratios, and archival operations
@@ -184,6 +185,16 @@ curl -u admin:password http://localhost:8080/api/stats/overview
 - `POST /api/archive/jobs/{id}/restore` - Restore an archived job to pending status
 - `DELETE /api/archive/purge` - Permanently purge old archived jobs
 - `GET /api/archive/stats?queue=email` - Get archive statistics and metrics
+
+#### Spawn Operations
+- `GET /api/spawn/info` - List available spawn API endpoints
+- `GET /api/jobs/{id}/children?include_grandchildren=true` - List spawned child jobs
+- `GET /api/jobs/{id}/parent` - Get parent job information
+- `GET /api/jobs/{id}/spawn-tree?format=json&max_depth=5` - Get complete spawn hierarchy
+- `GET /api/spawn/operations?limit=50` - List spawn operations
+- `GET /api/spawn/operations/{id}` - Get spawn operation details
+- `POST /api/jobs/{id}/spawn` - Manually trigger spawn operation
+- `GET /api/spawn/stats?queue=data_processing` - Get spawn operation statistics
 
 ### WebSocket API
 

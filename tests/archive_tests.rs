@@ -1,10 +1,10 @@
 mod test_utils;
 
-use hammerwork::{Job, JobStatus};
+use chrono::{Duration, Utc};
 use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason};
 use hammerwork::queue::DatabaseQueue;
+use hammerwork::{Job, JobStatus};
 use serde_json::json;
-use chrono::{Duration, Utc};
 
 #[cfg(feature = "postgres")]
 mod postgres_archive_tests {
@@ -16,8 +16,10 @@ mod postgres_archive_tests {
         let queue = test_utils::setup_postgres_queue().await;
 
         // Create completed and failed jobs with different ages
-        let completed_job_old = Job::new("test_queue".to_string(), json!({"type": "completed_old"}));
-        let completed_job_new = Job::new("test_queue".to_string(), json!({"type": "completed_new"}));
+        let completed_job_old =
+            Job::new("test_queue".to_string(), json!({"type": "completed_old"}));
+        let completed_job_new =
+            Job::new("test_queue".to_string(), json!({"type": "completed_new"}));
         let failed_job_old = Job::new("test_queue".to_string(), json!({"type": "failed_old"}));
         let failed_job_new = Job::new("test_queue".to_string(), json!({"type": "failed_new"}));
 
@@ -32,27 +34,36 @@ mod postgres_archive_tests {
         queue.complete_job(completed_job_new.id).await.unwrap();
 
         // Fail the failed jobs
-        queue.fail_job(failed_job_old.id, "Test failure").await.unwrap();
-        queue.fail_job(failed_job_new.id, "Test failure").await.unwrap();
+        queue
+            .fail_job(failed_job_old.id, "Test failure")
+            .await
+            .unwrap();
+        queue
+            .fail_job(failed_job_new.id, "Test failure")
+            .await
+            .unwrap();
 
         let config = ArchivalConfig::new().with_compression_level(6);
 
         // For testing, we'll use a very short duration to trigger archival
         let archival_policy = ArchivalPolicy::new()
-            .archive_completed_after(Duration::seconds(0))  // Archive immediately
-            .archive_failed_after(Duration::days(1))  // Don't archive failed jobs yet
+            .archive_completed_after(Duration::seconds(0)) // Archive immediately
+            .archive_failed_after(Duration::days(1)) // Don't archive failed jobs yet
             .with_batch_size(100)
             .compress_archived_payloads(true)
             .enabled(true);
 
         // Archive jobs
-        let stats = queue.archive_jobs(
-            Some("test_queue"),
-            &archival_policy,
-            &config,
-            ArchivalReason::Manual,
-            Some("test_user")
-        ).await.unwrap();
+        let stats = queue
+            .archive_jobs(
+                Some("test_queue"),
+                &archival_policy,
+                &config,
+                ArchivalReason::Manual,
+                Some("test_user"),
+            )
+            .await
+            .unwrap();
 
         // Should have archived the completed jobs
         assert_eq!(stats.jobs_archived, 2);
@@ -94,13 +105,16 @@ mod postgres_archive_tests {
             .enabled(true);
         let config = ArchivalConfig::new();
 
-        let stats = queue.archive_jobs(
-            Some("restore_test"),
-            &policy,
-            &config,
-            ArchivalReason::Manual,
-            Some("test")
-        ).await.unwrap();
+        let stats = queue
+            .archive_jobs(
+                Some("restore_test"),
+                &policy,
+                &config,
+                ArchivalReason::Manual,
+                Some("test"),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(stats.jobs_archived, 1);
 
@@ -128,12 +142,14 @@ mod postgres_archive_tests {
         let queue = test_utils::setup_postgres_queue().await;
 
         // Create multiple jobs in different queues
-        let jobs: Vec<Job> = (0..5).map(|i| {
-            Job::new(
-                format!("list_test_{}", i % 2), // Alternate between two queues
-                json!({"index": i})
-            )
-        }).collect();
+        let jobs: Vec<Job> = (0..5)
+            .map(|i| {
+                Job::new(
+                    format!("list_test_{}", i % 2), // Alternate between two queues
+                    json!({"index": i}),
+                )
+            })
+            .collect();
 
         // Enqueue and complete all jobs
         for job in &jobs {
@@ -148,30 +164,48 @@ mod postgres_archive_tests {
             .enabled(true);
         let config = ArchivalConfig::new();
 
-        let stats = queue.archive_jobs(
-            None, // Archive from all queues
-            &policy,
-            &config,
-            ArchivalReason::Automatic,
-            None
-        ).await.unwrap();
+        let stats = queue
+            .archive_jobs(
+                None, // Archive from all queues
+                &policy,
+                &config,
+                ArchivalReason::Automatic,
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(stats.jobs_archived, 5);
 
         // List all archived jobs
-        let all_archived = queue.list_archived_jobs(None, Some(10), Some(0)).await.unwrap();
+        let all_archived = queue
+            .list_archived_jobs(None, Some(10), Some(0))
+            .await
+            .unwrap();
         assert!(all_archived.len() >= 5); // May have more from other tests
 
         // List archived jobs from specific queue
-        let queue_0_archived = queue.list_archived_jobs(Some("list_test_0"), Some(10), Some(0)).await.unwrap();
+        let queue_0_archived = queue
+            .list_archived_jobs(Some("list_test_0"), Some(10), Some(0))
+            .await
+            .unwrap();
         assert_eq!(queue_0_archived.len(), 3); // Jobs 0, 2, 4
 
-        let queue_1_archived = queue.list_archived_jobs(Some("list_test_1"), Some(10), Some(0)).await.unwrap();
+        let queue_1_archived = queue
+            .list_archived_jobs(Some("list_test_1"), Some(10), Some(0))
+            .await
+            .unwrap();
         assert_eq!(queue_1_archived.len(), 2); // Jobs 1, 3
 
         // Test pagination
-        let first_page = queue.list_archived_jobs(None, Some(2), Some(0)).await.unwrap();
-        let second_page = queue.list_archived_jobs(None, Some(2), Some(2)).await.unwrap();
+        let first_page = queue
+            .list_archived_jobs(None, Some(2), Some(0))
+            .await
+            .unwrap();
+        let second_page = queue
+            .list_archived_jobs(None, Some(2), Some(2))
+            .await
+            .unwrap();
         assert_eq!(first_page.len(), 2);
         assert!(second_page.len() >= 2);
 
@@ -192,10 +226,10 @@ mod postgres_archive_tests {
         // Create jobs with different statuses
         let completed_job = Job::new("stats_test".to_string(), json!({"type": "completed"}));
         let failed_job = Job::new("stats_test".to_string(), json!({"type": "failed"}));
-        
+
         queue.enqueue(completed_job.clone()).await.unwrap();
         queue.enqueue(failed_job.clone()).await.unwrap();
-        
+
         queue.complete_job(completed_job.id).await.unwrap();
         queue.fail_job(failed_job.id, "Test error").await.unwrap();
 
@@ -207,13 +241,16 @@ mod postgres_archive_tests {
             .enabled(true);
         let config = ArchivalConfig::new().with_compression_level(9);
 
-        let archive_stats = queue.archive_jobs(
-            Some("stats_test"),
-            &policy,
-            &config,
-            ArchivalReason::Compliance,
-            Some("compliance_user")
-        ).await.unwrap();
+        let archive_stats = queue
+            .archive_jobs(
+                Some("stats_test"),
+                &policy,
+                &config,
+                ArchivalReason::Compliance,
+                Some("compliance_user"),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(archive_stats.jobs_archived, 2);
 
@@ -235,9 +272,9 @@ mod postgres_archive_tests {
         let queue = test_utils::setup_postgres_queue().await;
 
         // Create and archive some jobs
-        let jobs: Vec<Job> = (0..3).map(|i| {
-            Job::new("purge_test".to_string(), json!({"index": i}))
-        }).collect();
+        let jobs: Vec<Job> = (0..3)
+            .map(|i| Job::new("purge_test".to_string(), json!({"index": i})))
+            .collect();
 
         for job in &jobs {
             queue.enqueue(job.clone()).await.unwrap();
@@ -250,18 +287,24 @@ mod postgres_archive_tests {
             .enabled(true);
         let config = ArchivalConfig::new();
 
-        let stats = queue.archive_jobs(
-            Some("purge_test"),
-            &policy,
-            &config,
-            ArchivalReason::Manual,
-            Some("test")
-        ).await.unwrap();
+        let stats = queue
+            .archive_jobs(
+                Some("purge_test"),
+                &policy,
+                &config,
+                ArchivalReason::Manual,
+                Some("test"),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(stats.jobs_archived, 3);
 
         // Verify jobs are archived
-        let archived_list = queue.list_archived_jobs(Some("purge_test"), Some(10), Some(0)).await.unwrap();
+        let archived_list = queue
+            .list_archived_jobs(Some("purge_test"), Some(10), Some(0))
+            .await
+            .unwrap();
         assert_eq!(archived_list.len(), 3);
 
         // Purge archived jobs older than now (should delete all test jobs)
@@ -270,7 +313,10 @@ mod postgres_archive_tests {
         assert_eq!(purged_count, 3);
 
         // Verify jobs are purged
-        let archived_list_after = queue.list_archived_jobs(Some("purge_test"), Some(10), Some(0)).await.unwrap();
+        let archived_list_after = queue
+            .list_archived_jobs(Some("purge_test"), Some(10), Some(0))
+            .await
+            .unwrap();
         assert_eq!(archived_list_after.len(), 0);
     }
 
@@ -300,13 +346,16 @@ mod postgres_archive_tests {
             .enabled(true);
         let config_compressed = ArchivalConfig::new().with_compression_level(9);
 
-        let stats_compressed = queue.archive_jobs(
-            Some("compression_test"),
-            &policy_compressed,
-            &config_compressed,
-            ArchivalReason::Manual,
-            Some("test")
-        ).await.unwrap();
+        let stats_compressed = queue
+            .archive_jobs(
+                Some("compression_test"),
+                &policy_compressed,
+                &config_compressed,
+                ArchivalReason::Manual,
+                Some("test"),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(stats_compressed.jobs_archived, 1);
         assert!(stats_compressed.compression_ratio < 1.0); // Should be compressed
@@ -340,28 +389,31 @@ mod postgres_archive_tests {
         // Set different final statuses
         queue.complete_job(completed_job.id).await.unwrap();
         queue.fail_job(failed_job.id, "Test failure").await.unwrap();
-        
+
         // Simulate dead and timed out jobs by updating directly
         // In a real scenario, these would be set by the worker processes
         // For testing, we'll just test with completed and failed jobs
 
         // Create policy that archives different statuses at different intervals
         let policy = ArchivalPolicy::new()
-            .archive_completed_after(Duration::seconds(0))  // Archive completed immediately
-            .archive_failed_after(Duration::days(1))        // Don't archive failed yet
-            .archive_dead_after(Duration::seconds(0))       // Archive dead immediately
-            .archive_timed_out_after(Duration::seconds(0))  // Archive timed out immediately
+            .archive_completed_after(Duration::seconds(0)) // Archive completed immediately
+            .archive_failed_after(Duration::days(1)) // Don't archive failed yet
+            .archive_dead_after(Duration::seconds(0)) // Archive dead immediately
+            .archive_timed_out_after(Duration::seconds(0)) // Archive timed out immediately
             .enabled(true);
 
         let config = ArchivalConfig::new();
 
-        let stats = queue.archive_jobs(
-            Some("status_test"),
-            &policy,
-            &config,
-            ArchivalReason::Automatic,
-            None
-        ).await.unwrap();
+        let stats = queue
+            .archive_jobs(
+                Some("status_test"),
+                &policy,
+                &config,
+                ArchivalReason::Automatic,
+                None,
+            )
+            .await
+            .unwrap();
 
         // Should only archive completed job (failed job has longer retention)
         assert_eq!(stats.jobs_archived, 1);
@@ -392,7 +444,7 @@ mod mysql_archive_tests {
         // Create and complete a job
         let job = Job::new("mysql_test".to_string(), json!({"message": "MySQL test"}));
         let job_id = job.id;
-        
+
         queue.enqueue(job).await.unwrap();
         queue.complete_job(job_id).await.unwrap();
 
@@ -403,13 +455,16 @@ mod mysql_archive_tests {
             .enabled(true);
         let config = ArchivalConfig::new();
 
-        let stats = queue.archive_jobs(
-            Some("mysql_test"),
-            &policy,
-            &config,
-            ArchivalReason::Manual,
-            Some("mysql_test_user")
-        ).await.unwrap();
+        let stats = queue
+            .archive_jobs(
+                Some("mysql_test"),
+                &policy,
+                &config,
+                ArchivalReason::Manual,
+                Some("mysql_test_user"),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(stats.jobs_archived, 1);
         assert!(stats.bytes_archived > 0);
@@ -434,9 +489,9 @@ mod mysql_archive_tests {
         let queue = test_utils::setup_mysql_queue().await;
 
         // Create multiple jobs
-        let jobs: Vec<Job> = (0..4).map(|i| {
-            Job::new("mysql_stats".to_string(), json!({"index": i}))
-        }).collect();
+        let jobs: Vec<Job> = (0..4)
+            .map(|i| Job::new("mysql_stats".to_string(), json!({"index": i})))
+            .collect();
 
         for job in &jobs {
             queue.enqueue(job.clone()).await.unwrap();
@@ -450,13 +505,16 @@ mod mysql_archive_tests {
             .enabled(true);
         let config = ArchivalConfig::new().with_compression_level(6);
 
-        let archive_stats = queue.archive_jobs(
-            Some("mysql_stats"),
-            &policy,
-            &config,
-            ArchivalReason::Compliance,
-            Some("mysql_user")
-        ).await.unwrap();
+        let archive_stats = queue
+            .archive_jobs(
+                Some("mysql_stats"),
+                &policy,
+                &config,
+                ArchivalReason::Compliance,
+                Some("mysql_user"),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(archive_stats.jobs_archived, 4);
 

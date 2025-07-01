@@ -5,22 +5,6 @@ This roadmap outlines planned features for Hammerwork, prioritized by impact lev
 ## Phase 2: Medium Impact, Variable Complexity
 *Valuable features for specific use cases or operational efficiency*
 
-### ⚡ Dynamic Job Spawning
-**Impact: Medium** | **Complexity: Medium-High** | **Priority: Medium**
-
-Useful for fan-out processing patterns and dynamic workloads.
-
-```rust
-// Jobs that create other jobs
-let parent_job = Job::new("process_files".to_string(), file_list)
-    .with_spawn_handler(|job| {
-        // Spawn child jobs for each file
-        job.payload.files.iter().map(|file| {
-            Job::new("process_file".to_string(), json!({"file": file}))
-        }).collect()
-    });
-```
-
 ### 🔌 Webhook & Event Streaming
 **Impact: Medium** | **Complexity: Medium** | **Priority: Medium**
 
@@ -162,7 +146,6 @@ let geo_config = GeoReplicationConfig::new()
 Features are ordered within each phase by priority and should generally be implemented in the following sequence:
 
 **Phase 1 (Operational Features)**
-1. Dynamic Job Spawning
 2. Webhook & Event Streaming
 
 **Phase 2 (Enterprise Features)**

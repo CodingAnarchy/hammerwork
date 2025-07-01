@@ -354,3 +354,284 @@ mod error_handling_tests {
         assert_eq!(safe_limit, 50);
     }
 }
+
+#[cfg(test)]
+mod spawn_query_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_spawn_list_queries() -> Result<()> {
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:hammerwork@localhost:5433/hammerwork".to_string()
+        });
+
+        let pool = PgPool::connect(&database_url).await?;
+
+        // Test spawn operations listing query
+        let query = r#"
+            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
+                   parent.payload->'_spawn_config' as spawn_config,
+                   COUNT(child.id) as spawned_count,
+                   parent.workflow_id, parent.workflow_name
+            FROM hammerwork_jobs parent
+            LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('["', parent.id, '"]')::jsonb
+            WHERE parent.payload ? '_spawn_config' 
+                  AND parent.status IN ('Completed', 'Running')
+            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload, parent.workflow_id, parent.workflow_name
+            ORDER BY parent.created_at DESC
+            LIMIT 20
+        "#;
+
+        let rows = sqlx::query(query).fetch_all(&pool).await?;
+        // Should succeed even if no spawn operations exist
+        assert!(rows.len() >= 0);
+
+        // Test with recent filter
+        let query_recent = r#"
+            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
+                   parent.payload->'_spawn_config' as spawn_config,
+                   COUNT(child.id) as spawned_count
+            FROM hammerwork_jobs parent
+            LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('["', parent.id, '"]')::jsonb
+            WHERE parent.payload ? '_spawn_config' 
+                  AND parent.status IN ('Completed', 'Running')
+                  AND parent.created_at > NOW() - INTERVAL '1 hour'
+            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
+            ORDER BY parent.created_at DESC
+            LIMIT 10
+        "#;
+
+        let rows = sqlx::query(query_recent).fetch_all(&pool).await?;
+        // Verify query executes without error
+        assert!(rows.len() >= 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_spawn_stats_queries() -> Result<()> {
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:hammerwork@localhost:5433/hammerwork".to_string()
+        });
+
+        let pool = PgPool::connect(&database_url).await?;
+
+        // Test spawn statistics aggregation
+        let query = r#"
+            SELECT COUNT(*) as total_spawn_ops,
+                   AVG(spawned_count) as avg_children,
+                   MAX(spawned_count) as max_children
+            FROM (
+                SELECT parent.id, COUNT(child.id) as spawned_count
+                FROM hammerwork_jobs parent
+                LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('["', parent.id, '"]')::jsonb
+                WHERE parent.payload ? '_spawn_config'
+                      AND parent.created_at > NOW() - INTERVAL '24 hours'
+                GROUP BY parent.id
+            ) spawn_stats
+        "#;
+
+        let row = sqlx::query(query).fetch_one(&pool).await?;
+        let total: i64 = row.get("total_spawn_ops");
+        assert!(total >= 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_spawn_list_queries() -> Result<()> {
+        let database_url = std::env::var("MYSQL_DATABASE_URL").unwrap_or_else(|_| {
+            "mysql://root:hammerwork@localhost:3307/hammerwork".to_string()
+        });
+
+        let pool = MySqlPool::connect(&database_url).await?;
+
+        // Test MySQL spawn operations listing query
+        let query = r#"
+            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
+                   JSON_EXTRACT(parent.payload, '$._spawn_config') as spawn_config,
+                   COUNT(child.id) as spawned_count,
+                   parent.workflow_id, parent.workflow_name
+            FROM hammerwork_jobs parent
+            LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
+            WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
+                  AND parent.status IN ('Completed', 'Running')
+            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload, parent.workflow_id, parent.workflow_name
+            ORDER BY parent.created_at DESC
+            LIMIT 20
+        "#;
+
+        let rows = sqlx::query(query).fetch_all(&pool).await?;
+        // Should succeed even if no spawn operations exist
+        assert!(rows.len() >= 0);
+
+        // Test with recent filter using MySQL syntax
+        let query_recent = r#"
+            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
+                   JSON_EXTRACT(parent.payload, '$._spawn_config') as spawn_config,
+                   COUNT(child.id) as spawned_count
+            FROM hammerwork_jobs parent
+            LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
+            WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
+                  AND parent.status IN ('Completed', 'Running')
+                  AND parent.created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
+            ORDER BY parent.created_at DESC
+            LIMIT 10
+        "#;
+
+        let rows = sqlx::query(query_recent).fetch_all(&pool).await?;
+        // Verify query executes without error
+        assert!(rows.len() >= 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_spawn_stats_queries() -> Result<()> {
+        let database_url = std::env::var("MYSQL_DATABASE_URL").unwrap_or_else(|_| {
+            "mysql://root:hammerwork@localhost:3307/hammerwork".to_string()
+        });
+
+        let pool = MySqlPool::connect(&database_url).await?;
+
+        // Test MySQL spawn statistics aggregation
+        let query = r#"
+            SELECT COUNT(*) as total_spawn_ops,
+                   AVG(spawned_count) as avg_children,
+                   MAX(spawned_count) as max_children
+            FROM (
+                SELECT parent.id, COUNT(child.id) as spawned_count
+                FROM hammerwork_jobs parent
+                LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
+                WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
+                      AND parent.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                GROUP BY parent.id
+            ) spawn_stats
+        "#;
+
+        let row = sqlx::query(query).fetch_one(&pool).await?;
+        let total: i64 = row.get("total_spawn_ops");
+        assert!(total >= 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spawn_query_building_postgres() {
+        // Test PostgreSQL spawn query building
+        let recent = true;
+        let queue_filter = Some("spawn_queue");
+        let limit = 20u32;
+
+        let mut query = r#"
+            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
+                   parent.payload->'_spawn_config' as spawn_config,
+                   COUNT(child.id) as spawned_count
+            FROM hammerwork_jobs parent
+            LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('["', parent.id, '"]')::jsonb
+            WHERE parent.payload ? '_spawn_config' 
+                  AND parent.status IN ('Completed', 'Running')"#.to_string();
+
+        if recent {
+            query.push_str(" AND parent.created_at > NOW() - INTERVAL '1 hour'");
+        }
+
+        if let Some(queue) = queue_filter {
+            query.push_str(&format!(" AND parent.queue_name = '{}'", queue));
+        }
+
+        query.push_str(r#"
+            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
+            ORDER BY parent.created_at DESC"#);
+        
+        query.push_str(&format!(" LIMIT {}", limit));
+
+        // Verify query structure
+        assert!(query.contains("payload ? '_spawn_config'"));
+        assert!(query.contains("depends_on @>"));
+        assert!(query.contains("INTERVAL '1 hour'"));
+        assert!(query.contains("parent.queue_name = 'spawn_queue'"));
+        assert!(query.contains("LIMIT 20"));
+    }
+
+    #[test]
+    fn test_spawn_query_building_mysql() {
+        // Test MySQL spawn query building
+        let recent = true;
+        let queue_filter = Some("spawn_queue");
+        let limit = 20u32;
+
+        let mut query = r#"
+            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
+                   JSON_EXTRACT(parent.payload, '$._spawn_config') as spawn_config,
+                   COUNT(child.id) as spawned_count
+            FROM hammerwork_jobs parent
+            LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
+            WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
+                  AND parent.status IN ('Completed', 'Running')"#.to_string();
+
+        if recent {
+            query.push_str(" AND parent.created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)");
+        }
+
+        if let Some(queue) = queue_filter {
+            query.push_str(&format!(" AND parent.queue_name = '{}'", queue));
+        }
+
+        query.push_str(r#"
+            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
+            ORDER BY parent.created_at DESC"#);
+        
+        query.push_str(&format!(" LIMIT {}", limit));
+
+        // Verify query structure
+        assert!(query.contains("JSON_EXTRACT(parent.payload, '$._spawn_config')"));
+        assert!(query.contains("JSON_CONTAINS(child.depends_on"));
+        assert!(query.contains("DATE_SUB(NOW(), INTERVAL 1 HOUR)"));
+        assert!(query.contains("parent.queue_name = 'spawn_queue'"));
+        assert!(query.contains("LIMIT 20"));
+    }
+
+    #[test]
+    fn test_spawn_tree_query_building() {
+        // Test spawn tree query construction
+        let job_id = "550e8400-e29b-41d4-a716-446655440000";
+        
+        let postgres_query = format!(
+            r#"
+            SELECT id, queue_name, status, depends_on,
+                   payload->'_spawn_config' as spawn_config,
+                   created_at, workflow_id, workflow_name
+            FROM hammerwork_jobs
+            WHERE depends_on @> '["{}"]'
+            ORDER BY created_at
+            "#,
+            job_id
+        );
+
+        let mysql_query = format!(
+            r#"
+            SELECT id, queue_name, status, depends_on,
+                   JSON_EXTRACT(payload, '$._spawn_config') as spawn_config,
+                   created_at, workflow_id, workflow_name
+            FROM hammerwork_jobs
+            WHERE JSON_CONTAINS(depends_on, '"{}"')
+            ORDER BY created_at
+            "#,
+            job_id
+        );
+
+        // Verify both queries contain the job ID
+        assert!(postgres_query.contains(&job_id));
+        assert!(mysql_query.contains(&job_id));
+        
+        // Verify database-specific syntax
+        assert!(postgres_query.contains("@>"));
+        assert!(mysql_query.contains("JSON_CONTAINS"));
+    }
+}

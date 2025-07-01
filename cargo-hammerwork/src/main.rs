@@ -96,6 +96,12 @@ enum Commands {
         #[command(subcommand)]
         command: ArchiveCommand,
     },
+
+    #[command(about = "Job spawning operations and spawn tree management")]
+    Spawn {
+        #[command(subcommand)]
+        command: SpawnCommand,
+    },
 }
 
 #[tokio::main]
@@ -199,6 +205,9 @@ async fn execute_command(command: &Commands, config: &mut Config) -> Result<()> 
         }
         Commands::Archive { command } => {
             command.execute(config).await?;
+        }
+        Commands::Spawn { command } => {
+            command.execute(config.clone()).await?;
         }
     }
 

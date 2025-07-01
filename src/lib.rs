@@ -108,6 +108,7 @@ pub mod priority;
 pub mod queue;
 pub mod rate_limit;
 pub mod retry;
+pub mod spawn;
 pub mod stats;
 pub mod tracing;
 pub mod worker;
@@ -132,6 +133,7 @@ pub use priority::{
 pub use queue::JobQueue;
 pub use rate_limit::{RateLimit, RateLimiter, ThrottleConfig};
 pub use retry::{JitterType, RetryStrategy, fibonacci};
+pub use spawn::{JobSpawnExt, SpawnConfig, SpawnHandler, SpawnManager, SpawnResult};
 pub use stats::{
     DeadJobSummary, InMemoryStatsCollector, JobStatistics, QueueStats, StatisticsCollector,
 };
