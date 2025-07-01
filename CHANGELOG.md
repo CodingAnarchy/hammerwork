@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2025-07-01
+
+### Added
+- **🧪 Comprehensive TestQueue Implementation**
+  - Complete in-memory test implementation of DatabaseQueue trait for unit testing
+  - MockClock for deterministic time-based testing of delayed jobs and cron schedules
+  - Full support for all queue operations: enqueue, dequeue, batch operations, workflows, cron jobs
+  - Priority-aware job selection with weighted and strict priority algorithms
+  - Job dependency management and workflow execution testing
+  - Comprehensive statistics and monitoring capabilities for test scenarios
+
+### Enhanced
+- **⚡ TestQueue Feature Completeness**
+  - Delayed job execution with time control using MockClock
+  - Batch operations with PartialFailureMode support (ContinueOnError, FailFast)
+  - Workflow dependency resolution and cancellation policies
+  - Cron job scheduling with timezone support (6-field cron expressions)
+  - Dead job management with purging and retry capabilities
+  - Job result storage with expiration and cleanup
+  - Throttling configuration management
+  - Queue statistics with accurate failed/dead job counting
+
+### Fixed
+- **🐛 TestQueue Core Functionality**
+  - Fixed job scheduling timestamp logic to use MockClock consistently across all enqueue methods
+  - Fixed retry logic off-by-one error where jobs required 4 failures instead of 3 to become dead
+  - Fixed workflow fail-fast policy implementation to automatically fail related jobs
+  - Fixed workflow status preservation for cancelled workflows
+  - Fixed dead job purging time comparison logic (changed from `<` to `<=`)
+  - Fixed cron job scheduling to use 6-field format with seconds
+  - Fixed queue statistics to count Dead jobs as failed for reporting purposes
+
+### Technical Implementation
+- All 19 TestQueue integration tests now passing
+- Proper mock clock integration across enqueue, batch, and workflow operations  
+- Fail-fast logic implementation for both workflows and batches
+- Comprehensive error handling and status management
+- Support for complex job dependency graphs and workflow execution
+- Full compatibility with DatabaseQueue trait for drop-in testing
+
 ## [1.2.1] - 2025-06-30
 
 ### Fixed

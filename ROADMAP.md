@@ -21,24 +21,6 @@ let archival_policy = ArchivalPolicy::new()
 queue.set_archival_policy(archival_policy).await?;
 ```
 
-### 🔧 Job Testing & Simulation
-**Impact: Medium** | **Complexity: Medium** | **Priority: Medium**
-
-Valuable for development and testing workflows.
-
-```rust
-// Test job handlers without database
-let test_queue = TestQueue::new()
-    .with_mock_dependencies()
-    .with_time_control(); // Fast-forward time for testing
-
-// Job simulation and load testing
-let load_test = LoadTest::new()
-    .with_job_template(job_template)
-    .with_rate(100) // 100 jobs/second
-    .with_duration(Duration::from_minutes(10))
-    .run().await?;
-```
 
 ### ⚡ Dynamic Job Spawning
 **Impact: Medium** | **Complexity: Medium-High** | **Priority: Medium**

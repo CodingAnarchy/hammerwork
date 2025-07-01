@@ -32,7 +32,7 @@ pub type JobId = Uuid;
 /// let is_final = matches!(status, JobStatus::Completed | JobStatus::Dead | JobStatus::TimedOut);
 /// assert!(is_final);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum JobStatus {
     /// Job is waiting to be processed by a worker.
     Pending,

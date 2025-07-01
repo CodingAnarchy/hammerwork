@@ -22,6 +22,9 @@ pub mod postgres;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 
+#[cfg(feature = "test")]
+pub mod test;
+
 /// The main trait defining database operations for the job queue.
 ///
 /// This trait provides a database-agnostic interface for all job queue operations,

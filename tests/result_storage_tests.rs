@@ -3,7 +3,7 @@
 mod test_utils;
 
 use hammerwork::{
-    Job, Worker, WorkerPool, JobStatus,
+    Job, JobStatus, Worker, WorkerPool,
     job::{ResultConfig, ResultStorage},
     queue::DatabaseQueue,
     worker::{JobHandler, JobHandlerWithResult, JobResult},
@@ -143,8 +143,7 @@ mod postgres_tests {
         });
 
         // Create worker with result handler
-        let worker =
-            Worker::new_with_result_handler(queue.clone(), unique_queue.clone(), handler);
+        let worker = Worker::new_with_result_handler(queue.clone(), unique_queue.clone(), handler);
 
         // Create a job with result storage enabled
         let job = Job::new(unique_queue, json!({"task_id": 123}))
@@ -164,10 +163,10 @@ mod postgres_tests {
         let mut attempts = 0;
         let max_attempts = 40; // Wait up to 20 seconds
         let mut job_completed = false;
-        
+
         while attempts < max_attempts {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            
+
             // Check if job is completed
             if let Some(job) = queue.get_job(job_id).await.unwrap() {
                 if job.status == JobStatus::Completed {
@@ -177,13 +176,16 @@ mod postgres_tests {
             }
             attempts += 1;
         }
-        
+
         // Ensure job was completed
         assert!(job_completed, "Job should have completed within timeout");
 
         // Verify result was automatically stored
         let stored_result = queue.get_job_result(job_id).await.unwrap();
-        assert!(stored_result.is_some(), "Job result should be stored after completion");
+        assert!(
+            stored_result.is_some(),
+            "Job result should be stored after completion"
+        );
 
         let result = stored_result.unwrap();
         assert_eq!(result["task_id"], 123);
@@ -226,7 +228,7 @@ mod postgres_tests {
         let max_attempts = 20; // Wait up to 10 seconds
         while attempts < max_attempts {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            
+
             // Check if job is completed
             if let Some(job) = queue.get_job(job_id).await.unwrap() {
                 if job.status == JobStatus::Completed {
@@ -238,7 +240,10 @@ mod postgres_tests {
 
         // Verify no result was stored (legacy handler returns no data)
         let stored_result = queue.get_job_result(job_id).await.unwrap();
-        assert!(stored_result.is_none(), "Legacy handler should not store result data");
+        assert!(
+            stored_result.is_none(),
+            "Legacy handler should not store result data"
+        );
 
         worker_handle.abort();
     }
