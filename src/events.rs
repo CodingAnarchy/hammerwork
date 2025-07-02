@@ -1204,8 +1204,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_manager_buffer_overflow() {
-        let mut config = EventConfig::default();
-        config.max_buffer_size = 2; // Very small buffer
+        let config = EventConfig {
+            max_buffer_size: 2, // Very small buffer
+            ..Default::default()
+        };
         let manager = EventManager::new(config);
 
         // Don't create any subscriptions so events accumulate in buffer

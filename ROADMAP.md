@@ -2,40 +2,6 @@
 
 This roadmap outlines planned features for Hammerwork, prioritized by impact level and implementation complexity. Features are organized into phases based on their value proposition to users and estimated development effort.
 
-## Phase 2: Medium Impact, Variable Complexity
-*Valuable features for specific use cases or operational efficiency*
-
-### 📡 Real-time Archive WebSocket Events
-**Impact: Low-Medium** | **Complexity: Low** | **Priority: Low**
-
-Enhance the web dashboard with real-time updates for archive operations.
-
-```rust
-// WebSocket events for archive operations
-#[derive(Serialize)]
-enum ArchiveEvent {
-    JobArchived { job_id: JobId, queue: String, reason: ArchivalReason },
-    JobRestored { job_id: JobId, queue: String, restored_by: Option<String> },
-    BulkArchiveStarted { operation_id: String, estimated_jobs: u64 },
-    BulkArchiveProgress { operation_id: String, jobs_processed: u64, total: u64 },
-    BulkArchiveCompleted { operation_id: String, stats: ArchivalStats },
-    JobsPurged { count: u64, older_than: DateTime<Utc> },
-}
-
-// Real-time dashboard updates
-websocket.send_event(ArchiveEvent::JobArchived {
-    job_id: job.id,
-    queue: job.queue_name.clone(),
-    reason: ArchivalReason::Automatic,
-});
-```
-
-**Benefits:**
-- Live archive operation progress tracking
-- Instant UI updates when jobs are archived/restored
-- Real-time compression ratio and storage statistics
-- Enhanced user experience during bulk operations
-
 ## Phase 3: Specialized Features
 *Features for specific enterprise or compliance requirements*
 
@@ -126,15 +92,12 @@ let geo_config = GeoReplicationConfig::new()
 
 Features are ordered within each phase by priority and should generally be implemented in the following sequence:
 
-**Phase 1 (Operational Features)**
-2. Webhook & Event Streaming
-
-**Phase 2 (Enterprise Features)**
+**Phase 3 (Enterprise Features)**
 1. Job Encryption & PII Protection
 2. Access Control & Auditing
 3. Message Queue Integration
 
-**Phase 3 (Scaling Features)**
+**Phase 4 (Scaling Features)**
 1. Zero-downtime Deployments
 2. Queue Partitioning & Sharding
 3. Multi-region Support

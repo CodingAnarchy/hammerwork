@@ -2,8 +2,7 @@ mod test_utils;
 
 use chrono::{Duration, Utc};
 use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason};
-use hammerwork::queue::DatabaseQueue;
-use hammerwork::{Job, JobStatus};
+use hammerwork::{Job, JobStatus, queue::DatabaseQueue};
 use serde_json::json;
 
 #[cfg(feature = "postgres")]
@@ -581,5 +580,317 @@ async fn test_archival_reason_enum() {
         let serialized = serde_json::to_string(&reason).unwrap();
         let deserialized: ArchivalReason = serde_json::from_str(&serialized).unwrap();
         assert_eq!(reason, deserialized);
+    }
+}
+
+// WebSocket Archive Event Tests
+mod websocket_archive_event_tests {
+    use super::*;
+    use chrono::Utc;
+    use hammerwork::archive::{ArchivalStats, ArchiveEvent, JobArchiver};
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    #[test]
+    fn test_archive_event_creation() {
+        let job_id = Uuid::new_v4();
+        let queue_name = "test_queue".to_string();
+        let reason = ArchivalReason::Manual;
+
+        let event = ArchiveEvent::JobArchived {
+            job_id,
+            queue: queue_name.clone(),
+            reason: reason.clone(),
+        };
+
+        match event {
+            ArchiveEvent::JobArchived {
+                job_id: id,
+                queue,
+                reason: r,
+            } => {
+                assert_eq!(id, job_id);
+                assert_eq!(queue, queue_name);
+                assert_eq!(r, reason);
+            }
+            _ => panic!("Expected JobArchived event"),
+        }
+    }
+
+    #[test]
+    fn test_archive_event_serialization() {
+        let events = vec![
+            ArchiveEvent::JobArchived {
+                job_id: Uuid::new_v4(),
+                queue: "test_queue".to_string(),
+                reason: ArchivalReason::Automatic,
+            },
+            ArchiveEvent::JobRestored {
+                job_id: Uuid::new_v4(),
+                queue: "restore_queue".to_string(),
+                restored_by: Some("admin".to_string()),
+            },
+            ArchiveEvent::BulkArchiveStarted {
+                operation_id: "op_123".to_string(),
+                estimated_jobs: 1000,
+            },
+            ArchiveEvent::BulkArchiveProgress {
+                operation_id: "op_123".to_string(),
+                jobs_processed: 500,
+                total: 1000,
+            },
+            ArchiveEvent::BulkArchiveCompleted {
+                operation_id: "op_123".to_string(),
+                stats: ArchivalStats {
+                    jobs_archived: 1000,
+                    jobs_purged: 0,
+                    bytes_archived: 50000,
+                    bytes_purged: 0,
+                    compression_ratio: 0.7,
+                    operation_duration: std::time::Duration::from_secs(30),
+                    last_run_at: Utc::now(),
+                },
+            },
+            ArchiveEvent::JobsPurged {
+                count: 100,
+                older_than: Utc::now(),
+            },
+        ];
+
+        for event in events {
+            let serialized = serde_json::to_string(&event).unwrap();
+            let deserialized: ArchiveEvent = serde_json::from_str(&serialized).unwrap();
+
+            // Verify the deserialized event matches the original
+            match (&event, &deserialized) {
+                (
+                    ArchiveEvent::JobArchived {
+                        job_id: id1,
+                        queue: q1,
+                        reason: r1,
+                    },
+                    ArchiveEvent::JobArchived {
+                        job_id: id2,
+                        queue: q2,
+                        reason: r2,
+                    },
+                ) => {
+                    assert_eq!(id1, id2);
+                    assert_eq!(q1, q2);
+                    assert_eq!(r1, r2);
+                }
+                (
+                    ArchiveEvent::JobRestored {
+                        job_id: id1,
+                        queue: q1,
+                        restored_by: rb1,
+                    },
+                    ArchiveEvent::JobRestored {
+                        job_id: id2,
+                        queue: q2,
+                        restored_by: rb2,
+                    },
+                ) => {
+                    assert_eq!(id1, id2);
+                    assert_eq!(q1, q2);
+                    assert_eq!(rb1, rb2);
+                }
+                (
+                    ArchiveEvent::BulkArchiveStarted {
+                        operation_id: op1,
+                        estimated_jobs: ej1,
+                    },
+                    ArchiveEvent::BulkArchiveStarted {
+                        operation_id: op2,
+                        estimated_jobs: ej2,
+                    },
+                ) => {
+                    assert_eq!(op1, op2);
+                    assert_eq!(ej1, ej2);
+                }
+                _ => {} // Other variants handled by serde equality
+            }
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_archive_with_events() {
+        let queue = test_utils::setup_postgres_queue().await;
+
+        // Create a test job archiver
+        let mut archiver = JobArchiver::new(queue.pool.clone());
+
+        // Set up event tracking
+        let events: Arc<Mutex<Vec<ArchiveEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+
+        // Create a job to archive
+        let job = Job::new("websocket_test".to_string(), json!({"test": "data"}));
+        queue.enqueue(job.clone()).await.unwrap();
+        queue.complete_job(job.id).await.unwrap();
+
+        // Configure archival policy
+        archiver.set_policy(
+            "websocket_test",
+            ArchivalPolicy::new()
+                .archive_completed_after(Duration::seconds(0))
+                .enabled(true),
+        );
+
+        // Run archive operation with event publishing
+        let (operation_id, stats) = archiver
+            .archive_jobs_with_events(
+                queue.as_ref(),
+                Some("websocket_test"),
+                ArchivalReason::Manual,
+                Some("test_user"),
+                |event| {
+                    events_clone.lock().unwrap().push(event);
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify operation completed successfully
+        assert_eq!(stats.jobs_archived, 1);
+        assert!(!operation_id.is_empty());
+
+        // Verify events were published
+        let captured_events = events.lock().unwrap();
+        assert_eq!(captured_events.len(), 2);
+
+        // Check bulk archive started event
+        match &captured_events[0] {
+            ArchiveEvent::BulkArchiveStarted {
+                operation_id: op_id,
+                estimated_jobs,
+            } => {
+                assert_eq!(op_id, &operation_id);
+                assert!(estimated_jobs > &0);
+            }
+            _ => panic!("Expected BulkArchiveStarted event"),
+        }
+
+        // Check bulk archive completed event
+        match &captured_events[1] {
+            ArchiveEvent::BulkArchiveCompleted {
+                operation_id: op_id,
+                stats: event_stats,
+            } => {
+                assert_eq!(op_id, &operation_id);
+                assert_eq!(event_stats.jobs_archived, 1);
+            }
+            _ => panic!("Expected BulkArchiveCompleted event"),
+        }
+
+        // Clean up
+        let cutoff = Utc::now() + Duration::seconds(1);
+        queue.purge_archived_jobs(cutoff).await.unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_archive_progress_callback() {
+        let queue = test_utils::setup_postgres_queue().await;
+
+        // Create multiple jobs to archive
+        let jobs: Vec<Job> = (0..5)
+            .map(|i| Job::new("progress_test".to_string(), json!({"index": i})))
+            .collect();
+
+        for job in &jobs {
+            queue.enqueue(job.clone()).await.unwrap();
+            queue.complete_job(job.id).await.unwrap();
+        }
+
+        // Set up progress tracking
+        let progress_updates: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let progress_clone = Arc::clone(&progress_updates);
+
+        let mut archiver = JobArchiver::new(queue.pool.clone());
+        archiver.set_policy(
+            "progress_test",
+            ArchivalPolicy::new()
+                .archive_completed_after(Duration::seconds(0))
+                .enabled(true),
+        );
+
+        // Run archive operation with progress callback
+        let (operation_id, stats) = archiver
+            .archive_jobs_with_progress(
+                queue.as_ref(),
+                Some("progress_test"),
+                ArchivalReason::Automatic,
+                Some("progress_test"),
+                Some(Box::new(move |current, total| {
+                    progress_clone.lock().unwrap().push((current, total));
+                })),
+            )
+            .await
+            .unwrap();
+
+        // Verify operation completed
+        assert_eq!(stats.jobs_archived, 5);
+        assert!(!operation_id.is_empty());
+
+        // Verify progress updates were called
+        let updates = progress_updates.lock().unwrap();
+        assert!(!updates.is_empty());
+
+        // Should have at least start (0, total) and end (jobs_archived, total) updates
+        assert!(updates.len() >= 2);
+
+        // Check first update (start)
+        let (start_current, start_total) = updates[0];
+        assert_eq!(start_current, 0);
+        assert!(start_total > 0);
+
+        // Check last update (completion)
+        let (end_current, end_total) = updates[updates.len() - 1];
+        assert_eq!(end_current, stats.jobs_archived);
+        assert_eq!(end_total, start_total);
+
+        // Clean up
+        let cutoff = Utc::now() + Duration::seconds(1);
+        queue.purge_archived_jobs(cutoff).await.unwrap();
+    }
+
+    #[test]
+    fn test_archive_event_display() {
+        let job_id = Uuid::new_v4();
+        let operation_id = "test_op_123";
+
+        let events = vec![
+            ArchiveEvent::JobArchived {
+                job_id,
+                queue: "test_queue".to_string(),
+                reason: ArchivalReason::Manual,
+            },
+            ArchiveEvent::BulkArchiveStarted {
+                operation_id: operation_id.to_string(),
+                estimated_jobs: 100,
+            },
+        ];
+
+        // Test that events can be formatted for display/logging
+        for event in events {
+            let formatted = format!("{:?}", event);
+            assert!(!formatted.is_empty());
+
+            match event {
+                ArchiveEvent::JobArchived { .. } => {
+                    assert!(formatted.contains("JobArchived"));
+                    assert!(formatted.contains(&job_id.to_string()));
+                }
+                ArchiveEvent::BulkArchiveStarted { .. } => {
+                    assert!(formatted.contains("BulkArchiveStarted"));
+                    assert!(formatted.contains(operation_id));
+                }
+                _ => {}
+            }
+        }
     }
 }

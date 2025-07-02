@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2025-07-02
+
+### Added
+- **📡 Real-time Archive WebSocket Events**
+  - Complete implementation of real-time archive operation events for enhanced web dashboard integration
+  - `ArchiveEvent` enum with 6 event types: `JobArchived`, `JobRestored`, `BulkArchiveStarted`, `BulkArchiveProgress`, `BulkArchiveCompleted`, and `JobsPurged`
+  - WebSocket integration in `hammerwork-web` with `publish_archive_event()` method for broadcasting archive events
+  - Real-time progress tracking for bulk archive operations with unique operation IDs
+  - Dashboard JavaScript handlers for live archive operation updates and notifications
+  - CSS styling for archive progress bars and operation status notifications
+
+- **🔧 Public Pool Field Access**
+  - Made `JobQueue.pool` field public (was previously `pub(crate)`) for improved API ergonomics
+  - Enables direct pool access for advanced use cases and better integration with external components
+  - Added `get_pool()` method with comprehensive documentation and usage examples
+  - Supports patterns like `JobArchiver::new(queue.pool.clone())` for sharing database connections
+
+- **🧪 Comprehensive Test Coverage**
+  - Added extensive test suite for archive WebSocket events including serialization, progress tracking, and error handling
+  - Created `comprehensive_archive_tests.rs` with 300+ lines of tests covering edge cases and event publishing
+  - Added `jobarchiver_pool_tests.rs` with tests for public pool field access patterns and multiple archiver scenarios
+  - Comprehensive doctests for `JobArchiver::new()` demonstrating public pool usage patterns
+  - Integration tests for archive events with real-time progress callbacks and operation tracking
+  - Performance benchmarks for archive operations with 100+ job batches
+
+### Enhanced
+- **📈 Archive Operation Tracking**
+  - Enhanced `JobArchiver` with progress tracking methods: `archive_jobs_with_progress()` and `archive_jobs_with_events()`
+  - Real-time progress callbacks during bulk archive operations with `(current, total)` parameters
+  - Operation ID generation for tracking concurrent archive operations
+  - Event-driven architecture supporting custom event handlers and WebSocket integration
+  - Improved `estimate_archival_jobs()` method using actual archival policies instead of simplifications
+
+- **🎨 Dashboard User Experience**
+  - Live archive operation notifications with job IDs, queue names, and archival reasons
+  - Real-time progress bars showing completion percentage during bulk operations
+  - Archive operation history with timestamps and statistics
+  - Automatic data refresh when archive events are received
+  - Enhanced visual feedback for archive, restore, and purge operations
+
+### Fixed
+- **🐛 Code Quality Improvements**
+  - Removed all unnecessary `assert!(true)` calls from test files (7 instances across multiple files)
+  - Fixed clippy warnings including field reassignment patterns and dead code warnings
+  - Resolved compilation errors in integration tests and examples with proper import management
+  - Fixed pointer dereference issues in archive event handling (`*estimated_jobs` → `estimated_jobs > &0`)
+  - Added missing imports for `json!` macro, database traits, and standard library types across test files
+
+- **🔧 Import Organization**
+  - Standardized import organization across all test files with alphabetical ordering
+  - Added missing `DatabaseQueue` trait imports for proper method access in integration tests
+  - Fixed import paths for worker types, job handlers, and result storage components
+  - Resolved examples compilation with proper UUID, Duration, and async imports
+
+### Technical Improvements
+- **🏗️ Architecture Enhancements**
+  - Event-driven archive system with operation IDs for tracking concurrent operations
+  - Bridge pattern implementation for WebSocket event publishing without modifying core archive operations
+  - Comprehensive error handling for archive events with proper async patterns
+  - Type-safe event serialization with serde support for JSON WebSocket transmission
+
+- **⚡ Performance & Testing**
+  - Archive operation benchmarks with timing measurements and performance assertions
+  - Concurrent archive testing with multiple `JobArchiver` instances sharing database pools
+  - Edge case testing including zero-job operations, invalid queue names, and error scenarios
+  - Memory-efficient event tracking using `Arc<Mutex<Vec<Event>>>` patterns for concurrent access
+
 ## [1.5.2] - 2025-07-02
 
 ### Fixed

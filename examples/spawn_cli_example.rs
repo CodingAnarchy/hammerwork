@@ -10,8 +10,7 @@
 //! cargo run --example spawn_cli_example --features mysql
 //! ```
 
-use hammerwork::queue::DatabaseQueue;
-use hammerwork::{Job, JobQueue, Result};
+use hammerwork::{Job, JobQueue, Result, queue::DatabaseQueue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;

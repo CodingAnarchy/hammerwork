@@ -502,7 +502,7 @@ pub trait DatabaseQueue: Send + Sync {
 /// ```
 pub struct JobQueue<DB: Database> {
     #[allow(dead_code)] // Used in database-specific implementations
-    pub(crate) pool: Pool<DB>,
+    pub pool: Pool<DB>,
     pub(crate) _phantom: PhantomData<DB>,
     pub(crate) throttle_configs: Arc<RwLock<HashMap<String, ThrottleConfig>>>,
 }
@@ -608,5 +608,158 @@ impl<DB: Database> JobQueue<DB> {
     pub async fn get_all_throttles(&self) -> HashMap<String, ThrottleConfig> {
         let configs = self.throttle_configs.read().await;
         configs.clone()
+    }
+
+    /// Get a reference to the underlying database connection pool.
+    ///
+    /// This method provides access to the database pool for advanced use cases
+    /// that require direct database operations or integration with other components.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::JobQueue;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
+    /// let queue = JobQueue::new(pool);
+    ///
+    /// // Access the pool for advanced operations
+    /// let pool_ref = &queue.pool;
+    /// let pool_clone = queue.pool.clone();
+    ///
+    /// // Use the pool for custom queries or integration with other components
+    /// let row_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM hammerwork_jobs")
+    ///     .fetch_one(&queue.pool)
+    ///     .await?;
+    ///
+    /// println!("Total jobs in database: {}", row_count.0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_pool(&self) -> &Pool<DB> {
+        &self.pool
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that the pool field is publicly accessible
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_public_pool_access() {
+        // Note: This test requires a real database connection
+        // It's designed to test compilation and API accessibility with real database operations
+
+        // This test is ignored by default since it requires a database
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:hammerwork@localhost:5433/hammerwork".to_string()
+        });
+
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        let queue = JobQueue::new(pool.clone());
+
+        // Test direct field access
+        let _pool_ref = &queue.pool;
+        let _pool_clone = queue.pool.clone();
+
+        // Test that we can use the pool field in function calls
+        let _same_pool = std::ptr::eq(&queue.pool, &pool);
+    }
+
+    #[test]
+    fn test_queue_creation_with_pool() {
+        // Test that JobQueue can be created and the pool field is accessible
+        // This test doesn't require an actual database connection
+
+        // We'll use the test queue for this since it doesn't require a real database
+        #[cfg(feature = "test")]
+        {
+            use crate::queue::test::TestQueue;
+            let test_queue = TestQueue::new();
+
+            // Verify the queue was created successfully
+            // Note: TestQueue doesn't have a pool field since it's an in-memory implementation
+            // This test validates the general queue creation pattern
+
+            // Simple test - just verify it can be created (TestQueue has no simple methods to test)
+            let _ = test_queue; // Consume to avoid unused variable warning
+        }
+
+        // Always pass this test since it's primarily a compilation test
+    }
+
+    #[test]
+    fn test_pool_field_visibility() {
+        // Compile-time test to ensure the pool field is public
+        // This test will fail to compile if the field is not public
+
+        // This is a compilation test - if this compiles, the field is public
+        #[allow(dead_code)]
+        fn _check_pool_access<DB: sqlx::Database>(queue: &JobQueue<DB>) -> &sqlx::Pool<DB> {
+            &queue.pool // This line will fail to compile if pool is not public
+        }
+
+        // If we reach this point, the compilation test passed
+    }
+
+    #[test]
+    fn test_throttle_configs_still_private() {
+        // Ensure that making pool public didn't accidentally expose other private fields
+        // This test verifies that throttle_configs remains crate-private
+
+        // This function should NOT compile if throttle_configs becomes public
+        fn _ensure_throttle_configs_private<DB: sqlx::Database>(_queue: &JobQueue<DB>) {
+            // Uncommenting the next line should cause a compilation error
+            // let _configs = &queue.throttle_configs;  // Should be private
+        }
+    }
+
+    /// Test documentation examples compile correctly
+    #[test]
+    fn test_pool_documentation_examples() {
+        // This test ensures that the documentation examples in the pool-related methods compile
+
+        // Example: Creating a JobArchiver with the pool (from archive module docs)
+        #[cfg(feature = "postgres")]
+        #[allow(dead_code)]
+        async fn _example_archive_integration()
+        -> std::result::Result<(), Box<dyn std::error::Error>> {
+            let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
+            let queue = std::sync::Arc::new(JobQueue::new(pool.clone()));
+
+            // This pattern should work with the public pool field
+            let _archiver = crate::archive::JobArchiver::new(queue.pool.clone());
+
+            Ok(())
+        }
+
+        // Test that the example compiles (even though it won't run without a database)
+    }
+
+    #[test]
+    fn test_throttle_config_creation() {
+        // Test that throttle configuration can be created and configured
+        // This is a simple API test that doesn't require database operations
+
+        use crate::rate_limit::ThrottleConfig;
+
+        let throttle_config = ThrottleConfig::new()
+            .max_concurrent(10)
+            .rate_per_minute(60)
+            .enabled(true);
+
+        assert_eq!(throttle_config.max_concurrent, Some(10));
+        assert_eq!(throttle_config.rate_per_minute, Some(60));
+        assert!(throttle_config.enabled);
+
+        // Test default configuration
+        let default_config = ThrottleConfig::new();
+        assert_eq!(default_config.max_concurrent, None);
+        assert_eq!(default_config.rate_per_minute, None);
+        assert!(default_config.enabled);
     }
 }

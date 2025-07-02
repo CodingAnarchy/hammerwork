@@ -451,6 +451,24 @@ class HammerworkDashboard {
             case 'queue_update':
                 this.refreshQueuesIfVisible();
                 break;
+            case 'JobArchived':
+                this.handleJobArchived(message);
+                break;
+            case 'JobRestored':
+                this.handleJobRestored(message);
+                break;
+            case 'BulkArchiveStarted':
+                this.handleBulkArchiveStarted(message);
+                break;
+            case 'BulkArchiveProgress':
+                this.handleBulkArchiveProgress(message);
+                break;
+            case 'BulkArchiveCompleted':
+                this.handleBulkArchiveCompleted(message);
+                break;
+            case 'JobsPurged':
+                this.handleJobsPurged(message);
+                break;
             case 'ping':
                 // Respond to ping
                 if (this.websocket.readyState === WebSocket.OPEN) {
@@ -1145,6 +1163,179 @@ class HammerworkDashboard {
         const sizes = ['B', 'KB', 'MB', 'GB'];
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    // Archive event handlers for real-time dashboard updates
+    
+    handleJobArchived(message) {
+        console.log('Job archived:', message);
+        
+        // Show notification
+        this.showNotification(`Job ${message.job_id.substring(0, 8)} archived from ${message.queue} (${message.reason})`, 'info');
+        
+        // Refresh archive stats and lists if visible
+        this.refreshArchiveDataIfVisible();
+        
+        // Update queue stats as job counts may have changed
+        this.refreshQueuesIfVisible();
+    }
+
+    handleJobRestored(message) {
+        console.log('Job restored:', message);
+        
+        // Show notification
+        const restoredBy = message.restored_by ? ` by ${message.restored_by}` : '';
+        this.showNotification(`Job ${message.job_id.substring(0, 8)} restored to ${message.queue}${restoredBy}`, 'success');
+        
+        // Refresh archive lists and queue stats
+        this.refreshArchiveDataIfVisible();
+        this.refreshQueuesIfVisible();
+        this.refreshJobsIfVisible();
+    }
+
+    handleBulkArchiveStarted(message) {
+        console.log('Bulk archive started:', message);
+        
+        // Show progress notification with operation tracking
+        this.showBulkOperationProgress(message.operation_id, 'Archive', 0, message.estimated_jobs);
+        
+        // Show notification
+        this.showNotification(`Bulk archive operation started (${message.estimated_jobs} jobs estimated)`, 'info');
+    }
+
+    handleBulkArchiveProgress(message) {
+        console.log('Bulk archive progress:', message);
+        
+        // Update progress bar
+        this.updateBulkOperationProgress(message.operation_id, message.jobs_processed, message.total);
+    }
+
+    handleBulkArchiveCompleted(message) {
+        console.log('Bulk archive completed:', message);
+        
+        // Hide progress and show completion
+        this.hideBulkOperationProgress(message.operation_id);
+        
+        // Show completion notification with stats
+        const stats = message.stats;
+        const compressionText = stats.compression_ratio !== 1.0 ? ` (${(stats.compression_ratio * 100).toFixed(1)}% compression)` : '';
+        this.showNotification(
+            `Bulk archive completed: ${stats.jobs_archived} jobs archived, ${this.formatBytes(stats.bytes_archived)} saved${compressionText}`, 
+            'success'
+        );
+        
+        // Refresh all archive-related data
+        this.refreshArchiveDataIfVisible();
+        this.refreshQueuesIfVisible();
+    }
+
+    handleJobsPurged(message) {
+        console.log('Jobs purged:', message);
+        
+        // Show notification
+        const olderThanDate = new Date(message.older_than).toLocaleDateString();
+        this.showNotification(`${message.count} archived jobs purged (older than ${olderThanDate})`, 'warning');
+        
+        // Refresh archive stats and lists
+        this.refreshArchiveDataIfVisible();
+    }
+
+    // Helper methods for archive event handling
+    
+    refreshArchiveDataIfVisible() {
+        // Refresh archive tab if it's currently visible
+        const archiveTab = document.querySelector('.archive-section');
+        if (archiveTab && this.isElementInViewport(archiveTab)) {
+            this.loadArchivedJobs();
+            this.loadArchiveStats();
+        }
+    }
+
+    showBulkOperationProgress(operationId, operationType, current, total) {
+        // Create or update progress notification
+        let progressContainer = document.getElementById('bulk-operation-progress');
+        if (!progressContainer) {
+            progressContainer = document.createElement('div');
+            progressContainer.id = 'bulk-operation-progress';
+            progressContainer.className = 'bulk-progress-notification';
+            document.body.appendChild(progressContainer);
+        }
+
+        const percentage = total > 0 ? Math.round((current / total) * 100) : 0;
+        
+        progressContainer.innerHTML = `
+            <div class="progress-header">
+                <span class="operation-type">${operationType} Operation</span>
+                <span class="operation-id">${operationId.substring(0, 8)}</span>
+            </div>
+            <div class="progress-bar-container">
+                <div class="progress-bar" style="width: ${percentage}%"></div>
+            </div>
+            <div class="progress-text">
+                ${current} / ${total} jobs (${percentage}%)
+            </div>
+        `;
+    }
+
+    updateBulkOperationProgress(operationId, current, total) {
+        const progressContainer = document.getElementById('bulk-operation-progress');
+        if (progressContainer) {
+            const percentage = total > 0 ? Math.round((current / total) * 100) : 0;
+            
+            const progressBar = progressContainer.querySelector('.progress-bar');
+            const progressText = progressContainer.querySelector('.progress-text');
+            
+            if (progressBar) progressBar.style.width = `${percentage}%`;
+            if (progressText) progressText.textContent = `${current} / ${total} jobs (${percentage}%)`;
+        }
+    }
+
+    hideBulkOperationProgress(operationId) {
+        const progressContainer = document.getElementById('bulk-operation-progress');
+        if (progressContainer) {
+            // Fade out and remove after a delay
+            progressContainer.style.opacity = '0';
+            setTimeout(() => {
+                if (progressContainer.parentNode) {
+                    progressContainer.parentNode.removeChild(progressContainer);
+                }
+            }, 2000);
+        }
+    }
+
+    showNotification(message, type = 'info') {
+        // Create notification element
+        const notification = document.createElement('div');
+        notification.className = `notification notification-${type}`;
+        notification.innerHTML = `
+            <div class="notification-content">
+                <span class="notification-message">${message}</span>
+                <button class="notification-close" onclick="this.parentElement.parentElement.remove()">×</button>
+            </div>
+        `;
+
+        // Add to notifications container
+        let container = document.getElementById('notifications-container');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'notifications-container';
+            container.className = 'notifications-container';
+            document.body.appendChild(container);
+        }
+
+        container.appendChild(notification);
+
+        // Auto-remove after 5 seconds
+        setTimeout(() => {
+            if (notification.parentNode) {
+                notification.style.opacity = '0';
+                setTimeout(() => {
+                    if (notification.parentNode) {
+                        notification.parentNode.removeChild(notification);
+                    }
+                }, 300);
+            }
+        }, 5000);
     }
 
     destroy() {

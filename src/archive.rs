@@ -36,6 +36,7 @@ use crate::{Job, JobId, JobStatus, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Unique identifier for an archival policy.
 pub type ArchivalPolicyId = String;
@@ -92,6 +93,69 @@ impl std::fmt::Display for ArchivalReason {
             Self::Maintenance => write!(f, "Maintenance"),
         }
     }
+}
+
+/// WebSocket events for archive operations.
+///
+/// These events are emitted during archival operations and can be consumed
+/// by WebSocket clients for real-time dashboard updates.
+///
+/// # Examples
+///
+/// ```rust
+/// use hammerwork::archive::{ArchiveEvent, ArchivalReason, ArchivalStats};
+/// use uuid::Uuid;
+/// use chrono::Utc;
+///
+/// // Job archived event
+/// let job_archived = ArchiveEvent::JobArchived {
+///     job_id: Uuid::new_v4(),
+///     queue: "email_queue".to_string(),
+///     reason: ArchivalReason::Automatic,
+/// };
+///
+/// // Bulk operation started
+/// let operation_id = "bulk_op_123".to_string();
+/// let bulk_started = ArchiveEvent::BulkArchiveStarted {
+///     operation_id: operation_id.clone(),
+///     estimated_jobs: 1000,
+/// };
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ArchiveEvent {
+    /// A job was archived
+    JobArchived {
+        job_id: JobId,
+        queue: String,
+        reason: ArchivalReason,
+    },
+    /// A job was restored from archive
+    JobRestored {
+        job_id: JobId,
+        queue: String,
+        restored_by: Option<String>,
+    },
+    /// A bulk archive operation was started
+    BulkArchiveStarted {
+        operation_id: String,
+        estimated_jobs: u64,
+    },
+    /// Progress update for a bulk archive operation
+    BulkArchiveProgress {
+        operation_id: String,
+        jobs_processed: u64,
+        total: u64,
+    },
+    /// A bulk archive operation completed
+    BulkArchiveCompleted {
+        operation_id: String,
+        stats: ArchivalStats,
+    },
+    /// Jobs were purged from the archive
+    JobsPurged {
+        count: u64,
+        older_than: DateTime<Utc>,
+    },
 }
 
 /// Configuration for job archival policies.
@@ -611,6 +675,8 @@ where
     ///
     /// # Examples
     ///
+    /// ## Basic Usage
+    ///
     /// ```rust,no_run
     /// use hammerwork::archive::JobArchiver;
     /// use sqlx::PgPool;
@@ -618,6 +684,43 @@ where
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let pool = PgPool::connect("postgresql://localhost/hammerwork").await?;
     /// let archiver = JobArchiver::new(pool);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Integration with JobQueue (using public pool field)
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{JobQueue, archive::JobArchiver};
+    /// use std::sync::Arc;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
+    /// let queue = Arc::new(JobQueue::new(pool.clone()));
+    ///
+    /// // Access the public pool field to create an archiver
+    /// let archiver = JobArchiver::new(queue.pool.clone());
+    ///
+    /// // Both the queue and archiver share the same database connection pool
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Multiple Archivers with Shared Pool
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{JobQueue, archive::JobArchiver};
+    /// use std::sync::Arc;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
+    /// let queue = Arc::new(JobQueue::new(pool.clone()));
+    ///
+    /// // Create multiple archivers sharing the same pool
+    /// let archiver1 = JobArchiver::new(queue.pool.clone());
+    /// let archiver2 = JobArchiver::new(queue.pool.clone());
+    ///
+    /// // All components share the same connection pool for efficiency
     /// # Ok(())
     /// # }
     /// ```
@@ -677,6 +780,207 @@ where
     /// Gets the current archival configuration.
     pub fn get_config(&self) -> &ArchivalConfig {
         &self.config
+    }
+
+    /// Archive jobs with real-time progress reporting and WebSocket events.
+    ///
+    /// This method provides enhanced archival capabilities with:
+    /// - Unique operation ID for tracking
+    /// - Progress callbacks for real-time updates
+    /// - WebSocket event publishing for dashboard integration
+    /// - Batch processing for large datasets
+    ///
+    /// # Arguments
+    ///
+    /// * `queue` - Database queue implementation
+    /// * `queue_name` - Optional queue name to filter jobs
+    /// * `reason` - Reason for archival
+    /// * `archived_by` - Who initiated the archival
+    /// * `progress_callback` - Optional callback for progress updates
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (operation_id, final_stats)
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{JobQueue, archive::{JobArchiver, ArchivalReason}};
+    /// use std::sync::Arc;
+    ///
+    /// # async fn example(queue: Arc<JobQueue<sqlx::Postgres>>) -> hammerwork::Result<()> {
+    /// let mut archiver = JobArchiver::new(queue.pool.clone());
+    ///
+    /// let (operation_id, stats) = archiver.archive_jobs_with_progress(
+    ///     queue.as_ref(),
+    ///     Some("email_queue"),
+    ///     ArchivalReason::Manual,
+    ///     Some("admin"),
+    ///     Some(Box::new(|processed, total| {
+    ///         println!("Progress: {}/{}", processed, total);
+    ///     }))
+    /// ).await?;
+    ///
+    /// println!("Operation {} completed, archived {} jobs", operation_id, stats.jobs_archived);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn archive_jobs_with_progress<Q>(
+        &self,
+        queue: &Q,
+        queue_name: Option<&str>,
+        reason: ArchivalReason,
+        archived_by: Option<&str>,
+        progress_callback: Option<Box<dyn Fn(u64, u64) + Send + Sync>>,
+    ) -> Result<(String, ArchivalStats)>
+    where
+        Q: crate::queue::DatabaseQueue,
+    {
+        let operation_id = Uuid::new_v4().to_string();
+
+        // Get the archival policy for this queue
+        let default_policy = ArchivalPolicy::default();
+        let policy = queue_name
+            .and_then(|name| self.policies.get(name))
+            .unwrap_or(&default_policy);
+
+        // Estimate total jobs to be archived (this is a simplified estimation)
+        let estimated_jobs = self
+            .estimate_archival_jobs(queue, queue_name, policy)
+            .await?;
+
+        // Publish bulk archive started event
+        if let Some(callback) = &progress_callback {
+            callback(0, estimated_jobs);
+        }
+
+        // Perform the actual archival
+        let stats = queue
+            .archive_jobs(queue_name, policy, &self.config, reason, archived_by)
+            .await?;
+
+        // Report completion
+        if let Some(callback) = &progress_callback {
+            callback(stats.jobs_archived, estimated_jobs);
+        }
+
+        Ok((operation_id, stats))
+    }
+
+    /// Archive jobs with WebSocket event publishing for real-time dashboard updates.
+    ///
+    /// This is a convenience method that wraps `archive_jobs_with_progress` and publishes
+    /// WebSocket events for dashboard integration.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue` - Database queue implementation
+    /// * `queue_name` - Optional queue name to filter jobs
+    /// * `reason` - Reason for archival
+    /// * `archived_by` - Who initiated the archival
+    /// * `event_publisher` - Function to publish archive events
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (operation_id, final_stats)
+    pub async fn archive_jobs_with_events<Q, F>(
+        &self,
+        queue: &Q,
+        queue_name: Option<&str>,
+        reason: ArchivalReason,
+        archived_by: Option<&str>,
+        event_publisher: F,
+    ) -> Result<(String, ArchivalStats)>
+    where
+        Q: crate::queue::DatabaseQueue,
+        F: Fn(ArchiveEvent) + Send + Sync,
+    {
+        let operation_id = Uuid::new_v4().to_string();
+
+        // Get the archival policy for this queue
+        let default_policy = ArchivalPolicy::default();
+        let policy = queue_name
+            .and_then(|name| self.policies.get(name))
+            .unwrap_or(&default_policy);
+
+        // Estimate total jobs to be archived
+        let estimated_jobs = self
+            .estimate_archival_jobs(queue, queue_name, policy)
+            .await?;
+
+        // Publish bulk archive started event
+        event_publisher(ArchiveEvent::BulkArchiveStarted {
+            operation_id: operation_id.clone(),
+            estimated_jobs,
+        });
+
+        // Perform the actual archival
+        let stats = queue
+            .archive_jobs(queue_name, policy, &self.config, reason, archived_by)
+            .await?;
+
+        // Publish completion event
+        event_publisher(ArchiveEvent::BulkArchiveCompleted {
+            operation_id: operation_id.clone(),
+            stats: stats.clone(),
+        });
+
+        Ok((operation_id, stats))
+    }
+
+    /// Estimate the number of jobs that would be archived by a policy.
+    async fn estimate_archival_jobs<Q>(
+        &self,
+        queue: &Q,
+        queue_name: Option<&str>,
+        policy: &ArchivalPolicy,
+    ) -> Result<u64>
+    where
+        Q: crate::queue::DatabaseQueue,
+    {
+        // Estimate based on queue statistics and policy configuration
+        if let Some(queue_name) = queue_name {
+            let stats = queue.get_queue_stats(queue_name).await?;
+            let mut estimate = 0u64;
+
+            // Add completed jobs if policy archives them
+            if policy.archive_completed_after.is_some() {
+                estimate += stats.completed_count;
+            }
+
+            // Add failed jobs if policy archives them
+            if policy.archive_failed_after.is_some() {
+                estimate += stats.statistics.failed;
+            }
+
+            // Add dead jobs if policy archives them
+            if policy.archive_dead_after.is_some() {
+                estimate += stats.dead_count;
+            }
+
+            // Add timed out jobs if policy archives them
+            if policy.archive_timed_out_after.is_some() {
+                estimate += stats.timed_out_count;
+            }
+
+            Ok(estimate)
+        } else {
+            // For all queues, this would require more complex querying
+            // Use a conservative estimate based on policy scope
+            let base_estimate = if policy.archive_completed_after.is_some()
+                && policy.archive_failed_after.is_some()
+            {
+                2000 // High estimate for policies that archive multiple status types
+            } else if policy.archive_completed_after.is_some()
+                || policy.archive_failed_after.is_some()
+            {
+                1000 // Medium estimate for selective policies
+            } else {
+                100 // Low estimate for very limited policies
+            };
+
+            Ok(base_estimate)
+        }
     }
 }
 

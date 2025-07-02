@@ -261,7 +261,8 @@ pub mod streaming;
 mod integration_tests;
 
 pub use archive::{
-    ArchivalConfig, ArchivalPolicy, ArchivalReason, ArchivalStats, ArchivedJob, JobArchiver,
+    ArchivalConfig, ArchivalPolicy, ArchivalReason, ArchivalStats, ArchiveEvent, ArchivedJob,
+    JobArchiver,
 };
 pub use batch::{BatchId, BatchResult, BatchStatus, JobBatch, PartialFailureMode};
 pub use config::{

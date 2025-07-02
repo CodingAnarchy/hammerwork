@@ -41,7 +41,9 @@
 //! ```
 
 use crate::config::WebSocketConfig;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
+pub use hammerwork::archive::{ArchivalReason, ArchivalStats};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -213,6 +215,68 @@ impl WebSocketState {
         Ok(())
     }
 
+    /// Publish an archive event to all connected clients
+    pub async fn publish_archive_event(
+        &self,
+        event: hammerwork::archive::ArchiveEvent,
+    ) -> crate::Result<()> {
+        let broadcast_message = match event {
+            hammerwork::archive::ArchiveEvent::JobArchived {
+                job_id,
+                queue,
+                reason,
+            } => BroadcastMessage::JobArchived {
+                job_id: job_id.to_string(),
+                queue,
+                reason,
+            },
+            hammerwork::archive::ArchiveEvent::JobRestored {
+                job_id,
+                queue,
+                restored_by,
+            } => BroadcastMessage::JobRestored {
+                job_id: job_id.to_string(),
+                queue,
+                restored_by,
+            },
+            hammerwork::archive::ArchiveEvent::BulkArchiveStarted {
+                operation_id,
+                estimated_jobs,
+            } => BroadcastMessage::BulkArchiveStarted {
+                operation_id,
+                estimated_jobs,
+            },
+            hammerwork::archive::ArchiveEvent::BulkArchiveProgress {
+                operation_id,
+                jobs_processed,
+                total,
+            } => BroadcastMessage::BulkArchiveProgress {
+                operation_id,
+                jobs_processed,
+                total,
+            },
+            hammerwork::archive::ArchiveEvent::BulkArchiveCompleted {
+                operation_id,
+                stats,
+            } => BroadcastMessage::BulkArchiveCompleted {
+                operation_id,
+                stats,
+            },
+            hammerwork::archive::ArchiveEvent::JobsPurged { count, older_than } => {
+                BroadcastMessage::JobsPurged { count, older_than }
+            }
+        };
+
+        // Send to the broadcast channel
+        if let Err(_) = self.broadcast_sender.send(broadcast_message) {
+            return Err(anyhow::anyhow!(
+                "Failed to send archive event to broadcast channel"
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Send ping to all connections to keep them alive
     pub async fn ping_all_connections(&self) {
         let ping_message = Message::ping(b"ping");
@@ -251,6 +315,50 @@ impl WebSocketState {
                         BroadcastMessage::SystemAlert { message, severity } => {
                             ServerMessage::SystemAlert { message, severity }
                         }
+                        BroadcastMessage::JobArchived {
+                            job_id,
+                            queue,
+                            reason,
+                        } => ServerMessage::JobArchived {
+                            job_id,
+                            queue,
+                            reason,
+                        },
+                        BroadcastMessage::JobRestored {
+                            job_id,
+                            queue,
+                            restored_by,
+                        } => ServerMessage::JobRestored {
+                            job_id,
+                            queue,
+                            restored_by,
+                        },
+                        BroadcastMessage::BulkArchiveStarted {
+                            operation_id,
+                            estimated_jobs,
+                        } => ServerMessage::BulkArchiveStarted {
+                            operation_id,
+                            estimated_jobs,
+                        },
+                        BroadcastMessage::BulkArchiveProgress {
+                            operation_id,
+                            jobs_processed,
+                            total,
+                        } => ServerMessage::BulkArchiveProgress {
+                            operation_id,
+                            jobs_processed,
+                            total,
+                        },
+                        BroadcastMessage::BulkArchiveCompleted {
+                            operation_id,
+                            stats,
+                        } => ServerMessage::BulkArchiveCompleted {
+                            operation_id,
+                            stats,
+                        },
+                        BroadcastMessage::JobsPurged { count, older_than } => {
+                            ServerMessage::JobsPurged { count, older_than }
+                        }
                     };
 
                     // Note: We'd need access to the WebSocketState here to broadcast
@@ -287,6 +395,33 @@ pub enum ServerMessage {
         message: String,
         severity: AlertSeverity,
     },
+    JobArchived {
+        job_id: String,
+        queue: String,
+        reason: ArchivalReason,
+    },
+    JobRestored {
+        job_id: String,
+        queue: String,
+        restored_by: Option<String>,
+    },
+    BulkArchiveStarted {
+        operation_id: String,
+        estimated_jobs: u64,
+    },
+    BulkArchiveProgress {
+        operation_id: String,
+        jobs_processed: u64,
+        total: u64,
+    },
+    BulkArchiveCompleted {
+        operation_id: String,
+        stats: ArchivalStats,
+    },
+    JobsPurged {
+        count: u64,
+        older_than: DateTime<Utc>,
+    },
     Pong,
 }
 
@@ -303,6 +438,33 @@ pub enum BroadcastMessage {
     SystemAlert {
         message: String,
         severity: AlertSeverity,
+    },
+    JobArchived {
+        job_id: String,
+        queue: String,
+        reason: ArchivalReason,
+    },
+    JobRestored {
+        job_id: String,
+        queue: String,
+        restored_by: Option<String>,
+    },
+    BulkArchiveStarted {
+        operation_id: String,
+        estimated_jobs: u64,
+    },
+    BulkArchiveProgress {
+        operation_id: String,
+        jobs_processed: u64,
+        total: u64,
+    },
+    BulkArchiveCompleted {
+        operation_id: String,
+        stats: ArchivalStats,
+    },
+    JobsPurged {
+        count: u64,
+        older_than: DateTime<Utc>,
     },
 }
 

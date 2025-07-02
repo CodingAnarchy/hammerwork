@@ -120,7 +120,7 @@ async fn test_weighted_priority_selection() {
         .await
         .unwrap()
     {
-        *priority_counts.entry(job.priority.clone()).or_insert(0) += 1;
+        *priority_counts.entry(job.priority).or_insert(0) += 1;
         queue.complete_job(job.id).await.unwrap();
     }
 

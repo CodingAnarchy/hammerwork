@@ -6,9 +6,7 @@
 
 mod test_utils;
 
-use hammerwork::{
-    Job, JobPriority, ResultStorage, queue::DatabaseQueue, workflow::DependencyStatus,
-};
+use hammerwork::{DependencyStatus, Job, JobPriority, ResultStorage, queue::DatabaseQueue};
 use serde_json::json;
 use std::time::Duration;
 use uuid::Uuid;
