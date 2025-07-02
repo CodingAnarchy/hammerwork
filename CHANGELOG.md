@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] - 2025-07-02
+
+### Fixed
+- **🔧 Migration System Improvements**
+  - Added missing migration 010_add_archival to the migration registration system
+  - Migration 010 was present as SQL files but not registered in the migration framework
+  - Updated `docs/migrations.md` to accurately reflect all 10 available migrations
+  - Fixed CLI command documentation to use correct `cargo hammerwork migration` syntax
+  - Corrected all usage examples throughout migration documentation
+
+### Enhanced
+- **📖 Migration Documentation Accuracy**
+  - Updated migration descriptions to match actual implementation:
+    - 001_initial_schema - Create initial hammerwork_jobs table
+    - 002_add_priority - Add priority field and indexes for job prioritization
+    - 003_add_timeouts - Add timeout_seconds and timed_out_at fields
+    - 004_add_cron - Add cron scheduling fields and indexes
+    - 005_add_batches - Add batch processing table and job batch_id field
+    - 006_add_result_storage - Add result storage fields for job execution results
+    - 007_add_dependencies - Add job dependencies and workflow support
+    - 008_add_result_config - Add result configuration storage fields
+    - 009_add_tracing - Add distributed tracing and correlation fields
+    - 010_add_archival - Add job archival support and archive table
+  - Fixed CLI command examples to use `cargo hammerwork migration run` and `cargo hammerwork migration status`
+  - Updated Docker and Kubernetes deployment examples with correct migration commands
+  - Added `--drop` flag documentation for development scenarios
+
 ## [1.5.1] - 2025-07-02
 
 ### Added

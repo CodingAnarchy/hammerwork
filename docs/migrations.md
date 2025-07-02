@@ -16,12 +16,16 @@ The migration system consists of:
 
 Migrations are organized chronologically and represent the evolution of Hammerwork's features:
 
-1. **001_initial_schema** - Basic job table with core functionality
-2. **002_add_priority** - Job prioritization system (v0.4.0)
-3. **003_add_timeouts** - Job timeout functionality (v0.2.2)
-4. **004_add_cron** - Cron scheduling support (v0.3.0)
-5. **005_add_batches** - Batch processing tables (v0.7.0)
-6. **006_add_result_storage** - Job result storage (v0.8.0)
+1. **001_initial_schema** - Create initial hammerwork_jobs table
+2. **002_add_priority** - Add priority field and indexes for job prioritization
+3. **003_add_timeouts** - Add timeout_seconds and timed_out_at fields
+4. **004_add_cron** - Add cron scheduling fields and indexes
+5. **005_add_batches** - Add batch processing table and job batch_id field
+6. **006_add_result_storage** - Add result storage fields for job execution results
+7. **007_add_dependencies** - Add job dependencies and workflow support
+8. **008_add_result_config** - Add result configuration storage fields
+9. **009_add_tracing** - Add distributed tracing and correlation fields
+10. **010_add_archival** - Add job archival support and archive table
 
 ## Running Migrations
 
@@ -34,12 +38,14 @@ The easiest way to run migrations is using the cargo subcommand after building H
 cargo build --bin cargo-hammerwork --features postgres
 
 # Run migrations
-cargo hammerwork migrate --database-url postgresql://localhost/hammerwork
-cargo hammerwork migrate --database-url mysql://localhost/hammerwork
+cargo hammerwork migration run --database-url postgresql://localhost/hammerwork
+cargo hammerwork migration run --database-url mysql://localhost/hammerwork
+
+# Run migrations with drop (removes existing tables first)
+cargo hammerwork migration run --database-url postgresql://localhost/hammerwork --drop
 
 # Check migration status
-cargo hammerwork status --database-url postgresql://localhost/hammerwork
-cargo hammerwork migrate --status --database-url postgresql://localhost/hammerwork
+cargo hammerwork migration status --database-url postgresql://localhost/hammerwork
 ```
 
 ### Application Integration
@@ -71,7 +77,7 @@ All Hammerwork examples now expect the database to be set up via migrations:
 
 ```bash
 # First, run migrations
-cargo hammerwork migrate --database-url postgresql://localhost/hammerwork
+cargo hammerwork migration run --database-url postgresql://localhost/hammerwork
 
 # Then run any example
 cargo run --example postgres_example --features postgres
@@ -139,11 +145,26 @@ When adding new features to Hammerwork:
 
 1. **Create Migration Files**: Add both PostgreSQL and MySQL versions
    ```
-   src/migrations/007_new_feature.postgres.sql
-   src/migrations/007_new_feature.mysql.sql
+   src/migrations/011_new_feature.postgres.sql
+   src/migrations/011_new_feature.mysql.sql
    ```
 
-2. **Register in Framework**: Add to `register_builtin_migrations()` in `mod.rs`
+2. **Register in Framework**: Add to `register_builtin_migrations()` in `src/migrations/mod.rs`
+   ```rust
+   // Migration 011: Add new feature
+   self.register_migration(
+       Migration {
+           id: "011_new_feature".to_string(),
+           description: "Add new feature description".to_string(),
+           version: 11,
+           created_at: chrono::DateTime::parse_from_rfc3339("2025-11-01T00:00:00Z")
+               .unwrap()
+               .with_timezone(&Utc),
+       },
+       include_str!("011_new_feature.postgres.sql").to_string(),
+       include_str!("011_new_feature.mysql.sql").to_string(),
+   );
+   ```
 
 3. **Test Both Databases**: Ensure the migration works with both PostgreSQL and MySQL
 
@@ -183,8 +204,8 @@ Currently, the migration system doesn't support automatic rollbacks. If you need
 
 ```dockerfile
 # Run migrations as part of container startup
-RUN cargo build --release --bin migrate --features postgres
-CMD ["sh", "-c", "/app/target/release/migrate --database-url $DATABASE_URL && /app/target/release/myapp"]
+RUN cargo build --release --bin cargo-hammerwork --features postgres
+CMD ["sh", "-c", "/app/target/release/cargo-hammerwork migration run --database-url $DATABASE_URL && /app/target/release/myapp"]
 ```
 
 ### Kubernetes Jobs
@@ -200,8 +221,8 @@ spec:
       containers:
       - name: migrate
         image: myapp:latest
-        command: ["/app/target/release/migrate"]
-        args: ["--database-url", "$(DATABASE_URL)"]
+        command: ["/app/target/release/cargo-hammerwork"]
+        args: ["migration", "run", "--database-url", "$(DATABASE_URL)"]
         env:
         - name: DATABASE_URL
           valueFrom:

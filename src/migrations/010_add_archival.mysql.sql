@@ -71,22 +71,53 @@ CREATE TABLE IF NOT EXISTS hammerwork_jobs_archive (
     INDEX idx_hammerwork_jobs_archive_correlation_id (correlation_id)
 );
 
--- Add archival metadata to main jobs table
-ALTER TABLE hammerwork_jobs 
-ADD COLUMN archived_at TIMESTAMP NULL,
-ADD COLUMN archival_reason VARCHAR(50) NULL,
-ADD COLUMN archival_policy_applied VARCHAR(100) NULL;
+-- Add archival metadata to main jobs table (MySQL doesn't support IF NOT EXISTS for columns)
+-- Check and add columns individually using a more MySQL-compatible approach
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns 
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'archived_at') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN archived_at TIMESTAMP NULL',
+    'SELECT "archived_at column already exists"'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
--- Indexes for main table archival queries
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns 
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'archival_reason') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN archival_reason VARCHAR(50) NULL',
+    'SELECT "archival_reason column already exists"'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns 
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'archival_policy_applied') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN archival_policy_applied VARCHAR(100) NULL',
+    'SELECT "archival_policy_applied column already exists"'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+-- Indexes for main table archival queries (MySQL doesn't support IF NOT EXISTS for indexes)
+-- Use DROP IF EXISTS followed by CREATE to ensure idempotency
+DROP INDEX IF EXISTS idx_hammerwork_jobs_archival_candidates ON hammerwork_jobs;
 CREATE INDEX idx_hammerwork_jobs_archival_candidates
     ON hammerwork_jobs (status, completed_at, failed_at, created_at);
 
 -- Index for finding jobs eligible for archival based on age and status
+DROP INDEX IF EXISTS idx_hammerwork_jobs_archival_completed ON hammerwork_jobs;
 CREATE INDEX idx_hammerwork_jobs_archival_completed
     ON hammerwork_jobs (completed_at, status);
 
+DROP INDEX IF EXISTS idx_hammerwork_jobs_archival_failed ON hammerwork_jobs;
 CREATE INDEX idx_hammerwork_jobs_archival_failed
     ON hammerwork_jobs (failed_at, status);
 
+DROP INDEX IF EXISTS idx_hammerwork_jobs_archival_dead ON hammerwork_jobs;
 CREATE INDEX idx_hammerwork_jobs_archival_dead
     ON hammerwork_jobs (failed_at, status);

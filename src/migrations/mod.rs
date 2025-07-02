@@ -333,5 +333,19 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("009_add_tracing.postgres.sql").to_string(),
             include_str!("009_add_tracing.mysql.sql").to_string(),
         );
+
+        // Migration 010: Add job archival support and archive table
+        self.register_migration(
+            Migration {
+                id: "010_add_archival".to_string(),
+                description: "Add job archival support and archive table".to_string(),
+                version: 10,
+                created_at: chrono::DateTime::parse_from_rfc3339("2025-10-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("010_add_archival.postgres.sql").to_string(),
+            include_str!("010_add_archival.mysql.sql").to_string(),
+        );
     }
 }
