@@ -2,6 +2,53 @@ use crate::{Result, error::HammerworkError, stats::JobEvent};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
+// Serde helper functions
+fn serialize_socket_addr<S>(
+    addr: &Option<SocketAddr>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match addr {
+        Some(a) => serializer.serialize_some(&a.to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_socket_addr<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<SocketAddr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let addr_str: Option<String> = Option::deserialize(deserializer)?;
+    match addr_str {
+        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
+fn serialize_duration_secs<S>(
+    duration: &Duration,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u64(duration.as_secs())
+}
+
+fn deserialize_duration_secs<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let secs: u64 = u64::deserialize(deserializer)?;
+    Ok(Duration::from_secs(secs))
+}
+
 #[cfg(feature = "metrics")]
 use prometheus::{CounterVec, Encoder, GaugeVec, HistogramVec, Registry, TextEncoder};
 
@@ -9,11 +56,15 @@ use prometheus::{CounterVec, Encoder, GaugeVec, HistogramVec, Registry, TextEnco
 use warp::Filter;
 
 /// Configuration for metrics collection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MetricsConfig {
     /// Prometheus registry name
     pub registry_name: String,
-    /// HTTP server address for metrics exposition
+    /// HTTP server address for metrics exposition (as string)
+    #[serde(
+        serialize_with = "serialize_socket_addr",
+        deserialize_with = "deserialize_socket_addr"
+    )]
     pub exposition_addr: Option<SocketAddr>,
     /// Custom metric labels to include
     pub custom_labels: HashMap<String, String>,
@@ -23,7 +74,11 @@ pub struct MetricsConfig {
     pub custom_gauges: Vec<String>,
     /// Custom histogram metric names to track
     pub custom_histograms: Vec<String>,
-    /// Update interval for gauge metrics
+    /// Update interval for gauge metrics (in seconds)
+    #[serde(
+        serialize_with = "serialize_duration_secs",
+        deserialize_with = "deserialize_duration_secs"
+    )]
     pub update_interval: Duration,
 }
 

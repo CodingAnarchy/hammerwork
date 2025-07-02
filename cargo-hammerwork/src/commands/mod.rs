@@ -9,6 +9,8 @@ pub mod migration;
 pub mod monitor;
 pub mod queue;
 pub mod spawn;
+pub mod streaming;
+pub mod webhook;
 pub mod worker;
 pub mod workflow;
 
@@ -23,5 +25,7 @@ pub use migration::*;
 pub use monitor::*;
 pub use queue::*;
 pub use spawn::*;
+pub use streaming::*;
+pub use webhook::*;
 pub use worker::*;
 pub use workflow::*;

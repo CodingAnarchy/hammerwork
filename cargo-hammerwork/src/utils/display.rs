@@ -59,6 +59,13 @@
 use comfy_table::Table;
 use std::fmt;
 
+/// Create a new basic table with default styling.
+///
+/// This is a convenience function for creating simple tables in CLI commands.
+pub fn create_table() -> Table {
+    Table::new()
+}
+
 /// Table formatter for displaying job information.
 ///
 /// This struct creates formatted tables with job details including

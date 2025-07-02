@@ -628,8 +628,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_handler_basic() {
-        let handler = TestSpawnHandler;
-        let parent_job = Job::new("parent_task".to_string(), json!({"spawn_count": 3}));
+        let _handler = TestSpawnHandler;
+        let _parent_job = Job::new("parent_task".to_string(), json!({"spawn_count": 3}));
 
         // Note: This test would need a mock queue implementation
         // We'll implement proper tests when we add the queue integration
@@ -645,6 +645,7 @@ mod tests {
         assert!(config.inherit_trace_context);
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn test_spawn_manager_registration() {
         let mut manager: SpawnManager<sqlx::Postgres> = SpawnManager::new();

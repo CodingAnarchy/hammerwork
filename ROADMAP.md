@@ -5,25 +5,6 @@ This roadmap outlines planned features for Hammerwork, prioritized by impact lev
 ## Phase 2: Medium Impact, Variable Complexity
 *Valuable features for specific use cases or operational efficiency*
 
-### 🔌 Webhook & Event Streaming
-**Impact: Medium** | **Complexity: Medium** | **Priority: Medium**
-
-Important for integration with external systems and real-time notifications.
-
-```rust
-// Real-time job events via webhooks
-let webhook_config = WebhookConfig::new()
-    .url("https://api.example.com/job-events")
-    .events(vec![JobEvent::Completed, JobEvent::Failed])
-    .with_retry_policy(RetryPolicy::exponential());
-
-// Event streaming to external systems
-let event_stream = EventStream::new()
-    .to_kafka("job-events")
-    .to_kinesis("job-stream")
-    .with_filtering(|event| event.priority >= JobPriority::High);
-```
-
 ### 📡 Real-time Archive WebSocket Events
 **Impact: Low-Medium** | **Complexity: Low** | **Priority: Low**
 

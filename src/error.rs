@@ -52,6 +52,31 @@ pub enum HammerworkError {
 
     #[error("Invalid job payload: {message}")]
     InvalidJobPayload { message: String },
+
+    #[error("Streaming error: {message}")]
+    Streaming { message: String },
+
+    #[error("Webhook error: {message}")]
+    Webhook { message: String },
+
+    #[error("Event system error: {message}")]
+    Event { message: String },
+
+    #[error("Configuration error: {0}")]
+    Config(String),
+}
+
+// Add From implementations for toml errors
+impl From<toml::de::Error> for HammerworkError {
+    fn from(err: toml::de::Error) -> Self {
+        HammerworkError::Config(format!("TOML deserialization error: {}", err))
+    }
+}
+
+impl From<toml::ser::Error> for HammerworkError {
+    fn from(err: toml::ser::Error) -> Self {
+        HammerworkError::Config(format!("TOML serialization error: {}", err))
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
@@ -19,7 +19,7 @@ documentation = "https://docs.rs/hammerwork"
 rust-version = "1.86"
 
 [workspace.dependencies]
-hammerwork = { version = "1.4.0", path = "." }
+hammerwork = { version = "1.5.0", path = "." }
 tokio = { version = "1.0", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -49,10 +49,13 @@ bcrypt = "0.15"
 base64 = "0.22"
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 [package]
 name = "hammerwork"
-description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job prioritization, cron scheduling, timeouts, rate limiting, Prometheus metrics, alerting, and comprehensive statistics collection"
+description = "A high-performance, database-driven job queue for Rust with PostgreSQL and MySQL support, featuring job prioritization, cron scheduling, event streaming (Kafka/Kinesis/PubSub), webhooks, rate limiting, Prometheus metrics, and comprehensive monitoring"
 readme = "README.md"
 keywords = ["database", "job-queue", "async", "postgres", "mysql"]
 categories = ["database", "asynchronous", "concurrency"]
@@ -88,19 +91,26 @@ opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"], optional = true
 opentelemetry-otlp = { version = "0.15", features = ["tokio"], optional = true }
 tracing-opentelemetry = { version = "0.23", optional = true }
 flate2 = { workspace = true }
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+toml = { workspace = true }
 
 [features]
-default = ["metrics", "alerting"]
+default = ["metrics", "alerting", "webhooks"]
 postgres = ["sqlx/postgres"]
 mysql = ["sqlx/mysql"]
 metrics = ["prometheus", "warp"]
 alerting = ["reqwest"]
+webhooks = ["reqwest", "hmac", "sha2", "hex"]
 tracing = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 test = []
 
 [dev-dependencies]
 tokio-test = { workspace = true }
 tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "mysql"] }
 
 [[example]]
 name = "postgres_example"

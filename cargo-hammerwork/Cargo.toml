@@ -1,6 +1,6 @@
 [package]
 name = "cargo-hammerwork"
-description = "A comprehensive cargo subcommand for managing Hammerwork job queues with advanced tooling and monitoring capabilities"
+description = "A comprehensive cargo subcommand for managing Hammerwork job queues with webhook management, event streaming, database operations, and advanced monitoring capabilities"
 keywords = ["cargo", "cli", "hammerwork", "job-queue", "database"]
 categories = ["command-line-utilities", "development-tools::cargo-plugins"]
 version.workspace = true

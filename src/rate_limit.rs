@@ -3,6 +3,26 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+// Serde helper functions for Duration
+fn serialize_duration<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match duration {
+        Some(d) => serializer.serialize_some(&d.as_secs()),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let secs: Option<u64> = Option::deserialize(deserializer)?;
+    Ok(secs.map(Duration::from_secs))
+}
+
 /// Rate limiting configuration for job processing
 #[derive(Debug, Clone)]
 pub struct RateLimit {
@@ -55,13 +75,17 @@ impl RateLimit {
 }
 
 /// Throttling configuration for queues
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ThrottleConfig {
     /// Maximum number of concurrent jobs for this queue
     pub max_concurrent: Option<u64>,
     /// Rate limit for this queue
     pub rate_per_minute: Option<u64>,
-    /// Backoff duration when errors occur
+    /// Backoff duration when errors occur (in seconds)
+    #[serde(
+        serialize_with = "serialize_duration",
+        deserialize_with = "deserialize_duration"
+    )]
     pub backoff_on_error: Option<Duration>,
     /// Enable/disable throttling
     pub enabled: bool,

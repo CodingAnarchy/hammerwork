@@ -8,6 +8,7 @@ use std::time::Duration;
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
+#[ignore = "requires PostgreSQL database"]
 async fn test_postgres_result_config_persistence() {
     let queue = test_utils::setup_postgres_queue().await;
 
@@ -39,6 +40,7 @@ async fn test_postgres_result_config_persistence() {
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
+#[ignore = "requires MySQL database"]
 async fn test_mysql_result_config_persistence() {
     let queue = test_utils::setup_mysql_queue().await;
 

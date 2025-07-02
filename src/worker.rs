@@ -23,6 +23,9 @@ use crate::metrics::PrometheusMetricsCollector;
 #[cfg(feature = "alerting")]
 use crate::alerting::{AlertManager, AlertingConfig};
 
+#[cfg(feature = "webhooks")]
+use crate::events::{EventManager, JobError, JobLifecycleEvent, JobLifecycleEventType};
+
 use chrono::{DateTime, Utc};
 use sqlx::Database;
 use std::{sync::Arc, time::Duration};
@@ -603,6 +606,9 @@ pub struct Worker<DB: Database> {
     event_hooks: JobEventHooks,
     /// Spawn manager for dynamic job spawning
     spawn_manager: Option<Arc<crate::spawn::SpawnManager<DB>>>,
+    /// Event manager for publishing job lifecycle events
+    #[cfg(feature = "webhooks")]
+    event_manager: Option<Arc<crate::events::EventManager>>,
 }
 
 impl<DB: Database + Send + Sync + 'static> Clone for Worker<DB>
@@ -633,6 +639,8 @@ where
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
             event_hooks: self.event_hooks.clone(),
             spawn_manager: self.spawn_manager.clone(),
+            #[cfg(feature = "webhooks")]
+            event_manager: self.event_manager.clone(),
         }
     }
 }
@@ -710,6 +718,8 @@ where
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
             event_hooks: JobEventHooks::default(),
             spawn_manager: None,
+            #[cfg(feature = "webhooks")]
+            event_manager: None,
         }
     }
 
@@ -779,6 +789,8 @@ where
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
             event_hooks: JobEventHooks::default(),
             spawn_manager: None,
+            #[cfg(feature = "webhooks")]
+            event_manager: None,
         }
     }
 
@@ -1042,6 +1054,38 @@ where
     #[cfg(feature = "alerting")]
     pub fn with_alert_manager(mut self, alert_manager: Arc<AlertManager>) -> Self {
         self.alert_manager = Some(alert_manager);
+        self
+    }
+
+    /// Add an event manager for publishing job lifecycle events.
+    ///
+    /// The event manager will receive job lifecycle events which can be delivered
+    /// to webhooks, streaming systems, and other external integrations.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_manager` - The event manager to use for publishing events
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{Worker, JobQueue, events::EventManager};
+    /// use std::sync::Arc;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
+    /// let queue = Arc::new(JobQueue::new(pool));
+    /// let event_manager = Arc::new(EventManager::new_default());
+    ///
+    /// let handler: Arc<dyn Fn(hammerwork::Job) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), hammerwork::HammerworkError>> + Send>> + Send + Sync> = Arc::new(|_job| Box::pin(async move { Ok(()) }));
+    /// let worker = Worker::new(queue, "default".to_string(), handler)
+    ///     .with_event_manager(event_manager);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "webhooks")]
+    pub fn with_event_manager(mut self, event_manager: Arc<EventManager>) -> Self {
+        self.event_manager = Some(event_manager);
         self
     }
 
@@ -1824,6 +1868,56 @@ where
         }
     }
 
+    /// Convert a JobEvent to a JobLifecycleEvent for external publishing
+    #[cfg(feature = "webhooks")]
+    fn convert_to_lifecycle_event(&self, event: &JobEvent) -> JobLifecycleEvent {
+        use std::collections::HashMap;
+
+        let event_type = match event.event_type {
+            JobEventType::Started => JobLifecycleEventType::Started,
+            JobEventType::Completed => JobLifecycleEventType::Completed,
+            JobEventType::Failed => JobLifecycleEventType::Failed,
+            JobEventType::Retried => JobLifecycleEventType::Retried,
+            JobEventType::Dead => JobLifecycleEventType::Dead,
+            JobEventType::TimedOut => JobLifecycleEventType::TimedOut,
+        };
+
+        let error = event.error_message.as_ref().map(|message| JobError {
+            message: message.clone(),
+            error_type: match event.event_type {
+                JobEventType::TimedOut => Some("timeout".to_string()),
+                JobEventType::Failed => Some("processing_error".to_string()),
+                JobEventType::Dead => Some("max_retries_exceeded".to_string()),
+                _ => None,
+            },
+            details: None,
+            retry_attempt: None,
+        });
+
+        let mut metadata = HashMap::new();
+        metadata.insert("worker_queue".to_string(), self.queue_name.clone());
+
+        if let Some(processing_time) = event.processing_time_ms {
+            metadata.insert(
+                "processing_time_ms".to_string(),
+                processing_time.to_string(),
+            );
+        }
+
+        JobLifecycleEvent {
+            event_id: uuid::Uuid::new_v4(),
+            job_id: event.job_id,
+            queue_name: event.queue_name.clone(),
+            event_type,
+            priority: event.priority,
+            timestamp: event.timestamp,
+            processing_time_ms: event.processing_time_ms,
+            error,
+            payload: None, // Payload inclusion is controlled by EventFilter
+            metadata,
+        }
+    }
+
     /// Check and update the status of a batch after job completion
     async fn check_and_update_batch_status(&self, batch_id: BatchId) -> Result<()> {
         // Get current batch status
@@ -1904,6 +1998,15 @@ where
         if let Some(metrics_collector) = &self.metrics_collector {
             if let Err(e) = metrics_collector.record_job_event(&event).await {
                 warn!("Failed to record metrics event: {}", e);
+            }
+        }
+
+        // Publish to event manager for external integrations
+        #[cfg(feature = "webhooks")]
+        if let Some(event_manager) = &self.event_manager {
+            let lifecycle_event = self.convert_to_lifecycle_event(&event);
+            if let Err(e) = event_manager.publish_event(lifecycle_event).await {
+                warn!("Failed to publish lifecycle event: {}", e);
             }
         }
 

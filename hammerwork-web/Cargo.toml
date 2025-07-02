@@ -1,6 +1,6 @@
 [package]
 name = "hammerwork-web"
-description = "Web-based admin dashboard for Hammerwork job queues with real-time monitoring and management"
+description = "Web-based admin dashboard for Hammerwork job queues with real-time monitoring, webhook management, event streaming, and comprehensive job queue administration"
 readme = "README.md"
 keywords = ["job-queue", "dashboard", "web", "monitoring", "admin"]
 categories = ["web-programming", "development-tools", "database"]

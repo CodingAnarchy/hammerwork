@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2025-07-02
+
+### Added
+- **🔗 Comprehensive Event System & Webhook Integration**
+  - Complete job lifecycle event system with real-time event publishing and subscription
+  - `EventManager` for centralized event publishing with broadcast channels and filtering
+  - `JobLifecycleEvent` struct with detailed job metadata, timestamps, and error tracking
+  - Flexible `EventFilter` system for filtering by event type, queue, priority, processing time, and metadata
+  - `EventSubscription` handles for receiving filtered events with async channels
+  - Thread-safe event publishing integrated into job processing pipeline
+
+- **📡 Production-Ready Webhook System**
+  - `WebhookManager` for managing webhook configurations and delivery
+  - Multiple authentication methods: Bearer tokens, Basic auth, API keys, custom headers
+  - HMAC-SHA256 signature generation and verification for webhook security
+  - Configurable retry policies with exponential backoff and jitter
+  - Event filtering to deliver only relevant events to each webhook endpoint
+  - Delivery tracking with comprehensive statistics and failure analysis
+  - Rate limiting with configurable concurrent delivery limits
+
+- **🌊 Advanced Event Streaming Integration**
+  - `StreamManager` for delivering events to external message systems
+  - Multi-backend support: Apache Kafka, AWS Kinesis, Google Cloud Pub/Sub
+  - Flexible partitioning strategies: by job ID, queue name, priority, event type, or custom fields
+  - Multiple serialization formats: JSON, Avro with schema registry, Protocol Buffers, MessagePack
+  - Configurable buffering and batching for high-throughput scenarios
+  - Stream-specific retry policies and health monitoring
+  - Per-stream statistics tracking and global metrics
+
+- **⚙️ Enhanced Configuration System**
+  - Extended `HammerworkConfig` with webhook and streaming configurations
+  - TOML-based configuration with environment variable overrides
+  - `WebhookConfig` and `StreamConfig` for individual endpoint configuration
+  - Global settings for webhook and streaming behavior
+  - Development and production configuration presets
+  - Configuration validation and error handling
+
+- **🛠️ CLI Webhook & Streaming Management**
+  - Complete CLI integration in `cargo-hammerwork` for webhook management:
+    - `webhook list` - List configured webhooks with status and statistics
+    - `webhook test` - Test webhook deliveries with sample events
+    - `webhook enable/disable` - Control webhook activation
+    - `webhook stats` - Detailed webhook delivery statistics
+  - Streaming management commands:
+    - `stream list` - List configured streams with backend information
+    - `stream test` - Test stream connectivity and delivery
+    - `stream stats` - Stream-specific delivery statistics
+  - Enhanced monitoring commands with event system integration
+
+### Enhanced
+- **📈 Event-Driven Monitoring & Alerting**
+  - Webhook and streaming integration with existing metrics and alerting systems
+  - Real-time event delivery for external monitoring systems
+  - Event-based triggers for alerting and notification systems
+  - Integration with Prometheus metrics for webhook and streaming statistics
+
+- **🧪 Comprehensive Testing & Documentation**
+  - Complete test suite for event system, webhooks, and streaming (200+ new tests)
+  - Extensive documentation with doctests and practical examples
+  - Security testing for HMAC signature validation and authentication
+  - Integration tests with mock HTTP servers and message systems
+  - Performance testing for high-throughput event delivery scenarios
+
+- **📖 Enhanced Documentation**
+  - Comprehensive module-level documentation with architecture overviews
+  - Detailed examples for webhook authentication, HMAC signatures, and retry policies
+  - Streaming configuration examples for Kafka, Kinesis, and Pub/Sub
+  - Event filtering and partitioning strategy examples
+  - Updated main library documentation with event system integration examples
+
+### Technical Implementation
+- **Event Architecture**: Publish/subscribe pattern with broadcast channels and async event delivery
+- **Webhook Security**: HMAC-SHA256 signatures with configurable secrets and verification
+- **Stream Processing**: Async batch processing with configurable buffer sizes and flush intervals
+- **Configuration Management**: Hierarchical configuration with feature flags and environment variables
+- **Database Integration**: Event metadata stored in job payloads for correlation and debugging
+- **Error Handling**: Comprehensive error types with detailed error messages and retry logic
+- **Performance**: Optimized for high-throughput scenarios with concurrent processing limits
+
+### Breaking Changes
+- None - all webhook and streaming functionality is additive and backward compatible
+
 ## [1.4.0] - 2025-07-01
 
 ### Added
