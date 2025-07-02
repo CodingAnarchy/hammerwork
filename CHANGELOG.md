@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2025-07-02
+
+### Added
+- **📚 Complete Documentation Coverage**
+  - Added missing documentation files linked from README:
+    - `docs/tracing.md` - Comprehensive distributed tracing and correlation guide
+    - `docs/workflows.md` - Job dependencies and workflow orchestration documentation
+    - `docs/archiving.md` - Job archiving, retention, and compliance management guide
+  - All documentation includes practical examples, configuration options, and best practices
+
+### Enhanced
+- **📖 Updated Quick Start Guide**
+  - Completely redesigned `docs/quick-start.md` to match current v1.5.0 API
+  - Updated import statements and module structure to reflect actual implementation
+  - Added comprehensive examples for both PostgreSQL and MySQL
+  - Included statistics collection, rate limiting, and monitoring examples
+  - Added proper error handling patterns with `HammerworkError::Worker`
+  - Demonstrated worker configuration with timeouts, retry policies, and rate limits
+  - Added production considerations and environment setup guidance
+  - Updated all code examples to use current builder patterns and configuration methods
+
+- **🔧 Documentation Structure Improvements**
+  - Enhanced navigation with proper cross-references between documentation files
+  - Added prerequisite sections emphasizing database migration requirements
+  - Improved code examples with realistic job processing scenarios
+  - Added troubleshooting sections and performance considerations
+  - Standardized documentation format across all files
+
+### Fixed
+- **🐛 Documentation Accuracy**
+  - Corrected outdated API usage patterns in quick start examples
+  - Fixed import paths to match current module organization
+  - Updated job handler type signatures to match actual implementation
+  - Corrected database setup instructions to use `cargo hammerwork migrate`
+  - Fixed worker pool and statistics collector integration examples
+
 ## [1.5.0] - 2025-07-02
 
 ### Added

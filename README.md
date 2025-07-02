@@ -31,15 +31,15 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "1.4", features = ["postgres"] }
+hammerwork = { version = "1.5", features = ["postgres"] }
 # or
-hammerwork = { version = "1.4", features = ["mysql"] }
+hammerwork = { version = "1.5", features = ["mysql"] }
 
 # With distributed tracing
-hammerwork = { version = "1.4", features = ["postgres", "tracing"] }
+hammerwork = { version = "1.5", features = ["postgres", "tracing"] }
 
 # Minimal installation
-hammerwork = { version = "1.4", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.5", features = ["postgres"], default-features = false }
 ```
 
 **Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `tracing` (optional), `test` (for TestQueue)
@@ -52,7 +52,7 @@ cargo install hammerwork-web --features postgres
 
 # Or add to your project
 [dependencies]
-hammerwork-web = { version = "1.4", features = ["postgres"] }
+hammerwork-web = { version = "1.5", features = ["postgres"] }
 ```
 
 Start the dashboard:
