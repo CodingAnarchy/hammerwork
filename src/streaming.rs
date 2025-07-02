@@ -1427,37 +1427,45 @@ impl StreamProcessor for KafkaProcessor {
     async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
         // Placeholder implementation - in production this would use rdkafka
         // Configuration options could include: compression, acks, retries, batch.size, etc.
-        
+
         let start_time = Utc::now();
         let mut deliveries = Vec::new();
-        
+
         // Simulate batch processing with configuration-based delays
-        let batch_delay_ms = self.config
+        let batch_delay_ms = self
+            .config
             .get("batch.delay.ms")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(10);
-            
+
         tokio::time::sleep(tokio::time::Duration::from_millis(batch_delay_ms)).await;
-        
+
         // Simulate potential failures based on configuration
-        let error_rate = self.config
+        let error_rate = self
+            .config
             .get("test.error.rate")
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0);
-            
+
         for event in events {
             let success = rand::random::<f64>() > error_rate;
-            let duration = start_time.signed_duration_since(Utc::now()).num_milliseconds().unsigned_abs();
-            
+            let duration = start_time
+                .signed_duration_since(Utc::now())
+                .num_milliseconds()
+                .unsigned_abs();
+
             deliveries.push(StreamDelivery {
                 delivery_id: Uuid::new_v4(),
                 stream_id: Uuid::new_v4(), // Would be passed in
                 event_id: event.event.event_id,
                 success,
-                error_message: if success { 
-                    None 
-                } else { 
-                    Some(format!("Simulated Kafka delivery failure to topic: {}", self.topic))
+                error_message: if success {
+                    None
+                } else {
+                    Some(format!(
+                        "Simulated Kafka delivery failure to topic: {}",
+                        self.topic
+                    ))
                 },
                 attempted_at: start_time,
                 duration_ms: Some(duration),
@@ -1471,12 +1479,13 @@ impl StreamProcessor for KafkaProcessor {
     async fn health_check(&self) -> crate::Result<bool> {
         // In production, this would connect to Kafka brokers and check their health
         // Configuration could include timeout settings, retry policies, etc.
-        
-        let health_check_timeout_ms = self.config
+
+        let health_check_timeout_ms = self
+            .config
             .get("health.check.timeout.ms")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5000);
-            
+
         // Simulate health check with configurable timeout
         tokio::time::timeout(
             tokio::time::Duration::from_millis(health_check_timeout_ms),
@@ -1487,8 +1496,10 @@ impl StreamProcessor for KafkaProcessor {
                     // In real implementation, would ping broker
                 }
                 Ok(true)
-            }
-        ).await.unwrap_or(Ok(false))
+            },
+        )
+        .await
+        .unwrap_or(Ok(false))
     }
 
     async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
@@ -1578,30 +1589,33 @@ impl StreamProcessor for KinesisProcessor {
     async fn health_check(&self) -> crate::Result<bool> {
         // In production, this would validate AWS credentials and check Kinesis stream status
         // Configuration could include retry policies, credential validation, etc.
-        
+
         // Check if we have credentials configured
         let has_credentials = self.access_key_id.is_some() && self.secret_access_key.is_some();
-        
+
         if !has_credentials {
             tracing::warn!("Kinesis health check: No AWS credentials configured");
             return Ok(false);
         }
-        
+
         // Simulate credential validation and stream health check
-        let health_timeout = self.config
+        let health_timeout = self
+            .config
             .get("health.check.timeout.ms")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(10000);
-            
-        tokio::time::timeout(
-            tokio::time::Duration::from_millis(health_timeout),
-            async {
-                tracing::debug!("Checking Kinesis stream health: {} in region {}", 
-                    self.stream_name, self.region);
-                // In real implementation, would call AWS Kinesis DescribeStream
-                Ok(true)
-            }
-        ).await.unwrap_or(Ok(false))
+
+        tokio::time::timeout(tokio::time::Duration::from_millis(health_timeout), async {
+            tracing::debug!(
+                "Checking Kinesis stream health: {} in region {}",
+                self.stream_name,
+                self.region
+            );
+            // In real implementation, would call AWS Kinesis DescribeStream
+            Ok(true)
+        })
+        .await
+        .unwrap_or(Ok(false))
     }
 
     async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
@@ -1621,7 +1635,10 @@ impl StreamProcessor for KinesisProcessor {
         if let Some(ref access_key_id) = self.access_key_id {
             stats.insert(
                 "access_key_id".to_string(),
-                serde_json::Value::String(format!("{}***", &access_key_id[..4.min(access_key_id.len())])),
+                serde_json::Value::String(format!(
+                    "{}***",
+                    &access_key_id[..4.min(access_key_id.len())]
+                )),
             );
         }
         stats.insert(
@@ -2502,55 +2519,73 @@ mod tests {
     #[tokio::test]
     async fn test_stream_processor_configuration_usage() {
         // Test that configuration fields are properly used in stream processors
-        
+
         // Test Kafka processor with custom configuration
         let mut kafka_config = HashMap::new();
         kafka_config.insert("batch.delay.ms".to_string(), "50".to_string());
         kafka_config.insert("test.error.rate".to_string(), "0.1".to_string());
         kafka_config.insert("health.check.timeout.ms".to_string(), "1000".to_string());
-        
+
         let kafka_processor = KafkaProcessor::new(
             vec!["localhost:9092".to_string()],
             "test-topic".to_string(),
             kafka_config,
-        ).await.unwrap();
-        
+        )
+        .await
+        .unwrap();
+
         // Test that stats include configuration
         let stats = kafka_processor.get_stats().await.unwrap();
-        assert_eq!(stats.get("type").unwrap(), &serde_json::Value::String("kafka".to_string()));
+        assert_eq!(
+            stats.get("type").unwrap(),
+            &serde_json::Value::String("kafka".to_string())
+        );
         assert!(stats.contains_key("config"));
-        
+
         // Test Kinesis processor with AWS credentials
         let mut kinesis_config = HashMap::new();
         kinesis_config.insert("retries".to_string(), "3".to_string());
-        
+
         let kinesis_processor = KinesisProcessor::new(
             "us-west-2".to_string(),
             "test-stream".to_string(),
             Some("AKIA***".to_string()),
             Some("secret".to_string()),
             kinesis_config,
-        ).await.unwrap();
-        
+        )
+        .await
+        .unwrap();
+
         let kinesis_stats = kinesis_processor.get_stats().await.unwrap();
-        assert_eq!(kinesis_stats.get("type").unwrap(), &serde_json::Value::String("kinesis".to_string()));
+        assert_eq!(
+            kinesis_stats.get("type").unwrap(),
+            &serde_json::Value::String("kinesis".to_string())
+        );
         assert!(kinesis_stats.contains_key("access_key_id"));
         assert!(kinesis_stats.contains_key("config"));
-        
+
         // Test PubSub processor with service account
         let mut pubsub_config = HashMap::new();
         pubsub_config.insert("max_messages".to_string(), "1000".to_string());
-        
+
         let pubsub_processor = PubSubProcessor::new(
             "my-project".to_string(),
             "test-topic".to_string(),
             Some("service-account-key".to_string()),
             pubsub_config,
-        ).await.unwrap();
-        
+        )
+        .await
+        .unwrap();
+
         let pubsub_stats = pubsub_processor.get_stats().await.unwrap();
-        assert_eq!(pubsub_stats.get("type").unwrap(), &serde_json::Value::String("pubsub".to_string()));
-        assert_eq!(pubsub_stats.get("service_account_configured").unwrap(), &serde_json::Value::Bool(true));
+        assert_eq!(
+            pubsub_stats.get("type").unwrap(),
+            &serde_json::Value::String("pubsub".to_string())
+        );
+        assert_eq!(
+            pubsub_stats.get("service_account_configured").unwrap(),
+            &serde_json::Value::Bool(true)
+        );
         assert!(pubsub_stats.contains_key("config"));
     }
 }

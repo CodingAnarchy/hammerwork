@@ -264,7 +264,6 @@ pub struct EventFilter {
     pub include_payload: bool,
 }
 
-
 impl EventFilter {
     /// Create a new event filter
     pub fn new() -> Self {

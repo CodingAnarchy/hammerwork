@@ -106,7 +106,6 @@ pub struct HammerworkConfig {
     pub logging: LoggingConfig,
 }
 
-
 impl HammerworkConfig {
     /// Create a new configuration with defaults
     pub fn new() -> Self {
@@ -284,7 +283,6 @@ pub struct WebhookConfigs {
     pub global_settings: WebhookGlobalSettings,
 }
 
-
 /// Individual webhook configuration
 #[cfg(feature = "webhooks")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,7 +378,6 @@ pub struct StreamingConfigs {
     /// Global streaming settings
     pub global_settings: StreamingGlobalSettings,
 }
-
 
 /// Individual stream configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -540,7 +537,6 @@ pub struct RateLimitingConfig {
     /// Per-queue throttle configurations
     pub queue_throttles: HashMap<String, ThrottleConfig>,
 }
-
 
 /// Logging and tracing configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
