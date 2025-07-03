@@ -40,34 +40,32 @@ CREATE TABLE IF NOT EXISTS hammerwork_encryption_keys (
 );
 
 -- Add encryption fields to main jobs table
-ALTER TABLE hammerwork_jobs 
-ADD COLUMN is_encrypted BOOLEAN NOT NULL DEFAULT false,
-ADD COLUMN encryption_key_id VARCHAR(255), -- References hammerwork_encryption_keys.key_id
-ADD COLUMN encryption_algorithm VARCHAR(50), -- Algorithm used for this specific job
-ADD COLUMN encrypted_payload LONGBLOB, -- Encrypted payload data when is_encrypted = true
-ADD COLUMN encryption_nonce BLOB, -- Nonce/IV used for encryption
-ADD COLUMN encryption_tag BLOB, -- Authentication tag for AEAD ciphers
-ADD COLUMN encryption_metadata JSON, -- Metadata about encryption (compression, PII fields, etc.)
-ADD COLUMN payload_hash VARCHAR(255), -- Hash of original payload for integrity verification
-ADD COLUMN pii_fields JSON, -- Array of field names containing PII
-ADD COLUMN retention_policy VARCHAR(50), -- Retention policy for encrypted data
-ADD COLUMN retention_delete_at TIMESTAMP(6), -- When to delete encrypted data based on retention policy
-ADD COLUMN encrypted_at TIMESTAMP(6); -- When the payload was encrypted
+ALTER TABLE hammerwork_jobs ADD COLUMN is_encrypted BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE hammerwork_jobs ADD COLUMN encryption_key_id VARCHAR(255);
+ALTER TABLE hammerwork_jobs ADD COLUMN encryption_algorithm VARCHAR(50);
+ALTER TABLE hammerwork_jobs ADD COLUMN encrypted_payload LONGBLOB;
+ALTER TABLE hammerwork_jobs ADD COLUMN encryption_nonce BLOB;
+ALTER TABLE hammerwork_jobs ADD COLUMN encryption_tag BLOB;
+ALTER TABLE hammerwork_jobs ADD COLUMN encryption_metadata JSON;
+ALTER TABLE hammerwork_jobs ADD COLUMN payload_hash VARCHAR(255);
+ALTER TABLE hammerwork_jobs ADD COLUMN pii_fields JSON;
+ALTER TABLE hammerwork_jobs ADD COLUMN retention_policy VARCHAR(50);
+ALTER TABLE hammerwork_jobs ADD COLUMN retention_delete_at TIMESTAMP(6);
+ALTER TABLE hammerwork_jobs ADD COLUMN encrypted_at TIMESTAMP(6);
 
 -- Add encryption fields to archive table
-ALTER TABLE hammerwork_jobs_archive
-ADD COLUMN is_encrypted BOOLEAN NOT NULL DEFAULT false,
-ADD COLUMN encryption_key_id VARCHAR(255),
-ADD COLUMN encryption_algorithm VARCHAR(50),
-ADD COLUMN encrypted_payload LONGBLOB,
-ADD COLUMN encryption_nonce BLOB,
-ADD COLUMN encryption_tag BLOB,
-ADD COLUMN encryption_metadata JSON,
-ADD COLUMN payload_hash VARCHAR(255),
-ADD COLUMN pii_fields JSON,
-ADD COLUMN retention_policy VARCHAR(50),
-ADD COLUMN retention_delete_at TIMESTAMP(6),
-ADD COLUMN encrypted_at TIMESTAMP(6);
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN is_encrypted BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_key_id VARCHAR(255);
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_algorithm VARCHAR(50);
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN encrypted_payload LONGBLOB;
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_nonce BLOB;
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_tag BLOB;
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_metadata JSON;
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN payload_hash VARCHAR(255);
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN pii_fields JSON;
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN retention_policy VARCHAR(50);
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN retention_delete_at TIMESTAMP(6);
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN encrypted_at TIMESTAMP(6);
 
 -- Create indexes for encryption keys table
 CREATE INDEX idx_hammerwork_encryption_keys_key_id
