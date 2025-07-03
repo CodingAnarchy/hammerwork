@@ -118,6 +118,11 @@ impl JobRow {
             correlation_id: self.correlation_id,
             parent_span_id: self.parent_span_id,
             span_context: self.span_context,
+            encryption_config: None, // TODO: Implement encryption config deserialization
+            pii_fields: Vec::new(), // TODO: Implement PII fields deserialization
+            retention_policy: None, // TODO: Implement retention policy deserialization
+            is_encrypted: false, // TODO: Implement encryption status from database
+            encrypted_payload: None, // TODO: Implement encrypted payload deserialization
         })
     }
 }
@@ -180,6 +185,11 @@ impl DeadJobRow {
             correlation_id: None,
             parent_span_id: None,
             span_context: None,
+            encryption_config: None,
+            pii_fields: Vec::new(),
+            retention_policy: None,
+            is_encrypted: false,
+            encrypted_payload: None,
         }
     }
 }
@@ -360,6 +370,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 correlation_id,
                 parent_span_id,
                 span_context,
+                encryption_config: None,
+                pii_fields: Vec::new(),
+                retention_policy: None,
+                is_encrypted: false,
+                encrypted_payload: None,
             }))
         } else {
             Ok(None)
@@ -513,6 +528,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                         correlation_id: None,
                         parent_span_id: None,
                         span_context: None,
+                        encryption_config: None,
+                        pii_fields: Vec::new(),
+                        retention_policy: None,
+                        is_encrypted: false,
+                        encrypted_payload: None,
                     }));
                 }
             }
@@ -1690,6 +1710,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             correlation_id: archived_row.get("correlation_id"),
             parent_span_id: archived_row.get("parent_span_id"),
             span_context: archived_row.get("span_context"),
+            encryption_config: None,
+            pii_fields: Vec::new(),
+            retention_policy: None,
+            is_encrypted: false,
+            encrypted_payload: None,
         };
 
         // Insert back into main table

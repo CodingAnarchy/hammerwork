@@ -4,6 +4,8 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 ## Features
 
+- **🔐 Job Encryption & PII Protection**: Enterprise-grade encryption for sensitive job payloads with AES-256-GCM and ChaCha20-Poly1305, field-level PII protection, and configurable retention policies
+- **🗝️ Advanced Key Management**: Complete key lifecycle management with master key encryption, automatic rotation, audit trails, and external KMS integration
 - **🚀 Dynamic Job Spawning**: Jobs can dynamically create child jobs during execution for fan-out processing patterns, with full parent-child relationship tracking and lineage management
 - **📊 Web Dashboard**: Modern real-time web interface for monitoring queues, managing jobs, and system administration with authentication and WebSocket updates
 - **🧪 TestQueue Framework**: Complete in-memory testing implementation with MockClock for deterministic testing of time-dependent features, workflows, and job processing
@@ -31,18 +33,24 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "1.5", features = ["postgres"] }
+hammerwork = { version = "1.7", features = ["postgres"] }
 # or
-hammerwork = { version = "1.5", features = ["mysql"] }
+hammerwork = { version = "1.7", features = ["mysql"] }
+
+# With encryption for PII protection
+hammerwork = { version = "1.7", features = ["postgres", "encryption"] }
 
 # With distributed tracing
-hammerwork = { version = "1.5", features = ["postgres", "tracing"] }
+hammerwork = { version = "1.7", features = ["postgres", "tracing"] }
+
+# Full feature set
+hammerwork = { version = "1.7", features = ["postgres", "encryption", "tracing"] }
 
 # Minimal installation
-hammerwork = { version = "1.5", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.7", features = ["postgres"], default-features = false }
 ```
 
-**Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `tracing` (optional), `test` (for TestQueue)
+**Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `encryption` (optional), `tracing` (optional), `test` (for TestQueue)
 
 ### Web Dashboard (Optional)
 
@@ -52,7 +60,7 @@ cargo install hammerwork-web --features postgres
 
 # Or add to your project
 [dependencies]
-hammerwork-web = { version = "1.5", features = ["postgres"] }
+hammerwork-web = { version = "1.7", features = ["postgres"] }
 ```
 
 Start the dashboard:
@@ -81,6 +89,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 - **[Priority System](docs/priority-system.md)** - Five-level priority system with weighted scheduling
 - **[Batch Operations](docs/batch-operations.md)** - High-performance bulk job processing
 - **[Database Migrations](docs/migrations.md)** - Progressive schema updates and database setup
+- **[Job Encryption & PII Protection](docs/encryption.md)** - Enterprise encryption, key management, and data protection
 - **[Monitoring & Alerting](docs/monitoring.md)** - Prometheus metrics and notification systems
 
 ## Basic Example
@@ -338,6 +347,71 @@ let purged = queue.purge_archived_jobs(
 
 Archival moves completed/failed jobs to a separate table with compressed payloads, reducing the main table size while maintaining compliance requirements.
 
+## Job Encryption Example
+
+Protect sensitive job payloads with enterprise-grade encryption:
+
+```rust
+use hammerwork::{
+    Job, JobQueue, 
+    encryption::{EncryptionConfig, EncryptionAlgorithm, KeySource, RetentionPolicy},
+    queue::DatabaseQueue
+};
+use serde_json::json;
+use std::{sync::Arc, time::Duration};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup database and queue with encryption
+    let pool = sqlx::PgPool::connect("postgresql://localhost/mydb").await?;
+    let queue = Arc::new(JobQueue::new(pool));
+
+    // Configure encryption for PII protection
+    let encryption_config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+        .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()))
+        .with_key_rotation_enabled(true);
+
+    // Create job with encrypted PII fields
+    let payment_job = Job::new("payment_processing".to_string(), json!({
+        "user_id": "user123",
+        "credit_card": "4111-1111-1111-1111",  // PII - will be encrypted
+        "ssn": "123-45-6789",                  // PII - will be encrypted  
+        "amount": 299.99,
+        "merchant": "Online Store"
+    }))
+    .with_encryption(encryption_config)
+    .with_pii_fields(vec!["credit_card", "ssn"])  // Specify which fields contain PII
+    .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(7 * 24 * 60 * 60))); // 7 days
+
+    // Enqueue encrypted job
+    queue.enqueue(payment_job).await?;
+
+    // Job handler processes decrypted payload transparently
+    let handler = Arc::new(|job: Job| {
+        Box::pin(async move {
+            // Payload is automatically decrypted before reaching handler
+            println!("Processing payment: {:?}", job.payload);
+            
+            // PII fields are available in plain text for processing
+            let credit_card = job.payload["credit_card"].as_str().unwrap();
+            let ssn = job.payload["ssn"].as_str().unwrap();
+            
+            // Your business logic here - encryption is transparent
+            Ok(())
+        })
+    });
+
+    Ok(())
+}
+```
+
+Key features:
+- **Automatic Encryption**: PII fields are automatically encrypted when jobs are enqueued
+- **Transparent Decryption**: Job handlers receive decrypted payloads transparently
+- **Field-Level Protection**: Only specified PII fields are encrypted, keeping metadata accessible
+- **Retention Policies**: Automatic deletion of encrypted data after compliance periods
+- **Key Management**: Enterprise key rotation, audit trails, and external KMS integration
+
 ## Web Dashboard
 
 Start the real-time web dashboard for monitoring and managing your job queues:
@@ -406,13 +480,14 @@ queue.enqueue(job).await?;
 ### Database Schema
 
 Hammerwork uses optimized tables with comprehensive indexing:
-- **`hammerwork_jobs`** - Main job table with priorities, timeouts, cron scheduling, retry strategies, result storage, and distributed tracing fields
+- **`hammerwork_jobs`** - Main job table with priorities, timeouts, cron scheduling, retry strategies, result storage, distributed tracing, and encryption fields
 - **`hammerwork_jobs_archive`** - Archive table for completed/failed jobs with compressed payloads (v1.3.0+)
+- **`hammerwork_encryption_keys`** - Encrypted key storage with master key encryption and audit trails (v1.7.0+)
 - **`hammerwork_batches`** - Batch metadata and tracking (v0.7.0+)
 - **`hammerwork_job_results`** - Job result storage with TTL and expiration (v0.8.0+)
 - **`hammerwork_migrations`** - Migration tracking for schema evolution
 
-The schema supports all features including job prioritization, advanced retry strategies, timeouts, cron scheduling, batch processing, result storage with TTL, distributed tracing with trace/correlation IDs, worker autoscaling, job archival with compression, and comprehensive lifecycle tracking. See [Database Migrations](docs/migrations.md) for details.
+The schema supports all features including job prioritization, advanced retry strategies, timeouts, cron scheduling, batch processing, result storage with TTL, distributed tracing with trace/correlation IDs, worker autoscaling, job archival with compression, job encryption with PII protection, enterprise key management, and comprehensive lifecycle tracking. See [Database Migrations](docs/migrations.md) for details.
 
 ## Development
 
@@ -442,6 +517,8 @@ Working examples in `examples/`:
 - `result_storage_example.rs` - Job result storage and retrieval
 - `autoscaling_example.rs` - Dynamic worker pool scaling based on queue depth
 - `tracing_example.rs` - Distributed tracing with OpenTelemetry and event hooks
+- `encryption_example.rs` - Job encryption, PII protection, and key management
+- `key_management_example.rs` - Enterprise key lifecycle and audit trails
 
 ```bash
 cargo run --example postgres_example --features postgres

@@ -324,6 +324,16 @@ pub struct Job {
     pub parent_span_id: Option<String>,
     /// Serialized span context for trace propagation.
     pub span_context: Option<String>,
+    /// Encryption configuration for this job's payload (if encrypted).
+    pub encryption_config: Option<crate::encryption::EncryptionConfig>,
+    /// List of field names that contain PII and should be encrypted.
+    pub pii_fields: Vec<String>,
+    /// Retention policy for encrypted data (overrides default if specified).
+    pub retention_policy: Option<crate::encryption::RetentionPolicy>,
+    /// Whether the payload is currently encrypted.
+    pub is_encrypted: bool,
+    /// Encrypted payload data (if job is encrypted).
+    pub encrypted_payload: Option<crate::encryption::EncryptedPayload>,
 }
 
 impl Job {
@@ -397,6 +407,11 @@ impl Job {
             correlation_id: None,
             parent_span_id: None,
             span_context: None,
+            encryption_config: None,
+            pii_fields: Vec::new(),
+            retention_policy: None,
+            is_encrypted: false,
+            encrypted_payload: None,
         }
     }
 
@@ -475,6 +490,11 @@ impl Job {
             correlation_id: None,
             parent_span_id: None,
             span_context: None,
+            encryption_config: None,
+            pii_fields: Vec::new(),
+            retention_policy: None,
+            is_encrypted: false,
+            encrypted_payload: None,
         }
     }
 
@@ -827,6 +847,11 @@ impl Job {
             correlation_id: None,
             parent_span_id: None,
             span_context: None,
+            encryption_config: None,
+            pii_fields: Vec::new(),
+            retention_policy: None,
+            is_encrypted: false,
+            encrypted_payload: None,
         })
     }
 
@@ -1551,6 +1576,242 @@ impl Job {
     /// ```
     pub fn get_correlation_id(&self) -> Option<&str> {
         self.correlation_id.as_deref()
+    }
+
+    /// Sets the encryption configuration for this job.
+    ///
+    /// When encryption is configured, the job payload will be encrypted before
+    /// being stored in the database and decrypted when retrieved.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The encryption configuration to use
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::{Job, encryption::{EncryptionConfig, EncryptionAlgorithm}};
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("secure_task".to_string(), json!({"data": "sensitive"}))
+    ///     .with_encryption(EncryptionConfig::new(EncryptionAlgorithm::AES256GCM));
+    ///
+    /// assert!(job.has_encryption());
+    /// # }
+    /// ```
+    pub fn with_encryption(mut self, config: crate::encryption::EncryptionConfig) -> Self {
+        self.encryption_config = Some(config);
+        self
+    }
+
+    /// Sets the PII fields for this job.
+    ///
+    /// PII (Personally Identifiable Information) fields are tracked separately
+    /// for compliance and auditing purposes. When encryption is enabled, these
+    /// fields receive special handling.
+    ///
+    /// # Arguments
+    ///
+    /// * `pii_fields` - List of field names that contain PII
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("user_processing".to_string(), json!({
+    ///     "user_id": "123",
+    ///     "email": "user@example.com",
+    ///     "ssn": "123-45-6789"
+    /// }))
+    /// .with_pii_fields(vec!["email", "ssn"]);
+    ///
+    /// assert_eq!(job.pii_fields.len(), 2);
+    /// assert!(job.has_pii_fields());
+    /// ```
+    pub fn with_pii_fields(mut self, pii_fields: Vec<impl Into<String>>) -> Self {
+        self.pii_fields = pii_fields.into_iter().map(|f| f.into()).collect();
+        self
+    }
+
+    /// Sets the retention policy for this job's encrypted data.
+    ///
+    /// The retention policy determines how long encrypted job data should be
+    /// kept before automatic cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy` - The retention policy to apply
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::{Job, encryption::RetentionPolicy};
+    /// use serde_json::json;
+    /// use std::time::Duration;
+    ///
+    /// let job = Job::new("temp_processing".to_string(), json!({"data": "temp"}))
+    ///     .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(3600)));
+    /// # }
+    /// ```
+    pub fn with_retention_policy(mut self, policy: crate::encryption::RetentionPolicy) -> Self {
+        self.retention_policy = Some(policy);
+        self
+    }
+
+    /// Checks if this job has encryption configured.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job1 = Job::new("plain".to_string(), json!({}));
+    /// assert!(!job1.has_encryption());
+    ///
+    /// #[cfg(feature = "encryption")]
+    /// {
+    ///     use hammerwork::encryption::{EncryptionConfig, EncryptionAlgorithm};
+    ///     let job2 = Job::new("encrypted".to_string(), json!({}))
+    ///         .with_encryption(EncryptionConfig::new(EncryptionAlgorithm::AES256GCM));
+    ///     assert!(job2.has_encryption());
+    /// }
+    /// ```
+    pub fn has_encryption(&self) -> bool {
+        self.encryption_config.is_some()
+    }
+
+    /// Checks if this job has PII fields configured.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job1 = Job::new("normal".to_string(), json!({}));
+    /// assert!(!job1.has_pii_fields());
+    ///
+    /// let job2 = Job::new("with_pii".to_string(), json!({}))
+    ///     .with_pii_fields(vec!["email"]);
+    /// assert!(job2.has_pii_fields());
+    /// ```
+    pub fn has_pii_fields(&self) -> bool {
+        !self.pii_fields.is_empty()
+    }
+
+    /// Checks if this job's payload is currently encrypted.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("test".to_string(), json!({}));
+    /// assert!(!job.is_payload_encrypted());
+    /// ```
+    pub fn is_payload_encrypted(&self) -> bool {
+        self.is_encrypted
+    }
+
+    /// Gets the list of PII fields for this job.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("test".to_string(), json!({}))
+    ///     .with_pii_fields(vec!["email", "ssn"]);
+    ///
+    /// let pii_fields = job.get_pii_fields();
+    /// assert_eq!(pii_fields.len(), 2);
+    /// assert!(pii_fields.contains(&"email".to_string()));
+    /// ```
+    pub fn get_pii_fields(&self) -> &[String] {
+        &self.pii_fields
+    }
+
+    /// Gets the encryption configuration if available.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::{Job, encryption::{EncryptionConfig, EncryptionAlgorithm}};
+    /// use serde_json::json;
+    ///
+    /// let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM);
+    /// let job = Job::new("test".to_string(), json!({}))
+    ///     .with_encryption(config.clone());
+    ///
+    /// let retrieved_config = job.get_encryption_config().unwrap();
+    /// assert_eq!(retrieved_config.algorithm, EncryptionAlgorithm::AES256GCM);
+    /// # }
+    /// ```
+    pub fn get_encryption_config(&self) -> Option<&crate::encryption::EncryptionConfig> {
+        self.encryption_config.as_ref()
+    }
+
+    /// Gets the retention policy if available.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::{Job, encryption::RetentionPolicy};
+    /// use serde_json::json;
+    /// use std::time::Duration;
+    ///
+    /// let policy = RetentionPolicy::DeleteAfter(Duration::from_secs(3600));
+    /// let job = Job::new("test".to_string(), json!({}))
+    ///     .with_retention_policy(policy.clone());
+    ///
+    /// assert_eq!(job.get_retention_policy(), Some(&policy));
+    /// # }
+    /// ```
+    pub fn get_retention_policy(&self) -> Option<&crate::encryption::RetentionPolicy> {
+        self.retention_policy.as_ref()
+    }
+
+    /// Checks if this job should have its encrypted data cleaned up now.
+    ///
+    /// This method checks the retention policy and encrypted payload metadata
+    /// to determine if the data has exceeded its retention period.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let job = Job::new("test".to_string(), json!({}));
+    /// assert!(!job.should_cleanup_encrypted_data());
+    /// ```
+    pub fn should_cleanup_encrypted_data(&self) -> bool {
+        if let Some(encrypted_payload) = &self.encrypted_payload {
+            encrypted_payload.should_delete_now()
+        } else if let Some(retention_policy) = &self.retention_policy {
+            retention_policy.should_delete_now(
+                self.created_at,
+                self.completed_at,
+                self.encryption_config
+                    .as_ref()
+                    .and_then(|c| c.default_retention),
+            )
+        } else {
+            false
+        }
     }
 }
 

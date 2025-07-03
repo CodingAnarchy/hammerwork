@@ -347,5 +347,19 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("010_add_archival.postgres.sql").to_string(),
             include_str!("010_add_archival.mysql.sql").to_string(),
         );
+
+        // Migration 011: Add encryption support for job payloads
+        self.register_migration(
+            Migration {
+                id: "011_add_encryption".to_string(),
+                description: "Add job payload encryption and key management".to_string(),
+                version: 11,
+                created_at: chrono::DateTime::parse_from_rfc3339("2025-11-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("011_add_encryption.postgres.sql").to_string(),
+            include_str!("011_add_encryption.mysql.sql").to_string(),
+        );
     }
 }

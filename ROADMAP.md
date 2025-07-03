@@ -2,20 +2,24 @@
 
 This roadmap outlines planned features for Hammerwork, prioritized by impact level and implementation complexity. Features are organized into phases based on their value proposition to users and estimated development effort.
 
-## Phase 3: Specialized Features
+## Phase 3: Specialized Features (🚧 IN PROGRESS)
 *Features for specific enterprise or compliance requirements*
 
-### 🔐 Job Encryption & PII Protection
+### ✅ Job Encryption & PII Protection (IMPLEMENTED)
 **Impact: Medium** | **Complexity: High** | **Priority: Low-Medium**
 
 Critical for organizations with strict data protection requirements.
 
+**Status**: Core encryption system implemented with AES-256-GCM and ChaCha20-Poly1305 support, PII field detection, and retention policies.
+
 ```rust
 // Encrypt sensitive job payloads
+use hammerwork::{Job, encryption::{EncryptionConfig, EncryptionAlgorithm, RetentionPolicy}};
+
 let job = Job::new("process_payment".to_string(), payment_data)
-    .with_encryption(EncryptionConfig::AES256)
+    .with_encryption(EncryptionConfig::new(EncryptionAlgorithm::AES256GCM))
     .with_pii_fields(vec!["credit_card", "ssn"])
-    .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_days(7)));
+    .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(7 * 24 * 60 * 60)));
 ```
 
 ### 🛡️ Access Control & Auditing

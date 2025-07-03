@@ -5,6 +5,105 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2025-07-03
+
+### Added
+- **🔐 Job Encryption & PII Protection**
+  - Complete encryption system for protecting sensitive job payloads and personally identifiable information (PII)
+  - Support for multiple encryption algorithms: AES-256-GCM and ChaCha20-Poly1305 with authenticated encryption
+  - Field-level encryption targeting specific PII fields like credit cards, SSNs, and other sensitive data
+  - Automatic PII field detection using pattern matching for common sensitive data types
+  - Thread-safe `EncryptionEngine` with performance statistics and operation tracking
+  - Configurable retention policies: `DeleteAfter`, `DeleteAt`, `KeepIndefinitely`, `DeleteImmediately`, and `UseDefault`
+
+- **🗝️ Advanced Key Management System**
+  - Enterprise-grade key management with `KeyManager` supporting PostgreSQL and MySQL
+  - Master key encryption (KEK - Key Encryption Keys) for securing data encryption keys
+  - Key rotation and lifecycle management with automatic rotation scheduling
+  - Key versioning system with configurable maximum versions (default: 10 versions)
+  - Key audit trails tracking all key operations: Create, Access, Rotate, Retire, Revoke, Delete, Update
+  - External KMS integration support (AWS, GCP, Azure, HashiCorp Vault) with authentication configuration
+  - Key derivation from passwords using Argon2 with configurable memory, time, and parallelism parameters
+
+- **🛡️ Security Features**
+  - Keys never stored in plain text - all keys encrypted with master key in database
+  - Secure key caching with 1-hour TTL and thread-safe access patterns
+  - Key status management: Active, Retired, Revoked, Expired with proper lifecycle enforcement
+  - Comprehensive key statistics: total keys, active/retired/revoked counts, usage tracking, rotation metrics
+  - Key expiration handling with automatic status updates and access prevention
+  - Salt-based key derivation for password-based keys with configurable parameters
+
+- **📊 Database Schema Enhancements**
+  - New `hammerwork_encryption_keys` table for secure key storage with encrypted key material
+  - Added encryption fields to `hammerwork_jobs` table: `is_encrypted`, `encrypted_payload`, `pii_fields`, `retention_policy`
+  - Extended `hammerwork_job_archive` table with encryption support for archived job data
+  - Comprehensive indexes for efficient key lookup and rotation queries
+  - Migration 011_add_encryption for both PostgreSQL and MySQL with proper column types and constraints
+
+### Enhanced
+- **🔧 Job System Integration**
+  - Extended `Job` struct with encryption fields: `encryption_config`, `pii_fields`, `retention_policy`, `is_encrypted`, `encrypted_payload`
+  - Builder pattern methods: `with_encryption()`, `with_pii_fields()`, `with_retention_policy()` for fluent job creation
+  - Seamless integration with existing job processing - no changes required to job handlers
+  - Automatic encryption/decryption during job enqueue/dequeue operations when configured
+  - Compression before encryption for large payloads to optimize storage and performance
+
+- **⚡ Performance Optimizations**
+  - Zero overhead for non-encrypted jobs - encryption only activated when explicitly configured
+  - Efficient field-level encryption that only processes specified PII fields
+  - Key caching reduces database queries for frequently accessed keys
+  - Batch key operations for improved performance in high-throughput scenarios
+  - Memory-efficient encryption with streaming for large payloads
+
+- **🎯 Configuration Flexibility**
+  - Feature flag `encryption` for optional compilation - only includes dependencies when needed
+  - Multiple key sources: Environment variables, static keys, generated keys, external KMS
+  - Configurable encryption algorithms with algorithm-specific key sizes and security parameters
+  - Flexible retention policies supporting various compliance requirements (GDPR, HIPAA, PCI-DSS)
+  - Runtime configuration loading from environment variables and configuration files
+
+### Security Considerations
+- **🔒 Cryptographic Standards**
+  - Uses industry-standard encryption algorithms with authenticated encryption (AEAD)
+  - AES-256-GCM provides 256-bit security with Galois/Counter Mode for performance and security
+  - ChaCha20-Poly1305 offers modern stream cipher with Poly1305 MAC for mobile and embedded systems
+  - Secure random number generation using OS entropy sources (`OsRng`)
+  - Proper nonce handling with unique nonces for each encryption operation
+
+- **🛡️ Key Security**
+  - Master keys loaded from secure sources with proper access control
+  - Key rotation prevents long-term key exposure with configurable rotation intervals
+  - Key versioning maintains backward compatibility while enabling forward security
+  - Audit logging provides complete key operation history for compliance and security monitoring
+  - Key expiration and revocation capabilities for incident response and key compromise scenarios
+
+### Examples & Documentation
+- **📖 Comprehensive Examples**
+  - `encryption_example.rs` demonstrating all encryption features with realistic PII scenarios
+  - `key_management_example.rs` showing enterprise key management patterns and best practices
+  - Doctests throughout encryption modules with proper feature guards and usage patterns
+  - Integration examples showing encryption with job processing, archiving, and worker operations
+
+- **🔧 CLI Integration**
+  - Extended cargo-hammerwork CLI with encryption key management commands
+  - Database migration support for encryption schema with `cargo hammerwork migration run`
+  - Key generation, rotation, and audit trail inspection through CLI interface
+  - Configuration validation and security best practice recommendations
+
+### Technical Implementation
+- **🏗️ Architecture**
+  - Modular design with `encryption::engine` and `encryption::key_manager` separation
+  - Generic key management supporting multiple database backends
+  - Event-driven key operations with proper error handling and rollback capabilities
+  - Thread-safe design using `Arc<Mutex<>>` patterns for concurrent access
+
+- **🧪 Testing Coverage**
+  - Comprehensive unit tests for all encryption and key management operations
+  - Integration tests with real database backends (PostgreSQL and MySQL)
+  - Security tests validating encryption strength, key protection, and audit trail integrity
+  - Performance benchmarks ensuring encryption overhead remains acceptable
+  - Edge case testing including key rotation failures, expired keys, and revoked key handling
+
 ## [1.6.0] - 2025-07-02
 
 ### Added

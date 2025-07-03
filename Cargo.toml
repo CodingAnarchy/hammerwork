@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.6.0"
+version = "1.7.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
@@ -19,7 +19,7 @@ documentation = "https://docs.rs/hammerwork"
 rust-version = "1.86"
 
 [workspace.dependencies]
-hammerwork = { version = "1.6.0", path = "." }
+hammerwork = { version = "1.7.0", path = "." }
 tokio = { version = "1.0", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -52,6 +52,9 @@ futures-util = "0.3"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
 
 [package]
 name = "hammerwork"
@@ -94,6 +97,10 @@ flate2 = { workspace = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+argon2 = { workspace = true, optional = true }
+base64 = { workspace = true }
 toml = { workspace = true }
 
 [features]
@@ -103,6 +110,7 @@ mysql = ["sqlx/mysql"]
 metrics = ["prometheus", "warp"]
 alerting = ["reqwest"]
 webhooks = ["reqwest", "hmac", "sha2", "hex"]
+encryption = ["aes-gcm", "chacha20poly1305", "argon2", "hmac", "sha2", "hex"]
 tracing = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 test = []
 
@@ -151,4 +159,8 @@ required-features = ["postgres"]
 [[example]]
 name = "test_queue_example"
 required-features = ["test"]
+
+[[example]]
+name = "encryption_example"
+required-features = ["encryption"]
 

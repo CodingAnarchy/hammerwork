@@ -124,6 +124,11 @@ impl JobRow {
             correlation_id: self.correlation_id,
             parent_span_id: self.parent_span_id,
             span_context: self.span_context,
+            encryption_config: None,
+            pii_fields: Vec::new(),
+            retention_policy: None,
+            is_encrypted: false,
+            encrypted_payload: None,
         })
     }
 }
@@ -186,6 +191,11 @@ impl DeadJobRow {
             correlation_id: None,
             parent_span_id: None,
             span_context: None,
+            encryption_config: None,
+            pii_fields: Vec::new(),
+            retention_policy: None,
+            is_encrypted: false,
+            encrypted_payload: None,
         })
     }
 }
@@ -1507,6 +1517,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             correlation_id: archived_row.get("correlation_id"),
             parent_span_id: archived_row.get("parent_span_id"),
             span_context: archived_row.get("span_context"),
+            encryption_config: None,
+            pii_fields: Vec::new(),
+            retention_policy: None,
+            is_encrypted: false,
+            encrypted_payload: None,
         };
 
         // Insert back into main table using existing enqueue method

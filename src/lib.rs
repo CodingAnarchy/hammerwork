@@ -224,12 +224,14 @@
 //! - `metrics` - Enable Prometheus metrics collection (default)
 //! - `alerting` - Enable webhook/Slack/email alerting (default)
 //! - `webhooks` - Enable webhook and event system features (default)
+//! - `encryption` - Enable job payload encryption and PII protection
 //! - `tracing` - Enable OpenTelemetry distributed tracing
 
 pub mod archive;
 pub mod batch;
 pub mod config;
 pub mod cron;
+pub mod encryption;
 pub mod error;
 pub mod job;
 pub mod migrations;
@@ -273,6 +275,12 @@ pub use config::{
 #[cfg(feature = "webhooks")]
 pub use config::{WebhookConfig, WebhookConfigs, WebhookGlobalSettings};
 pub use cron::{CronError, CronSchedule};
+pub use encryption::{
+    EncryptedPayload, EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, EncryptionError,
+    EncryptionKey, EncryptionMetadata, EncryptionStats, ExternalKmsConfig, KeyAuditRecord,
+    KeyDerivationConfig, KeyManager, KeyManagerConfig, KeyManagerStats, KeyOperation, KeyPurpose,
+    KeySource, KeyStatus, RetentionPolicy,
+};
 pub use error::HammerworkError;
 pub use job::{Job, JobId, JobStatus, ResultConfig, ResultStorage};
 pub use priority::{
