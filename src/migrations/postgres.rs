@@ -25,11 +25,11 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
         let mut tx = self.pool.begin().await?;
 
         // Split SQL into individual statements and execute each one
-        // This is a simple split that handles most cases - splits on semicolon followed by newline
+        // Split on semicolon and filter out empty statements
         let statements: Vec<&str> = sql
-            .split(";\n")
+            .split(';')
             .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.chars().all(|c| c.is_whitespace() || c == '\n'))
             .collect();
 
         for (i, statement) in statements.iter().enumerate() {
