@@ -295,19 +295,19 @@ impl PrometheusMetricsCollector {
         match event.event_type {
             crate::stats::JobEventType::Completed => {
                 self.jobs_total
-                    .with_label_values(&[queue, "completed", &priority])
+                    .with_label_values(&[queue.as_str(), "completed", priority.as_str()])
                     .inc();
 
                 if let Some(duration_ms) = event.processing_time_ms {
                     let duration_secs = duration_ms as f64 / 1000.0;
                     self.jobs_duration
-                        .with_label_values(&[queue, &priority])
+                        .with_label_values(&[queue.as_str(), priority.as_str()])
                         .observe(duration_secs);
                 }
             }
             crate::stats::JobEventType::Failed => {
                 self.jobs_total
-                    .with_label_values(&[queue, "failed", &priority])
+                    .with_label_values(&[queue.as_str(), "failed", priority.as_str()])
                     .inc();
 
                 let error_type = event
@@ -326,35 +326,35 @@ impl PrometheusMetricsCollector {
                     .unwrap_or("unknown");
 
                 self.jobs_failed_total
-                    .with_label_values(&[queue, error_type, &priority])
+                    .with_label_values(&[queue.as_str(), error_type, priority.as_str()])
                     .inc();
             }
             crate::stats::JobEventType::TimedOut => {
                 self.jobs_total
-                    .with_label_values(&[queue, "timed_out", &priority])
+                    .with_label_values(&[queue.as_str(), "timed_out", priority.as_str()])
                     .inc();
 
                 self.jobs_failed_total
-                    .with_label_values(&[queue, "timeout", &priority])
+                    .with_label_values(&[queue.as_str(), "timeout", priority.as_str()])
                     .inc();
             }
             crate::stats::JobEventType::Dead => {
                 self.jobs_total
-                    .with_label_values(&[queue, "dead", &priority])
+                    .with_label_values(&[queue.as_str(), "dead", priority.as_str()])
                     .inc();
 
                 self.jobs_failed_total
-                    .with_label_values(&[queue, "exhausted", &priority])
+                    .with_label_values(&[queue.as_str(), "exhausted", priority.as_str()])
                     .inc();
             }
             crate::stats::JobEventType::Retried => {
                 self.jobs_total
-                    .with_label_values(&[queue, "retried", &priority])
+                    .with_label_values(&[queue.as_str(), "retried", priority.as_str()])
                     .inc();
             }
             crate::stats::JobEventType::Started => {
                 self.jobs_total
-                    .with_label_values(&[queue, "started", &priority])
+                    .with_label_values(&[queue.as_str(), "started", priority.as_str()])
                     .inc();
             }
         }

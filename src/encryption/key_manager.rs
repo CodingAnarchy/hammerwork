@@ -22,13 +22,15 @@
 //! # #[cfg(feature = "encryption")]
 //! # {
 //! use hammerwork::encryption::{KeyManager, EncryptionAlgorithm, KeyManagerConfig};
+//! use sqlx::{postgres::PgPool, Pool};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let pool: Pool<sqlx::Postgres> = todo!();
 //! let config = KeyManagerConfig::new()
 //!     .with_master_key_env("MASTER_KEY")
 //!     .with_auto_rotation_enabled(true);
 //!
-//! let mut key_manager = KeyManager::new(config).await?;
+//! let mut key_manager = KeyManager::new(config, pool).await?;
 //!
 //! // Generate a new encryption key
 //! let key_id = key_manager.generate_key("payment-encryption", EncryptionAlgorithm::AES256GCM).await?;

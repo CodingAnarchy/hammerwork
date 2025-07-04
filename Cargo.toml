@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.7.2"
+version = "1.7.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
@@ -19,7 +19,7 @@ documentation = "https://docs.rs/hammerwork"
 rust-version = "1.86"
 
 [workspace.dependencies]
-hammerwork = { version = "1.7.2", path = "." }
+hammerwork = { version = "1.7.3", path = "." }
 tokio = { version = "1.0", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 tokio-test = "0.4"
 rand = "0.8"
-prometheus = { version = "0.13" }
+prometheus = { version = "0.14" }
 reqwest = { version = "0.12", features = ["json"] }
 warp = { version = "0.3" }
 clap = { version = "4.0", features = ["derive"] }
@@ -84,7 +84,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
-prometheus = { version = "0.13", optional = true }
+prometheus = { workspace = true, optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 warp = { version = "0.3", optional = true }
 clap = { workspace = true }
