@@ -3,9 +3,15 @@
 
 -- Add cron scheduling fields
 ALTER TABLE hammerwork_jobs 
-ADD COLUMN IF NOT EXISTS cron_schedule VARCHAR(100),
-ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMPTZ,
-ADD COLUMN IF NOT EXISTS recurring BOOLEAN NOT NULL DEFAULT FALSE,
+ADD COLUMN IF NOT EXISTS cron_schedule VARCHAR(100);
+
+ALTER TABLE hammerwork_jobs 
+ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMPTZ;
+
+ALTER TABLE hammerwork_jobs 
+ADD COLUMN IF NOT EXISTS recurring BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE hammerwork_jobs 
 ADD COLUMN IF NOT EXISTS timezone VARCHAR(50);
 
 -- Create indexes for cron job queries

@@ -644,6 +644,7 @@ impl EncryptionEngine {
     }
 
     #[cfg(feature = "encryption")]
+    #[allow(clippy::type_complexity)]
     fn encrypt_data(&self, data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), EncryptionError> {
         let default_key_id = "default".to_string();
         let key_id = self.config.key_id.as_ref().unwrap_or(&default_key_id);
@@ -778,6 +779,7 @@ impl EncryptionEngine {
         hex::encode(hasher.finalize())
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn scan_object_for_pii(
         &self,
         value: &Value,

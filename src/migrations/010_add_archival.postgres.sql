@@ -66,8 +66,12 @@ CREATE TABLE IF NOT EXISTS hammerwork_jobs_archive (
 
 -- Add archival metadata to main jobs table
 ALTER TABLE hammerwork_jobs 
-ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ,
-ADD COLUMN IF NOT EXISTS archival_reason VARCHAR,
+ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+
+ALTER TABLE hammerwork_jobs 
+ADD COLUMN IF NOT EXISTS archival_reason VARCHAR;
+
+ALTER TABLE hammerwork_jobs 
 ADD COLUMN IF NOT EXISTS archival_policy_applied VARCHAR;
 
 -- Indexes for archive table - optimized for archival queries

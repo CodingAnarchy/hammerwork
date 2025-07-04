@@ -40,34 +40,54 @@ CREATE TABLE IF NOT EXISTS hammerwork_encryption_keys (
 );
 
 -- Add encryption fields to main jobs table
-ALTER TABLE hammerwork_jobs 
-ADD COLUMN IF NOT EXISTS is_encrypted BOOLEAN NOT NULL DEFAULT false,
-ADD COLUMN IF NOT EXISTS encryption_key_id VARCHAR, -- References hammerwork_encryption_keys.key_id
-ADD COLUMN IF NOT EXISTS encryption_algorithm VARCHAR, -- Algorithm used for this specific job
-ADD COLUMN IF NOT EXISTS encrypted_payload BYTEA, -- Encrypted payload data when is_encrypted = true
-ADD COLUMN IF NOT EXISTS encryption_nonce BYTEA, -- Nonce/IV used for encryption
-ADD COLUMN IF NOT EXISTS encryption_tag BYTEA, -- Authentication tag for AEAD ciphers
-ADD COLUMN IF NOT EXISTS encryption_metadata JSONB, -- Metadata about encryption (compression, PII fields, etc.)
-ADD COLUMN IF NOT EXISTS payload_hash VARCHAR, -- Hash of original payload for integrity verification
-ADD COLUMN IF NOT EXISTS pii_fields TEXT[], -- Array of field names containing PII
-ADD COLUMN IF NOT EXISTS retention_policy VARCHAR, -- Retention policy for encrypted data
-ADD COLUMN IF NOT EXISTS retention_delete_at TIMESTAMPTZ, -- When to delete encrypted data based on retention policy
-ADD COLUMN IF NOT EXISTS encrypted_at TIMESTAMPTZ; -- When the payload was encrypted
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS is_encrypted BOOLEAN NOT NULL DEFAULT false;
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS encryption_key_id VARCHAR; -- References hammerwork_encryption_keys.key_id
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS encryption_algorithm VARCHAR; -- Algorithm used for this specific job
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS encrypted_payload BYTEA; -- Encrypted payload data when is_encrypted = true
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS encryption_nonce BYTEA; -- Nonce/IV used for encryption
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS encryption_tag BYTEA; -- Authentication tag for AEAD ciphers
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS encryption_metadata JSONB; -- Metadata about encryption (compression, PII fields, etc.)
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS payload_hash VARCHAR; -- Hash of original payload for integrity verification
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS pii_fields TEXT[]; -- Array of field names containing PII
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS retention_policy VARCHAR; -- Retention policy for encrypted data
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS retention_delete_at TIMESTAMPTZ; -- When to delete encrypted data based on retention policy
+
+ALTER TABLE hammerwork_jobs ADD COLUMN IF NOT EXISTS encrypted_at TIMESTAMPTZ; -- When the payload was encrypted
 
 -- Add encryption fields to archive table
-ALTER TABLE hammerwork_jobs_archive
-ADD COLUMN IF NOT EXISTS is_encrypted BOOLEAN NOT NULL DEFAULT false,
-ADD COLUMN IF NOT EXISTS encryption_key_id VARCHAR,
-ADD COLUMN IF NOT EXISTS encryption_algorithm VARCHAR,
-ADD COLUMN IF NOT EXISTS encrypted_payload BYTEA,
-ADD COLUMN IF NOT EXISTS encryption_nonce BYTEA,
-ADD COLUMN IF NOT EXISTS encryption_tag BYTEA,
-ADD COLUMN IF NOT EXISTS encryption_metadata JSONB,
-ADD COLUMN IF NOT EXISTS payload_hash VARCHAR,
-ADD COLUMN IF NOT EXISTS pii_fields TEXT[],
-ADD COLUMN IF NOT EXISTS retention_policy VARCHAR,
-ADD COLUMN IF NOT EXISTS retention_delete_at TIMESTAMPTZ,
-ADD COLUMN IF NOT EXISTS encrypted_at TIMESTAMPTZ;
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS is_encrypted BOOLEAN NOT NULL DEFAULT false;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS encryption_key_id VARCHAR;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS encryption_algorithm VARCHAR;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS encrypted_payload BYTEA;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS encryption_nonce BYTEA;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS encryption_tag BYTEA;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS encryption_metadata JSONB;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS payload_hash VARCHAR;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS pii_fields TEXT[];
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS retention_policy VARCHAR;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS retention_delete_at TIMESTAMPTZ;
+
+ALTER TABLE hammerwork_jobs_archive ADD COLUMN IF NOT EXISTS encrypted_at TIMESTAMPTZ;
 
 -- Create indexes for encryption keys table
 CREATE INDEX IF NOT EXISTS idx_hammerwork_encryption_keys_key_id

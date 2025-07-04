@@ -3,9 +3,15 @@
 
 -- Add tracing fields to support distributed tracing and correlation
 ALTER TABLE hammerwork_jobs 
-ADD COLUMN IF NOT EXISTS trace_id VARCHAR(128),
-ADD COLUMN IF NOT EXISTS correlation_id VARCHAR(128),
-ADD COLUMN IF NOT EXISTS parent_span_id VARCHAR(128),
+ADD COLUMN IF NOT EXISTS trace_id VARCHAR(128);
+
+ALTER TABLE hammerwork_jobs 
+ADD COLUMN IF NOT EXISTS correlation_id VARCHAR(128);
+
+ALTER TABLE hammerwork_jobs 
+ADD COLUMN IF NOT EXISTS parent_span_id VARCHAR(128);
+
+ALTER TABLE hammerwork_jobs 
 ADD COLUMN IF NOT EXISTS span_context TEXT;
 
 -- Index for trace ID lookups (finding all jobs in a trace)

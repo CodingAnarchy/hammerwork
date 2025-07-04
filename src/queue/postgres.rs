@@ -119,9 +119,9 @@ impl JobRow {
             parent_span_id: self.parent_span_id,
             span_context: self.span_context,
             encryption_config: None, // TODO: Implement encryption config deserialization
-            pii_fields: Vec::new(), // TODO: Implement PII fields deserialization
-            retention_policy: None, // TODO: Implement retention policy deserialization
-            is_encrypted: false, // TODO: Implement encryption status from database
+            pii_fields: Vec::new(),  // TODO: Implement PII fields deserialization
+            retention_policy: None,  // TODO: Implement retention policy deserialization
+            is_encrypted: false,     // TODO: Implement encryption status from database
             encrypted_payload: None, // TODO: Implement encrypted payload deserialization
         })
     }

@@ -3,5 +3,7 @@
 
 -- Add timeout fields
 ALTER TABLE hammerwork_jobs 
-ADD COLUMN IF NOT EXISTS timeout_seconds INTEGER,
+ADD COLUMN IF NOT EXISTS timeout_seconds INTEGER;
+
+ALTER TABLE hammerwork_jobs 
 ADD COLUMN IF NOT EXISTS timed_out_at TIMESTAMPTZ;

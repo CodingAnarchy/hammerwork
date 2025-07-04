@@ -3,8 +3,12 @@
 
 -- Add result storage fields
 ALTER TABLE hammerwork_jobs 
-ADD COLUMN IF NOT EXISTS result_data JSONB,
-ADD COLUMN IF NOT EXISTS result_stored_at TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS result_data JSONB;
+
+ALTER TABLE hammerwork_jobs 
+ADD COLUMN IF NOT EXISTS result_stored_at TIMESTAMPTZ;
+
+ALTER TABLE hammerwork_jobs 
 ADD COLUMN IF NOT EXISTS result_expires_at TIMESTAMPTZ;
 
 -- Create index for result cleanup operations

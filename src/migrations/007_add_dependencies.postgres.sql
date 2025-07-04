@@ -3,10 +3,18 @@
 
 -- Add dependency tracking columns to hammerwork_jobs table
 ALTER TABLE hammerwork_jobs
-ADD COLUMN IF NOT EXISTS depends_on JSONB DEFAULT '[]'::jsonb,
-ADD COLUMN IF NOT EXISTS dependents JSONB DEFAULT '[]'::jsonb,
-ADD COLUMN IF NOT EXISTS dependency_status VARCHAR DEFAULT 'none',
-ADD COLUMN IF NOT EXISTS workflow_id UUID,
+ADD COLUMN IF NOT EXISTS depends_on JSONB DEFAULT '[]'::jsonb;
+
+ALTER TABLE hammerwork_jobs
+ADD COLUMN IF NOT EXISTS dependents JSONB DEFAULT '[]'::jsonb;
+
+ALTER TABLE hammerwork_jobs
+ADD COLUMN IF NOT EXISTS dependency_status VARCHAR DEFAULT 'none';
+
+ALTER TABLE hammerwork_jobs
+ADD COLUMN IF NOT EXISTS workflow_id UUID;
+
+ALTER TABLE hammerwork_jobs
 ADD COLUMN IF NOT EXISTS workflow_name VARCHAR;
 
 -- Add comments for clarity

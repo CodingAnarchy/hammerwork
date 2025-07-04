@@ -284,11 +284,15 @@ pub struct KeyManagerStats {
 }
 
 /// Main key management system
+type KeyCacheEntry = (Vec<u8>, DateTime<Utc>); // (decrypted_material, cached_at)
+type KeyCache = Arc<Mutex<HashMap<String, KeyCacheEntry>>>;
+
 pub struct KeyManager<DB: Database> {
     config: KeyManagerConfig,
+    #[allow(dead_code)]
     pool: Pool<DB>,
     master_key: Arc<Mutex<Option<Vec<u8>>>>,
-    key_cache: Arc<Mutex<HashMap<String, (Vec<u8>, DateTime<Utc>)>>>, // key_id -> (decrypted_material, cached_at)
+    key_cache: KeyCache,
     stats: Arc<Mutex<KeyManagerStats>>,
 }
 
@@ -902,7 +906,6 @@ impl Default for KeyManagerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encryption::EncryptionAlgorithm;
 
     #[tokio::test]
     async fn test_key_manager_config_creation() {
