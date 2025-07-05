@@ -433,10 +433,10 @@ fn get_memory_usage() -> Option<u64> {
         if let Ok(contents) = fs::read_to_string("/proc/self/status") {
             for line in contents.lines() {
                 if line.starts_with("VmRSS:") {
-                    if let Ok(kb) = line
+                    if let Some(kb) = line
                         .split_whitespace()
                         .nth(1)
-                        .and_then(|s| s.parse::<u64>())
+                        .and_then(|s| s.parse::<u64>().ok())
                     {
                         return Some(kb * 1024); // Convert KB to bytes
                     }

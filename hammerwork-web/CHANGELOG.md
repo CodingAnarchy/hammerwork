@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.3] - 2025-07-05
+
+### Fixed
+- Fixed compilation error on Linux systems in memory usage detection for system metrics
+  - Changed pattern matching from `Ok(kb)` to `Some(kb)` for Option type
+  - Added `.ok()` conversion after `parse::<u64>()` to properly handle Result to Option conversion
+
 ## [1.5.0] - 2025-07-02
 
 ### Added
