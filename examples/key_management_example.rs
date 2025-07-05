@@ -8,10 +8,9 @@
 //! - Handle key lifecycle (active -> retired -> expired)
 //! - Use external key management service configuration
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use hammerwork::encryption::{
-    EncryptionAlgorithm, ExternalKmsConfig, KeyDerivationConfig, KeyManager, KeyManagerConfig,
-    KeyPurpose, KeyStatus,
+    ExternalKmsConfig, KeyDerivationConfig, KeyManagerConfig,
 };
 use std::collections::HashMap;
 

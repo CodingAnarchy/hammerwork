@@ -266,7 +266,7 @@ async fn priority_example() -> Result<(), Box<dyn std::error::Error>> {
     println!("   🟢 Low: {}", low_id);
 
     // Dequeue in priority order
-    let order = vec![critical_id, high_id, normal_id, low_id];
+    let order = [critical_id, high_id, normal_id, low_id];
     for (i, expected_id) in order.iter().enumerate() {
         if let Some(job) = queue.dequeue("priority_queue").await? {
             assert_eq!(job.id, *expected_id);
