@@ -72,10 +72,13 @@ impl Type<Postgres> for JobStatus {
 
 #[cfg(feature = "postgres")]
 impl Encode<'_, Postgres> for JobStatus {
-    fn encode_by_ref(&self, buf: &mut sqlx::postgres::PgArgumentBuffer) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let status_str = match self {
             JobStatus::Pending => "Pending",
-            JobStatus::Running => "Running", 
+            JobStatus::Running => "Running",
             JobStatus::Completed => "Completed",
             JobStatus::Failed => "Failed",
             JobStatus::Dead => "Dead",
@@ -116,11 +119,14 @@ impl Type<MySql> for JobStatus {
 
 #[cfg(feature = "mysql")]
 impl Encode<'_, MySql> for JobStatus {
-    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    fn encode_by_ref(
+        &self,
+        buf: &mut Vec<u8>,
+    ) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let status_str = match self {
             JobStatus::Pending => "Pending",
             JobStatus::Running => "Running",
-            JobStatus::Completed => "Completed", 
+            JobStatus::Completed => "Completed",
             JobStatus::Failed => "Failed",
             JobStatus::Dead => "Dead",
             JobStatus::TimedOut => "TimedOut",
@@ -2280,8 +2286,12 @@ mod tests {
                 "Archived" => JobStatus::Archived,
                 _ => panic!("Unknown job status: {}", input),
             };
-            
-            assert_eq!(*expected, parsed_status, "Failed to parse '{}' correctly", input);
+
+            assert_eq!(
+                *expected, parsed_status,
+                "Failed to parse '{}' correctly",
+                input
+            );
         }
     }
 
@@ -2311,12 +2321,24 @@ mod tests {
                 JobStatus::Retrying => "Retrying",
                 JobStatus::Archived => "Archived",
             };
-            
-            assert_eq!(*expected_str, encoded_str, "Encoding mismatch for {:?}", status);
-            
+
+            assert_eq!(
+                *expected_str, encoded_str,
+                "Encoding mismatch for {:?}",
+                status
+            );
+
             // Verify the encoded string does not have quotes
-            assert!(!encoded_str.starts_with('"'), "Encoded string should not start with quotes: {}", encoded_str);
-            assert!(!encoded_str.ends_with('"'), "Encoded string should not end with quotes: {}", encoded_str);
+            assert!(
+                !encoded_str.starts_with('"'),
+                "Encoded string should not start with quotes: {}",
+                encoded_str
+            );
+            assert!(
+                !encoded_str.ends_with('"'),
+                "Encoded string should not end with quotes: {}",
+                encoded_str
+            );
         }
     }
 }

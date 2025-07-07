@@ -9,9 +9,7 @@
 //! - Use external key management service configuration
 
 use chrono::Duration;
-use hammerwork::encryption::{
-    ExternalKmsConfig, KeyDerivationConfig, KeyManagerConfig,
-};
+use hammerwork::encryption::{ExternalKmsConfig, KeyDerivationConfig, KeyManagerConfig};
 use std::collections::HashMap;
 
 #[tokio::main]
