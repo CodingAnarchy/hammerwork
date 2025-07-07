@@ -43,7 +43,7 @@ impl Default for PartialFailureMode {
 }
 
 /// Current status of a job batch.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BatchStatus {
     /// Batch is waiting to be processed.
     Pending,
