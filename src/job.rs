@@ -61,6 +61,22 @@ pub enum JobStatus {
     Archived,
 }
 
+impl JobStatus {
+    /// Returns the string representation of the job status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobStatus::Pending => "Pending",
+            JobStatus::Running => "Running",
+            JobStatus::Completed => "Completed",
+            JobStatus::Failed => "Failed",
+            JobStatus::Dead => "Dead",
+            JobStatus::TimedOut => "TimedOut",
+            JobStatus::Retrying => "Retrying",
+            JobStatus::Archived => "Archived",
+        }
+    }
+}
+
 // SQLx implementations for JobStatus to handle database encoding/decoding
 
 #[cfg(feature = "postgres")]

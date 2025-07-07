@@ -43,8 +43,8 @@ pub(crate) struct JobRow {
     pub result_storage_type: Option<String>,
     pub result_ttl_seconds: Option<i64>,
     pub result_max_size_bytes: Option<i64>,
-    pub depends_on: Option<serde_json::Value>,
-    pub dependents: Option<serde_json::Value>,
+    pub depends_on: Vec<uuid::Uuid>,
+    pub dependents: Vec<uuid::Uuid>,
     pub dependency_status: Option<String>,
     pub workflow_id: Option<uuid::Uuid>,
     pub workflow_name: Option<String>,
@@ -99,14 +99,8 @@ impl JobRow {
             result_stored_at: self.result_stored_at,
             result_expires_at: self.result_expires_at,
             retry_strategy: None, // Will be populated from job data when needed
-            depends_on: self
-                .depends_on
-                .map(|v| serde_json::from_value(v).unwrap_or_default())
-                .unwrap_or_default(),
-            dependents: self
-                .dependents
-                .map(|v| serde_json::from_value(v).unwrap_or_default())
-                .unwrap_or_default(),
+            depends_on: self.depends_on,
+            dependents: self.dependents,
             dependency_status: self
                 .dependency_status
                 .as_ref()
@@ -214,7 +208,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .bind(job.id)
         .bind(&job.queue_name)
         .bind(&job.payload)
-        .bind(serde_json::to_string(&job.status)?)
+        .bind(job.status)
         .bind(job.priority.as_i32())
         .bind(job.attempts)
         .bind(job.max_attempts)
@@ -234,8 +228,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         })
         .bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
         .bind(job.result_config.max_size_bytes.map(|s| s as i64))
-        .bind(serde_json::to_value(&job.depends_on)?)
-        .bind(serde_json::to_value(&job.dependents)?)
+        .bind(&job.depends_on)
+        .bind(&job.dependents)
         .bind(job.dependency_status.as_str())
         .bind(job.workflow_id)
         .bind(&job.workflow_name)
@@ -306,8 +300,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             let result_storage_type: Option<String> = row.get("result_storage_type");
             let result_ttl_seconds: Option<i64> = row.get("result_ttl_seconds");
             let result_max_size_bytes: Option<i64> = row.get("result_max_size_bytes");
-            let depends_on: Option<serde_json::Value> = row.get("depends_on");
-            let dependents: Option<serde_json::Value> = row.get("dependents");
+            let depends_on: Vec<uuid::Uuid> = row.get("depends_on");
+            let dependents: Vec<uuid::Uuid> = row.get("dependents");
             let dependency_status: Option<String> = row.get("dependency_status");
             let workflow_id: Option<uuid::Uuid> = row.get("workflow_id");
             let workflow_name: Option<String> = row.get("workflow_name");
@@ -354,12 +348,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 result_stored_at,
                 result_expires_at,
                 retry_strategy: None,
-                depends_on: depends_on
-                    .map(|v| serde_json::from_value(v).unwrap_or_default())
-                    .unwrap_or_default(),
-                dependents: dependents
-                    .map(|v| serde_json::from_value(v).unwrap_or_default())
-                    .unwrap_or_default(),
+                depends_on,
+                dependents,
                 dependency_status: dependency_status
                     .as_ref()
                     .and_then(|s| crate::workflow::DependencyStatus::parse_from_db(s).ok())
@@ -636,7 +626,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             let mut job_ids = Vec::new();
             let mut queue_names = Vec::new();
             let mut payloads = Vec::new();
-            let mut statuses = Vec::new();
+            let mut statuses: Vec<String> = Vec::new();
             let mut priorities = Vec::new();
             let mut attempts = Vec::new();
             let mut max_attempts = Vec::new();
@@ -658,7 +648,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 job_ids.push(job.id);
                 queue_names.push(&job.queue_name);
                 payloads.push(&job.payload);
-                statuses.push(serde_json::to_string(&job.status)?);
+                statuses.push(job.status.as_str().to_string());
                 priorities.push(job.priority.as_i32());
                 attempts.push(job.attempts);
                 max_attempts.push(job.max_attempts);
@@ -739,7 +729,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let completed_jobs: i32 = batch_row.get("completed_jobs");
         let failed_jobs: i32 = batch_row.get("failed_jobs");
         let pending_jobs: i32 = batch_row.get("pending_jobs");
-        let status: String = batch_row.get("status");
+        let status: crate::batch::BatchStatus = batch_row.get("status");
         let created_at: DateTime<Utc> = batch_row.get("created_at");
         let completed_at: Option<DateTime<Utc>> = batch_row.get("completed_at");
         let error_summary: Option<String> = batch_row.get("error_summary");
@@ -760,7 +750,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             completed_jobs: completed_jobs as u32,
             failed_jobs: failed_jobs as u32,
             pending_jobs: pending_jobs as u32,
-            status: serde_json::from_str(&status)?,
+            status,
             created_at,
             completed_at,
             error_summary,
@@ -1521,7 +1511,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .bind(&final_payload)
             .bind(is_compressed)
             .bind(original_size as i32)
-            .bind(serde_json::to_string(&job.status)?)
+            .bind(job.status)
             .bind(job.priority.to_string())
             .bind(job.attempts)
             .bind(job.max_attempts)
@@ -1546,11 +1536,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .bind(job.recurring)
             .bind(job.timezone)
             .bind(job.batch_id)
-            .bind(if job.depends_on.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_value(&job.depends_on)?)
-            })
+            .bind(&job.depends_on)
             .bind(serde_json::to_string(&job.dependency_status)?)
             .bind(serde_json::to_value(&job.result_config)?)
             .bind(job.trace_id)
@@ -1677,10 +1663,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             retry_strategy: archived_row
                 .get::<Option<String>, _>("retry_strategy")
                 .and_then(|s| serde_json::from_str(&s).ok()),
-            depends_on: archived_row
-                .get::<Option<serde_json::Value>, _>("depends_on")
-                .map(|v| serde_json::from_value(v).unwrap_or_default())
-                .unwrap_or_default(),
+            depends_on: archived_row.get("depends_on"),
             dependents: Vec::new(),
             dependency_status: archived_row
                 .get::<Option<String>, _>("dependency_status")
@@ -1875,7 +1858,7 @@ impl crate::queue::JobQueue<Postgres> {
         .bind(job.id)
         .bind(&job.queue_name)
         .bind(&job.payload)
-        .bind(serde_json::to_string(&job.status)?)
+        .bind(job.status)
         .bind(job.priority as i32)
         .bind(job.attempts)
         .bind(job.max_attempts)
@@ -1895,16 +1878,8 @@ impl crate::queue::JobQueue<Postgres> {
         })
         .bind(job.result_config.ttl.map(|t| t.as_secs() as i64))
         .bind(job.result_config.max_size_bytes.map(|s| s as i64))
-        .bind(if job.depends_on.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_value(&job.depends_on)?)
-        })
-        .bind(if job.dependents.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_value(&job.dependents)?)
-        })
+        .bind(&job.depends_on)
+        .bind(&job.dependents)
         .bind(serde_json::to_string(&job.dependency_status)?)
         .bind(job.workflow_id)
         .bind(job.workflow_name)

@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use sqlx::{Decode, Encode, Type};
+
+#[cfg(feature = "postgres")]
+use sqlx::Postgres;
+
+#[cfg(feature = "mysql")]
+use sqlx::MySql;
+
 /// Unique identifier for a job batch.
 pub type BatchId = Uuid;
 
@@ -46,6 +55,95 @@ pub enum BatchStatus {
     PartiallyFailed,
     /// Batch processing failed (either FailFast mode or all jobs failed).
     Failed,
+}
+
+// SQLx implementations for BatchStatus
+#[cfg(feature = "postgres")]
+impl Type<Postgres> for BatchStatus {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <String as Type<Postgres>>::type_info()
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Encode<'_, Postgres> for BatchStatus {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> std::result::Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync + 'static>>
+    {
+        let status_str = match self {
+            BatchStatus::Pending => "Pending",
+            BatchStatus::Processing => "Processing",
+            BatchStatus::Completed => "Completed",
+            BatchStatus::PartiallyFailed => "PartiallyFailed",
+            BatchStatus::Failed => "Failed",
+        };
+        <&str as Encode<'_, Postgres>>::encode_by_ref(&status_str, buf)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Decode<'_, Postgres> for BatchStatus {
+    fn decode(
+        value: sqlx::postgres::PgValueRef<'_>,
+    ) -> std::result::Result<Self, sqlx::error::BoxDynError> {
+        let status_str = <String as Decode<Postgres>>::decode(value)?;
+        // Handle both quoted (old format) and unquoted (new format) status values
+        let cleaned_str = status_str.trim_matches('"');
+        match cleaned_str {
+            "Pending" => Ok(BatchStatus::Pending),
+            "Processing" => Ok(BatchStatus::Processing),
+            "Completed" => Ok(BatchStatus::Completed),
+            "PartiallyFailed" => Ok(BatchStatus::PartiallyFailed),
+            "Failed" => Ok(BatchStatus::Failed),
+            _ => Err(format!("Unknown batch status: {}", status_str).into()),
+        }
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl Type<MySql> for BatchStatus {
+    fn type_info() -> sqlx::mysql::MySqlTypeInfo {
+        <String as Type<MySql>>::type_info()
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl Encode<'_, MySql> for BatchStatus {
+    fn encode_by_ref(
+        &self,
+        buf: &mut Vec<u8>,
+    ) -> std::result::Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync + 'static>>
+    {
+        let status_str = match self {
+            BatchStatus::Pending => "Pending",
+            BatchStatus::Processing => "Processing",
+            BatchStatus::Completed => "Completed",
+            BatchStatus::PartiallyFailed => "PartiallyFailed",
+            BatchStatus::Failed => "Failed",
+        };
+        <&str as Encode<'_, MySql>>::encode_by_ref(&status_str, buf)
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl Decode<'_, MySql> for BatchStatus {
+    fn decode(
+        value: sqlx::mysql::MySqlValueRef<'_>,
+    ) -> std::result::Result<Self, sqlx::error::BoxDynError> {
+        let status_str = <String as Decode<MySql>>::decode(value)?;
+        // Handle both quoted (old format) and unquoted (new format) status values
+        let cleaned_str = status_str.trim_matches('"');
+        match cleaned_str {
+            "Pending" => Ok(BatchStatus::Pending),
+            "Processing" => Ok(BatchStatus::Processing),
+            "Completed" => Ok(BatchStatus::Completed),
+            "PartiallyFailed" => Ok(BatchStatus::PartiallyFailed),
+            "Failed" => Ok(BatchStatus::Failed),
+            _ => Err(format!("Unknown batch status: {}", status_str).into()),
+        }
+    }
 }
 
 /// Summary of batch processing results.

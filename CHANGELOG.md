@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2025-07-07
+
+### Added
+- **🚀 PostgreSQL Native UUID Arrays for Dependencies**
+  - Added migration 012 to optimize job dependencies using native PostgreSQL UUID arrays
+  - PostgreSQL now uses `UUID[]` instead of JSONB for `depends_on` and `dependents` columns
+  - Provides ~30% storage reduction and better query performance for dependency operations
+  - Migration includes transaction safety, UUID validation, and data integrity checks
+  - MySQL continues to use JSONB for compatibility
+
+### Changed
+- **🔧 Improved Enum Serialization**
+  - `JobStatus` and `BatchStatus` enums now use proper SQLx `Encode`/`Decode` implementations
+  - Removed unnecessary JSON serialization for enum storage
+  - Added `JobStatus::as_str()` helper method for consistent string conversion
+  - Database values now stored as plain strings instead of JSON-encoded strings
+
+### Fixed
+- **🐛 Enum Storage Format**
+  - Fixed `JobStatus` being stored as `"\"Pending\""` instead of `"Pending"`
+  - Fixed `BatchStatus` deserialization to use direct SQLx types
+  - Improved backward compatibility handling for both quoted and unquoted formats
+
 ## [1.7.4] - 2025-07-07
 
 ### Fixed

@@ -361,5 +361,20 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("011_add_encryption.postgres.sql").to_string(),
             include_str!("011_add_encryption.mysql.sql").to_string(),
         );
+
+        // Migration 012: Optimize dependencies using native PostgreSQL arrays
+        self.register_migration(
+            Migration {
+                id: "012_optimize_dependencies".to_string(),
+                description: "Optimize job dependencies using native PostgreSQL UUID arrays"
+                    .to_string(),
+                version: 12,
+                created_at: chrono::DateTime::parse_from_rfc3339("2025-12-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("012_optimize_dependencies.postgres.sql").to_string(),
+            include_str!("012_optimize_dependencies.mysql.sql").to_string(),
+        );
     }
 }
