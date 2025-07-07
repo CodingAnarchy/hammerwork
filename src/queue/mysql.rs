@@ -808,7 +808,6 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn get_queue_stats(&self, queue_name: &str) -> Result<QueueStats> {
-        use crate::job::JobStatus;
         use crate::stats::JobStatistics;
         use std::collections::HashMap;
 
@@ -825,35 +824,17 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             counts.insert(status, count as u64);
         }
 
-        let pending_count = counts
-            .get("Pending")
-            .copied()
-            .unwrap_or(0);
-        let running_count = counts
-            .get("Running")
-            .copied()
-            .unwrap_or(0);
-        let dead_count = counts
-            .get("Dead")
-            .copied()
-            .unwrap_or(0);
-        let timed_out_count = counts
-            .get("TimedOut")
-            .copied()
-            .unwrap_or(0);
-        let completed_count = counts
-            .get("Completed")
-            .copied()
-            .unwrap_or(0);
+        let pending_count = counts.get("Pending").copied().unwrap_or(0);
+        let running_count = counts.get("Running").copied().unwrap_or(0);
+        let dead_count = counts.get("Dead").copied().unwrap_or(0);
+        let timed_out_count = counts.get("TimedOut").copied().unwrap_or(0);
+        let completed_count = counts.get("Completed").copied().unwrap_or(0);
 
         // Basic statistics (more detailed stats would require the statistics collector)
         let statistics = JobStatistics {
             total_processed: completed_count + dead_count,
             completed: completed_count,
-            failed: counts
-                .get("Failed")
-                .copied()
-                .unwrap_or(0),
+            failed: counts.get("Failed").copied().unwrap_or(0),
             dead: dead_count,
             timed_out: timed_out_count,
             running: running_count,
