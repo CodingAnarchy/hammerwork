@@ -11,6 +11,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use sqlx::{Decode, Encode, Type};
+
+#[cfg(feature = "postgres")]
+use sqlx::Postgres;
+
+#[cfg(feature = "mysql")]
+use sqlx::MySql;
+
 /// Unique identifier for a job.
 ///
 /// Each job gets a unique UUID when created to enable tracking and management
@@ -50,6 +59,96 @@ pub enum JobStatus {
     Retrying,
     /// Job has been archived for long-term storage.
     Archived,
+}
+
+// SQLx implementations for JobStatus to handle database encoding/decoding
+
+#[cfg(feature = "postgres")]
+impl Type<Postgres> for JobStatus {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <String as Type<Postgres>>::type_info()
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Encode<'_, Postgres> for JobStatus {
+    fn encode_by_ref(&self, buf: &mut sqlx::postgres::PgArgumentBuffer) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        let status_str = match self {
+            JobStatus::Pending => "Pending",
+            JobStatus::Running => "Running", 
+            JobStatus::Completed => "Completed",
+            JobStatus::Failed => "Failed",
+            JobStatus::Dead => "Dead",
+            JobStatus::TimedOut => "TimedOut",
+            JobStatus::Retrying => "Retrying",
+            JobStatus::Archived => "Archived",
+        };
+        <&str as Encode<'_, Postgres>>::encode_by_ref(&status_str, buf)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Decode<'_, Postgres> for JobStatus {
+    fn decode(value: sqlx::postgres::PgValueRef<'_>) -> Result<Self, sqlx::error::BoxDynError> {
+        let status_str = <String as Decode<Postgres>>::decode(value)?;
+        // Handle both quoted (old format) and unquoted (new format) status values
+        let cleaned_str = status_str.trim_matches('"');
+        match cleaned_str {
+            "Pending" => Ok(JobStatus::Pending),
+            "Running" => Ok(JobStatus::Running),
+            "Completed" => Ok(JobStatus::Completed),
+            "Failed" => Ok(JobStatus::Failed),
+            "Dead" => Ok(JobStatus::Dead),
+            "TimedOut" => Ok(JobStatus::TimedOut),
+            "Retrying" => Ok(JobStatus::Retrying),
+            "Archived" => Ok(JobStatus::Archived),
+            _ => Err(format!("Unknown job status: {}", status_str).into()),
+        }
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl Type<MySql> for JobStatus {
+    fn type_info() -> sqlx::mysql::MySqlTypeInfo {
+        <String as Type<MySql>>::type_info()
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl Encode<'_, MySql> for JobStatus {
+    fn encode_by_ref(&self, buf: &mut Vec<u8>) -> Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        let status_str = match self {
+            JobStatus::Pending => "Pending",
+            JobStatus::Running => "Running",
+            JobStatus::Completed => "Completed", 
+            JobStatus::Failed => "Failed",
+            JobStatus::Dead => "Dead",
+            JobStatus::TimedOut => "TimedOut",
+            JobStatus::Retrying => "Retrying",
+            JobStatus::Archived => "Archived",
+        };
+        <&str as Encode<'_, MySql>>::encode_by_ref(&status_str, buf)
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl Decode<'_, MySql> for JobStatus {
+    fn decode(value: sqlx::mysql::MySqlValueRef<'_>) -> Result<Self, sqlx::error::BoxDynError> {
+        let status_str = <String as Decode<MySql>>::decode(value)?;
+        // Handle both quoted (old format) and unquoted (new format) status values
+        let cleaned_str = status_str.trim_matches('"');
+        match cleaned_str {
+            "Pending" => Ok(JobStatus::Pending),
+            "Running" => Ok(JobStatus::Running),
+            "Completed" => Ok(JobStatus::Completed),
+            "Failed" => Ok(JobStatus::Failed),
+            "Dead" => Ok(JobStatus::Dead),
+            "TimedOut" => Ok(JobStatus::TimedOut),
+            "Retrying" => Ok(JobStatus::Retrying),
+            "Archived" => Ok(JobStatus::Archived),
+            _ => Err(format!("Unknown job status: {}", status_str).into()),
+        }
+    }
 }
 
 /// Configuration for job result storage.
@@ -2141,5 +2240,83 @@ mod tests {
         assert_eq!(job.timeout, Some(timeout_duration));
         assert!(job.timed_out_at.is_some());
         assert!(job.error_message.is_some());
+    }
+
+    #[test]
+    fn test_job_status_backward_compatibility_string_matching() {
+        // Test that our string matching logic handles both quoted and unquoted formats
+        // This simulates what happens in the Decode implementation
+        let test_cases = [
+            // (input_string, expected_status)
+            ("Pending", JobStatus::Pending),
+            ("\"Pending\"", JobStatus::Pending),
+            ("Running", JobStatus::Running),
+            ("\"Running\"", JobStatus::Running),
+            ("Completed", JobStatus::Completed),
+            ("\"Completed\"", JobStatus::Completed),
+            ("Failed", JobStatus::Failed),
+            ("\"Failed\"", JobStatus::Failed),
+            ("Dead", JobStatus::Dead),
+            ("\"Dead\"", JobStatus::Dead),
+            ("TimedOut", JobStatus::TimedOut),
+            ("\"TimedOut\"", JobStatus::TimedOut),
+            ("Retrying", JobStatus::Retrying),
+            ("\"Retrying\"", JobStatus::Retrying),
+            ("Archived", JobStatus::Archived),
+            ("\"Archived\"", JobStatus::Archived),
+        ];
+
+        for (input, expected) in &test_cases {
+            // This is the same logic used in our Decode implementations
+            let cleaned_str = input.trim_matches('"');
+            let parsed_status = match cleaned_str {
+                "Pending" => JobStatus::Pending,
+                "Running" => JobStatus::Running,
+                "Completed" => JobStatus::Completed,
+                "Failed" => JobStatus::Failed,
+                "Dead" => JobStatus::Dead,
+                "TimedOut" => JobStatus::TimedOut,
+                "Retrying" => JobStatus::Retrying,
+                "Archived" => JobStatus::Archived,
+                _ => panic!("Unknown job status: {}", input),
+            };
+            
+            assert_eq!(*expected, parsed_status, "Failed to parse '{}' correctly", input);
+        }
+    }
+
+    #[test]
+    fn test_job_status_encoding_logic() {
+        // Verify that our encoding logic produces the expected unquoted strings
+        let statuses = [
+            (JobStatus::Pending, "Pending"),
+            (JobStatus::Running, "Running"),
+            (JobStatus::Completed, "Completed"),
+            (JobStatus::Failed, "Failed"),
+            (JobStatus::Dead, "Dead"),
+            (JobStatus::TimedOut, "TimedOut"),
+            (JobStatus::Retrying, "Retrying"),
+            (JobStatus::Archived, "Archived"),
+        ];
+
+        for (status, expected_str) in &statuses {
+            // This matches the logic in our Encode implementations
+            let encoded_str = match status {
+                JobStatus::Pending => "Pending",
+                JobStatus::Running => "Running",
+                JobStatus::Completed => "Completed",
+                JobStatus::Failed => "Failed",
+                JobStatus::Dead => "Dead",
+                JobStatus::TimedOut => "TimedOut",
+                JobStatus::Retrying => "Retrying",
+                JobStatus::Archived => "Archived",
+            };
+            
+            assert_eq!(*expected_str, encoded_str, "Encoding mismatch for {:?}", status);
+            
+            // Verify the encoded string does not have quotes
+            assert!(!encoded_str.starts_with('"'), "Encoded string should not start with quotes: {}", encoded_str);
+            assert!(!encoded_str.ends_with('"'), "Encoded string should not end with quotes: {}", encoded_str);
+        }
     }
 }

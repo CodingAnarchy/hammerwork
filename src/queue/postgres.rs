@@ -271,10 +271,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                      trace_id, correlation_id, parent_span_id, span_context
             "#,
         )
-        .bind(serde_json::to_string(&JobStatus::Running)?)
+        .bind(JobStatus::Running)
         .bind(Utc::now())
         .bind(queue_name)
-        .bind(serde_json::to_string(&JobStatus::Pending)?)
+        .bind(JobStatus::Pending)
         .bind(Utc::now())
         .fetch_optional(&self.pool)
         .await?;
@@ -407,7 +407,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             "#
         )
         .bind(queue_name)
-        .bind(serde_json::to_string(&JobStatus::Pending)?)
+        .bind(JobStatus::Pending)
         .bind(Utc::now())
         .fetch_all(&self.pool)
         .await?;
@@ -462,7 +462,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 let updated_row = sqlx::query(
                     "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 WHERE id = $3 RETURNING id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name"
                 )
-                .bind(serde_json::to_string(&JobStatus::Running)?)
+                .bind(JobStatus::Running)
                 .bind(Utc::now())
                 .bind(job_id)
                 .fetch_optional(&self.pool)
@@ -543,7 +543,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
         sqlx::query("UPDATE hammerwork_jobs SET status = $1, completed_at = $2 WHERE id = $3")
-            .bind(serde_json::to_string(&JobStatus::Completed)?)
+            .bind(JobStatus::Completed)
             .bind(Utc::now())
             .bind(job_id)
             .execute(&self.pool)
@@ -556,7 +556,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         sqlx::query(
             "UPDATE hammerwork_jobs SET status = $1, error_message = $2, failed_at = $3 WHERE id = $4"
         )
-        .bind(serde_json::to_string(&JobStatus::Failed)?)
+        .bind(JobStatus::Failed)
         .bind(error_message)
         .bind(Utc::now())
         .bind(job_id)
@@ -570,7 +570,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         sqlx::query(
             "UPDATE hammerwork_jobs SET status = $1, scheduled_at = $2, started_at = NULL WHERE id = $3"
         )
-        .bind(serde_json::to_string(&JobStatus::Pending)?)
+        .bind(JobStatus::Pending)
         .bind(retry_at)
         .bind(job_id)
         .execute(&self.pool)
@@ -802,7 +802,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         sqlx::query(
             "UPDATE hammerwork_jobs SET status = $1, error_message = $2, failed_at = $3 WHERE id = $4"
         )
-        .bind(serde_json::to_string(&JobStatus::Dead)?)
+        .bind(JobStatus::Dead)
         .bind(error_message)
         .bind(Utc::now())
         .bind(job_id)
@@ -816,7 +816,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         sqlx::query(
             "UPDATE hammerwork_jobs SET status = $1, error_message = $2, timed_out_at = $3 WHERE id = $4"
         )
-        .bind(serde_json::to_string(&JobStatus::TimedOut)?)
+        .bind(JobStatus::TimedOut)
         .bind(error_message)
         .bind(Utc::now())
         .bind(job_id)
@@ -833,7 +833,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let rows = sqlx::query_as::<_, DeadJobRow>(
             "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = $1 ORDER BY failed_at DESC LIMIT $2 OFFSET $3"
         )
-        .bind(serde_json::to_string(&JobStatus::Dead)?)
+        .bind(JobStatus::Dead)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -854,7 +854,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let rows = sqlx::query_as::<_, DeadJobRow>(
             "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = $1 AND queue_name = $2 ORDER BY failed_at DESC LIMIT $3 OFFSET $4"
         )
-        .bind(serde_json::to_string(&JobStatus::Dead)?)
+        .bind(JobStatus::Dead)
         .bind(queue_name)
         .bind(limit)
         .bind(offset)
@@ -868,10 +868,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         sqlx::query(
             "UPDATE hammerwork_jobs SET status = $1, attempts = 0, scheduled_at = $2, started_at = NULL, failed_at = NULL WHERE id = $3 AND status = $4"
         )
-        .bind(serde_json::to_string(&JobStatus::Pending)?)
+        .bind(JobStatus::Pending)
         .bind(Utc::now())
         .bind(job_id)
-        .bind(serde_json::to_string(&JobStatus::Dead)?)
+        .bind(JobStatus::Dead)
         .execute(&self.pool)
         .await?;
 
@@ -881,7 +881,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     async fn purge_dead_jobs(&self, older_than: DateTime<Utc>) -> Result<u64> {
         let result =
             sqlx::query("DELETE FROM hammerwork_jobs WHERE status = $1 AND failed_at < $2")
-                .bind(serde_json::to_string(&JobStatus::Dead)?)
+                .bind(JobStatus::Dead)
                 .bind(older_than)
                 .execute(&self.pool)
                 .await?;
@@ -895,7 +895,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         // Get total dead job count
         let total_dead_jobs: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM hammerwork_jobs WHERE status = $1")
-                .bind(serde_json::to_string(&JobStatus::Dead)?)
+                .bind(JobStatus::Dead)
                 .fetch_one(&self.pool)
                 .await?;
 
@@ -903,7 +903,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let dead_jobs_by_queue_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT queue_name, COUNT(*) FROM hammerwork_jobs WHERE status = $1 GROUP BY queue_name"
         )
-        .bind(serde_json::to_string(&JobStatus::Dead)?)
+        .bind(JobStatus::Dead)
         .fetch_all(&self.pool)
         .await?;
 
@@ -911,7 +911,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let timestamps: Vec<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
             "SELECT MIN(failed_at), MAX(failed_at) FROM hammerwork_jobs WHERE status = $1 AND failed_at IS NOT NULL"
         )
-        .bind(serde_json::to_string(&JobStatus::Dead)?)
+        .bind(JobStatus::Dead)
         .fetch_all(&self.pool)
         .await?;
 
@@ -919,7 +919,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let error_patterns_rows: Vec<(Option<String>, i64)> = sqlx::query_as(
             "SELECT error_message, COUNT(*) FROM hammerwork_jobs WHERE status = $1 AND error_message IS NOT NULL GROUP BY error_message ORDER BY COUNT(*) DESC LIMIT 20"
         )
-        .bind(serde_json::to_string(&JobStatus::Dead)?)
+        .bind(JobStatus::Dead)
         .fetch_all(&self.pool)
         .await?;
 
@@ -966,23 +966,23 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         }
 
         let pending_count = counts
-            .get(&serde_json::to_string(&JobStatus::Pending).unwrap())
+            .get("Pending")
             .copied()
             .unwrap_or(0);
         let running_count = counts
-            .get(&serde_json::to_string(&JobStatus::Running).unwrap())
+            .get("Running")
             .copied()
             .unwrap_or(0);
         let dead_count = counts
-            .get(&serde_json::to_string(&JobStatus::Dead).unwrap())
+            .get("Dead")
             .copied()
             .unwrap_or(0);
         let timed_out_count = counts
-            .get(&serde_json::to_string(&JobStatus::TimedOut).unwrap())
+            .get("TimedOut")
             .copied()
             .unwrap_or(0);
         let completed_count = counts
-            .get(&serde_json::to_string(&JobStatus::Completed).unwrap())
+            .get("Completed")
             .copied()
             .unwrap_or(0);
 
@@ -991,7 +991,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             total_processed: completed_count + dead_count,
             completed: completed_count,
             failed: counts
-                .get(&serde_json::to_string(&JobStatus::Failed).unwrap())
+                .get("Failed")
                 .copied()
                 .unwrap_or(0),
             dead: dead_count,
@@ -1133,13 +1133,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             sqlx::query_as::<_, JobRow>(query)
                 .bind(queue)
                 .bind(Utc::now())
-                .bind(serde_json::to_string(&JobStatus::Pending)?)
+                .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
         } else {
             sqlx::query_as::<_, JobRow>(query)
                 .bind(Utc::now())
-                .bind(serde_json::to_string(&JobStatus::Pending)?)
+                .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
         };
@@ -1163,7 +1163,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             WHERE id = $3 AND recurring = TRUE
             "#,
         )
-        .bind(serde_json::to_string(&JobStatus::Pending)?)
+        .bind(JobStatus::Pending)
         .bind(next_run_at)
         .bind(job_id)
         .execute(&self.pool)
@@ -1222,7 +1222,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 AND status = $2",
         )
         .bind(queue_name)
-        .bind(serde_json::to_string(&JobStatus::Pending)?)
+        .bind(JobStatus::Pending)
         .fetch_one(&self.pool)
         .await?;
 

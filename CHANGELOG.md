@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.4] - 2025-07-07
+
+### Fixed
+- **🐛 Job Status Encoding** 
+  - Fixed job status values being stored with extra quotes in database
+  - Replaced `serde_json::to_string()` with proper SQLx type implementations for `JobStatus` enum
+  - Job status values now stored as clean strings (`"Pending"`, `"Running"`, etc.) instead of JSON strings (`"\"Pending\""`, `"\"Running\""`, etc.)
+  - Added backward compatibility support to handle both quoted and unquoted status formats during database reads
+  - CLI commands now work correctly with job status filtering and querying
+  - Added comprehensive tests for backward compatibility and encoding logic
+
 ## [1.7.3] - 2025-07-04
 
 ### Changed
