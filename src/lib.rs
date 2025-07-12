@@ -231,6 +231,7 @@ pub mod archive;
 pub mod batch;
 pub mod config;
 pub mod cron;
+#[cfg(feature = "encryption")]
 pub mod encryption;
 pub mod error;
 pub mod job;
@@ -275,6 +276,7 @@ pub use config::{
 #[cfg(feature = "webhooks")]
 pub use config::{WebhookConfig, WebhookConfigs, WebhookGlobalSettings};
 pub use cron::{CronError, CronSchedule};
+#[cfg(feature = "encryption")]
 pub use encryption::{
     EncryptedPayload, EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, EncryptionError,
     EncryptionKey, EncryptionMetadata, EncryptionStats, ExternalKmsConfig, KeyAuditRecord,

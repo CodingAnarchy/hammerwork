@@ -446,14 +446,17 @@ pub struct Job {
     /// Serialized span context for trace propagation.
     pub span_context: Option<String>,
     /// Encryption configuration for this job's payload (if encrypted).
+    #[cfg(feature = "encryption")]
     pub encryption_config: Option<crate::encryption::EncryptionConfig>,
     /// List of field names that contain PII and should be encrypted.
     pub pii_fields: Vec<String>,
     /// Retention policy for encrypted data (overrides default if specified).
+    #[cfg(feature = "encryption")]
     pub retention_policy: Option<crate::encryption::RetentionPolicy>,
     /// Whether the payload is currently encrypted.
     pub is_encrypted: bool,
     /// Encrypted payload data (if job is encrypted).
+    #[cfg(feature = "encryption")]
     pub encrypted_payload: Option<crate::encryption::EncryptedPayload>,
 }
 
@@ -528,10 +531,13 @@ impl Job {
             correlation_id: None,
             parent_span_id: None,
             span_context: None,
+            #[cfg(feature = "encryption")]
             encryption_config: None,
             pii_fields: Vec::new(),
+            #[cfg(feature = "encryption")]
             retention_policy: None,
             is_encrypted: false,
+            #[cfg(feature = "encryption")]
             encrypted_payload: None,
         }
     }
@@ -611,10 +617,13 @@ impl Job {
             correlation_id: None,
             parent_span_id: None,
             span_context: None,
+            #[cfg(feature = "encryption")]
             encryption_config: None,
             pii_fields: Vec::new(),
+            #[cfg(feature = "encryption")]
             retention_policy: None,
             is_encrypted: false,
+            #[cfg(feature = "encryption")]
             encrypted_payload: None,
         }
     }
@@ -968,10 +977,13 @@ impl Job {
             correlation_id: None,
             parent_span_id: None,
             span_context: None,
+            #[cfg(feature = "encryption")]
             encryption_config: None,
             pii_fields: Vec::new(),
+            #[cfg(feature = "encryption")]
             retention_policy: None,
             is_encrypted: false,
+            #[cfg(feature = "encryption")]
             encrypted_payload: None,
         })
     }
@@ -1722,6 +1734,7 @@ impl Job {
     /// assert!(job.has_encryption());
     /// # }
     /// ```
+    #[cfg(feature = "encryption")]
     pub fn with_encryption(mut self, config: crate::encryption::EncryptionConfig) -> Self {
         self.encryption_config = Some(config);
         self
@@ -1780,6 +1793,7 @@ impl Job {
     ///     .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(3600)));
     /// # }
     /// ```
+    #[cfg(feature = "encryption")]
     pub fn with_retention_policy(mut self, policy: crate::encryption::RetentionPolicy) -> Self {
         self.retention_policy = Some(policy);
         self
@@ -1805,7 +1819,14 @@ impl Job {
     /// }
     /// ```
     pub fn has_encryption(&self) -> bool {
-        self.encryption_config.is_some()
+        #[cfg(feature = "encryption")]
+        {
+            self.encryption_config.is_some()
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            false
+        }
     }
 
     /// Checks if this job has PII fields configured.
@@ -1879,6 +1900,7 @@ impl Job {
     /// assert_eq!(retrieved_config.algorithm, EncryptionAlgorithm::AES256GCM);
     /// # }
     /// ```
+    #[cfg(feature = "encryption")]
     pub fn get_encryption_config(&self) -> Option<&crate::encryption::EncryptionConfig> {
         self.encryption_config.as_ref()
     }
@@ -1901,6 +1923,7 @@ impl Job {
     /// assert_eq!(job.get_retention_policy(), Some(&policy));
     /// # }
     /// ```
+    #[cfg(feature = "encryption")]
     pub fn get_retention_policy(&self) -> Option<&crate::encryption::RetentionPolicy> {
         self.retention_policy.as_ref()
     }
@@ -1920,17 +1943,24 @@ impl Job {
     /// assert!(!job.should_cleanup_encrypted_data());
     /// ```
     pub fn should_cleanup_encrypted_data(&self) -> bool {
-        if let Some(encrypted_payload) = &self.encrypted_payload {
-            encrypted_payload.should_delete_now()
-        } else if let Some(retention_policy) = &self.retention_policy {
-            retention_policy.should_delete_now(
-                self.created_at,
-                self.completed_at,
-                self.encryption_config
-                    .as_ref()
-                    .and_then(|c| c.default_retention),
-            )
-        } else {
+        #[cfg(feature = "encryption")]
+        {
+            if let Some(encrypted_payload) = &self.encrypted_payload {
+                encrypted_payload.should_delete_now()
+            } else if let Some(retention_policy) = &self.retention_policy {
+                retention_policy.should_delete_now(
+                    self.created_at,
+                    self.completed_at,
+                    self.encryption_config
+                        .as_ref()
+                        .and_then(|c| c.default_retention),
+                )
+            } else {
+                false
+            }
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
             false
         }
     }

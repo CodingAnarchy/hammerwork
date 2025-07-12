@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.2] - 2025-07-12
+
+### Fixed
+- **🔐 Encryption Feature Compilation**
+  - Fixed compilation errors when `encryption` feature is disabled
+  - Added proper `#[cfg(feature = "encryption")]` feature gates throughout encryption modules
+  - Resolved unused import warnings in encryption engine and key manager
+  - Ensured encryption functionality is properly isolated behind feature flags
+
+- **🧹 Code Quality**
+  - Cleaned up unused imports in `encryption::engine` and `encryption::key_manager` modules
+  - Fixed unused parameter warnings by removing unnecessary underscore prefixes
+  - Verified encryption tests pass with proper feature flag isolation
+
 ## [1.8.1] - 2025-07-12
 
 ### Added
