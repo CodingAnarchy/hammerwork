@@ -279,7 +279,7 @@ impl TestStorage {
     /// Add a job to the appropriate queue and status list
     fn add_job_to_queue(&mut self, job: &Job) {
         let queue_jobs = self.queues.entry(job.queue_name.clone()).or_default();
-        let status_jobs = queue_jobs.entry(job.status.clone()).or_default();
+        let status_jobs = queue_jobs.entry(job.status).or_default();
         if !status_jobs.contains(&job.id) {
             status_jobs.push(job.id);
         }
@@ -291,7 +291,7 @@ impl TestStorage {
         let old_status = self
             .jobs
             .get(&job_id)
-            .map(|job| job.status.clone())
+            .map(|job| job.status)
             .ok_or_else(|| HammerworkError::JobNotFound {
                 id: job_id.to_string(),
             })?;
@@ -314,7 +314,7 @@ impl TestStorage {
 
         // Update the job status
         if let Some(job) = self.jobs.get_mut(&job_id) {
-            job.status = new_status.clone();
+            job.status = new_status;
         }
 
         // Add to new status
@@ -2219,7 +2219,7 @@ impl DatabaseQueue for TestQueue {
             archived_jobs.push(crate::archive::ArchivedJob {
                 id: job.id,
                 queue_name: job.queue_name.clone(),
-                status: job.status.clone(),
+                status: job.status,
                 created_at: job.created_at,
                 archived_at: now, // Mock archived time
                 archival_reason: crate::archive::ArchivalReason::Manual, // Mock reason

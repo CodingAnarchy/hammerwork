@@ -507,6 +507,16 @@ pub struct JobQueue<DB: Database> {
     pub(crate) throttle_configs: Arc<RwLock<HashMap<String, ThrottleConfig>>>,
 }
 
+impl<DB: Database> Clone for JobQueue<DB> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            _phantom: PhantomData,
+            throttle_configs: self.throttle_configs.clone(),
+        }
+    }
+}
+
 impl<DB: Database> JobQueue<DB> {
     /// Creates a new job queue with the given database connection pool.
     ///
@@ -761,5 +771,35 @@ mod tests {
         assert_eq!(default_config.max_concurrent, None);
         assert_eq!(default_config.rate_per_minute, None);
         assert!(default_config.enabled);
+    }
+
+    #[test]
+    fn test_job_queue_clone() {
+        // Test that JobQueue implements Clone trait correctly
+        // This test verifies compilation and basic cloning functionality
+
+        #[cfg(feature = "test")]
+        {
+            use crate::queue::test::TestQueue;
+
+            // Test that TestQueue can be cloned
+            let test_queue = TestQueue::new();
+            let cloned_queue = test_queue.clone();
+
+            // Basic verification - both should be independent instances
+            // (This is mainly a compilation test to ensure Clone trait is properly implemented)
+            let _ = test_queue;
+            let _ = cloned_queue;
+        }
+
+        // Test that JobQueue<DB> implements Clone at the type level
+        // This function will only compile if JobQueue<DB> implements Clone
+        #[allow(dead_code)]
+        fn _test_job_queue_clone_trait<DB: sqlx::Database>()
+        -> impl Fn(&JobQueue<DB>) -> JobQueue<DB> {
+            |queue: &JobQueue<DB>| queue.clone()
+        }
+
+        // If we reach this point, Clone is properly implemented
     }
 }
