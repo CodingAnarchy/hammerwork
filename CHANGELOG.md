@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.3] - 2025-07-12
+
+### Fixed
+- **🔐 Database Queue Compilation**
+  - Fixed PostgreSQL and MySQL queue implementations to use feature-gated encryption fields
+  - Added `#[cfg(feature = "encryption")]` guards around `encryption_config`, `retention_policy`, and `encrypted_payload` field assignments
+  - Resolved compilation errors when using Hammerwork without the encryption feature in client applications
+  - Ensures Job struct creation works correctly in all database queue operations regardless of feature flags
+
 ## [1.8.2] - 2025-07-12
 
 ### Fixed

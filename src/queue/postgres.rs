@@ -112,10 +112,13 @@ impl JobRow {
             correlation_id: self.correlation_id,
             parent_span_id: self.parent_span_id,
             span_context: self.span_context,
+            #[cfg(feature = "encryption")]
             encryption_config: None, // TODO: Implement encryption config deserialization
-            pii_fields: Vec::new(),  // TODO: Implement PII fields deserialization
-            retention_policy: None,  // TODO: Implement retention policy deserialization
-            is_encrypted: false,     // TODO: Implement encryption status from database
+            pii_fields: Vec::new(), // TODO: Implement PII fields deserialization
+            #[cfg(feature = "encryption")]
+            retention_policy: None, // TODO: Implement retention policy deserialization
+            is_encrypted: false,    // TODO: Implement encryption status from database
+            #[cfg(feature = "encryption")]
             encrypted_payload: None, // TODO: Implement encrypted payload deserialization
         })
     }
@@ -179,10 +182,13 @@ impl DeadJobRow {
             correlation_id: None,
             parent_span_id: None,
             span_context: None,
+            #[cfg(feature = "encryption")]
             encryption_config: None,
             pii_fields: Vec::new(),
+            #[cfg(feature = "encryption")]
             retention_policy: None,
             is_encrypted: false,
+            #[cfg(feature = "encryption")]
             encrypted_payload: None,
         }
     }
@@ -360,10 +366,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 correlation_id,
                 parent_span_id,
                 span_context,
+                #[cfg(feature = "encryption")]
                 encryption_config: None,
                 pii_fields: Vec::new(),
+                #[cfg(feature = "encryption")]
                 retention_policy: None,
                 is_encrypted: false,
+                #[cfg(feature = "encryption")]
                 encrypted_payload: None,
             }))
         } else {
@@ -518,10 +527,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                         correlation_id: None,
                         parent_span_id: None,
                         span_context: None,
+                        #[cfg(feature = "encryption")]
                         encryption_config: None,
                         pii_fields: Vec::new(),
+                        #[cfg(feature = "encryption")]
                         retention_policy: None,
                         is_encrypted: false,
+                        #[cfg(feature = "encryption")]
                         encrypted_payload: None,
                     }));
                 }
@@ -1675,10 +1687,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             correlation_id: archived_row.get("correlation_id"),
             parent_span_id: archived_row.get("parent_span_id"),
             span_context: archived_row.get("span_context"),
+            #[cfg(feature = "encryption")]
             encryption_config: None,
             pii_fields: Vec::new(),
+            #[cfg(feature = "encryption")]
             retention_policy: None,
             is_encrypted: false,
+            #[cfg(feature = "encryption")]
             encrypted_payload: None,
         };
 
