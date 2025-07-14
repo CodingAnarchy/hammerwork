@@ -241,6 +241,18 @@ body {
 .status-failed { background: #fee2e2; color: #991b1b; }
 .status-dead { background: #f3f4f6; color: #374151; }
 
+/* Queue status badges */
+.status-badge.active { 
+    background: #d1fae5; 
+    color: #065f46; 
+    border: 1px solid #a7f3d0;
+}
+.status-badge.paused { 
+    background: #fef3c7; 
+    color: #92400e; 
+    border: 1px solid #fde68a;
+}
+
 .priority-badge {
     display: inline-block;
     padding: 0.25rem 0.5rem;
@@ -295,6 +307,24 @@ body {
 
 .btn-danger:hover {
     background: #dc2626;
+}
+
+.btn-success {
+    background: var(--success-color);
+    color: white;
+}
+
+.btn-success:hover {
+    background: #059669;
+}
+
+.btn-warning {
+    background: var(--warning-color);
+    color: white;
+}
+
+.btn-warning:hover {
+    background: #d97706;
 }
 
 .btn-sm {

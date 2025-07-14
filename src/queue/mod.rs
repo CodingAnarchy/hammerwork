@@ -12,6 +12,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{Database, Pool};
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 use tokio::sync::RwLock;
@@ -24,6 +25,19 @@ pub mod mysql;
 
 #[cfg(feature = "test")]
 pub mod test;
+
+/// Information about a queue's pause state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuePauseInfo {
+    /// Name of the paused queue
+    pub queue_name: String,
+    /// When the queue was paused
+    pub paused_at: DateTime<Utc>,
+    /// Who or what paused the queue
+    pub paused_by: Option<String>,
+    /// Optional reason for pausing
+    pub reason: Option<String>,
+}
 
 /// The main trait defining database operations for the job queue.
 ///
@@ -471,6 +485,130 @@ pub trait DatabaseQueue: Send + Sync {
         &self,
         queue_name: Option<&str>,
     ) -> Result<crate::archive::ArchivalStats>;
+
+    // Queue management operations
+    /// Pause job processing for a specific queue.
+    ///
+    /// When a queue is paused, workers will stop dequeuing new jobs from it,
+    /// but jobs already in progress will continue to completion. This allows
+    /// for graceful queue management without interrupting running jobs.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - The name of the queue to pause
+    /// * `paused_by` - Optional identifier of who/what paused the queue
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// queue.pause_queue("email_queue", Some("admin")).await?;
+    /// println!("Email queue has been paused");
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn pause_queue(&self, queue_name: &str, paused_by: Option<&str>) -> Result<()>;
+
+    /// Resume job processing for a previously paused queue.
+    ///
+    /// This re-enables job processing for the specified queue, allowing workers
+    /// to start dequeuing jobs again.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - The name of the queue to resume
+    /// * `resumed_by` - Optional identifier of who/what resumed the queue
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// queue.resume_queue("email_queue", Some("admin")).await?;
+    /// println!("Email queue has been resumed");
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn resume_queue(&self, queue_name: &str, resumed_by: Option<&str>) -> Result<()>;
+
+    /// Check if a queue is currently paused.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - The name of the queue to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the queue is paused, `false` otherwise
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// if queue.is_queue_paused("email_queue").await? {
+    ///     println!("Email queue is currently paused");
+    /// } else {
+    ///     println!("Email queue is active");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn is_queue_paused(&self, queue_name: &str) -> Result<bool>;
+
+    /// Get pause information for a queue.
+    ///
+    /// Returns detailed information about a queue's pause state including
+    /// when it was paused and by whom.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue_name` - The name of the queue to check
+    ///
+    /// # Returns
+    ///
+    /// Pause information if the queue is paused, `None` otherwise
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// if let Some(pause_info) = queue.get_queue_pause_info("email_queue").await? {
+    ///     println!("Queue paused by {} at {}", 
+    ///         pause_info.paused_by.unwrap_or("unknown".to_string()), 
+    ///         pause_info.paused_at);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn get_queue_pause_info(&self, queue_name: &str) -> Result<Option<QueuePauseInfo>>;
+
+    /// Get all currently paused queues.
+    ///
+    /// # Returns
+    ///
+    /// A list of all queues that are currently paused with their pause information
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// let paused_queues = queue.get_paused_queues().await?;
+    /// for queue_info in paused_queues {
+    ///     println!("Queue '{}' is paused", queue_info.queue_name);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn get_paused_queues(&self) -> Result<Vec<QueuePauseInfo>>;
 }
 
 /// A generic job queue implementation that works with multiple database backends.

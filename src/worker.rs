@@ -1402,6 +1402,22 @@ where
             }
         }
 
+        // Check if the queue is paused
+        match self.queue.is_queue_paused(&self.queue_name).await {
+            Ok(true) => {
+                debug!("Queue '{}' is paused, skipping job dequeue", self.queue_name);
+                sleep(self.poll_interval).await;
+                return Ok(());
+            }
+            Ok(false) => {
+                // Queue is not paused, continue with normal processing
+            }
+            Err(e) => {
+                warn!("Failed to check queue pause status: {}", e);
+                // Continue with normal processing if we can't check pause status
+            }
+        }
+
         // Update queue depth metrics before dequeuing
         #[cfg(feature = "metrics")]
         if let Some(metrics_collector) = &self.metrics_collector {

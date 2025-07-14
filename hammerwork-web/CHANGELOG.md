@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2025-07-14
+
+### Added
+- **⏸️ Queue Pause/Resume Management**
+  - Interactive queue pause and resume controls in the web dashboard
+  - Visual queue status indicators with color-coded badges: 🟢 Active, 🟡 Paused
+  - Dynamic action buttons that change based on queue state (Pause ↔ Resume)
+  - Real-time status updates when queues are paused or resumed
+  - Queue status column added to the main queues table for operational visibility
+
+- **🎨 Enhanced User Interface**
+  - New status badge styling for queue states with proper visual distinction
+  - Success/warning button styles for pause/resume operations
+  - Improved queue table layout with better information density
+  - Immediate user feedback with success/error notifications
+  - Responsive design ensuring controls work across different screen sizes
+
+- **🌐 API Integration**
+  - Enhanced queue API responses including pause state information
+  - Updated queue action endpoints supporting pause/resume operations
+  - Extended queue information with `is_paused`, `paused_at`, and `paused_by` fields
+  - Improved error handling and user feedback for all queue management operations
+
+### Enhanced
+- **📊 Queue Management**
+  - Queue table now displays comprehensive status information
+  - Better visual distinction between active and paused queues
+  - Enhanced user experience with contextual action buttons
+  - Improved accessibility with clear status indicators
+
 ## [1.7.3] - 2025-07-05
 
 ### Fixed

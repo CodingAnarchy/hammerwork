@@ -306,25 +306,37 @@ class HammerworkDashboard {
         const tbody = document.querySelector('#queuesTable tbody');
         
         if (queues.length === 0) {
-            tbody.innerHTML = '<tr class="loading-row"><td colspan="8">No queues found</td></tr>';
+            tbody.innerHTML = '<tr class="loading-row"><td colspan="9">No queues found</td></tr>';
             return;
         }
 
-        tbody.innerHTML = queues.map(queue => `
-            <tr>
-                <td class="font-mono">${this.escapeHtml(queue.name)}</td>
-                <td>${this.formatNumber(queue.pending_count || 0)}</td>
-                <td>${this.formatNumber(queue.running_count || 0)}</td>
-                <td>${this.formatNumber(queue.completed_count || 0)}</td>
-                <td>${this.formatNumber(queue.failed_count || 0)}</td>
-                <td>${this.formatNumber(queue.throughput || 0)}/min</td>
-                <td>${this.formatPercentage(queue.error_rate || 0)}</td>
-                <td>
-                    <button class="btn btn-sm btn-secondary" onclick="dashboard.clearQueue('${queue.name}')">Clear</button>
-                    <button class="btn btn-sm btn-danger" onclick="dashboard.pauseQueue('${queue.name}')">Pause</button>
-                </td>
-            </tr>
-        `).join('');
+        tbody.innerHTML = queues.map(queue => {
+            const isPaused = queue.is_paused || false;
+            const statusBadge = isPaused 
+                ? '<span class="status-badge paused">⏸️ Paused</span>' 
+                : '<span class="status-badge active">▶️ Active</span>';
+            
+            const pauseResumeButton = isPaused
+                ? `<button class="btn btn-sm btn-success" onclick="dashboard.resumeQueue('${queue.name}')">Resume</button>`
+                : `<button class="btn btn-sm btn-warning" onclick="dashboard.pauseQueue('${queue.name}')">Pause</button>`;
+                
+            return `
+                <tr>
+                    <td class="font-mono">${this.escapeHtml(queue.name)}</td>
+                    <td>${statusBadge}</td>
+                    <td>${this.formatNumber(queue.pending_count || 0)}</td>
+                    <td>${this.formatNumber(queue.running_count || 0)}</td>
+                    <td>${this.formatNumber(queue.completed_count || 0)}</td>
+                    <td>${this.formatNumber(queue.failed_count || 0)}</td>
+                    <td>${this.formatNumber(queue.throughput_per_minute || 0)}/min</td>
+                    <td>${this.formatPercentage(queue.error_rate || 0)}</td>
+                    <td>
+                        ${pauseResumeButton}
+                        <button class="btn btn-sm btn-secondary" onclick="dashboard.clearQueue('${queue.name}')">Clear</button>
+                    </td>
+                </tr>
+            `;
+        }).join('');
     }
 
     updateQueueFilter(queues) {
@@ -702,9 +714,11 @@ class HammerworkDashboard {
 
     async pauseQueue(queueName) {
         try {
-            const response = await this.apiCall(`/api/queues/${encodeURIComponent(queueName)}/pause`, 'POST');
+            const response = await this.apiCall(`/api/queues/${encodeURIComponent(queueName)}/actions`, 'POST', {
+                action: 'pause'
+            });
             if (response.success) {
-                this.showSuccess('Queue paused successfully');
+                this.showSuccess(`Queue '${queueName}' paused successfully`);
                 this.loadQueues();
             } else {
                 this.showError(response.error || 'Failed to pause queue');
@@ -712,6 +726,23 @@ class HammerworkDashboard {
         } catch (error) {
             console.error('Failed to pause queue:', error);
             this.showError('Failed to pause queue');
+        }
+    }
+
+    async resumeQueue(queueName) {
+        try {
+            const response = await this.apiCall(`/api/queues/${encodeURIComponent(queueName)}/actions`, 'POST', {
+                action: 'resume'
+            });
+            if (response.success) {
+                this.showSuccess(`Queue '${queueName}' resumed successfully`);
+                this.loadQueues();
+            } else {
+                this.showError(response.error || 'Failed to resume queue');
+            }
+        } catch (error) {
+            console.error('Failed to resume queue:', error);
+            this.showError('Failed to resume queue');
         }
     }
 

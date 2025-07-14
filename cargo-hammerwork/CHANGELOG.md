@@ -5,6 +5,35 @@ All notable changes to the cargo-hammerwork CLI tool will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2025-07-14
+
+### Added
+- **⏸️ Queue Pause/Resume Commands**
+  - `queue pause` - Pause job processing for specific queues with audit tracking
+  - `queue resume` - Resume job processing for previously paused queues
+  - `queue paused` - List all currently paused queues with detailed information
+  - Enhanced `queue list` command to show pause status for all queues
+  - Complete PostgreSQL and MySQL support with proper error handling and user feedback
+  - CLI operations automatically record who performed the action for audit trails
+
+- **📊 Enhanced Queue Management**
+  - Visual status indicators in queue listings: ⏸️ Paused / ▶️ Active
+  - Detailed pause information including timestamp, user, and reason
+  - Improved queue overview with operational state visibility
+  - Better error messages and confirmation feedback for queue operations
+
+### Enhanced
+- **🗄️ Database Migration System**
+  - Updated migration registry to include queue pause functionality (migration 014)
+  - Enhanced migration tracking and execution for comprehensive schema management
+  - Cross-database compatibility improvements for PostgreSQL and MySQL migrations
+
+- **🚀 CLI User Experience**
+  - Enhanced queue listing with status column for better operational visibility
+  - Improved command feedback with emoji indicators and clear messaging
+  - Comprehensive error handling for queue operations
+  - Consistent command-line interface across all queue management functions
+
 ## [1.5.0] - 2025-07-02
 
 ### Added

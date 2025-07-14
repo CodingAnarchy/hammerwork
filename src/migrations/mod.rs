@@ -376,5 +376,33 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("012_optimize_dependencies.postgres.sql").to_string(),
             include_str!("012_optimize_dependencies.mysql.sql").to_string(),
         );
+
+        // Migration 013: Add encryption key audit trails
+        self.register_migration(
+            Migration {
+                id: "013_add_key_audit".to_string(),
+                description: "Add encryption key audit trail and operation logging".to_string(),
+                version: 13,
+                created_at: chrono::DateTime::parse_from_rfc3339("2025-12-15T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("013_add_key_audit.postgres.sql").to_string(),
+            include_str!("013_add_key_audit.mysql.sql").to_string(),
+        );
+
+        // Migration 014: Add queue pause functionality
+        self.register_migration(
+            Migration {
+                id: "014_add_queue_pause".to_string(),
+                description: "Add queue pause and resume functionality for operational control".to_string(),
+                version: 14,
+                created_at: chrono::DateTime::parse_from_rfc3339("2025-12-30T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("014_add_queue_pause.postgres.sql").to_string(),
+            include_str!("014_add_queue_pause.mysql.sql").to_string(),
+        );
     }
 }

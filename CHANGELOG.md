@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2025-07-14
+
+### Added
+- **⏸️ Queue Pause/Resume Functionality**
+  - Complete queue pause and resume system for operational control and maintenance windows
+  - New `pause_queue()`, `resume_queue()`, `is_queue_paused()`, `get_queue_pause_info()`, and `get_paused_queues()` methods in DatabaseQueue trait
+  - Database migration 014 adding `hammerwork_queue_pause` table for persistent pause state storage
+  - Full PostgreSQL and MySQL backend implementation with optimized queries and proper indexing
+  - Worker integration automatically respecting paused queues - workers skip job dequeuing when queues are paused
+  - Graceful operation: jobs already in progress continue to completion while new jobs are blocked
+  - Audit trail support tracking who paused/resumed queues and when for operational transparency
+
+- **🌐 Web UI Queue Management**
+  - Enhanced web dashboard with visual queue status indicators showing active/paused state
+  - Interactive pause/resume buttons with dynamic UI updates based on current queue state
+  - Real-time status badges with color-coded indicators: 🟢 Active, 🟡 Paused
+  - Immediate user feedback with success/error notifications for all queue operations
+  - Updated queue API endpoints supporting pause/resume actions via `/api/queues/{name}/actions`
+  - Extended queue information API responses including `is_paused`, `paused_at`, and `paused_by` fields
+
+- **🏗️ Database Schema and Migration**
+  - New `hammerwork_queue_pause` table with queue_name (primary key), timestamps, and audit fields
+  - Automatic timestamp management for PostgreSQL (triggers) and MySQL (ON UPDATE CURRENT_TIMESTAMP)
+  - Proper indexing on `paused_at` for efficient query performance
+  - Cross-database compatibility with database-specific SQL optimizations
+
+### Enhanced
+- **📊 API Responses**
+  - Queue information now includes pause status, pause timestamp, and who initiated the pause
+  - Enhanced queue statistics with operational state visibility
+  - Improved error handling and user feedback for all queue management operations
+
+- **🎨 Web Interface**
+  - Updated queue table layout with new Status column for better visibility
+  - Added success/warning button styles for pause/resume actions
+  - Enhanced CSS styling with consistent color scheme and visual feedback
+  - Improved user experience with contextual action buttons
+
 ## [1.10.0] - 2025-07-14
 
 ### Added

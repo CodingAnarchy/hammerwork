@@ -48,6 +48,11 @@ pub enum QueueCommand {
         #[arg(short = 'n', long, help = "Queue name")]
         queue: String,
     },
+    #[command(about = "List all paused queues")]
+    Paused {
+        #[arg(short, long, help = "Database connection URL")]
+        database_url: Option<String>,
+    },
     #[command(about = "Get queue health status")]
     Health {
         #[arg(short, long, help = "Database connection URL")]
@@ -85,6 +90,9 @@ impl QueueCommand {
             QueueCommand::Resume { queue, .. } => {
                 resume_queue(pool, queue).await?;
             }
+            QueueCommand::Paused { .. } => {
+                list_paused_queues(pool).await?;
+            }
             QueueCommand::Health { queue, .. } => {
                 show_queue_health(pool, queue.clone()).await?;
             }
@@ -99,6 +107,7 @@ impl QueueCommand {
             QueueCommand::Clear { database_url, .. } => database_url,
             QueueCommand::Pause { database_url, .. } => database_url,
             QueueCommand::Resume { database_url, .. } => database_url,
+            QueueCommand::Paused { database_url, .. } => database_url,
             QueueCommand::Health { database_url, .. } => database_url,
         };
 
@@ -114,21 +123,24 @@ impl QueueCommand {
 async fn list_queues(pool: DatabasePool) -> Result<()> {
     let query = r#"
         SELECT 
-            queue_name,
-            COUNT(*) as total_jobs,
-            COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
-            COUNT(CASE WHEN status = 'running' THEN 1 END) as running,
-            COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
-            COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed,
-            COUNT(CASE WHEN status = 'dead' THEN 1 END) as dead
-        FROM hammerwork_jobs 
-        GROUP BY queue_name 
-        ORDER BY queue_name
+            j.queue_name,
+            COUNT(j.id) as total_jobs,
+            COUNT(CASE WHEN j.status = 'pending' THEN 1 END) as pending,
+            COUNT(CASE WHEN j.status = 'running' THEN 1 END) as running,
+            COUNT(CASE WHEN j.status = 'completed' THEN 1 END) as completed,
+            COUNT(CASE WHEN j.status = 'failed' THEN 1 END) as failed,
+            COUNT(CASE WHEN j.status = 'dead' THEN 1 END) as dead,
+            CASE WHEN p.queue_name IS NOT NULL THEN true ELSE false END as is_paused
+        FROM hammerwork_jobs j
+        LEFT JOIN hammerwork_queue_pause p ON j.queue_name = p.queue_name
+        GROUP BY j.queue_name, p.queue_name
+        ORDER BY j.queue_name
     "#;
 
     let mut table = comfy_table::Table::new();
     table.set_header(vec![
         "Queue",
+        "Status",
         "Total",
         "Pending",
         "Running",
@@ -148,9 +160,17 @@ async fn list_queues(pool: DatabasePool) -> Result<()> {
                 let completed: i64 = row.try_get("completed")?;
                 let failed: i64 = row.try_get("failed")?;
                 let dead: i64 = row.try_get("dead")?;
+                let is_paused: bool = row.try_get("is_paused")?;
+
+                let status = if is_paused {
+                    "⏸️ Paused"
+                } else {
+                    "▶️ Active"
+                };
 
                 table.add_row(vec![
                     queue_name,
+                    status.to_string(),
                     total.to_string(),
                     pending.to_string(),
                     running.to_string(),
@@ -170,9 +190,17 @@ async fn list_queues(pool: DatabasePool) -> Result<()> {
                 let completed: i64 = row.try_get("completed")?;
                 let failed: i64 = row.try_get("failed")?;
                 let dead: i64 = row.try_get("dead")?;
+                let is_paused: bool = row.try_get("is_paused")?;
+
+                let status = if is_paused {
+                    "⏸️ Paused"
+                } else {
+                    "▶️ Active"
+                };
 
                 table.add_row(vec![
                     queue_name,
+                    status.to_string(),
                     total.to_string(),
                     pending.to_string(),
                     running.to_string(),
@@ -379,30 +407,90 @@ async fn clear_queue(
     Ok(())
 }
 
-async fn pause_queue(_pool: DatabasePool, queue: &str) -> Result<()> {
-    // Note: This is a placeholder. In a real implementation, you might:
-    // 1. Add a queue_paused table or column
-    // 2. Update worker logic to respect paused queues
-    // 3. Store pause state in Redis or similar
+async fn pause_queue(pool: DatabasePool, queue: &str) -> Result<()> {
+    match pool {
+        DatabasePool::Postgres(pg_pool) => {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO hammerwork_queue_pause (queue_name, paused_by, paused_at, created_at, updated_at)
+                VALUES ($1, $2, NOW(), NOW(), NOW())
+                ON CONFLICT (queue_name) 
+                DO UPDATE SET 
+                    paused_by = EXCLUDED.paused_by,
+                    paused_at = NOW(),
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(queue)
+            .bind("cli")
+            .execute(&pg_pool)
+            .await?;
 
-    println!(
-        "⏸️  Queue '{}' paused (placeholder - implement pause logic)",
-        queue
-    );
-    info!("Queue '{}' has been paused", queue);
+            if result.rows_affected() > 0 {
+                println!("⏸️  Queue '{}' has been paused", queue);
+                info!("Queue '{}' has been paused via CLI", queue);
+            } else {
+                println!("⚠️  Failed to pause queue '{}'", queue);
+            }
+        }
+        DatabasePool::MySQL(mysql_pool) => {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO hammerwork_queue_pause (queue_name, paused_by, paused_at, created_at, updated_at)
+                VALUES (?, ?, NOW(), NOW(), NOW())
+                ON DUPLICATE KEY UPDATE 
+                    paused_by = VALUES(paused_by),
+                    paused_at = NOW(),
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(queue)
+            .bind("cli")
+            .execute(&mysql_pool)
+            .await?;
+
+            if result.rows_affected() > 0 {
+                println!("⏸️  Queue '{}' has been paused", queue);
+                info!("Queue '{}' has been paused via CLI", queue);
+            } else {
+                println!("⚠️  Failed to pause queue '{}'", queue);
+            }
+        }
+    }
+
     Ok(())
 }
 
-async fn resume_queue(_pool: DatabasePool, queue: &str) -> Result<()> {
-    // Note: This is a placeholder. In a real implementation, you would:
-    // 1. Remove from paused queues table/column
-    // 2. Resume worker processing for this queue
+async fn resume_queue(pool: DatabasePool, queue: &str) -> Result<()> {
+    match pool {
+        DatabasePool::Postgres(pg_pool) => {
+            let result = sqlx::query("DELETE FROM hammerwork_queue_pause WHERE queue_name = $1")
+                .bind(queue)
+                .execute(&pg_pool)
+                .await?;
 
-    println!(
-        "▶️  Queue '{}' resumed (placeholder - implement resume logic)",
-        queue
-    );
-    info!("Queue '{}' has been resumed", queue);
+            if result.rows_affected() > 0 {
+                println!("▶️  Queue '{}' has been resumed", queue);
+                info!("Queue '{}' has been resumed via CLI", queue);
+            } else {
+                println!("ℹ️  Queue '{}' was not paused", queue);
+            }
+        }
+        DatabasePool::MySQL(mysql_pool) => {
+            let result = sqlx::query("DELETE FROM hammerwork_queue_pause WHERE queue_name = ?")
+                .bind(queue)
+                .execute(&mysql_pool)
+                .await?;
+
+            if result.rows_affected() > 0 {
+                println!("▶️  Queue '{}' has been resumed", queue);
+                info!("Queue '{}' has been resumed via CLI", queue);
+            } else {
+                println!("ℹ️  Queue '{}' was not paused", queue);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -571,5 +659,76 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
     }
     println!("{}", health_table);
 
+    Ok(())
+}
+
+async fn list_paused_queues(pool: DatabasePool) -> Result<()> {
+    let query = r#"
+        SELECT 
+            queue_name,
+            paused_at,
+            paused_by,
+            reason
+        FROM hammerwork_queue_pause 
+        ORDER BY paused_at DESC
+    "#;
+
+    let mut table = comfy_table::Table::new();
+    table.set_header(vec![
+        "Queue Name",
+        "Paused At",
+        "Paused By", 
+        "Reason",
+    ]);
+
+    match pool {
+        DatabasePool::Postgres(pg_pool) => {
+            let rows = sqlx::query(query).fetch_all(&pg_pool).await?;
+            
+            if rows.is_empty() {
+                println!("✅ No paused queues found - all queues are active");
+                return Ok(());
+            }
+
+            for row in rows {
+                let queue_name: String = row.try_get("queue_name")?;
+                let paused_at: chrono::DateTime<chrono::Utc> = row.try_get("paused_at")?;
+                let paused_by: Option<String> = row.try_get("paused_by")?;
+                let reason: Option<String> = row.try_get("reason")?;
+
+                table.add_row(vec![
+                    queue_name,
+                    paused_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                    paused_by.unwrap_or_else(|| "Unknown".to_string()),
+                    reason.unwrap_or_else(|| "-".to_string()),
+                ]);
+            }
+        }
+        DatabasePool::MySQL(mysql_pool) => {
+            let rows = sqlx::query(query).fetch_all(&mysql_pool).await?;
+            
+            if rows.is_empty() {
+                println!("✅ No paused queues found - all queues are active");
+                return Ok(());
+            }
+
+            for row in rows {
+                let queue_name: String = row.try_get("queue_name")?;
+                let paused_at: chrono::DateTime<chrono::Utc> = row.try_get("paused_at")?;
+                let paused_by: Option<String> = row.try_get("paused_by")?;
+                let reason: Option<String> = row.try_get("reason")?;
+
+                table.add_row(vec![
+                    queue_name,
+                    paused_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                    paused_by.unwrap_or_else(|| "Unknown".to_string()),
+                    reason.unwrap_or_else(|| "-".to_string()),
+                ]);
+            }
+        }
+    }
+
+    println!("⏸️  Paused Queues");
+    println!("{}", table);
     Ok(())
 }

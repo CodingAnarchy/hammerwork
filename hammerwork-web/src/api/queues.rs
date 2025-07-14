@@ -116,6 +116,9 @@ pub struct QueueInfo {
     pub error_rate: f64,
     pub last_job_at: Option<chrono::DateTime<chrono::Utc>>,
     pub oldest_pending_job: Option<chrono::DateTime<chrono::Utc>>,
+    pub is_paused: bool,
+    pub paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub paused_by: Option<String>,
 }
 
 /// Detailed queue statistics
@@ -216,6 +219,9 @@ where
             let mut queue_infos: Vec<QueueInfo> = Vec::new();
 
             for stats in all_stats {
+                // Get pause information for this queue
+                let pause_info = queue.get_queue_pause_info(&stats.queue_name).await.unwrap_or(None);
+                
                 let queue_info = QueueInfo {
                     name: stats.queue_name.clone(),
                     pending_count: stats.pending_count,
@@ -228,6 +234,9 @@ where
                     error_rate: stats.statistics.error_rate,
                     last_job_at: None,        // TODO: Get from database
                     oldest_pending_job: None, // TODO: Get from database
+                    is_paused: pause_info.is_some(),
+                    paused_at: pause_info.as_ref().map(|p| p.paused_at),
+                    paused_by: pause_info.as_ref().and_then(|p| p.paused_by.clone()),
                 };
                 queue_infos.push(queue_info);
             }
@@ -276,6 +285,9 @@ where
                 let hourly_throughput = Vec::new(); // TODO: Implement
                 let recent_errors = Vec::new(); // TODO: Implement
 
+                // Get pause information for this queue
+                let pause_info = queue.get_queue_pause_info(&queue_name).await.unwrap_or(None);
+                
                 let queue_info = QueueInfo {
                     name: stats.queue_name.clone(),
                     pending_count: stats.pending_count,
@@ -288,6 +300,9 @@ where
                     error_rate: stats.statistics.error_rate,
                     last_job_at: None,
                     oldest_pending_job: None,
+                    is_paused: pause_info.is_some(),
+                    paused_at: pause_info.as_ref().map(|p| p.paused_at),
+                    paused_by: pause_info.as_ref().and_then(|p| p.paused_by.clone()),
                 };
 
                 let detailed_stats = DetailedQueueStats {
@@ -347,14 +362,38 @@ where
             Ok(warp::reply::json(&response))
         }
         "pause" => {
-            // TODO: Implement queue pause
-            let response = ApiResponse::<()>::error("Queue pause not yet implemented".to_string());
-            Ok(warp::reply::json(&response))
+            match queue.pause_queue(&queue_name, Some("web-ui")).await {
+                Ok(()) => {
+                    let response = ApiResponse::success(serde_json::json!({
+                        "message": format!("Queue '{}' has been paused", queue_name),
+                        "queue": queue_name,
+                        "action": "pause"
+                    }));
+                    Ok(warp::reply::json(&response))
+                }
+                Err(e) => {
+                    let response =
+                        ApiResponse::<()>::error(format!("Failed to pause queue: {}", e));
+                    Ok(warp::reply::json(&response))
+                }
+            }
         }
         "resume" => {
-            // TODO: Implement queue resume
-            let response = ApiResponse::<()>::error("Queue resume not yet implemented".to_string());
-            Ok(warp::reply::json(&response))
+            match queue.resume_queue(&queue_name, Some("web-ui")).await {
+                Ok(()) => {
+                    let response = ApiResponse::success(serde_json::json!({
+                        "message": format!("Queue '{}' has been resumed", queue_name),
+                        "queue": queue_name,
+                        "action": "resume"
+                    }));
+                    Ok(warp::reply::json(&response))
+                }
+                Err(e) => {
+                    let response =
+                        ApiResponse::<()>::error(format!("Failed to resume queue: {}", e));
+                    Ok(warp::reply::json(&response))
+                }
+            }
         }
         _ => {
             let response =
@@ -413,10 +452,14 @@ mod tests {
             error_rate: 0.05,
             last_job_at: None,
             oldest_pending_job: None,
+            is_paused: false,
+            paused_at: None,
+            paused_by: None,
         };
 
         let json = serde_json::to_string(&queue_info).unwrap();
         assert!(json.contains("test_queue"));
         assert!(json.contains("42"));
+        assert!(json.contains("is_paused"));
     }
 }

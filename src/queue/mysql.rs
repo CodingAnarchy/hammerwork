@@ -2201,6 +2201,89 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             last_run_at: last_archived_at.unwrap_or(Utc::now()),
         })
     }
+
+    // Queue management operations
+    async fn pause_queue(&self, queue_name: &str, paused_by: Option<&str>) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_queue_pause (queue_name, paused_by, paused_at, created_at, updated_at)
+            VALUES (?, ?, NOW(), NOW(), NOW())
+            ON DUPLICATE KEY UPDATE 
+                paused_by = VALUES(paused_by),
+                paused_at = NOW(),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(queue_name)
+        .bind(paused_by)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn resume_queue(&self, queue_name: &str, _resumed_by: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM hammerwork_queue_pause WHERE queue_name = ?"
+        )
+        .bind(queue_name)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn is_queue_paused(&self, queue_name: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM hammerwork_queue_pause WHERE queue_name = ?"
+        )
+        .bind(queue_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.is_some())
+    }
+
+    async fn get_queue_pause_info(&self, queue_name: &str) -> Result<Option<super::QueuePauseInfo>> {
+        let row = sqlx::query(
+            "SELECT queue_name, paused_at, paused_by, reason FROM hammerwork_queue_pause WHERE queue_name = ?"
+        )
+        .bind(queue_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => {
+                Ok(Some(super::QueuePauseInfo {
+                    queue_name: row.get("queue_name"),
+                    paused_at: row.get("paused_at"),
+                    paused_by: row.get("paused_by"),
+                    reason: row.get("reason"),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_paused_queues(&self) -> Result<Vec<super::QueuePauseInfo>> {
+        let rows = sqlx::query(
+            "SELECT queue_name, paused_at, paused_by, reason FROM hammerwork_queue_pause ORDER BY paused_at DESC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let paused_queues = rows
+            .into_iter()
+            .map(|row| super::QueuePauseInfo {
+                queue_name: row.get("queue_name"),
+                paused_at: row.get("paused_at"),
+                paused_by: row.get("paused_by"),
+                reason: row.get("reason"),
+            })
+            .collect();
+
+        Ok(paused_queues)
+    }
 }
 
 // Helper method for enqueueing with an existing transaction
