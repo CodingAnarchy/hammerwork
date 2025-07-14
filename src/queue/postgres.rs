@@ -52,10 +52,35 @@ pub(crate) struct JobRow {
     pub correlation_id: Option<String>,
     pub parent_span_id: Option<String>,
     pub span_context: Option<String>,
+    // Encryption fields
+    pub is_encrypted: bool,
+    pub encryption_key_id: Option<String>,
+    pub encryption_algorithm: Option<String>,
+    pub encrypted_payload: Option<Vec<u8>>,
+    pub encryption_nonce: Option<Vec<u8>>,
+    pub encryption_tag: Option<Vec<u8>>,
+    pub encryption_metadata: Option<serde_json::Value>,
+    pub payload_hash: Option<String>,
+    pub pii_fields: Option<Vec<String>>,
+    pub retention_policy: Option<String>,
+    pub retention_delete_at: Option<DateTime<Utc>>,
+    pub encrypted_at: Option<DateTime<Utc>>,
 }
+
+/// Standard field list for selecting complete job data from hammerwork_jobs table.
+const JOB_SELECT_FIELDS: &str = "id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context, is_encrypted, encryption_key_id, encryption_algorithm, encrypted_payload, encryption_nonce, encryption_tag, encryption_metadata, payload_hash, pii_fields, retention_policy, retention_delete_at, encrypted_at";
 
 impl JobRow {
     pub fn into_job(self) -> Result<Job> {
+        // Extract encryption data before moving self
+        #[cfg(feature = "encryption")]
+        let encryption_config = self.build_encryption_config()?;
+        #[cfg(feature = "encryption")]
+        let retention_policy = self.parse_retention_policy()?;
+        #[cfg(feature = "encryption")]
+        let encrypted_payload = self.build_encrypted_payload()?;
+        let pii_fields = self.pii_fields.unwrap_or_default();
+        
         Ok(Job {
             id: self.id,
             queue_name: self.queue_name,
@@ -113,14 +138,231 @@ impl JobRow {
             parent_span_id: self.parent_span_id,
             span_context: self.span_context,
             #[cfg(feature = "encryption")]
-            encryption_config: None, // TODO: Implement encryption config deserialization
-            pii_fields: Vec::new(), // TODO: Implement PII fields deserialization
+            encryption_config,
+            pii_fields,
             #[cfg(feature = "encryption")]
-            retention_policy: None, // TODO: Implement retention policy deserialization
-            is_encrypted: false,    // TODO: Implement encryption status from database
+            retention_policy,
+            is_encrypted: self.is_encrypted,
             #[cfg(feature = "encryption")]
-            encrypted_payload: None, // TODO: Implement encrypted payload deserialization
+            encrypted_payload,
         })
+    }
+
+    /// Builds an EncryptionConfig from database fields if encryption is enabled.
+    #[cfg(feature = "encryption")]
+    fn build_encryption_config(&self) -> Result<Option<crate::encryption::EncryptionConfig>> {
+        if !self.is_encrypted {
+            return Ok(None);
+        }
+
+        // Parse algorithm
+        let algorithm = match self.encryption_algorithm.as_deref() {
+            Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
+            Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
+            Some(alg) => {
+                return Err(crate::HammerworkError::Processing(format!(
+                    "Unknown encryption algorithm: {}", alg
+                )));
+            }
+            None => {
+                return Err(crate::HammerworkError::Processing(
+                    "Missing encryption algorithm for encrypted job".to_string()
+                ));
+            }
+        };
+
+        // Parse metadata if available
+        let (key_id, compression_enabled, version) = if let Some(metadata) = &self.encryption_metadata {
+            let key_id = metadata.get("key_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let compression_enabled = metadata.get("compressed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let version = metadata.get("config_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+            (key_id, compression_enabled, version)
+        } else {
+            (self.encryption_key_id.clone(), false, 1)
+        };
+
+        let config = crate::encryption::EncryptionConfig {
+            algorithm,
+            key_source: crate::encryption::KeySource::External(
+                key_id.unwrap_or_else(|| "unknown".to_string())
+            ),
+            key_rotation_enabled: false, // Not stored in database
+            key_rotation_interval: None,
+            default_retention: None, // Will be parsed separately
+            compression_enabled,
+            key_id: self.encryption_key_id.clone(),
+            version,
+        };
+
+        Ok(Some(config))
+    }
+
+    /// Builds an EncryptionConfig from database fields - no-op when encryption is disabled.
+    #[cfg(not(feature = "encryption"))]
+    fn build_encryption_config(&self) -> Result<Option<()>> {
+        Ok(None)
+    }
+
+    /// Parses the retention policy from the database string.
+    #[cfg(feature = "encryption")]
+    fn parse_retention_policy(&self) -> Result<Option<crate::encryption::RetentionPolicy>> {
+        match self.retention_policy.as_deref() {
+            None => Ok(None),
+            Some("KeepIndefinitely") => Ok(Some(crate::encryption::RetentionPolicy::KeepIndefinitely)),
+            Some("DeleteImmediately") => Ok(Some(crate::encryption::RetentionPolicy::DeleteImmediately)),
+            Some("UseDefault") => Ok(Some(crate::encryption::RetentionPolicy::UseDefault)),
+            Some(policy_str) => {
+                // Handle DeleteAfter and DeleteAt policies
+                if let Some(delete_at) = self.retention_delete_at {
+                    if policy_str == "DeleteAt" {
+                        Ok(Some(crate::encryption::RetentionPolicy::DeleteAt(delete_at)))
+                    } else if policy_str == "DeleteAfter" {
+                        // Calculate duration from creation to deletion time
+                        let duration = delete_at.signed_duration_since(self.created_at);
+                        if let Ok(std_duration) = duration.to_std() {
+                            Ok(Some(crate::encryption::RetentionPolicy::DeleteAfter(std_duration)))
+                        } else {
+                            Ok(Some(crate::encryption::RetentionPolicy::UseDefault))
+                        }
+                    } else {
+                        Err(crate::HammerworkError::Processing(format!(
+                            "Unknown retention policy: {}", policy_str
+                        )))
+                    }
+                } else {
+                    Err(crate::HammerworkError::Processing(format!(
+                        "Retention policy '{}' requires retention_delete_at timestamp", policy_str
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Parses the retention policy - no-op when encryption is disabled.
+    #[cfg(not(feature = "encryption"))]
+    fn parse_retention_policy(&self) -> Result<Option<()>> {
+        Ok(None)
+    }
+
+    /// Builds an EncryptedPayload from database fields if the job is encrypted.
+    #[cfg(feature = "encryption")]
+    fn build_encrypted_payload(&self) -> Result<Option<crate::encryption::EncryptedPayload>> {
+        if !self.is_encrypted {
+            return Ok(None);
+        }
+
+        let encrypted_data = self.encrypted_payload.as_ref().ok_or_else(|| {
+            crate::HammerworkError::Processing(
+                "Missing encrypted payload for encrypted job".to_string()
+            )
+        })?;
+
+        let nonce = self.encryption_nonce.as_ref().ok_or_else(|| {
+            crate::HammerworkError::Processing(
+                "Missing encryption nonce for encrypted job".to_string()
+            )
+        })?;
+
+        let tag = self.encryption_tag.as_ref().ok_or_else(|| {
+            crate::HammerworkError::Processing(
+                "Missing encryption tag for encrypted job".to_string()
+            )
+        })?;
+
+        // Parse metadata
+        let metadata = if let Some(metadata_json) = &self.encryption_metadata {
+            // Build metadata from JSON
+            let algorithm = match self.encryption_algorithm.as_deref() {
+                Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
+                Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
+                _ => crate::encryption::EncryptionAlgorithm::AES256GCM, // Default fallback
+            };
+
+            let key_id = metadata_json.get("key_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| self.encryption_key_id.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let config_version = metadata_json.get("config_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+
+            let compressed = metadata_json.get("compressed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let encrypted_fields = metadata_json.get("encrypted_fields")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_else(|| self.pii_fields.clone().unwrap_or_default());
+
+            let retention_policy = self.parse_retention_policy()?
+                .unwrap_or(crate::encryption::RetentionPolicy::UseDefault);
+
+            let encrypted_at = self.encrypted_at.unwrap_or(self.created_at);
+
+            crate::encryption::EncryptionMetadata {
+                algorithm,
+                key_id,
+                config_version,
+                compressed,
+                encrypted_fields,
+                retention_policy,
+                encrypted_at,
+                delete_at: self.retention_delete_at,
+                payload_hash: self.payload_hash.clone().unwrap_or_default(),
+            }
+        } else {
+            // Build basic metadata from available fields
+            let algorithm = match self.encryption_algorithm.as_deref() {
+                Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
+                Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
+                _ => crate::encryption::EncryptionAlgorithm::AES256GCM, // Default fallback
+            };
+
+            crate::encryption::EncryptionMetadata {
+                algorithm,
+                key_id: self.encryption_key_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                config_version: 1,
+                compressed: false,
+                encrypted_fields: self.pii_fields.clone().unwrap_or_default(),
+                retention_policy: self.parse_retention_policy()?
+                    .unwrap_or(crate::encryption::RetentionPolicy::UseDefault),
+                encrypted_at: self.encrypted_at.unwrap_or(self.created_at),
+                delete_at: self.retention_delete_at,
+                payload_hash: self.payload_hash.clone().unwrap_or_default(),
+            }
+        };
+
+        // Encode binary data to base64
+        use base64::Engine;
+        let ciphertext = base64::engine::general_purpose::STANDARD.encode(encrypted_data);
+        let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce);
+        let tag_b64 = base64::engine::general_purpose::STANDARD.encode(tag);
+
+        Ok(Some(crate::encryption::EncryptedPayload {
+            ciphertext,
+            nonce: nonce_b64,
+            tag: tag_b64,
+            metadata,
+        }))
+    }
+
+    /// Builds an EncryptedPayload - no-op when encryption is disabled.
+    #[cfg(not(feature = "encryption"))]
+    fn build_encrypted_payload(&self) -> Result<Option<()>> {
+        Ok(None)
     }
 }
 
@@ -250,7 +492,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
-        let row = sqlx::query(
+        let query = format!(
             r#"
             UPDATE hammerwork_jobs 
             SET status = $1, started_at = $2, attempts = attempts + 1 
@@ -262,15 +504,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 FOR UPDATE SKIP LOCKED 
                 LIMIT 1
             )
-            RETURNING id, queue_name, payload, status, priority, attempts, max_attempts, 
-                     timeout_seconds, created_at, scheduled_at, started_at, completed_at, 
-                     failed_at, timed_out_at, error_message, cron_schedule, next_run_at, 
-                     recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at,
-                     result_storage_type, result_ttl_seconds, result_max_size_bytes,
-                     depends_on, dependents, dependency_status, workflow_id, workflow_name,
-                     trace_id, correlation_id, parent_span_id, span_context
-            "#,
-        )
+            RETURNING {}
+            "#, JOB_SELECT_FIELDS
+        );
+        let row = sqlx::query(&query)
         .bind(JobStatus::Running)
         .bind(Utc::now())
         .bind(queue_name)
@@ -393,9 +630,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         }
 
         // Get available jobs by priority
-        let available_jobs = sqlx::query(
+        let query = format!(
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
+            SELECT {}
             FROM hammerwork_jobs 
             WHERE queue_name = $1 
             AND status = $2 
@@ -403,8 +640,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             ORDER BY priority DESC, scheduled_at ASC 
             LIMIT 20
             FOR UPDATE SKIP LOCKED
-            "#
-        )
+            "#, JOB_SELECT_FIELDS
+        );
+        let available_jobs = sqlx::query(&query)
         .bind(queue_name)
         .bind(JobStatus::Pending)
         .bind(Utc::now())
@@ -458,9 +696,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 let job_id: uuid::Uuid = selected_row.get("id");
 
                 // Update the selected job
-                let updated_row = sqlx::query(
-                    "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 WHERE id = $3 RETURNING id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name"
-                )
+                let query = format!(
+                    "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 WHERE id = $3 RETURNING {}", JOB_SELECT_FIELDS
+                );
+                let updated_row = sqlx::query(&query)
                 .bind(JobStatus::Running)
                 .bind(Utc::now())
                 .bind(job_id)
@@ -583,7 +822,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context FROM hammerwork_jobs WHERE id = $1"
+            &format!("SELECT {} FROM hammerwork_jobs WHERE id = $1", JOB_SELECT_FIELDS)
         )
         .bind(job_id)
         .fetch_optional(&self.pool)
@@ -772,7 +1011,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context FROM hammerwork_jobs WHERE batch_id = $1 ORDER BY created_at ASC"
+            &format!("SELECT {} FROM hammerwork_jobs WHERE batch_id = $1 ORDER BY created_at ASC", JOB_SELECT_FIELDS)
         )
         .bind(batch_id)
         .fetch_all(&self.pool)
@@ -1093,35 +1332,39 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_due_cron_jobs(&self, queue_name: Option<&str>) -> Result<Vec<Job>> {
         let query = if queue_name.is_some() {
-            r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
-            FROM hammerwork_jobs 
-            WHERE recurring = TRUE 
-            AND queue_name = $1
-            AND (next_run_at IS NULL OR next_run_at <= $2)
-            AND status = $3
-            ORDER BY next_run_at ASC
-            "#
+            format!(
+                r#"
+                SELECT {}
+                FROM hammerwork_jobs 
+                WHERE recurring = TRUE 
+                AND queue_name = $1
+                AND (next_run_at IS NULL OR next_run_at <= $2)
+                AND status = $3
+                ORDER BY next_run_at ASC
+                "#, JOB_SELECT_FIELDS
+            )
         } else {
-            r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
-            FROM hammerwork_jobs 
-            WHERE recurring = TRUE 
-            AND (next_run_at IS NULL OR next_run_at <= $1)
-            AND status = $2
-            ORDER BY next_run_at ASC
-            "#
+            format!(
+                r#"
+                SELECT {}
+                FROM hammerwork_jobs 
+                WHERE recurring = TRUE 
+                AND (next_run_at IS NULL OR next_run_at <= $1)
+                AND status = $2
+                ORDER BY next_run_at ASC
+                "#, JOB_SELECT_FIELDS
+            )
         };
 
         let rows = if let Some(queue) = queue_name {
-            sqlx::query_as::<_, JobRow>(query)
+            sqlx::query_as::<_, JobRow>(&query)
                 .bind(queue)
                 .bind(Utc::now())
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query_as::<_, JobRow>(query)
+            sqlx::query_as::<_, JobRow>(&query)
                 .bind(Utc::now())
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
@@ -1158,7 +1401,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context FROM hammerwork_jobs WHERE queue_name = $1 AND recurring = TRUE ORDER BY next_run_at ASC"
+            &format!("SELECT {} FROM hammerwork_jobs WHERE queue_name = $1 AND recurring = TRUE ORDER BY next_run_at ASC", JOB_SELECT_FIELDS)
         )
         .bind(queue_name)
         .fetch_all(&self.pool)

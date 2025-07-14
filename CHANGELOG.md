@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.4] - 2025-07-14
+
+### Added
+- **🔐 Encryption Deserialization Implementation**
+  - Implemented complete deserialization logic for encrypted job payloads in PostgreSQL queue
+  - Added encryption fields to `JobRow` struct: `is_encrypted`, `encryption_key_id`, `encryption_algorithm`, `encrypted_payload`, `encryption_nonce`, `encryption_tag`, `encryption_metadata`, `payload_hash`, `pii_fields`, `retention_policy`, `retention_delete_at`, `encrypted_at`
+  - Created helper methods `build_encryption_config()`, `parse_retention_policy()`, and `build_encrypted_payload()` for reconstructing encryption data structures from database fields
+  - Updated all SQL SELECT queries to include encryption fields using new `JOB_SELECT_FIELDS` constant
+  - Properly handles base64 encoding/decoding of binary encryption data
+  - Full backward compatibility - works with and without encryption feature enabled
+
+### Fixed
+- **📊 Query Consistency**
+  - Standardized all job selection queries to include complete field list
+  - Fixed missing encryption fields in `dequeue()`, `get_job()`, `get_batch_jobs()`, `get_due_cron_jobs()`, and `get_recurring_jobs()` queries
+  - Resolved borrow checker issues in `into_job()` method by extracting encryption data before consuming self
+
 ## [1.8.3] - 2025-07-12
 
 ### Fixed
