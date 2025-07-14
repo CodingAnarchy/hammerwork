@@ -1519,39 +1519,279 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     // Workflow and dependency management methods
     async fn enqueue_workflow(
         &self,
-        _workflow: crate::workflow::JobGroup,
+        workflow: crate::workflow::JobGroup,
     ) -> Result<crate::workflow::WorkflowId> {
-        todo!("Workflow enqueuing will be implemented next")
+        // Validate workflow before enqueuing
+        workflow.validate()?;
+        
+        let mut tx = self.pool.begin().await?;
+        
+        // Insert workflow metadata
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_workflows
+            (id, name, status, created_at, completed_at, failed_at, total_jobs, completed_jobs, failed_jobs, failure_policy, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#
+        )
+        .bind(workflow.id)
+        .bind(&workflow.name)
+        .bind(workflow.status.as_str())
+        .bind(workflow.created_at)
+        .bind(workflow.completed_at)
+        .bind(workflow.failed_at)
+        .bind(workflow.total_jobs as i32)
+        .bind(workflow.completed_jobs as i32)
+        .bind(workflow.failed_jobs as i32)
+        .bind(workflow.failure_policy.as_str())
+        .bind(&workflow.metadata)
+        .execute(&mut *tx)
+        .await?;
+        
+        // Insert all jobs in the workflow
+        for job in &workflow.jobs {
+            self.insert_job_in_transaction(&mut tx, job).await?;
+        }
+        
+        tx.commit().await?;
+        
+        Ok(workflow.id)
     }
 
     async fn get_workflow_status(
         &self,
-        _workflow_id: crate::workflow::WorkflowId,
+        workflow_id: crate::workflow::WorkflowId,
     ) -> Result<Option<crate::workflow::JobGroup>> {
-        todo!("Workflow status retrieval will be implemented next")
+        use crate::workflow::{JobGroup, WorkflowStatus, FailurePolicy};
+        
+        // Get workflow metadata
+        let workflow_row = sqlx::query(
+            r#"
+            SELECT id, name, status, created_at, completed_at, failed_at, total_jobs, completed_jobs, failed_jobs, failure_policy, metadata
+            FROM hammerwork_workflows
+            WHERE id = $1
+            "#
+        )
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        if let Some(row) = workflow_row {
+            // Get all jobs in the workflow
+            let jobs = self.get_workflow_jobs(workflow_id).await?;
+            
+            // Build dependencies map
+            let mut dependencies = std::collections::HashMap::new();
+            for job in &jobs {
+                if !job.depends_on.is_empty() {
+                    dependencies.insert(job.id, job.depends_on.clone());
+                }
+            }
+            
+            let workflow = JobGroup {
+                id: row.get("id"),
+                name: row.get("name"),
+                status: WorkflowStatus::parse_from_db(row.get("status"))?,
+                created_at: row.get("created_at"),
+                completed_at: row.get("completed_at"),
+                failed_at: row.get("failed_at"),
+                failure_policy: FailurePolicy::parse_from_db(row.get("failure_policy"))?,
+                jobs,
+                dependencies,
+                total_jobs: row.get::<i32, _>("total_jobs") as usize,
+                completed_jobs: row.get::<i32, _>("completed_jobs") as usize,
+                failed_jobs: row.get::<i32, _>("failed_jobs") as usize,
+                metadata: row.get("metadata"),
+            };
+            
+            Ok(Some(workflow))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn resolve_job_dependencies(&self, _completed_job_id: JobId) -> Result<Vec<JobId>> {
-        todo!("Dependency resolution will be implemented next")
+    async fn resolve_job_dependencies(&self, completed_job_id: JobId) -> Result<Vec<JobId>> {
+        // Find all jobs that depend on the completed job
+        let dependent_jobs = sqlx::query(
+            r#"
+            SELECT id, depends_on
+            FROM hammerwork_jobs
+            WHERE depends_on @> $1::jsonb
+            AND dependency_status = 'waiting'
+            "#
+        )
+        .bind(serde_json::json!([completed_job_id]))
+        .fetch_all(&self.pool)
+        .await?;
+        
+        let mut resolved_jobs = Vec::new();
+        
+        for job_row in dependent_jobs {
+            let job_id: uuid::Uuid = job_row.get("id");
+            let depends_on: Vec<uuid::Uuid> = serde_json::from_value(job_row.get("depends_on"))?;
+            
+            // Check if all dependencies are now satisfied
+            let satisfied_count = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*)
+                FROM hammerwork_jobs
+                WHERE id = ANY($1::uuid[])
+                AND status = 'Completed'
+                "#
+            )
+            .bind(&depends_on)
+            .fetch_one(&self.pool)
+            .await?;
+            
+            if satisfied_count == depends_on.len() as i64 {
+                // All dependencies satisfied, mark as ready
+                sqlx::query(
+                    r#"
+                    UPDATE hammerwork_jobs
+                    SET dependency_status = 'satisfied'
+                    WHERE id = $1
+                    "#
+                )
+                .bind(job_id)
+                .execute(&self.pool)
+                .await?;
+                
+                resolved_jobs.push(job_id);
+            }
+        }
+        
+        Ok(resolved_jobs)
     }
 
-    async fn get_ready_jobs(&self, _queue_name: &str, _limit: u32) -> Result<Vec<Job>> {
-        todo!("Ready jobs query will be implemented next")
+    async fn get_ready_jobs(&self, queue_name: &str, limit: u32) -> Result<Vec<Job>> {
+        let rows = sqlx::query_as::<_, JobRow>(
+            &format!(
+                r#"
+                SELECT {}
+                FROM hammerwork_jobs
+                WHERE queue_name = $1
+                AND status = 'Pending'
+                AND dependency_status IN ('none', 'satisfied')
+                AND scheduled_at <= $2
+                ORDER BY priority DESC, scheduled_at ASC
+                LIMIT $3
+                "#, JOB_SELECT_FIELDS
+            )
+        )
+        .bind(queue_name)
+        .bind(chrono::Utc::now())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        
+        rows.into_iter().map(|row| row.into_job()).collect()
     }
 
-    async fn fail_job_dependencies(&self, _failed_job_id: JobId) -> Result<Vec<JobId>> {
-        todo!("Dependency failure propagation will be implemented next")
+    async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>> {
+        // Find all jobs that depend on the failed job (directly or indirectly)
+        let mut failed_jobs = Vec::new();
+        let mut jobs_to_check = vec![failed_job_id];
+        
+        while let Some(current_job_id) = jobs_to_check.pop() {
+            // Find jobs that depend on the current job
+            let dependent_jobs = sqlx::query_scalar::<_, uuid::Uuid>(
+                r#"
+                SELECT id
+                FROM hammerwork_jobs
+                WHERE depends_on @> $1::jsonb
+                AND dependency_status IN ('waiting', 'satisfied')
+                AND status = 'Pending'
+                "#
+            )
+            .bind(serde_json::json!([current_job_id]))
+            .fetch_all(&self.pool)
+            .await?;
+            
+            for dependent_job_id in dependent_jobs {
+                if !failed_jobs.contains(&dependent_job_id) {
+                    // Mark job as failed due to dependency
+                    sqlx::query(
+                        r#"
+                        UPDATE hammerwork_jobs
+                        SET dependency_status = 'failed',
+                            status = 'Failed',
+                            failed_at = $2,
+                            error_message = 'Dependency failed: job ' || $1 || ' failed'
+                        WHERE id = $3
+                        "#
+                    )
+                    .bind(current_job_id)
+                    .bind(chrono::Utc::now())
+                    .bind(dependent_job_id)
+                    .execute(&self.pool)
+                    .await?;
+                    
+                    failed_jobs.push(dependent_job_id);
+                    jobs_to_check.push(dependent_job_id);
+                }
+            }
+        }
+        
+        Ok(failed_jobs)
     }
 
     async fn get_workflow_jobs(
         &self,
-        _workflow_id: crate::workflow::WorkflowId,
+        workflow_id: crate::workflow::WorkflowId,
     ) -> Result<Vec<Job>> {
-        todo!("Workflow jobs query will be implemented next")
+        let rows = sqlx::query_as::<_, JobRow>(
+            &format!(
+                r#"
+                SELECT {}
+                FROM hammerwork_jobs
+                WHERE workflow_id = $1
+                ORDER BY created_at ASC
+                "#, JOB_SELECT_FIELDS
+            )
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        
+        rows.into_iter().map(|row| row.into_job()).collect()
     }
 
-    async fn cancel_workflow(&self, _workflow_id: crate::workflow::WorkflowId) -> Result<()> {
-        todo!("Workflow cancellation will be implemented next")
+    async fn cancel_workflow(&self, workflow_id: crate::workflow::WorkflowId) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        
+        // Cancel all pending jobs in the workflow
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_jobs
+            SET status = 'Failed',
+                failed_at = $2,
+                error_message = 'Workflow cancelled'
+            WHERE workflow_id = $1
+            AND status = 'Pending'
+            "#
+        )
+        .bind(workflow_id)
+        .bind(chrono::Utc::now())
+        .execute(&mut *tx)
+        .await?;
+        
+        // Update workflow status
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_workflows
+            SET status = 'cancelled',
+                failed_at = $2
+            WHERE id = $1
+            "#
+        )
+        .bind(workflow_id)
+        .bind(chrono::Utc::now())
+        .execute(&mut *tx)
+        .await?;
+        
+        tx.commit().await?;
+        
+        Ok(())
     }
 
     // Job archival operations
@@ -2149,5 +2389,63 @@ impl crate::queue::JobQueue<Postgres> {
         .await?;
 
         Ok(job.id)
+    }
+}
+
+/// Helper methods for PostgreSQL JobQueue
+impl crate::queue::JobQueue<Postgres> {
+    /// Helper method to insert a job within a transaction
+    async fn insert_job_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job: &Job,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_jobs (
+                id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds,
+                created_at, scheduled_at, error_message, cron_schedule, next_run_at, recurring,
+                timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes,
+                depends_on, dependents, dependency_status, workflow_id, workflow_name,
+                trace_id, correlation_id, parent_span_id, span_context
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+            "#,
+        )
+        .bind(job.id)
+        .bind(&job.queue_name)
+        .bind(&job.payload)
+        .bind(job.status)
+        .bind(job.priority.as_i32())
+        .bind(job.attempts)
+        .bind(job.max_attempts)
+        .bind(job.timeout.map(|d| d.as_secs() as i32))
+        .bind(job.created_at)
+        .bind(job.scheduled_at)
+        .bind(&job.error_message)
+        .bind(&job.cron_schedule)
+        .bind(job.next_run_at)
+        .bind(job.recurring)
+        .bind(&job.timezone)
+        .bind(job.batch_id)
+        .bind(match job.result_config.storage {
+            crate::job::ResultStorage::Database => "database",
+            crate::job::ResultStorage::Memory => "memory", 
+            crate::job::ResultStorage::None => "none",
+        })
+        .bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
+        .bind(job.result_config.max_size_bytes.map(|s| s as i64))
+        .bind(&job.depends_on)
+        .bind(&job.dependents)
+        .bind(job.dependency_status.as_str())
+        .bind(job.workflow_id)
+        .bind(&job.workflow_name)
+        .bind(&job.trace_id)
+        .bind(&job.correlation_id)
+        .bind(&job.parent_span_id)
+        .bind(&job.span_context)
+        .execute(&mut **tx)
+        .await?;
+        
+        Ok(())
     }
 }

@@ -52,10 +52,35 @@ pub(crate) struct JobRow {
     pub correlation_id: Option<String>,
     pub parent_span_id: Option<String>,
     pub span_context: Option<String>,
+    // Encryption fields
+    pub is_encrypted: bool,
+    pub encryption_key_id: Option<String>,
+    pub encryption_algorithm: Option<String>,
+    pub encrypted_payload: Option<Vec<u8>>,
+    pub encryption_nonce: Option<Vec<u8>>,
+    pub encryption_tag: Option<Vec<u8>>,
+    pub encryption_metadata: Option<serde_json::Value>,
+    pub payload_hash: Option<String>,
+    pub pii_fields: Option<serde_json::Value>,
+    pub retention_policy: Option<String>,
+    pub retention_delete_at: Option<DateTime<Utc>>,
+    pub encrypted_at: Option<DateTime<Utc>>,
 }
+
+/// Standard field list for selecting complete job data from hammerwork_jobs table.
+const JOB_SELECT_FIELDS: &str = "id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context, is_encrypted, encryption_key_id, encryption_algorithm, encrypted_payload, encryption_nonce, encryption_tag, encryption_metadata, payload_hash, pii_fields, retention_policy, retention_delete_at, encrypted_at";
 
 impl JobRow {
     pub fn into_job(self) -> Result<Job> {
+        // Extract encryption data before moving self
+        #[cfg(feature = "encryption")]
+        let encryption_config = self.build_encryption_config()?;
+        #[cfg(feature = "encryption")]
+        let retention_policy = self.parse_retention_policy()?;
+        #[cfg(feature = "encryption")]
+        let encrypted_payload = self.build_encrypted_payload()?;
+        let pii_fields = self.parse_pii_fields();
+        
         Ok(Job {
             id: uuid::Uuid::parse_str(&self.id)?,
             queue_name: self.queue_name,
@@ -125,14 +150,244 @@ impl JobRow {
             parent_span_id: self.parent_span_id,
             span_context: self.span_context,
             #[cfg(feature = "encryption")]
-            encryption_config: None,
-            pii_fields: Vec::new(),
+            encryption_config,
+            pii_fields,
             #[cfg(feature = "encryption")]
-            retention_policy: None,
-            is_encrypted: false,
+            retention_policy,
+            is_encrypted: self.is_encrypted,
             #[cfg(feature = "encryption")]
-            encrypted_payload: None,
+            encrypted_payload,
         })
+    }
+
+    /// Parses PII fields from JSON value.
+    fn parse_pii_fields(&self) -> Vec<String> {
+        self.pii_fields
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Builds an EncryptionConfig from database fields if encryption is enabled.
+    #[cfg(feature = "encryption")]
+    fn build_encryption_config(&self) -> Result<Option<crate::encryption::EncryptionConfig>> {
+        if !self.is_encrypted {
+            return Ok(None);
+        }
+
+        // Parse algorithm
+        let algorithm = match self.encryption_algorithm.as_deref() {
+            Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
+            Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
+            Some(alg) => {
+                return Err(crate::HammerworkError::Processing(format!(
+                    "Unknown encryption algorithm: {}", alg
+                )));
+            }
+            None => {
+                return Err(crate::HammerworkError::Processing(
+                    "Missing encryption algorithm for encrypted job".to_string()
+                ));
+            }
+        };
+
+        // Parse metadata if available
+        let (key_id, compression_enabled, version) = if let Some(metadata) = &self.encryption_metadata {
+            let key_id = metadata.get("key_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let compression_enabled = metadata.get("compressed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let version = metadata.get("config_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+            (key_id, compression_enabled, version)
+        } else {
+            (self.encryption_key_id.clone(), false, 1)
+        };
+
+        let config = crate::encryption::EncryptionConfig {
+            algorithm,
+            key_source: crate::encryption::KeySource::External(
+                key_id.unwrap_or_else(|| "unknown".to_string())
+            ),
+            key_rotation_enabled: false, // Not stored in database
+            key_rotation_interval: None,
+            default_retention: None, // Will be parsed separately
+            compression_enabled,
+            key_id: self.encryption_key_id.clone(),
+            version,
+        };
+
+        Ok(Some(config))
+    }
+
+    /// Builds an EncryptionConfig from database fields - no-op when encryption is disabled.
+    #[cfg(not(feature = "encryption"))]
+    fn build_encryption_config(&self) -> Result<Option<()>> {
+        Ok(None)
+    }
+
+    /// Parses the retention policy from the database string.
+    #[cfg(feature = "encryption")]
+    fn parse_retention_policy(&self) -> Result<Option<crate::encryption::RetentionPolicy>> {
+        match self.retention_policy.as_deref() {
+            None => Ok(None),
+            Some("KeepIndefinitely") => Ok(Some(crate::encryption::RetentionPolicy::KeepIndefinitely)),
+            Some("DeleteImmediately") => Ok(Some(crate::encryption::RetentionPolicy::DeleteImmediately)),
+            Some("UseDefault") => Ok(Some(crate::encryption::RetentionPolicy::UseDefault)),
+            Some(policy_str) => {
+                // Handle DeleteAfter and DeleteAt policies
+                if let Some(delete_at) = self.retention_delete_at {
+                    if policy_str == "DeleteAt" {
+                        Ok(Some(crate::encryption::RetentionPolicy::DeleteAt(delete_at)))
+                    } else if policy_str == "DeleteAfter" {
+                        // Calculate duration from creation to deletion time
+                        let duration = delete_at.signed_duration_since(self.created_at);
+                        if let Ok(std_duration) = duration.to_std() {
+                            Ok(Some(crate::encryption::RetentionPolicy::DeleteAfter(std_duration)))
+                        } else {
+                            Ok(Some(crate::encryption::RetentionPolicy::UseDefault))
+                        }
+                    } else {
+                        Err(crate::HammerworkError::Processing(format!(
+                            "Unknown retention policy: {}", policy_str
+                        )))
+                    }
+                } else {
+                    Err(crate::HammerworkError::Processing(format!(
+                        "Retention policy '{}' requires retention_delete_at timestamp", policy_str
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Parses the retention policy - no-op when encryption is disabled.
+    #[cfg(not(feature = "encryption"))]
+    fn parse_retention_policy(&self) -> Result<Option<()>> {
+        Ok(None)
+    }
+
+    /// Builds an EncryptedPayload from database fields if the job is encrypted.
+    #[cfg(feature = "encryption")]
+    fn build_encrypted_payload(&self) -> Result<Option<crate::encryption::EncryptedPayload>> {
+        if !self.is_encrypted {
+            return Ok(None);
+        }
+
+        let encrypted_data = self.encrypted_payload.as_ref().ok_or_else(|| {
+            crate::HammerworkError::Processing(
+                "Missing encrypted payload for encrypted job".to_string()
+            )
+        })?;
+
+        let nonce = self.encryption_nonce.as_ref().ok_or_else(|| {
+            crate::HammerworkError::Processing(
+                "Missing encryption nonce for encrypted job".to_string()
+            )
+        })?;
+
+        let tag = self.encryption_tag.as_ref().ok_or_else(|| {
+            crate::HammerworkError::Processing(
+                "Missing encryption tag for encrypted job".to_string()
+            )
+        })?;
+
+        // Parse metadata
+        let metadata = if let Some(metadata_json) = &self.encryption_metadata {
+            // Build metadata from JSON
+            let algorithm = match self.encryption_algorithm.as_deref() {
+                Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
+                Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
+                _ => crate::encryption::EncryptionAlgorithm::AES256GCM, // Default fallback
+            };
+
+            let key_id = metadata_json.get("key_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| self.encryption_key_id.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let config_version = metadata_json.get("config_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+
+            let compressed = metadata_json.get("compressed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let encrypted_fields = metadata_json.get("encrypted_fields")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_else(|| self.parse_pii_fields());
+
+            let retention_policy = self.parse_retention_policy()?
+                .unwrap_or(crate::encryption::RetentionPolicy::UseDefault);
+
+            let encrypted_at = self.encrypted_at.unwrap_or(self.created_at);
+
+            crate::encryption::EncryptionMetadata {
+                algorithm,
+                key_id,
+                config_version,
+                compressed,
+                encrypted_fields,
+                retention_policy,
+                encrypted_at,
+                delete_at: self.retention_delete_at,
+                payload_hash: self.payload_hash.clone().unwrap_or_default(),
+            }
+        } else {
+            // Build basic metadata from available fields
+            let algorithm = match self.encryption_algorithm.as_deref() {
+                Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
+                Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
+                _ => crate::encryption::EncryptionAlgorithm::AES256GCM, // Default fallback
+            };
+
+            crate::encryption::EncryptionMetadata {
+                algorithm,
+                key_id: self.encryption_key_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                config_version: 1,
+                compressed: false,
+                encrypted_fields: self.parse_pii_fields(),
+                retention_policy: self.parse_retention_policy()?
+                    .unwrap_or(crate::encryption::RetentionPolicy::UseDefault),
+                encrypted_at: self.encrypted_at.unwrap_or(self.created_at),
+                delete_at: self.retention_delete_at,
+                payload_hash: self.payload_hash.clone().unwrap_or_default(),
+            }
+        };
+
+        // Encode binary data to base64
+        use base64::Engine;
+        let ciphertext = base64::engine::general_purpose::STANDARD.encode(encrypted_data);
+        let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce);
+        let tag_b64 = base64::engine::general_purpose::STANDARD.encode(tag);
+
+        Ok(Some(crate::encryption::EncryptedPayload {
+            ciphertext,
+            nonce: nonce_b64,
+            tag: tag_b64,
+            metadata,
+        }))
+    }
+
+    /// Builds an EncryptedPayload - no-op when encryption is disabled.
+    #[cfg(not(feature = "encryption"))]
+    fn build_encrypted_payload(&self) -> Result<Option<()>> {
+        Ok(None)
     }
 }
 
@@ -268,8 +523,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         let mut tx = self.pool.begin().await?;
 
         let row = sqlx::query_as::<_, JobRow>(
+            &format!(
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context
+            SELECT {}
             FROM hammerwork_jobs 
             WHERE queue_name = ? 
             AND status = ? 
@@ -277,7 +533,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             ORDER BY priority DESC, scheduled_at ASC 
             LIMIT 1
             FOR UPDATE
-            "#
+            "#, JOB_SELECT_FIELDS)
         )
         .bind(queue_name)
         .bind(JobStatus::Pending)
@@ -328,8 +584,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         // Get available jobs by priority
         let available_jobs = sqlx::query_as::<_, JobRow>(
+            &format!(
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context
+            SELECT {}
             FROM hammerwork_jobs 
             WHERE queue_name = ? 
             AND status = ? 
@@ -337,7 +594,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             ORDER BY priority DESC, scheduled_at ASC 
             LIMIT 20
             FOR UPDATE
-            "#
+            "#, JOB_SELECT_FIELDS)
         )
         .bind(queue_name)
         .bind(JobStatus::Pending)
@@ -461,7 +718,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context FROM hammerwork_jobs WHERE id = ?"
+            &format!("SELECT {} FROM hammerwork_jobs WHERE id = ?", JOB_SELECT_FIELDS)
         )
         .bind(job_id.to_string())
         .fetch_optional(&self.pool)
@@ -624,7 +881,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context FROM hammerwork_jobs WHERE batch_id = ? ORDER BY created_at ASC"
+            &format!("SELECT {} FROM hammerwork_jobs WHERE batch_id = ? ORDER BY created_at ASC", JOB_SELECT_FIELDS)
         )
         .bind(batch_id.to_string())
         .fetch_all(&self.pool)
@@ -958,35 +1215,37 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         use crate::job::JobStatus;
 
         let query = if queue_name.is_some() {
+            format!(
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
+            SELECT {}
             FROM hammerwork_jobs 
             WHERE recurring = TRUE 
             AND queue_name = ?
             AND (next_run_at IS NULL OR next_run_at <= ?)
             AND status = ?
             ORDER BY next_run_at ASC
-            "#
+            "#, JOB_SELECT_FIELDS)
         } else {
+            format!(
             r#"
-            SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name
+            SELECT {}
             FROM hammerwork_jobs 
             WHERE recurring = TRUE 
             AND (next_run_at IS NULL OR next_run_at <= ?)
             AND status = ?
             ORDER BY next_run_at ASC
-            "#
+            "#, JOB_SELECT_FIELDS)
         };
 
         let rows = if let Some(queue) = queue_name {
-            sqlx::query_as::<_, JobRow>(query)
+            sqlx::query_as::<_, JobRow>(&query)
                 .bind(queue)
                 .bind(Utc::now())
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query_as::<_, JobRow>(query)
+            sqlx::query_as::<_, JobRow>(&query)
                 .bind(Utc::now())
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
@@ -1026,7 +1285,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context FROM hammerwork_jobs WHERE queue_name = ? AND recurring = TRUE ORDER BY next_run_at ASC"
+            &format!("SELECT {} FROM hammerwork_jobs WHERE queue_name = ? AND recurring = TRUE ORDER BY next_run_at ASC", JOB_SELECT_FIELDS)
         )
         .bind(queue_name)
         .fetch_all(&self.pool)
@@ -1146,39 +1405,295 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     // Workflow and dependency management methods
     async fn enqueue_workflow(
         &self,
-        _workflow: crate::workflow::JobGroup,
+        workflow: crate::workflow::JobGroup,
     ) -> Result<crate::workflow::WorkflowId> {
-        todo!("Workflow enqueuing will be implemented next")
+        // Validate workflow before enqueuing
+        workflow.validate()?;
+        
+        let mut tx = self.pool.begin().await?;
+        
+        // Insert workflow metadata
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_workflows
+            (id, name, status, created_at, completed_at, failed_at, total_jobs, completed_jobs, failed_jobs, failure_policy, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#
+        )
+        .bind(workflow.id.to_string())
+        .bind(&workflow.name)
+        .bind(workflow.status.as_str())
+        .bind(workflow.created_at)
+        .bind(workflow.completed_at)
+        .bind(workflow.failed_at)
+        .bind(workflow.total_jobs as i32)
+        .bind(workflow.completed_jobs as i32)
+        .bind(workflow.failed_jobs as i32)
+        .bind(workflow.failure_policy.as_str())
+        .bind(&workflow.metadata)
+        .execute(&mut *tx)
+        .await?;
+        
+        // Insert all jobs in the workflow
+        for job in &workflow.jobs {
+            self.insert_job_in_transaction(&mut tx, job).await?;
+        }
+        
+        tx.commit().await?;
+        
+        Ok(workflow.id)
     }
 
     async fn get_workflow_status(
         &self,
-        _workflow_id: crate::workflow::WorkflowId,
+        workflow_id: crate::workflow::WorkflowId,
     ) -> Result<Option<crate::workflow::JobGroup>> {
-        todo!("Workflow status retrieval will be implemented next")
+        use crate::workflow::{JobGroup, WorkflowStatus, FailurePolicy};
+        
+        // Get workflow metadata
+        let workflow_row = sqlx::query(
+            r#"
+            SELECT id, name, status, created_at, completed_at, failed_at, total_jobs, completed_jobs, failed_jobs, failure_policy, metadata
+            FROM hammerwork_workflows
+            WHERE id = ?
+            "#
+        )
+        .bind(workflow_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        
+        if let Some(row) = workflow_row {
+            // Get all jobs in the workflow
+            let jobs = self.get_workflow_jobs(workflow_id).await?;
+            
+            // Build dependencies map
+            let mut dependencies = std::collections::HashMap::new();
+            for job in &jobs {
+                if !job.depends_on.is_empty() {
+                    dependencies.insert(job.id, job.depends_on.clone());
+                }
+            }
+            
+            let workflow = JobGroup {
+                id: uuid::Uuid::parse_str(row.get::<String, _>("id").as_str())?,
+                name: row.get("name"),
+                status: WorkflowStatus::parse_from_db(row.get("status"))?,
+                created_at: row.get("created_at"),
+                completed_at: row.get("completed_at"),
+                failed_at: row.get("failed_at"),
+                failure_policy: FailurePolicy::parse_from_db(row.get("failure_policy"))?,
+                jobs,
+                dependencies,
+                total_jobs: row.get::<i32, _>("total_jobs") as usize,
+                completed_jobs: row.get::<i32, _>("completed_jobs") as usize,
+                failed_jobs: row.get::<i32, _>("failed_jobs") as usize,
+                metadata: row.get("metadata"),
+            };
+            
+            Ok(Some(workflow))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn resolve_job_dependencies(&self, _completed_job_id: JobId) -> Result<Vec<JobId>> {
-        todo!("Dependency resolution will be implemented next")
+    async fn resolve_job_dependencies(&self, completed_job_id: JobId) -> Result<Vec<JobId>> {
+        // Find all jobs that depend on the completed job
+        let dependent_jobs = sqlx::query(
+            r#"
+            SELECT id, depends_on
+            FROM hammerwork_jobs
+            WHERE JSON_CONTAINS(depends_on, ?)
+            AND dependency_status = 'waiting'
+            "#
+        )
+        .bind(serde_json::json!([completed_job_id.to_string()]))
+        .fetch_all(&self.pool)
+        .await?;
+        
+        let mut resolved_jobs = Vec::new();
+        
+        for job_row in dependent_jobs {
+            let job_id = uuid::Uuid::parse_str(&job_row.get::<String, _>("id"))?;
+            let depends_on_json: serde_json::Value = job_row.get("depends_on");
+            let depends_on: Vec<String> = serde_json::from_value(depends_on_json)?;
+            
+            // Convert String UUIDs to uuid::Uuid for validation
+            let depends_on_uuids: Result<Vec<uuid::Uuid>> = depends_on.iter()
+                .map(|s| uuid::Uuid::parse_str(s).map_err(Into::into))
+                .collect();
+            let _depends_on_uuids = depends_on_uuids?;
+            
+            // Check if all dependencies are now satisfied
+            let placeholders = depends_on.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let query_str = format!(
+                r#"
+                SELECT COUNT(*)
+                FROM hammerwork_jobs
+                WHERE id IN ({})
+                AND status = 'Completed'
+                "#,
+                placeholders
+            );
+            
+            let satisfied_count = sqlx::query_scalar::<_, i64>(&query_str);
+            
+            let mut query = satisfied_count;
+            for uuid_str in &depends_on {
+                query = query.bind(uuid_str);
+            }
+            
+            let satisfied_count = query.fetch_one(&self.pool).await?;
+            
+            if satisfied_count == depends_on.len() as i64 {
+                // All dependencies satisfied, mark as ready
+                sqlx::query(
+                    r#"
+                    UPDATE hammerwork_jobs
+                    SET dependency_status = 'satisfied'
+                    WHERE id = ?
+                    "#
+                )
+                .bind(job_id.to_string())
+                .execute(&self.pool)
+                .await?;
+                
+                resolved_jobs.push(job_id);
+            }
+        }
+        
+        Ok(resolved_jobs)
     }
 
-    async fn get_ready_jobs(&self, _queue_name: &str, _limit: u32) -> Result<Vec<Job>> {
-        todo!("Ready jobs query will be implemented next")
+    async fn get_ready_jobs(&self, queue_name: &str, limit: u32) -> Result<Vec<Job>> {
+        let rows = sqlx::query_as::<_, JobRow>(
+            &format!(
+                r#"
+                SELECT {}
+                FROM hammerwork_jobs
+                WHERE queue_name = ?
+                AND status = 'Pending'
+                AND dependency_status IN ('none', 'satisfied')
+                AND scheduled_at <= ?
+                ORDER BY priority DESC, scheduled_at ASC
+                LIMIT ?
+                "#, JOB_SELECT_FIELDS
+            )
+        )
+        .bind(queue_name)
+        .bind(chrono::Utc::now())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        
+        rows.into_iter().map(|row| row.into_job()).collect()
     }
 
-    async fn fail_job_dependencies(&self, _failed_job_id: JobId) -> Result<Vec<JobId>> {
-        todo!("Dependency failure propagation will be implemented next")
+    async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>> {
+        // Find all jobs that depend on the failed job (directly or indirectly)
+        let mut failed_jobs = Vec::new();
+        let mut jobs_to_check = vec![failed_job_id];
+        
+        while let Some(current_job_id) = jobs_to_check.pop() {
+            // Find jobs that depend on the current job
+            let dependent_jobs = sqlx::query_scalar::<_, String>(
+                r#"
+                SELECT id
+                FROM hammerwork_jobs
+                WHERE JSON_CONTAINS(depends_on, ?)
+                AND dependency_status IN ('waiting', 'satisfied')
+                AND status = 'Pending'
+                "#
+            )
+            .bind(serde_json::json!([current_job_id.to_string()]))
+            .fetch_all(&self.pool)
+            .await?;
+            
+            for dependent_job_id_str in dependent_jobs {
+                let dependent_job_id = uuid::Uuid::parse_str(&dependent_job_id_str)?;
+                if !failed_jobs.contains(&dependent_job_id) {
+                    // Mark job as failed due to dependency
+                    sqlx::query(
+                        r#"
+                        UPDATE hammerwork_jobs
+                        SET dependency_status = 'failed',
+                            status = 'Failed',
+                            failed_at = ?,
+                            error_message = CONCAT('Dependency failed: job ', ?, ' failed')
+                        WHERE id = ?
+                        "#
+                    )
+                    .bind(chrono::Utc::now())
+                    .bind(current_job_id.to_string())
+                    .bind(dependent_job_id.to_string())
+                    .execute(&self.pool)
+                    .await?;
+                    
+                    failed_jobs.push(dependent_job_id);
+                    jobs_to_check.push(dependent_job_id);
+                }
+            }
+        }
+        
+        Ok(failed_jobs)
     }
 
     async fn get_workflow_jobs(
         &self,
-        _workflow_id: crate::workflow::WorkflowId,
+        workflow_id: crate::workflow::WorkflowId,
     ) -> Result<Vec<Job>> {
-        todo!("Workflow jobs query will be implemented next")
+        let rows = sqlx::query_as::<_, JobRow>(
+            &format!(
+                r#"
+                SELECT {}
+                FROM hammerwork_jobs
+                WHERE workflow_id = ?
+                ORDER BY created_at ASC
+                "#, JOB_SELECT_FIELDS
+            )
+        )
+        .bind(workflow_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        
+        rows.into_iter().map(|row| row.into_job()).collect()
     }
 
-    async fn cancel_workflow(&self, _workflow_id: crate::workflow::WorkflowId) -> Result<()> {
-        todo!("Workflow cancellation will be implemented next")
+    async fn cancel_workflow(&self, workflow_id: crate::workflow::WorkflowId) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        
+        // Cancel all pending jobs in the workflow
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_jobs
+            SET status = 'Failed',
+                failed_at = ?,
+                error_message = 'Workflow cancelled'
+            WHERE workflow_id = ?
+            AND status = 'Pending'
+            "#
+        )
+        .bind(chrono::Utc::now())
+        .bind(workflow_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        
+        // Update workflow status
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_workflows
+            SET status = 'cancelled',
+                failed_at = ?
+            WHERE id = ?
+            "#
+        )
+        .bind(chrono::Utc::now())
+        .bind(workflow_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        
+        tx.commit().await?;
+        
+        Ok(())
     }
 
     // Job archival operations
@@ -1717,5 +2232,71 @@ impl crate::queue::JobQueue<sqlx::MySql> {
         .await?;
 
         Ok(job.id)
+    }
+}
+
+/// Helper methods for MySQL JobQueue
+impl crate::queue::JobQueue<MySql> {
+    /// Helper method to insert a job within a transaction
+    async fn insert_job_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        job: &Job,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_jobs (
+                id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds,
+                created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message,
+                cron_schedule, next_run_at, recurring, timezone, batch_id,
+                result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes,
+                depends_on, dependents, dependency_status, workflow_id, workflow_name,
+                trace_id, correlation_id, parent_span_id, span_context
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#
+        )
+        .bind(job.id.to_string())
+        .bind(&job.queue_name)
+        .bind(&job.payload)
+        .bind(job.status)
+        .bind(job.priority.as_i32())
+        .bind(job.attempts)
+        .bind(job.max_attempts)
+        .bind(job.timeout.map(|t| t.as_secs() as i32))
+        .bind(job.created_at)
+        .bind(job.scheduled_at)
+        .bind(job.started_at)
+        .bind(job.completed_at)
+        .bind(job.failed_at)
+        .bind(job.timed_out_at)
+        .bind(&job.error_message)
+        .bind(&job.cron_schedule)
+        .bind(job.next_run_at)
+        .bind(job.recurring)
+        .bind(&job.timezone)
+        .bind(job.batch_id.map(|id| id.to_string()))
+        .bind(&job.result_data)
+        .bind(job.result_stored_at)
+        .bind(job.result_expires_at)
+        .bind(match job.result_config.storage {
+            crate::job::ResultStorage::Database => "database",
+            crate::job::ResultStorage::Memory => "memory",
+            crate::job::ResultStorage::None => "none",
+        })
+        .bind(job.result_config.ttl.map(|t| t.as_secs() as i64))
+        .bind(job.result_config.max_size_bytes.map(|s| s as i64))
+        .bind(serde_json::to_value(&job.depends_on)?)
+        .bind(serde_json::to_value(&job.dependents)?)
+        .bind(job.dependency_status.as_str())
+        .bind(job.workflow_id.map(|id| id.to_string()))
+        .bind(&job.workflow_name)
+        .bind(&job.trace_id)
+        .bind(&job.correlation_id)
+        .bind(&job.parent_span_id)
+        .bind(&job.span_context)
+        .execute(&mut **tx)
+        .await?;
+        
+        Ok(())
     }
 }

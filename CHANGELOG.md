@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2025-07-14
+
+### Added
+- **🔄 Complete Workflow and Dependency Management System**
+  - Implemented full workflow orchestration capabilities with job dependency management
+  - Added `JobGroup` workflow builder with fluent API for creating complex job pipelines
+  - Support for sequential job chains using `.then()` method
+  - Support for parallel job execution using `.add_parallel_jobs()` method
+  - Comprehensive dependency resolution engine that automatically manages job execution order
+  - Workflow validation with circular dependency detection using topological sorting
+  - Three failure policies: `FailFast`, `ContinueOnFailure`, and `Manual` intervention modes
+
+- **🗄️ Database Schema and Storage**
+  - New `hammerwork_workflows` table for workflow metadata tracking
+  - Extended `hammerwork_jobs` table with dependency fields: `depends_on`, `dependents`, `dependency_status`, `workflow_id`, `workflow_name`
+  - Optimized database indexes for efficient dependency resolution queries
+  - PostgreSQL implementation uses native UUID arrays and JSONB for dependencies
+  - MySQL implementation uses JSON columns with proper constraint validation
+
+- **🚀 Queue Interface Extensions**
+  - `enqueue_workflow()` - Validates and atomically inserts entire workflows
+  - `get_workflow_status()` - Retrieves workflow metadata and current execution state
+  - `resolve_job_dependencies()` - Updates dependency status when jobs complete successfully
+  - `get_ready_jobs()` - Efficiently finds jobs ready for execution (no unsatisfied dependencies)
+  - `fail_job_dependencies()` - Cascades failure through dependency graph with configurable policies
+  - `get_workflow_jobs()` - Retrieves all jobs within a specific workflow
+  - `cancel_workflow()` - Cancels workflow and marks all pending jobs as failed
+
+- **⚡ Advanced Dependency Features**
+  - Automatic dependency satisfaction tracking with real-time status updates
+  - Intelligent failure propagation that respects workflow failure policies
+  - Support for complex dependency graphs with multiple fan-in/fan-out patterns
+  - Transactional workflow operations ensuring data consistency
+  - Workflow statistics tracking: total jobs, completed jobs, failed jobs
+
+### Fixed
+- **🔧 Implementation Completeness**
+  - Replaced all `todo!()` placeholders in workflow code with full implementations
+  - Added comprehensive error handling for workflow validation and execution
+  - Implemented proper UUID conversion handling between PostgreSQL and MySQL
+  - Added helper methods `insert_job_in_transaction()` for both database backends
+  - Fixed compilation issues and ensured feature parity between PostgreSQL and MySQL
+
+### Enhanced
+- **📊 MySQL Encryption Deserialization**
+  - Completed MySQL encryption deserialization implementation to match PostgreSQL
+  - Updated all MySQL SQL queries to include encryption fields using `JOB_SELECT_FIELDS` constant
+  - Added encryption helper methods: `build_encryption_config()`, `parse_retention_policy()`, `build_encrypted_payload()`
+  - Proper handling of MySQL JSON types vs PostgreSQL arrays for encryption metadata
+  - Full feature parity between PostgreSQL and MySQL encryption implementations
+
 ## [1.8.4] - 2025-07-14
 
 ### Added
