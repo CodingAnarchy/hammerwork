@@ -60,7 +60,8 @@ pub mod key_manager;
 pub use engine::EncryptionEngine;
 pub use key_manager::{
     EncryptionKey, ExternalKmsConfig, KeyAuditRecord, KeyDerivationConfig, KeyManager,
-    KeyManagerConfig, KeyManagerStats, KeyOperation, KeyPurpose, KeyStatus,
+    KeyManagerConfig, KeyManagerStats, KeyOperation, KeyPurpose, KeyStatus, parse_algorithm,
+    parse_key_purpose, parse_key_source, parse_key_status,
 };
 
 use chrono::{DateTime, Utc};

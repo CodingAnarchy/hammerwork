@@ -45,7 +45,7 @@
 use super::{EncryptionAlgorithm, EncryptionError, KeySource};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Database, Pool};
+use sqlx::{Database, Pool, Row};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -826,16 +826,18 @@ impl<DB: Database> KeyManager<DB> {
         None
     }
 
-    // These methods would be implemented with actual database operations
+    // Database operations for key storage
     async fn store_key(&self, _key: &EncryptionKey) -> Result<(), EncryptionError> {
-        // TODO: Implement database storage
-        Ok(())
+        // Database-specific implementations are provided in separate impl blocks
+        Err(EncryptionError::KeyManagement(
+            "Database-specific implementation required".to_string(),
+        ))
     }
 
     async fn load_key(&self, _key_id: &str) -> Result<EncryptionKey, EncryptionError> {
-        // TODO: Implement database loading
+        // Database-specific implementations are provided in separate impl blocks
         Err(EncryptionError::KeyManagement(
-            "Database operations not yet implemented".to_string(),
+            "Database-specific implementation required".to_string(),
         ))
     }
 
@@ -844,23 +846,31 @@ impl<DB: Database> KeyManager<DB> {
         _key_id: &str,
         _version: u32,
     ) -> Result<(), EncryptionError> {
-        // TODO: Implement key retirement
-        Ok(())
+        // Database-specific implementations are provided in separate impl blocks
+        Err(EncryptionError::KeyManagement(
+            "Database-specific implementation required".to_string(),
+        ))
     }
 
     async fn cleanup_old_key_versions(&self, _key_id: &str) -> Result<(), EncryptionError> {
-        // TODO: Implement version cleanup
-        Ok(())
+        // Database-specific implementations are provided in separate impl blocks
+        Err(EncryptionError::KeyManagement(
+            "Database-specific implementation required".to_string(),
+        ))
     }
 
     async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
-        // TODO: Implement rotation query
-        Ok(vec![])
+        // Database-specific implementations are provided in separate impl blocks
+        Err(EncryptionError::KeyManagement(
+            "Database-specific implementation required".to_string(),
+        ))
     }
 
     async fn record_key_usage(&self, _key_id: &str) -> Result<(), EncryptionError> {
-        // TODO: Implement usage tracking
-        Ok(())
+        // Database-specific implementations are provided in separate impl blocks
+        Err(EncryptionError::KeyManagement(
+            "Database-specific implementation required".to_string(),
+        ))
     }
 
     async fn record_audit_event(
@@ -870,8 +880,10 @@ impl<DB: Database> KeyManager<DB> {
         _success: bool,
         _error_message: Option<String>,
     ) -> Result<(), EncryptionError> {
-        // TODO: Implement audit logging
-        Ok(())
+        // Database-specific implementations are provided in separate impl blocks
+        Err(EncryptionError::KeyManagement(
+            "Database-specific implementation required".to_string(),
+        ))
     }
 
     async fn increment_key_count(&self) {
@@ -888,6 +900,444 @@ impl<DB: Database> KeyManager<DB> {
     }
 }
 
+// Database-specific implementations
+#[cfg(feature = "postgres")]
+impl KeyManager<sqlx::Postgres> {
+    async fn store_key_postgres(&self, key: &EncryptionKey) -> Result<(), EncryptionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_encryption_keys (
+                id, key_id, key_version, algorithm, key_material, key_derivation_salt, key_source, key_purpose,
+                created_at, created_by, expires_at, rotated_at, retired_at, status, rotation_interval, next_rotation_at,
+                key_strength, master_key_id, last_used_at, usage_count
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            ON CONFLICT (key_id) DO UPDATE SET
+                key_version = $3,
+                algorithm = $4,
+                key_material = $5,
+                status = $14,
+                rotated_at = $12,
+                next_rotation_at = $16,
+                last_used_at = $19,
+                usage_count = $20
+            "#
+        )
+        .bind(key.id)
+        .bind(&key.key_id)
+        .bind(key.version as i32)
+        .bind(key.algorithm.to_string())
+        .bind(&key.encrypted_key_material)
+        .bind(&key.derivation_salt)
+        .bind(key.source.to_string())
+        .bind(key.purpose.to_string())
+        .bind(key.created_at)
+        .bind(&key.created_by)
+        .bind(key.expires_at)
+        .bind(key.rotated_at)
+        .bind(key.retired_at)
+        .bind(key.status.to_string())
+        .bind(key.rotation_interval.map(|d| {
+            // Convert chrono::Duration to PostgreSQL INTERVAL
+            format!("{} seconds", d.num_seconds())
+        }))
+        .bind(key.next_rotation_at)
+        .bind(key.key_strength as i32)
+        .bind(key.master_key_id)
+        .bind(key.last_used_at)
+        .bind(key.usage_count as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| EncryptionError::KeyManagement(format!("Failed to store key: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn load_key_postgres(&self, key_id: &str) -> Result<EncryptionKey, EncryptionError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, key_id, key_version, algorithm, key_material, key_derivation_salt, key_source, key_purpose,
+                   created_at, created_by, expires_at, rotated_at, retired_at, status, rotation_interval, next_rotation_at,
+                   key_strength, master_key_id, last_used_at, usage_count
+            FROM hammerwork_encryption_keys
+            WHERE key_id = $1
+            ORDER BY key_version DESC
+            LIMIT 1
+            "#
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| EncryptionError::KeyManagement(format!("Failed to load key: {}", e)))?;
+
+        let row = row
+            .ok_or_else(|| EncryptionError::KeyManagement(format!("Key not found: {}", key_id)))?;
+
+        let rotation_interval =
+            if let Some(interval_str) = row.get::<Option<String>, _>("rotation_interval") {
+                // Parse PostgreSQL INTERVAL format
+                parse_postgres_interval(&interval_str)
+            } else {
+                None
+            };
+
+        Ok(EncryptionKey {
+            id: row.get("id"),
+            key_id: row.get("key_id"),
+            version: row.get::<i32, _>("key_version") as u32,
+            algorithm: parse_algorithm(row.get("algorithm"))?,
+            encrypted_key_material: row.get("key_material"),
+            derivation_salt: row.get("key_derivation_salt"),
+            source: parse_key_source(row.get("key_source"))?,
+            purpose: parse_key_purpose(row.get("key_purpose"))?,
+            created_at: row.get("created_at"),
+            created_by: row.get("created_by"),
+            expires_at: row.get("expires_at"),
+            rotated_at: row.get("rotated_at"),
+            retired_at: row.get("retired_at"),
+            status: parse_key_status(row.get("status"))?,
+            rotation_interval,
+            next_rotation_at: row.get("next_rotation_at"),
+            key_strength: row.get::<i32, _>("key_strength") as u32,
+            master_key_id: row.get("master_key_id"),
+            last_used_at: row.get("last_used_at"),
+            usage_count: row.get::<i64, _>("usage_count") as u64,
+        })
+    }
+
+    async fn retire_key_version_postgres(
+        &self,
+        key_id: &str,
+        version: u32,
+    ) -> Result<(), EncryptionError> {
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_encryption_keys
+            SET status = 'Retired', retired_at = NOW()
+            WHERE key_id = $1 AND key_version = $2
+            "#,
+        )
+        .bind(key_id)
+        .bind(version as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to retire key version: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn cleanup_old_key_versions_postgres(&self, key_id: &str) -> Result<(), EncryptionError> {
+        // Keep only the latest max_key_versions for each key_id
+        sqlx::query(
+            r#"
+            DELETE FROM hammerwork_encryption_keys
+            WHERE key_id = $1 AND key_version NOT IN (
+                SELECT key_version FROM hammerwork_encryption_keys
+                WHERE key_id = $1
+                ORDER BY key_version DESC
+                LIMIT $2
+            )
+            "#,
+        )
+        .bind(key_id)
+        .bind(self.config.max_key_versions as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to cleanup old key versions: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn get_keys_due_for_rotation_postgres(&self) -> Result<Vec<String>, EncryptionError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT key_id
+            FROM hammerwork_encryption_keys
+            WHERE status = 'Active' 
+            AND next_rotation_at IS NOT NULL 
+            AND next_rotation_at <= NOW()
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to get keys due for rotation: {}", e))
+        })?;
+
+        Ok(rows.into_iter().map(|row| row.get("key_id")).collect())
+    }
+
+    async fn record_key_usage_postgres(&self, key_id: &str) -> Result<(), EncryptionError> {
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_encryption_keys
+            SET last_used_at = NOW(), usage_count = usage_count + 1
+            WHERE key_id = $1
+            "#,
+        )
+        .bind(key_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to record key usage: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn record_audit_event_postgres(
+        &self,
+        key_id: &str,
+        operation: KeyOperation,
+        success: bool,
+        error_message: Option<String>,
+    ) -> Result<(), EncryptionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_key_audit_log (
+                key_id, operation, success, error_message, timestamp
+            ) VALUES ($1, $2, $3, $4, NOW())
+            "#,
+        )
+        .bind(key_id)
+        .bind(operation.to_string())
+        .bind(success)
+        .bind(error_message)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to record audit event: {}", e))
+        })?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl KeyManager<sqlx::MySql> {
+    async fn store_key_mysql(&self, key: &EncryptionKey) -> Result<(), EncryptionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_encryption_keys (
+                id, key_id, key_version, algorithm, key_material, key_derivation_salt, key_source, key_purpose,
+                created_at, created_by, expires_at, rotated_at, retired_at, status, rotation_interval_seconds, next_rotation_at,
+                key_strength, master_key_id, last_used_at, usage_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+                key_version = VALUES(key_version),
+                algorithm = VALUES(algorithm),
+                key_material = VALUES(key_material),
+                status = VALUES(status),
+                rotated_at = VALUES(rotated_at),
+                next_rotation_at = VALUES(next_rotation_at),
+                last_used_at = VALUES(last_used_at),
+                usage_count = VALUES(usage_count)
+            "#
+        )
+        .bind(key.id.to_string())
+        .bind(&key.key_id)
+        .bind(key.version as i32)
+        .bind(key.algorithm.to_string())
+        .bind(&key.encrypted_key_material)
+        .bind(&key.derivation_salt)
+        .bind(key.source.to_string())
+        .bind(key.purpose.to_string())
+        .bind(key.created_at)
+        .bind(&key.created_by)
+        .bind(key.expires_at)
+        .bind(key.rotated_at)
+        .bind(key.retired_at)
+        .bind(key.status.to_string())
+        .bind(key.rotation_interval.map(|d| d.num_seconds()))
+        .bind(key.next_rotation_at)
+        .bind(key.key_strength as i32)
+        .bind(key.master_key_id.map(|id| id.to_string()))
+        .bind(key.last_used_at)
+        .bind(key.usage_count as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| EncryptionError::KeyManagement(format!("Failed to store key: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn load_key_mysql(&self, key_id: &str) -> Result<EncryptionKey, EncryptionError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, key_id, key_version, algorithm, key_material, key_derivation_salt, key_source, key_purpose,
+                   created_at, created_by, expires_at, rotated_at, retired_at, status, rotation_interval_seconds, next_rotation_at,
+                   key_strength, master_key_id, last_used_at, usage_count
+            FROM hammerwork_encryption_keys
+            WHERE key_id = ?
+            ORDER BY key_version DESC
+            LIMIT 1
+            "#
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| EncryptionError::KeyManagement(format!("Failed to load key: {}", e)))?;
+
+        let row = row
+            .ok_or_else(|| EncryptionError::KeyManagement(format!("Key not found: {}", key_id)))?;
+
+        let rotation_interval =
+            if let Some(seconds) = row.get::<Option<i64>, _>("rotation_interval_seconds") {
+                Some(Duration::seconds(seconds))
+            } else {
+                None
+            };
+
+        Ok(EncryptionKey {
+            id: uuid::Uuid::parse_str(&row.get::<String, _>("id"))
+                .map_err(|e| EncryptionError::KeyManagement(format!("Invalid UUID: {}", e)))?,
+            key_id: row.get("key_id"),
+            version: row.get::<i32, _>("key_version") as u32,
+            algorithm: parse_algorithm(row.get("algorithm"))?,
+            encrypted_key_material: row.get("key_material"),
+            derivation_salt: row.get("key_derivation_salt"),
+            source: parse_key_source(row.get("key_source"))?,
+            purpose: parse_key_purpose(row.get("key_purpose"))?,
+            created_at: row.get("created_at"),
+            created_by: row.get("created_by"),
+            expires_at: row.get("expires_at"),
+            rotated_at: row.get("rotated_at"),
+            retired_at: row.get("retired_at"),
+            status: parse_key_status(row.get("status"))?,
+            rotation_interval,
+            next_rotation_at: row.get("next_rotation_at"),
+            key_strength: row.get::<i32, _>("key_strength") as u32,
+            master_key_id: row
+                .get::<Option<String>, _>("master_key_id")
+                .map(|s| {
+                    uuid::Uuid::parse_str(&s).map_err(|e| {
+                        EncryptionError::KeyManagement(format!("Invalid master key UUID: {}", e))
+                    })
+                })
+                .transpose()?,
+            last_used_at: row.get("last_used_at"),
+            usage_count: row.get::<i64, _>("usage_count") as u64,
+        })
+    }
+
+    async fn retire_key_version_mysql(
+        &self,
+        key_id: &str,
+        version: u32,
+    ) -> Result<(), EncryptionError> {
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_encryption_keys
+            SET status = 'Retired', retired_at = NOW()
+            WHERE key_id = ? AND key_version = ?
+            "#,
+        )
+        .bind(key_id)
+        .bind(version as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to retire key version: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn cleanup_old_key_versions_mysql(&self, key_id: &str) -> Result<(), EncryptionError> {
+        // Keep only the latest max_key_versions for each key_id
+        sqlx::query(
+            r#"
+            DELETE FROM hammerwork_encryption_keys
+            WHERE key_id = ? AND key_version NOT IN (
+                SELECT key_version FROM (
+                    SELECT key_version FROM hammerwork_encryption_keys
+                    WHERE key_id = ?
+                    ORDER BY key_version DESC
+                    LIMIT ?
+                ) t
+            )
+            "#,
+        )
+        .bind(key_id)
+        .bind(key_id)
+        .bind(self.config.max_key_versions as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to cleanup old key versions: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn get_keys_due_for_rotation_mysql(&self) -> Result<Vec<String>, EncryptionError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT key_id
+            FROM hammerwork_encryption_keys
+            WHERE status = 'Active' 
+            AND next_rotation_at IS NOT NULL 
+            AND next_rotation_at <= NOW()
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to get keys due for rotation: {}", e))
+        })?;
+
+        Ok(rows.into_iter().map(|row| row.get("key_id")).collect())
+    }
+
+    async fn record_key_usage_mysql(&self, key_id: &str) -> Result<(), EncryptionError> {
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_encryption_keys
+            SET last_used_at = NOW(), usage_count = usage_count + 1
+            WHERE key_id = ?
+            "#,
+        )
+        .bind(key_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to record key usage: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    async fn record_audit_event_mysql(
+        &self,
+        key_id: &str,
+        operation: KeyOperation,
+        success: bool,
+        error_message: Option<String>,
+    ) -> Result<(), EncryptionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_key_audit_log (
+                key_id, operation, success, error_message, timestamp
+            ) VALUES (?, ?, ?, ?, NOW())
+            "#,
+        )
+        .bind(key_id)
+        .bind(operation.to_string())
+        .bind(success)
+        .bind(error_message)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::KeyManagement(format!("Failed to record audit event: {}", e))
+        })?;
+
+        Ok(())
+    }
+}
+
 impl Default for KeyManagerStats {
     fn default() -> Self {
         Self {
@@ -901,6 +1351,147 @@ impl Default for KeyManagerStats {
             average_key_age_days: 0.0,
             keys_expiring_soon: 0,
             keys_due_for_rotation: 0,
+        }
+    }
+}
+
+// Helper functions for parsing database values
+pub fn parse_algorithm(s: &str) -> Result<EncryptionAlgorithm, EncryptionError> {
+    match s {
+        "AES256GCM" => Ok(EncryptionAlgorithm::AES256GCM),
+        "ChaCha20Poly1305" => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
+        _ => Err(EncryptionError::KeyManagement(format!(
+            "Unknown algorithm: {}",
+            s
+        ))),
+    }
+}
+
+pub fn parse_key_source(s: &str) -> Result<KeySource, EncryptionError> {
+    if s.starts_with("Environment(") && s.ends_with(")") {
+        let env_var = s
+            .strip_prefix("Environment(")
+            .unwrap()
+            .strip_suffix(")")
+            .unwrap();
+        Ok(KeySource::Environment(env_var.to_string()))
+    } else if s.starts_with("Static(") && s.ends_with(")") {
+        let static_key = s
+            .strip_prefix("Static(")
+            .unwrap()
+            .strip_suffix(")")
+            .unwrap();
+        Ok(KeySource::Static(static_key.to_string()))
+    } else if s.starts_with("Generated(") && s.ends_with(")") {
+        let generated_type = s
+            .strip_prefix("Generated(")
+            .unwrap()
+            .strip_suffix(")")
+            .unwrap();
+        Ok(KeySource::Generated(generated_type.to_string()))
+    } else if s.starts_with("External(") && s.ends_with(")") {
+        let external_id = s
+            .strip_prefix("External(")
+            .unwrap()
+            .strip_suffix(")")
+            .unwrap();
+        Ok(KeySource::External(external_id.to_string()))
+    } else {
+        Err(EncryptionError::KeyManagement(format!(
+            "Unknown key source: {}",
+            s
+        )))
+    }
+}
+
+pub fn parse_key_purpose(s: &str) -> Result<KeyPurpose, EncryptionError> {
+    match s {
+        "Encryption" => Ok(KeyPurpose::Encryption),
+        "MAC" => Ok(KeyPurpose::MAC),
+        "KEK" => Ok(KeyPurpose::KEK),
+        _ => Err(EncryptionError::KeyManagement(format!(
+            "Unknown key purpose: {}",
+            s
+        ))),
+    }
+}
+
+pub fn parse_key_status(s: &str) -> Result<KeyStatus, EncryptionError> {
+    match s {
+        "Active" => Ok(KeyStatus::Active),
+        "Retired" => Ok(KeyStatus::Retired),
+        "Revoked" => Ok(KeyStatus::Revoked),
+        "Expired" => Ok(KeyStatus::Expired),
+        _ => Err(EncryptionError::KeyManagement(format!(
+            "Unknown key status: {}",
+            s
+        ))),
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn parse_postgres_interval(interval_str: &str) -> Option<Duration> {
+    // Parse PostgreSQL INTERVAL format like "3600 seconds"
+    if let Some(seconds_str) = interval_str.strip_suffix(" seconds") {
+        if let Ok(seconds) = seconds_str.parse::<i64>() {
+            return Some(Duration::seconds(seconds));
+        }
+    }
+    None
+}
+
+// Add Display implementations for enum serialization
+impl std::fmt::Display for KeyPurpose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyPurpose::Encryption => write!(f, "Encryption"),
+            KeyPurpose::MAC => write!(f, "MAC"),
+            KeyPurpose::KEK => write!(f, "KEK"),
+        }
+    }
+}
+
+impl std::fmt::Display for KeyStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyStatus::Active => write!(f, "Active"),
+            KeyStatus::Retired => write!(f, "Retired"),
+            KeyStatus::Revoked => write!(f, "Revoked"),
+            KeyStatus::Expired => write!(f, "Expired"),
+        }
+    }
+}
+
+impl std::fmt::Display for EncryptionAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncryptionAlgorithm::AES256GCM => write!(f, "AES256GCM"),
+            EncryptionAlgorithm::ChaCha20Poly1305 => write!(f, "ChaCha20Poly1305"),
+        }
+    }
+}
+
+impl std::fmt::Display for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeySource::Environment(env_var) => write!(f, "Environment({})", env_var),
+            KeySource::Static(key) => write!(f, "Static({})", key),
+            KeySource::Generated(gen_type) => write!(f, "Generated({})", gen_type),
+            KeySource::External(ext_id) => write!(f, "External({})", ext_id),
+        }
+    }
+}
+
+impl std::fmt::Display for KeyOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyOperation::Create => write!(f, "Create"),
+            KeyOperation::Access => write!(f, "Access"),
+            KeyOperation::Rotate => write!(f, "Rotate"),
+            KeyOperation::Retire => write!(f, "Retire"),
+            KeyOperation::Revoke => write!(f, "Revoke"),
+            KeyOperation::Delete => write!(f, "Delete"),
+            KeyOperation::Update => write!(f, "Update"),
         }
     }
 }

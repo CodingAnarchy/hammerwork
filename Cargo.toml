@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.9.0"
+version = "1.10.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
@@ -19,7 +19,7 @@ documentation = "https://docs.rs/hammerwork"
 rust-version = "1.86"
 
 [workspace.dependencies]
-hammerwork = { version = "1.9.0", path = "." }
+hammerwork = { version = "1.10.0", path = "." }
 tokio = { version = "1.0", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "json"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2025-07-14
+
+### Added
+- **🔐 Complete Encryption Key Management System**
+  - Implemented comprehensive encryption key lifecycle management with secure storage, rotation, and retirement
+  - Added `KeyManager<DB>` with full PostgreSQL and MySQL support for enterprise-grade key operations
+  - Support for multiple encryption algorithms: AES-256-GCM and ChaCha20-Poly1305 with configurable key strengths
+  - Master key encryption (KEK) system ensuring data encryption keys are never stored in plaintext
+  - Automatic key rotation with configurable intervals and next rotation scheduling
+  - Key versioning system supporting up to configurable maximum versions per key ID
+  - Secure key derivation using Argon2 with customizable memory cost, time cost, and parallelism parameters
+
+- **🏗️ Database Schema and Migration Support**
+  - New `hammerwork_encryption_keys` table with comprehensive metadata tracking and optimized indexes
+  - New `hammerwork_key_audit_log` table for complete audit trail of all key operations
+  - Database migration files for both PostgreSQL (013_add_key_audit.postgres.sql) and MySQL (013_add_key_audit.mysql.sql)
+  - Proper constraint validation ensuring data integrity and encryption consistency
+  - Optimized indexes for key lookup, rotation queries, expiration tracking, and audit log searches
+
+- **🔑 Advanced Key Operations**
+  - `store_key()` and `load_key()` operations with automatic encryption and version management
+  - `retire_key_version()` for secure key retirement while maintaining decryption capabilities
+  - `cleanup_old_key_versions()` with configurable retention policies preventing key sprawl
+  - `get_keys_due_for_rotation()` for automated rotation scheduling and compliance
+  - `record_key_usage()` with comprehensive usage statistics and last access tracking
+  - `record_audit_event()` providing complete audit trails for compliance and security monitoring
+
+- **🛡️ Security and Compliance Features**
+  - External Key Management Service (KMS) integration support for AWS KMS, Azure Key Vault, HashiCorp Vault
+  - Key source management supporting environment variables, static keys, generated keys, and external services
+  - Comprehensive audit logging with operation type, success/failure tracking, and error message capture
+  - Key purpose categorization: Encryption, MAC (Message Authentication Code), and KEK (Key Encryption Key)
+  - Key status management: Active, Retired, Revoked, and Expired with proper lifecycle transitions
+  - Configurable key expiration, rotation intervals, and automated cleanup policies
+
+- **📊 Key Management Statistics and Monitoring**
+  - `KeyManagerStats` providing comprehensive metrics: total keys, active/retired/revoked/expired counts
+  - Key usage analytics: total access operations, rotations performed, average key age
+  - Proactive monitoring: keys expiring soon alerts and rotation due notifications
+  - Performance metrics and key management health indicators
+
+- **🔧 Configuration and Flexibility**
+  - `KeyManagerConfig` with fluent builder pattern for easy configuration management
+  - Support for auto-rotation with configurable intervals and maximum key version limits
+  - Audit logging enable/disable with comprehensive event tracking
+  - External KMS configuration with service type, endpoint, authentication, and namespace support
+  - Key derivation configuration with Argon2 parameter tuning for security vs. performance optimization
+
+### Enhanced
+- **🔒 Database Feature Parity**
+  - Complete feature parity between PostgreSQL and MySQL implementations for all key management operations
+  - Database-specific optimizations: PostgreSQL uses native UUID arrays and INTERVAL types
+  - MySQL implementation uses JSON columns and seconds-based interval storage for compatibility
+  - Proper error handling and conversion between different database type systems
+
+- **📝 Comprehensive Testing**
+  - Added 20 comprehensive unit tests covering all key management functionality
+  - Error handling tests validating robust parsing and graceful failure modes
+  - Database operation tests ensuring proper integration with both PostgreSQL and MySQL
+  - Configuration validation tests for all builder patterns and default values
+  - Serialization/deserialization tests ensuring cross-system compatibility
+
+### Fixed
+- **🛠️ Code Quality and Maintainability**
+  - Exposed parsing helper functions (`parse_algorithm`, `parse_key_source`, `parse_key_purpose`, `parse_key_status`) for extensibility
+  - Implemented `Display` traits for all key management enums enabling human-readable output
+  - Added comprehensive error types and messages for debugging and troubleshooting
+  - Proper feature flag isolation ensuring encryption functionality is optional and self-contained
+
 ## [1.9.0] - 2025-07-14
 
 ### Added

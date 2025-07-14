@@ -80,7 +80,7 @@ impl JobRow {
         #[cfg(feature = "encryption")]
         let encrypted_payload = self.build_encrypted_payload()?;
         let pii_fields = self.pii_fields.unwrap_or_default();
-        
+
         Ok(Job {
             id: self.id,
             queue_name: self.queue_name,
@@ -161,36 +161,41 @@ impl JobRow {
             Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
             Some(alg) => {
                 return Err(crate::HammerworkError::Processing(format!(
-                    "Unknown encryption algorithm: {}", alg
+                    "Unknown encryption algorithm: {}",
+                    alg
                 )));
             }
             None => {
                 return Err(crate::HammerworkError::Processing(
-                    "Missing encryption algorithm for encrypted job".to_string()
+                    "Missing encryption algorithm for encrypted job".to_string(),
                 ));
             }
         };
 
         // Parse metadata if available
-        let (key_id, compression_enabled, version) = if let Some(metadata) = &self.encryption_metadata {
-            let key_id = metadata.get("key_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let compression_enabled = metadata.get("compressed")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let version = metadata.get("config_version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
-            (key_id, compression_enabled, version)
-        } else {
-            (self.encryption_key_id.clone(), false, 1)
-        };
+        let (key_id, compression_enabled, version) =
+            if let Some(metadata) = &self.encryption_metadata {
+                let key_id = metadata
+                    .get("key_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let compression_enabled = metadata
+                    .get("compressed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let version = metadata
+                    .get("config_version")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as u32;
+                (key_id, compression_enabled, version)
+            } else {
+                (self.encryption_key_id.clone(), false, 1)
+            };
 
         let config = crate::encryption::EncryptionConfig {
             algorithm,
             key_source: crate::encryption::KeySource::External(
-                key_id.unwrap_or_else(|| "unknown".to_string())
+                key_id.unwrap_or_else(|| "unknown".to_string()),
             ),
             key_rotation_enabled: false, // Not stored in database
             key_rotation_interval: None,
@@ -214,30 +219,40 @@ impl JobRow {
     fn parse_retention_policy(&self) -> Result<Option<crate::encryption::RetentionPolicy>> {
         match self.retention_policy.as_deref() {
             None => Ok(None),
-            Some("KeepIndefinitely") => Ok(Some(crate::encryption::RetentionPolicy::KeepIndefinitely)),
-            Some("DeleteImmediately") => Ok(Some(crate::encryption::RetentionPolicy::DeleteImmediately)),
+            Some("KeepIndefinitely") => {
+                Ok(Some(crate::encryption::RetentionPolicy::KeepIndefinitely))
+            }
+            Some("DeleteImmediately") => {
+                Ok(Some(crate::encryption::RetentionPolicy::DeleteImmediately))
+            }
             Some("UseDefault") => Ok(Some(crate::encryption::RetentionPolicy::UseDefault)),
             Some(policy_str) => {
                 // Handle DeleteAfter and DeleteAt policies
                 if let Some(delete_at) = self.retention_delete_at {
                     if policy_str == "DeleteAt" {
-                        Ok(Some(crate::encryption::RetentionPolicy::DeleteAt(delete_at)))
+                        Ok(Some(crate::encryption::RetentionPolicy::DeleteAt(
+                            delete_at,
+                        )))
                     } else if policy_str == "DeleteAfter" {
                         // Calculate duration from creation to deletion time
                         let duration = delete_at.signed_duration_since(self.created_at);
                         if let Ok(std_duration) = duration.to_std() {
-                            Ok(Some(crate::encryption::RetentionPolicy::DeleteAfter(std_duration)))
+                            Ok(Some(crate::encryption::RetentionPolicy::DeleteAfter(
+                                std_duration,
+                            )))
                         } else {
                             Ok(Some(crate::encryption::RetentionPolicy::UseDefault))
                         }
                     } else {
                         Err(crate::HammerworkError::Processing(format!(
-                            "Unknown retention policy: {}", policy_str
+                            "Unknown retention policy: {}",
+                            policy_str
                         )))
                     }
                 } else {
                     Err(crate::HammerworkError::Processing(format!(
-                        "Retention policy '{}' requires retention_delete_at timestamp", policy_str
+                        "Retention policy '{}' requires retention_delete_at timestamp",
+                        policy_str
                     )))
                 }
             }
@@ -259,19 +274,19 @@ impl JobRow {
 
         let encrypted_data = self.encrypted_payload.as_ref().ok_or_else(|| {
             crate::HammerworkError::Processing(
-                "Missing encrypted payload for encrypted job".to_string()
+                "Missing encrypted payload for encrypted job".to_string(),
             )
         })?;
 
         let nonce = self.encryption_nonce.as_ref().ok_or_else(|| {
             crate::HammerworkError::Processing(
-                "Missing encryption nonce for encrypted job".to_string()
+                "Missing encryption nonce for encrypted job".to_string(),
             )
         })?;
 
         let tag = self.encryption_tag.as_ref().ok_or_else(|| {
             crate::HammerworkError::Processing(
-                "Missing encryption tag for encrypted job".to_string()
+                "Missing encryption tag for encrypted job".to_string(),
             )
         })?;
 
@@ -280,25 +295,31 @@ impl JobRow {
             // Build metadata from JSON
             let algorithm = match self.encryption_algorithm.as_deref() {
                 Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
-                Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
+                Some("ChaCha20Poly1305") => {
+                    crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305
+                }
                 _ => crate::encryption::EncryptionAlgorithm::AES256GCM, // Default fallback
             };
 
-            let key_id = metadata_json.get("key_id")
+            let key_id = metadata_json
+                .get("key_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .or_else(|| self.encryption_key_id.clone())
                 .unwrap_or_else(|| "unknown".to_string());
 
-            let config_version = metadata_json.get("config_version")
+            let config_version = metadata_json
+                .get("config_version")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as u32;
 
-            let compressed = metadata_json.get("compressed")
+            let compressed = metadata_json
+                .get("compressed")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            let encrypted_fields = metadata_json.get("encrypted_fields")
+            let encrypted_fields = metadata_json
+                .get("encrypted_fields")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -307,7 +328,8 @@ impl JobRow {
                 })
                 .unwrap_or_else(|| self.pii_fields.clone().unwrap_or_default());
 
-            let retention_policy = self.parse_retention_policy()?
+            let retention_policy = self
+                .parse_retention_policy()?
                 .unwrap_or(crate::encryption::RetentionPolicy::UseDefault);
 
             let encrypted_at = self.encrypted_at.unwrap_or(self.created_at);
@@ -327,17 +349,23 @@ impl JobRow {
             // Build basic metadata from available fields
             let algorithm = match self.encryption_algorithm.as_deref() {
                 Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
-                Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
+                Some("ChaCha20Poly1305") => {
+                    crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305
+                }
                 _ => crate::encryption::EncryptionAlgorithm::AES256GCM, // Default fallback
             };
 
             crate::encryption::EncryptionMetadata {
                 algorithm,
-                key_id: self.encryption_key_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                key_id: self
+                    .encryption_key_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
                 config_version: 1,
                 compressed: false,
                 encrypted_fields: self.pii_fields.clone().unwrap_or_default(),
-                retention_policy: self.parse_retention_policy()?
+                retention_policy: self
+                    .parse_retention_policy()?
                     .unwrap_or(crate::encryption::RetentionPolicy::UseDefault),
                 encrypted_at: self.encrypted_at.unwrap_or(self.created_at),
                 delete_at: self.retention_delete_at,
@@ -505,16 +533,17 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 LIMIT 1
             )
             RETURNING {}
-            "#, JOB_SELECT_FIELDS
+            "#,
+            JOB_SELECT_FIELDS
         );
         let row = sqlx::query(&query)
-        .bind(JobStatus::Running)
-        .bind(Utc::now())
-        .bind(queue_name)
-        .bind(JobStatus::Pending)
-        .bind(Utc::now())
-        .fetch_optional(&self.pool)
-        .await?;
+            .bind(JobStatus::Running)
+            .bind(Utc::now())
+            .bind(queue_name)
+            .bind(JobStatus::Pending)
+            .bind(Utc::now())
+            .fetch_optional(&self.pool)
+            .await?;
 
         if let Some(row) = row {
             let id: uuid::Uuid = row.get("id");
@@ -640,14 +669,15 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             ORDER BY priority DESC, scheduled_at ASC 
             LIMIT 20
             FOR UPDATE SKIP LOCKED
-            "#, JOB_SELECT_FIELDS
+            "#,
+            JOB_SELECT_FIELDS
         );
         let available_jobs = sqlx::query(&query)
-        .bind(queue_name)
-        .bind(JobStatus::Pending)
-        .bind(Utc::now())
-        .fetch_all(&self.pool)
-        .await?;
+            .bind(queue_name)
+            .bind(JobStatus::Pending)
+            .bind(Utc::now())
+            .fetch_all(&self.pool)
+            .await?;
 
         if available_jobs.is_empty() {
             return Ok(None);
@@ -697,14 +727,15 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
                 // Update the selected job
                 let query = format!(
-                    "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 WHERE id = $3 RETURNING {}", JOB_SELECT_FIELDS
+                    "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 WHERE id = $3 RETURNING {}",
+                    JOB_SELECT_FIELDS
                 );
                 let updated_row = sqlx::query(&query)
-                .bind(JobStatus::Running)
-                .bind(Utc::now())
-                .bind(job_id)
-                .fetch_optional(&self.pool)
-                .await?;
+                    .bind(JobStatus::Running)
+                    .bind(Utc::now())
+                    .bind(job_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
 
                 if let Some(row) = updated_row {
                     let id: uuid::Uuid = row.get("id");
@@ -821,9 +852,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
-        let row = sqlx::query_as::<_, JobRow>(
-            &format!("SELECT {} FROM hammerwork_jobs WHERE id = $1", JOB_SELECT_FIELDS)
-        )
+        let row = sqlx::query_as::<_, JobRow>(&format!(
+            "SELECT {} FROM hammerwork_jobs WHERE id = $1",
+            JOB_SELECT_FIELDS
+        ))
         .bind(job_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -1010,9 +1042,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>> {
-        let rows = sqlx::query_as::<_, JobRow>(
-            &format!("SELECT {} FROM hammerwork_jobs WHERE batch_id = $1 ORDER BY created_at ASC", JOB_SELECT_FIELDS)
-        )
+        let rows = sqlx::query_as::<_, JobRow>(&format!(
+            "SELECT {} FROM hammerwork_jobs WHERE batch_id = $1 ORDER BY created_at ASC",
+            JOB_SELECT_FIELDS
+        ))
         .bind(batch_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1341,7 +1374,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 AND (next_run_at IS NULL OR next_run_at <= $2)
                 AND status = $3
                 ORDER BY next_run_at ASC
-                "#, JOB_SELECT_FIELDS
+                "#,
+                JOB_SELECT_FIELDS
             )
         } else {
             format!(
@@ -1352,7 +1386,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 AND (next_run_at IS NULL OR next_run_at <= $1)
                 AND status = $2
                 ORDER BY next_run_at ASC
-                "#, JOB_SELECT_FIELDS
+                "#,
+                JOB_SELECT_FIELDS
             )
         };
 
@@ -1523,9 +1558,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     ) -> Result<crate::workflow::WorkflowId> {
         // Validate workflow before enqueuing
         workflow.validate()?;
-        
+
         let mut tx = self.pool.begin().await?;
-        
+
         // Insert workflow metadata
         sqlx::query(
             r#"
@@ -1547,14 +1582,14 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .bind(&workflow.metadata)
         .execute(&mut *tx)
         .await?;
-        
+
         // Insert all jobs in the workflow
         for job in &workflow.jobs {
             self.insert_job_in_transaction(&mut tx, job).await?;
         }
-        
+
         tx.commit().await?;
-        
+
         Ok(workflow.id)
     }
 
@@ -1562,8 +1597,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         &self,
         workflow_id: crate::workflow::WorkflowId,
     ) -> Result<Option<crate::workflow::JobGroup>> {
-        use crate::workflow::{JobGroup, WorkflowStatus, FailurePolicy};
-        
+        use crate::workflow::{FailurePolicy, JobGroup, WorkflowStatus};
+
         // Get workflow metadata
         let workflow_row = sqlx::query(
             r#"
@@ -1575,11 +1610,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .bind(workflow_id)
         .fetch_optional(&self.pool)
         .await?;
-        
+
         if let Some(row) = workflow_row {
             // Get all jobs in the workflow
             let jobs = self.get_workflow_jobs(workflow_id).await?;
-            
+
             // Build dependencies map
             let mut dependencies = std::collections::HashMap::new();
             for job in &jobs {
@@ -1587,7 +1622,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                     dependencies.insert(job.id, job.depends_on.clone());
                 }
             }
-            
+
             let workflow = JobGroup {
                 id: row.get("id"),
                 name: row.get("name"),
@@ -1603,7 +1638,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 failed_jobs: row.get::<i32, _>("failed_jobs") as usize,
                 metadata: row.get("metadata"),
             };
-            
+
             Ok(Some(workflow))
         } else {
             Ok(None)
@@ -1618,18 +1653,18 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             FROM hammerwork_jobs
             WHERE depends_on @> $1::jsonb
             AND dependency_status = 'waiting'
-            "#
+            "#,
         )
         .bind(serde_json::json!([completed_job_id]))
         .fetch_all(&self.pool)
         .await?;
-        
+
         let mut resolved_jobs = Vec::new();
-        
+
         for job_row in dependent_jobs {
             let job_id: uuid::Uuid = job_row.get("id");
             let depends_on: Vec<uuid::Uuid> = serde_json::from_value(job_row.get("depends_on"))?;
-            
+
             // Check if all dependencies are now satisfied
             let satisfied_count = sqlx::query_scalar::<_, i64>(
                 r#"
@@ -1637,12 +1672,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 FROM hammerwork_jobs
                 WHERE id = ANY($1::uuid[])
                 AND status = 'Completed'
-                "#
+                "#,
             )
             .bind(&depends_on)
             .fetch_one(&self.pool)
             .await?;
-            
+
             if satisfied_count == depends_on.len() as i64 {
                 // All dependencies satisfied, mark as ready
                 sqlx::query(
@@ -1650,23 +1685,22 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                     UPDATE hammerwork_jobs
                     SET dependency_status = 'satisfied'
                     WHERE id = $1
-                    "#
+                    "#,
                 )
                 .bind(job_id)
                 .execute(&self.pool)
                 .await?;
-                
+
                 resolved_jobs.push(job_id);
             }
         }
-        
+
         Ok(resolved_jobs)
     }
 
     async fn get_ready_jobs(&self, queue_name: &str, limit: u32) -> Result<Vec<Job>> {
-        let rows = sqlx::query_as::<_, JobRow>(
-            &format!(
-                r#"
+        let rows = sqlx::query_as::<_, JobRow>(&format!(
+            r#"
                 SELECT {}
                 FROM hammerwork_jobs
                 WHERE queue_name = $1
@@ -1675,15 +1709,15 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 AND scheduled_at <= $2
                 ORDER BY priority DESC, scheduled_at ASC
                 LIMIT $3
-                "#, JOB_SELECT_FIELDS
-            )
-        )
+                "#,
+            JOB_SELECT_FIELDS
+        ))
         .bind(queue_name)
         .bind(chrono::Utc::now())
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
-        
+
         rows.into_iter().map(|row| row.into_job()).collect()
     }
 
@@ -1691,7 +1725,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         // Find all jobs that depend on the failed job (directly or indirectly)
         let mut failed_jobs = Vec::new();
         let mut jobs_to_check = vec![failed_job_id];
-        
+
         while let Some(current_job_id) = jobs_to_check.pop() {
             // Find jobs that depend on the current job
             let dependent_jobs = sqlx::query_scalar::<_, uuid::Uuid>(
@@ -1701,12 +1735,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 WHERE depends_on @> $1::jsonb
                 AND dependency_status IN ('waiting', 'satisfied')
                 AND status = 'Pending'
-                "#
+                "#,
             )
             .bind(serde_json::json!([current_job_id]))
             .fetch_all(&self.pool)
             .await?;
-            
+
             for dependent_job_id in dependent_jobs {
                 if !failed_jobs.contains(&dependent_job_id) {
                     // Mark job as failed due to dependency
@@ -1718,20 +1752,20 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                             failed_at = $2,
                             error_message = 'Dependency failed: job ' || $1 || ' failed'
                         WHERE id = $3
-                        "#
+                        "#,
                     )
                     .bind(current_job_id)
                     .bind(chrono::Utc::now())
                     .bind(dependent_job_id)
                     .execute(&self.pool)
                     .await?;
-                    
+
                     failed_jobs.push(dependent_job_id);
                     jobs_to_check.push(dependent_job_id);
                 }
             }
         }
-        
+
         Ok(failed_jobs)
     }
 
@@ -1739,26 +1773,25 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         &self,
         workflow_id: crate::workflow::WorkflowId,
     ) -> Result<Vec<Job>> {
-        let rows = sqlx::query_as::<_, JobRow>(
-            &format!(
-                r#"
+        let rows = sqlx::query_as::<_, JobRow>(&format!(
+            r#"
                 SELECT {}
                 FROM hammerwork_jobs
                 WHERE workflow_id = $1
                 ORDER BY created_at ASC
-                "#, JOB_SELECT_FIELDS
-            )
-        )
+                "#,
+            JOB_SELECT_FIELDS
+        ))
         .bind(workflow_id)
         .fetch_all(&self.pool)
         .await?;
-        
+
         rows.into_iter().map(|row| row.into_job()).collect()
     }
 
     async fn cancel_workflow(&self, workflow_id: crate::workflow::WorkflowId) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        
+
         // Cancel all pending jobs in the workflow
         sqlx::query(
             r#"
@@ -1768,13 +1801,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 error_message = 'Workflow cancelled'
             WHERE workflow_id = $1
             AND status = 'Pending'
-            "#
+            "#,
         )
         .bind(workflow_id)
         .bind(chrono::Utc::now())
         .execute(&mut *tx)
         .await?;
-        
+
         // Update workflow status
         sqlx::query(
             r#"
@@ -1782,15 +1815,15 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             SET status = 'cancelled',
                 failed_at = $2
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(workflow_id)
         .bind(chrono::Utc::now())
         .execute(&mut *tx)
         .await?;
-        
+
         tx.commit().await?;
-        
+
         Ok(())
     }
 
@@ -2445,7 +2478,7 @@ impl crate::queue::JobQueue<Postgres> {
         .bind(&job.span_context)
         .execute(&mut **tx)
         .await?;
-        
+
         Ok(())
     }
 }
