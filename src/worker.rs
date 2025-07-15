@@ -1405,7 +1405,10 @@ where
         // Check if the queue is paused
         match self.queue.is_queue_paused(&self.queue_name).await {
             Ok(true) => {
-                debug!("Queue '{}' is paused, skipping job dequeue", self.queue_name);
+                debug!(
+                    "Queue '{}' is paused, skipping job dequeue",
+                    self.queue_name
+                );
                 sleep(self.poll_interval).await;
                 return Ok(());
             }

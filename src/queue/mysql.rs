@@ -2223,28 +2223,27 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn resume_queue(&self, queue_name: &str, _resumed_by: Option<&str>) -> Result<()> {
-        sqlx::query(
-            "DELETE FROM hammerwork_queue_pause WHERE queue_name = ?"
-        )
-        .bind(queue_name)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM hammerwork_queue_pause WHERE queue_name = ?")
+            .bind(queue_name)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
 
     async fn is_queue_paused(&self, queue_name: &str) -> Result<bool> {
-        let row = sqlx::query(
-            "SELECT 1 FROM hammerwork_queue_pause WHERE queue_name = ?"
-        )
-        .bind(queue_name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT 1 FROM hammerwork_queue_pause WHERE queue_name = ?")
+            .bind(queue_name)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.is_some())
     }
 
-    async fn get_queue_pause_info(&self, queue_name: &str) -> Result<Option<super::QueuePauseInfo>> {
+    async fn get_queue_pause_info(
+        &self,
+        queue_name: &str,
+    ) -> Result<Option<super::QueuePauseInfo>> {
         let row = sqlx::query(
             "SELECT queue_name, paused_at, paused_by, reason FROM hammerwork_queue_pause WHERE queue_name = ?"
         )
@@ -2253,14 +2252,12 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         .await?;
 
         match row {
-            Some(row) => {
-                Ok(Some(super::QueuePauseInfo {
-                    queue_name: row.get("queue_name"),
-                    paused_at: row.get("paused_at"),
-                    paused_by: row.get("paused_by"),
-                    reason: row.get("reason"),
-                }))
-            }
+            Some(row) => Ok(Some(super::QueuePauseInfo {
+                queue_name: row.get("queue_name"),
+                paused_at: row.get("paused_at"),
+                paused_by: row.get("paused_by"),
+                reason: row.get("reason"),
+            })),
             None => Ok(None),
         }
     }

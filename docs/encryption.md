@@ -107,10 +107,44 @@ let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
 
 #### External KMS
 
+Hammerwork supports multiple external Key Management Services for enterprise key management:
+
+##### AWS KMS
+
 ```rust
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
-    .with_key_source(KeySource::External("aws-kms://key-id".to_string()));
+    .with_key_source(KeySource::External("aws://alias/hammerwork-key?region=us-east-1".to_string()));
 ```
+
+##### Google Cloud KMS
+
+```rust
+let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+    .with_key_source(KeySource::External("gcp://projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY".to_string()));
+```
+
+##### HashiCorp Vault KMS
+
+```rust
+let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+    .with_key_source(KeySource::External("vault://secret/hammerwork/encryption-key".to_string()));
+```
+
+With custom Vault address:
+
+```rust
+let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+    .with_key_source(KeySource::External("vault://secret/hammerwork/encryption-key?addr=https://vault.example.com".to_string()));
+```
+
+**Environment Variables:**
+- `VAULT_ADDR`: Vault server address (default: https://vault.example.com)
+- `VAULT_TOKEN`: Authentication token for Vault access
+
+**Vault Requirements:**
+- KV v2 secrets engine enabled
+- Secret stored with `key` field containing base64-encoded key material
+- Proper authentication and access policies configured
 
 ## PII Field Protection
 

@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.11.0"
+version = "1.12.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/CodingAnarchy/hammerwork"
@@ -19,7 +19,7 @@ documentation = "https://docs.rs/hammerwork"
 rust-version = "1.86"
 
 [workspace.dependencies]
-hammerwork = { version = "1.11.0", path = "." }
+hammerwork = { version = "1.12.0", path = "." }
 tokio = { version = "1.0", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -102,6 +102,11 @@ chacha20poly1305 = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
 base64 = { workspace = true }
 toml = { workspace = true }
+aws-sdk-kms = { version = "1.0", optional = true }
+aws-config = { version = "1.0", optional = true }
+google-cloud-kms = { version = "0.6", optional = true }
+google-cloud-auth = { version = "0.4", optional = true }
+vaultrs = { version = "0.7", optional = true }
 
 [features]
 default = ["metrics", "alerting", "webhooks"]
@@ -111,6 +116,9 @@ metrics = ["prometheus", "warp"]
 alerting = ["reqwest"]
 webhooks = ["reqwest", "hmac", "sha2", "hex"]
 encryption = ["aes-gcm", "chacha20poly1305", "argon2", "hmac", "sha2", "hex"]
+aws-kms = ["aws-sdk-kms", "aws-config"]
+gcp-kms = ["google-cloud-kms", "google-cloud-auth"]
+vault-kms = ["vaultrs"]
 tracing = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 test = []
 
@@ -162,5 +170,17 @@ required-features = ["test"]
 
 [[example]]
 name = "encryption_example"
+required-features = ["encryption"]
+
+[[example]]
+name = "aws_kms_encryption_example"
+required-features = ["encryption"]
+
+[[example]]
+name = "gcp_kms_encryption_example"
+required-features = ["encryption"]
+
+[[example]]
+name = "vault_kms_encryption_example"
 required-features = ["encryption"]
 

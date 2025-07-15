@@ -33,24 +33,33 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "1.7", features = ["postgres"] }
+hammerwork = { version = "1.12", features = ["postgres"] }
 # or
-hammerwork = { version = "1.7", features = ["mysql"] }
+hammerwork = { version = "1.12", features = ["mysql"] }
 
 # With encryption for PII protection
-hammerwork = { version = "1.7", features = ["postgres", "encryption"] }
+hammerwork = { version = "1.12", features = ["postgres", "encryption"] }
+
+# With AWS KMS integration for enterprise key management
+hammerwork = { version = "1.12", features = ["postgres", "encryption", "aws-kms"] }
+
+# With Google Cloud KMS integration for enterprise key management
+hammerwork = { version = "1.12", features = ["postgres", "encryption", "gcp-kms"] }
+
+# With HashiCorp Vault KMS integration for enterprise key management
+hammerwork = { version = "1.12", features = ["postgres", "encryption", "vault-kms"] }
 
 # With distributed tracing
-hammerwork = { version = "1.7", features = ["postgres", "tracing"] }
+hammerwork = { version = "1.12", features = ["postgres", "tracing"] }
 
 # Full feature set
-hammerwork = { version = "1.7", features = ["postgres", "encryption", "tracing"] }
+hammerwork = { version = "1.12", features = ["postgres", "encryption", "aws-kms", "gcp-kms", "vault-kms", "tracing"] }
 
 # Minimal installation
-hammerwork = { version = "1.7", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.12", features = ["postgres"], default-features = false }
 ```
 
-**Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `encryption` (optional), `tracing` (optional), `test` (for TestQueue)
+**Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `encryption` (optional), `aws-kms` (optional), `gcp-kms` (optional), `vault-kms` (optional), `tracing` (optional), `test` (for TestQueue)
 
 ### Web Dashboard (Optional)
 
@@ -60,7 +69,7 @@ cargo install hammerwork-web --features postgres
 
 # Or add to your project
 [dependencies]
-hammerwork-web = { version = "1.7", features = ["postgres"] }
+hammerwork-web = { version = "1.12", features = ["postgres"] }
 ```
 
 Start the dashboard:
@@ -369,6 +378,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure encryption for PII protection
     let encryption_config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
         .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()))
+        // Or use AWS KMS for enterprise key management:
+        // .with_key_source(KeySource::External("aws://alias/hammerwork-key?region=us-east-1".to_string()))
+        // Or use Google Cloud KMS for enterprise key management:
+        // .with_key_source(KeySource::External("gcp://projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY".to_string()))
+        // Or use HashiCorp Vault KMS for enterprise key management:
+        // .with_key_source(KeySource::External("vault://secret/hammerwork/encryption-key".to_string()))
         .with_key_rotation_enabled(true);
 
     // Create job with encrypted PII fields
@@ -518,10 +533,14 @@ Working examples in `examples/`:
 - `autoscaling_example.rs` - Dynamic worker pool scaling based on queue depth
 - `tracing_example.rs` - Distributed tracing with OpenTelemetry and event hooks
 - `encryption_example.rs` - Job encryption, PII protection, and key management
+- `aws_kms_encryption_example.rs` - AWS KMS integration for enterprise key management
+- `gcp_kms_encryption_example.rs` - Google Cloud KMS integration for enterprise key management
+- `vault_kms_encryption_example.rs` - HashiCorp Vault KMS integration for enterprise key management
 - `key_management_example.rs` - Enterprise key lifecycle and audit trails
 
 ```bash
 cargo run --example postgres_example --features postgres
+cargo run --example vault_kms_encryption_example --features vault-kms
 ```
 
 ## Contributing

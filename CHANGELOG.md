@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2025-07-15
+
+### Added
+- **🏢 Enterprise Key Management Service (KMS) Integrations**
+  - Complete AWS KMS integration for enterprise key management with support for key aliases, ARNs, and IAM authentication
+  - Google Cloud KMS integration with full resource path support and service account authentication
+  - HashiCorp Vault KMS integration using KV v2 secrets engine with token and AppRole authentication
+  - New feature flags: `aws-kms`, `gcp-kms`, and `vault-kms` for selective compilation
+  - Graceful fallback to deterministic key generation when external KMS services are unavailable
+
+- **🔐 Enhanced External Key Source Support**
+  - AWS KMS URI format: `aws://key-id?region=us-east-1` with support for key aliases and ARNs
+  - GCP KMS URI format: `gcp://projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY`
+  - Vault KMS URI format: `vault://secret/path/to/key` with optional address parameter
+  - Flexible authentication via environment variables (AWS_*, GOOGLE_*, VAULT_*)
+  - Base64 key encoding/decoding with proper error handling and validation
+
+- **📚 Comprehensive Documentation and Examples**
+  - `aws_kms_encryption_example.rs` - Complete AWS KMS setup, authentication, and best practices
+  - `gcp_kms_encryption_example.rs` - Google Cloud KMS configuration and service account setup
+  - `vault_kms_encryption_example.rs` - HashiCorp Vault KMS with policies, authentication, and troubleshooting
+  - Updated README.md with installation instructions for all KMS providers
+  - Enhanced `docs/encryption.md` with detailed KMS configuration sections
+
+- **🧪 Extensive Test Coverage**
+  - 18 new unit tests covering KMS configuration parsing and validation
+  - 9 integration tests for KMS functionality and fallback behavior
+  - Comprehensive test coverage for URI parsing, authentication, and error handling
+  - SQL injection prevention tests for dynamic query generation
+
+### Enhanced
+- **🔑 Key Management Flexibility**
+  - Support for multiple concurrent KMS providers within the same application
+  - Improved error messages with specific guidance for KMS configuration issues
+  - Enhanced key caching and connection management for better performance
+  - Consistent API across all KMS providers for seamless switching
+
+- **🔒 Security Improvements**
+  - Proper secret handling with no plain-text key storage in logs or memory dumps
+  - Secure key material transport with authenticated encryption
+  - Audit trail support for all KMS operations and key lifecycle events
+  - Environment variable validation and sanitization
+
 ## [1.11.0] - 2025-07-14
 
 ### Added

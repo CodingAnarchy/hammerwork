@@ -674,17 +674,12 @@ async fn list_paused_queues(pool: DatabasePool) -> Result<()> {
     "#;
 
     let mut table = comfy_table::Table::new();
-    table.set_header(vec![
-        "Queue Name",
-        "Paused At",
-        "Paused By", 
-        "Reason",
-    ]);
+    table.set_header(vec!["Queue Name", "Paused At", "Paused By", "Reason"]);
 
     match pool {
         DatabasePool::Postgres(pg_pool) => {
             let rows = sqlx::query(query).fetch_all(&pg_pool).await?;
-            
+
             if rows.is_empty() {
                 println!("✅ No paused queues found - all queues are active");
                 return Ok(());
@@ -706,7 +701,7 @@ async fn list_paused_queues(pool: DatabasePool) -> Result<()> {
         }
         DatabasePool::MySQL(mysql_pool) => {
             let rows = sqlx::query(query).fetch_all(&mysql_pool).await?;
-            
+
             if rows.is_empty() {
                 println!("✅ No paused queues found - all queues are active");
                 return Ok(());

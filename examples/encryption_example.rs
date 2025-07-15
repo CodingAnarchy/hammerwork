@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_key_source(KeySource::Environment("ENCRYPTION_KEY".to_string()))
             .with_key_id("example-key-1");
 
-        let mut engine = EncryptionEngine::new(config)?;
+        let mut engine = EncryptionEngine::new(config).await?;
 
         // Automatic PII detection
         let sensitive_payload = json!({

@@ -220,8 +220,11 @@ where
 
             for stats in all_stats {
                 // Get pause information for this queue
-                let pause_info = queue.get_queue_pause_info(&stats.queue_name).await.unwrap_or(None);
-                
+                let pause_info = queue
+                    .get_queue_pause_info(&stats.queue_name)
+                    .await
+                    .unwrap_or(None);
+
                 let queue_info = QueueInfo {
                     name: stats.queue_name.clone(),
                     pending_count: stats.pending_count,
@@ -286,8 +289,11 @@ where
                 let recent_errors = Vec::new(); // TODO: Implement
 
                 // Get pause information for this queue
-                let pause_info = queue.get_queue_pause_info(&queue_name).await.unwrap_or(None);
-                
+                let pause_info = queue
+                    .get_queue_pause_info(&queue_name)
+                    .await
+                    .unwrap_or(None);
+
                 let queue_info = QueueInfo {
                     name: stats.queue_name.clone(),
                     pending_count: stats.pending_count,
@@ -361,40 +367,34 @@ where
                 ApiResponse::<()>::error("Clear completed jobs not yet implemented".to_string());
             Ok(warp::reply::json(&response))
         }
-        "pause" => {
-            match queue.pause_queue(&queue_name, Some("web-ui")).await {
-                Ok(()) => {
-                    let response = ApiResponse::success(serde_json::json!({
-                        "message": format!("Queue '{}' has been paused", queue_name),
-                        "queue": queue_name,
-                        "action": "pause"
-                    }));
-                    Ok(warp::reply::json(&response))
-                }
-                Err(e) => {
-                    let response =
-                        ApiResponse::<()>::error(format!("Failed to pause queue: {}", e));
-                    Ok(warp::reply::json(&response))
-                }
+        "pause" => match queue.pause_queue(&queue_name, Some("web-ui")).await {
+            Ok(()) => {
+                let response = ApiResponse::success(serde_json::json!({
+                    "message": format!("Queue '{}' has been paused", queue_name),
+                    "queue": queue_name,
+                    "action": "pause"
+                }));
+                Ok(warp::reply::json(&response))
             }
-        }
-        "resume" => {
-            match queue.resume_queue(&queue_name, Some("web-ui")).await {
-                Ok(()) => {
-                    let response = ApiResponse::success(serde_json::json!({
-                        "message": format!("Queue '{}' has been resumed", queue_name),
-                        "queue": queue_name,
-                        "action": "resume"
-                    }));
-                    Ok(warp::reply::json(&response))
-                }
-                Err(e) => {
-                    let response =
-                        ApiResponse::<()>::error(format!("Failed to resume queue: {}", e));
-                    Ok(warp::reply::json(&response))
-                }
+            Err(e) => {
+                let response = ApiResponse::<()>::error(format!("Failed to pause queue: {}", e));
+                Ok(warp::reply::json(&response))
             }
-        }
+        },
+        "resume" => match queue.resume_queue(&queue_name, Some("web-ui")).await {
+            Ok(()) => {
+                let response = ApiResponse::success(serde_json::json!({
+                    "message": format!("Queue '{}' has been resumed", queue_name),
+                    "queue": queue_name,
+                    "action": "resume"
+                }));
+                Ok(warp::reply::json(&response))
+            }
+            Err(e) => {
+                let response = ApiResponse::<()>::error(format!("Failed to resume queue: {}", e));
+                Ok(warp::reply::json(&response))
+            }
+        },
         _ => {
             let response =
                 ApiResponse::<()>::error(format!("Unknown action: {}", action_request.action));

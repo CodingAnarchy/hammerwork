@@ -580,8 +580,8 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
     /// if let Some(pause_info) = queue.get_queue_pause_info("email_queue").await? {
-    ///     println!("Queue paused by {} at {}", 
-    ///         pause_info.paused_by.unwrap_or("unknown".to_string()), 
+    ///     println!("Queue paused by {} at {}",
+    ///         pause_info.paused_by.unwrap_or("unknown".to_string()),
     ///         pause_info.paused_at);
     /// }
     /// # Ok(())

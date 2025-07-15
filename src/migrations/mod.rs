@@ -395,7 +395,8 @@ impl<DB: Database> MigrationManager<DB> {
         self.register_migration(
             Migration {
                 id: "014_add_queue_pause".to_string(),
-                description: "Add queue pause and resume functionality for operational control".to_string(),
+                description: "Add queue pause and resume functionality for operational control"
+                    .to_string(),
                 version: 14,
                 created_at: chrono::DateTime::parse_from_rfc3339("2025-12-30T00:00:00Z")
                     .unwrap()

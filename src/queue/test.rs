@@ -41,7 +41,7 @@ use crate::{
     batch::{BatchId, BatchResult, BatchStatus, JobBatch},
     job::{Job, JobId, JobStatus},
     priority::{JobPriority, PriorityWeights},
-    queue::DatabaseQueue,
+    queue::{DatabaseQueue, QueuePauseInfo},
     rate_limit::ThrottleConfig,
     stats::{DeadJobSummary, QueueStats},
     workflow::{JobGroup, WorkflowId, WorkflowStatus},
@@ -256,6 +256,8 @@ struct TestStorage {
     throttle_configs: HashMap<String, ThrottleConfig>,
     /// Job results storage
     job_results: HashMap<JobId, (serde_json::Value, Option<DateTime<Utc>>)>,
+    /// Paused queues information
+    paused_queues: HashMap<String, QueuePauseInfo>,
     /// Mock clock for time control
     clock: MockClock,
 }
@@ -272,6 +274,7 @@ impl TestStorage {
             dependents: HashMap::new(),
             throttle_configs: HashMap::new(),
             job_results: HashMap::new(),
+            paused_queues: HashMap::new(),
             clock,
         }
     }
@@ -2310,6 +2313,42 @@ impl DatabaseQueue for TestQueue {
             last_run_at: now,
             operation_duration: std::time::Duration::from_millis(50),
         })
+    }
+
+    async fn pause_queue(&self, queue_name: &str, paused_by: Option<&str>) -> Result<()> {
+        let mut storage = self.storage.write().await;
+        let now = storage.clock.now();
+        
+        let pause_info = QueuePauseInfo {
+            queue_name: queue_name.to_string(),
+            paused_at: now,
+            paused_by: paused_by.map(|s| s.to_string()),
+            reason: None,
+        };
+        
+        storage.paused_queues.insert(queue_name.to_string(), pause_info);
+        Ok(())
+    }
+
+    async fn resume_queue(&self, queue_name: &str, _resumed_by: Option<&str>) -> Result<()> {
+        let mut storage = self.storage.write().await;
+        storage.paused_queues.remove(queue_name);
+        Ok(())
+    }
+
+    async fn is_queue_paused(&self, queue_name: &str) -> Result<bool> {
+        let storage = self.storage.read().await;
+        Ok(storage.paused_queues.contains_key(queue_name))
+    }
+
+    async fn get_queue_pause_info(&self, queue_name: &str) -> Result<Option<QueuePauseInfo>> {
+        let storage = self.storage.read().await;
+        Ok(storage.paused_queues.get(queue_name).cloned())
+    }
+
+    async fn get_paused_queues(&self) -> Result<Vec<QueuePauseInfo>> {
+        let storage = self.storage.read().await;
+        Ok(storage.paused_queues.values().cloned().collect())
     }
 }
 
