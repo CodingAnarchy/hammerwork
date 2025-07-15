@@ -270,11 +270,14 @@ pub use archive::{
 pub use batch::{BatchId, BatchResult, BatchStatus, JobBatch, PartialFailureMode};
 pub use config::{
     ArchiveConfig, DatabaseConfig, HammerworkConfig, LoggingConfig, RateLimitingConfig,
-    StreamConfig, StreamingConfigs, StreamingGlobalSettings, WorkerConfig,
+    StreamingConfigs, StreamingGlobalSettings, WorkerConfig,
 };
+pub use streaming::StreamConfig;
 
 #[cfg(feature = "webhooks")]
-pub use config::{WebhookConfig, WebhookConfigs, WebhookGlobalSettings};
+pub use config::{WebhookConfigs, WebhookGlobalSettings};
+#[cfg(feature = "webhooks")]
+pub use webhooks::WebhookConfig;
 pub use cron::{CronError, CronSchedule};
 #[cfg(feature = "encryption")]
 pub use encryption::{

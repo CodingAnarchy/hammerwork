@@ -105,6 +105,28 @@ use tokio::{
 };
 use uuid::Uuid;
 
+/// Module for serializing UUID as string for TOML compatibility
+mod uuid_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use uuid::Uuid;
+
+    pub fn serialize<S>(uuid: &Uuid, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&uuid.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let s = String::deserialize(deserializer)?;
+        Uuid::parse_str(&s).map_err(D::Error::custom)
+    }
+}
+
 /// Configuration for a webhook endpoint.
 ///
 /// WebhookConfig defines how events should be delivered to a specific webhook endpoint.
@@ -147,6 +169,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookConfig {
     /// Unique identifier for this webhook
+    #[serde(with = "uuid_string")]
     pub id: Uuid,
     /// Human-readable name for this webhook
     pub name: String,
@@ -170,6 +193,25 @@ pub struct WebhookConfig {
     pub secret: Option<String>,
     /// Custom payload template (optional)
     pub payload_template: Option<String>,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: "Default Webhook".to_string(),
+            url: "https://example.com/webhook".to_string(),
+            method: HttpMethod::Post,
+            headers: HashMap::new(),
+            filter: EventFilter::default(),
+            retry_policy: RetryPolicy::default(),
+            auth: None,
+            timeout_secs: 30,
+            enabled: true,
+            secret: None,
+            payload_template: None,
+        }
+    }
 }
 
 /// HTTP methods supported for webhooks
@@ -254,10 +296,13 @@ impl RetryPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookDelivery {
     /// Unique identifier for this delivery attempt
+    #[serde(with = "uuid_string")]
     pub delivery_id: Uuid,
     /// Webhook configuration ID
+    #[serde(with = "uuid_string")]
     pub webhook_id: Uuid,
     /// Event that was delivered
+    #[serde(with = "uuid_string")]
     pub event_id: Uuid,
     /// HTTP status code received
     pub status_code: Option<u16>,
@@ -279,6 +324,7 @@ pub struct WebhookDelivery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookStats {
     /// Webhook configuration ID
+    #[serde(with = "uuid_string")]
     pub webhook_id: Uuid,
     /// Total number of delivery attempts
     pub total_attempts: u64,

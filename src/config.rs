@@ -11,11 +11,8 @@ use crate::{
 
 #[cfg(feature = "webhooks")]
 use crate::{
-    events::EventFilter,
-    streaming::{
-        BufferConfig, PartitioningStrategy, SerializationFormat, StreamBackend, StreamRetryPolicy,
-    },
-    webhooks::{HttpMethod, RetryPolicy as WebhookRetryPolicy, WebhookAuth},
+    streaming::StreamBackend,
+    webhooks::WebhookConfig,
 };
 
 #[cfg(feature = "alerting")]
@@ -27,8 +24,9 @@ use crate::metrics::MetricsConfig;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Duration as StdDuration};
+use crate::streaming::StreamConfig;
 
-/// Module for serializing std::time::Duration as seconds
+/// Module for serializing std::time::Duration as human-readable strings
 mod duration_secs {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
@@ -37,17 +35,78 @@ mod duration_secs {
     where
         S: Serializer,
     {
-        serializer.serialize_u64(duration.as_secs())
+        let secs = duration.as_secs();
+        if secs == 0 {
+            serializer.serialize_str("0s")
+        } else if secs % 3600 == 0 {
+            serializer.serialize_str(&format!("{}h", secs / 3600))
+        } else if secs % 60 == 0 {
+            serializer.serialize_str(&format!("{}m", secs / 60))
+        } else {
+            serializer.serialize_str(&format!("{}s", secs))
+        }
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let secs = u64::deserialize(deserializer)?;
-        Ok(Duration::from_secs(secs))
+        use serde::de::Error;
+        
+        let s = String::deserialize(deserializer)?;
+        parse_duration(&s).map_err(D::Error::custom)
+    }
+
+    /// Parse a duration string like "30s", "5m", "1h", "90", etc.
+    fn parse_duration(s: &str) -> Result<Duration, String> {
+        let s = s.trim();
+        
+        // Handle just numbers (assume seconds)
+        if let Ok(secs) = s.parse::<u64>() {
+            return Ok(Duration::from_secs(secs));
+        }
+        
+        // Handle suffixed durations
+        if s.len() < 2 {
+            return Err(format!("Invalid duration format: {}", s));
+        }
+        
+        let (num_str, suffix) = s.split_at(s.len() - 1);
+        let num: u64 = num_str.parse()
+            .map_err(|_| format!("Invalid number in duration: {}", num_str))?;
+        
+        match suffix {
+            "s" => Ok(Duration::from_secs(num)),
+            "m" => Ok(Duration::from_secs(num * 60)),
+            "h" => Ok(Duration::from_secs(num * 3600)),
+            "d" => Ok(Duration::from_secs(num * 86400)),
+            _ => Err(format!("Invalid duration suffix: {}. Use s, m, h, or d", suffix)),
+        }
     }
 }
+
+/// Module for serializing UUID as string for TOML compatibility
+mod uuid_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use uuid::Uuid;
+
+    pub fn serialize<S>(uuid: &Uuid, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&uuid.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let s = String::deserialize(deserializer)?;
+        Uuid::parse_str(&s).map_err(D::Error::custom)
+    }
+}
+
 use uuid::Uuid;
 
 /// Main configuration for the Hammerwork job queue system.
@@ -283,62 +342,6 @@ pub struct WebhookConfigs {
     pub global_settings: WebhookGlobalSettings,
 }
 
-/// Individual webhook configuration
-#[cfg(feature = "webhooks")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebhookConfig {
-    /// Unique identifier
-    pub id: Uuid,
-
-    /// Human-readable name
-    pub name: String,
-
-    /// Webhook URL
-    pub url: String,
-
-    /// HTTP method
-    pub method: HttpMethod,
-
-    /// Custom headers
-    pub headers: HashMap<String, String>,
-
-    /// Event filter
-    pub filter: EventFilter,
-
-    /// Retry policy
-    pub retry_policy: WebhookRetryPolicy,
-
-    /// Authentication
-    pub auth: Option<WebhookAuth>,
-
-    /// Request timeout in seconds
-    pub timeout_secs: u64,
-
-    /// Whether enabled
-    pub enabled: bool,
-
-    /// Secret for HMAC signatures
-    pub secret: Option<String>,
-}
-
-#[cfg(feature = "webhooks")]
-impl Default for WebhookConfig {
-    fn default() -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            name: "Default Webhook".to_string(),
-            url: "https://example.com/webhook".to_string(),
-            method: HttpMethod::Post,
-            headers: HashMap::new(),
-            filter: EventFilter::default(),
-            retry_policy: WebhookRetryPolicy::default(),
-            auth: None,
-            timeout_secs: 30,
-            enabled: true,
-            secret: None,
-        }
-    }
-}
 
 /// Global webhook settings
 #[cfg(feature = "webhooks")]
@@ -379,64 +382,6 @@ pub struct StreamingConfigs {
     pub global_settings: StreamingGlobalSettings,
 }
 
-/// Individual stream configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamConfig {
-    /// Unique identifier
-    pub id: Uuid,
-
-    /// Human-readable name
-    pub name: String,
-
-    /// Streaming backend
-    pub backend: StreamBackend,
-
-    /// Event filter
-    #[cfg(feature = "webhooks")]
-    pub filter: EventFilter,
-
-    #[cfg(not(feature = "webhooks"))]
-    /// Simple event filter when webhooks feature is disabled
-    pub filter: SimpleEventFilter,
-
-    /// Partitioning strategy
-    pub partitioning: PartitioningStrategy,
-
-    /// Serialization format
-    pub serialization: SerializationFormat,
-
-    /// Retry policy
-    pub retry_policy: StreamRetryPolicy,
-
-    /// Whether enabled
-    pub enabled: bool,
-
-    /// Buffer configuration
-    pub buffer_config: BufferConfig,
-}
-
-impl Default for StreamConfig {
-    fn default() -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            name: "Default Stream".to_string(),
-            backend: StreamBackend::Kafka {
-                brokers: vec!["localhost:9092".to_string()],
-                topic: "hammerwork-events".to_string(),
-                config: HashMap::new(),
-            },
-            #[cfg(feature = "webhooks")]
-            filter: EventFilter::default(),
-            #[cfg(not(feature = "webhooks"))]
-            filter: SimpleEventFilter::default(),
-            partitioning: PartitioningStrategy::QueueName,
-            serialization: SerializationFormat::Json,
-            retry_policy: StreamRetryPolicy::default(),
-            enabled: true,
-            buffer_config: BufferConfig::default(),
-        }
-    }
-}
 
 /// Simple event filter for when webhooks feature is disabled
 #[cfg(not(feature = "webhooks"))]
@@ -695,7 +640,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Fix Duration serialization in TOML
     fn test_config_file_operations() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("hammerwork.toml");
@@ -733,6 +677,98 @@ mod tests {
             std::env::remove_var("HAMMERWORK_DATABASE_URL");
             std::env::remove_var("HAMMERWORK_WORKER_POOL_SIZE");
             std::env::remove_var("HAMMERWORK_JOB_TIMEOUT_SECONDS");
+        }
+    }
+
+    #[test]
+    fn test_duration_serialization() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("duration_test.toml");
+
+        // Create config with various durations
+        let mut config = HammerworkConfig::new();
+        config.worker.polling_interval = StdDuration::from_secs(30); // Should serialize as "30s"
+        config.worker.job_timeout = StdDuration::from_secs(300); // Should serialize as "5m"
+
+        // Save to TOML
+        config.save_to_file(config_path.to_str().unwrap()).unwrap();
+
+        // Read the TOML content to verify human-readable format
+        let toml_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(toml_content.contains("polling_interval = \"30s\""));
+        assert!(toml_content.contains("job_timeout = \"5m\""));
+
+        // Load back and verify values
+        let loaded_config = HammerworkConfig::from_file(config_path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded_config.worker.polling_interval, StdDuration::from_secs(30));
+        assert_eq!(loaded_config.worker.job_timeout, StdDuration::from_secs(300));
+
+        // Test parsing various duration formats
+        let test_durations = [
+            ("30", StdDuration::from_secs(30)),
+            ("30s", StdDuration::from_secs(30)),
+            ("5m", StdDuration::from_secs(300)),
+            ("2h", StdDuration::from_secs(7200)),
+            ("1d", StdDuration::from_secs(86400)),
+        ];
+
+        for (duration_str, expected) in test_durations.iter() {
+            let toml_content = format!(
+                r#"
+[database]
+url = "postgresql://localhost/test"
+
+[worker]
+pool_size = 4
+polling_interval = "{}"
+job_timeout = "5m"
+autoscaling_enabled = false
+min_workers = 1
+max_workers = 10
+scale_up_threshold = 0.8
+scale_down_threshold = 0.2
+scale_check_interval = "30s"
+
+[worker.priority_weights]
+background = 1
+low = 2
+normal = 5
+high = 10
+critical = 20
+
+[worker.retry_strategy]
+max_attempts = 3
+initial_delay = "1s"
+max_delay = "60s"
+backoff_multiplier = 2.0
+
+[events]
+enabled = true
+buffer_size = 1000
+
+[streaming]
+
+[archive]
+enabled = false
+retention_days = 30
+compression_enabled = false
+
+[rate_limiting]
+enabled = false
+requests_per_second = 100
+burst_size = 200
+
+[logging]
+level = "info"
+json_format = false
+"#,
+                duration_str
+            );
+
+            let config: HammerworkConfig = toml::from_str(&toml_content).unwrap();
+            assert_eq!(config.worker.polling_interval, *expected, "Failed to parse duration: {}", duration_str);
         }
     }
 

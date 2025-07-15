@@ -119,6 +119,28 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
+/// Module for serializing UUID as string for TOML compatibility
+mod uuid_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use uuid::Uuid;
+
+    pub fn serialize<S>(uuid: &Uuid, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&uuid.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let s = String::deserialize(deserializer)?;
+        Uuid::parse_str(&s).map_err(D::Error::custom)
+    }
+}
+
 /// A job lifecycle event that can be delivered to external systems.
 ///
 /// This struct represents a single event in a job's lifecycle, containing all the metadata
@@ -153,8 +175,10 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobLifecycleEvent {
     /// Unique identifier for this event
+    #[serde(with = "uuid_string")]
     pub event_id: Uuid,
     /// The job that this event relates to
+    #[serde(with = "uuid_string")]
     pub job_id: Uuid,
     /// Name of the queue the job belongs to
     pub queue_name: String,

@@ -144,6 +144,28 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
+/// Module for serializing UUID as string for TOML compatibility
+mod uuid_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use uuid::Uuid;
+
+    pub fn serialize<S>(uuid: &Uuid, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&uuid.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let s = String::deserialize(deserializer)?;
+        Uuid::parse_str(&s).map_err(D::Error::custom)
+    }
+}
+
 /// Configuration for event streaming.
 ///
 /// StreamConfig defines how events should be delivered to a specific streaming backend.
@@ -197,6 +219,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
     /// Unique identifier for this stream
+    #[serde(with = "uuid_string")]
     pub id: Uuid,
     /// Human-readable name for this stream
     pub name: String,
@@ -576,10 +599,13 @@ pub struct StreamedEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamDelivery {
     /// Unique identifier for this delivery attempt
+    #[serde(with = "uuid_string")]
     pub delivery_id: Uuid,
     /// Stream configuration ID
+    #[serde(with = "uuid_string")]
     pub stream_id: Uuid,
     /// Event that was delivered
+    #[serde(with = "uuid_string")]
     pub event_id: Uuid,
     /// Whether the delivery was successful
     pub success: bool,
@@ -599,6 +625,7 @@ pub struct StreamDelivery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStats {
     /// Stream configuration ID
+    #[serde(with = "uuid_string")]
     pub stream_id: Uuid,
     /// Total number of events processed
     pub total_events: u64,

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **⚙️ Configuration Serialization**
+  - Fixed Duration serialization in TOML configuration files to use human-readable format ("30s", "5m", "1h", "1d")
+  - Fixed UUID serialization in TOML by converting to string format to prevent u128 compatibility issues
+  - Removed duplicate struct definitions that caused serialization conflicts
+  - Enhanced duration parsing to support multiple formats: plain numbers (seconds), and suffixes (s, m, h, d)
+  - Re-enabled previously ignored configuration file tests (`test_config_file_operations`)
+
 ## [1.12.0] - 2025-07-15
 
 ### Added
