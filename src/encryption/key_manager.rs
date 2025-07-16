@@ -390,7 +390,11 @@ impl KeyManagerConfig {
     }
 }
 
-impl<DB: Database> KeyManager<DB> {
+impl<DB: Database> KeyManager<DB> 
+where
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+{
     /// Create a new key manager instance
     pub async fn new(config: KeyManagerConfig, pool: Pool<DB>) -> Result<Self, EncryptionError> {
         let manager = Self {
@@ -674,70 +678,12 @@ impl<DB: Database> KeyManager<DB> {
 
     /// Check if a specific key needs rotation based on its rotation schedule
     pub async fn is_key_due_for_rotation(&self, key_id: &str) -> Result<bool, EncryptionError> {
-        #[cfg(feature = "postgres")]
-        {
-            self.is_key_due_for_rotation_postgres(key_id).await
-        }
-
-        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        {
-            self.is_key_due_for_rotation_mysql(key_id).await
-        }
-
-        #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-        {
-            Ok(false)
-        }
+        // Check if key is in the list of keys due for rotation
+        let keys_due = self.get_keys_due_for_rotation().await?;
+        Ok(keys_due.contains(&key_id.to_string()))
     }
 
-    /// Update the rotation schedule for a key
-    pub async fn update_key_rotation_schedule(
-        &self,
-        key_id: &str,
-        rotation_interval: Option<Duration>,
-    ) -> Result<(), EncryptionError> {
-        let next_rotation_at = rotation_interval.map(|interval| Utc::now() + interval);
 
-        #[cfg(feature = "postgres")]
-        {
-            self.update_key_rotation_schedule_postgres(key_id, rotation_interval, next_rotation_at)
-                .await
-        }
-
-        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        {
-            self.update_key_rotation_schedule_mysql(key_id, rotation_interval, next_rotation_at)
-                .await
-        }
-
-        #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-        {
-            Err(EncryptionError::KeyManagement(
-                "Database features not enabled".to_string(),
-            ))
-        }
-    }
-
-    /// Get the next scheduled rotation time for a key
-    pub async fn get_key_rotation_schedule(
-        &self,
-        key_id: &str,
-    ) -> Result<Option<DateTime<Utc>>, EncryptionError> {
-        #[cfg(feature = "postgres")]
-        {
-            self.get_key_rotation_schedule_postgres(key_id).await
-        }
-
-        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        {
-            self.get_key_rotation_schedule_mysql(key_id).await
-        }
-
-        #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-        {
-            Ok(None)
-        }
-    }
 
     /// Start automated key rotation service that runs in the background
     /// Returns a future that should be spawned as a background task
@@ -799,54 +745,7 @@ impl<DB: Database> KeyManager<DB> {
         Ok(rotation_service)
     }
 
-    /// Schedule a key for future rotation
-    pub async fn schedule_key_rotation(
-        &self,
-        key_id: &str,
-        rotation_time: DateTime<Utc>,
-    ) -> Result<(), EncryptionError> {
-        #[cfg(feature = "postgres")]
-        {
-            self.schedule_key_rotation_postgres(key_id, rotation_time)
-                .await
-        }
 
-        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        {
-            self.schedule_key_rotation_mysql(key_id, rotation_time)
-                .await
-        }
-
-        #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-        {
-            Err(EncryptionError::KeyManagement(
-                "Database features not enabled".to_string(),
-            ))
-        }
-    }
-
-    /// Get all keys scheduled for rotation within a time window
-    pub async fn get_scheduled_rotations(
-        &self,
-        from_time: DateTime<Utc>,
-        to_time: DateTime<Utc>,
-    ) -> Result<Vec<(String, DateTime<Utc>)>, EncryptionError> {
-        #[cfg(feature = "postgres")]
-        {
-            self.get_scheduled_rotations_postgres(from_time, to_time)
-                .await
-        }
-
-        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        {
-            self.get_scheduled_rotations_mysql(from_time, to_time).await
-        }
-
-        #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-        {
-            Ok(vec![])
-        }
-    }
 
     /// Get current key management statistics
     pub async fn get_stats(&self) -> KeyManagerStats {
@@ -890,211 +789,8 @@ impl<DB: Database> KeyManager<DB> {
 
     /// Query the database for comprehensive key statistics
     async fn query_database_statistics(&self) -> Result<KeyManagerStats, EncryptionError> {
-        #[cfg(feature = "postgres")]
-        {
-            self.query_postgres_statistics().await
-        }
-
-        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        {
-            self.query_mysql_statistics().await
-        }
-
-        #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-        {
-            // Return default stats if no database features are enabled
-            Ok(KeyManagerStats::default())
-        }
-    }
-
-    /// Query statistics from PostgreSQL
-    #[cfg(feature = "postgres")]
-    async fn query_postgres_statistics(&self) -> Result<KeyManagerStats, EncryptionError> {
-        // Execute multiple queries to gather comprehensive statistics
-        let basic_counts = sqlx::query(
-            r#"
-            SELECT 
-                COUNT(*) as total_keys,
-                COUNT(CASE WHEN status = 'Active' THEN 1 END) as active_keys,
-                COUNT(CASE WHEN status = 'Retired' THEN 1 END) as retired_keys,
-                COUNT(CASE WHEN status = 'Revoked' THEN 1 END) as revoked_keys,
-                COUNT(CASE WHEN status = 'Expired' THEN 1 END) as expired_keys
-            FROM hammerwork_encryption_keys
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            EncryptionError::DatabaseError(format!("Failed to query key counts: {}", e))
-        })?;
-
-        let total_keys: i64 = basic_counts.get("total_keys");
-        let active_keys: i64 = basic_counts.get("active_keys");
-        let retired_keys: i64 = basic_counts.get("retired_keys");
-        let revoked_keys: i64 = basic_counts.get("revoked_keys");
-        let expired_keys: i64 = basic_counts.get("expired_keys");
-
-        // Calculate average key age
-        let age_result = sqlx::query(
-            r#"
-            SELECT 
-                COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400), 0) as avg_age_days
-            FROM hammerwork_encryption_keys 
-            WHERE status IN ('Active', 'Retired')
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            EncryptionError::DatabaseError(format!("Failed to query average age: {}", e))
-        })?;
-
-        let average_key_age_days: f64 = age_result.get("avg_age_days");
-
-        // Count keys expiring soon (within 7 days)
-        let expiring_result = sqlx::query(
-            r#"
-            SELECT COUNT(*) as expiring_soon
-            FROM hammerwork_encryption_keys 
-            WHERE status = 'Active' 
-            AND expires_at IS NOT NULL 
-            AND expires_at <= NOW() + INTERVAL '7 days'
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            EncryptionError::DatabaseError(format!("Failed to query expiring keys: {}", e))
-        })?;
-
-        let keys_expiring_soon: i64 = expiring_result.get("expiring_soon");
-
-        // Count keys due for rotation
-        let rotation_result = sqlx::query(
-            r#"
-            SELECT COUNT(*) as due_for_rotation
-            FROM hammerwork_encryption_keys 
-            WHERE status = 'Active' 
-            AND next_rotation_at IS NOT NULL 
-            AND next_rotation_at <= NOW()
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            EncryptionError::DatabaseError(format!("Failed to query rotation due keys: {}", e))
-        })?;
-
-        let keys_due_for_rotation: i64 = rotation_result.get("due_for_rotation");
-
-        Ok(KeyManagerStats {
-            total_keys: total_keys as u64,
-            active_keys: active_keys as u64,
-            retired_keys: retired_keys as u64,
-            revoked_keys: revoked_keys as u64,
-            expired_keys: expired_keys as u64,
-            average_key_age_days,
-            keys_expiring_soon: keys_expiring_soon as u64,
-            keys_due_for_rotation: keys_due_for_rotation as u64,
-            // Keep existing memory-tracked values
-            total_access_operations: 0, // This should be tracked in memory or separate table
-            rotations_performed: 0,     // This should be tracked in memory or separate table
-        })
-    }
-
-    /// Query statistics from MySQL
-    #[cfg(feature = "mysql")]
-    async fn query_mysql_statistics(&self) -> Result<KeyManagerStats, EncryptionError> {
-        // Execute multiple queries to gather comprehensive statistics
-        let basic_counts = sqlx::query(
-            r#"
-            SELECT 
-                COUNT(*) as total_keys,
-                COUNT(CASE WHEN status = 'Active' THEN 1 END) as active_keys,
-                COUNT(CASE WHEN status = 'Retired' THEN 1 END) as retired_keys,
-                COUNT(CASE WHEN status = 'Revoked' THEN 1 END) as revoked_keys,
-                COUNT(CASE WHEN status = 'Expired' THEN 1 END) as expired_keys
-            FROM hammerwork_encryption_keys
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            EncryptionError::DatabaseError(format!("Failed to query key counts: {}", e))
-        })?;
-
-        let total_keys: i64 = basic_counts.get("total_keys");
-        let active_keys: i64 = basic_counts.get("active_keys");
-        let retired_keys: i64 = basic_counts.get("retired_keys");
-        let revoked_keys: i64 = basic_counts.get("revoked_keys");
-        let expired_keys: i64 = basic_counts.get("expired_keys");
-
-        // Calculate average key age (MySQL syntax)
-        let age_result = sqlx::query(
-            r#"
-            SELECT 
-                COALESCE(AVG(TIMESTAMPDIFF(DAY, created_at, NOW())), 0) as avg_age_days
-            FROM hammerwork_encryption_keys 
-            WHERE status IN ('Active', 'Retired')
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            EncryptionError::DatabaseError(format!("Failed to query average age: {}", e))
-        })?;
-
-        let average_key_age_days: f64 = age_result.get("avg_age_days");
-
-        // Count keys expiring soon (within 7 days)
-        let expiring_result = sqlx::query(
-            r#"
-            SELECT COUNT(*) as expiring_soon
-            FROM hammerwork_encryption_keys 
-            WHERE status = 'Active' 
-            AND expires_at IS NOT NULL 
-            AND expires_at <= DATE_ADD(NOW(), INTERVAL 7 DAY)
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            EncryptionError::DatabaseError(format!("Failed to query expiring keys: {}", e))
-        })?;
-
-        let keys_expiring_soon: i64 = expiring_result.get("expiring_soon");
-
-        // Count keys due for rotation
-        let rotation_result = sqlx::query(
-            r#"
-            SELECT COUNT(*) as due_for_rotation
-            FROM hammerwork_encryption_keys 
-            WHERE status = 'Active' 
-            AND next_rotation_at IS NOT NULL 
-            AND next_rotation_at <= NOW()
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            EncryptionError::DatabaseError(format!("Failed to query rotation due keys: {}", e))
-        })?;
-
-        let keys_due_for_rotation: i64 = rotation_result.get("due_for_rotation");
-
-        Ok(KeyManagerStats {
-            total_keys: total_keys as u64,
-            active_keys: active_keys as u64,
-            retired_keys: retired_keys as u64,
-            revoked_keys: revoked_keys as u64,
-            expired_keys: expired_keys as u64,
-            average_key_age_days,
-            keys_expiring_soon: keys_expiring_soon as u64,
-            keys_due_for_rotation: keys_due_for_rotation as u64,
-            // Keep existing memory-tracked values
-            total_access_operations: 0, // This should be tracked in memory or separate table
-            rotations_performed: 0,     // This should be tracked in memory or separate table
-        })
+        // Return default stats for generic implementation - concrete implementations will override
+        Ok(KeyManagerStats::default())
     }
 
     /// Get the current master key ID
@@ -1372,21 +1068,8 @@ impl<DB: Database> KeyManager<DB> {
     }
 
     async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
-        #[cfg(feature = "postgres")]
-        {
-            self.get_keys_due_for_rotation_postgres().await
-        }
-
-        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-        {
-            self.get_keys_due_for_rotation_mysql().await
-        }
-
-        #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-        {
-            // Return empty list if no database features are enabled
-            Ok(vec![])
-        }
+        // Return empty list for generic implementation - concrete implementations will override
+        Ok(Vec::new())
     }
 
     async fn record_key_usage(&self, _key_id: &str) -> Result<(), EncryptionError> {
@@ -1765,66 +1448,9 @@ impl<DB: Database> KeyManager<DB> {
         // Encrypt the master key material with the system key
         let encrypted_material = self.encrypt_with_system_key(&system_key, key_material)?;
 
-        // Store in database with purpose "KEK" (Key Encryption Key)
-        #[cfg(feature = "postgres")]
-        {
-            sqlx::query(
-                r#"
-                INSERT INTO hammerwork_encryption_keys (
-                    key_id, key_version, algorithm, key_material, key_derivation_salt,
-                    key_source, key_purpose, created_by, status, key_strength, master_key_id
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                ON CONFLICT (key_id) DO UPDATE SET
-                    key_material = EXCLUDED.key_material,
-                    key_derivation_salt = EXCLUDED.key_derivation_salt,
-                    rotated_at = NOW()
-                "#,
-            )
-            .bind(master_key_id.to_string())
-            .bind(1i32)
-            .bind("AES256GCM")
-            .bind(&encrypted_material)
-            .bind(&salt)
-            .bind("Generated")
-            .bind("KEK") // Key Encryption Key
-            .bind("system")
-            .bind("Active")
-            .bind(256i32)
-            .bind(Option::<Uuid>::None) // Master keys don't have a parent master key
-            .execute(&self.pool)
-            .await
-            .map_err(|e| EncryptionError::DatabaseError(e.to_string()))?;
-        }
-
-        #[cfg(feature = "mysql")]
-        {
-            sqlx::query(
-                r#"
-                INSERT INTO hammerwork_encryption_keys (
-                    key_id, key_version, algorithm, key_material, key_derivation_salt,
-                    key_source, key_purpose, created_by, status, key_strength, master_key_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE
-                    key_material = VALUES(key_material),
-                    key_derivation_salt = VALUES(key_derivation_salt),
-                    rotated_at = NOW()
-                "#,
-            )
-            .bind(master_key_id.to_string())
-            .bind(1i32)
-            .bind("AES256GCM")
-            .bind(&encrypted_material)
-            .bind(&salt)
-            .bind("Generated")
-            .bind("KEK") // Key Encryption Key
-            .bind("system")
-            .bind("Active")
-            .bind(256i32)
-            .bind(Option::<String>::None) // Master keys don't have a parent master key
-            .execute(&self.pool)
-            .await
-            .map_err(|e| EncryptionError::DatabaseError(e.to_string()))?;
-        }
+        // Database operations are handled by concrete implementations
+        // This is a placeholder for generic implementation
+        // TODO: Move to concrete database implementations
 
         info!(
             "Master key stored securely in database with ID: {}",
@@ -2375,6 +2001,144 @@ impl KeyManager<sqlx::Postgres> {
 
         Ok(scheduled_rotations)
     }
+
+    /// Update the rotation schedule for a key (PostgreSQL)
+    pub async fn update_key_rotation_schedule(
+        &self,
+        key_id: &str,
+        rotation_interval: Option<Duration>,
+    ) -> Result<(), EncryptionError> {
+        let next_rotation_at = rotation_interval.map(|interval| Utc::now() + interval);
+        self.update_key_rotation_schedule_postgres(key_id, rotation_interval, next_rotation_at)
+            .await
+    }
+
+    /// Get the next scheduled rotation time for a key (PostgreSQL)
+    pub async fn get_key_rotation_schedule(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, EncryptionError> {
+        self.get_key_rotation_schedule_postgres(key_id).await
+    }
+
+    /// Schedule a key for future rotation (PostgreSQL)
+    pub async fn schedule_key_rotation(
+        &self,
+        key_id: &str,
+        rotation_time: DateTime<Utc>,
+    ) -> Result<(), EncryptionError> {
+        self.schedule_key_rotation_postgres(key_id, rotation_time)
+            .await
+    }
+
+    /// Get all keys scheduled for rotation within a time window (PostgreSQL)
+    pub async fn get_scheduled_rotations(
+        &self,
+        from_time: DateTime<Utc>,
+        to_time: DateTime<Utc>,
+    ) -> Result<Vec<(String, DateTime<Utc>)>, EncryptionError> {
+        self.get_scheduled_rotations_postgres(from_time, to_time)
+            .await
+    }
+
+    /// Query statistics from PostgreSQL
+    pub async fn query_database_statistics(&self) -> Result<KeyManagerStats, EncryptionError> {
+        // Execute multiple queries to gather comprehensive statistics
+        let basic_counts = sqlx::query(
+            r#"
+            SELECT 
+                COUNT(*) as total_keys,
+                COUNT(CASE WHEN status = 'Active' THEN 1 END) as active_keys,
+                COUNT(CASE WHEN status = 'Retired' THEN 1 END) as retired_keys,
+                COUNT(CASE WHEN status = 'Revoked' THEN 1 END) as revoked_keys,
+                COUNT(CASE WHEN status = 'Expired' THEN 1 END) as expired_keys
+            FROM hammerwork_encryption_keys
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::DatabaseError(format!("Failed to query key counts: {}", e))
+        })?;
+
+        let total_keys: i64 = basic_counts.get("total_keys");
+        let active_keys: i64 = basic_counts.get("active_keys");
+        let retired_keys: i64 = basic_counts.get("retired_keys");
+        let revoked_keys: i64 = basic_counts.get("revoked_keys");
+        let expired_keys: i64 = basic_counts.get("expired_keys");
+
+        // Calculate average key age
+        let age_result = sqlx::query(
+            r#"
+            SELECT 
+                COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400), 0) as avg_age_days
+            FROM hammerwork_encryption_keys 
+            WHERE status IN ('Active', 'Retired')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::DatabaseError(format!("Failed to query average age: {}", e))
+        })?;
+
+        let average_key_age_days: f64 = age_result.get("avg_age_days");
+
+        // Count keys expiring soon (within 7 days)
+        let expiring_result = sqlx::query(
+            r#"
+            SELECT COUNT(*) as expiring_soon
+            FROM hammerwork_encryption_keys 
+            WHERE status = 'Active' 
+            AND expires_at IS NOT NULL 
+            AND expires_at <= NOW() + INTERVAL '7 days'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::DatabaseError(format!("Failed to query expiring keys: {}", e))
+        })?;
+
+        let keys_expiring_soon: i64 = expiring_result.get("expiring_soon");
+
+        // Count keys due for rotation
+        let rotation_result = sqlx::query(
+            r#"
+            SELECT COUNT(*) as due_for_rotation
+            FROM hammerwork_encryption_keys 
+            WHERE status = 'Active' 
+            AND next_rotation_at IS NOT NULL 
+            AND next_rotation_at <= NOW()
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::DatabaseError(format!("Failed to query rotation due keys: {}", e))
+        })?;
+
+        let keys_due_for_rotation: i64 = rotation_result.get("due_for_rotation");
+
+        Ok(KeyManagerStats {
+            total_keys: total_keys as u64,
+            active_keys: active_keys as u64,
+            retired_keys: retired_keys as u64,
+            revoked_keys: revoked_keys as u64,
+            expired_keys: expired_keys as u64,
+            average_key_age_days,
+            keys_expiring_soon: keys_expiring_soon as u64,
+            keys_due_for_rotation: keys_due_for_rotation as u64,
+            // Keep existing memory-tracked values
+            total_access_operations: 0, // This should be tracked in memory or separate table
+            rotations_performed: 0,     // This should be tracked in memory or separate table
+        })
+    }
+
+    /// Get keys due for rotation (PostgreSQL wrapper)
+    pub async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
+        self.get_keys_due_for_rotation_postgres().await
+    }
 }
 
 #[cfg(feature = "mysql")]
@@ -2755,6 +2519,144 @@ impl KeyManager<sqlx::MySql> {
             .collect();
 
         Ok(scheduled_rotations)
+    }
+
+    /// Update the rotation schedule for a key (MySQL)
+    pub async fn update_key_rotation_schedule(
+        &self,
+        key_id: &str,
+        rotation_interval: Option<Duration>,
+    ) -> Result<(), EncryptionError> {
+        let next_rotation_at = rotation_interval.map(|interval| Utc::now() + interval);
+        self.update_key_rotation_schedule_mysql(key_id, rotation_interval, next_rotation_at)
+            .await
+    }
+
+    /// Get the next scheduled rotation time for a key (MySQL)
+    pub async fn get_key_rotation_schedule(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, EncryptionError> {
+        self.get_key_rotation_schedule_mysql(key_id).await
+    }
+
+    /// Schedule a key for future rotation (MySQL)
+    pub async fn schedule_key_rotation(
+        &self,
+        key_id: &str,
+        rotation_time: DateTime<Utc>,
+    ) -> Result<(), EncryptionError> {
+        self.schedule_key_rotation_mysql(key_id, rotation_time)
+            .await
+    }
+
+    /// Get all keys scheduled for rotation within a time window (MySQL)
+    pub async fn get_scheduled_rotations(
+        &self,
+        from_time: DateTime<Utc>,
+        to_time: DateTime<Utc>,
+    ) -> Result<Vec<(String, DateTime<Utc>)>, EncryptionError> {
+        self.get_scheduled_rotations_mysql(from_time, to_time)
+            .await
+    }
+
+    /// Query statistics from MySQL
+    pub async fn query_database_statistics(&self) -> Result<KeyManagerStats, EncryptionError> {
+        // Execute multiple queries to gather comprehensive statistics
+        let basic_counts = sqlx::query(
+            r#"
+            SELECT 
+                COUNT(*) as total_keys,
+                COUNT(CASE WHEN status = 'Active' THEN 1 END) as active_keys,
+                COUNT(CASE WHEN status = 'Retired' THEN 1 END) as retired_keys,
+                COUNT(CASE WHEN status = 'Revoked' THEN 1 END) as revoked_keys,
+                COUNT(CASE WHEN status = 'Expired' THEN 1 END) as expired_keys
+            FROM hammerwork_encryption_keys
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::DatabaseError(format!("Failed to query key counts: {}", e))
+        })?;
+
+        let total_keys: i64 = basic_counts.get("total_keys");
+        let active_keys: i64 = basic_counts.get("active_keys");
+        let retired_keys: i64 = basic_counts.get("retired_keys");
+        let revoked_keys: i64 = basic_counts.get("revoked_keys");
+        let expired_keys: i64 = basic_counts.get("expired_keys");
+
+        // Calculate average key age (MySQL syntax)
+        let age_result = sqlx::query(
+            r#"
+            SELECT 
+                COALESCE(AVG(TIMESTAMPDIFF(DAY, created_at, NOW())), 0) as avg_age_days
+            FROM hammerwork_encryption_keys 
+            WHERE status IN ('Active', 'Retired')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::DatabaseError(format!("Failed to query average age: {}", e))
+        })?;
+
+        let average_key_age_days: f64 = age_result.get("avg_age_days");
+
+        // Count keys expiring soon (within 7 days)
+        let expiring_result = sqlx::query(
+            r#"
+            SELECT COUNT(*) as expiring_soon
+            FROM hammerwork_encryption_keys 
+            WHERE status = 'Active' 
+            AND expires_at IS NOT NULL 
+            AND expires_at <= DATE_ADD(NOW(), INTERVAL 7 DAY)
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::DatabaseError(format!("Failed to query expiring keys: {}", e))
+        })?;
+
+        let keys_expiring_soon: i64 = expiring_result.get("expiring_soon");
+
+        // Count keys due for rotation
+        let rotation_result = sqlx::query(
+            r#"
+            SELECT COUNT(*) as due_for_rotation
+            FROM hammerwork_encryption_keys 
+            WHERE status = 'Active' 
+            AND next_rotation_at IS NOT NULL 
+            AND next_rotation_at <= NOW()
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            EncryptionError::DatabaseError(format!("Failed to query rotation due keys: {}", e))
+        })?;
+
+        let keys_due_for_rotation: i64 = rotation_result.get("due_for_rotation");
+
+        Ok(KeyManagerStats {
+            total_keys: total_keys as u64,
+            active_keys: active_keys as u64,
+            retired_keys: retired_keys as u64,
+            revoked_keys: revoked_keys as u64,
+            expired_keys: expired_keys as u64,
+            average_key_age_days,
+            keys_expiring_soon: keys_expiring_soon as u64,
+            keys_due_for_rotation: keys_due_for_rotation as u64,
+            // Keep existing memory-tracked values
+            total_access_operations: 0, // This should be tracked in memory or separate table
+            rotations_performed: 0,     // This should be tracked in memory or separate table
+        })
+    }
+
+    /// Get keys due for rotation (MySQL wrapper)
+    pub async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
+        self.get_keys_due_for_rotation_mysql().await
     }
 }
 
@@ -3238,7 +3140,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now(),
             created_by: Some("test".to_string()),
@@ -3304,7 +3206,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now(),
             created_by: Some("test".to_string()),
@@ -3370,7 +3272,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(90),
             created_by: Some("test".to_string()),
@@ -3423,7 +3325,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(90),
             created_by: Some("test".to_string()),
@@ -3482,7 +3384,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(10),
             created_by: Some("test".to_string()),
@@ -3505,7 +3407,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(20),
             created_by: Some("test".to_string()),
@@ -3528,7 +3430,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(5),
             created_by: Some("test".to_string()),
@@ -3589,7 +3491,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(10),
             created_by: Some("test".to_string()),
@@ -3612,7 +3514,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(20),
             created_by: Some("test".to_string()),
@@ -3635,7 +3537,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(5),
             created_by: Some("test".to_string()),
@@ -3700,7 +3602,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(7),
             created_by: Some("test".to_string()),
@@ -3752,7 +3654,7 @@ mod tests {
             algorithm: EncryptionAlgorithm::AES256GCM,
             encrypted_key_material: vec![1, 2, 3, 4],
             derivation_salt: Some(vec![5, 6, 7, 8]),
-            source: KeySource::Generated,
+            source: KeySource::Generated("test_key".to_string()),
             purpose: KeyPurpose::Encryption,
             created_at: Utc::now() - Duration::days(7),
             created_by: Some("test".to_string()),

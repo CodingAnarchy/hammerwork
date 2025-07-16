@@ -106,6 +106,10 @@ pub enum EncryptionError {
     /// Cryptographic operation error.
     #[error("Cryptographic error: {0}")]
     Cryptographic(String),
+
+    /// Database operation error.
+    #[error("Database error: {0}")]
+    DatabaseError(String),
 }
 
 /// Supported encryption algorithms.
