@@ -276,8 +276,6 @@ pub use streaming::StreamConfig;
 
 #[cfg(feature = "webhooks")]
 pub use config::{WebhookConfigs, WebhookGlobalSettings};
-#[cfg(feature = "webhooks")]
-pub use webhooks::WebhookConfig;
 pub use cron::{CronError, CronSchedule};
 #[cfg(feature = "encryption")]
 pub use encryption::{
@@ -298,6 +296,8 @@ pub use spawn::{JobSpawnExt, SpawnConfig, SpawnHandler, SpawnManager, SpawnResul
 pub use stats::{
     DeadJobSummary, InMemoryStatsCollector, JobStatistics, QueueStats, StatisticsCollector,
 };
+#[cfg(feature = "webhooks")]
+pub use webhooks::WebhookConfig;
 pub use worker::{
     AutoscaleConfig, AutoscaleMetrics, BatchProcessingStats, JobEventHooks, JobHandler,
     JobHandlerWithResult, JobHookEvent, JobResult, Worker, WorkerPool,

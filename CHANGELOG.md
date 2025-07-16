@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.13.0] - 2025-07-16
 
 ### Fixed
 - **⚙️ Configuration Serialization**
@@ -14,6 +14,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Removed duplicate struct definitions that caused serialization conflicts
   - Enhanced duration parsing to support multiple formats: plain numbers (seconds), and suffixes (s, m, h, d)
   - Re-enabled previously ignored configuration file tests (`test_config_file_operations`)
+
+### Enhanced
+- **🔐 Encryption Key Management Statistics**
+  - Implemented real database statistics queries for encryption key management system
+  - Added comprehensive PostgreSQL and MySQL statistics queries for key counts by status (Active, Retired, Revoked, Expired)
+  - Enhanced key age calculation using database-specific date functions (PostgreSQL `EXTRACT(EPOCH)`, MySQL `TIMESTAMPDIFF`)
+  - Added expiration monitoring with 7-day early warning for keys approaching expiration
+  - Implemented rotation tracking for keys due for automated rotation
+  - Added integration tests for statistics queries with both PostgreSQL and MySQL backends
+  - Replaced placeholder statistics implementation with production-ready database queries
+
+- **🔄 Database-Managed Key Rotation System**
+  - Implemented complete database-managed key rotation with PostgreSQL and MySQL support
+  - Added automatic key rotation scheduling with configurable intervals and next rotation timestamps
+  - Enhanced rotation detection queries using database-native time comparisons
+  - Implemented key rotation schedule management (update, query, schedule specific times)
+  - Added background rotation service for automated key lifecycle management
+  - Enhanced rotation methods with proper version management and status tracking
+  - Added comprehensive integration tests for rotation functionality, scheduling, and automation
+  - Implemented Clone trait for KeyManager to support background service operations
 
 ## [1.12.0] - 2025-07-15
 

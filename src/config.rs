@@ -10,10 +10,7 @@ use crate::{
 };
 
 #[cfg(feature = "webhooks")]
-use crate::{
-    streaming::StreamBackend,
-    webhooks::WebhookConfig,
-};
+use crate::{streaming::StreamBackend, webhooks::WebhookConfig};
 
 #[cfg(feature = "alerting")]
 use crate::alerting::AlertingConfig;
@@ -21,10 +18,10 @@ use crate::alerting::AlertingConfig;
 #[cfg(feature = "metrics")]
 use crate::metrics::MetricsConfig;
 
+use crate::streaming::StreamConfig;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Duration as StdDuration};
-use crate::streaming::StreamConfig;
 
 /// Module for serializing std::time::Duration as human-readable strings
 mod duration_secs {
@@ -52,7 +49,7 @@ mod duration_secs {
         D: Deserializer<'de>,
     {
         use serde::de::Error;
-        
+
         let s = String::deserialize(deserializer)?;
         parse_duration(&s).map_err(D::Error::custom)
     }
@@ -60,27 +57,31 @@ mod duration_secs {
     /// Parse a duration string like "30s", "5m", "1h", "90", etc.
     fn parse_duration(s: &str) -> Result<Duration, String> {
         let s = s.trim();
-        
+
         // Handle just numbers (assume seconds)
         if let Ok(secs) = s.parse::<u64>() {
             return Ok(Duration::from_secs(secs));
         }
-        
+
         // Handle suffixed durations
         if s.len() < 2 {
             return Err(format!("Invalid duration format: {}", s));
         }
-        
+
         let (num_str, suffix) = s.split_at(s.len() - 1);
-        let num: u64 = num_str.parse()
+        let num: u64 = num_str
+            .parse()
             .map_err(|_| format!("Invalid number in duration: {}", num_str))?;
-        
+
         match suffix {
             "s" => Ok(Duration::from_secs(num)),
             "m" => Ok(Duration::from_secs(num * 60)),
             "h" => Ok(Duration::from_secs(num * 3600)),
             "d" => Ok(Duration::from_secs(num * 86400)),
-            _ => Err(format!("Invalid duration suffix: {}. Use s, m, h, or d", suffix)),
+            _ => Err(format!(
+                "Invalid duration suffix: {}. Use s, m, h, or d",
+                suffix
+            )),
         }
     }
 }
@@ -342,7 +343,6 @@ pub struct WebhookConfigs {
     pub global_settings: WebhookGlobalSettings,
 }
 
-
 /// Global webhook settings
 #[cfg(feature = "webhooks")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,7 +381,6 @@ pub struct StreamingConfigs {
     /// Global streaming settings
     pub global_settings: StreamingGlobalSettings,
 }
-
 
 /// Simple event filter for when webhooks feature is disabled
 #[cfg(not(feature = "webhooks"))]
@@ -702,8 +701,14 @@ mod tests {
 
         // Load back and verify values
         let loaded_config = HammerworkConfig::from_file(config_path.to_str().unwrap()).unwrap();
-        assert_eq!(loaded_config.worker.polling_interval, StdDuration::from_secs(30));
-        assert_eq!(loaded_config.worker.job_timeout, StdDuration::from_secs(300));
+        assert_eq!(
+            loaded_config.worker.polling_interval,
+            StdDuration::from_secs(30)
+        );
+        assert_eq!(
+            loaded_config.worker.job_timeout,
+            StdDuration::from_secs(300)
+        );
 
         // Test parsing various duration formats
         let test_durations = [
@@ -768,7 +773,11 @@ json_format = false
             );
 
             let config: HammerworkConfig = toml::from_str(&toml_content).unwrap();
-            assert_eq!(config.worker.polling_interval, *expected, "Failed to parse duration: {}", duration_str);
+            assert_eq!(
+                config.worker.polling_interval, *expected,
+                "Failed to parse duration: {}",
+                duration_str
+            );
         }
     }
 

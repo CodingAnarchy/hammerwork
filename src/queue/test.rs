@@ -2318,15 +2318,17 @@ impl DatabaseQueue for TestQueue {
     async fn pause_queue(&self, queue_name: &str, paused_by: Option<&str>) -> Result<()> {
         let mut storage = self.storage.write().await;
         let now = storage.clock.now();
-        
+
         let pause_info = QueuePauseInfo {
             queue_name: queue_name.to_string(),
             paused_at: now,
             paused_by: paused_by.map(|s| s.to_string()),
             reason: None,
         };
-        
-        storage.paused_queues.insert(queue_name.to_string(), pause_info);
+
+        storage
+            .paused_queues
+            .insert(queue_name.to_string(), pause_info);
         Ok(())
     }
 
