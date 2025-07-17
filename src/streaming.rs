@@ -1348,21 +1348,38 @@ impl StreamManager {
         let partition_key = Self::calculate_partition_key(&event, &stream.partitioning);
 
         // Serialize event data
-        let serialized_data = match stream.serialization {
+        let serialized_data = match &stream.serialization {
             SerializationFormat::Json => serde_json::to_vec(&event)?,
+            #[cfg(feature = "streaming")]
+            SerializationFormat::MessagePack => {
+                rmp_serde::to_vec(&event).map_err(|e| HammerworkError::Streaming {
+                    message: format!("MessagePack serialization failed: {}", e),
+                })?
+            }
+            #[cfg(not(feature = "streaming"))]
             SerializationFormat::MessagePack => {
                 return Err(HammerworkError::Streaming {
-                    message: "MessagePack serialization not implemented".to_string(),
+                    message: "MessagePack serialization requires 'streaming' feature".to_string(),
                 });
             }
+            #[cfg(feature = "streaming")]
+            SerializationFormat::Avro { schema_registry_url } => {
+                Self::serialize_avro(&event, schema_registry_url)?
+            }
+            #[cfg(not(feature = "streaming"))]
             SerializationFormat::Avro { .. } => {
                 return Err(HammerworkError::Streaming {
-                    message: "Avro serialization not implemented".to_string(),
+                    message: "Avro serialization requires 'streaming' feature".to_string(),
                 });
             }
+            #[cfg(feature = "streaming")]
+            SerializationFormat::Protobuf { schema_definition } => {
+                Self::serialize_protobuf(&event, schema_definition)?
+            }
+            #[cfg(not(feature = "streaming"))]
             SerializationFormat::Protobuf { .. } => {
                 return Err(HammerworkError::Streaming {
-                    message: "Protobuf serialization not implemented".to_string(),
+                    message: "Protobuf serialization requires 'streaming' feature".to_string(),
                 });
             }
         };
@@ -1381,6 +1398,99 @@ impl StreamManager {
             streamed_at: Utc::now(),
             headers,
         })
+    }
+
+    #[cfg(feature = "streaming")]
+    /// Serialize event data using Avro format
+    fn serialize_avro(
+        event: &JobLifecycleEvent,
+        _schema_registry_url: &str,
+    ) -> crate::Result<Vec<u8>> {
+        use apache_avro::{Writer, Schema};
+        
+        // Define Avro schema for JobLifecycleEvent
+        let schema = Schema::parse_str(r#"
+        {
+            "type": "record",
+            "name": "JobLifecycleEvent",
+            "fields": [
+                {"name": "job_id", "type": "string"},
+                {"name": "queue_name", "type": "string"},
+                {"name": "event_type", "type": "string"},
+                {"name": "priority", "type": "string"},
+                {"name": "timestamp", "type": "string"},
+                {"name": "metadata", "type": {"type": "map", "values": "string"}}
+            ]
+        }
+        "#).map_err(|e| HammerworkError::Streaming {
+            message: format!("Failed to parse Avro schema: {}", e),
+        })?;
+
+        let mut writer = Writer::new(&schema, Vec::new());
+        
+        // Create Avro record
+        let mut record = apache_avro::types::Record::new(&schema).ok_or_else(|| {
+            HammerworkError::Streaming {
+                message: "Failed to create Avro record".to_string(),
+            }
+        })?;
+        
+        record.put("job_id", event.job_id.to_string());
+        record.put("queue_name", event.queue_name.clone());
+        record.put("event_type", event.event_type.to_string());
+        record.put("priority", event.priority.to_string());
+        record.put("timestamp", event.timestamp.to_rfc3339());
+        record.put("metadata", event.metadata.clone());
+
+        writer.append(record).map_err(|e| HammerworkError::Streaming {
+            message: format!("Failed to append Avro record: {}", e),
+        })?;
+
+        writer.into_inner().map_err(|e| HammerworkError::Streaming {
+            message: format!("Failed to finalize Avro writer: {}", e),
+        })
+    }
+
+    #[cfg(feature = "streaming")]
+    /// Serialize event data using Protobuf format
+    fn serialize_protobuf(
+        event: &JobLifecycleEvent,
+        _schema_definition: &str,
+    ) -> crate::Result<Vec<u8>> {
+        use prost::Message;
+        
+        // Define protobuf message structure
+        #[derive(prost::Message)]
+        struct JobLifecycleEventProto {
+            #[prost(string, tag = "1")]
+            job_id: String,
+            #[prost(string, tag = "2")]
+            queue_name: String,
+            #[prost(string, tag = "3")]
+            event_type: String,
+            #[prost(string, tag = "4")]
+            priority: String,
+            #[prost(string, tag = "5")]
+            timestamp: String,
+            #[prost(map = "string, string", tag = "6")]
+            metadata: std::collections::HashMap<String, String>,
+        }
+
+        let proto_event = JobLifecycleEventProto {
+            job_id: event.job_id.to_string(),
+            queue_name: event.queue_name.clone(),
+            event_type: event.event_type.to_string(),
+            priority: event.priority.to_string(),
+            timestamp: event.timestamp.to_rfc3339(),
+            metadata: event.metadata.clone(),
+        };
+
+        let mut buf = Vec::new();
+        proto_event.encode(&mut buf).map_err(|e| HammerworkError::Streaming {
+            message: format!("Failed to encode Protobuf message: {}", e),
+        })?;
+
+        Ok(buf)
     }
 
     /// Calculate partition key based on partitioning strategy
