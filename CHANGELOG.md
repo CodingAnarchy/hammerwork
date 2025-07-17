@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **🔐 Encryption Key Rotation Architecture Simplification**
+  - **BREAKING CHANGE**: Removed `rotate_key_if_needed()` method from `EncryptionEngine`
+  - Delegated all key rotation responsibility to the `KeyManager` for cleaner separation of concerns
+  - Eliminated redundant rotation logic between engine and key manager
+  - Key rotation now uses database-driven scheduling through `KeyManager` methods:
+    - `perform_automatic_rotation()` - rotates all keys due for rotation
+    - `start_rotation_service()` - background service for automatic rotation
+    - `is_key_due_for_rotation()` - checks if a specific key needs rotation
+    - `rotate_key()` - manually rotates a specific key
+  - Updated trait bounds on `EncryptionEngine` to support KeyManager operations
+  - Removed fallback rotation tests as rotation is now handled entirely by KeyManager
+
+### Fixed
+- **🔐 Master Key Storage Database Operations**
+  - Implemented missing database operations in `store_master_key_securely()` method
+  - Added concrete PostgreSQL and MySQL implementations for secure master key storage
+  - Master keys are now properly encrypted and stored in the `hammerwork_encryption_keys` table
+  - Database records include proper metadata: `key_purpose = 'KEK'`, `status = 'Active'`, `algorithm = 'AES256GCM'`
+  - Encrypted master key material is stored with unique salt for key derivation security
+  - Added proper error handling with descriptive error messages for database operations
+  - Fixed unreachable code warnings by restructuring conditional compilation blocks
+  - Master keys are identified as Key Encryption Keys (KEK) and don't have rotation intervals
+
 ## [1.13.1] - 2025-07-17
 
 ### Fixed

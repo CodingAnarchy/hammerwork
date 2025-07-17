@@ -1372,17 +1372,94 @@ where
         let system_key = self.derive_system_encryption_key(&salt)?;
 
         // Encrypt the master key material with the system key
-        let _encrypted_material = self.encrypt_with_system_key(&system_key, key_material)?;
+        let encrypted_material = self.encrypt_with_system_key(&system_key, key_material)?;
 
-        // Database operations are handled by concrete implementations
-        // This is a placeholder for generic implementation
-        // TODO: Move to concrete database implementations
+        // Store the encrypted master key in the database
+        #[cfg(feature = "postgres")]
+        {
+            let now = chrono::Utc::now();
+            sqlx::query(
+                r#"
+                INSERT INTO hammerwork_encryption_keys 
+                (id, key_id, key_version, algorithm, key_material, key_derivation_salt, 
+                 key_source, key_purpose, created_at, created_by, expires_at, status, 
+                 key_strength, master_key_id, last_used_at, usage_count, rotation_interval, next_rotation_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                "#,
+            )
+            .bind(uuid::Uuid::new_v4()) // id
+            .bind(master_key_id.to_string()) // key_id
+            .bind(1i32) // key_version
+            .bind("AES256GCM") // algorithm
+            .bind(&encrypted_material) // key_material (encrypted)
+            .bind(&salt) // key_derivation_salt
+            .bind("System") // key_source
+            .bind("KEK") // key_purpose (Key Encryption Key)
+            .bind(now) // created_at
+            .bind("system") // created_by
+            .bind(None::<chrono::DateTime<chrono::Utc>>) // expires_at (no expiration for master key)
+            .bind("Active") // status
+            .bind(256i32) // key_strength (256-bit)
+            .bind(None::<uuid::Uuid>) // master_key_id (self-referential, but None for master key)
+            .bind(None::<chrono::DateTime<chrono::Utc>>) // last_used_at
+            .bind(0i64) // usage_count
+            .bind(None::<sqlx::postgres::types::PgInterval>) // rotation_interval (no rotation for master key)
+            .bind(None::<chrono::DateTime<chrono::Utc>>) // next_rotation_at
+            .execute(&self.pool)
+            .await
+            .map_err(|e| EncryptionError::DatabaseError(format!("Failed to store master key: {}", e)))?;
+        }
 
-        info!(
-            "Master key stored securely in database with ID: {}",
-            master_key_id
-        );
-        Ok(())
+        #[cfg(feature = "mysql")]
+        {
+            let now = chrono::Utc::now();
+            sqlx::query(
+                r#"
+                INSERT INTO hammerwork_encryption_keys 
+                (id, key_id, key_version, algorithm, key_material, key_derivation_salt, 
+                 key_source, key_purpose, created_at, created_by, expires_at, status, 
+                 key_strength, master_key_id, last_used_at, usage_count, rotation_interval_seconds, next_rotation_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(uuid::Uuid::new_v4().to_string()) // id
+            .bind(master_key_id.to_string()) // key_id
+            .bind(1i32) // key_version
+            .bind("AES256GCM") // algorithm
+            .bind(&encrypted_material) // key_material (encrypted)
+            .bind(&salt) // key_derivation_salt
+            .bind("System") // key_source
+            .bind("KEK") // key_purpose (Key Encryption Key)
+            .bind(now) // created_at
+            .bind("system") // created_by
+            .bind(None::<chrono::DateTime<chrono::Utc>>) // expires_at (no expiration for master key)
+            .bind("Active") // status
+            .bind(256i32) // key_strength (256-bit)
+            .bind(None::<String>) // master_key_id (self-referential, but None for master key)
+            .bind(None::<chrono::DateTime<chrono::Utc>>) // last_used_at
+            .bind(0i64) // usage_count
+            .bind(None::<i64>) // rotation_interval_seconds (no rotation for master key)
+            .bind(None::<chrono::DateTime<chrono::Utc>>) // next_rotation_at
+            .execute(&self.pool)
+            .await
+            .map_err(|e| EncryptionError::DatabaseError(format!("Failed to store master key: {}", e)))?;
+        }
+
+        #[cfg(any(feature = "postgres", feature = "mysql"))]
+        {
+            info!(
+                "Master key stored securely in database with ID: {}",
+                master_key_id
+            );
+            Ok(())
+        }
+
+        #[cfg(not(any(feature = "postgres", feature = "mysql")))]
+        {
+            Err(EncryptionError::InvalidConfiguration(
+                "No database feature enabled for key storage".to_string()
+            ))
+        }
     }
 
     /// Get or create a master key ID based on key material, with database persistence
