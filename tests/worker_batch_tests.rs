@@ -1,13 +1,5 @@
 mod test_utils;
 
-use hammerwork::{
-    BatchProcessingStats, InMemoryStatsCollector, Job, JobBatch, JobHandler, PartialFailureMode,
-    WorkerPool, queue::DatabaseQueue, worker::Worker,
-};
-use serde_json::json;
-use std::sync::Arc;
-use tokio::time::{Duration, timeout};
-
 #[cfg(feature = "postgres")]
 mod postgres_worker_batch_tests {
     use super::*;

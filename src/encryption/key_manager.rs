@@ -390,7 +390,7 @@ impl KeyManagerConfig {
     }
 }
 
-impl<DB: Database> KeyManager<DB> 
+impl<DB: Database> KeyManager<DB>
 where
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
     for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
@@ -683,8 +683,6 @@ where
         Ok(keys_due.contains(&key_id.to_string()))
     }
 
-
-
     /// Start automated key rotation service that runs in the background
     /// Returns a future that should be spawned as a background task
     pub async fn start_rotation_service(
@@ -744,8 +742,6 @@ where
 
         Ok(rotation_service)
     }
-
-
 
     /// Get current key management statistics
     pub async fn get_stats(&self) -> KeyManagerStats {
@@ -2556,8 +2552,7 @@ impl KeyManager<sqlx::MySql> {
         from_time: DateTime<Utc>,
         to_time: DateTime<Utc>,
     ) -> Result<Vec<(String, DateTime<Utc>)>, EncryptionError> {
-        self.get_scheduled_rotations_mysql(from_time, to_time)
-            .await
+        self.get_scheduled_rotations_mysql(from_time, to_time).await
     }
 
     /// Query statistics from MySQL

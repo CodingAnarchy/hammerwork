@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[cfg(feature = "webhooks")]
-use crate::{streaming::StreamBackend, webhooks::WebhookConfig};
+use crate::webhooks::WebhookConfig;
 
 #[cfg(feature = "alerting")]
 use crate::alerting::AlertingConfig;
@@ -86,29 +86,90 @@ mod duration_secs {
     }
 }
 
-/// Module for serializing UUID as string for TOML compatibility
-mod uuid_string {
+/// Module for serializing chrono::Duration as human-readable strings (in days)
+mod chrono_duration_days {
+    use chrono::Duration;
     use serde::{Deserialize, Deserializer, Serializer};
-    use uuid::Uuid;
 
-    pub fn serialize<S>(uuid: &Uuid, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_str(&uuid.to_string())
+        let days = duration.num_days();
+        if days == 0 {
+            serializer.serialize_str("0d")
+        } else {
+            serializer.serialize_str(&format!("{}d", days))
+        }
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
     where
         D: Deserializer<'de>,
     {
         use serde::de::Error;
+
         let s = String::deserialize(deserializer)?;
-        Uuid::parse_str(&s).map_err(D::Error::custom)
+        parse_chrono_duration(&s).map_err(D::Error::custom)
+    }
+
+    /// Parse a duration string like "30d", "7d", etc.
+    pub fn parse_chrono_duration(s: &str) -> Result<Duration, String> {
+        let s = s.trim();
+
+        // Handle just numbers (assume days)
+        if let Ok(days) = s.parse::<i64>() {
+            return Ok(Duration::days(days));
+        }
+
+        // Handle suffixed durations
+        if s.len() < 2 {
+            return Err(format!("Invalid duration format: {}", s));
+        }
+
+        let (num_str, suffix) = s.split_at(s.len() - 1);
+        let num: i64 = num_str
+            .parse()
+            .map_err(|_| format!("Invalid number in duration: {}", num_str))?;
+
+        match suffix {
+            "d" => Ok(Duration::days(num)),
+            _ => Err(format!(
+                "Invalid duration suffix: {}. Use d for days",
+                suffix
+            )),
+        }
     }
 }
 
-use uuid::Uuid;
+/// Module for serializing Option<chrono::Duration> as human-readable strings (in days)
+mod chrono_duration_days_option {
+    use chrono::Duration;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match duration {
+            Some(d) => super::chrono_duration_days::serialize(d, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => super::chrono_duration_days::parse_chrono_duration(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
 
 /// Main configuration for the Hammerwork job queue system.
 ///
@@ -443,9 +504,11 @@ pub struct ArchiveConfig {
     pub compression_level: u32,
 
     /// Archive jobs older than this duration
+    #[serde(with = "chrono_duration_days")]
     pub archive_after: Duration,
 
     /// Delete archived files older than this duration
+    #[serde(with = "chrono_duration_days_option")]
     pub delete_after: Option<Duration>,
 
     /// Maximum archive file size in bytes
@@ -604,6 +667,7 @@ impl HammerworkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::StreamBackend;
     use tempfile::tempdir;
 
     #[test]
@@ -648,6 +712,10 @@ mod tests {
             .with_worker_pool_size(6);
 
         // Save config
+        println!("Testing TOML serialization...");
+        let toml_result = toml::to_string_pretty(&config);
+        println!("TOML result: {:?}", toml_result);
+
         config.save_to_file(config_path.to_str().unwrap()).unwrap();
 
         // Load config
@@ -724,6 +792,10 @@ mod tests {
                 r#"
 [database]
 url = "postgresql://localhost/test"
+pool_size = 10
+connection_timeout_secs = 30
+auto_migrate = false
+create_tables = true
 
 [worker]
 pool_size = 4
@@ -732,42 +804,89 @@ job_timeout = "5m"
 autoscaling_enabled = false
 min_workers = 1
 max_workers = 10
-scale_up_threshold = 0.8
-scale_down_threshold = 0.2
-scale_check_interval = "30s"
 
 [worker.priority_weights]
-background = 1
-low = 2
-normal = 5
-high = 10
-critical = 20
+strict_priority = false
+fairness_factor = 0.1
+
+[worker.priority_weights.weights]
+Background = 1
+Low = 2
+Normal = 5
+High = 10
+Critical = 20
 
 [worker.retry_strategy]
-max_attempts = 3
-initial_delay = "1s"
-max_delay = "60s"
-backoff_multiplier = 2.0
+type = "Exponential"
+base_ms = 1000
+multiplier = 2.0
+max_delay_ms = 60000
 
 [events]
-enabled = true
-buffer_size = 1000
+max_buffer_size = 1000
+include_payload_default = false
+max_payload_size_bytes = 65536
+log_events = false
+
+[webhooks]
+webhooks = []
+
+[webhooks.global_settings]
+max_concurrent_deliveries = 100
+max_response_body_size = 65536
+log_deliveries = true
+user_agent = "hammerwork-webhooks/1.13.0"
 
 [streaming]
+streams = []
+
+[streaming.global_settings]
+max_concurrent_processors = 50
+log_operations = true
+global_flush_interval_secs = 10
+
+[alerting]
+targets = []
+enabled = true
+
+[alerting.cooldown_period]
+secs = 300
+nanos = 0
+
+[alerting.custom_thresholds]
+
+[metrics]
+registry_name = "hammerwork"
+collect_histograms = true
+custom_gauges = []
+custom_histograms = []
+update_interval = 15
+
+[metrics.custom_labels]
 
 [archive]
 enabled = false
-retention_days = 30
-compression_enabled = false
+archive_directory = "./archives"
+compression_level = 6
+archive_after = "30d"
+delete_after = "365d"
+max_file_size_bytes = 104857600
+include_payloads = true
 
 [rate_limiting]
 enabled = false
-requests_per_second = 100
-burst_size = 200
+
+[rate_limiting.default_throttle]
+enabled = true
+
+[rate_limiting.queue_throttles]
 
 [logging]
 level = "info"
 json_format = false
+include_location = false
+enable_tracing = false
+service_name = "hammerwork"
 "#,
                 duration_str
             );

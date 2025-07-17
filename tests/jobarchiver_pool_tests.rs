@@ -1,14 +1,5 @@
 mod test_utils;
 
-use chrono::{Duration, Utc};
-use hammerwork::archive::{
-    ArchivalConfig, ArchivalPolicy, ArchivalReason, ArchiveEvent, JobArchiver,
-};
-use hammerwork::queue::DatabaseQueue;
-use hammerwork::{Job, JobQueue};
-use serde_json::json;
-use std::sync::{Arc, Mutex};
-
 /// Test JobArchiver creation with public pool field from JobQueue
 #[cfg(feature = "postgres")]
 #[tokio::test]

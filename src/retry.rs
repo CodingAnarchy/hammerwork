@@ -70,7 +70,7 @@ use std::time::Duration;
 /// // Add ±20% randomness to the delay
 /// let multiplicative = JitterType::Multiplicative(0.2);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JitterType {
     /// Add a random duration between 0 and the specified value.
     ///
@@ -130,6 +130,117 @@ impl JitterType {
                 Duration::from_millis(jittered_millis)
             }
         }
+    }
+}
+
+impl Serialize for JitterType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        match self {
+            JitterType::Additive(duration) => {
+                let mut state = serializer.serialize_struct("JitterType", 2)?;
+                state.serialize_field("type", "Additive")?;
+                state.serialize_field("duration_ms", &(duration.as_millis() as u64))?;
+                state.end()
+            }
+            JitterType::Multiplicative(factor) => {
+                let mut state = serializer.serialize_struct("JitterType", 2)?;
+                state.serialize_field("type", "Multiplicative")?;
+                state.serialize_field("factor", factor)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JitterType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Type,
+            DurationMs,
+            Factor,
+        }
+
+        struct JitterTypeVisitor;
+
+        impl<'de> Visitor<'de> for JitterTypeVisitor {
+            type Value = JitterType;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a jitter type")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut jitter_type: Option<String> = None;
+                let mut duration_ms: Option<u64> = None;
+                let mut factor: Option<f64> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "type" => {
+                            if jitter_type.is_some() {
+                                return Err(de::Error::duplicate_field("type"));
+                            }
+                            jitter_type = Some(map.next_value()?);
+                        }
+                        "duration_ms" => {
+                            if duration_ms.is_some() {
+                                return Err(de::Error::duplicate_field("duration_ms"));
+                            }
+                            duration_ms = Some(map.next_value()?);
+                        }
+                        "factor" => {
+                            if factor.is_some() {
+                                return Err(de::Error::duplicate_field("factor"));
+                            }
+                            factor = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                let jitter_type = jitter_type.ok_or_else(|| de::Error::missing_field("type"))?;
+
+                match jitter_type.as_str() {
+                    "Additive" => {
+                        let duration_ms =
+                            duration_ms.ok_or_else(|| de::Error::missing_field("duration_ms"))?;
+                        Ok(JitterType::Additive(Duration::from_millis(duration_ms)))
+                    }
+                    "Multiplicative" => {
+                        let factor = factor.ok_or_else(|| de::Error::missing_field("factor"))?;
+                        Ok(JitterType::Multiplicative(factor))
+                    }
+                    _ => Err(de::Error::unknown_variant(
+                        &jitter_type,
+                        &["Additive", "Multiplicative"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "JitterType",
+            &["type", "duration_ms", "factor"],
+            JitterTypeVisitor,
+        )
     }
 }
 
@@ -748,13 +859,13 @@ impl Serialize for RetryStrategy {
     where
         S: serde::Serializer,
     {
-        use serde::ser::SerializeStructVariant;
+        use serde::ser::SerializeStruct;
 
         match self {
             RetryStrategy::Fixed(duration) => {
-                let mut state =
-                    serializer.serialize_struct_variant("RetryStrategy", 0, "Fixed", 1)?;
-                state.serialize_field("duration_ms", &duration.as_millis())?;
+                let mut state = serializer.serialize_struct("RetryStrategy", 2)?;
+                state.serialize_field("type", "Fixed")?;
+                state.serialize_field("duration_ms", &(duration.as_millis() as u64))?;
                 state.end()
             }
             RetryStrategy::Linear {
@@ -762,11 +873,11 @@ impl Serialize for RetryStrategy {
                 increment,
                 max_delay,
             } => {
-                let mut state =
-                    serializer.serialize_struct_variant("RetryStrategy", 1, "Linear", 3)?;
-                state.serialize_field("base_ms", &base.as_millis())?;
-                state.serialize_field("increment_ms", &increment.as_millis())?;
-                state.serialize_field("max_delay_ms", &max_delay.map(|d| d.as_millis()))?;
+                let mut state = serializer.serialize_struct("RetryStrategy", 4)?;
+                state.serialize_field("type", "Linear")?;
+                state.serialize_field("base_ms", &(base.as_millis() as u64))?;
+                state.serialize_field("increment_ms", &(increment.as_millis() as u64))?;
+                state.serialize_field("max_delay_ms", &max_delay.map(|d| d.as_millis() as u64))?;
                 state.end()
             }
             RetryStrategy::Exponential {
@@ -775,19 +886,19 @@ impl Serialize for RetryStrategy {
                 max_delay,
                 jitter,
             } => {
-                let mut state =
-                    serializer.serialize_struct_variant("RetryStrategy", 2, "Exponential", 4)?;
-                state.serialize_field("base_ms", &base.as_millis())?;
+                let mut state = serializer.serialize_struct("RetryStrategy", 5)?;
+                state.serialize_field("type", "Exponential")?;
+                state.serialize_field("base_ms", &(base.as_millis() as u64))?;
                 state.serialize_field("multiplier", multiplier)?;
-                state.serialize_field("max_delay_ms", &max_delay.map(|d| d.as_millis()))?;
+                state.serialize_field("max_delay_ms", &max_delay.map(|d| d.as_millis() as u64))?;
                 state.serialize_field("jitter", jitter)?;
                 state.end()
             }
             RetryStrategy::Fibonacci { base, max_delay } => {
-                let mut state =
-                    serializer.serialize_struct_variant("RetryStrategy", 3, "Fibonacci", 2)?;
-                state.serialize_field("base_ms", &base.as_millis())?;
-                state.serialize_field("max_delay_ms", &max_delay.map(|d| d.as_millis()))?;
+                let mut state = serializer.serialize_struct("RetryStrategy", 3)?;
+                state.serialize_field("type", "Fibonacci")?;
+                state.serialize_field("base_ms", &(base.as_millis() as u64))?;
+                state.serialize_field("max_delay_ms", &max_delay.map(|d| d.as_millis() as u64))?;
                 state.end()
             }
             RetryStrategy::Custom(_) => Err(serde::ser::Error::custom(
@@ -802,7 +913,7 @@ impl<'de> Deserialize<'de> for RetryStrategy {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::{self, EnumAccess, MapAccess, VariantAccess, Visitor};
+        use serde::de::{self, MapAccess, Visitor};
         use std::fmt;
 
         struct RetryStrategyVisitor;
@@ -814,230 +925,131 @@ impl<'de> Deserialize<'de> for RetryStrategy {
                 formatter.write_str("a retry strategy")
             }
 
-            fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
             where
-                A: EnumAccess<'de>,
+                M: MapAccess<'de>,
             {
-                let (variant, variant_data) = data.variant()?;
+                let mut strategy_type: Option<String> = None;
+                let mut duration_ms: Option<u64> = None;
+                let mut base_ms: Option<u64> = None;
+                let mut increment_ms: Option<u64> = None;
+                let mut max_delay_ms: Option<Option<u64>> = None;
+                let mut multiplier: Option<f64> = None;
+                let mut jitter: Option<Option<JitterType>> = None;
 
-                match variant {
-                    "Fixed" => variant_data.struct_variant(&["duration_ms"], FixedVisitor),
-                    "Linear" => variant_data.struct_variant(
-                        &["base_ms", "increment_ms", "max_delay_ms"],
-                        LinearVisitor,
-                    ),
-                    "Exponential" => variant_data.struct_variant(
-                        &["base_ms", "multiplier", "max_delay_ms", "jitter"],
-                        ExponentialVisitor,
-                    ),
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "type" => {
+                            if strategy_type.is_some() {
+                                return Err(de::Error::duplicate_field("type"));
+                            }
+                            strategy_type = Some(map.next_value()?);
+                        }
+                        "duration_ms" => {
+                            if duration_ms.is_some() {
+                                return Err(de::Error::duplicate_field("duration_ms"));
+                            }
+                            duration_ms = Some(map.next_value()?);
+                        }
+                        "base_ms" => {
+                            if base_ms.is_some() {
+                                return Err(de::Error::duplicate_field("base_ms"));
+                            }
+                            base_ms = Some(map.next_value()?);
+                        }
+                        "increment_ms" => {
+                            if increment_ms.is_some() {
+                                return Err(de::Error::duplicate_field("increment_ms"));
+                            }
+                            increment_ms = Some(map.next_value()?);
+                        }
+                        "max_delay_ms" => {
+                            if max_delay_ms.is_some() {
+                                return Err(de::Error::duplicate_field("max_delay_ms"));
+                            }
+                            max_delay_ms = Some(map.next_value()?);
+                        }
+                        "multiplier" => {
+                            if multiplier.is_some() {
+                                return Err(de::Error::duplicate_field("multiplier"));
+                            }
+                            multiplier = Some(map.next_value()?);
+                        }
+                        "jitter" => {
+                            if jitter.is_some() {
+                                return Err(de::Error::duplicate_field("jitter"));
+                            }
+                            jitter = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                let strategy_type =
+                    strategy_type.ok_or_else(|| de::Error::missing_field("type"))?;
+
+                match strategy_type.as_str() {
+                    "Fixed" => {
+                        let duration_ms =
+                            duration_ms.ok_or_else(|| de::Error::missing_field("duration_ms"))?;
+                        Ok(RetryStrategy::Fixed(Duration::from_millis(duration_ms)))
+                    }
+                    "Linear" => {
+                        let base_ms = base_ms.ok_or_else(|| de::Error::missing_field("base_ms"))?;
+                        let increment_ms =
+                            increment_ms.ok_or_else(|| de::Error::missing_field("increment_ms"))?;
+                        let max_delay_ms =
+                            max_delay_ms.ok_or_else(|| de::Error::missing_field("max_delay_ms"))?;
+                        Ok(RetryStrategy::Linear {
+                            base: Duration::from_millis(base_ms),
+                            increment: Duration::from_millis(increment_ms),
+                            max_delay: max_delay_ms.map(Duration::from_millis),
+                        })
+                    }
+                    "Exponential" => {
+                        let base_ms = base_ms.ok_or_else(|| de::Error::missing_field("base_ms"))?;
+                        let multiplier =
+                            multiplier.ok_or_else(|| de::Error::missing_field("multiplier"))?;
+                        let max_delay_ms =
+                            max_delay_ms.ok_or_else(|| de::Error::missing_field("max_delay_ms"))?;
+                        let jitter = jitter.unwrap_or(None);
+                        Ok(RetryStrategy::Exponential {
+                            base: Duration::from_millis(base_ms),
+                            multiplier,
+                            max_delay: max_delay_ms.map(Duration::from_millis),
+                            jitter,
+                        })
+                    }
                     "Fibonacci" => {
-                        variant_data.struct_variant(&["base_ms", "max_delay_ms"], FibonacciVisitor)
+                        let base_ms = base_ms.ok_or_else(|| de::Error::missing_field("base_ms"))?;
+                        let max_delay_ms =
+                            max_delay_ms.ok_or_else(|| de::Error::missing_field("max_delay_ms"))?;
+                        Ok(RetryStrategy::Fibonacci {
+                            base: Duration::from_millis(base_ms),
+                            max_delay: max_delay_ms.map(Duration::from_millis),
+                        })
                     }
                     _ => Err(de::Error::unknown_variant(
-                        variant,
+                        &strategy_type,
                         &["Fixed", "Linear", "Exponential", "Fibonacci"],
                     )),
                 }
             }
         }
 
-        struct FixedVisitor;
-        impl<'de> Visitor<'de> for FixedVisitor {
-            type Value = RetryStrategy;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("fixed retry strategy data")
-            }
-
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut duration_ms = None;
-
-                while let Some(key) = map.next_key::<&str>()? {
-                    match key {
-                        "duration_ms" => {
-                            if duration_ms.is_some() {
-                                return Err(de::Error::duplicate_field("duration_ms"));
-                            }
-                            duration_ms = Some(map.next_value::<u64>()?);
-                        }
-                        _ => {
-                            let _: serde::de::IgnoredAny = map.next_value()?;
-                        }
-                    }
-                }
-
-                let duration_ms =
-                    duration_ms.ok_or_else(|| de::Error::missing_field("duration_ms"))?;
-                Ok(RetryStrategy::Fixed(Duration::from_millis(duration_ms)))
-            }
-        }
-
-        struct LinearVisitor;
-        impl<'de> Visitor<'de> for LinearVisitor {
-            type Value = RetryStrategy;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("linear retry strategy data")
-            }
-
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut base_ms = None;
-                let mut increment_ms = None;
-                let mut max_delay_ms = None;
-
-                while let Some(key) = map.next_key::<&str>()? {
-                    match key {
-                        "base_ms" => {
-                            if base_ms.is_some() {
-                                return Err(de::Error::duplicate_field("base_ms"));
-                            }
-                            base_ms = Some(map.next_value::<u64>()?);
-                        }
-                        "increment_ms" => {
-                            if increment_ms.is_some() {
-                                return Err(de::Error::duplicate_field("increment_ms"));
-                            }
-                            increment_ms = Some(map.next_value::<u64>()?);
-                        }
-                        "max_delay_ms" => {
-                            if max_delay_ms.is_some() {
-                                return Err(de::Error::duplicate_field("max_delay_ms"));
-                            }
-                            max_delay_ms = Some(map.next_value::<Option<u64>>()?);
-                        }
-                        _ => {
-                            let _: serde::de::IgnoredAny = map.next_value()?;
-                        }
-                    }
-                }
-
-                let base_ms = base_ms.ok_or_else(|| de::Error::missing_field("base_ms"))?;
-                let increment_ms =
-                    increment_ms.ok_or_else(|| de::Error::missing_field("increment_ms"))?;
-
-                Ok(RetryStrategy::Linear {
-                    base: Duration::from_millis(base_ms),
-                    increment: Duration::from_millis(increment_ms),
-                    max_delay: max_delay_ms.flatten().map(Duration::from_millis),
-                })
-            }
-        }
-
-        struct ExponentialVisitor;
-        impl<'de> Visitor<'de> for ExponentialVisitor {
-            type Value = RetryStrategy;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("exponential retry strategy data")
-            }
-
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut base_ms = None;
-                let mut multiplier = None;
-                let mut max_delay_ms = None;
-                let mut jitter = None;
-
-                while let Some(key) = map.next_key::<&str>()? {
-                    match key {
-                        "base_ms" => {
-                            if base_ms.is_some() {
-                                return Err(de::Error::duplicate_field("base_ms"));
-                            }
-                            base_ms = Some(map.next_value::<u64>()?);
-                        }
-                        "multiplier" => {
-                            if multiplier.is_some() {
-                                return Err(de::Error::duplicate_field("multiplier"));
-                            }
-                            multiplier = Some(map.next_value::<f64>()?);
-                        }
-                        "max_delay_ms" => {
-                            if max_delay_ms.is_some() {
-                                return Err(de::Error::duplicate_field("max_delay_ms"));
-                            }
-                            max_delay_ms = Some(map.next_value::<Option<u64>>()?);
-                        }
-                        "jitter" => {
-                            if jitter.is_some() {
-                                return Err(de::Error::duplicate_field("jitter"));
-                            }
-                            jitter = Some(map.next_value::<Option<JitterType>>()?);
-                        }
-                        _ => {
-                            let _: serde::de::IgnoredAny = map.next_value()?;
-                        }
-                    }
-                }
-
-                let base_ms = base_ms.ok_or_else(|| de::Error::missing_field("base_ms"))?;
-                let multiplier =
-                    multiplier.ok_or_else(|| de::Error::missing_field("multiplier"))?;
-
-                Ok(RetryStrategy::Exponential {
-                    base: Duration::from_millis(base_ms),
-                    multiplier,
-                    max_delay: max_delay_ms.flatten().map(Duration::from_millis),
-                    jitter: jitter.flatten(),
-                })
-            }
-        }
-
-        struct FibonacciVisitor;
-        impl<'de> Visitor<'de> for FibonacciVisitor {
-            type Value = RetryStrategy;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("fibonacci retry strategy data")
-            }
-
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut base_ms = None;
-                let mut max_delay_ms = None;
-
-                while let Some(key) = map.next_key::<&str>()? {
-                    match key {
-                        "base_ms" => {
-                            if base_ms.is_some() {
-                                return Err(de::Error::duplicate_field("base_ms"));
-                            }
-                            base_ms = Some(map.next_value::<u64>()?);
-                        }
-                        "max_delay_ms" => {
-                            if max_delay_ms.is_some() {
-                                return Err(de::Error::duplicate_field("max_delay_ms"));
-                            }
-                            max_delay_ms = Some(map.next_value::<Option<u64>>()?);
-                        }
-                        _ => {
-                            let _: serde::de::IgnoredAny = map.next_value()?;
-                        }
-                    }
-                }
-
-                let base_ms = base_ms.ok_or_else(|| de::Error::missing_field("base_ms"))?;
-
-                Ok(RetryStrategy::Fibonacci {
-                    base: Duration::from_millis(base_ms),
-                    max_delay: max_delay_ms.flatten().map(Duration::from_millis),
-                })
-            }
-        }
-
-        deserializer.deserialize_enum(
+        deserializer.deserialize_struct(
             "RetryStrategy",
-            &["Fixed", "Linear", "Exponential", "Fibonacci"],
+            &[
+                "type",
+                "duration_ms",
+                "base_ms",
+                "increment_ms",
+                "max_delay_ms",
+                "multiplier",
+                "jitter",
+            ],
             RetryStrategyVisitor,
         )
     }

@@ -1,9 +1,7 @@
 mod test_utils;
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason};
-use hammerwork::{Job, JobStatus, queue::DatabaseQueue};
-use serde_json::json;
 
 #[cfg(feature = "postgres")]
 mod postgres_archive_tests {
@@ -587,8 +585,8 @@ async fn test_archival_reason_enum() {
 mod websocket_archive_event_tests {
     use super::*;
     use chrono::Utc;
-    use hammerwork::archive::{ArchivalStats, ArchiveEvent, JobArchiver};
-    use std::sync::{Arc, Mutex};
+    use hammerwork::archive::{ArchivalStats, ArchiveEvent};
+
     use uuid::Uuid;
 
     #[test]

@@ -10,12 +10,8 @@
 //! cargo run --example spawn_cli_example --features mysql
 //! ```
 
-use hammerwork::{Job, JobQueue, Result, queue::DatabaseQueue};
+use hammerwork::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::time::Duration;
-use tokio::time::sleep;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DataProcessingJob {

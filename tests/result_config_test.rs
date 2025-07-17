@@ -2,10 +2,6 @@
 
 mod test_utils;
 
-use hammerwork::{Job, ResultConfig, ResultStorage, queue::DatabaseQueue};
-use serde_json::json;
-use std::time::Duration;
-
 #[cfg(feature = "postgres")]
 #[tokio::test]
 #[ignore = "requires PostgreSQL database"]

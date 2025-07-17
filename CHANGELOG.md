@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.1] - 2025-07-17
+
+### Fixed
+- **🧪 Unit Test Compilation and TOML Serialization**
+  - Fixed compilation errors in `key_management_example.rs` by adding required `encryption` feature flag
+  - Resolved TOML serialization failures for configuration structs with proper serde attribute handling
+  - Fixed missing optional field handling in TOML deserialization by adding `skip_serializing_if` and `default` attributes
+  - Corrected `exposition_addr` field serialization in `MetricsConfig` to handle `None` values properly
+  - Fixed `backoff_on_error` field serialization in `ThrottleConfig` for proper TOML compatibility
+  - Updated `test_duration_serialization` test to use current configuration structure
+  - Fixed enum deserialization for `RetryStrategy` and `JitterType` using flat TOML structure with `type` field
+  - Resolved u128 serialization issues by converting `Duration.as_millis()` to u64 for TOML compatibility
+  - Removed unused UUID serialization functions to eliminate compiler warnings
+  - All 263 unit tests now pass successfully with no compilation errors or warnings
+
 ## [1.13.0] - 2025-07-16
 
 ### Fixed

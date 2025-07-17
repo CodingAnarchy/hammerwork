@@ -3,13 +3,10 @@
 mod test_utils;
 
 use hammerwork::{
-    Job, JobHandler, JobHandlerWithResult, JobStatus, Worker, WorkerPool,
     job::{ResultConfig, ResultStorage},
-    queue::DatabaseQueue,
     worker::JobResult,
 };
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
 
 #[cfg(feature = "postgres")]
 mod postgres_tests {

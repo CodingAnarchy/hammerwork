@@ -84,7 +84,9 @@ pub struct ThrottleConfig {
     /// Backoff duration when errors occur (in seconds)
     #[serde(
         serialize_with = "serialize_duration",
-        deserialize_with = "deserialize_duration"
+        deserialize_with = "deserialize_duration",
+        skip_serializing_if = "Option::is_none",
+        default
     )]
     pub backoff_on_error: Option<Duration>,
     /// Enable/disable throttling

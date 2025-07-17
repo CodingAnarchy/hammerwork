@@ -63,7 +63,9 @@ pub struct MetricsConfig {
     /// HTTP server address for metrics exposition (as string)
     #[serde(
         serialize_with = "serialize_socket_addr",
-        deserialize_with = "deserialize_socket_addr"
+        deserialize_with = "deserialize_socket_addr",
+        skip_serializing_if = "Option::is_none",
+        default
     )]
     pub exposition_addr: Option<SocketAddr>,
     /// Custom metric labels to include

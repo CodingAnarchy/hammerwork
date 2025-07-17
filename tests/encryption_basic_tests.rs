@@ -10,7 +10,6 @@ use hammerwork::encryption::{
     parse_key_purpose, parse_key_source, parse_key_status,
 };
 use std::collections::HashMap;
-use std::env;
 use uuid::Uuid;
 
 // Helper function to create test key manager configuration

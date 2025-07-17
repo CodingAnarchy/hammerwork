@@ -6,11 +6,6 @@
 
 mod test_utils;
 
-use hammerwork::{DependencyStatus, Job, JobPriority, ResultStorage, queue::DatabaseQueue};
-use serde_json::json;
-use std::time::Duration;
-use uuid::Uuid;
-
 /// Test that all JobRow queries include the complete field set
 #[cfg(test)]
 mod jobrow_field_tests {
@@ -180,7 +175,6 @@ mod jobrow_field_tests {
 /// Test that workflow-specific functionality works correctly
 #[cfg(test)]
 mod workflow_field_tests {
-    use super::*;
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
