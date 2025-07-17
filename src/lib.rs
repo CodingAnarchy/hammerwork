@@ -282,7 +282,7 @@ pub use encryption::{
     EncryptedPayload, EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, EncryptionError,
     EncryptionKey, EncryptionMetadata, EncryptionStats, ExternalKmsConfig, KeyAuditRecord,
     KeyDerivationConfig, KeyManager, KeyManagerConfig, KeyManagerStats, KeyOperation, KeyPurpose,
-    KeySource, KeyStatus, RetentionPolicy,
+    KeySource, KeyStatus, RetentionPolicy, generate_deterministic_key, generate_deterministic_key_with_size,
 };
 pub use error::HammerworkError;
 pub use job::{Job, JobId, JobStatus, ResultConfig, ResultStorage};

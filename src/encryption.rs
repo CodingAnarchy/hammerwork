@@ -936,6 +936,99 @@ impl EncryptionStats {
     }
 }
 
+/// Deterministic key generation utility for KMS fallback scenarios
+///
+/// This utility generates consistent keys for development, testing, and fallback scenarios
+/// when external KMS services are unavailable. It uses SHA-256 hashing to create
+/// deterministic keys based on the service type and configuration parameters.
+///
+/// # Arguments
+///
+/// * `service_prefix` - Service-specific prefix (e.g., "aws-kms-data-key", "azure-kv-master-key")
+/// * `inputs` - Variable number of string inputs that will be hashed together
+///
+/// # Returns
+///
+/// A `Vec<u8>` containing the generated key material (32 bytes for SHA-256)
+///
+/// # Examples
+///
+/// ```rust
+/// # #[cfg(feature = "encryption")]
+/// # {
+/// use hammerwork::encryption::generate_deterministic_key;
+///
+/// // Generate a deterministic key for AWS KMS fallback
+/// let key = generate_deterministic_key("aws-kms-data-key", &["my-key-id", "us-east-1"]);
+/// assert_eq!(key.len(), 32); // SHA-256 produces 32 bytes
+///
+/// // Generate a deterministic key for Azure Key Vault fallback
+/// let key = generate_deterministic_key("azure-kv-master-key", &["vault-url", "key-name"]);
+/// assert_eq!(key.len(), 32);
+/// # }
+/// ```
+pub fn generate_deterministic_key(service_prefix: &str, inputs: &[&str]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    
+    let mut hasher = Sha256::new();
+    hasher.update(service_prefix.as_bytes());
+    for input in inputs {
+        hasher.update(input.as_bytes());
+    }
+    let hash = hasher.finalize();
+    hash[0..32].to_vec()
+}
+
+/// Generate a deterministic key with a specific size
+///
+/// This function extends the basic deterministic key generation to support
+/// variable key sizes by repeating the hash pattern as needed.
+///
+/// # Arguments
+///
+/// * `service_prefix` - Service-specific prefix
+/// * `inputs` - Variable number of string inputs
+/// * `key_size` - Desired key size in bytes
+///
+/// # Returns
+///
+/// A `Vec<u8>` of the requested size containing the generated key material
+///
+/// # Examples
+///
+/// ```rust
+/// # #[cfg(feature = "encryption")]
+/// # {
+/// use hammerwork::encryption::generate_deterministic_key_with_size;
+///
+/// // Generate a 64-byte key for a specific use case
+/// let key = generate_deterministic_key_with_size("custom-service", &["param1", "param2"], 64);
+/// assert_eq!(key.len(), 64);
+///
+/// // Generate a 16-byte key for AES-128
+/// let key = generate_deterministic_key_with_size("aes128-key", &["param1"], 16);
+/// assert_eq!(key.len(), 16);
+/// # }
+/// ```
+pub fn generate_deterministic_key_with_size(service_prefix: &str, inputs: &[&str], key_size: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    
+    let mut hasher = Sha256::new();
+    hasher.update(service_prefix.as_bytes());
+    for input in inputs {
+        hasher.update(input.as_bytes());
+    }
+    let hash = hasher.finalize();
+    
+    // Generate key of the requested size by repeating the hash pattern
+    let mut key = vec![0u8; key_size];
+    let hash_bytes = hash.as_slice();
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = hash_bytes[i % hash_bytes.len()];
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

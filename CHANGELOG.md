@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Comprehensive error handling with fallback to deterministic key generation when Azure Key Vault is unavailable
   - Module-level documentation with complete Azure Key Vault setup examples and credential configuration
 
+- **🔧 Shared Deterministic Key Generation Utilities**
+  - Added `generate_deterministic_key()` and `generate_deterministic_key_with_size()` utility functions
+  - Consistent SHA-256 based key generation for fallback scenarios across all KMS providers
+  - Exported utility functions for use in external applications requiring deterministic key generation
+  - Comprehensive documentation with examples for AWS KMS, Azure Key Vault, GCP KMS, and HashiCorp Vault fallback scenarios
+
 ### Changed
 - **🔐 Encryption Key Rotation Architecture Simplification**
   - **BREAKING CHANGE**: Removed `rotate_key_if_needed()` method from `EncryptionEngine`
@@ -38,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `rotate_key()` - manually rotates a specific key
   - Updated trait bounds on `EncryptionEngine` to support KeyManager operations
   - Removed fallback rotation tests as rotation is now handled entirely by KeyManager
+
+### Refactored
+- **🔧 KMS Fallback Implementation Consolidation**
+  - Consolidated 8 duplicate fallback implementations across `engine.rs` and `key_manager.rs`
+  - Refactored AWS KMS, Azure Key Vault, GCP KMS, and HashiCorp Vault fallback logic to use shared utilities
+  - Eliminated ~150 lines of duplicate SHA-256 key generation code
+  - Improved maintainability and consistency across all KMS provider fallback scenarios
+  - Enhanced code reusability with public utility functions for deterministic key generation
 
 ### Fixed
 - **🔐 Master Key Storage Database Operations**

@@ -1578,13 +1578,7 @@ where
         }
 
         // Fallback to deterministic key generation for development/testing
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"aws-kms-master-key");
-        hasher.update(key_id.as_bytes());
-        hasher.update(region.as_bytes());
-        let hash = hasher.finalize();
-        hash[0..32].to_vec()
+        super::generate_deterministic_key("aws-kms-master-key", &[key_id, region])
     }
 
     #[cfg(feature = "encryption")]
@@ -1697,13 +1691,7 @@ where
         }
 
         // Fallback to deterministic key generation for development/testing
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"vault-master-key");
-        hasher.update(secret_path.as_bytes());
-        hasher.update(vault_addr.as_bytes());
-        let hash = hasher.finalize();
-        hash[0..32].to_vec()
+        super::generate_deterministic_key("vault-master-key", &[secret_path, &vault_addr])
     }
 
     #[cfg(feature = "encryption")]
@@ -1786,12 +1774,7 @@ where
         }
 
         // Fallback to deterministic key generation for development/testing
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"gcp-kms-master-key");
-        hasher.update(key_resource.as_bytes());
-        let hash = hasher.finalize();
-        hash[0..32].to_vec()
+        super::generate_deterministic_key("gcp-kms-master-key", &[key_resource])
     }
 
     /// Load master key from Azure Key Vault
@@ -1867,13 +1850,7 @@ where
         }
 
         // Fallback to deterministic key generation for development/testing
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"azure-kv-master-key");
-        hasher.update(vault_url.as_bytes());
-        hasher.update(key_name.as_bytes());
-        let hash = hasher.finalize();
-        hash[0..32].to_vec()
+        super::generate_deterministic_key("azure-kv-master-key", &[&vault_url, key_name])
     }
 
     /// Load key material directly from Azure Key Vault

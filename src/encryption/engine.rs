@@ -667,19 +667,11 @@ where
         }
 
         // Fallback to deterministic key generation for development/testing
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"aws-kms-data-key");
-        hasher.update(key_id.as_bytes());
-        hasher.update(region.as_bytes());
-        let hash = hasher.finalize();
-
-        // Use the hash to generate a key of the expected size
-        let mut key = vec![0u8; expected_size];
-        let hash_bytes = hash.as_slice();
-        for (i, byte) in key.iter_mut().enumerate() {
-            *byte = hash_bytes[i % hash_bytes.len()];
-        }
+        let key = super::generate_deterministic_key_with_size(
+            "aws-kms-data-key",
+            &[key_id, region],
+            expected_size
+        );
 
         Ok(key)
     }
@@ -841,19 +833,11 @@ where
         }
 
         // Fallback to deterministic key generation for development/testing
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"vault-data-key");
-        hasher.update(secret_path.as_bytes());
-        hasher.update(vault_addr.as_bytes());
-        let hash = hasher.finalize();
-
-        // Use the hash to generate a key of the expected size
-        let mut key = vec![0u8; expected_size];
-        let hash_bytes = hash.as_slice();
-        for (i, byte) in key.iter_mut().enumerate() {
-            *byte = hash_bytes[i % hash_bytes.len()];
-        }
+        let key = super::generate_deterministic_key_with_size(
+            "vault-data-key",
+            &[secret_path, &vault_addr],
+            expected_size
+        );
 
         Ok(key)
     }
@@ -947,18 +931,11 @@ where
         }
 
         // Fallback to deterministic key generation for development/testing
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"gcp-kms-data-key");
-        hasher.update(key_resource.as_bytes());
-        let hash = hasher.finalize();
-
-        // Use the hash to generate a key of the expected size
-        let mut key = vec![0u8; expected_size];
-        let hash_bytes = hash.as_slice();
-        for (i, byte) in key.iter_mut().enumerate() {
-            *byte = hash_bytes[i % hash_bytes.len()];
-        }
+        let key = super::generate_deterministic_key_with_size(
+            "gcp-kms-data-key",
+            &[key_resource],
+            expected_size
+        );
 
         Ok(key)
     }
@@ -1062,19 +1039,11 @@ where
         }
 
         // Fallback to deterministic key generation for development/testing
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"azure-kv-data-key");
-        hasher.update(vault_url.as_bytes());
-        hasher.update(key_name.as_bytes());
-        let hash = hasher.finalize();
-
-        // Use the hash to generate a key of the expected size
-        let mut key = vec![0u8; expected_size];
-        let hash_bytes = hash.as_slice();
-        for (i, byte) in key.iter_mut().enumerate() {
-            *byte = hash_bytes[i % hash_bytes.len()];
-        }
+        let key = super::generate_deterministic_key_with_size(
+            "azure-kv-data-key",
+            &[&vault_url, key_name],
+            expected_size
+        );
 
         info!("Using deterministic key generation for Azure Key Vault (fallback)");
         Ok(key)
