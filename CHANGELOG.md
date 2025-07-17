@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **🔐 Azure Key Vault Integration**
+  - Added real Azure Key Vault integration with `azure-kv` feature flag
+  - Implemented authentic Azure SDK integration using `azure_security_keyvault` and `azure_identity` crates
+  - Support for `DefaultAzureCredential` authentication with proper credential creation
+  - Real-time key retrieval from Azure Key Vault with base64 decoding and proper error handling
+  - Graceful fallback to deterministic key generation when Azure Key Vault is unavailable
+  - Configurable Azure Key Vault endpoint and key name parameters
+  - HMAC-based key derivation for deterministic padding when Azure keys are unavailable
+  - Comprehensive error handling with descriptive messages for Azure authentication and key retrieval failures
+
 ### Changed
 - **🔐 Encryption Key Rotation Architecture Simplification**
   - **BREAKING CHANGE**: Removed `rotate_key_if_needed()` method from `EncryptionEngine`

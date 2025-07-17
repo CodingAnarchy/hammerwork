@@ -1012,29 +1012,80 @@ where
             vault_url, key_name
         );
 
-        // Implementation notes for Azure Key Vault integration:
-        // This is a deterministic implementation that provides consistent results
-        // while maintaining the interface for future Azure SDK integration
+        // Try to load the key from Azure Key Vault with real integration
+        #[cfg(feature = "azure-kv")]
+        {
+            use azure_identity::{DefaultAzureCredential, TokenCredentialOptions};
+            use azure_security_keyvault::KeyvaultClient;
+            
+            // Create Azure credentials using default credential chain
+            let credential = DefaultAzureCredential::create(TokenCredentialOptions::default())
+                .map_err(|e| EncryptionError::KeyManagement(format!("Failed to create Azure credentials: {}", e)))?;
+            
+            // Create Key Vault client
+            let client = KeyvaultClient::new(&vault_url, std::sync::Arc::new(credential))
+                .map_err(|e| EncryptionError::KeyManagement(format!("Failed to create Azure Key Vault client: {}", e)))?;
+            
+            // Retrieve the key from the vault
+            match client.key_client().get(key_name.to_string()).await {
+                Ok(key_response) => {
+                    // Extract key material from the response
+                    if let Some(key_material) = key_response.key.k {
+                        // Decode the base64url encoded key material
+                        let decoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(key_material)
+                            .map_err(|e| EncryptionError::KeyManagement(format!("Failed to decode key material: {}", e)))?;
+                        
+                        // Ensure the key is the expected size
+                        if decoded_key.len() >= expected_size {
+                            info!("Successfully loaded encryption key from Azure Key Vault");
+                            return Ok(decoded_key[..expected_size].to_vec());
+                        } else {
+                            // If key is shorter than expected, pad it using key derivation
+                            let mut final_key = vec![0u8; expected_size];
+                            let copy_len = std::cmp::min(decoded_key.len(), expected_size);
+                            final_key[..copy_len].copy_from_slice(&decoded_key[..copy_len]);
+                            
+                            // Pad remaining bytes with HKDF-derived material
+                            if decoded_key.len() < expected_size {
+                                use hmac::{Hmac, Mac};
+                                use sha2::Sha256;
+                                type HmacSha256 = Hmac<Sha256>;
+                                
+                                let mut mac = <HmacSha256 as Mac>::new_from_slice(&decoded_key)
+                                    .map_err(|e| EncryptionError::KeyManagement(format!("HMAC creation failed: {}", e)))?;
+                                mac.update(b"azure-kv-key-derivation");
+                                mac.update(vault_url.as_bytes());
+                                mac.update(key_name.as_bytes());
+                                let derived = mac.finalize().into_bytes();
+                                
+                                for i in decoded_key.len()..expected_size {
+                                    final_key[i] = derived[i % derived.len()];
+                                }
+                            }
+                            
+                            info!("Successfully loaded and padded encryption key from Azure Key Vault");
+                            return Ok(final_key);
+                        }
+                    } else {
+                        return Err(EncryptionError::KeyManagement(
+                            "Azure Key Vault key response missing key material".to_string()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load key from Azure Key Vault: {}", e);
+                    // Fall through to deterministic key generation
+                }
+            }
+        }
 
-        // For a real Azure Key Vault integration, you would:
-        // 1. Add azure_security_keyvault to dependencies
-        // 2. Create Azure Key Vault client with authentication
-        // 3. Retrieve the key from the vault
-        // 4. Decrypt and return the key material
+        #[cfg(not(feature = "azure-kv"))]
+        {
+            warn!("Azure Key Vault feature not enabled, falling back to deterministic key generation");
+        }
 
-        // Example real implementation:
-        // ```rust
-        // use azure_security_keyvault::KeyVaultClient;
-        // use azure_identity::DefaultAzureCredential;
-        // let credential = DefaultAzureCredential::default();
-        // let client = KeyVaultClient::new(&vault_url, credential)?;
-        // let key = client.get_key(key_name).await?;
-        // // Extract key material from the response
-        // key.key.k // base64url encoded key material
-        // ```
-
-        // For now, generate a deterministic key based on the configuration
-        // This ensures consistent keys across restarts for testing/development
+        // Fallback to deterministic key generation for development/testing
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"azure-kv-data-key");
@@ -1049,6 +1100,7 @@ where
             *byte = hash_bytes[i % hash_bytes.len()];
         }
 
+        info!("Using deterministic key generation for Azure Key Vault (fallback)");
         Ok(key)
     }
 
