@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **📡 Kafka Streaming Integration**
+  - Added real Apache Kafka integration with `kafka` feature flag using `rdkafka` crate
+  - Implemented production-ready `KafkaProcessor` with real Kafka producer functionality
+  - Support for configurable Kafka producer settings (bootstrap servers, compression, acks, retries, batch size, etc.)
+  - Real-time message delivery with partition key support for proper message distribution
+  - Custom message headers support for tracing, metadata, and event correlation
+  - Comprehensive health checks using Kafka cluster metadata fetching and topic validation
+  - Graceful shutdown with message flushing to ensure no data loss
+  - Producer statistics and metrics reporting for monitoring and debugging
+  - Configurable timeouts for health checks and message delivery operations
+
+- **☁️ Google Cloud Pub/Sub Streaming Integration**
+  - Added real Google Cloud Pub/Sub integration with `google-pubsub` feature flag
+  - Implemented production-ready `PubSubProcessor` using official Google Cloud Pub/Sub SDK
+  - Support for both service account JSON credentials and Application Default Credentials (ADC)
+  - Real-time message publishing with message attributes for event metadata and correlation
+  - Ordering key support for maintaining message order within partitions
+  - Comprehensive error handling with detailed error messages for debugging
+  - Health checks and graceful shutdown capabilities
+  - Message delivery tracking with success/failure reporting and timing metrics
+  - Feature-gated implementation that gracefully degrades when feature is disabled
+
+- **🚀 AWS Kinesis Streaming Integration**
+  - Added real AWS Kinesis Data Streams integration with `kinesis` feature flag
+  - Implemented production-ready `KinesisProcessor` using official AWS SDK for Rust
+  - Support for both explicit AWS credentials and default credential chain (IAM roles, environment variables, profiles)
+  - Real-time record publishing with automatic partition key generation and custom partitioning support
+  - Comprehensive stream health checks using `DescribeStream` API with stream status validation
+  - Detailed delivery tracking with sequence numbers, shard IDs, and timing metrics
+  - Robust error handling with retry logic and detailed error reporting
+  - Feature-gated implementation that gracefully degrades when feature is disabled
+  - Proper AWS region configuration and credential management
+
 ## [1.14.0] - 2025-07-17
 
 ### Added

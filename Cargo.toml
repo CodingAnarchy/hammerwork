@@ -109,6 +109,10 @@ google-cloud-auth = { version = "0.4", optional = true }
 vaultrs = { version = "0.7", optional = true }
 azure_security_keyvault = { version = "0.20", optional = true }
 azure_identity = { version = "0.20", optional = true }
+rdkafka = { version = "0.36", optional = true }
+google-cloud-pubsub = { version = "0.25", optional = true }
+google-cloud-googleapis = { version = "0.13", optional = true }
+aws-sdk-kinesis = { version = "1.0", optional = true }
 
 [features]
 default = ["metrics", "alerting", "webhooks"]
@@ -122,6 +126,9 @@ aws-kms = ["aws-sdk-kms", "aws-config"]
 gcp-kms = ["google-cloud-kms", "google-cloud-auth"]
 vault-kms = ["vaultrs"]
 azure-kv = ["azure_security_keyvault", "azure_identity"]
+kafka = ["rdkafka"]
+google-pubsub = ["google-cloud-pubsub", "google-cloud-auth", "google-cloud-googleapis"]
+kinesis = ["aws-sdk-kinesis", "aws-config"]
 tracing = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 test = []
 

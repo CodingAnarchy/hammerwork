@@ -138,6 +138,31 @@ use crate::{
     HammerworkError,
     events::{EventFilter, EventManager, EventSubscription, JobLifecycleEvent},
 };
+
+#[cfg(feature = "kafka")]
+use rdkafka::{
+    producer::{FutureProducer, FutureRecord, Producer},
+    message::{Header, OwnedHeaders},
+    ClientConfig,
+};
+
+#[cfg(feature = "google-pubsub")]
+use google_cloud_pubsub::{
+    client::{Client, ClientConfig as PubSubClientConfig},
+    publisher::Publisher,
+};
+
+#[cfg(feature = "google-pubsub")]
+use google_cloud_pubsub::client::google_cloud_auth::credentials::CredentialsFile;
+
+#[cfg(feature = "google-pubsub")]
+use google_cloud_googleapis::pubsub::v1::PubsubMessage;
+
+#[cfg(feature = "kinesis")]
+use aws_sdk_kinesis::{Client as KinesisClient, config::Region};
+
+#[cfg(feature = "kinesis")]
+use aws_config::BehaviorVersion;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -1428,13 +1453,62 @@ impl StreamManager {
     }
 }
 
-/// Placeholder Kafka processor (would be implemented with rdkafka in production)
+#[cfg(feature = "kafka")]
+/// Kafka processor with real rdkafka implementation
+pub struct KafkaProcessor {
+    producer: FutureProducer,
+    topic: String,
+    config: HashMap<String, String>,
+}
+
+#[cfg(not(feature = "kafka"))]
+/// Placeholder Kafka processor (requires kafka feature flag)
 pub struct KafkaProcessor {
     brokers: Vec<String>,
     topic: String,
     config: HashMap<String, String>,
 }
 
+#[cfg(feature = "kafka")]
+impl KafkaProcessor {
+    pub async fn new(
+        brokers: Vec<String>,
+        topic: String,
+        config: HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        let mut client_config = ClientConfig::new();
+        
+        // Set basic configuration
+        client_config.set("bootstrap.servers", brokers.join(","));
+        
+        // Apply custom configuration
+        for (key, value) in &config {
+            client_config.set(key, value);
+        }
+        
+        // Set defaults if not provided
+        if !config.contains_key("message.timeout.ms") {
+            client_config.set("message.timeout.ms", "5000");
+        }
+        if !config.contains_key("queue.buffering.max.messages") {
+            client_config.set("queue.buffering.max.messages", "100000");
+        }
+        
+        let producer: FutureProducer = client_config
+            .create()
+            .map_err(|e| HammerworkError::Streaming {
+                message: format!("Failed to create Kafka producer: {}", e),
+            })?;
+        
+        Ok(Self {
+            producer,
+            topic,
+            config,
+        })
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
 impl KafkaProcessor {
     pub async fn new(
         brokers: Vec<String>,
@@ -1449,12 +1523,202 @@ impl KafkaProcessor {
     }
 }
 
+#[cfg(feature = "kafka")]
 #[async_trait::async_trait]
 impl StreamProcessor for KafkaProcessor {
     async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
-        // Placeholder implementation - in production this would use rdkafka
-        // Configuration options could include: compression, acks, retries, batch.size, etc.
+        let mut deliveries = Vec::new();
+        
+        // Send events to Kafka
+        for event in events {
+            let delivery_start = Utc::now();
+            
+            // Create Kafka record
+            let mut record = FutureRecord::to(&self.topic)
+                .payload(&event.serialized_data);
+            
+            // Add partition key if available
+            if let Some(ref key) = event.partition_key {
+                record = record.key(key);
+            }
+            
+            // Add headers
+            if !event.headers.is_empty() {
+                let mut headers = OwnedHeaders::new();
+                for (header_key, header_value) in &event.headers {
+                    headers = headers.insert(Header {
+                        key: header_key,
+                        value: Some(header_value),
+                    });
+                }
+                record = record.headers(headers);
+            }
+            
+            // Send the message
+            let result = self.producer.send(record, tokio::time::Duration::from_secs(5)).await;
+            
+            let delivery_end = Utc::now();
+            let duration_ms = delivery_end
+                .signed_duration_since(delivery_start)
+                .num_milliseconds()
+                .max(0) as u64;
+            
+            let (success, error_message, partition) = match result {
+                Ok((partition, offset)) => {
+                    tracing::debug!(
+                        "Message delivered to partition {} at offset {}",
+                        partition,
+                        offset
+                    );
+                    (true, None, Some(partition.to_string()))
+                }
+                Err((kafka_error, _)) => {
+                    let error_msg = format!("Kafka delivery failed: {}", kafka_error);
+                    tracing::error!("{}", error_msg);
+                    (false, Some(error_msg), event.partition_key)
+                }
+            };
+            
+            deliveries.push(StreamDelivery {
+                delivery_id: Uuid::new_v4(),
+                stream_id: Uuid::new_v4(), // Would be passed in from context
+                event_id: event.event.event_id,
+                success,
+                error_message,
+                attempted_at: delivery_start,
+                duration_ms: Some(duration_ms),
+                attempt_number: 1,
+                partition,
+            });
+        }
+        
+        Ok(deliveries)
+    }
 
+    async fn health_check(&self) -> crate::Result<bool> {
+        let health_check_timeout_ms = self
+            .config
+            .get("health.check.timeout.ms")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5000);
+        
+        // Get cluster metadata to verify connectivity
+        let timeout = tokio::time::Duration::from_millis(health_check_timeout_ms);
+        
+        // Try to get metadata (doesn't actually send the message)
+        let result = tokio::task::spawn_blocking({
+            let producer = self.producer.clone();
+            let topic = self.topic.clone();
+            move || {
+                producer.client().fetch_metadata(Some(&topic), timeout)
+            }
+        }).await;
+        
+        let health_result = match result {
+            Ok(metadata_result) => match metadata_result {
+                Ok(metadata) => {
+                    let topic_metadata = metadata.topics().iter()
+                        .find(|t| t.name() == self.topic);
+                    
+                    match topic_metadata {
+                        Some(topic) => {
+                            if topic.partitions().is_empty() {
+                                tracing::warn!("Topic {} has no partitions", self.topic);
+                                false
+                            } else {
+                                tracing::debug!("Kafka health check passed for topic {}", self.topic);
+                                true
+                            }
+                        }
+                        None => {
+                            tracing::warn!("Topic {} not found in metadata", self.topic);
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Kafka health check failed: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                tracing::error!("Kafka health check task failed: {}", e);
+                false
+            }
+        };
+        
+        Ok(health_result)
+    }
+
+    async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "type".to_string(),
+            serde_json::Value::String("kafka".to_string()),
+        );
+        
+        // Get broker information from producer configuration
+        let brokers = self.config.get("bootstrap.servers")
+            .map(|b| b.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        
+        stats.insert(
+            "brokers".to_string(),
+            serde_json::Value::Array(
+                brokers
+                    .iter()
+                    .map(|b| serde_json::Value::String(b.clone()))
+                    .collect(),
+            ),
+        );
+        stats.insert(
+            "topic".to_string(),
+            serde_json::Value::String(self.topic.clone()),
+        );
+        
+        // Include basic producer statistics (if available)
+        // Note: rdkafka statistics might not be available in all configurations
+        stats.insert("producer_available".to_string(), serde_json::Value::Bool(true));
+        
+        stats.insert(
+            "config".to_string(),
+            serde_json::Value::Object(
+                self.config
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect(),
+            ),
+        );
+        Ok(stats)
+    }
+
+    async fn shutdown(&self) -> crate::Result<()> {
+        // Flush any pending messages and gracefully shutdown
+        let producer = self.producer.clone();
+        let flush_result = tokio::task::spawn_blocking(move || {
+            producer.flush(tokio::time::Duration::from_secs(10))
+        }).await;
+        
+        match flush_result {
+            Ok(Ok(())) => {
+                tracing::debug!("Kafka producer flushed successfully during shutdown");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Error flushing Kafka producer during shutdown: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!("Flush task failed during shutdown: {}", e);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
+#[async_trait::async_trait]
+impl StreamProcessor for KafkaProcessor {
+    async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
+        // Placeholder implementation - requires kafka feature flag
         let start_time = Utc::now();
         let mut deliveries = Vec::new();
 
@@ -1504,9 +1768,7 @@ impl StreamProcessor for KafkaProcessor {
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
-        // In production, this would connect to Kafka brokers and check their health
-        // Configuration could include timeout settings, retry policies, etc.
-
+        // Placeholder implementation - requires kafka feature flag
         let health_check_timeout_ms = self
             .config
             .get("health.check.timeout.ms")
@@ -1565,7 +1827,19 @@ impl StreamProcessor for KafkaProcessor {
     }
 }
 
-/// Placeholder Kinesis processor (would be implemented with AWS SDK in production)
+/// AWS Kinesis processor for streaming job events
+#[cfg(feature = "kinesis")]
+pub struct KinesisProcessor {
+    region: String,
+    stream_name: String,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    config: HashMap<String, String>,
+    client: KinesisClient,
+}
+
+/// Placeholder Kinesis processor when kinesis feature is disabled
+#[cfg(not(feature = "kinesis"))]
 pub struct KinesisProcessor {
     region: String,
     stream_name: String,
@@ -1574,6 +1848,53 @@ pub struct KinesisProcessor {
     config: HashMap<String, String>,
 }
 
+#[cfg(feature = "kinesis")]
+impl KinesisProcessor {
+    pub async fn new(
+        region: String,
+        stream_name: String,
+        access_key_id: Option<String>,
+        secret_access_key: Option<String>,
+        config: HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        // Initialize AWS configuration
+        let aws_config = if let (Some(access_key), Some(secret_key)) = (&access_key_id, &secret_access_key) {
+            // Use provided credentials
+            let credentials = aws_sdk_kinesis::config::Credentials::new(
+                access_key,
+                secret_key,
+                None, // session token
+                None, // expiry
+                "hammerwork"
+            );
+            
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new(region.clone()))
+                .credentials_provider(credentials)
+                .load()
+                .await
+        } else {
+            // Use default credential chain (IAM roles, environment variables, etc.)
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new(region.clone()))
+                .load()
+                .await
+        };
+
+        let client = KinesisClient::new(&aws_config);
+
+        Ok(Self {
+            region,
+            stream_name,
+            access_key_id,
+            secret_access_key,
+            config,
+            client,
+        })
+    }
+}
+
+#[cfg(not(feature = "kinesis"))]
 impl KinesisProcessor {
     pub async fn new(
         region: String,
@@ -1592,57 +1913,108 @@ impl KinesisProcessor {
     }
 }
 
+#[cfg(feature = "kinesis")]
 #[async_trait::async_trait]
 impl StreamProcessor for KinesisProcessor {
     async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
-        // Placeholder implementation
+        let start_time = std::time::Instant::now();
         let mut deliveries = Vec::new();
+        
         for event in events {
-            deliveries.push(StreamDelivery {
-                delivery_id: Uuid::new_v4(),
-                stream_id: Uuid::new_v4(), // Would be passed in
-                event_id: event.event.event_id,
-                success: true,
-                error_message: None,
-                attempted_at: Utc::now(),
-                duration_ms: Some(100),
-                attempt_number: 1,
-                partition: event.partition_key,
+            let delivery_start = std::time::Instant::now();
+            let delivery_id = Uuid::new_v4();
+            
+            // Serialize the event to JSON
+            let payload = serde_json::to_vec(&event.event)
+                .map_err(|e| HammerworkError::Streaming { message: format!("Failed to serialize event: {}", e) })?;
+            
+            // Create Kinesis record
+            let partition_key = event.partition_key.clone().unwrap_or_else(|| {
+                // Use event ID as fallback partition key
+                event.event.event_id.to_string()
             });
+            
+            let put_result = self.client
+                .put_record()
+                .stream_name(&self.stream_name)
+                .data(aws_sdk_kinesis::primitives::Blob::new(payload))
+                .partition_key(&partition_key)
+                .send()
+                .await;
+            
+            let delivery = match put_result {
+                Ok(output) => {
+                    let sequence_number = output.sequence_number();
+                    let shard_id = output.shard_id();
+                    tracing::debug!("Published event to Kinesis: sequence={}, shard={}", sequence_number, shard_id);
+                    
+                    StreamDelivery {
+                        delivery_id,
+                        stream_id: Uuid::new_v4(), // Would be passed from StreamManager
+                        event_id: event.event.event_id,
+                        success: true,
+                        error_message: None,
+                        attempted_at: Utc::now(),
+                        duration_ms: Some(delivery_start.elapsed().as_millis() as u64),
+                        attempt_number: 1,
+                        partition: Some(partition_key),
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to publish to Kinesis: {}", e);
+                    tracing::error!("{}", error_msg);
+                    
+                    StreamDelivery {
+                        delivery_id,
+                        stream_id: Uuid::new_v4(),
+                        event_id: event.event.event_id,
+                        success: false,
+                        error_message: Some(error_msg),
+                        attempted_at: Utc::now(),
+                        duration_ms: Some(delivery_start.elapsed().as_millis() as u64),
+                        attempt_number: 1,
+                        partition: Some(partition_key),
+                    }
+                }
+            };
+            
+            deliveries.push(delivery);
         }
+        
+        tracing::info!("Sent {} events to Kinesis stream '{}' in {}ms", 
+                      deliveries.len(), 
+                      self.stream_name, 
+                      start_time.elapsed().as_millis());
+        
         Ok(deliveries)
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
-        // In production, this would validate AWS credentials and check Kinesis stream status
-        // Configuration could include retry policies, credential validation, etc.
-
-        // Check if we have credentials configured
-        let has_credentials = self.access_key_id.is_some() && self.secret_access_key.is_some();
-
-        if !has_credentials {
-            tracing::warn!("Kinesis health check: No AWS credentials configured");
-            return Ok(false);
+        // Try to describe the stream to verify connectivity and access
+        match self.client.describe_stream().stream_name(&self.stream_name).send().await {
+            Ok(output) => {
+                if let Some(stream_description) = output.stream_description() {
+                    let status = stream_description.stream_status();
+                    tracing::debug!("Kinesis stream '{}' status: {:?}", self.stream_name, status);
+                    // Consider stream healthy if it's ACTIVE or UPDATING
+                    match status {
+                        aws_sdk_kinesis::types::StreamStatus::Active | 
+                        aws_sdk_kinesis::types::StreamStatus::Updating => Ok(true),
+                        _ => {
+                            tracing::warn!("Kinesis stream '{}' is not in a healthy state: {:?}", self.stream_name, status);
+                            Ok(false)
+                        }
+                    }
+                } else {
+                    tracing::warn!("Kinesis stream '{}' description not available", self.stream_name);
+                    Ok(false)
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Kinesis health check failed for stream '{}': {}", self.stream_name, e);
+                Ok(false)
+            }
         }
-
-        // Simulate credential validation and stream health check
-        let health_timeout = self
-            .config
-            .get("health.check.timeout.ms")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(10000);
-
-        tokio::time::timeout(tokio::time::Duration::from_millis(health_timeout), async {
-            tracing::debug!(
-                "Checking Kinesis stream health: {} in region {}",
-                self.stream_name,
-                self.region
-            );
-            // In real implementation, would call AWS Kinesis DescribeStream
-            Ok(true)
-        })
-        .await
-        .unwrap_or(Ok(false))
     }
 
     async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
@@ -1658,6 +2030,10 @@ impl StreamProcessor for KinesisProcessor {
         stats.insert(
             "stream_name".to_string(),
             serde_json::Value::String(self.stream_name.clone()),
+        );
+        stats.insert(
+            "credentials_configured".to_string(),
+            serde_json::Value::Bool(self.access_key_id.is_some() && self.secret_access_key.is_some()),
         );
         if let Some(ref access_key_id) = self.access_key_id {
             stats.insert(
@@ -1677,6 +2053,72 @@ impl StreamProcessor for KinesisProcessor {
                     .collect(),
             ),
         );
+        stats.insert(
+            "feature_enabled".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        Ok(stats)
+    }
+
+    async fn shutdown(&self) -> crate::Result<()> {
+        // AWS SDK clients don't require explicit shutdown
+        tracing::info!("Kinesis processor shutdown for stream '{}'.", self.stream_name);
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "kinesis"))]
+#[async_trait::async_trait]
+impl StreamProcessor for KinesisProcessor {
+    async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
+        // Placeholder implementation when feature is disabled
+        let mut deliveries = Vec::new();
+        for event in events {
+            deliveries.push(StreamDelivery {
+                delivery_id: Uuid::new_v4(),
+                stream_id: Uuid::new_v4(),
+                event_id: event.event.event_id,
+                success: false,
+                error_message: Some("AWS Kinesis feature not enabled. Enable 'kinesis' feature to use this backend.".to_string()),
+                attempted_at: Utc::now(),
+                duration_ms: Some(0),
+                attempt_number: 1,
+                partition: event.partition_key,
+            });
+        }
+        Ok(deliveries)
+    }
+
+    async fn health_check(&self) -> crate::Result<bool> {
+        Ok(false) // Always unhealthy when feature is disabled
+    }
+
+    async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "type".to_string(),
+            serde_json::Value::String("kinesis".to_string()),
+        );
+        stats.insert(
+            "region".to_string(),
+            serde_json::Value::String(self.region.clone()),
+        );
+        stats.insert(
+            "stream_name".to_string(),
+            serde_json::Value::String(self.stream_name.clone()),
+        );
+        stats.insert(
+            "credentials_configured".to_string(),
+            serde_json::Value::Bool(self.access_key_id.is_some() && self.secret_access_key.is_some()),
+        );
+        stats.insert(
+            "feature_enabled".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        stats.insert(
+            "error".to_string(),
+            serde_json::Value::String("AWS Kinesis feature not enabled".to_string()),
+        );
         Ok(stats)
     }
 
@@ -1685,7 +2127,18 @@ impl StreamProcessor for KinesisProcessor {
     }
 }
 
-/// Placeholder Pub/Sub processor (would be implemented with Google Cloud SDK in production)
+/// Google Cloud Pub/Sub processor for streaming job events
+#[cfg(feature = "google-pubsub")]
+pub struct PubSubProcessor {
+    project_id: String,
+    topic_name: String,
+    service_account_key: Option<String>,
+    config: HashMap<String, String>,
+    publisher: Publisher,
+}
+
+/// Placeholder Pub/Sub processor when google-pubsub feature is disabled
+#[cfg(not(feature = "google-pubsub"))]
 pub struct PubSubProcessor {
     project_id: String,
     topic_name: String,
@@ -1693,6 +2146,50 @@ pub struct PubSubProcessor {
     config: HashMap<String, String>,
 }
 
+#[cfg(feature = "google-pubsub")]
+impl PubSubProcessor {
+    pub async fn new(
+        project_id: String,
+        topic_name: String,
+        service_account_key: Option<String>,
+        config: HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        // Initialize Google Cloud Pub/Sub client
+        let client_config = if let Some(service_account_json) = &service_account_key {
+            // Use provided service account credentials
+            let credentials = serde_json::from_str::<CredentialsFile>(service_account_json)
+                .map_err(|e| HammerworkError::Streaming { message: format!("Invalid service account credentials: {}", e) })?;
+            
+            PubSubClientConfig::default()
+                .with_credentials(credentials)
+                .await
+                .map_err(|e| HammerworkError::Streaming { message: format!("Failed to configure Pub/Sub client: {}", e) })?
+        } else {
+            // Use default credentials (Application Default Credentials)
+            PubSubClientConfig::default()
+                .with_auth()
+                .await
+                .map_err(|e| HammerworkError::Streaming { message: format!("Failed to initialize Pub/Sub client with default credentials: {}", e) })?
+        };
+
+        let client = Client::new(client_config)
+            .await
+            .map_err(|e| HammerworkError::Streaming { message: format!("Failed to create Pub/Sub client: {}", e) })?;
+
+        let topic = client.topic(&topic_name);
+        let publisher = topic.new_publisher(None);
+
+        Ok(Self {
+            project_id,
+            topic_name,
+            service_account_key,
+            config,
+            publisher,
+        })
+    }
+}
+
+#[cfg(not(feature = "google-pubsub"))]
 impl PubSubProcessor {
     pub async fn new(
         project_id: String,
@@ -1709,28 +2206,92 @@ impl PubSubProcessor {
     }
 }
 
+#[cfg(feature = "google-pubsub")]
 #[async_trait::async_trait]
 impl StreamProcessor for PubSubProcessor {
     async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
-        // Placeholder implementation
+        let start_time = std::time::Instant::now();
         let mut deliveries = Vec::new();
+        
         for event in events {
-            deliveries.push(StreamDelivery {
-                delivery_id: Uuid::new_v4(),
-                stream_id: Uuid::new_v4(), // Would be passed in
-                event_id: event.event.event_id,
-                success: true,
-                error_message: None,
-                attempted_at: Utc::now(),
-                duration_ms: Some(75),
-                attempt_number: 1,
-                partition: event.partition_key,
-            });
+            let delivery_start = std::time::Instant::now();
+            let delivery_id = Uuid::new_v4();
+            
+            // Serialize the event to JSON
+            let payload = serde_json::to_vec(&event.event)
+                .map_err(|e| HammerworkError::Streaming { message: format!("Failed to serialize event: {}", e) })?;
+            
+            // Create message attributes
+            let mut attributes = std::collections::HashMap::new();
+            attributes.insert("event_id".to_string(), event.event.event_id.to_string());
+            attributes.insert("job_id".to_string(), event.event.job_id.to_string());
+            attributes.insert("queue_name".to_string(), event.event.queue_name.clone());
+            attributes.insert("event_type".to_string(), format!("{:?}", event.event.event_type));
+            attributes.insert("timestamp".to_string(), event.event.timestamp.to_rfc3339());
+            
+            if let Some(partition_key) = &event.partition_key {
+                attributes.insert("partition_key".to_string(), partition_key.clone());
+            }
+            
+            // Create PubsubMessage
+            let message = PubsubMessage {
+                data: payload,
+                attributes,
+                message_id: String::new(),
+                publish_time: None,
+                ordering_key: event.partition_key.clone().unwrap_or_default(),
+            };
+            
+            // Publish the message using the publisher
+            let awaiter = self.publisher.publish(message).await;
+            
+            let delivery = match awaiter.get().await {
+                Ok(message_id) => {
+                    tracing::debug!("Published message to Pub/Sub: {}", message_id);
+                    StreamDelivery {
+                        delivery_id,
+                        stream_id: Uuid::new_v4(), // Would be passed from StreamManager
+                        event_id: event.event.event_id,
+                        success: true,
+                        error_message: None,
+                        attempted_at: Utc::now(),
+                        duration_ms: Some(delivery_start.elapsed().as_millis() as u64),
+                        attempt_number: 1,
+                        partition: event.partition_key,
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to publish to Pub/Sub: {}", e);
+                    tracing::error!("{}", error_msg);
+                    StreamDelivery {
+                        delivery_id,
+                        stream_id: Uuid::new_v4(),
+                        event_id: event.event.event_id,
+                        success: false,
+                        error_message: Some(error_msg),
+                        attempted_at: Utc::now(),
+                        duration_ms: Some(delivery_start.elapsed().as_millis() as u64),
+                        attempt_number: 1,
+                        partition: event.partition_key,
+                    }
+                }
+            };
+            
+            deliveries.push(delivery);
         }
+        
+        tracing::info!("Sent {} events to Pub/Sub topic '{}' in {}ms", 
+                      deliveries.len(), 
+                      self.topic_name, 
+                      start_time.elapsed().as_millis());
+        
         Ok(deliveries)
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
+        // For now, just return true as the publisher will handle connection errors
+        // A more sophisticated health check could try to publish a test message
+        tracing::debug!("Pub/Sub health check for topic '{}'.", self.topic_name);
         Ok(true)
     }
 
@@ -1748,12 +2309,10 @@ impl StreamProcessor for PubSubProcessor {
             "topic_name".to_string(),
             serde_json::Value::String(self.topic_name.clone()),
         );
-        if self.service_account_key.is_some() {
-            stats.insert(
-                "service_account_configured".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
+        stats.insert(
+            "service_account_configured".to_string(),
+            serde_json::Value::Bool(self.service_account_key.is_some()),
+        );
         stats.insert(
             "config".to_string(),
             serde_json::Value::Object(
@@ -1762,6 +2321,77 @@ impl StreamProcessor for PubSubProcessor {
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect(),
             ),
+        );
+        
+        // Add publisher stats if available
+        // Note: google-cloud-pubsub doesn't expose detailed publisher stats
+        // This would be enhanced with custom metrics collection
+        stats.insert(
+            "feature_enabled".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        
+        Ok(stats)
+    }
+
+    async fn shutdown(&self) -> crate::Result<()> {
+        // The publisher will be dropped and cleaned up automatically
+        tracing::info!("Pub/Sub publisher shutdown for topic '{}'.", self.topic_name);
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "google-pubsub"))]
+#[async_trait::async_trait]
+impl StreamProcessor for PubSubProcessor {
+    async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
+        // Placeholder implementation when feature is disabled
+        let mut deliveries = Vec::new();
+        for event in events {
+            deliveries.push(StreamDelivery {
+                delivery_id: Uuid::new_v4(),
+                stream_id: Uuid::new_v4(),
+                event_id: event.event.event_id,
+                success: false,
+                error_message: Some("Google Pub/Sub feature not enabled. Enable 'google-pubsub' feature to use this backend.".to_string()),
+                attempted_at: Utc::now(),
+                duration_ms: Some(0),
+                attempt_number: 1,
+                partition: event.partition_key,
+            });
+        }
+        Ok(deliveries)
+    }
+
+    async fn health_check(&self) -> crate::Result<bool> {
+        Ok(false) // Always unhealthy when feature is disabled
+    }
+
+    async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "type".to_string(),
+            serde_json::Value::String("pubsub".to_string()),
+        );
+        stats.insert(
+            "project_id".to_string(),
+            serde_json::Value::String(self.project_id.clone()),
+        );
+        stats.insert(
+            "topic_name".to_string(),
+            serde_json::Value::String(self.topic_name.clone()),
+        );
+        stats.insert(
+            "service_account_configured".to_string(),
+            serde_json::Value::Bool(self.service_account_key.is_some()),
+        );
+        stats.insert(
+            "feature_enabled".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        stats.insert(
+            "error".to_string(),
+            serde_json::Value::String("Google Pub/Sub feature not enabled".to_string()),
         );
         Ok(stats)
     }
@@ -2198,7 +2828,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(processor.brokers.len(), 1);
         assert_eq!(processor.topic, "test-topic");
     }
 
