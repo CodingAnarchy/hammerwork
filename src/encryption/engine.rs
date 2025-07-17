@@ -535,30 +535,6 @@ where
             })
     }
 
-    /// Rotates the encryption key according to the configuration.
-    ///
-    /// If key rotation is enabled, this method will generate a new key
-    /// and update the key store. Old keys are retained for decryption
-    /// of existing encrypted data.
-    ///
-    /// # Returns
-    ///
-    /// The new key identifier if rotation was performed.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # #[cfg(feature = "encryption")]
-    /// # {
-    /// # async fn example(mut engine: hammerwork::encryption::EncryptionEngine) -> Result<(), Box<dyn std::error::Error>> {
-    /// if let Some(new_key_id) = engine.rotate_key_if_needed().await? {
-    ///     println!("Key rotated to: {}", new_key_id);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// # }
-    /// ```
-    
     /// Sets the key manager for the encryption engine.
     ///
     /// This enables the engine to use proper key metadata for rotation decisions

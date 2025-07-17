@@ -25,7 +25,8 @@
 //! use sqlx::{postgres::PgPool, Pool};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! # let database_url = "postgres://user:pass@localhost/hammerwork";\n//! # let pool = sqlx::PgPool::connect(database_url).await?;
+//! # let database_url = "postgres://user:pass@localhost/hammerwork";
+//! # let pool = sqlx::PgPool::connect(database_url).await?;
 //! let config = KeyManagerConfig::new()
 //!     .with_master_key_env("MASTER_KEY")
 //!     .with_auto_rotation_enabled(true);
@@ -37,6 +38,56 @@
 //!
 //! // Use the key for encryption operations
 //! let key_material = key_manager.get_key(&key_id).await?;
+//! # Ok(())
+//! # }
+//! # }
+//! ```
+//!
+//! ## Key Rotation Workflow
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "encryption")]
+//! # {
+//! use hammerwork::encryption::{KeyManager, EncryptionAlgorithm, KeyManagerConfig};
+//! use sqlx::postgres::PgPool;
+//! use chrono::Duration;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let database_url = "postgres://user:pass@localhost/hammerwork";
+//! # let pool = sqlx::PgPool::connect(database_url).await?;
+//! // Configure key manager with automatic rotation
+//! let config = KeyManagerConfig::new()
+//!     .with_master_key_env("MASTER_KEY")
+//!     .with_auto_rotation_enabled(true)
+//!     .with_rotation_interval(Duration::days(30))
+//!     .with_max_key_versions(5);
+//!
+//! let mut key_manager = KeyManager::new(config, pool).await?;
+//!
+//! // Generate initial key
+//! let key_id = key_manager.generate_key("user-data-key", EncryptionAlgorithm::AES256GCM).await?;
+//! println!("Initial key generated: {}", key_id);
+//!
+//! // Check if key needs rotation
+//! if key_manager.is_key_due_for_rotation(&key_id).await? {
+//!     println!("Key is due for rotation");
+//!     
+//!     // Rotate the key
+//!     let new_version = key_manager.rotate_key(&key_id).await?;
+//!     println!("Key rotated to version: {}", new_version);
+//!     
+//!     // Update rotation schedule
+//!     key_manager.update_key_rotation_schedule(&key_id, None).await?;
+//! }
+//!
+//! // Perform automatic rotation for all keys
+//! let rotated_keys = key_manager.perform_automatic_rotation().await?;
+//! println!("Automatically rotated {} keys", rotated_keys.len());
+//!
+//! // Get key management statistics
+//! let stats = key_manager.get_stats().await?;
+//! println!("Total keys: {}, Rotations performed: {}", 
+//!          stats.total_keys, stats.rotations_performed);
 //! # Ok(())
 //! # }
 //! # }
@@ -339,47 +390,184 @@ impl Default for KeyDerivationConfig {
 
 impl KeyManagerConfig {
     /// Create a new key manager configuration
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManagerConfig, KeySource};
+    /// use chrono::Duration;
+    ///
+    /// // Create default configuration
+    /// let config = KeyManagerConfig::new();
+    /// assert_eq!(config.auto_rotation_enabled, false);
+    /// assert_eq!(config.max_key_versions, 10);
+    /// assert_eq!(config.audit_enabled, true);
+    /// # }
+    /// ```
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the master key source
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManagerConfig, KeySource};
+    ///
+    /// let config = KeyManagerConfig::new()
+    ///     .with_master_key_source(KeySource::Static("my-master-key".to_string()));
+    /// # }
+    /// ```
     pub fn with_master_key_source(mut self, source: KeySource) -> Self {
         self.master_key_source = source;
         self
     }
 
     /// Set the master key from an environment variable
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManagerConfig, KeySource};
+    ///
+    /// let config = KeyManagerConfig::new()
+    ///     .with_master_key_env("MASTER_KEY");
+    ///
+    /// // This is equivalent to:
+    /// let config2 = KeyManagerConfig::new()
+    ///     .with_master_key_source(KeySource::Environment("MASTER_KEY".to_string()));
+    /// # }
+    /// ```
     pub fn with_master_key_env(mut self, env_var: &str) -> Self {
         self.master_key_source = KeySource::Environment(env_var.to_string());
         self
     }
 
     /// Enable or disable automatic key rotation
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::KeyManagerConfig;
+    /// use chrono::Duration;
+    ///
+    /// let config = KeyManagerConfig::new()
+    ///     .with_auto_rotation_enabled(true)
+    ///     .with_rotation_interval(Duration::days(30));
+    ///
+    /// assert_eq!(config.auto_rotation_enabled, true);
+    /// # }
+    /// ```
     pub fn with_auto_rotation_enabled(mut self, enabled: bool) -> Self {
         self.auto_rotation_enabled = enabled;
         self
     }
 
     /// Set the default rotation interval
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::KeyManagerConfig;
+    /// use chrono::Duration;
+    ///
+    /// // Rotate keys every 30 days
+    /// let config = KeyManagerConfig::new()
+    ///     .with_rotation_interval(Duration::days(30));
+    ///
+    /// // Or rotate keys every 24 hours for high-security scenarios
+    /// let config2 = KeyManagerConfig::new()
+    ///     .with_rotation_interval(Duration::hours(24));
+    /// # }
+    /// ```
     pub fn with_rotation_interval(mut self, interval: Duration) -> Self {
         self.default_rotation_interval = interval;
         self
     }
 
     /// Set the maximum number of key versions to retain
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::KeyManagerConfig;
+    ///
+    /// // Keep only 5 versions of each key
+    /// let config = KeyManagerConfig::new()
+    ///     .with_max_key_versions(5);
+    ///
+    /// // Keep up to 50 versions for compliance requirements
+    /// let config2 = KeyManagerConfig::new()
+    ///     .with_max_key_versions(50);
+    /// # }
+    /// ```
     pub fn with_max_key_versions(mut self, max_versions: u32) -> Self {
         self.max_key_versions = max_versions;
         self
     }
 
     /// Enable or disable key usage auditing
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::KeyManagerConfig;
+    ///
+    /// // Disable auditing for performance-critical applications
+    /// let config = KeyManagerConfig::new()
+    ///     .with_audit_enabled(false);
+    ///
+    /// // Enable auditing for compliance (default)
+    /// let config2 = KeyManagerConfig::new()
+    ///     .with_audit_enabled(true);
+    /// # }
+    /// ```
     pub fn with_audit_enabled(mut self, enabled: bool) -> Self {
         self.audit_enabled = enabled;
         self
     }
 
     /// Configure external KMS integration
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManagerConfig, ExternalKmsConfig};
+    /// use std::collections::HashMap;
+    ///
+    /// let mut auth_config = HashMap::new();
+    /// auth_config.insert("access_key".to_string(), "AKIA...".to_string());
+    /// auth_config.insert("secret_key".to_string(), "secret...".to_string());
+    ///
+    /// let kms_config = ExternalKmsConfig {
+    ///     service_type: "aws-kms".to_string(),
+    ///     endpoint: "https://kms.us-east-1.amazonaws.com".to_string(),
+    ///     auth_config,
+    ///     region: Some("us-east-1".to_string()),
+    ///     namespace: None,
+    /// };
+    ///
+    /// let config = KeyManagerConfig::new()
+    ///     .with_external_kms(kms_config);
+    /// # }
+    /// ```
     pub fn with_external_kms(mut self, config: ExternalKmsConfig) -> Self {
         self.external_kms_config = Some(config);
         self
@@ -394,6 +582,65 @@ where
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
     /// Create a new key manager instance
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration for the key manager
+    /// * `pool` - Database connection pool
+    ///
+    /// # Returns
+    ///
+    /// A new `KeyManager` instance with initialized master key and statistics
+    ///
+    /// # Examples
+    ///
+    /// ## Basic PostgreSQL setup
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManager, KeyManagerConfig, KeySource};
+    /// use sqlx::PgPool;
+    /// use std::env;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Set up environment variable for master key
+    /// env::set_var("MASTER_KEY", "my-super-secret-master-key-32-chars");
+    ///
+    /// let pool = PgPool::connect("postgresql://user:pass@localhost/hammerwork").await?;
+    /// let config = KeyManagerConfig::new()
+    ///     .with_master_key_env("MASTER_KEY")
+    ///     .with_auto_rotation_enabled(true);
+    ///
+    /// let key_manager = KeyManager::new(config, pool).await?;
+    /// println!("Key manager initialized successfully");
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// ## MySQL setup with static master key
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManager, KeyManagerConfig, KeySource};
+    /// use sqlx::MySqlPool;
+    /// use chrono::Duration;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let pool = MySqlPool::connect("mysql://user:pass@localhost/hammerwork").await?;
+    /// let config = KeyManagerConfig::new()
+    ///     .with_master_key_source(KeySource::Static("my-32-char-master-key-here!!".to_string()))
+    ///     .with_auto_rotation_enabled(true)
+    ///     .with_default_rotation_interval(Duration::days(30));
+    ///
+    /// let key_manager = KeyManager::new(config, pool).await?;
+    /// println!("MySQL key manager initialized with 30-day rotation");
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     pub async fn new(config: KeyManagerConfig, pool: Pool<DB>) -> Result<Self, EncryptionError> {
         let manager = Self {
             config,
@@ -414,6 +661,67 @@ where
     }
 
     /// Generate a new encryption key
+    ///
+    /// # Arguments
+    ///
+    /// * `key_id` - Human-readable identifier for the key
+    /// * `algorithm` - Encryption algorithm to use for this key
+    ///
+    /// # Returns
+    ///
+    /// The generated key ID string that can be used to retrieve the key later
+    ///
+    /// # Examples
+    ///
+    /// ## Generate different types of encryption keys
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManager, EncryptionAlgorithm};
+    ///
+    /// # async fn example(mut key_manager: KeyManager<sqlx::Postgres>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Generate a key for payment processing
+    /// let payment_key = key_manager.generate_key(
+    ///     "payment-encryption-v1",
+    ///     EncryptionAlgorithm::AES256GCM
+    /// ).await?;
+    /// println!("Payment key generated: {}", payment_key);
+    ///
+    /// // Generate a key for user data
+    /// let user_data_key = key_manager.generate_key(
+    ///     "user-data-encryption",
+    ///     EncryptionAlgorithm::ChaCha20Poly1305
+    /// ).await?;
+    /// println!("User data key generated: {}", user_data_key);
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// ## Generate with key ID pattern
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManager, EncryptionAlgorithm};
+    ///
+    /// # async fn example(mut key_manager: KeyManager<sqlx::Postgres>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Use consistent naming pattern for keys
+    /// let keys = vec![
+    ///     ("prod-api-encryption-2024", EncryptionAlgorithm::AES256GCM),
+    ///     ("prod-db-encryption-2024", EncryptionAlgorithm::AES256GCM),
+    ///     ("prod-file-encryption-2024", EncryptionAlgorithm::ChaCha20Poly1305),
+    /// ];
+    ///
+    /// for (key_id, algorithm) in keys {
+    ///     let generated_key = key_manager.generate_key(key_id, algorithm).await?;
+    ///     println!("Generated key: {} -> {}", key_id, generated_key);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     pub async fn generate_key(
         &mut self,
         key_id: &str,
@@ -506,6 +814,69 @@ where
     }
 
     /// Retrieve key material for encryption/decryption operations
+    ///
+    /// # Arguments
+    ///
+    /// * `key_id` - The identifier of the key to retrieve
+    ///
+    /// # Returns
+    ///
+    /// The decrypted key material ready for use in encryption/decryption operations
+    ///
+    /// # Examples
+    ///
+    /// ## Retrieve a key for encryption
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManager, EncryptionAlgorithm};
+    ///
+    /// # async fn example(mut key_manager: KeyManager<sqlx::Postgres>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // First generate a key
+    /// let key_id = key_manager.generate_key(
+    ///     "api-encryption-key",
+    ///     EncryptionAlgorithm::AES256GCM
+    /// ).await?;
+    ///
+    /// // Retrieve the key material for use
+    /// let key_material = key_manager.get_key(&key_id).await?;
+    /// println!("Retrieved key material: {} bytes", key_material.len());
+    ///
+    /// // Key material can now be used for encryption operations
+    /// assert_eq!(key_material.len(), 32); // AES-256 key size
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// ## Handle key retrieval errors
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManager, EncryptionError};
+    ///
+    /// # async fn example(mut key_manager: KeyManager<sqlx::Postgres>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Try to retrieve a non-existent key
+    /// match key_manager.get_key("non-existent-key").await {
+    ///     Ok(key_material) => {
+    ///         println!("Key retrieved successfully: {} bytes", key_material.len());
+    ///     }
+    ///     Err(EncryptionError::KeyNotFound(key_id)) => {
+    ///         println!("Key '{}' not found", key_id);
+    ///     }
+    ///     Err(EncryptionError::KeyManagement(msg)) => {
+    ///         println!("Key management error: {}", msg);
+    ///     }
+    ///     Err(e) => {
+    ///         println!("Other error: {}", e);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     pub async fn get_key(&mut self, key_id: &str) -> Result<Vec<u8>, EncryptionError> {
         // Check cache first
         if let Some(cached_key) = self.get_cached_key(key_id).await {
@@ -554,6 +925,71 @@ where
     }
 
     /// Rotate a key to a new version
+    ///
+    /// Creates a new version of the specified key while keeping the old version
+    /// available for decryption of previously encrypted data.
+    ///
+    /// # Arguments
+    ///
+    /// * `key_id` - The identifier of the key to rotate
+    ///
+    /// # Returns
+    ///
+    /// The new version number of the rotated key
+    ///
+    /// # Examples
+    ///
+    /// ## Basic key rotation
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManager, EncryptionAlgorithm};
+    ///
+    /// # async fn example(mut key_manager: KeyManager<sqlx::Postgres>) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Generate initial key
+    /// let key_id = key_manager.generate_key(
+    ///     "payment-processing-key",
+    ///     EncryptionAlgorithm::AES256GCM
+    /// ).await?;
+    ///
+    /// // Rotate the key to a new version
+    /// let new_version = key_manager.rotate_key(&key_id).await?;
+    /// println!("Key rotated to version: {}", new_version);
+    ///
+    /// // Old version is still available for decryption
+    /// // New version will be used for new encryption operations
+    /// assert_eq!(new_version, 2); // Should be version 2 after first rotation
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// ## Key rotation with usage tracking
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::{KeyManager, EncryptionAlgorithm};
+    ///
+    /// # async fn example(mut key_manager: KeyManager<sqlx::Postgres>) -> Result<(), Box<dyn std::error::Error>> {
+    /// let key_id = "user-data-encryption";
+    /// 
+    /// // Generate initial key
+    /// let initial_key = key_manager.generate_key(key_id, EncryptionAlgorithm::AES256GCM).await?;
+    /// 
+    /// // Check if rotation is needed
+    /// if key_manager.is_key_due_for_rotation(&initial_key).await? {
+    ///     let new_version = key_manager.rotate_key(&initial_key).await?;
+    ///     println!("Key {} rotated to version {}", key_id, new_version);
+    ///     
+    ///     // Update rotation schedule
+    ///     key_manager.update_key_rotation_schedule(&initial_key, None).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     pub async fn rotate_key(&mut self, key_id: &str) -> Result<u32, EncryptionError> {
         #[cfg(not(feature = "encryption"))]
         {
