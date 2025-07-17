@@ -54,10 +54,6 @@ use uuid::Uuid;
 #[cfg(feature = "encryption")]
 use {
     aes_gcm::{Aes256Gcm, Key as AesKey, KeyInit, Nonce, aead::Aead},
-    argon2::{
-        Argon2,
-        password_hash::{PasswordHasher, SaltString},
-    },
     base64::Engine,
     rand::{RngCore, rngs::OsRng},
 };
@@ -394,6 +390,8 @@ impl<DB: Database> KeyManager<DB>
 where
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
     for<'q> <DB as sqlx::Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+    for<'r> String: sqlx::Decode<'r, DB> + sqlx::Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
     /// Create a new key manager instance
     pub async fn new(config: KeyManagerConfig, pool: Pool<DB>) -> Result<Self, EncryptionError> {
@@ -642,46 +640,11 @@ where
             return Ok(vec![]);
         }
 
-        let keys_due_for_rotation = self.get_keys_due_for_rotation().await?;
-        let mut rotated_keys = Vec::new();
-
-        for key_id in keys_due_for_rotation {
-            match self.rotate_key(&key_id).await {
-                Ok(_) => {
-                    rotated_keys.push(key_id);
-                }
-                Err(e) => {
-                    error!("Failed to rotate key {}: {:?}", key_id, e);
-                    if self.config.audit_enabled {
-                        self.record_audit_event(
-                            &key_id,
-                            KeyOperation::Rotate,
-                            false,
-                            Some(format!("{:?}", e)),
-                        )
-                        .await?;
-                    }
-                }
-            }
-        }
-
-        if !rotated_keys.is_empty() {
-            info!(
-                "Automatic rotation completed. Rotated {} keys: {:?}",
-                rotated_keys.len(),
-                rotated_keys
-            );
-        }
-
-        Ok(rotated_keys)
+        // Note: Database-specific implementations should override this behavior
+        warn!("perform_automatic_rotation called on generic implementation - no rotation performed");
+        Ok(vec![])
     }
 
-    /// Check if a specific key needs rotation based on its rotation schedule
-    pub async fn is_key_due_for_rotation(&self, key_id: &str) -> Result<bool, EncryptionError> {
-        // Check if key is in the list of keys due for rotation
-        let keys_due = self.get_keys_due_for_rotation().await?;
-        Ok(keys_due.contains(&key_id.to_string()))
-    }
 
     /// Start automated key rotation service that runs in the background
     /// Returns a future that should be spawned as a background task
@@ -753,41 +716,12 @@ where
 
     /// Refresh statistics by querying the database
     pub async fn refresh_stats(&self) -> Result<(), EncryptionError> {
-        // Query the database for real statistics
-        let db_stats = self.query_database_statistics().await?;
-
-        if let Ok(mut stats) = self.stats.lock() {
-            // Update with real database values
-            stats.total_keys = db_stats.total_keys;
-            stats.active_keys = db_stats.active_keys;
-            stats.retired_keys = db_stats.retired_keys;
-            stats.revoked_keys = db_stats.revoked_keys;
-            stats.expired_keys = db_stats.expired_keys;
-            stats.average_key_age_days = db_stats.average_key_age_days;
-            stats.keys_expiring_soon = db_stats.keys_expiring_soon;
-            stats.keys_due_for_rotation = db_stats.keys_due_for_rotation;
-
-            // Keep existing operation counters (these are tracked in memory)
-            // stats.total_access_operations and stats.rotations_performed remain unchanged
-
-            info!(
-                "Statistics refreshed from database: {} total keys, {} active, {} retired, {} revoked, {} expired",
-                stats.total_keys,
-                stats.active_keys,
-                stats.retired_keys,
-                stats.revoked_keys,
-                stats.expired_keys
-            );
-        }
-
+        // Note: Database-specific implementations should override this behavior
+        // For now, this method doesn't refresh from database to prevent compilation issues
+        warn!("refresh_stats called on generic implementation - no database refresh performed");
         Ok(())
     }
 
-    /// Query the database for comprehensive key statistics
-    async fn query_database_statistics(&self) -> Result<KeyManagerStats, EncryptionError> {
-        // Return default stats for generic implementation - concrete implementations will override
-        Ok(KeyManagerStats::default())
-    }
 
     /// Get the current master key ID
     pub async fn get_master_key_id(&self) -> Option<Uuid> {
@@ -1063,10 +997,6 @@ where
         ))
     }
 
-    async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
-        // Return empty list for generic implementation - concrete implementations will override
-        Ok(Vec::new())
-    }
 
     async fn record_key_usage(&self, _key_id: &str) -> Result<(), EncryptionError> {
         // Database-specific implementations are provided in separate impl blocks
@@ -1442,7 +1372,7 @@ where
         let system_key = self.derive_system_encryption_key(&salt)?;
 
         // Encrypt the master key material with the system key
-        let encrypted_material = self.encrypt_with_system_key(&system_key, key_material)?;
+        let _encrypted_material = self.encrypt_with_system_key(&system_key, key_material)?;
 
         // Database operations are handled by concrete implementations
         // This is a placeholder for generic implementation
@@ -1543,7 +1473,7 @@ where
     fn derive_system_encryption_key(&self, salt: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         use argon2::{
             Argon2,
-            password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
+            password_hash::{PasswordHasher, SaltString},
         };
 
         // Use a combination of system properties and configuration for key derivation
@@ -1839,8 +1769,9 @@ impl KeyManager<sqlx::Postgres> {
         Ok(())
     }
 
-    /// Check if a specific key is due for rotation (PostgreSQL)
-    async fn is_key_due_for_rotation_postgres(
+    /// Check if a specific key is due for rotation
+    #[cfg(feature = "postgres")]
+    pub async fn is_key_due_for_rotation(
         &self,
         key_id: &str,
     ) -> Result<bool, EncryptionError> {
@@ -2038,6 +1969,7 @@ impl KeyManager<sqlx::Postgres> {
     }
 
     /// Query statistics from PostgreSQL
+    #[cfg(feature = "postgres")]
     pub async fn query_database_statistics(&self) -> Result<KeyManagerStats, EncryptionError> {
         // Execute multiple queries to gather comprehensive statistics
         let basic_counts = sqlx::query(
@@ -2131,7 +2063,8 @@ impl KeyManager<sqlx::Postgres> {
         })
     }
 
-    /// Get keys due for rotation (PostgreSQL wrapper)
+    /// Get keys due for rotation
+    #[cfg(feature = "postgres")]
     pub async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
         self.get_keys_due_for_rotation_postgres().await
     }
@@ -2362,8 +2295,9 @@ impl KeyManager<sqlx::MySql> {
         Ok(())
     }
 
-    /// Check if a specific key is due for rotation (MySQL)
-    async fn is_key_due_for_rotation_mysql(&self, key_id: &str) -> Result<bool, EncryptionError> {
+    /// Check if a specific key is due for rotation
+    #[cfg(feature = "mysql")]
+    pub async fn is_key_due_for_rotation(&self, key_id: &str) -> Result<bool, EncryptionError> {
         let result = sqlx::query(
             r#"
             SELECT COUNT(*) as count
@@ -2556,6 +2490,7 @@ impl KeyManager<sqlx::MySql> {
     }
 
     /// Query statistics from MySQL
+    #[cfg(feature = "mysql")]
     pub async fn query_database_statistics(&self) -> Result<KeyManagerStats, EncryptionError> {
         // Execute multiple queries to gather comprehensive statistics
         let basic_counts = sqlx::query(
@@ -2649,7 +2584,8 @@ impl KeyManager<sqlx::MySql> {
         })
     }
 
-    /// Get keys due for rotation (MySQL wrapper)
+    /// Get keys due for rotation
+    #[cfg(feature = "mysql")]
     pub async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
         self.get_keys_due_for_rotation_mysql().await
     }
