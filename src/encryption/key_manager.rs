@@ -4,7 +4,8 @@
 //! - Secure key generation and storage
 //! - Key rotation and lifecycle management
 //! - Master key encryption (Key Encryption Keys)
-//! - External key management service integration
+//! - External key management service integration (AWS KMS, Azure Key Vault, GCP KMS, HashiCorp Vault)
+//! - Azure Key Vault integration for master key retrieval with automatic credential resolution
 //! - Audit trails and key usage tracking
 //!
 //! # Security Considerations
@@ -88,6 +89,43 @@
 //! let stats = key_manager.get_stats().await?;
 //! println!("Total keys: {}, Rotations performed: {}", 
 //!          stats.total_keys, stats.rotations_performed);
+//! # Ok(())
+//! # }
+//! # }
+//! ```
+//!
+//! ## Azure Key Vault Master Key Integration
+//!
+//! ```rust,no_run
+//! # #[cfg(all(feature = "encryption", feature = "azure-kv"))]
+//! # {
+//! use hammerwork::encryption::{KeyManager, KeyManagerConfig, KeySource};
+//! use sqlx::postgres::PgPool;
+//! use std::env;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # let database_url = "postgres://user:pass@localhost/hammerwork";
+//! # let pool = sqlx::PgPool::connect(database_url).await?;
+//! // Set up Azure credentials via environment variables
+//! env::set_var("AZURE_CLIENT_ID", "your-client-id");
+//! env::set_var("AZURE_CLIENT_SECRET", "your-client-secret");
+//! env::set_var("AZURE_TENANT_ID", "your-tenant-id");
+//!
+//! // Configure key manager with Azure Key Vault for master key
+//! let config = KeyManagerConfig::new()
+//!     .with_master_key_source(KeySource::External(
+//!         "azure://my-vault.vault.azure.net/keys/master-key".to_string()
+//!     ))
+//!     .with_auto_rotation_enabled(true);
+//!
+//! let mut key_manager = KeyManager::new(config, pool).await?;
+//!
+//! // Master key is automatically loaded from Azure Key Vault
+//! // If Azure Key Vault is unavailable, falls back to deterministic generation
+//! let key_id = key_manager.generate_key("payment-key", 
+//!     hammerwork::encryption::EncryptionAlgorithm::AES256GCM).await?;
+//!
+//! println!("Generated key with Azure Key Vault master key: {}", key_id);
 //! # Ok(())
 //! # }
 //! # }
@@ -1756,6 +1794,38 @@ where
         hash[0..32].to_vec()
     }
 
+    /// Load master key from Azure Key Vault
+    ///
+    /// This method attempts to retrieve the master key from Azure Key Vault using the
+    /// configured service URL and key name. If Azure Key Vault is not available or
+    /// the `azure-kv` feature is not enabled, it falls back to deterministic key generation.
+    ///
+    /// # Arguments
+    ///
+    /// * `service_config` - Azure Key Vault configuration string in format "azure://vault-name/path/key-name"
+    ///
+    /// # Returns
+    ///
+    /// A 32-byte master key suitable for AES-256 encryption
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "encryption")]
+    /// # {
+    /// use hammerwork::encryption::key_manager::KeyManager;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Load master key from Azure Key Vault
+    /// let master_key = KeyManager::<sqlx::Postgres>::load_master_key_from_azure(
+    ///     "azure://my-vault.vault.azure.net/keys/master-key"
+    /// ).await;
+    ///
+    /// assert_eq!(master_key.len(), 32); // AES-256 key size
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     #[cfg(feature = "encryption")]
     async fn load_master_key_from_azure(service_config: &str) -> Vec<u8> {
         // Parse Azure Key Vault configuration for master key
@@ -1778,12 +1848,25 @@ where
             vault_url, key_name
         );
 
-        // In a real implementation, this would:
-        // 1. Create Azure Key Vault client with authentication
-        // 2. Retrieve the master key from the vault
-        // 3. Decrypt and return the master key material
+        // Try to load from Azure Key Vault if the feature is enabled
+        #[cfg(feature = "azure-kv")]
+        {
+            use azure_identity::{DefaultAzureCredential, TokenCredentialOptions};
+            use azure_security_keyvault::KeyvaultClient;
+            
+            match Self::load_from_azure_key_vault(&vault_url, key_name).await {
+                Ok(key_material) => {
+                    info!("Successfully loaded master key from Azure Key Vault");
+                    return key_material;
+                }
+                Err(e) => {
+                    warn!("Failed to load master key from Azure Key Vault: {}", e);
+                    info!("Falling back to deterministic key generation");
+                }
+            }
+        }
 
-        // For now, generate a deterministic key based on the configuration
+        // Fallback to deterministic key generation for development/testing
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"azure-kv-master-key");
@@ -1791,6 +1874,95 @@ where
         hasher.update(key_name.as_bytes());
         let hash = hasher.finalize();
         hash[0..32].to_vec()
+    }
+
+    /// Load key material directly from Azure Key Vault
+    ///
+    /// This method uses the Azure SDK to authenticate and retrieve key material from
+    /// Azure Key Vault. It supports automatic credential resolution through
+    /// `DefaultAzureCredential` and handles key size normalization.
+    ///
+    /// # Arguments
+    ///
+    /// * `vault_url` - Full URL to the Azure Key Vault (e.g., "https://my-vault.vault.azure.net")
+    /// * `key_name` - Name of the key to retrieve from the vault
+    ///
+    /// # Returns
+    ///
+    /// A 32-byte key material suitable for AES-256 encryption, or an error message
+    ///
+    /// # Security Features
+    ///
+    /// - Uses `DefaultAzureCredential` for secure authentication
+    /// - Automatically handles key size normalization via HMAC-based key derivation
+    /// - Supports base64-encoded key material from Azure Key Vault
+    /// - Includes proper error handling for authentication and network issues
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(all(feature = "encryption", feature = "azure-kv"))]
+    /// # {
+    /// use hammerwork::encryption::key_manager::KeyManager;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Load key from Azure Key Vault
+    /// let key_material = KeyManager::<sqlx::Postgres>::load_from_azure_key_vault(
+    ///     "https://my-vault.vault.azure.net",
+    ///     "master-key"
+    /// ).await?;
+    ///
+    /// assert_eq!(key_material.len(), 32); // Always 32 bytes for AES-256
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    #[cfg(all(feature = "encryption", feature = "azure-kv"))]
+    async fn load_from_azure_key_vault(vault_url: &str, key_name: &str) -> Result<Vec<u8>, String> {
+        use azure_identity::{DefaultAzureCredential, TokenCredentialOptions};
+        use azure_security_keyvault::KeyvaultClient;
+        
+        // Create Azure credentials
+        let credential = DefaultAzureCredential::create(TokenCredentialOptions::default())
+            .map_err(|e| format!("Failed to create Azure credentials: {}", e))?;
+
+        // Create Azure Key Vault client
+        let client = KeyvaultClient::new(vault_url, std::sync::Arc::new(credential))
+            .map_err(|e| format!("Failed to create Azure Key Vault client: {}", e))?;
+
+        // Retrieve the master key from Azure Key Vault
+        match client.key_client().get(key_name.to_string()).await {
+            Ok(key_response) => {
+                if let Some(key_material) = key_response.key.k {
+                    // Decode the base64-encoded key material
+                    let decoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(key_material)
+                        .map_err(|e| format!("Failed to decode key material: {}", e))?;
+                    
+                    // Ensure the key is the correct size for AES-256 (32 bytes)
+                    if decoded_key.len() >= 32 {
+                        Ok(decoded_key[0..32].to_vec())
+                    } else {
+                        // If the key is too short, use it as input for HMAC-based key derivation
+                        use hmac::{Hmac, Mac};
+                        use sha2::Sha256;
+                        
+                        let mut hmac = <Hmac<Sha256> as Mac>::new_from_slice(&decoded_key)
+                            .map_err(|e| format!("Failed to create HMAC: {}", e))?;
+                        hmac.update(b"azure-kv-master-key-derivation");
+                        hmac.update(vault_url.as_bytes());
+                        hmac.update(key_name.as_bytes());
+                        let result = hmac.finalize();
+                        Ok(result.into_bytes()[0..32].to_vec())
+                    }
+                } else {
+                    Err("Key material not found in Azure Key Vault response".to_string())
+                }
+            }
+            Err(e) => {
+                Err(format!("Failed to retrieve key from Azure Key Vault: {}", e))
+            }
+        }
     }
 
     /// Store master key securely in the database

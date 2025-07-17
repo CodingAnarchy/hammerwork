@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - HMAC-based key derivation for deterministic padding when Azure keys are unavailable
   - Comprehensive error handling with descriptive messages for Azure authentication and key retrieval failures
 
+- **🔐 Azure Key Vault Master Key Retrieval**
+  - Implemented real Azure Key Vault master key retrieval for `KeyManager`
+  - Master keys can now be loaded directly from Azure Key Vault using `KeySource::External("azure://vault-name/keys/key-name")`
+  - Automatic key size normalization via HMAC-based key derivation for keys shorter than 32 bytes
+  - Secure authentication using `DefaultAzureCredential` with support for service principal and managed identity
+  - Comprehensive error handling with fallback to deterministic key generation when Azure Key Vault is unavailable
+  - Module-level documentation with complete Azure Key Vault setup examples and credential configuration
+
 ### Changed
 - **🔐 Encryption Key Rotation Architecture Simplification**
   - **BREAKING CHANGE**: Removed `rotate_key_if_needed()` method from `EncryptionEngine`
