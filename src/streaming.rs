@@ -141,9 +141,9 @@ use crate::{
 
 #[cfg(feature = "kafka")]
 use rdkafka::{
-    producer::{FutureProducer, FutureRecord, Producer},
-    message::{Header, OwnedHeaders},
     ClientConfig,
+    message::{Header, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord, Producer},
 };
 
 #[cfg(feature = "google-pubsub")]
@@ -1363,9 +1363,9 @@ impl StreamManager {
                 });
             }
             #[cfg(feature = "streaming")]
-            SerializationFormat::Avro { schema_registry_url } => {
-                Self::serialize_avro(&event, schema_registry_url)?
-            }
+            SerializationFormat::Avro {
+                schema_registry_url,
+            } => Self::serialize_avro(&event, schema_registry_url)?,
             #[cfg(not(feature = "streaming"))]
             SerializationFormat::Avro { .. } => {
                 return Err(HammerworkError::Streaming {
@@ -1406,10 +1406,11 @@ impl StreamManager {
         event: &JobLifecycleEvent,
         _schema_registry_url: &str,
     ) -> crate::Result<Vec<u8>> {
-        use apache_avro::{Writer, Schema};
-        
+        use apache_avro::{Schema, Writer};
+
         // Define Avro schema for JobLifecycleEvent
-        let schema = Schema::parse_str(r#"
+        let schema = Schema::parse_str(
+            r#"
         {
             "type": "record",
             "name": "JobLifecycleEvent",
@@ -1422,19 +1423,20 @@ impl StreamManager {
                 {"name": "metadata", "type": {"type": "map", "values": "string"}}
             ]
         }
-        "#).map_err(|e| HammerworkError::Streaming {
+        "#,
+        )
+        .map_err(|e| HammerworkError::Streaming {
             message: format!("Failed to parse Avro schema: {}", e),
         })?;
 
         let mut writer = Writer::new(&schema, Vec::new());
-        
+
         // Create Avro record
-        let mut record = apache_avro::types::Record::new(&schema).ok_or_else(|| {
-            HammerworkError::Streaming {
+        let mut record =
+            apache_avro::types::Record::new(&schema).ok_or_else(|| HammerworkError::Streaming {
                 message: "Failed to create Avro record".to_string(),
-            }
-        })?;
-        
+            })?;
+
         record.put("job_id", event.job_id.to_string());
         record.put("queue_name", event.queue_name.clone());
         record.put("event_type", event.event_type.to_string());
@@ -1442,9 +1444,11 @@ impl StreamManager {
         record.put("timestamp", event.timestamp.to_rfc3339());
         record.put("metadata", event.metadata.clone());
 
-        writer.append(record).map_err(|e| HammerworkError::Streaming {
-            message: format!("Failed to append Avro record: {}", e),
-        })?;
+        writer
+            .append(record)
+            .map_err(|e| HammerworkError::Streaming {
+                message: format!("Failed to append Avro record: {}", e),
+            })?;
 
         writer.into_inner().map_err(|e| HammerworkError::Streaming {
             message: format!("Failed to finalize Avro writer: {}", e),
@@ -1458,7 +1462,7 @@ impl StreamManager {
         _schema_definition: &str,
     ) -> crate::Result<Vec<u8>> {
         use prost::Message;
-        
+
         // Define protobuf message structure
         #[derive(prost::Message)]
         struct JobLifecycleEventProto {
@@ -1486,9 +1490,11 @@ impl StreamManager {
         };
 
         let mut buf = Vec::new();
-        proto_event.encode(&mut buf).map_err(|e| HammerworkError::Streaming {
-            message: format!("Failed to encode Protobuf message: {}", e),
-        })?;
+        proto_event
+            .encode(&mut buf)
+            .map_err(|e| HammerworkError::Streaming {
+                message: format!("Failed to encode Protobuf message: {}", e),
+            })?;
 
         Ok(buf)
     }
@@ -1587,15 +1593,15 @@ impl KafkaProcessor {
         config: HashMap<String, String>,
     ) -> crate::Result<Self> {
         let mut client_config = ClientConfig::new();
-        
+
         // Set basic configuration
         client_config.set("bootstrap.servers", brokers.join(","));
-        
+
         // Apply custom configuration
         for (key, value) in &config {
             client_config.set(key, value);
         }
-        
+
         // Set defaults if not provided
         if !config.contains_key("message.timeout.ms") {
             client_config.set("message.timeout.ms", "5000");
@@ -1603,13 +1609,14 @@ impl KafkaProcessor {
         if !config.contains_key("queue.buffering.max.messages") {
             client_config.set("queue.buffering.max.messages", "100000");
         }
-        
-        let producer: FutureProducer = client_config
-            .create()
-            .map_err(|e| HammerworkError::Streaming {
-                message: format!("Failed to create Kafka producer: {}", e),
-            })?;
-        
+
+        let producer: FutureProducer =
+            client_config
+                .create()
+                .map_err(|e| HammerworkError::Streaming {
+                    message: format!("Failed to create Kafka producer: {}", e),
+                })?;
+
         Ok(Self {
             producer,
             topic,
@@ -1638,20 +1645,19 @@ impl KafkaProcessor {
 impl StreamProcessor for KafkaProcessor {
     async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
         let mut deliveries = Vec::new();
-        
+
         // Send events to Kafka
         for event in events {
             let delivery_start = Utc::now();
-            
+
             // Create Kafka record
-            let mut record = FutureRecord::to(&self.topic)
-                .payload(&event.serialized_data);
-            
+            let mut record = FutureRecord::to(&self.topic).payload(&event.serialized_data);
+
             // Add partition key if available
             if let Some(ref key) = event.partition_key {
                 record = record.key(key);
             }
-            
+
             // Add headers
             if !event.headers.is_empty() {
                 let mut headers = OwnedHeaders::new();
@@ -1663,16 +1669,19 @@ impl StreamProcessor for KafkaProcessor {
                 }
                 record = record.headers(headers);
             }
-            
+
             // Send the message
-            let result = self.producer.send(record, tokio::time::Duration::from_secs(5)).await;
-            
+            let result = self
+                .producer
+                .send(record, tokio::time::Duration::from_secs(5))
+                .await;
+
             let delivery_end = Utc::now();
             let duration_ms = delivery_end
                 .signed_duration_since(delivery_start)
                 .num_milliseconds()
                 .max(0) as u64;
-            
+
             let (success, error_message, partition) = match result {
                 Ok((partition, offset)) => {
                     tracing::debug!(
@@ -1688,7 +1697,7 @@ impl StreamProcessor for KafkaProcessor {
                     (false, Some(error_msg), event.partition_key)
                 }
             };
-            
+
             deliveries.push(StreamDelivery {
                 delivery_id: Uuid::new_v4(),
                 stream_id: Uuid::new_v4(), // Would be passed in from context
@@ -1701,7 +1710,7 @@ impl StreamProcessor for KafkaProcessor {
                 partition,
             });
         }
-        
+
         Ok(deliveries)
     }
 
@@ -1711,32 +1720,33 @@ impl StreamProcessor for KafkaProcessor {
             .get("health.check.timeout.ms")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5000);
-        
+
         // Get cluster metadata to verify connectivity
         let timeout = tokio::time::Duration::from_millis(health_check_timeout_ms);
-        
+
         // Try to get metadata (doesn't actually send the message)
         let result = tokio::task::spawn_blocking({
             let producer = self.producer.clone();
             let topic = self.topic.clone();
-            move || {
-                producer.client().fetch_metadata(Some(&topic), timeout)
-            }
-        }).await;
-        
+            move || producer.client().fetch_metadata(Some(&topic), timeout)
+        })
+        .await;
+
         let health_result = match result {
             Ok(metadata_result) => match metadata_result {
                 Ok(metadata) => {
-                    let topic_metadata = metadata.topics().iter()
-                        .find(|t| t.name() == self.topic);
-                    
+                    let topic_metadata = metadata.topics().iter().find(|t| t.name() == self.topic);
+
                     match topic_metadata {
                         Some(topic) => {
                             if topic.partitions().is_empty() {
                                 tracing::warn!("Topic {} has no partitions", self.topic);
                                 false
                             } else {
-                                tracing::debug!("Kafka health check passed for topic {}", self.topic);
+                                tracing::debug!(
+                                    "Kafka health check passed for topic {}",
+                                    self.topic
+                                );
                                 true
                             }
                         }
@@ -1756,7 +1766,7 @@ impl StreamProcessor for KafkaProcessor {
                 false
             }
         };
-        
+
         Ok(health_result)
     }
 
@@ -1766,12 +1776,18 @@ impl StreamProcessor for KafkaProcessor {
             "type".to_string(),
             serde_json::Value::String("kafka".to_string()),
         );
-        
+
         // Get broker information from producer configuration
-        let brokers = self.config.get("bootstrap.servers")
-            .map(|b| b.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+        let brokers = self
+            .config
+            .get("bootstrap.servers")
+            .map(|b| {
+                b.split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
-        
+
         stats.insert(
             "brokers".to_string(),
             serde_json::Value::Array(
@@ -1785,11 +1801,14 @@ impl StreamProcessor for KafkaProcessor {
             "topic".to_string(),
             serde_json::Value::String(self.topic.clone()),
         );
-        
+
         // Include basic producer statistics (if available)
         // Note: rdkafka statistics might not be available in all configurations
-        stats.insert("producer_available".to_string(), serde_json::Value::Bool(true));
-        
+        stats.insert(
+            "producer_available".to_string(),
+            serde_json::Value::Bool(true),
+        );
+
         stats.insert(
             "config".to_string(),
             serde_json::Value::Object(
@@ -1807,8 +1826,9 @@ impl StreamProcessor for KafkaProcessor {
         let producer = self.producer.clone();
         let flush_result = tokio::task::spawn_blocking(move || {
             producer.flush(tokio::time::Duration::from_secs(10))
-        }).await;
-        
+        })
+        .await;
+
         match flush_result {
             Ok(Ok(())) => {
                 tracing::debug!("Kafka producer flushed successfully during shutdown");
@@ -1968,28 +1988,29 @@ impl KinesisProcessor {
         config: HashMap<String, String>,
     ) -> crate::Result<Self> {
         // Initialize AWS configuration
-        let aws_config = if let (Some(access_key), Some(secret_key)) = (&access_key_id, &secret_access_key) {
-            // Use provided credentials
-            let credentials = aws_sdk_kinesis::config::Credentials::new(
-                access_key,
-                secret_key,
-                None, // session token
-                None, // expiry
-                "hammerwork"
-            );
-            
-            aws_config::defaults(BehaviorVersion::latest())
-                .region(Region::new(region.clone()))
-                .credentials_provider(credentials)
-                .load()
-                .await
-        } else {
-            // Use default credential chain (IAM roles, environment variables, etc.)
-            aws_config::defaults(BehaviorVersion::latest())
-                .region(Region::new(region.clone()))
-                .load()
-                .await
-        };
+        let aws_config =
+            if let (Some(access_key), Some(secret_key)) = (&access_key_id, &secret_access_key) {
+                // Use provided credentials
+                let credentials = aws_sdk_kinesis::config::Credentials::new(
+                    access_key,
+                    secret_key,
+                    None, // session token
+                    None, // expiry
+                    "hammerwork",
+                );
+
+                aws_config::defaults(BehaviorVersion::latest())
+                    .region(Region::new(region.clone()))
+                    .credentials_provider(credentials)
+                    .load()
+                    .await
+            } else {
+                // Use default credential chain (IAM roles, environment variables, etc.)
+                aws_config::defaults(BehaviorVersion::latest())
+                    .region(Region::new(region.clone()))
+                    .load()
+                    .await
+            };
 
         let client = KinesisClient::new(&aws_config);
 
@@ -2029,35 +2050,42 @@ impl StreamProcessor for KinesisProcessor {
     async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
         let start_time = std::time::Instant::now();
         let mut deliveries = Vec::new();
-        
+
         for event in events {
             let delivery_start = std::time::Instant::now();
             let delivery_id = Uuid::new_v4();
-            
+
             // Serialize the event to JSON
-            let payload = serde_json::to_vec(&event.event)
-                .map_err(|e| HammerworkError::Streaming { message: format!("Failed to serialize event: {}", e) })?;
-            
+            let payload =
+                serde_json::to_vec(&event.event).map_err(|e| HammerworkError::Streaming {
+                    message: format!("Failed to serialize event: {}", e),
+                })?;
+
             // Create Kinesis record
             let partition_key = event.partition_key.clone().unwrap_or_else(|| {
                 // Use event ID as fallback partition key
                 event.event.event_id.to_string()
             });
-            
-            let put_result = self.client
+
+            let put_result = self
+                .client
                 .put_record()
                 .stream_name(&self.stream_name)
                 .data(aws_sdk_kinesis::primitives::Blob::new(payload))
                 .partition_key(&partition_key)
                 .send()
                 .await;
-            
+
             let delivery = match put_result {
                 Ok(output) => {
                     let sequence_number = output.sequence_number();
                     let shard_id = output.shard_id();
-                    tracing::debug!("Published event to Kinesis: sequence={}, shard={}", sequence_number, shard_id);
-                    
+                    tracing::debug!(
+                        "Published event to Kinesis: sequence={}, shard={}",
+                        sequence_number,
+                        shard_id
+                    );
+
                     StreamDelivery {
                         delivery_id,
                         stream_id: Uuid::new_v4(), // Would be passed from StreamManager
@@ -2073,7 +2101,7 @@ impl StreamProcessor for KinesisProcessor {
                 Err(e) => {
                     let error_msg = format!("Failed to publish to Kinesis: {}", e);
                     tracing::error!("{}", error_msg);
-                    
+
                     StreamDelivery {
                         delivery_id,
                         stream_id: Uuid::new_v4(),
@@ -2087,41 +2115,60 @@ impl StreamProcessor for KinesisProcessor {
                     }
                 }
             };
-            
+
             deliveries.push(delivery);
         }
-        
-        tracing::info!("Sent {} events to Kinesis stream '{}' in {}ms", 
-                      deliveries.len(), 
-                      self.stream_name, 
-                      start_time.elapsed().as_millis());
-        
+
+        tracing::info!(
+            "Sent {} events to Kinesis stream '{}' in {}ms",
+            deliveries.len(),
+            self.stream_name,
+            start_time.elapsed().as_millis()
+        );
+
         Ok(deliveries)
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
         // Try to describe the stream to verify connectivity and access
-        match self.client.describe_stream().stream_name(&self.stream_name).send().await {
+        match self
+            .client
+            .describe_stream()
+            .stream_name(&self.stream_name)
+            .send()
+            .await
+        {
             Ok(output) => {
                 if let Some(stream_description) = output.stream_description() {
                     let status = stream_description.stream_status();
                     tracing::debug!("Kinesis stream '{}' status: {:?}", self.stream_name, status);
                     // Consider stream healthy if it's ACTIVE or UPDATING
                     match status {
-                        aws_sdk_kinesis::types::StreamStatus::Active | 
-                        aws_sdk_kinesis::types::StreamStatus::Updating => Ok(true),
+                        aws_sdk_kinesis::types::StreamStatus::Active
+                        | aws_sdk_kinesis::types::StreamStatus::Updating => Ok(true),
                         _ => {
-                            tracing::warn!("Kinesis stream '{}' is not in a healthy state: {:?}", self.stream_name, status);
+                            tracing::warn!(
+                                "Kinesis stream '{}' is not in a healthy state: {:?}",
+                                self.stream_name,
+                                status
+                            );
                             Ok(false)
                         }
                     }
                 } else {
-                    tracing::warn!("Kinesis stream '{}' description not available", self.stream_name);
+                    tracing::warn!(
+                        "Kinesis stream '{}' description not available",
+                        self.stream_name
+                    );
                     Ok(false)
                 }
             }
             Err(e) => {
-                tracing::warn!("Kinesis health check failed for stream '{}': {}", self.stream_name, e);
+                tracing::warn!(
+                    "Kinesis health check failed for stream '{}': {}",
+                    self.stream_name,
+                    e
+                );
                 Ok(false)
             }
         }
@@ -2143,7 +2190,9 @@ impl StreamProcessor for KinesisProcessor {
         );
         stats.insert(
             "credentials_configured".to_string(),
-            serde_json::Value::Bool(self.access_key_id.is_some() && self.secret_access_key.is_some()),
+            serde_json::Value::Bool(
+                self.access_key_id.is_some() && self.secret_access_key.is_some(),
+            ),
         );
         if let Some(ref access_key_id) = self.access_key_id {
             stats.insert(
@@ -2163,16 +2212,16 @@ impl StreamProcessor for KinesisProcessor {
                     .collect(),
             ),
         );
-        stats.insert(
-            "feature_enabled".to_string(),
-            serde_json::Value::Bool(true),
-        );
+        stats.insert("feature_enabled".to_string(), serde_json::Value::Bool(true));
         Ok(stats)
     }
 
     async fn shutdown(&self) -> crate::Result<()> {
         // AWS SDK clients don't require explicit shutdown
-        tracing::info!("Kinesis processor shutdown for stream '{}'.", self.stream_name);
+        tracing::info!(
+            "Kinesis processor shutdown for stream '{}'.",
+            self.stream_name
+        );
         Ok(())
     }
 }
@@ -2219,7 +2268,9 @@ impl StreamProcessor for KinesisProcessor {
         );
         stats.insert(
             "credentials_configured".to_string(),
-            serde_json::Value::Bool(self.access_key_id.is_some() && self.secret_access_key.is_some()),
+            serde_json::Value::Bool(
+                self.access_key_id.is_some() && self.secret_access_key.is_some(),
+            ),
         );
         stats.insert(
             "feature_enabled".to_string(),
@@ -2268,23 +2319,34 @@ impl PubSubProcessor {
         let client_config = if let Some(service_account_json) = &service_account_key {
             // Use provided service account credentials
             let credentials = serde_json::from_str::<CredentialsFile>(service_account_json)
-                .map_err(|e| HammerworkError::Streaming { message: format!("Invalid service account credentials: {}", e) })?;
-            
+                .map_err(|e| HammerworkError::Streaming {
+                    message: format!("Invalid service account credentials: {}", e),
+                })?;
+
             PubSubClientConfig::default()
                 .with_credentials(credentials)
                 .await
-                .map_err(|e| HammerworkError::Streaming { message: format!("Failed to configure Pub/Sub client: {}", e) })?
+                .map_err(|e| HammerworkError::Streaming {
+                    message: format!("Failed to configure Pub/Sub client: {}", e),
+                })?
         } else {
             // Use default credentials (Application Default Credentials)
             PubSubClientConfig::default()
                 .with_auth()
                 .await
-                .map_err(|e| HammerworkError::Streaming { message: format!("Failed to initialize Pub/Sub client with default credentials: {}", e) })?
+                .map_err(|e| HammerworkError::Streaming {
+                    message: format!(
+                        "Failed to initialize Pub/Sub client with default credentials: {}",
+                        e
+                    ),
+                })?
         };
 
         let client = Client::new(client_config)
             .await
-            .map_err(|e| HammerworkError::Streaming { message: format!("Failed to create Pub/Sub client: {}", e) })?;
+            .map_err(|e| HammerworkError::Streaming {
+                message: format!("Failed to create Pub/Sub client: {}", e),
+            })?;
 
         let topic = client.topic(&topic_name);
         let publisher = topic.new_publisher(None);
@@ -2322,27 +2384,32 @@ impl StreamProcessor for PubSubProcessor {
     async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
         let start_time = std::time::Instant::now();
         let mut deliveries = Vec::new();
-        
+
         for event in events {
             let delivery_start = std::time::Instant::now();
             let delivery_id = Uuid::new_v4();
-            
+
             // Serialize the event to JSON
-            let payload = serde_json::to_vec(&event.event)
-                .map_err(|e| HammerworkError::Streaming { message: format!("Failed to serialize event: {}", e) })?;
-            
+            let payload =
+                serde_json::to_vec(&event.event).map_err(|e| HammerworkError::Streaming {
+                    message: format!("Failed to serialize event: {}", e),
+                })?;
+
             // Create message attributes
             let mut attributes = std::collections::HashMap::new();
             attributes.insert("event_id".to_string(), event.event.event_id.to_string());
             attributes.insert("job_id".to_string(), event.event.job_id.to_string());
             attributes.insert("queue_name".to_string(), event.event.queue_name.clone());
-            attributes.insert("event_type".to_string(), format!("{:?}", event.event.event_type));
+            attributes.insert(
+                "event_type".to_string(),
+                format!("{:?}", event.event.event_type),
+            );
             attributes.insert("timestamp".to_string(), event.event.timestamp.to_rfc3339());
-            
+
             if let Some(partition_key) = &event.partition_key {
                 attributes.insert("partition_key".to_string(), partition_key.clone());
             }
-            
+
             // Create PubsubMessage
             let message = PubsubMessage {
                 data: payload,
@@ -2351,10 +2418,10 @@ impl StreamProcessor for PubSubProcessor {
                 publish_time: None,
                 ordering_key: event.partition_key.clone().unwrap_or_default(),
             };
-            
+
             // Publish the message using the publisher
             let awaiter = self.publisher.publish(message).await;
-            
+
             let delivery = match awaiter.get().await {
                 Ok(message_id) => {
                     tracing::debug!("Published message to Pub/Sub: {}", message_id);
@@ -2386,15 +2453,17 @@ impl StreamProcessor for PubSubProcessor {
                     }
                 }
             };
-            
+
             deliveries.push(delivery);
         }
-        
-        tracing::info!("Sent {} events to Pub/Sub topic '{}' in {}ms", 
-                      deliveries.len(), 
-                      self.topic_name, 
-                      start_time.elapsed().as_millis());
-        
+
+        tracing::info!(
+            "Sent {} events to Pub/Sub topic '{}' in {}ms",
+            deliveries.len(),
+            self.topic_name,
+            start_time.elapsed().as_millis()
+        );
+
         Ok(deliveries)
     }
 
@@ -2432,21 +2501,21 @@ impl StreamProcessor for PubSubProcessor {
                     .collect(),
             ),
         );
-        
+
         // Add publisher stats if available
         // Note: google-cloud-pubsub doesn't expose detailed publisher stats
         // This would be enhanced with custom metrics collection
-        stats.insert(
-            "feature_enabled".to_string(),
-            serde_json::Value::Bool(true),
-        );
-        
+        stats.insert("feature_enabled".to_string(), serde_json::Value::Bool(true));
+
         Ok(stats)
     }
 
     async fn shutdown(&self) -> crate::Result<()> {
         // The publisher will be dropped and cleaned up automatically
-        tracing::info!("Pub/Sub publisher shutdown for topic '{}'.", self.topic_name);
+        tracing::info!(
+            "Pub/Sub publisher shutdown for topic '{}'.",
+            self.topic_name
+        );
         Ok(())
     }
 }
@@ -2752,6 +2821,268 @@ mod tests {
         assert!(matches!(avro, SerializationFormat::Avro { .. }));
         assert!(matches!(protobuf, SerializationFormat::Protobuf { .. }));
         assert!(matches!(msgpack, SerializationFormat::MessagePack));
+    }
+
+    fn create_test_job_lifecycle_event() -> JobLifecycleEvent {
+        JobLifecycleEvent {
+            event_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            queue_name: "test_queue".to_string(),
+            event_type: JobLifecycleEventType::Started,
+            priority: crate::priority::JobPriority::Normal,
+            timestamp: chrono::Utc::now(),
+            processing_time_ms: Some(150),
+            error: None,
+            payload: Some(serde_json::json!({"message": "test payload"})),
+            metadata: {
+                let mut metadata = HashMap::new();
+                metadata.insert("test_key".to_string(), "test_value".to_string());
+                metadata.insert("priority".to_string(), "normal".to_string());
+                metadata
+            },
+        }
+    }
+
+    #[test]
+    fn test_json_serialization() {
+        let event = create_test_job_lifecycle_event();
+        let stream_config = StreamConfig {
+            name: "test_stream".to_string(),
+            serialization: SerializationFormat::Json,
+            ..Default::default()
+        };
+
+        let result = StreamManager::prepare_streamed_event(event.clone(), &stream_config);
+        assert!(result.is_ok());
+
+        let streamed_event = result.unwrap();
+        assert!(!streamed_event.serialized_data.is_empty());
+
+        // Verify we can deserialize back to the original event
+        let deserialized: JobLifecycleEvent =
+            serde_json::from_slice(&streamed_event.serialized_data).unwrap();
+        assert_eq!(deserialized.queue_name, event.queue_name);
+        assert_eq!(deserialized.event_type, event.event_type);
+        assert_eq!(deserialized.priority, event.priority);
+        assert_eq!(deserialized.metadata, event.metadata);
+    }
+
+    #[test]
+    #[cfg(feature = "streaming")]
+    fn test_messagepack_serialization() {
+        let event = create_test_job_lifecycle_event();
+        let stream_config = StreamConfig {
+            name: "test_stream".to_string(),
+            serialization: SerializationFormat::MessagePack,
+            ..Default::default()
+        };
+
+        let result = StreamManager::prepare_streamed_event(event.clone(), &stream_config);
+        assert!(result.is_ok());
+
+        let streamed_event = result.unwrap();
+        assert!(!streamed_event.serialized_data.is_empty());
+
+        // Verify we can deserialize back to the original event
+        let deserialized: JobLifecycleEvent =
+            rmp_serde::from_slice(&streamed_event.serialized_data).unwrap();
+        assert_eq!(deserialized.queue_name, event.queue_name);
+        assert_eq!(deserialized.event_type, event.event_type);
+        assert_eq!(deserialized.priority, event.priority);
+        assert_eq!(deserialized.metadata, event.metadata);
+
+        // MessagePack should be more compact than JSON for this data
+        let json_size = serde_json::to_vec(&event).unwrap().len();
+        assert!(streamed_event.serialized_data.len() <= json_size);
+    }
+
+    #[test]
+    #[cfg(not(feature = "streaming"))]
+    fn test_messagepack_serialization_requires_feature() {
+        let event = create_test_job_lifecycle_event();
+        let stream_config = StreamConfig {
+            name: "test_stream".to_string(),
+            serialization: SerializationFormat::MessagePack,
+            ..Default::default()
+        };
+
+        let result = StreamManager::prepare_streamed_event(event, &stream_config);
+        assert!(result.is_err());
+
+        let error = result.unwrap_err();
+        if let crate::error::HammerworkError::Streaming { message } = error {
+            assert!(message.contains("streaming"));
+            assert!(message.contains("feature"));
+        } else {
+            panic!("Expected Streaming error");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "streaming")]
+    fn test_avro_serialization() {
+        let event = create_test_job_lifecycle_event();
+        let stream_config = StreamConfig {
+            name: "test_stream".to_string(),
+            serialization: SerializationFormat::Avro {
+                schema_registry_url: "http://localhost:8081".to_string(),
+            },
+            ..Default::default()
+        };
+
+        let result = StreamManager::prepare_streamed_event(event.clone(), &stream_config);
+        assert!(result.is_ok());
+
+        let streamed_event = result.unwrap();
+        assert!(!streamed_event.serialized_data.is_empty());
+
+        // Verify the Avro data has the expected binary format header
+        // Avro binary format starts with a magic byte sequence
+        assert!(streamed_event.serialized_data.len() > 10); // Should have header + data
+    }
+
+    #[test]
+    #[cfg(not(feature = "streaming"))]
+    fn test_avro_serialization_requires_feature() {
+        let event = create_test_job_lifecycle_event();
+        let stream_config = StreamConfig {
+            name: "test_stream".to_string(),
+            serialization: SerializationFormat::Avro {
+                schema_registry_url: "http://localhost:8081".to_string(),
+            },
+            ..Default::default()
+        };
+
+        let result = StreamManager::prepare_streamed_event(event, &stream_config);
+        assert!(result.is_err());
+
+        let error = result.unwrap_err();
+        if let crate::error::HammerworkError::Streaming { message } = error {
+            assert!(message.contains("streaming"));
+            assert!(message.contains("feature"));
+        } else {
+            panic!("Expected Streaming error");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "streaming")]
+    fn test_protobuf_serialization() {
+        let event = create_test_job_lifecycle_event();
+        let stream_config = StreamConfig {
+            name: "test_stream".to_string(),
+            serialization: SerializationFormat::Protobuf {
+                schema_definition: "syntax = \"proto3\";".to_string(),
+            },
+            ..Default::default()
+        };
+
+        let result = StreamManager::prepare_streamed_event(event.clone(), &stream_config);
+        assert!(result.is_ok());
+
+        let streamed_event = result.unwrap();
+        assert!(!streamed_event.serialized_data.is_empty());
+
+        // Verify the Protobuf data has a reasonable binary format
+        // Protobuf is typically very compact
+        assert!(streamed_event.serialized_data.len() > 5); // Should have meaningful data
+
+        // Protobuf should be more compact than JSON for structured data
+        let json_size = serde_json::to_vec(&event).unwrap().len();
+        assert!(streamed_event.serialized_data.len() <= json_size);
+    }
+
+    #[test]
+    #[cfg(not(feature = "streaming"))]
+    fn test_protobuf_serialization_requires_feature() {
+        let event = create_test_job_lifecycle_event();
+        let stream_config = StreamConfig {
+            name: "test_stream".to_string(),
+            serialization: SerializationFormat::Protobuf {
+                schema_definition: "syntax = \"proto3\";".to_string(),
+            },
+            ..Default::default()
+        };
+
+        let result = StreamManager::prepare_streamed_event(event, &stream_config);
+        assert!(result.is_err());
+
+        let error = result.unwrap_err();
+        if let crate::error::HammerworkError::Streaming { message } = error {
+            assert!(message.contains("streaming"));
+            assert!(message.contains("feature"));
+        } else {
+            panic!("Expected Streaming error");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "streaming")]
+    fn test_serialization_format_size_comparison() {
+        let event = create_test_job_lifecycle_event();
+
+        // Test all serialization formats
+        let json_config = StreamConfig {
+            name: "json_stream".to_string(),
+            serialization: SerializationFormat::Json,
+            ..Default::default()
+        };
+
+        let msgpack_config = StreamConfig {
+            name: "msgpack_stream".to_string(),
+            serialization: SerializationFormat::MessagePack,
+            ..Default::default()
+        };
+
+        let avro_config = StreamConfig {
+            name: "avro_stream".to_string(),
+            serialization: SerializationFormat::Avro {
+                schema_registry_url: "http://localhost:8081".to_string(),
+            },
+            ..Default::default()
+        };
+
+        let protobuf_config = StreamConfig {
+            name: "protobuf_stream".to_string(),
+            serialization: SerializationFormat::Protobuf {
+                schema_definition: "syntax = \"proto3\";".to_string(),
+            },
+            ..Default::default()
+        };
+
+        let json_result =
+            StreamManager::prepare_streamed_event(event.clone(), &json_config).unwrap();
+        let msgpack_result =
+            StreamManager::prepare_streamed_event(event.clone(), &msgpack_config).unwrap();
+        let avro_result =
+            StreamManager::prepare_streamed_event(event.clone(), &avro_config).unwrap();
+        let protobuf_result =
+            StreamManager::prepare_streamed_event(event.clone(), &protobuf_config).unwrap();
+
+        // All formats should produce non-empty data
+        assert!(!json_result.serialized_data.is_empty());
+        assert!(!msgpack_result.serialized_data.is_empty());
+        assert!(!avro_result.serialized_data.is_empty());
+        assert!(!protobuf_result.serialized_data.is_empty());
+
+        // Binary formats are typically more compact than JSON
+        let json_size = json_result.serialized_data.len();
+        let msgpack_size = msgpack_result.serialized_data.len();
+        let protobuf_size = protobuf_result.serialized_data.len();
+
+        // MessagePack and Protobuf should generally be more compact than JSON
+        assert!(
+            msgpack_size <= json_size,
+            "MessagePack ({} bytes) should be <= JSON ({} bytes)",
+            msgpack_size,
+            json_size
+        );
+        assert!(
+            protobuf_size <= json_size,
+            "Protobuf ({} bytes) should be <= JSON ({} bytes)",
+            protobuf_size,
+            json_size
+        );
     }
 
     #[tokio::test]

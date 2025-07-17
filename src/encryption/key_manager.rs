@@ -1228,7 +1228,10 @@ where
 
             // Store the master key securely in the database
             // Note: Database persistence is optional - master key works in-memory only
-            info!("Master key generated and stored in memory with ID: {}", master_key_id);
+            info!(
+                "Master key generated and stored in memory with ID: {}",
+                master_key_id
+            );
 
             // Keep a copy in memory for performance (encrypted with a derived key)
             *self.master_key.lock().map_err(|_| {
@@ -1939,7 +1942,6 @@ where
         }
     }
 
-
     /// Get or create a master key ID based on key material, with database persistence
     async fn get_or_create_master_key_id(
         &self,
@@ -2622,7 +2624,6 @@ impl KeyManager<sqlx::Postgres> {
     pub async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
         self.get_keys_due_for_rotation_postgres().await
     }
-
 }
 
 #[cfg(feature = "mysql")]
@@ -3144,7 +3145,6 @@ impl KeyManager<sqlx::MySql> {
     pub async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
         self.get_keys_due_for_rotation_mysql().await
     }
-
 }
 
 impl Default for KeyManagerStats {
@@ -3545,7 +3545,7 @@ mod tests {
                 "rotation-test-key",
                 EncryptionAlgorithm::AES256GCM,
                 KeyPurpose::Encryption,
-                None, // expires_at
+                None,                     // expires_at
                 Some(Duration::days(30)), // 30-day rotation interval
             )
             .await
@@ -3579,7 +3579,7 @@ mod tests {
                 "rotation-test-key",
                 EncryptionAlgorithm::AES256GCM,
                 KeyPurpose::Encryption,
-                None, // expires_at
+                None,                     // expires_at
                 Some(Duration::days(30)), // 30-day rotation interval
             )
             .await
@@ -4166,7 +4166,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     impl TestKeyManager {
         #[allow(dead_code)]
-    fn derive_system_encryption_key(&self, salt: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+        fn derive_system_encryption_key(&self, salt: &[u8]) -> Result<Vec<u8>, EncryptionError> {
             use argon2::{
                 Argon2,
                 password_hash::{PasswordHasher, SaltString},
@@ -4211,7 +4211,7 @@ mod tests {
         }
 
         #[allow(dead_code)]
-    fn encrypt_with_system_key(
+        fn encrypt_with_system_key(
             &self,
             system_key: &[u8],
             plaintext: &[u8],

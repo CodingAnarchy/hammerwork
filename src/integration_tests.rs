@@ -8,14 +8,21 @@ mod tests {
     use crate::{
         events::{EventFilter, EventManager, JobError, JobLifecycleEvent, JobLifecycleEventType},
         priority::JobPriority,
-        streaming::{
-            PartitioningStrategy, SerializationFormat, StreamBackend, StreamConfig, StreamManager,
-            StreamManagerConfig,
-        },
         webhooks::{
             HttpMethod, RetryPolicy, WebhookAuth, WebhookConfig, WebhookManager,
             WebhookManagerConfig,
         },
+    };
+
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
+    use crate::streaming::{
+        PartitioningStrategy, SerializationFormat, StreamBackend, StreamConfig, StreamManager,
+        StreamManagerConfig,
     };
     use chrono::Utc;
     use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -110,6 +117,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
     async fn test_event_manager_streaming_integration() {
         // Set up event manager
         let event_manager = Arc::new(EventManager::new_default());
@@ -158,6 +171,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
     async fn test_full_system_integration() {
         // Set up all components
         let event_manager = Arc::new(EventManager::new_default());
@@ -317,6 +336,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
     async fn test_event_filtering_across_systems() {
         let event_manager = Arc::new(EventManager::new_default());
         let webhook_manager =
@@ -435,6 +460,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
     async fn test_concurrent_event_processing() {
         let event_manager = Arc::new(EventManager::new_default());
         let webhook_manager = Arc::new(WebhookManager::new(
@@ -528,6 +559,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
     async fn test_system_resilience_with_failures() {
         let event_manager = Arc::new(EventManager::new_default());
         let webhook_manager =

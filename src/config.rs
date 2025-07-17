@@ -18,6 +18,12 @@ use crate::alerting::AlertingConfig;
 #[cfg(feature = "metrics")]
 use crate::metrics::MetricsConfig;
 
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
 use crate::streaming::StreamConfig;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
@@ -207,6 +213,12 @@ pub struct HammerworkConfig {
     pub webhooks: WebhookConfigs,
 
     /// Streaming configurations
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
     pub streaming: StreamingConfigs,
 
     /// Alerting configuration
@@ -434,12 +446,18 @@ impl Default for WebhookGlobalSettings {
 }
 
 /// Streaming configurations container
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StreamingConfigs {
     /// List of configured streams
     pub streams: Vec<StreamConfig>,
 
-    /// Global streaming settings
+    /// Global streaming settings  
     pub global_settings: StreamingGlobalSettings,
 }
 
@@ -469,6 +487,12 @@ impl Default for SimpleEventFilter {
 }
 
 /// Global streaming settings
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingGlobalSettings {
     /// Maximum concurrent stream processors
@@ -481,6 +505,12 @@ pub struct StreamingGlobalSettings {
     pub global_flush_interval_secs: u64,
 }
 
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
 impl Default for StreamingGlobalSettings {
     fn default() -> Self {
         Self {
@@ -658,6 +688,12 @@ impl HammerworkConfig {
     }
 
     /// Add a stream configuration
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
     pub fn add_stream(mut self, stream: StreamConfig) -> Self {
         self.streaming.streams.push(stream);
         self
@@ -667,6 +703,12 @@ impl HammerworkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
     use crate::streaming::StreamBackend;
     use tempfile::tempdir;
 
@@ -915,6 +957,12 @@ service_name = "hammerwork"
     }
 
     #[test]
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
     fn test_stream_config() {
         let stream = StreamConfig {
             name: "Test Stream".to_string(),

@@ -258,6 +258,12 @@ pub mod events;
 #[cfg(feature = "webhooks")]
 pub mod webhooks;
 
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
 pub mod streaming;
 
 #[cfg(test)]
@@ -270,8 +276,22 @@ pub use archive::{
 pub use batch::{BatchId, BatchResult, BatchStatus, JobBatch, PartialFailureMode};
 pub use config::{
     ArchiveConfig, DatabaseConfig, HammerworkConfig, LoggingConfig, RateLimitingConfig,
-    StreamingConfigs, StreamingGlobalSettings, WorkerConfig,
+    WorkerConfig,
 };
+
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
+pub use config::{StreamingConfigs, StreamingGlobalSettings};
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
 pub use streaming::StreamConfig;
 
 #[cfg(feature = "webhooks")]
@@ -323,6 +343,12 @@ pub use webhooks::{
     WebhookManager, WebhookManagerConfig, WebhookManagerStats, WebhookStats,
 };
 
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
 pub use streaming::{
     BufferConfig, PartitionField, PartitioningStrategy, SerializationFormat, StreamBackend,
     StreamConfig as StreamSettings, StreamDelivery, StreamManager, StreamManagerConfig,
