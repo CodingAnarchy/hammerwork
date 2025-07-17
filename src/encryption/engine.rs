@@ -3,12 +3,12 @@
 //! This module provides the actual cryptographic operations for encrypting and
 //! decrypting job payloads using various algorithms and key management strategies.
 
+#[cfg(feature = "encryption")]
+use super::key_manager::KeyManager;
 use super::{
     EncryptedPayload, EncryptionAlgorithm, EncryptionConfig, EncryptionError, EncryptionMetadata,
     EncryptionStats, KeySource, RetentionPolicy,
 };
-#[cfg(feature = "encryption")]
-use super::key_manager::KeyManager;
 use serde_json::Value;
 use sqlx::Database;
 use std::collections::HashMap;
@@ -72,7 +72,7 @@ pub struct EncryptionEngine<DB: Database> {
     key_manager: Option<Arc<Mutex<KeyManager<DB>>>>,
 }
 
-impl<DB: Database> EncryptionEngine<DB> 
+impl<DB: Database> EncryptionEngine<DB>
 where
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
     for<'q> <DB as Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
@@ -547,8 +547,6 @@ where
     pub fn set_key_manager(&mut self, key_manager: Arc<Mutex<KeyManager<DB>>>) {
         self.key_manager = Some(key_manager);
     }
-    
-
 
     /// Cleans up expired encrypted data based on retention policies.
     ///
@@ -670,7 +668,7 @@ where
         let key = super::generate_deterministic_key_with_size(
             "aws-kms-data-key",
             &[key_id, region],
-            expected_size
+            expected_size,
         );
 
         Ok(key)
@@ -836,7 +834,7 @@ where
         let key = super::generate_deterministic_key_with_size(
             "vault-data-key",
             &[secret_path, &vault_addr],
-            expected_size
+            expected_size,
         );
 
         Ok(key)
@@ -934,7 +932,7 @@ where
         let key = super::generate_deterministic_key_with_size(
             "gcp-kms-data-key",
             &[key_resource],
-            expected_size
+            expected_size,
         );
 
         Ok(key)
@@ -970,15 +968,25 @@ where
         {
             use azure_identity::{DefaultAzureCredential, TokenCredentialOptions};
             use azure_security_keyvault::KeyvaultClient;
-            
+
             // Create Azure credentials using default credential chain
             let credential = DefaultAzureCredential::create(TokenCredentialOptions::default())
-                .map_err(|e| EncryptionError::KeyManagement(format!("Failed to create Azure credentials: {}", e)))?;
-            
+                .map_err(|e| {
+                    EncryptionError::KeyManagement(format!(
+                        "Failed to create Azure credentials: {}",
+                        e
+                    ))
+                })?;
+
             // Create Key Vault client
-            let client = KeyvaultClient::new(&vault_url, std::sync::Arc::new(credential))
-                .map_err(|e| EncryptionError::KeyManagement(format!("Failed to create Azure Key Vault client: {}", e)))?;
-            
+            let client =
+                KeyvaultClient::new(&vault_url, std::sync::Arc::new(credential)).map_err(|e| {
+                    EncryptionError::KeyManagement(format!(
+                        "Failed to create Azure Key Vault client: {}",
+                        e
+                    ))
+                })?;
+
             // Retrieve the key from the vault
             match client.key_client().get(key_name.to_string()).await {
                 Ok(key_response) => {
@@ -987,8 +995,13 @@ where
                         // Decode the base64url encoded key material
                         let decoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
                             .decode(key_material)
-                            .map_err(|e| EncryptionError::KeyManagement(format!("Failed to decode key material: {}", e)))?;
-                        
+                            .map_err(|e| {
+                                EncryptionError::KeyManagement(format!(
+                                    "Failed to decode key material: {}",
+                                    e
+                                ))
+                            })?;
+
                         // Ensure the key is the expected size
                         if decoded_key.len() >= expected_size {
                             info!("Successfully loaded encryption key from Azure Key Vault");
@@ -998,31 +1011,38 @@ where
                             let mut final_key = vec![0u8; expected_size];
                             let copy_len = std::cmp::min(decoded_key.len(), expected_size);
                             final_key[..copy_len].copy_from_slice(&decoded_key[..copy_len]);
-                            
+
                             // Pad remaining bytes with HKDF-derived material
                             if decoded_key.len() < expected_size {
                                 use hmac::{Hmac, Mac};
                                 use sha2::Sha256;
                                 type HmacSha256 = Hmac<Sha256>;
-                                
+
                                 let mut mac = <HmacSha256 as Mac>::new_from_slice(&decoded_key)
-                                    .map_err(|e| EncryptionError::KeyManagement(format!("HMAC creation failed: {}", e)))?;
+                                    .map_err(|e| {
+                                        EncryptionError::KeyManagement(format!(
+                                            "HMAC creation failed: {}",
+                                            e
+                                        ))
+                                    })?;
                                 mac.update(b"azure-kv-key-derivation");
                                 mac.update(vault_url.as_bytes());
                                 mac.update(key_name.as_bytes());
                                 let derived = mac.finalize().into_bytes();
-                                
+
                                 for i in decoded_key.len()..expected_size {
                                     final_key[i] = derived[i % derived.len()];
                                 }
                             }
-                            
-                            info!("Successfully loaded and padded encryption key from Azure Key Vault");
+
+                            info!(
+                                "Successfully loaded and padded encryption key from Azure Key Vault"
+                            );
                             return Ok(final_key);
                         }
                     } else {
                         return Err(EncryptionError::KeyManagement(
-                            "Azure Key Vault key response missing key material".to_string()
+                            "Azure Key Vault key response missing key material".to_string(),
                         ));
                     }
                 }
@@ -1035,14 +1055,16 @@ where
 
         #[cfg(not(feature = "azure-kv"))]
         {
-            warn!("Azure Key Vault feature not enabled, falling back to deterministic key generation");
+            warn!(
+                "Azure Key Vault feature not enabled, falling back to deterministic key generation"
+            );
         }
 
         // Fallback to deterministic key generation for development/testing
         let key = super::generate_deterministic_key_with_size(
             "azure-kv-data-key",
             &[&vault_url, key_name],
-            expected_size
+            expected_size,
         );
 
         info!("Using deterministic key generation for Azure Key Vault (fallback)");
@@ -1600,10 +1622,6 @@ mod tests {
         assert_eq!(expired_count, 1);
     }
 
-
-
-
-
     #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_set_key_manager() {
@@ -1620,7 +1638,7 @@ mod tests {
         let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
             .with_key_source(KeySource::Environment("TEST_ENCRYPTION_KEY".to_string()));
 
-        let mut engine = EncryptionEngine::new(config).await.unwrap();
+        let engine = EncryptionEngine::new(config).await.unwrap();
 
         // Initially no key manager
         assert!(engine.key_manager.is_none());
@@ -1633,5 +1651,4 @@ mod tests {
         // 4. Test that key rotation uses the key manager
         assert!(engine.key_manager.is_none());
     }
-
 }

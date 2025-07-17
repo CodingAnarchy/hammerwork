@@ -969,7 +969,7 @@ impl EncryptionStats {
 /// ```
 pub fn generate_deterministic_key(service_prefix: &str, inputs: &[&str]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
-    
+
     let mut hasher = Sha256::new();
     hasher.update(service_prefix.as_bytes());
     for input in inputs {
@@ -1010,16 +1010,20 @@ pub fn generate_deterministic_key(service_prefix: &str, inputs: &[&str]) -> Vec<
 /// assert_eq!(key.len(), 16);
 /// # }
 /// ```
-pub fn generate_deterministic_key_with_size(service_prefix: &str, inputs: &[&str], key_size: usize) -> Vec<u8> {
+pub fn generate_deterministic_key_with_size(
+    service_prefix: &str,
+    inputs: &[&str],
+    key_size: usize,
+) -> Vec<u8> {
     use sha2::{Digest, Sha256};
-    
+
     let mut hasher = Sha256::new();
     hasher.update(service_prefix.as_bytes());
     for input in inputs {
         hasher.update(input.as_bytes());
     }
     let hash = hasher.finalize();
-    
+
     // Generate key of the requested size by repeating the hash pattern
     let mut key = vec![0u8; key_size];
     let hash_bytes = hash.as_slice();

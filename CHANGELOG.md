@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] - 2025-07-17
+
 ### Added
 - **🔐 Azure Key Vault Integration**
   - Added real Azure Key Vault integration with `azure-kv` feature flag

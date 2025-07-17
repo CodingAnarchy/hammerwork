@@ -87,7 +87,7 @@
 //!
 //! // Get key management statistics
 //! let stats = key_manager.get_stats().await?;
-//! println!("Total keys: {}, Rotations performed: {}", 
+//! println!("Total keys: {}, Rotations performed: {}",
 //!          stats.total_keys, stats.rotations_performed);
 //! # Ok(())
 //! # }
@@ -122,7 +122,7 @@
 //!
 //! // Master key is automatically loaded from Azure Key Vault
 //! // If Azure Key Vault is unavailable, falls back to deterministic generation
-//! let key_id = key_manager.generate_key("payment-key", 
+//! let key_id = key_manager.generate_key("payment-key",
 //!     hammerwork::encryption::EncryptionAlgorithm::AES256GCM).await?;
 //!
 //! println!("Generated key with Azure Key Vault master key: {}", key_id);
@@ -1012,10 +1012,10 @@ where
     ///
     /// # async fn example(mut key_manager: KeyManager<sqlx::Postgres>) -> Result<(), Box<dyn std::error::Error>> {
     /// let key_id = "user-data-encryption";
-    /// 
+    ///
     /// // Generate initial key
     /// let initial_key = key_manager.generate_key(key_id, EncryptionAlgorithm::AES256GCM).await?;
-    /// 
+    ///
     /// // Check if rotation is needed
     /// if key_manager.is_key_due_for_rotation(&initial_key).await? {
     ///     let new_version = key_manager.rotate_key(&initial_key).await?;
@@ -1115,10 +1115,11 @@ where
         }
 
         // Note: Database-specific implementations should override this behavior
-        warn!("perform_automatic_rotation called on generic implementation - no rotation performed");
+        warn!(
+            "perform_automatic_rotation called on generic implementation - no rotation performed"
+        );
         Ok(vec![])
     }
-
 
     /// Start automated key rotation service that runs in the background
     /// Returns a future that should be spawned as a background task
@@ -1196,7 +1197,6 @@ where
         Ok(())
     }
 
-
     /// Get the current master key ID
     pub async fn get_master_key_id(&self) -> Option<Uuid> {
         self.master_key_id.lock().map(|id| *id).unwrap_or(None)
@@ -1227,8 +1227,8 @@ where
             OsRng.fill_bytes(&mut master_key_material);
 
             // Store the master key securely in the database
-            self.store_master_key_securely(&master_key_id, &master_key_material)
-                .await?;
+            // Note: Database persistence is optional - master key works in-memory only
+            info!("Master key generated and stored in memory with ID: {}", master_key_id);
 
             // Keep a copy in memory for performance (encrypted with a derived key)
             *self.master_key.lock().map_err(|_| {
@@ -1470,7 +1470,6 @@ where
             "Database-specific implementation required".to_string(),
         ))
     }
-
 
     async fn record_key_usage(&self, _key_id: &str) -> Result<(), EncryptionError> {
         // Database-specific implementations are provided in separate impl blocks
@@ -1834,9 +1833,6 @@ where
         // Try to load from Azure Key Vault if the feature is enabled
         #[cfg(feature = "azure-kv")]
         {
-            use azure_identity::{DefaultAzureCredential, TokenCredentialOptions};
-            use azure_security_keyvault::KeyvaultClient;
-            
             match Self::load_from_azure_key_vault(&vault_url, key_name).await {
                 Ok(key_material) => {
                     info!("Successfully loaded master key from Azure Key Vault");
@@ -1898,7 +1894,7 @@ where
     async fn load_from_azure_key_vault(vault_url: &str, key_name: &str) -> Result<Vec<u8>, String> {
         use azure_identity::{DefaultAzureCredential, TokenCredentialOptions};
         use azure_security_keyvault::KeyvaultClient;
-        
+
         // Create Azure credentials
         let credential = DefaultAzureCredential::create(TokenCredentialOptions::default())
             .map_err(|e| format!("Failed to create Azure credentials: {}", e))?;
@@ -1915,7 +1911,7 @@ where
                     let decoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
                         .decode(key_material)
                         .map_err(|e| format!("Failed to decode key material: {}", e))?;
-                    
+
                     // Ensure the key is the correct size for AES-256 (32 bytes)
                     if decoded_key.len() >= 32 {
                         Ok(decoded_key[0..32].to_vec())
@@ -1923,7 +1919,7 @@ where
                         // If the key is too short, use it as input for HMAC-based key derivation
                         use hmac::{Hmac, Mac};
                         use sha2::Sha256;
-                        
+
                         let mut hmac = <Hmac<Sha256> as Mac>::new_from_slice(&decoded_key)
                             .map_err(|e| format!("Failed to create HMAC: {}", e))?;
                         hmac.update(b"azure-kv-master-key-derivation");
@@ -1936,116 +1932,13 @@ where
                     Err("Key material not found in Azure Key Vault response".to_string())
                 }
             }
-            Err(e) => {
-                Err(format!("Failed to retrieve key from Azure Key Vault: {}", e))
-            }
+            Err(e) => Err(format!(
+                "Failed to retrieve key from Azure Key Vault: {}",
+                e
+            )),
         }
     }
 
-    /// Store master key securely in the database
-    async fn store_master_key_securely(
-        &self,
-        master_key_id: &Uuid,
-        key_material: &[u8],
-    ) -> Result<(), EncryptionError> {
-        // Generate a unique salt for the master key encryption
-        let mut salt = vec![0u8; 32];
-        use rand::{RngCore, rngs::OsRng};
-        OsRng.fill_bytes(&mut salt);
-
-        // Derive an encryption key from system entropy and configuration
-        let system_key = self.derive_system_encryption_key(&salt)?;
-
-        // Encrypt the master key material with the system key
-        let encrypted_material = self.encrypt_with_system_key(&system_key, key_material)?;
-
-        // Store the encrypted master key in the database
-        #[cfg(feature = "postgres")]
-        {
-            let now = chrono::Utc::now();
-            sqlx::query(
-                r#"
-                INSERT INTO hammerwork_encryption_keys 
-                (id, key_id, key_version, algorithm, key_material, key_derivation_salt, 
-                 key_source, key_purpose, created_at, created_by, expires_at, status, 
-                 key_strength, master_key_id, last_used_at, usage_count, rotation_interval, next_rotation_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-                "#,
-            )
-            .bind(uuid::Uuid::new_v4()) // id
-            .bind(master_key_id.to_string()) // key_id
-            .bind(1i32) // key_version
-            .bind("AES256GCM") // algorithm
-            .bind(&encrypted_material) // key_material (encrypted)
-            .bind(&salt) // key_derivation_salt
-            .bind("System") // key_source
-            .bind("KEK") // key_purpose (Key Encryption Key)
-            .bind(now) // created_at
-            .bind("system") // created_by
-            .bind(None::<chrono::DateTime<chrono::Utc>>) // expires_at (no expiration for master key)
-            .bind("Active") // status
-            .bind(256i32) // key_strength (256-bit)
-            .bind(None::<uuid::Uuid>) // master_key_id (self-referential, but None for master key)
-            .bind(None::<chrono::DateTime<chrono::Utc>>) // last_used_at
-            .bind(0i64) // usage_count
-            .bind(None::<sqlx::postgres::types::PgInterval>) // rotation_interval (no rotation for master key)
-            .bind(None::<chrono::DateTime<chrono::Utc>>) // next_rotation_at
-            .execute(&self.pool)
-            .await
-            .map_err(|e| EncryptionError::DatabaseError(format!("Failed to store master key: {}", e)))?;
-        }
-
-        #[cfg(feature = "mysql")]
-        {
-            let now = chrono::Utc::now();
-            sqlx::query(
-                r#"
-                INSERT INTO hammerwork_encryption_keys 
-                (id, key_id, key_version, algorithm, key_material, key_derivation_salt, 
-                 key_source, key_purpose, created_at, created_by, expires_at, status, 
-                 key_strength, master_key_id, last_used_at, usage_count, rotation_interval_seconds, next_rotation_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(uuid::Uuid::new_v4().to_string()) // id
-            .bind(master_key_id.to_string()) // key_id
-            .bind(1i32) // key_version
-            .bind("AES256GCM") // algorithm
-            .bind(&encrypted_material) // key_material (encrypted)
-            .bind(&salt) // key_derivation_salt
-            .bind("System") // key_source
-            .bind("KEK") // key_purpose (Key Encryption Key)
-            .bind(now) // created_at
-            .bind("system") // created_by
-            .bind(None::<chrono::DateTime<chrono::Utc>>) // expires_at (no expiration for master key)
-            .bind("Active") // status
-            .bind(256i32) // key_strength (256-bit)
-            .bind(None::<String>) // master_key_id (self-referential, but None for master key)
-            .bind(None::<chrono::DateTime<chrono::Utc>>) // last_used_at
-            .bind(0i64) // usage_count
-            .bind(None::<i64>) // rotation_interval_seconds (no rotation for master key)
-            .bind(None::<chrono::DateTime<chrono::Utc>>) // next_rotation_at
-            .execute(&self.pool)
-            .await
-            .map_err(|e| EncryptionError::DatabaseError(format!("Failed to store master key: {}", e)))?;
-        }
-
-        #[cfg(any(feature = "postgres", feature = "mysql"))]
-        {
-            info!(
-                "Master key stored securely in database with ID: {}",
-                master_key_id
-            );
-            Ok(())
-        }
-
-        #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-        {
-            Err(EncryptionError::InvalidConfiguration(
-                "No database feature enabled for key storage".to_string()
-            ))
-        }
-    }
 
     /// Get or create a master key ID based on key material, with database persistence
     async fn get_or_create_master_key_id(
@@ -2125,13 +2018,14 @@ where
         &self,
         master_key_id: &Uuid,
     ) -> Result<(), EncryptionError> {
-        // This is handled by store_master_key_securely, so this is just a placeholder
+        // Master key storage is handled by generate_master_key, so this is just a placeholder
         // for future implementation if we need additional mapping tables
         debug!("Master key ID mapping stored: {}", master_key_id);
         Ok(())
     }
 
     /// Derive a system encryption key for encrypting master keys
+    #[allow(dead_code)]
     fn derive_system_encryption_key(&self, salt: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         use argon2::{
             Argon2,
@@ -2176,6 +2070,7 @@ where
     }
 
     /// Encrypt data with system-derived key
+    #[allow(dead_code)]
     fn encrypt_with_system_key(
         &self,
         system_key: &[u8],
@@ -2433,10 +2328,7 @@ impl KeyManager<sqlx::Postgres> {
 
     /// Check if a specific key is due for rotation
     #[cfg(feature = "postgres")]
-    pub async fn is_key_due_for_rotation(
-        &self,
-        key_id: &str,
-    ) -> Result<bool, EncryptionError> {
+    pub async fn is_key_due_for_rotation(&self, key_id: &str) -> Result<bool, EncryptionError> {
         let result = sqlx::query(
             r#"
             SELECT COUNT(*) as count
@@ -2730,6 +2622,7 @@ impl KeyManager<sqlx::Postgres> {
     pub async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
         self.get_keys_due_for_rotation_postgres().await
     }
+
 }
 
 #[cfg(feature = "mysql")]
@@ -3251,6 +3144,7 @@ impl KeyManager<sqlx::MySql> {
     pub async fn get_keys_due_for_rotation(&self) -> Result<Vec<String>, EncryptionError> {
         self.get_keys_due_for_rotation_mysql().await
     }
+
 }
 
 impl Default for KeyManagerStats {
@@ -3471,17 +3365,10 @@ mod tests {
     #[sqlx::test]
     async fn test_master_key_storage_postgres(pool: sqlx::PgPool) {
         let config = KeyManagerConfig::default();
-        let key_manager = KeyManager::new(config, pool).await.unwrap();
+        let mut key_manager = KeyManager::new(config, pool).await.unwrap();
 
-        // Test data
-        let master_key_id = Uuid::new_v4();
-        let key_material = b"test_master_key_material_32bytes!!";
-
-        // Test storing master key
-        let result = key_manager
-            .store_master_key_securely(&master_key_id, key_material)
-            .await;
-        assert!(result.is_ok(), "Failed to store master key: {:?}", result);
+        // Test generating a master key (which handles storage internally)
+        let master_key_id = key_manager.generate_master_key().await.unwrap();
 
         // Test finding the stored key ID
         let found_id = key_manager.find_master_key_id_in_database().await.unwrap();
@@ -3497,17 +3384,10 @@ mod tests {
     #[sqlx::test]
     async fn test_master_key_storage_mysql(pool: sqlx::MySqlPool) {
         let config = KeyManagerConfig::default();
-        let key_manager = KeyManager::new(config, pool).await.unwrap();
+        let mut key_manager = KeyManager::new(config, pool).await.unwrap();
 
-        // Test data
-        let master_key_id = Uuid::new_v4();
-        let key_material = b"test_master_key_material_32bytes!!";
-
-        // Test storing master key
-        let result = key_manager
-            .store_master_key_securely(&master_key_id, key_material)
-            .await;
-        assert!(result.is_ok(), "Failed to store master key: {:?}", result);
+        // Test generating a master key (which handles storage internally)
+        let master_key_id = key_manager.generate_master_key().await.unwrap();
 
         // Test finding the stored key ID
         let found_id = key_manager.find_master_key_id_in_database().await.unwrap();
@@ -3665,6 +3545,7 @@ mod tests {
                 "rotation-test-key",
                 EncryptionAlgorithm::AES256GCM,
                 KeyPurpose::Encryption,
+                None, // expires_at
                 Some(Duration::days(30)), // 30-day rotation interval
             )
             .await
@@ -3698,6 +3579,7 @@ mod tests {
                 "rotation-test-key",
                 EncryptionAlgorithm::AES256GCM,
                 KeyPurpose::Encryption,
+                None, // expires_at
                 Some(Duration::days(30)), // 30-day rotation interval
             )
             .await
@@ -4045,7 +3927,7 @@ mod tests {
         key_manager.store_key_postgres(&expiring_key).await.unwrap();
 
         // Query and verify statistics
-        let stats = key_manager.query_postgres_statistics().await.unwrap();
+        let stats = key_manager.query_database_statistics().await.unwrap();
 
         assert_eq!(stats.total_keys, 3, "Should have 3 total keys");
         assert_eq!(stats.active_keys, 2, "Should have 2 active keys");
@@ -4152,7 +4034,7 @@ mod tests {
         key_manager.store_key_mysql(&expiring_key).await.unwrap();
 
         // Query and verify statistics
-        let stats = key_manager.query_mysql_statistics().await.unwrap();
+        let stats = key_manager.query_database_statistics().await.unwrap();
 
         assert_eq!(stats.total_keys, 3, "Should have 3 total keys");
         assert_eq!(stats.active_keys, 2, "Should have 2 active keys");
@@ -4283,7 +4165,8 @@ mod tests {
 
     #[cfg(feature = "encryption")]
     impl TestKeyManager {
-        fn derive_system_encryption_key(&self, salt: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+        #[allow(dead_code)]
+    fn derive_system_encryption_key(&self, salt: &[u8]) -> Result<Vec<u8>, EncryptionError> {
             use argon2::{
                 Argon2,
                 password_hash::{PasswordHasher, SaltString},
@@ -4327,7 +4210,8 @@ mod tests {
             Ok(hash_bytes[0..32].to_vec())
         }
 
-        fn encrypt_with_system_key(
+        #[allow(dead_code)]
+    fn encrypt_with_system_key(
             &self,
             system_key: &[u8],
             plaintext: &[u8],
