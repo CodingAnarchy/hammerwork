@@ -1435,6 +1435,71 @@ impl DatabaseQueue for TestQueue {
         Ok(stats)
     }
 
+    async fn get_priority_stats(
+        &self,
+        queue_name: &str,
+    ) -> Result<crate::priority::PriorityStats> {
+        let storage = self.storage.read().await;
+        
+        let mut job_counts = std::collections::HashMap::new();
+        let mut avg_processing_times = std::collections::HashMap::new();
+        let mut recent_throughput = std::collections::HashMap::new();
+        let mut priority_distribution = std::collections::HashMap::new();
+        
+        // Initialize counts for all priorities
+        for priority in [
+            crate::priority::JobPriority::Background,
+            crate::priority::JobPriority::Low,
+            crate::priority::JobPriority::Normal,
+            crate::priority::JobPriority::High,
+            crate::priority::JobPriority::Critical,
+        ] {
+            job_counts.insert(priority.clone(), 0);
+            avg_processing_times.insert(priority.clone(), 0.0);
+            recent_throughput.insert(priority.clone(), 0);
+            priority_distribution.insert(priority.clone(), 0.0);
+        }
+        
+        let mut total_jobs = 0u64;
+        
+        if let Some(queue_jobs) = storage.queues.get(queue_name) {
+            for jobs in queue_jobs.values() {
+                for job_id in jobs {
+                    if let Some(job) = storage.jobs.get(job_id) {
+                        *job_counts.entry(job.priority.clone()).or_insert(0) += 1;
+                        total_jobs += 1;
+                        
+                        // Calculate processing time if job is completed
+                        if let (Some(started), Some(completed)) = (job.started_at, job.completed_at) {
+                            let processing_time = (completed - started).num_milliseconds() as f64;
+                            let current_avg = avg_processing_times.get(&job.priority).unwrap_or(&0.0);
+                            let current_count = *job_counts.get(&job.priority).unwrap_or(&1);
+                            let new_avg = (current_avg * (current_count - 1) as f64 + processing_time) / current_count as f64;
+                            avg_processing_times.insert(job.priority.clone(), new_avg);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Calculate priority distribution percentages
+        for (priority, count) in &job_counts {
+            let percentage = if total_jobs > 0 {
+                (*count as f32 / total_jobs as f32) * 100.0
+            } else {
+                0.0
+            };
+            priority_distribution.insert(priority.clone(), percentage);
+        }
+        
+        Ok(crate::priority::PriorityStats {
+            job_counts,
+            avg_processing_times,
+            recent_throughput,
+            priority_distribution,
+        })
+    }
+
     async fn get_job_counts_by_status(&self, queue_name: &str) -> Result<HashMap<String, u64>> {
         let storage = self.storage.read().await;
 

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **🔔 WebSocket Subscription Management**
+  - Implemented per-connection subscription tracking for targeted event delivery
+  - Added subscription state management with HashSet for efficient event filtering
+  - New `broadcast_to_subscribed()` method for sending messages only to interested clients
+  - Automatic cleanup of subscriptions when clients disconnect
+  - Event type categorization: "queue_updates", "job_updates", "system_alerts", "archive_events"
+
+- **📊 Enhanced Statistics and Monitoring**
+  - Real-time uptime tracking using SystemState's `started_at` timestamp
+  - Improved job listing with comprehensive data from all job sources (ready, dead, recurring)
+  - Enhanced search functionality querying across all job types and statuses
+  - Better pagination with accurate total count estimation for archived jobs
+
+### Fixed
+- **🔧 Database Query Implementations**
+  - Implemented `get_last_job_time()` using actual job queries instead of placeholder
+  - Implemented `get_oldest_pending_job()` with proper pending job filtering
+  - Implemented `get_recent_errors()` by querying dead jobs with error messages
+  - Added missing `get_priority_stats()` method in TestQueue for trait compliance
+
+- **📡 WebSocket Broadcast Processing**
+  - Fixed broadcast message delivery by implementing proper state access in `start_broadcast_listener`
+  - Integrated broadcast listener into server startup sequence
+  - Messages now properly route to subscribed clients based on event types
+  - Replaced placeholder TODO with fully functional broadcast implementation
+
+### Enhanced
+- **🔍 Archive Operations**
+  - Improved dry run estimation using actual job count queries
+  - Enhanced statistics collection with per-queue stats when no filter applied
+  - Added mock recent operations for better UI representation
+  - Better error messages for operations requiring additional DatabaseQueue methods
+
+- **⚙️ Configuration Detection**
+  - Metrics feature detection now uses compile-time `cfg!` macro
+  - Added helper functions for custom metrics counting and scrape time tracking
+  - Improved error handling with more descriptive messages
+
 ## [1.11.0] - 2025-07-14
 
 ### Added

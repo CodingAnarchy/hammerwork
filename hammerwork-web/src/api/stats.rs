@@ -236,17 +236,20 @@ pub struct StatsQuery {
 /// Create statistics routes
 pub fn routes<T>(
     queue: Arc<T>,
+    system_state: Arc<tokio::sync::RwLock<crate::api::system::SystemState>>,
 ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
 where
     T: DatabaseQueue + Send + Sync + 'static,
 {
     let queue_filter = warp::any().map(move || queue.clone());
+    let state_filter = warp::any().map(move || system_state.clone());
 
     let overview = warp::path("stats")
         .and(warp::path("overview"))
         .and(warp::path::end())
         .and(warp::get())
         .and(queue_filter.clone())
+        .and(state_filter.clone())
         .and_then(overview_handler);
 
     let detailed = warp::path("stats")
@@ -276,7 +279,10 @@ where
 }
 
 /// Handler for system overview statistics
-async fn overview_handler<T>(queue: Arc<T>) -> Result<impl Reply, warp::Rejection>
+async fn overview_handler<T>(
+    queue: Arc<T>,
+    system_state: Arc<tokio::sync::RwLock<crate::api::system::SystemState>>,
+) -> Result<impl Reply, warp::Rejection>
 where
     T: DatabaseQueue + Send + Sync,
 {
@@ -330,7 +336,10 @@ where
                 overall_error_rate,
                 avg_processing_time_ms: avg_processing_time,
                 system_health: health,
-                uptime_seconds: 0, // TODO: Track actual uptime
+                uptime_seconds: {
+                    let state = system_state.read().await;
+                    state.uptime_seconds() as u64
+                },
                 last_updated: chrono::Utc::now(),
             };
 

@@ -45,6 +45,7 @@
 
 use crate::{
     Result, api,
+    api::system::SystemState,
     auth::{AuthState, auth_filter, handle_auth_rejection},
     config::DashboardConfig,
     websocket::WebSocketState,
@@ -127,11 +128,23 @@ impl WebDashboard {
     pub async fn start(self) -> Result<()> {
         let bind_addr: SocketAddr = self.config.bind_addr().parse()?;
 
-        // Create job queue
-        let queue = Arc::new(self.create_job_queue().await?);
+        // Detect database type and create job queue
+        let (queue, database_type) = self.create_job_queue_with_type().await?;
+        let queue = Arc::new(queue);
+        
+        // Create system state
+        let system_state = Arc::new(RwLock::new(SystemState::new(
+            self.config.clone(),
+            database_type,
+            self.config.pool_size,
+        )));
 
         // Create API routes
-        let api_routes = Self::create_api_routes_static(queue.clone(), self.auth_state.clone());
+        let api_routes = Self::create_api_routes_static(
+            queue.clone(), 
+            self.auth_state.clone(),
+            system_state.clone(),
+        );
 
         // Create WebSocket routes
         let websocket_routes = Self::create_websocket_routes_static(
@@ -182,14 +195,18 @@ impl WebDashboard {
             }
         });
 
+        // Start WebSocket broadcast listener
+        let websocket_state_broadcast = self.websocket_state.clone();
+        WebSocketState::start_broadcast_listener(websocket_state_broadcast).await?;
+
         // Start the server
         warp::serve(routes).run(bind_addr).await;
 
         Ok(())
     }
 
-    /// Create job queue from database URL
-    async fn create_job_queue(&self) -> Result<QueueType> {
+    /// Create job queue from database URL and return database type
+    async fn create_job_queue_with_type(&self) -> Result<(QueueType, String)> {
         // Determine database type from URL and create appropriate queue
         if self.config.database_url.starts_with("postgres") {
             #[cfg(feature = "postgres")]
@@ -199,7 +216,7 @@ impl WebDashboard {
                     "Connected to PostgreSQL with {} connections",
                     self.config.pool_size
                 );
-                Ok(JobQueue::new(pg_pool))
+                Ok((JobQueue::new(pg_pool), "PostgreSQL".to_string()))
             }
             #[cfg(not(feature = "postgres"))]
             {
@@ -217,7 +234,7 @@ impl WebDashboard {
                         "Connected to MySQL with {} connections",
                         self.config.pool_size
                     );
-                    Ok(JobQueue::new(mysql_pool))
+                    Ok((JobQueue::new(mysql_pool), "MySQL".to_string()))
                 }
                 #[cfg(all(feature = "postgres", feature = "mysql"))]
                 {
@@ -241,6 +258,7 @@ impl WebDashboard {
     fn create_api_routes_static(
         queue: Arc<QueueType>,
         auth_state: AuthState,
+        system_state: Arc<RwLock<SystemState>>,
     ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone {
         // Health check endpoint (no auth required)
         let health = warp::path("health")
@@ -257,8 +275,8 @@ impl WebDashboard {
         // API routes (require authentication)
         let api_routes = api::queues::routes(queue.clone())
             .or(api::jobs::routes(queue.clone()))
-            .or(api::stats::routes(queue.clone()))
-            .or(api::system::routes(queue.clone()))
+            .or(api::stats::routes(queue.clone(), system_state.clone()))
+            .or(api::system::routes(queue.clone(), system_state))
             .or(api::archive::archive_routes(queue.clone()))
             .or(api::spawn::spawn_routes(queue));
 

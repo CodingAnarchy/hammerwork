@@ -1180,6 +1180,72 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .collect())
     }
 
+    async fn get_priority_stats(
+        &self,
+        queue_name: &str,
+    ) -> Result<crate::priority::PriorityStats> {
+        let priority_counts: Vec<(i32, i64)> = sqlx::query_as(
+            "SELECT priority, COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? GROUP BY priority",
+        )
+        .bind(queue_name)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut stats = crate::priority::PriorityStats::new();
+        
+        for (priority_num, count) in priority_counts {
+            let priority = match priority_num {
+                0 => crate::priority::JobPriority::Background,
+                1 => crate::priority::JobPriority::Low,
+                2 => crate::priority::JobPriority::Normal,
+                3 => crate::priority::JobPriority::High,
+                4 => crate::priority::JobPriority::Critical,
+                _ => crate::priority::JobPriority::Normal, // Default fallback
+            };
+            
+            *stats.job_counts.entry(priority).or_insert(0) = count as u64;
+        }
+
+        // Calculate additional statistics if we have processing time data
+        let processing_times: Vec<(i32, i64)> = sqlx::query_as(
+            r#"SELECT priority, TIMESTAMPDIFF(MICROSECOND, started_at, completed_at) / 1000 as processing_ms
+               FROM hammerwork_jobs 
+               WHERE queue_name = ? AND started_at IS NOT NULL AND completed_at IS NOT NULL"#,
+        )
+        .bind(queue_name)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        // Group processing times by priority and calculate averages
+        let mut priority_times: std::collections::HashMap<crate::priority::JobPriority, Vec<f64>> = 
+            std::collections::HashMap::new();
+            
+        for (priority_num, processing_ms) in processing_times {
+            let priority = match priority_num {
+                0 => crate::priority::JobPriority::Background,
+                1 => crate::priority::JobPriority::Low,
+                2 => crate::priority::JobPriority::Normal,
+                3 => crate::priority::JobPriority::High,
+                4 => crate::priority::JobPriority::Critical,
+                _ => crate::priority::JobPriority::Normal,
+            };
+            
+            priority_times.entry(priority).or_insert_with(Vec::new).push(processing_ms as f64);
+        }
+
+        // Calculate average processing times for each priority
+        for (priority, times) in priority_times {
+            if !times.is_empty() {
+                let avg = times.iter().sum::<f64>() / times.len() as f64;
+                stats.avg_processing_times.insert(priority, avg);
+            }
+        }
+
+        stats.calculate_distribution();
+        Ok(stats)
+    }
+
     async fn get_processing_times(
         &self,
         queue_name: &str,

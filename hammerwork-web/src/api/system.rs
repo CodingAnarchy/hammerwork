@@ -124,7 +124,36 @@ use super::ApiResponse;
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use warp::{Filter, Reply};
+
+/// Shared system state for tracking runtime information
+#[derive(Clone)]
+pub struct SystemState {
+    /// Application start time
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Server configuration
+    pub config: crate::DashboardConfig,
+    /// Database type (detected at runtime)
+    pub database_type: String,
+    /// Pool size from actual connection pool
+    pub pool_size: u32,
+}
+
+impl SystemState {
+    pub fn new(config: crate::DashboardConfig, database_type: String, pool_size: u32) -> Self {
+        Self {
+            started_at: chrono::Utc::now(),
+            config,
+            database_type,
+            pool_size,
+        }
+    }
+    
+    pub fn uptime_seconds(&self) -> i64 {
+        (chrono::Utc::now() - self.started_at).num_seconds()
+    }
+}
 
 /// System information
 #[derive(Debug, Serialize)]
@@ -207,29 +236,34 @@ pub struct MaintenanceRequest {
 /// Create system routes
 pub fn routes<T>(
     queue: Arc<T>,
+    system_state: Arc<RwLock<SystemState>>,
 ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
 where
     T: DatabaseQueue + Send + Sync + 'static,
 {
     let queue_filter = warp::any().map(move || queue.clone());
+    let state_filter = warp::any().map(move || system_state.clone());
 
     let info = warp::path("system")
         .and(warp::path("info"))
         .and(warp::path::end())
         .and(warp::get())
         .and(queue_filter.clone())
+        .and(state_filter.clone())
         .and_then(system_info_handler);
 
     let config = warp::path("system")
         .and(warp::path("config"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(state_filter.clone())
         .and_then(system_config_handler);
 
     let metrics_info = warp::path("system")
         .and(warp::path("metrics"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(state_filter.clone())
         .and_then(metrics_info_handler);
 
     let maintenance = warp::path("system")
@@ -249,7 +283,10 @@ where
 }
 
 /// Handler for system information
-async fn system_info_handler<T>(queue: Arc<T>) -> Result<impl Reply, warp::Rejection>
+async fn system_info_handler<T>(
+    queue: Arc<T>,
+    system_state: Arc<RwLock<SystemState>>,
+) -> Result<impl Reply, warp::Rejection>
 where
     T: DatabaseQueue + Send + Sync,
 {
@@ -272,13 +309,15 @@ where
         gc_collections: None,    // Not applicable for Rust
     };
 
+    let state = system_state.read().await;
+    
     let database_info = DatabaseInfo {
-        database_type: "PostgreSQL/MySQL".to_string(), // TODO: Detect actual type
+        database_type: state.database_type.clone(),
         connection_url: "***masked***".to_string(),
-        pool_size: 5,             // TODO: Get from actual config
-        active_connections: None, // TODO: Get from pool
+        pool_size: state.pool_size,
+        active_connections: None, // Would need pool access
         connection_health: database_healthy,
-        last_migration: None, // TODO: Get from migration table
+        last_migration: None, // Would need migration table query
     };
 
     let features = vec![
@@ -296,34 +335,41 @@ where
         runtime_info,
         database_info,
         features,
-        uptime_seconds: 0,              // TODO: Track actual uptime
-        started_at: chrono::Utc::now(), // TODO: Track actual start time
+        uptime_seconds: state.uptime_seconds() as u64,
+        started_at: state.started_at,
     };
 
     Ok(warp::reply::json(&ApiResponse::success(system_info)))
 }
 
 /// Handler for system configuration
-async fn system_config_handler() -> Result<impl Reply, warp::Rejection> {
+async fn system_config_handler(
+    system_state: Arc<RwLock<SystemState>>,
+) -> Result<impl Reply, warp::Rejection> {
+    let state = system_state.read().await;
     let config = ServerConfig {
-        bind_address: "127.0.0.1".to_string(), // TODO: Get from actual config
-        port: 8080,                            // TODO: Get from actual config
-        authentication_enabled: false,         // TODO: Get from actual config
-        cors_enabled: false,                   // TODO: Get from actual config
-        websocket_max_connections: 100,        // TODO: Get from actual config
-        static_assets_path: "./assets".to_string(), // TODO: Get from actual config
+        bind_address: state.config.bind_address.clone(),
+        port: state.config.port,
+        authentication_enabled: state.config.auth.enabled,
+        cors_enabled: state.config.enable_cors,
+        websocket_max_connections: state.config.websocket.max_connections,
+        static_assets_path: state.config.static_dir.to_string_lossy().to_string(),
     };
 
     Ok(warp::reply::json(&ApiResponse::success(config)))
 }
 
 /// Handler for metrics information
-async fn metrics_info_handler() -> Result<impl Reply, warp::Rejection> {
+async fn metrics_info_handler(
+    system_state: Arc<RwLock<SystemState>>,
+) -> Result<impl Reply, warp::Rejection> {
+    let state = system_state.read().await;
+    
     let metrics_info = MetricsInfo {
-        prometheus_enabled: true, // TODO: Detect if metrics feature is enabled
+        prometheus_enabled: cfg!(feature = "metrics"),
         metrics_endpoint: "/metrics".to_string(),
-        custom_metrics_count: 0, // TODO: Count actual custom metrics
-        last_scrape: None,       // TODO: Track last scrape time
+        custom_metrics_count: get_custom_metrics_count(),
+        last_scrape: get_last_scrape_time().await,
     };
 
     Ok(warp::reply::json(&ApiResponse::success(metrics_info)))
@@ -458,6 +504,39 @@ fn get_memory_usage() -> Option<u64> {
     }
 
     None
+}
+
+/// Get count of custom metrics (Prometheus metrics beyond the default ones)
+fn get_custom_metrics_count() -> u32 {
+    #[cfg(feature = "metrics")]
+    {
+        // TODO: In a real implementation, you would query the Prometheus registry
+        // to count custom metrics. For now, we return a placeholder.
+        // This would typically involve accessing the global metrics registry
+        // and counting user-defined metrics vs. system metrics.
+        0
+    }
+    
+    #[cfg(not(feature = "metrics"))]
+    {
+        0
+    }
+}
+
+/// Get the last time metrics were scraped
+async fn get_last_scrape_time() -> Option<chrono::DateTime<chrono::Utc>> {
+    #[cfg(feature = "metrics")]
+    {
+        // TODO: Track actual scrape times in a real implementation
+        // This would typically be stored in a shared state or metrics registry
+        // For now, we return None as metrics scraping time tracking isn't implemented
+        None
+    }
+    
+    #[cfg(not(feature = "metrics"))]
+    {
+        None
+    }
 }
 
 #[cfg(test)]

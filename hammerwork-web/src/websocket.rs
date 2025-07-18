@@ -56,6 +56,7 @@ use warp::ws::Message;
 pub struct WebSocketState {
     config: WebSocketConfig,
     connections: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
+    subscriptions: HashMap<Uuid, std::collections::HashSet<String>>,
     broadcast_sender: mpsc::UnboundedSender<BroadcastMessage>,
     broadcast_receiver: Option<mpsc::UnboundedReceiver<BroadcastMessage>>,
 }
@@ -67,6 +68,7 @@ impl WebSocketState {
         Self {
             config,
             connections: HashMap::new(),
+            subscriptions: HashMap::new(),
             broadcast_sender,
             broadcast_receiver: Some(broadcast_receiver),
         }
@@ -126,8 +128,9 @@ impl WebSocketState {
             }
         }
 
-        // Clean up connection
+        // Clean up connection and subscriptions
         self.connections.remove(&connection_id);
+        self.subscriptions.remove(&connection_id);
         info!("WebSocket connection closed: {}", connection_id);
 
         Ok(())
@@ -173,18 +176,31 @@ impl WebSocketState {
 
     /// Handle a client action
     async fn handle_client_action(
-        &self,
-        _connection_id: Uuid,
+        &mut self,
+        connection_id: Uuid,
         message: ClientMessage,
     ) -> crate::Result<()> {
         match message {
             ClientMessage::Subscribe { event_types } => {
-                info!("Client subscribed to events: {:?}", event_types);
-                // TODO: Store subscription preferences per connection
+                info!("Client {} subscribed to events: {:?}", connection_id, event_types);
+                // Store subscription preferences per connection
+                let subscription_set = self.subscriptions.entry(connection_id).or_insert_with(std::collections::HashSet::new);
+                for event_type in event_types {
+                    subscription_set.insert(event_type);
+                }
             }
             ClientMessage::Unsubscribe { event_types } => {
-                info!("Client unsubscribed from events: {:?}", event_types);
-                // TODO: Update subscription preferences
+                info!("Client {} unsubscribed from events: {:?}", connection_id, event_types);
+                // Update subscription preferences
+                if let Some(subscription_set) = self.subscriptions.get_mut(&connection_id) {
+                    for event_type in event_types {
+                        subscription_set.remove(&event_type);
+                    }
+                    // Remove empty subscription sets
+                    if subscription_set.is_empty() {
+                        self.subscriptions.remove(&connection_id);
+                    }
+                }
             }
             ClientMessage::Ping => {
                 // Client ping - we'll send a pong back via broadcast
@@ -211,6 +227,27 @@ impl WebSocketState {
         // Clean up disconnected clients
         // Note: In a real implementation, we'd need mutable access to self.connections
         // This would be handled by the connection cleanup in handle_connection
+
+        Ok(())
+    }
+
+    /// Broadcast a message to subscribed clients only
+    pub async fn broadcast_to_subscribed(&self, message: ServerMessage, event_type: &str) -> crate::Result<()> {
+        let json_message = serde_json::to_string(&message)?;
+        let ws_message = Message::text(json_message);
+
+        let mut disconnected = Vec::new();
+
+        for (&connection_id, sender) in &self.connections {
+            // Check if this connection is subscribed to this event type
+            if let Some(subscription_set) = self.subscriptions.get(&connection_id) {
+                if subscription_set.contains(event_type) {
+                    if sender.send(ws_message.clone()).is_err() {
+                        disconnected.push(connection_id);
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -302,11 +339,27 @@ impl WebSocketState {
     }
 
     /// Start the broadcast listener task
-    pub async fn start_broadcast_listener(&mut self) -> crate::Result<()> {
-        if let Some(mut receiver) = self.broadcast_receiver.take() {
+    pub async fn start_broadcast_listener(state: Arc<tokio::sync::RwLock<WebSocketState>>) -> crate::Result<()> {
+        let mut state_guard = state.write().await;
+        if let Some(mut receiver) = state_guard.broadcast_receiver.take() {
+            drop(state_guard); // Release the lock before spawning the task
+            
             tokio::spawn(async move {
                 while let Some(broadcast_message) = receiver.recv().await {
-                    // Convert broadcast message to server message and send to all clients
+                    // Determine the event type for subscription filtering
+                    let event_type = match &broadcast_message {
+                        BroadcastMessage::QueueUpdate { .. } => "queue_updates",
+                        BroadcastMessage::JobUpdate { .. } => "job_updates",
+                        BroadcastMessage::SystemAlert { .. } => "system_alerts",
+                        BroadcastMessage::JobArchived { .. } => "archive_events",
+                        BroadcastMessage::JobRestored { .. } => "archive_events",
+                        BroadcastMessage::BulkArchiveStarted { .. } => "archive_events",
+                        BroadcastMessage::BulkArchiveProgress { .. } => "archive_events",
+                        BroadcastMessage::BulkArchiveCompleted { .. } => "archive_events",
+                        BroadcastMessage::JobsPurged { .. } => "archive_events",
+                    };
+                    
+                    // Convert broadcast message to server message
                     let server_message = match broadcast_message {
                         BroadcastMessage::QueueUpdate { queue_name, stats } => {
                             ServerMessage::QueueUpdate { queue_name, stats }
@@ -361,9 +414,11 @@ impl WebSocketState {
                         }
                     };
 
-                    // Note: We'd need access to the WebSocketState here to broadcast
-                    // In a real implementation, this would be handled differently
-                    debug!("Broadcasting message: {:?}", server_message);
+                    // Actually broadcast the message to subscribed clients
+                    let state_read = state.read().await;
+                    if let Err(e) = state_read.broadcast_to_subscribed(&server_message, event_type).await {
+                        error!("Failed to broadcast message: {}", e);
+                    }
                 }
             });
         }

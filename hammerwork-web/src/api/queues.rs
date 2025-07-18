@@ -97,7 +97,7 @@ use super::{
     ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
     with_filters, with_pagination, with_sort,
 };
-use hammerwork::queue::DatabaseQueue;
+use hammerwork::{queue::DatabaseQueue, JobPriority};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use warp::{Filter, Reply};
@@ -235,8 +235,8 @@ where
                     avg_processing_time_ms: stats.statistics.avg_processing_time_ms,
                     throughput_per_minute: stats.statistics.throughput_per_minute,
                     error_rate: stats.statistics.error_rate,
-                    last_job_at: None,        // TODO: Get from database
-                    oldest_pending_job: None, // TODO: Get from database
+                    last_job_at: get_last_job_time(&queue, &stats.queue_name).await,
+                    oldest_pending_job: get_oldest_pending_job(&queue, &stats.queue_name).await,
                     is_paused: pause_info.is_some(),
                     paused_at: pause_info.as_ref().map(|p| p.paused_at),
                     paused_by: pause_info.as_ref().and_then(|p| p.paused_by.clone()),
@@ -283,10 +283,10 @@ where
         Ok(all_stats) => {
             if let Some(stats) = all_stats.into_iter().find(|s| s.queue_name == queue_name) {
                 // Get additional details for this specific queue
-                let priority_breakdown = std::collections::HashMap::new(); // TODO: Implement
-                let status_breakdown = std::collections::HashMap::new(); // TODO: Implement
-                let hourly_throughput = Vec::new(); // TODO: Implement
-                let recent_errors = Vec::new(); // TODO: Implement
+                let priority_breakdown = get_priority_breakdown(&queue, &queue_name).await;
+                let status_breakdown = get_status_breakdown(&queue, &queue_name).await;
+                let hourly_throughput = get_hourly_throughput(&queue, &queue_name).await;
+                let recent_errors = get_recent_errors(&queue, &queue_name).await;
 
                 // Get pause information for this queue
                 let pause_info = queue
@@ -362,10 +362,20 @@ where
             }
         }
         "clear_completed" => {
-            // TODO: Implement clear completed jobs
-            let response =
-                ApiResponse::<()>::error("Clear completed jobs not yet implemented".to_string());
-            Ok(warp::reply::json(&response))
+            match clear_completed_jobs(&queue, &queue_name).await {
+                Ok(count) => {
+                    let response = ApiResponse::success(serde_json::json!({
+                        "message": format!("Cleared {} completed jobs from queue '{}'", count, queue_name),
+                        "queue": queue_name,
+                        "cleared_count": count
+                    }));
+                    Ok(warp::reply::json(&response))
+                }
+                Err(e) => {
+                    let response = ApiResponse::<()>::error(format!("Failed to clear completed jobs: {}", e));
+                    Ok(warp::reply::json(&response))
+                }
+            }
         }
         "pause" => match queue.pause_queue(&queue_name, Some("web-ui")).await {
             Ok(()) => {
@@ -424,6 +434,166 @@ where
     }));
 
     Ok(warp::reply::json(&response))
+}
+
+/// Helper function to get the last job time for a queue
+async fn get_last_job_time<T>(
+    queue: &Arc<T>,
+    queue_name: &str,
+) -> Option<chrono::DateTime<chrono::Utc>>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    // Get recent jobs from multiple sources and find the most recent timestamp
+    let mut latest_time: Option<chrono::DateTime<chrono::Utc>> = None;
+    
+    // Check ready jobs
+    if let Ok(ready_jobs) = queue.get_ready_jobs(queue_name, 10).await {
+        for job in ready_jobs {
+            if let Some(time) = job.completed_at.or(job.started_at).or(Some(job.created_at)) {
+                latest_time = match latest_time {
+                    Some(current) if time > current => Some(time),
+                    None => Some(time),
+                    _ => latest_time,
+                };
+            }
+        }
+    }
+    
+    // Check dead jobs
+    if let Ok(dead_jobs) = queue.get_dead_jobs_by_queue(queue_name, Some(10), Some(0)).await {
+        for job in dead_jobs {
+            if let Some(time) = job.failed_at.or(job.completed_at).or(job.started_at).or(Some(job.created_at)) {
+                latest_time = match latest_time {
+                    Some(current) if time > current => Some(time),
+                    None => Some(time),
+                    _ => latest_time,
+                };
+            }
+        }
+    }
+    
+    latest_time
+}
+
+/// Helper function to get the oldest pending job time for a queue
+async fn get_oldest_pending_job<T>(
+    queue: &Arc<T>,
+    queue_name: &str,
+) -> Option<chrono::DateTime<chrono::Utc>>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    // Get ready jobs (these are pending jobs) and find the oldest
+    if let Ok(ready_jobs) = queue.get_ready_jobs(queue_name, 100).await {
+        ready_jobs
+            .iter()
+            .filter(|job| matches!(job.status, hammerwork::job::JobStatus::Pending))
+            .map(|job| job.created_at)
+            .min()
+    } else {
+        None
+    }
+}
+
+/// Helper function to get priority breakdown for a queue
+async fn get_priority_breakdown<T>(
+    queue: &Arc<T>,
+    queue_name: &str,
+) -> std::collections::HashMap<String, u64>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    // Use the new get_priority_stats method
+    if let Ok(priority_stats) = queue.get_priority_stats(queue_name).await {
+        let mut breakdown = std::collections::HashMap::new();
+        for (priority, count) in priority_stats.job_counts {
+            let priority_name = match priority {
+                JobPriority::Background => "background",
+                JobPriority::Low => "low",
+                JobPriority::Normal => "normal", 
+                JobPriority::High => "high",
+                JobPriority::Critical => "critical",
+            };
+            breakdown.insert(priority_name.to_string(), count);
+        }
+        breakdown
+    } else {
+        std::collections::HashMap::new()
+    }
+}
+
+/// Helper function to get status breakdown for a queue
+async fn get_status_breakdown<T>(
+    queue: &Arc<T>,
+    queue_name: &str,
+) -> std::collections::HashMap<String, u64>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    // Use existing job counts method
+    if let Ok(counts) = queue.get_job_counts_by_status(queue_name).await {
+        counts.into_iter().collect()
+    } else {
+        std::collections::HashMap::new()
+    }
+}
+
+/// Helper function to get hourly throughput data for a queue
+async fn get_hourly_throughput<T>(
+    _queue: &Arc<T>,
+    _queue_name: &str,
+) -> Vec<HourlyThroughput>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    // This would require tracking hourly statistics
+    // For now, return empty as it's not implemented in the DatabaseQueue trait
+    Vec::new()
+}
+
+/// Helper function to get recent errors for a queue
+async fn get_recent_errors<T>(
+    queue: &Arc<T>,
+    queue_name: &str,
+) -> Vec<RecentError>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    // Get dead jobs which contain failed jobs with error messages
+    if let Ok(dead_jobs) = queue.get_dead_jobs_by_queue(queue_name, Some(20), Some(0)).await {
+        dead_jobs
+            .into_iter()
+            .filter_map(|job| {
+                job.error_message.map(|error_msg| RecentError {
+                    job_id: job.id.to_string(),
+                    error_message: error_msg,
+                    occurred_at: job.failed_at.unwrap_or(job.created_at),
+                    attempts: job.attempts as i32,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Helper function to clear completed jobs from a queue
+async fn clear_completed_jobs<T>(
+    _queue: &Arc<T>,
+    _queue_name: &str,
+) -> Result<u64, String>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    // To implement this properly, we would need:
+    // 1. A method to query jobs by status (get_jobs_by_status)
+    // 2. Filter for completed jobs
+    // 3. Delete them using the existing delete_job method
+    // 
+    // Since DatabaseQueue trait doesn't provide a way to query jobs by status,
+    // we cannot implement this functionality without extending the trait.
+    Err("Clear completed jobs requires additional DatabaseQueue methods not yet available".to_string())
 }
 
 #[cfg(test)]
