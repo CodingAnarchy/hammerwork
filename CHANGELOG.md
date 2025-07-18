@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.0] - 2025-01-17
+
 ### Added
 - **📦 Advanced Streaming Serialization Formats**
   - Implemented MessagePack serialization using `rmp-serde` for compact binary JSON-like format
@@ -15,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - All advanced serialization formats are feature-gated under the `streaming` feature flag
   - Graceful degradation with helpful error messages when streaming feature is not enabled
   - Comprehensive schema definitions for JobLifecycleEvent in both Avro and Protobuf formats
+- **🔧 Comprehensive Streaming Feature Flag Implementation**
+  - Complete feature-gating of streaming module behind `streaming`/`kafka`/`google-pubsub`/`kinesis` features
+  - Selective compilation of streaming functionality to reduce dependencies when not needed
+  - Proper conditional exports and configuration structs with feature boundary respect
+  - Integration tests properly isolated based on feature availability
+- **🧪 Enhanced Serialization Testing**
+  - Comprehensive test coverage for all serialization formats with round-trip validation
+  - Binary format validation and size efficiency testing
+  - Feature flag enforcement testing with proper error handling
+  - Cross-format performance comparison testing
 - **📡 Kafka Streaming Integration**
   - Added real Apache Kafka integration with `kafka` feature flag using `rdkafka` crate
   - Implemented production-ready `KafkaProcessor` with real Kafka producer functionality
