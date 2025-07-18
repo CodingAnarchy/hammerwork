@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **📊 Enhanced Statistics and Monitoring**
+  - Added `get_jobs_completed_in_range` method to `DatabaseQueue` trait for time-based job queries
+  - Implemented PostgreSQL and MySQL backends for retrieving jobs completed within specific time ranges
+  - Added support for filtering completed jobs by queue name and limiting result sets
+  - Enhanced TestQueue implementation with proper time-based filtering for completed jobs
+
+### Fixed
+- **🔧 Web Dashboard Improvements**
+  - Fixed hourly trends to use actual time-bucketed data instead of repeating the same average for each hour
+  - Improved accuracy of hourly statistics by querying actual job completion data for each time bucket
+  - Enhanced error rate calculation to be based on actual completed and failed job counts per hour
+  - Fixed processing time calculations to use real data from jobs completed within specific hour windows
+
 ## [1.15.0] - 2025-01-17
 
 ### Added

@@ -1301,6 +1301,68 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .collect())
     }
 
+    async fn get_jobs_completed_in_range(
+        &self,
+        queue_name: Option<&str>,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Job>> {
+        let limit_clause = if let Some(limit) = limit {
+            format!("LIMIT {}", limit)
+        } else {
+            "".to_string()
+        };
+
+        let query = if queue_name.is_some() {
+            format!(
+                r#"
+                SELECT {} 
+                FROM hammerwork_jobs 
+                WHERE queue_name = ? 
+                  AND status = 'completed' 
+                  AND completed_at >= ? 
+                  AND completed_at < ?
+                ORDER BY completed_at DESC
+                {}
+                "#,
+                JOB_SELECT_FIELDS,
+                limit_clause
+            )
+        } else {
+            format!(
+                r#"
+                SELECT {} 
+                FROM hammerwork_jobs 
+                WHERE status = 'completed' 
+                  AND completed_at >= ? 
+                  AND completed_at < ?
+                ORDER BY completed_at DESC
+                {}
+                "#,
+                JOB_SELECT_FIELDS,
+                limit_clause
+            )
+        };
+
+        let rows: Vec<JobRow> = if let Some(queue) = queue_name {
+            sqlx::query_as(&query)
+                .bind(queue)
+                .bind(start_time)
+                .bind(end_time)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query_as(&query)
+                .bind(start_time)
+                .bind(end_time)
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        rows.into_iter().map(|row| row.into_job()).collect()
+    }
+
     async fn enqueue_cron_job(&self, job: Job) -> Result<JobId> {
         // For cron jobs, we use the regular enqueue method
         // The job should already have the cron fields set

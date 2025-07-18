@@ -1579,6 +1579,47 @@ impl DatabaseQueue for TestQueue {
         Ok(frequencies)
     }
 
+    async fn get_jobs_completed_in_range(
+        &self,
+        queue_name: Option<&str>,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Job>> {
+        let storage = self.storage.read().await;
+        let mut matching_jobs = Vec::new();
+
+        for job in storage.jobs.values() {
+            // Filter by queue name if specified
+            if let Some(qn) = queue_name {
+                if job.queue_name != qn {
+                    continue;
+                }
+            }
+
+            // Check if job is completed and within time range
+            if job.status == JobStatus::Completed {
+                if let Some(completed_at) = job.completed_at {
+                    if completed_at >= start_time && completed_at < end_time {
+                        matching_jobs.push(job.clone());
+                    }
+                }
+            }
+        }
+
+        // Sort by completion time (most recent first)
+        matching_jobs.sort_by(|a, b| {
+            b.completed_at.cmp(&a.completed_at)
+        });
+
+        // Apply limit if specified
+        if let Some(limit) = limit {
+            matching_jobs.truncate(limit as usize);
+        }
+
+        Ok(matching_jobs)
+    }
+
     // Cron job management
     async fn enqueue_cron_job(&self, mut job: Job) -> Result<JobId> {
         if job.cron_schedule.is_none() {

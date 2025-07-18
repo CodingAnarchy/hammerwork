@@ -139,6 +139,15 @@ pub trait DatabaseQueue: Send + Sync {
         since: DateTime<Utc>,
     ) -> Result<std::collections::HashMap<String, u64>>;
 
+    /// Get jobs that completed within a specific time range
+    async fn get_jobs_completed_in_range(
+        &self,
+        queue_name: Option<&str>,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Job>>;
+
     // Cron job management
     /// Enqueue a cron job for recurring execution
     async fn enqueue_cron_job(&self, job: Job) -> Result<JobId>;
