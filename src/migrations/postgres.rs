@@ -3,8 +3,124 @@
 use super::{Migration, MigrationRecord, MigrationRunner};
 use crate::Result;
 use chrono::Utc;
+use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 use sqlx::{PgPool, Row};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Parse SQL text into individual statements using sqlparser-rs
+/// This properly handles quoted strings, dollar-quoted strings, and comments
+fn parse_sql_statements(sql: &str) -> Result<Vec<String>, sqlparser::parser::ParserError> {
+    let dialect = PostgreSqlDialect {};
+    
+    // First, try to parse the entire SQL as a series of statements
+    match Parser::parse_sql(&dialect, sql) {
+        Ok(statements) => {
+            // Convert parsed statements back to SQL strings
+            Ok(statements.iter().map(|stmt| format!("{};", stmt)).collect())
+        }
+        Err(_) => {
+            // If parsing fails, try to split manually while respecting SQL syntax
+            // This is a more conservative approach for complex migrations
+            Ok(split_sql_respecting_quotes(sql))
+        }
+    }
+}
+
+/// Split SQL while respecting quoted contexts
+/// This is a simpler fallback that handles the most common cases
+fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current_statement = String::new();
+    let mut in_single_quote = false;
+    let mut in_dollar_quote = false;
+    let mut dollar_tag = String::new();
+    let mut chars = sql.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        current_statement.push(ch);
+        
+        match ch {
+            '\'' if !in_dollar_quote => {
+                // Handle single quotes (with escape sequences)
+                if in_single_quote {
+                    // Check for escaped quote
+                    if chars.peek() == Some(&'\'') {
+                        current_statement.push(chars.next().unwrap());
+                    } else {
+                        in_single_quote = false;
+                    }
+                } else {
+                    in_single_quote = true;
+                }
+            }
+            '$' if !in_single_quote => {
+                // Handle dollar quoting
+                if in_dollar_quote {
+                    // Check if this closes the dollar quote
+                    let mut temp_tag = String::new();
+                    let chars_ahead: Vec<char> = chars.clone().collect();
+                    let mut i = 0;
+                    
+                    while i < chars_ahead.len() && (chars_ahead[i].is_alphanumeric() || chars_ahead[i] == '_') {
+                        temp_tag.push(chars_ahead[i]);
+                        i += 1;
+                    }
+                    
+                    if i < chars_ahead.len() && chars_ahead[i] == '$' && temp_tag == dollar_tag {
+                        // Consume the tag and closing $
+                        for _ in 0..=i {
+                            if let Some(c) = chars.next() {
+                                current_statement.push(c);
+                            }
+                        }
+                        in_dollar_quote = false;
+                        dollar_tag.clear();
+                    }
+                } else {
+                    // Check if this starts a dollar quote
+                    let mut temp_tag = String::new();
+                    let chars_ahead: Vec<char> = chars.clone().collect();
+                    let mut i = 0;
+                    
+                    while i < chars_ahead.len() && (chars_ahead[i].is_alphanumeric() || chars_ahead[i] == '_') {
+                        temp_tag.push(chars_ahead[i]);
+                        i += 1;
+                    }
+                    
+                    if i < chars_ahead.len() && chars_ahead[i] == '$' {
+                        // This is a dollar quote start
+                        for _ in 0..=i {
+                            if let Some(c) = chars.next() {
+                                current_statement.push(c);
+                            }
+                        }
+                        in_dollar_quote = true;
+                        dollar_tag = temp_tag;
+                    }
+                }
+            }
+            ';' if !in_single_quote && !in_dollar_quote => {
+                // This is a statement terminator
+                let trimmed = current_statement.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with("--") {
+                    statements.push(current_statement.clone());
+                }
+                current_statement.clear();
+            }
+            _ => {
+                // Regular character, just continue
+            }
+        }
+    }
+    
+    // Add final statement if non-empty
+    let trimmed = current_statement.trim();
+    if !trimmed.is_empty() && !trimmed.starts_with("--") {
+        statements.push(current_statement);
+    }
+    
+    statements
+}
 
 /// PostgreSQL migration runner
 pub struct PostgresMigrationRunner {
@@ -24,13 +140,18 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
 
         let mut tx = self.pool.begin().await?;
 
-        // Split SQL into individual statements and execute each one
-        // Split on semicolon and filter out empty statements
-        let statements: Vec<&str> = sql
-            .split(';')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty() && !s.chars().all(|c| c.is_whitespace() || c == '\n'))
-            .collect();
+        // Parse SQL using sqlparser-rs for proper statement splitting
+        let statements = match parse_sql_statements(sql) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                warn!("Failed to parse SQL with sqlparser, falling back to naive splitting: {}", e);
+                // Fallback to simple splitting for compatibility
+                sql.split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && !s.chars().all(|c| c.is_whitespace() || c == '\n'))
+                    .collect()
+            }
+        };
 
         for (i, statement) in statements.iter().enumerate() {
             // Add semicolon back if it was removed by split

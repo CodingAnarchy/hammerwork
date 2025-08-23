@@ -3,8 +3,27 @@
 use super::{Migration, MigrationRecord, MigrationRunner};
 use crate::Result;
 use chrono::Utc;
+use sqlparser::{dialect::MySqlDialect, parser::Parser};
 use sqlx::{MySqlPool, Row};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Parse SQL text into individual statements using sqlparser-rs for MySQL
+fn parse_mysql_statements(sql: &str) -> Result<Vec<String>, sqlparser::parser::ParserError> {
+    let dialect = MySqlDialect {};
+    
+    match Parser::parse_sql(&dialect, sql) {
+        Ok(statements) => {
+            Ok(statements.iter().map(|stmt| format!("{};", stmt)).collect())
+        }
+        Err(_) => {
+            // Fallback to simple splitting for MySQL
+            Ok(sql.split(";\n")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
+        }
+    }
+}
 
 /// MySQL migration runner
 pub struct MySqlMigrationRunner {
@@ -24,13 +43,17 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
 
         let mut tx = self.pool.begin().await?;
 
-        // Split SQL into individual statements and execute each one
-        // This is a simple split that handles most cases - splits on semicolon followed by newline
-        let statements: Vec<&str> = sql
-            .split(";\n")
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Parse SQL using sqlparser-rs for proper statement splitting
+        let statements = match parse_mysql_statements(sql) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                warn!("Failed to parse MySQL SQL with sqlparser, falling back to naive splitting: {}", e);
+                sql.split(";\n")
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+        };
 
         for (i, statement) in statements.iter().enumerate() {
             // Add semicolon back if it was removed by split
