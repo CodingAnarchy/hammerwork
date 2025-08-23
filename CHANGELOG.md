@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.1] - 2025-01-23
+
 ### Added
 - **📊 Enhanced Statistics and Monitoring**
   - Added `get_jobs_completed_in_range` method to `DatabaseQueue` trait for time-based job queries
@@ -15,11 +17,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Enhanced TestQueue implementation with proper time-based filtering for completed jobs
 
 ### Fixed
+- **🔧 Migration System Improvements**
+  - Implemented proper SQL parsing in migration runners using `sqlparser-rs` dependency
+  - Fixed migration execution issues with complex SQL statements containing:
+    - Single-quoted strings with escape sequences
+    - Dollar-quoted strings ($tag$...$tag$) for PL/pgSQL functions
+    - Comments (-- and /* */) within migrations
+    - Complex function definitions and procedural blocks
+  - Replaced naive semicolon splitting with robust SQL parsing for both PostgreSQL and MySQL
+  - Added fallback parsing mechanisms for edge cases to maintain compatibility
+  - Fixed migration 012 dependency optimization to handle empty tables correctly
+  - Fixed migration 014 function definitions to work with proper dollar-quoting
+  - Restored proper trigger function creation for automatic timestamp updates
 - **🔧 Web Dashboard Improvements**
   - Fixed hourly trends to use actual time-bucketed data instead of repeating the same average for each hour
   - Improved accuracy of hourly statistics by querying actual job completion data for each time bucket
   - Enhanced error rate calculation to be based on actual completed and failed job counts per hour
   - Fixed processing time calculations to use real data from jobs completed within specific hour windows
+- **🗃️ Database Schema Fixes**
+  - Fixed PostgreSQL dependency resolution queries to work with UUID array operations
+  - Corrected jsonb to UUID array conversion logic in dependency optimization migration
+  - Updated postgres.rs implementation to use proper UUID array syntax with ANY() operations
 
 ## [1.15.0] - 2025-01-17
 
