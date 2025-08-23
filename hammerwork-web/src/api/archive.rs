@@ -405,7 +405,15 @@ where
             let total = if jobs.len() as u64 == pagination.limit {
                 // If we got exactly the limit, there might be more records
                 // Run another query to get a better count estimate
-                match queue.list_archived_jobs(filters.queue.as_deref(), Some(10000), Some(0), filters.older_than).await {
+                match queue
+                    .list_archived_jobs(
+                        filters.queue.as_deref(),
+                        Some(10000),
+                        Some(0),
+                        filters.older_than,
+                    )
+                    .await
+                {
                     Ok(all_jobs) => all_jobs.len() as u64,
                     Err(_) => jobs.len() as u64, // Fallback to current page count
                 }
@@ -474,11 +482,14 @@ where
     if request.dry_run {
         // For dry run, estimate how many jobs would be purged by using list_archived_jobs
         // with a large limit to get an accurate count
-        let count = match queue.list_archived_jobs(None, Some(10000), Some(0), request.older_than).await {
+        let count = match queue
+            .list_archived_jobs(None, Some(10000), Some(0), request.older_than)
+            .await
+        {
             Ok(jobs) => jobs.len() as u64,
             Err(_) => 0, // If we can't get the count, return 0 for safety
         };
-        
+
         let response = PurgeResponse {
             jobs_purged: count,
             dry_run: true,
@@ -515,18 +526,20 @@ where
         Ok(stats) => {
             // Collect per-queue stats if no specific queue is filtered
             let mut by_queue = std::collections::HashMap::new();
-            
+
             if filters.queue.is_none() {
                 // Get queue list and collect stats for each
                 if let Ok(queue_stats) = queue.get_all_queue_stats().await {
                     for queue_stat in queue_stats {
-                        if let Ok(queue_archival_stats) = queue.get_archival_stats(Some(&queue_stat.queue_name)).await {
+                        if let Ok(queue_archival_stats) =
+                            queue.get_archival_stats(Some(&queue_stat.queue_name)).await
+                        {
                             by_queue.insert(queue_stat.queue_name, queue_archival_stats);
                         }
                     }
                 }
             }
-            
+
             // Generate some mock recent operations (in a real implementation, these would be tracked)
             let recent_operations = vec![
                 RecentOperation {

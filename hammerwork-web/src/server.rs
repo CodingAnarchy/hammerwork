@@ -131,7 +131,7 @@ impl WebDashboard {
         // Detect database type and create job queue
         let (queue, database_type) = self.create_job_queue_with_type().await?;
         let queue = Arc::new(queue);
-        
+
         // Create system state
         let system_state = Arc::new(RwLock::new(SystemState::new(
             self.config.clone(),
@@ -141,7 +141,7 @@ impl WebDashboard {
 
         // Create API routes
         let api_routes = Self::create_api_routes_static(
-            queue.clone(), 
+            queue.clone(),
             self.auth_state.clone(),
             system_state.clone(),
         );

@@ -149,7 +149,7 @@ impl SystemState {
             pool_size,
         }
     }
-    
+
     pub fn uptime_seconds(&self) -> i64 {
         (chrono::Utc::now() - self.started_at).num_seconds()
     }
@@ -310,7 +310,7 @@ where
     };
 
     let state = system_state.read().await;
-    
+
     let database_info = DatabaseInfo {
         database_type: state.database_type.clone(),
         connection_url: "***masked***".to_string(),
@@ -364,7 +364,7 @@ async fn metrics_info_handler(
     system_state: Arc<RwLock<SystemState>>,
 ) -> Result<impl Reply, warp::Rejection> {
     let state = system_state.read().await;
-    
+
     let metrics_info = MetricsInfo {
         prometheus_enabled: cfg!(feature = "metrics"),
         metrics_endpoint: "/metrics".to_string(),
@@ -516,7 +516,7 @@ fn get_custom_metrics_count() -> u32 {
         // and counting user-defined metrics vs. system metrics.
         0
     }
-    
+
     #[cfg(not(feature = "metrics"))]
     {
         0
@@ -532,7 +532,7 @@ async fn get_last_scrape_time() -> Option<chrono::DateTime<chrono::Utc>> {
         // For now, we return None as metrics scraping time tracking isn't implemented
         None
     }
-    
+
     #[cfg(not(feature = "metrics"))]
     {
         None

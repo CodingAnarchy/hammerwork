@@ -1180,10 +1180,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .collect())
     }
 
-    async fn get_priority_stats(
-        &self,
-        queue_name: &str,
-    ) -> Result<crate::priority::PriorityStats> {
+    async fn get_priority_stats(&self, queue_name: &str) -> Result<crate::priority::PriorityStats> {
         let priority_counts: Vec<(i32, i64)> = sqlx::query_as(
             "SELECT priority, COUNT(*) FROM hammerwork_jobs WHERE queue_name = ? GROUP BY priority",
         )
@@ -1192,7 +1189,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         .await?;
 
         let mut stats = crate::priority::PriorityStats::new();
-        
+
         for (priority_num, count) in priority_counts {
             let priority = match priority_num {
                 0 => crate::priority::JobPriority::Background,
@@ -1202,7 +1199,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 4 => crate::priority::JobPriority::Critical,
                 _ => crate::priority::JobPriority::Normal, // Default fallback
             };
-            
+
             *stats.job_counts.entry(priority).or_insert(0) = count as u64;
         }
 
@@ -1218,9 +1215,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         .unwrap_or_default();
 
         // Group processing times by priority and calculate averages
-        let mut priority_times: std::collections::HashMap<crate::priority::JobPriority, Vec<f64>> = 
+        let mut priority_times: std::collections::HashMap<crate::priority::JobPriority, Vec<f64>> =
             std::collections::HashMap::new();
-            
+
         for (priority_num, processing_ms) in processing_times {
             let priority = match priority_num {
                 0 => crate::priority::JobPriority::Background,
@@ -1230,8 +1227,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 4 => crate::priority::JobPriority::Critical,
                 _ => crate::priority::JobPriority::Normal,
             };
-            
-            priority_times.entry(priority).or_default().push(processing_ms as f64);
+
+            priority_times
+                .entry(priority)
+                .or_default()
+                .push(processing_ms as f64);
         }
 
         // Calculate average processing times for each priority
@@ -1326,8 +1326,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 ORDER BY completed_at DESC
                 {}
                 "#,
-                JOB_SELECT_FIELDS,
-                limit_clause
+                JOB_SELECT_FIELDS, limit_clause
             )
         } else {
             format!(
@@ -1340,8 +1339,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 ORDER BY completed_at DESC
                 {}
                 "#,
-                JOB_SELECT_FIELDS,
-                limit_clause
+                JOB_SELECT_FIELDS, limit_clause
             )
         };
 

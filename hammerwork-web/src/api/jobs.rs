@@ -228,7 +228,7 @@ where
     // Since DatabaseQueue doesn't provide direct list methods with filters,
     // we'll use the available methods to gather jobs
     let mut all_jobs = Vec::new();
-    
+
     // Get queue stats to find available queues
     let queue_stats = match queue.get_all_queue_stats().await {
         Ok(stats) => stats,
@@ -237,46 +237,55 @@ where
             return Ok(warp::reply::json(&response));
         }
     };
-    
+
     // Filter by queue if specified
     let target_queues: Vec<String> = if let Some(ref queue_name) = filters.queue {
         vec![queue_name.clone()]
     } else {
         queue_stats.iter().map(|s| s.queue_name.clone()).collect()
     };
-    
+
     // For each queue, get jobs from different sources based on status filter
     for queue_name in &target_queues {
         let mut queue_jobs = Vec::new();
-        
+
         // Collect jobs based on status filter or get all types if no filter
-        if filters.status.is_none() || filters.status.as_ref().unwrap().to_lowercase() == "pending" {
+        if filters.status.is_none() || filters.status.as_ref().unwrap().to_lowercase() == "pending"
+        {
             // Get ready jobs (pending jobs ready to be processed)
             if let Ok(ready_jobs) = queue.get_ready_jobs(&queue_name, 100).await {
                 queue_jobs.extend(ready_jobs);
             }
         }
-        
-        if filters.status.is_none() || filters.status.as_ref().unwrap().to_lowercase() == "failed" || filters.status.as_ref().unwrap().to_lowercase() == "dead" {
+
+        if filters.status.is_none()
+            || filters.status.as_ref().unwrap().to_lowercase() == "failed"
+            || filters.status.as_ref().unwrap().to_lowercase() == "dead"
+        {
             // Get dead jobs
-            if let Ok(dead_jobs) = queue.get_dead_jobs_by_queue(&queue_name, Some(100), Some(0)).await {
+            if let Ok(dead_jobs) = queue
+                .get_dead_jobs_by_queue(&queue_name, Some(100), Some(0))
+                .await
+            {
                 queue_jobs.extend(dead_jobs);
             }
         }
-        
-        if filters.status.is_none() || filters.status.as_ref().unwrap().to_lowercase() == "recurring" {
+
+        if filters.status.is_none()
+            || filters.status.as_ref().unwrap().to_lowercase() == "recurring"
+        {
             // Get recurring jobs
             if let Ok(recurring_jobs) = queue.get_recurring_jobs(&queue_name).await {
                 queue_jobs.extend(recurring_jobs);
             }
         }
-        
+
         for job in queue_jobs {
             let processing_time_ms = match (job.started_at, job.completed_at) {
                 (Some(started), Some(completed)) => Some((completed - started).num_milliseconds()),
                 _ => None,
             };
-            
+
             let job_info = JobInfo {
                 id: job.id.to_string(),
                 queue_name: job.queue_name.clone(),
@@ -297,25 +306,25 @@ where
                 trace_id: job.trace_id.clone(),
                 correlation_id: job.correlation_id.clone(),
             };
-            
+
             // Apply status filter
             if let Some(ref status) = filters.status {
                 if job_info.status.to_lowercase() != status.to_lowercase() {
                     continue;
                 }
             }
-            
+
             // Apply priority filter
             if let Some(ref priority) = filters.priority {
                 if job_info.priority.to_lowercase() != priority.to_lowercase() {
                     continue;
                 }
             }
-            
+
             all_jobs.push(job_info);
         }
     }
-    
+
     // Sort jobs
     match sort.sort_by.as_deref() {
         Some("created_at") => {
@@ -350,19 +359,15 @@ where
             all_jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         }
     }
-    
+
     // Apply pagination
     let total_count = all_jobs.len() as u64;
     let page_size = pagination.limit.unwrap_or(20).min(100) as usize;
     let page = pagination.page.unwrap_or(1).max(1) as usize;
     let offset = (page - 1) * page_size;
-    
-    let paginated_jobs: Vec<JobInfo> = all_jobs
-        .into_iter()
-        .skip(offset)
-        .take(page_size)
-        .collect();
-    
+
+    let paginated_jobs: Vec<JobInfo> = all_jobs.into_iter().skip(offset).take(page_size).collect();
+
     let response = PaginatedResponse {
         items: paginated_jobs,
         pagination: PaginationMeta::new(&pagination, total_count),
@@ -590,7 +595,7 @@ where
     // Since we don't have direct search methods, we'll gather jobs and filter in memory
     let mut matching_jobs = Vec::new();
     let search_term = search_request.query.to_lowercase();
-    
+
     // Get queue stats to find available queues
     let queue_stats = match queue.get_all_queue_stats().await {
         Ok(stats) => stats,
@@ -599,77 +604,100 @@ where
             return Ok(warp::reply::json(&response));
         }
     };
-    
+
     // Filter by specified queues or use all
     let target_queues: Vec<String> = if let Some(ref queue_names) = search_request.queues {
         queue_names.clone()
     } else {
         queue_stats.iter().map(|s| s.queue_name.clone()).collect()
     };
-    
+
     for queue_name in &target_queues {
         let mut queue_jobs = Vec::new();
-        
+
         // Collect jobs from all sources for comprehensive search
         if let Ok(ready_jobs) = queue.get_ready_jobs(&queue_name, 200).await {
             queue_jobs.extend(ready_jobs);
         }
-        
-        if let Ok(dead_jobs) = queue.get_dead_jobs_by_queue(&queue_name, Some(200), Some(0)).await {
+
+        if let Ok(dead_jobs) = queue
+            .get_dead_jobs_by_queue(&queue_name, Some(200), Some(0))
+            .await
+        {
             queue_jobs.extend(dead_jobs);
         }
-        
+
         if let Ok(recurring_jobs) = queue.get_recurring_jobs(&queue_name).await {
             queue_jobs.extend(recurring_jobs);
         }
-        
+
         for job in queue_jobs {
             // Check if job matches search criteria
-            let payload_str = serde_json::to_string(&job.payload).unwrap_or_default().to_lowercase();
-            let matches_search = job.id.to_string().contains(&search_term) ||
-                job.queue_name.to_lowercase().contains(&search_term) ||
-                payload_str.contains(&search_term) ||
-                job.error_message.as_ref().map(|e| e.to_lowercase().contains(&search_term)).unwrap_or(false) ||
-                job.trace_id.as_ref().map(|t| t.to_lowercase().contains(&search_term)).unwrap_or(false) ||
-                job.correlation_id.as_ref().map(|c| c.to_lowercase().contains(&search_term)).unwrap_or(false);
-            
+            let payload_str = serde_json::to_string(&job.payload)
+                .unwrap_or_default()
+                .to_lowercase();
+            let matches_search = job.id.to_string().contains(&search_term)
+                || job.queue_name.to_lowercase().contains(&search_term)
+                || payload_str.contains(&search_term)
+                || job
+                    .error_message
+                    .as_ref()
+                    .map(|e| e.to_lowercase().contains(&search_term))
+                    .unwrap_or(false)
+                || job
+                    .trace_id
+                    .as_ref()
+                    .map(|t| t.to_lowercase().contains(&search_term))
+                    .unwrap_or(false)
+                || job
+                    .correlation_id
+                    .as_ref()
+                    .map(|c| c.to_lowercase().contains(&search_term))
+                    .unwrap_or(false);
+
             if !matches_search {
                 continue;
             }
-            
+
             // Apply status filter
             if let Some(ref statuses) = search_request.statuses {
-                if !statuses.iter().any(|s| s.eq_ignore_ascii_case(job.status.as_str())) {
+                if !statuses
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(job.status.as_str()))
+                {
                     continue;
                 }
             }
-            
+
             // Apply priority filter
             if let Some(ref priorities) = search_request.priorities {
                 let job_priority_str = format!("{:?}", job.priority);
-                if !priorities.iter().any(|p| p.eq_ignore_ascii_case(&job_priority_str)) {
+                if !priorities
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&job_priority_str))
+                {
                     continue;
                 }
             }
-            
+
             // Apply date filters
             if let Some(ref created_after) = search_request.created_after {
                 if job.created_at < *created_after {
                     continue;
                 }
             }
-            
+
             if let Some(ref created_before) = search_request.created_before {
                 if job.created_at > *created_before {
                     continue;
                 }
             }
-            
+
             let processing_time_ms = match (job.started_at, job.completed_at) {
                 (Some(started), Some(completed)) => Some((completed - started).num_milliseconds()),
                 _ => None,
             };
-            
+
             matching_jobs.push(JobInfo {
                 id: job.id.to_string(),
                 queue_name: job.queue_name.clone(),
@@ -691,61 +719,84 @@ where
                 correlation_id: job.correlation_id.clone(),
             });
         }
-        
+
         // Also search recurring jobs
         let recurring_jobs = match queue.get_recurring_jobs(&queue_name).await {
             Ok(jobs) => jobs,
             Err(e) => {
-                eprintln!("Failed to get recurring jobs for queue {}: {}", queue_name, e);
+                eprintln!(
+                    "Failed to get recurring jobs for queue {}: {}",
+                    queue_name, e
+                );
                 continue;
             }
         };
-            
+
         for job in recurring_jobs {
             // Check if job matches search criteria
-            let payload_str = serde_json::to_string(&job.payload).unwrap_or_default().to_lowercase();
-            let matches_search = job.id.to_string().contains(&search_term) ||
-                job.queue_name.to_lowercase().contains(&search_term) ||
-                payload_str.contains(&search_term) ||
-                job.error_message.as_ref().map(|e| e.to_lowercase().contains(&search_term)).unwrap_or(false) ||
-                job.trace_id.as_ref().map(|t| t.to_lowercase().contains(&search_term)).unwrap_or(false) ||
-                job.correlation_id.as_ref().map(|c| c.to_lowercase().contains(&search_term)).unwrap_or(false);
-            
+            let payload_str = serde_json::to_string(&job.payload)
+                .unwrap_or_default()
+                .to_lowercase();
+            let matches_search = job.id.to_string().contains(&search_term)
+                || job.queue_name.to_lowercase().contains(&search_term)
+                || payload_str.contains(&search_term)
+                || job
+                    .error_message
+                    .as_ref()
+                    .map(|e| e.to_lowercase().contains(&search_term))
+                    .unwrap_or(false)
+                || job
+                    .trace_id
+                    .as_ref()
+                    .map(|t| t.to_lowercase().contains(&search_term))
+                    .unwrap_or(false)
+                || job
+                    .correlation_id
+                    .as_ref()
+                    .map(|c| c.to_lowercase().contains(&search_term))
+                    .unwrap_or(false);
+
             if !matches_search {
                 continue;
             }
-            
+
             // Apply additional filters
             if let Some(ref statuses) = search_request.statuses {
-                if !statuses.iter().any(|s| s.eq_ignore_ascii_case(job.status.as_str())) {
+                if !statuses
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(job.status.as_str()))
+                {
                     continue;
                 }
             }
-            
+
             if let Some(ref priorities) = search_request.priorities {
                 let job_priority_str = format!("{:?}", job.priority);
-                if !priorities.iter().any(|p| p.eq_ignore_ascii_case(&job_priority_str)) {
+                if !priorities
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(&job_priority_str))
+                {
                     continue;
                 }
             }
-            
+
             if let Some(ref created_after) = search_request.created_after {
                 if job.created_at < *created_after {
                     continue;
                 }
             }
-            
+
             if let Some(ref created_before) = search_request.created_before {
                 if job.created_at > *created_before {
                     continue;
                 }
             }
-            
+
             let processing_time_ms = match (job.started_at, job.completed_at) {
                 (Some(started), Some(completed)) => Some((completed - started).num_milliseconds()),
                 _ => None,
             };
-            
+
             matching_jobs.push(JobInfo {
                 id: job.id.to_string(),
                 queue_name: job.queue_name.clone(),
@@ -768,22 +819,22 @@ where
             });
         }
     }
-    
+
     // Sort by created_at desc by default
     matching_jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    
+
     // Apply pagination
     let total_count = matching_jobs.len() as u64;
     let page_size = pagination.limit.unwrap_or(20).min(100) as usize;
     let page = pagination.page.unwrap_or(1).max(1) as usize;
     let offset = (page - 1) * page_size;
-    
+
     let paginated_jobs: Vec<JobInfo> = matching_jobs
         .into_iter()
         .skip(offset)
         .take(page_size)
         .collect();
-    
+
     let response = PaginatedResponse {
         items: paginated_jobs,
         pagination: PaginationMeta::new(&pagination, total_count),

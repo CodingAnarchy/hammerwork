@@ -370,11 +370,13 @@ where
             let mut queue_stats: Vec<QueueStats> = Vec::new();
             for stats in all_stats.iter() {
                 // Calculate oldest pending age seconds
-                let oldest_pending_age_seconds = calculate_oldest_pending_age(&queue, &stats.queue_name).await;
-                
+                let oldest_pending_age_seconds =
+                    calculate_oldest_pending_age(&queue, &stats.queue_name).await;
+
                 // Get priority distribution from priority stats
-                let priority_distribution = get_priority_distribution(&queue, &stats.queue_name).await;
-                
+                let priority_distribution =
+                    get_priority_distribution(&queue, &stats.queue_name).await;
+
                 queue_stats.push(QueueStats {
                     name: stats.queue_name.clone(),
                     pending: stats.pending_count,
@@ -596,10 +598,7 @@ fn generate_overview_from_stats(stats: &[hammerwork::stats::QueueStats]) -> Syst
 }
 
 /// Calculate the oldest pending job age in seconds for a queue
-async fn calculate_oldest_pending_age<T>(
-    queue: &Arc<T>,
-    queue_name: &str,
-) -> Option<u64>
+async fn calculate_oldest_pending_age<T>(queue: &Arc<T>, queue_name: &str) -> Option<u64>
 where
     T: DatabaseQueue + Send + Sync,
 {
@@ -620,29 +619,25 @@ where
 }
 
 /// Get priority distribution from priority stats for a queue
-async fn get_priority_distribution<T>(
-    queue: &Arc<T>,
-    queue_name: &str,
-) -> HashMap<String, f32>
+async fn get_priority_distribution<T>(queue: &Arc<T>, queue_name: &str) -> HashMap<String, f32>
 where
     T: DatabaseQueue + Send + Sync,
 {
     match queue.get_priority_stats(queue_name).await {
-        Ok(priority_stats) => {
-            priority_stats.priority_distribution
-                .into_iter()
-                .map(|(priority, percentage)| {
-                    let priority_name = match priority {
-                        hammerwork::priority::JobPriority::Background => "background",
-                        hammerwork::priority::JobPriority::Low => "low",
-                        hammerwork::priority::JobPriority::Normal => "normal",
-                        hammerwork::priority::JobPriority::High => "high",
-                        hammerwork::priority::JobPriority::Critical => "critical",
-                    };
-                    (priority_name.to_string(), percentage)
-                })
-                .collect()
-        }
+        Ok(priority_stats) => priority_stats
+            .priority_distribution
+            .into_iter()
+            .map(|(priority, percentage)| {
+                let priority_name = match priority {
+                    hammerwork::priority::JobPriority::Background => "background",
+                    hammerwork::priority::JobPriority::Low => "low",
+                    hammerwork::priority::JobPriority::Normal => "normal",
+                    hammerwork::priority::JobPriority::High => "high",
+                    hammerwork::priority::JobPriority::Critical => "critical",
+                };
+                (priority_name.to_string(), percentage)
+            })
+            .collect(),
         Err(_) => HashMap::new(),
     }
 }
@@ -657,20 +652,23 @@ where
 {
     let now = chrono::Utc::now();
     let mut trends = Vec::new();
-    
+
     // Generate trends for the last 24 hours using actual database queries
     for i in 0..24 {
         let hour_start = now - chrono::Duration::hours(23 - i);
         let hour_end = hour_start + chrono::Duration::hours(1);
-        
+
         let mut hour_completed = 0u64;
         let mut hour_failed = 0u64;
         let mut hour_processing_times = Vec::new();
-        
+
         // Get completed jobs for this specific hour across all queues
-        if let Ok(completed_jobs) = queue.get_jobs_completed_in_range(None, hour_start, hour_end, Some(1000)).await {
+        if let Ok(completed_jobs) = queue
+            .get_jobs_completed_in_range(None, hour_start, hour_end, Some(1000))
+            .await
+        {
             hour_completed = completed_jobs.len() as u64;
-            
+
             // Collect processing times for completed jobs
             for job in completed_jobs {
                 if let (Some(started_at), Some(completed_at)) = (job.started_at, job.completed_at) {
@@ -679,14 +677,14 @@ where
                 }
             }
         }
-        
+
         // Get failed jobs for this hour using error frequencies
         // Since we don't have a direct method for failed jobs in time range,
         // we'll estimate based on error frequencies for this hour
         if let Ok(error_frequencies) = queue.get_error_frequencies(None, hour_start).await {
             // This gives us errors since hour_start, so we need to estimate for just this hour
             let total_errors_since_start = error_frequencies.values().sum::<u64>();
-            
+
             // For recent hours, use a more accurate estimate
             if i < 3 {
                 // For the last 3 hours, assume more recent distribution
@@ -696,28 +694,32 @@ where
                 hour_failed = total_errors_since_start / 24; // Rough hourly average
             }
         }
-        
+
         // Calculate throughput (jobs per second for this hour)
         let hour_throughput = (hour_completed + hour_failed) as f64 / 3600.0;
-        
+
         // Calculate average processing time for this hour
         let avg_processing_time_ms = if !hour_processing_times.is_empty() {
             hour_processing_times.iter().sum::<f64>() / hour_processing_times.len() as f64
         } else {
             // If no processing times available, use overall average from stats
             if !all_stats.is_empty() {
-                all_stats.iter().map(|s| s.statistics.avg_processing_time_ms).sum::<f64>() / all_stats.len() as f64
+                all_stats
+                    .iter()
+                    .map(|s| s.statistics.avg_processing_time_ms)
+                    .sum::<f64>()
+                    / all_stats.len() as f64
             } else {
                 0.0
             }
         };
-        
+
         let error_rate = if (hour_completed + hour_failed) > 0 {
             hour_failed as f64 / (hour_completed + hour_failed) as f64
         } else {
             0.0
         };
-        
+
         trends.push(HourlyTrend {
             hour: hour_start,
             completed: hour_completed,
@@ -727,10 +729,9 @@ where
             error_rate,
         });
     }
-    
+
     trends
 }
-
 
 /// Generate error patterns from queue statistics
 async fn generate_error_patterns<T>(
@@ -742,15 +743,18 @@ where
 {
     let mut error_patterns = Vec::new();
     let total_errors = all_stats.iter().map(|s| s.dead_count).sum::<u64>();
-    
+
     if total_errors == 0 {
         return error_patterns;
     }
-    
+
     // Collect error messages from dead jobs across all queues
     let mut error_messages = Vec::new();
     for stats in all_stats {
-        if let Ok(dead_jobs) = queue.get_dead_jobs_by_queue(&stats.queue_name, Some(20), Some(0)).await {
+        if let Ok(dead_jobs) = queue
+            .get_dead_jobs_by_queue(&stats.queue_name, Some(20), Some(0))
+            .await
+        {
             for job in dead_jobs {
                 if let Some(error_msg) = job.error_message {
                     error_messages.push((error_msg, job.failed_at.unwrap_or(job.created_at)));
@@ -758,24 +762,26 @@ where
             }
         }
     }
-    
+
     // Group similar error messages
     let mut error_counts = std::collections::HashMap::new();
     let mut error_first_seen = std::collections::HashMap::new();
-    
+
     for (error_msg, failed_at) in error_messages {
         let error_type = extract_error_type(&error_msg);
         let count = error_counts.entry(error_type.clone()).or_insert(0);
         *count += 1;
-        
-        error_first_seen.entry(error_type.clone()).or_insert_with(|| (error_msg, failed_at));
+
+        error_first_seen
+            .entry(error_type.clone())
+            .or_insert_with(|| (error_msg, failed_at));
     }
-    
+
     // Convert to error patterns
     for (error_type, count) in error_counts {
         let percentage = (count as f64 / total_errors as f64) * 100.0;
         let (sample_message, first_seen) = error_first_seen.get(&error_type).unwrap();
-        
+
         error_patterns.push(ErrorPattern {
             error_type,
             count,
@@ -784,42 +790,58 @@ where
             first_seen: *first_seen,
         });
     }
-    
+
     // Sort by count descending
     error_patterns.sort_by(|a, b| b.count.cmp(&a.count));
-    
+
     error_patterns
 }
 
 /// Calculate performance metrics from queue statistics
-fn calculate_performance_metrics(all_stats: &[hammerwork::queue::QueueStats]) -> PerformanceMetrics {
-    let total_jobs = all_stats.iter().map(|s| s.pending_count + s.running_count + s.completed_count + s.dead_count).sum::<u64>();
-    let total_throughput = all_stats.iter().map(|s| s.statistics.throughput_per_minute).sum::<f64>();
+fn calculate_performance_metrics(
+    all_stats: &[hammerwork::queue::QueueStats],
+) -> PerformanceMetrics {
+    let total_jobs = all_stats
+        .iter()
+        .map(|s| s.pending_count + s.running_count + s.completed_count + s.dead_count)
+        .sum::<u64>();
+    let total_throughput = all_stats
+        .iter()
+        .map(|s| s.statistics.throughput_per_minute)
+        .sum::<f64>();
     let avg_processing_time = if !all_stats.is_empty() {
-        all_stats.iter().map(|s| s.statistics.avg_processing_time_ms).sum::<f64>() / all_stats.len() as f64
+        all_stats
+            .iter()
+            .map(|s| s.statistics.avg_processing_time_ms)
+            .sum::<f64>()
+            / all_stats.len() as f64
     } else {
         0.0
     };
-    
+
     let average_queue_depth = if !all_stats.is_empty() {
-        all_stats.iter().map(|s| s.pending_count as f64).sum::<f64>() / all_stats.len() as f64
+        all_stats
+            .iter()
+            .map(|s| s.pending_count as f64)
+            .sum::<f64>()
+            / all_stats.len() as f64
     } else {
         0.0
     };
-    
+
     // Estimate database response time based on processing time
     let database_response_time_ms = if avg_processing_time > 0.0 {
         (avg_processing_time * 0.1).max(1.0).min(100.0) // Assume DB is 10% of processing time
     } else {
         2.0
     };
-    
+
     PerformanceMetrics {
         database_response_time_ms,
         average_queue_depth,
         jobs_per_second: total_throughput / 60.0, // Convert from per minute to per second
-        memory_usage_mb: None, // Would need system monitoring
-        cpu_usage_percent: None, // Would need system monitoring
+        memory_usage_mb: None,                    // Would need system monitoring
+        cpu_usage_percent: None,                  // Would need system monitoring
         active_workers: all_stats.iter().map(|s| s.running_count as u32).sum(),
         worker_utilization: if total_jobs > 0 {
             all_stats.iter().map(|s| s.running_count).sum::<u64>() as f64 / total_jobs as f64
@@ -836,15 +858,22 @@ fn extract_error_type(error_msg: &str) -> String {
         "Timeout Error".to_string()
     } else if error_msg.contains("connection") || error_msg.contains("Connection") {
         "Connection Error".to_string()
-    } else if error_msg.contains("parse") || error_msg.contains("Parse") || error_msg.contains("invalid") {
+    } else if error_msg.contains("parse")
+        || error_msg.contains("Parse")
+        || error_msg.contains("invalid")
+    {
         "Parse Error".to_string()
-    } else if error_msg.contains("permission") || error_msg.contains("Permission") || error_msg.contains("forbidden") {
+    } else if error_msg.contains("permission")
+        || error_msg.contains("Permission")
+        || error_msg.contains("forbidden")
+    {
         "Permission Error".to_string()
     } else if error_msg.contains("not found") || error_msg.contains("Not Found") {
         "Not Found Error".to_string()
     } else {
         // Use first word of error message as type
-        error_msg.split_whitespace()
+        error_msg
+            .split_whitespace()
             .next()
             .map(|s| format!("{} Error", s))
             .unwrap_or_else(|| "Unknown Error".to_string())

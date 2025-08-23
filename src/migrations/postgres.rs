@@ -9,9 +9,9 @@ use tracing::{debug, info, warn};
 
 /// Parse SQL text into individual statements using sqlparser-rs
 /// This properly handles quoted strings, dollar-quoted strings, and comments
-fn parse_sql_statements(sql: &str) -> Result<Vec<String>, sqlparser::parser::ParserError> {
+fn parse_sql_statements(sql: &str) -> std::result::Result<Vec<String>, sqlparser::parser::ParserError> {
     let dialect = PostgreSqlDialect {};
-    
+
     // First, try to parse the entire SQL as a series of statements
     match Parser::parse_sql(&dialect, sql) {
         Ok(statements) => {
@@ -35,10 +35,10 @@ fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
     let mut in_dollar_quote = false;
     let mut dollar_tag = String::new();
     let mut chars = sql.chars().peekable();
-    
+
     while let Some(ch) = chars.next() {
         current_statement.push(ch);
-        
+
         match ch {
             '\'' if !in_dollar_quote => {
                 // Handle single quotes (with escape sequences)
@@ -60,12 +60,14 @@ fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
                     let mut temp_tag = String::new();
                     let chars_ahead: Vec<char> = chars.clone().collect();
                     let mut i = 0;
-                    
-                    while i < chars_ahead.len() && (chars_ahead[i].is_alphanumeric() || chars_ahead[i] == '_') {
+
+                    while i < chars_ahead.len()
+                        && (chars_ahead[i].is_alphanumeric() || chars_ahead[i] == '_')
+                    {
                         temp_tag.push(chars_ahead[i]);
                         i += 1;
                     }
-                    
+
                     if i < chars_ahead.len() && chars_ahead[i] == '$' && temp_tag == dollar_tag {
                         // Consume the tag and closing $
                         for _ in 0..=i {
@@ -81,12 +83,14 @@ fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
                     let mut temp_tag = String::new();
                     let chars_ahead: Vec<char> = chars.clone().collect();
                     let mut i = 0;
-                    
-                    while i < chars_ahead.len() && (chars_ahead[i].is_alphanumeric() || chars_ahead[i] == '_') {
+
+                    while i < chars_ahead.len()
+                        && (chars_ahead[i].is_alphanumeric() || chars_ahead[i] == '_')
+                    {
                         temp_tag.push(chars_ahead[i]);
                         i += 1;
                     }
-                    
+
                     if i < chars_ahead.len() && chars_ahead[i] == '$' {
                         // This is a dollar quote start
                         for _ in 0..=i {
@@ -112,13 +116,13 @@ fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
             }
         }
     }
-    
+
     // Add final statement if non-empty
     let trimmed = current_statement.trim();
     if !trimmed.is_empty() && !trimmed.starts_with("--") {
         statements.push(current_statement);
     }
-    
+
     statements
 }
 
@@ -144,7 +148,10 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
         let statements = match parse_sql_statements(sql) {
             Ok(stmts) => stmts,
             Err(e) => {
-                warn!("Failed to parse SQL with sqlparser, falling back to naive splitting: {}", e);
+                warn!(
+                    "Failed to parse SQL with sqlparser, falling back to naive splitting: {}",
+                    e
+                );
                 // Fallback to simple splitting for compatibility
                 sql.split(';')
                     .map(|s| s.trim().to_string())

@@ -120,10 +120,7 @@ pub trait DatabaseQueue: Send + Sync {
     ) -> Result<std::collections::HashMap<String, u64>>;
 
     /// Get job counts by priority for a specific queue
-    async fn get_priority_stats(
-        &self,
-        queue_name: &str,
-    ) -> Result<crate::priority::PriorityStats>;
+    async fn get_priority_stats(&self, queue_name: &str) -> Result<crate::priority::PriorityStats>;
 
     /// Get processing times for completed jobs in a time window
     async fn get_processing_times(

@@ -97,7 +97,7 @@ use super::{
     ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
     with_filters, with_pagination, with_sort,
 };
-use hammerwork::{queue::DatabaseQueue, JobPriority};
+use hammerwork::{JobPriority, queue::DatabaseQueue};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use warp::{Filter, Reply};
@@ -361,22 +361,21 @@ where
                 }
             }
         }
-        "clear_completed" => {
-            match clear_completed_jobs(&queue, &queue_name).await {
-                Ok(count) => {
-                    let response = ApiResponse::success(serde_json::json!({
-                        "message": format!("Cleared {} completed jobs from queue '{}'", count, queue_name),
-                        "queue": queue_name,
-                        "cleared_count": count
-                    }));
-                    Ok(warp::reply::json(&response))
-                }
-                Err(e) => {
-                    let response = ApiResponse::<()>::error(format!("Failed to clear completed jobs: {}", e));
-                    Ok(warp::reply::json(&response))
-                }
+        "clear_completed" => match clear_completed_jobs(&queue, &queue_name).await {
+            Ok(count) => {
+                let response = ApiResponse::success(serde_json::json!({
+                    "message": format!("Cleared {} completed jobs from queue '{}'", count, queue_name),
+                    "queue": queue_name,
+                    "cleared_count": count
+                }));
+                Ok(warp::reply::json(&response))
             }
-        }
+            Err(e) => {
+                let response =
+                    ApiResponse::<()>::error(format!("Failed to clear completed jobs: {}", e));
+                Ok(warp::reply::json(&response))
+            }
+        },
         "pause" => match queue.pause_queue(&queue_name, Some("web-ui")).await {
             Ok(()) => {
                 let response = ApiResponse::success(serde_json::json!({
@@ -446,7 +445,7 @@ where
 {
     // Get recent jobs from multiple sources and find the most recent timestamp
     let mut latest_time: Option<chrono::DateTime<chrono::Utc>> = None;
-    
+
     // Check ready jobs
     if let Ok(ready_jobs) = queue.get_ready_jobs(queue_name, 10).await {
         for job in ready_jobs {
@@ -459,11 +458,19 @@ where
             }
         }
     }
-    
+
     // Check dead jobs
-    if let Ok(dead_jobs) = queue.get_dead_jobs_by_queue(queue_name, Some(10), Some(0)).await {
+    if let Ok(dead_jobs) = queue
+        .get_dead_jobs_by_queue(queue_name, Some(10), Some(0))
+        .await
+    {
         for job in dead_jobs {
-            if let Some(time) = job.failed_at.or(job.completed_at).or(job.started_at).or(Some(job.created_at)) {
+            if let Some(time) = job
+                .failed_at
+                .or(job.completed_at)
+                .or(job.started_at)
+                .or(Some(job.created_at))
+            {
                 latest_time = match latest_time {
                     Some(current) if time > current => Some(time),
                     None => Some(time),
@@ -472,7 +479,7 @@ where
             }
         }
     }
-    
+
     latest_time
 }
 
@@ -511,7 +518,7 @@ where
             let priority_name = match priority {
                 JobPriority::Background => "background",
                 JobPriority::Low => "low",
-                JobPriority::Normal => "normal", 
+                JobPriority::Normal => "normal",
                 JobPriority::High => "high",
                 JobPriority::Critical => "critical",
             };
@@ -540,10 +547,7 @@ where
 }
 
 /// Helper function to get hourly throughput data for a queue
-async fn get_hourly_throughput<T>(
-    _queue: &Arc<T>,
-    _queue_name: &str,
-) -> Vec<HourlyThroughput>
+async fn get_hourly_throughput<T>(_queue: &Arc<T>, _queue_name: &str) -> Vec<HourlyThroughput>
 where
     T: DatabaseQueue + Send + Sync,
 {
@@ -553,15 +557,15 @@ where
 }
 
 /// Helper function to get recent errors for a queue
-async fn get_recent_errors<T>(
-    queue: &Arc<T>,
-    queue_name: &str,
-) -> Vec<RecentError>
+async fn get_recent_errors<T>(queue: &Arc<T>, queue_name: &str) -> Vec<RecentError>
 where
     T: DatabaseQueue + Send + Sync,
 {
     // Get dead jobs which contain failed jobs with error messages
-    if let Ok(dead_jobs) = queue.get_dead_jobs_by_queue(queue_name, Some(20), Some(0)).await {
+    if let Ok(dead_jobs) = queue
+        .get_dead_jobs_by_queue(queue_name, Some(20), Some(0))
+        .await
+    {
         dead_jobs
             .into_iter()
             .filter_map(|job| {
@@ -579,10 +583,7 @@ where
 }
 
 /// Helper function to clear completed jobs from a queue
-async fn clear_completed_jobs<T>(
-    _queue: &Arc<T>,
-    _queue_name: &str,
-) -> Result<u64, String>
+async fn clear_completed_jobs<T>(_queue: &Arc<T>, _queue_name: &str) -> Result<u64, String>
 where
     T: DatabaseQueue + Send + Sync,
 {
@@ -590,10 +591,13 @@ where
     // 1. A method to query jobs by status (get_jobs_by_status)
     // 2. Filter for completed jobs
     // 3. Delete them using the existing delete_job method
-    // 
+    //
     // Since DatabaseQueue trait doesn't provide a way to query jobs by status,
     // we cannot implement this functionality without extending the trait.
-    Err("Clear completed jobs requires additional DatabaseQueue methods not yet available".to_string())
+    Err(
+        "Clear completed jobs requires additional DatabaseQueue methods not yet available"
+            .to_string(),
+    )
 }
 
 #[cfg(test)]

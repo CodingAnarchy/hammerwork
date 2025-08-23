@@ -182,15 +182,24 @@ impl WebSocketState {
     ) -> crate::Result<()> {
         match message {
             ClientMessage::Subscribe { event_types } => {
-                info!("Client {} subscribed to events: {:?}", connection_id, event_types);
+                info!(
+                    "Client {} subscribed to events: {:?}",
+                    connection_id, event_types
+                );
                 // Store subscription preferences per connection
-                let subscription_set = self.subscriptions.entry(connection_id).or_insert_with(std::collections::HashSet::new);
+                let subscription_set = self
+                    .subscriptions
+                    .entry(connection_id)
+                    .or_insert_with(std::collections::HashSet::new);
                 for event_type in event_types {
                     subscription_set.insert(event_type);
                 }
             }
             ClientMessage::Unsubscribe { event_types } => {
-                info!("Client {} unsubscribed from events: {:?}", connection_id, event_types);
+                info!(
+                    "Client {} unsubscribed from events: {:?}",
+                    connection_id, event_types
+                );
                 // Update subscription preferences
                 if let Some(subscription_set) = self.subscriptions.get_mut(&connection_id) {
                     for event_type in event_types {
@@ -232,7 +241,11 @@ impl WebSocketState {
     }
 
     /// Broadcast a message to subscribed clients only
-    pub async fn broadcast_to_subscribed(&self, message: ServerMessage, event_type: &str) -> crate::Result<()> {
+    pub async fn broadcast_to_subscribed(
+        &self,
+        message: ServerMessage,
+        event_type: &str,
+    ) -> crate::Result<()> {
         let json_message = serde_json::to_string(&message)?;
         let ws_message = Message::text(json_message);
 
@@ -339,11 +352,13 @@ impl WebSocketState {
     }
 
     /// Start the broadcast listener task
-    pub async fn start_broadcast_listener(state: Arc<tokio::sync::RwLock<WebSocketState>>) -> crate::Result<()> {
+    pub async fn start_broadcast_listener(
+        state: Arc<tokio::sync::RwLock<WebSocketState>>,
+    ) -> crate::Result<()> {
         let mut state_guard = state.write().await;
         if let Some(mut receiver) = state_guard.broadcast_receiver.take() {
             drop(state_guard); // Release the lock before spawning the task
-            
+
             tokio::spawn(async move {
                 while let Some(broadcast_message) = receiver.recv().await {
                     // Determine the event type for subscription filtering
@@ -358,7 +373,7 @@ impl WebSocketState {
                         BroadcastMessage::BulkArchiveCompleted { .. } => "archive_events",
                         BroadcastMessage::JobsPurged { .. } => "archive_events",
                     };
-                    
+
                     // Convert broadcast message to server message
                     let server_message = match broadcast_message {
                         BroadcastMessage::QueueUpdate { queue_name, stats } => {
@@ -416,7 +431,10 @@ impl WebSocketState {
 
                     // Actually broadcast the message to subscribed clients
                     let state_read = state.read().await;
-                    if let Err(e) = state_read.broadcast_to_subscribed(&server_message, event_type).await {
+                    if let Err(e) = state_read
+                        .broadcast_to_subscribed(&server_message, event_type)
+                        .await
+                    {
                         error!("Failed to broadcast message: {}", e);
                     }
                 }

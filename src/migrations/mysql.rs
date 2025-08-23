@@ -8,16 +8,15 @@ use sqlx::{MySqlPool, Row};
 use tracing::{debug, info, warn};
 
 /// Parse SQL text into individual statements using sqlparser-rs for MySQL
-fn parse_mysql_statements(sql: &str) -> Result<Vec<String>, sqlparser::parser::ParserError> {
+fn parse_mysql_statements(sql: &str) -> std::result::Result<Vec<String>, sqlparser::parser::ParserError> {
     let dialect = MySqlDialect {};
-    
+
     match Parser::parse_sql(&dialect, sql) {
-        Ok(statements) => {
-            Ok(statements.iter().map(|stmt| format!("{};", stmt)).collect())
-        }
+        Ok(statements) => Ok(statements.iter().map(|stmt| format!("{};", stmt)).collect()),
         Err(_) => {
             // Fallback to simple splitting for MySQL
-            Ok(sql.split(";\n")
+            Ok(sql
+                .split(";\n")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect())
@@ -47,7 +46,10 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
         let statements = match parse_mysql_statements(sql) {
             Ok(stmts) => stmts,
             Err(e) => {
-                warn!("Failed to parse MySQL SQL with sqlparser, falling back to naive splitting: {}", e);
+                warn!(
+                    "Failed to parse MySQL SQL with sqlparser, falling back to naive splitting: {}",
+                    e
+                );
                 sql.split(";\n")
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
