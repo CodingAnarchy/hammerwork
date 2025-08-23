@@ -46,6 +46,7 @@ use futures_util::{SinkExt, StreamExt};
 pub use hammerwork::archive::{ArchivalReason, ArchivalStats};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -138,7 +139,7 @@ impl WebSocketState {
 
     /// Handle a message from a client
     async fn handle_client_message(
-        &self,
+        &mut self,
         connection_id: Uuid,
         message: Message,
         _broadcast_sender: &mpsc::UnboundedSender<BroadcastMessage>,
@@ -432,7 +433,7 @@ impl WebSocketState {
                     // Actually broadcast the message to subscribed clients
                     let state_read = state.read().await;
                     if let Err(e) = state_read
-                        .broadcast_to_subscribed(&server_message, event_type)
+                        .broadcast_to_subscribed(server_message, event_type)
                         .await
                     {
                         error!("Failed to broadcast message: {}", e);

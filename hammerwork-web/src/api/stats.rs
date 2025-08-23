@@ -180,7 +180,7 @@ pub struct QueueStats {
     pub avg_processing_time_ms: f64,
     pub error_rate: f64,
     pub oldest_pending_age_seconds: Option<u64>,
-    pub priority_distribution: HashMap<String, u64>,
+    pub priority_distribution: HashMap<String, f32>,
 }
 
 /// Hourly trend data
@@ -645,7 +645,7 @@ where
 /// Generate hourly trends from queue statistics
 async fn generate_hourly_trends<T>(
     queue: &Arc<T>,
-    all_stats: &[hammerwork::queue::QueueStats],
+    all_stats: &[hammerwork::stats::QueueStats],
 ) -> Vec<HourlyTrend>
 where
     T: DatabaseQueue + Send + Sync,
@@ -736,7 +736,7 @@ where
 /// Generate error patterns from queue statistics
 async fn generate_error_patterns<T>(
     queue: &Arc<T>,
-    all_stats: &[hammerwork::queue::QueueStats],
+    all_stats: &[hammerwork::stats::QueueStats],
 ) -> Vec<ErrorPattern>
 where
     T: DatabaseQueue + Send + Sync,
@@ -783,11 +783,13 @@ where
         let (sample_message, first_seen) = error_first_seen.get(&error_type).unwrap();
 
         error_patterns.push(ErrorPattern {
-            error_type,
+            error_type: error_type.clone(),
             count,
             percentage,
             sample_message: sample_message.clone(),
             first_seen: *first_seen,
+            last_seen: chrono::Utc::now(), // In a real implementation, track actual last seen
+            affected_queues: vec![error_type], // In a real implementation, track actual affected queues
         });
     }
 
@@ -799,7 +801,7 @@ where
 
 /// Calculate performance metrics from queue statistics
 fn calculate_performance_metrics(
-    all_stats: &[hammerwork::queue::QueueStats],
+    all_stats: &[hammerwork::stats::QueueStats],
 ) -> PerformanceMetrics {
     let total_jobs = all_stats
         .iter()

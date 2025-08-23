@@ -402,7 +402,7 @@ where
 
             // Get a better estimate of total count by running a query with a large limit
             // This is not perfect but gives a more accurate total than just the current page
-            let total = if jobs.len() as u64 == pagination.limit {
+            let total = if jobs.len() as u64 == pagination.limit.unwrap_or(0) as u64 {
                 // If we got exactly the limit, there might be more records
                 // Run another query to get a better count estimate
                 match queue
@@ -410,7 +410,6 @@ where
                         filters.queue.as_deref(),
                         Some(10000),
                         Some(0),
-                        filters.older_than,
                     )
                     .await
                 {
@@ -419,7 +418,7 @@ where
                 }
             } else {
                 // If we got less than the limit, we have all records
-                pagination.offset + jobs.len() as u64
+                pagination.offset.unwrap_or(0) as u64 + jobs.len() as u64
             };
 
             let pagination_meta = PaginationMeta::new(&pagination, total);
@@ -483,7 +482,7 @@ where
         // For dry run, estimate how many jobs would be purged by using list_archived_jobs
         // with a large limit to get an accurate count
         let count = match queue
-            .list_archived_jobs(None, Some(10000), Some(0), request.older_than)
+            .list_archived_jobs(None, Some(10000), Some(0))
             .await
         {
             Ok(jobs) => jobs.len() as u64,
@@ -544,14 +543,18 @@ where
             let recent_operations = vec![
                 RecentOperation {
                     operation_type: "archive".to_string(),
-                    jobs_count: stats.jobs_archived,
-                    timestamp: chrono::Utc::now() - chrono::Duration::hours(2),
+                    jobs_affected: stats.jobs_archived,
+                    executed_at: chrono::Utc::now() - chrono::Duration::hours(2),
+                    executed_by: Some("system".to_string()),
+                    reason: Some("Automated archival".to_string()),
                     queue_name: filters.queue.clone(),
                 },
                 RecentOperation {
                     operation_type: "purge".to_string(),
-                    jobs_count: stats.jobs_purged,
-                    timestamp: chrono::Utc::now() - chrono::Duration::hours(4),
+                    jobs_affected: stats.jobs_purged,
+                    executed_at: chrono::Utc::now() - chrono::Duration::hours(4),
+                    executed_by: Some("system".to_string()),
+                    reason: Some("Automated purge".to_string()),
                     queue_name: filters.queue.clone(),
                 },
             ];
