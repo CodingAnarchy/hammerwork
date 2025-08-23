@@ -67,7 +67,8 @@ BEGIN
         RAISE EXCEPTION 'Data migration failed: % depends_on and % dependents records were not migrated', 
             unmigrated_depends_on, unmigrated_dependents;
     END IF;
-END $$;
+END;
+$$;
 
 -- Step 4: Create indexes on new array columns (before dropping old ones)
 CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_depends_on_array
