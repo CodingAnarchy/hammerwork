@@ -19,12 +19,11 @@ SET depends_on_array = CASE
     WHEN jsonb_typeof(depends_on) = 'array' THEN 
         ARRAY(
             SELECT elem::UUID 
-            FROM jsonb_array_elements_text(depends_on) AS elem(value)
-            WHERE elem.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+            FROM jsonb_array_elements_text(depends_on) AS elem
+            WHERE elem::text ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
         )
     ELSE '{}'::UUID[]
-END
-WHERE depends_on_array = '{}';
+END;
 
 -- Handle dependents column with UUID validation
 UPDATE hammerwork_jobs 
@@ -33,12 +32,11 @@ SET dependents_array = CASE
     WHEN jsonb_typeof(dependents) = 'array' THEN 
         ARRAY(
             SELECT elem::UUID 
-            FROM jsonb_array_elements_text(dependents) AS elem(value)
-            WHERE elem.value ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+            FROM jsonb_array_elements_text(dependents) AS elem
+            WHERE elem::text ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
         )
     ELSE '{}'::UUID[]
-END
-WHERE dependents_array = '{}';
+END;
 
 -- Step 3: Verify data migration integrity
 DO $$

@@ -1779,11 +1779,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             r#"
             SELECT id, depends_on
             FROM hammerwork_jobs
-            WHERE depends_on @> $1::jsonb
+            WHERE $1 = ANY(depends_on)
             AND dependency_status = 'waiting'
             "#,
         )
-        .bind(serde_json::json!([completed_job_id]))
+        .bind(completed_job_id)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1791,7 +1791,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
         for job_row in dependent_jobs {
             let job_id: uuid::Uuid = job_row.get("id");
-            let depends_on: Vec<uuid::Uuid> = serde_json::from_value(job_row.get("depends_on"))?;
+            let depends_on: Vec<uuid::Uuid> = job_row.get("depends_on");
 
             // Check if all dependencies are now satisfied
             let satisfied_count = sqlx::query_scalar::<_, i64>(
@@ -1860,12 +1860,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 r#"
                 SELECT id
                 FROM hammerwork_jobs
-                WHERE depends_on @> $1::jsonb
+                WHERE $1 = ANY(depends_on)
                 AND dependency_status IN ('waiting', 'satisfied')
                 AND status = 'Pending'
                 "#,
             )
-            .bind(serde_json::json!([current_job_id]))
+            .bind(current_job_id)
             .fetch_all(&self.pool)
             .await?;
 
