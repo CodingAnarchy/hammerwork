@@ -1454,10 +1454,10 @@ impl DatabaseQueue for TestQueue {
             crate::priority::JobPriority::High,
             crate::priority::JobPriority::Critical,
         ] {
-            job_counts.insert(priority.clone(), 0);
-            avg_processing_times.insert(priority.clone(), 0.0);
-            recent_throughput.insert(priority.clone(), 0);
-            priority_distribution.insert(priority.clone(), 0.0);
+            job_counts.insert(priority, 0);
+            avg_processing_times.insert(priority, 0.0);
+            recent_throughput.insert(priority, 0);
+            priority_distribution.insert(priority, 0.0);
         }
         
         let mut total_jobs = 0u64;
@@ -1466,7 +1466,7 @@ impl DatabaseQueue for TestQueue {
             for jobs in queue_jobs.values() {
                 for job_id in jobs {
                     if let Some(job) = storage.jobs.get(job_id) {
-                        *job_counts.entry(job.priority.clone()).or_insert(0) += 1;
+                        *job_counts.entry(job.priority).or_insert(0) += 1;
                         total_jobs += 1;
                         
                         // Calculate processing time if job is completed
@@ -1475,7 +1475,7 @@ impl DatabaseQueue for TestQueue {
                             let current_avg = avg_processing_times.get(&job.priority).unwrap_or(&0.0);
                             let current_count = *job_counts.get(&job.priority).unwrap_or(&1);
                             let new_avg = (current_avg * (current_count - 1) as f64 + processing_time) / current_count as f64;
-                            avg_processing_times.insert(job.priority.clone(), new_avg);
+                            avg_processing_times.insert(job.priority, new_avg);
                         }
                     }
                 }
@@ -1489,7 +1489,7 @@ impl DatabaseQueue for TestQueue {
             } else {
                 0.0
             };
-            priority_distribution.insert(priority.clone(), percentage);
+            priority_distribution.insert(*priority, percentage);
         }
         
         Ok(crate::priority::PriorityStats {

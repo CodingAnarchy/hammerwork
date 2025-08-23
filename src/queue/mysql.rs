@@ -1231,7 +1231,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 _ => crate::priority::JobPriority::Normal,
             };
             
-            priority_times.entry(priority).or_insert_with(Vec::new).push(processing_ms as f64);
+            priority_times.entry(priority).or_default().push(processing_ms as f64);
         }
 
         // Calculate average processing times for each priority
