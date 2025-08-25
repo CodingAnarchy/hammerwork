@@ -8,7 +8,9 @@ use sqlx::{MySqlPool, Row};
 use tracing::{debug, info, warn};
 
 /// Parse SQL text into individual statements using sqlparser-rs for MySQL
-fn parse_mysql_statements(sql: &str) -> std::result::Result<Vec<String>, sqlparser::parser::ParserError> {
+fn parse_mysql_statements(
+    sql: &str,
+) -> std::result::Result<Vec<String>, sqlparser::parser::ParserError> {
     let dialect = MySqlDialect {};
 
     match Parser::parse_sql(&dialect, sql) {

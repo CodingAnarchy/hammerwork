@@ -406,11 +406,7 @@ where
                 // If we got exactly the limit, there might be more records
                 // Run another query to get a better count estimate
                 match queue
-                    .list_archived_jobs(
-                        filters.queue.as_deref(),
-                        Some(10000),
-                        Some(0),
-                    )
+                    .list_archived_jobs(filters.queue.as_deref(), Some(10000), Some(0))
                     .await
                 {
                     Ok(all_jobs) => all_jobs.len() as u64,
@@ -481,10 +477,7 @@ where
     if request.dry_run {
         // For dry run, estimate how many jobs would be purged by using list_archived_jobs
         // with a large limit to get an accurate count
-        let count = match queue
-            .list_archived_jobs(None, Some(10000), Some(0))
-            .await
-        {
+        let count = match queue.list_archived_jobs(None, Some(10000), Some(0)).await {
             Ok(jobs) => jobs.len() as u64,
             Err(_) => 0, // If we can't get the count, return 0 for safety
         };

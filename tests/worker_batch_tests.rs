@@ -1,7 +1,8 @@
 mod test_utils;
 
 use hammerwork::{
-    queue::test::TestQueue, PartialFailureMode, Worker, WorkerPool, Job, JobBatch, BatchProcessingStats,
+    BatchProcessingStats, Job, JobBatch, PartialFailureMode, Worker, WorkerPool,
+    queue::test::TestQueue,
 };
 use serde_json::json;
 use std::time::Duration;

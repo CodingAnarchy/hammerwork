@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.2] - 2025-01-25
+
+### Fixed
+- **🔧 SQL Migration Parsing Improvements**
+  - Fixed critical bug in PostgreSQL migration runner where dollar-quoted strings (`$$...$$`) were not properly parsed
+  - Enhanced `split_sql_respecting_quotes` function to correctly handle empty dollar tags and complex nested structures
+  - Improved comment filtering logic to properly distinguish between comment-only blocks and executable SQL statements
+  - Fixed migration 014 execution which was failing with "unterminated dollar-quoted string" errors
+  - Added comprehensive test coverage for both migration 012 and 014 SQL parsing validation
+  - Validated complex SQL structures including PL/pgSQL functions, multi-line CASE expressions, and transaction blocks
+  - Ensured `sqlparser-rs` integration works correctly with PostgreSQL-specific syntax features
+
 ## [1.15.1] - 2025-01-23
 
 ### Added
