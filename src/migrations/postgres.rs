@@ -18,7 +18,32 @@ fn parse_sql_statements(
     match Parser::parse_sql(&dialect, sql) {
         Ok(statements) => {
             // Convert parsed statements back to SQL strings
-            Ok(statements.iter().map(|stmt| format!("{};", stmt)).collect())
+            Ok(statements
+                .iter()
+                .map(|stmt| {
+                    let mut sql_string = format!("{}", stmt);
+
+                    // Fix sqlparser bug: it drops empty parentheses from CREATE FUNCTION
+                    // PostgreSQL requires () even when there are no parameters
+                    if let sqlparser::ast::Statement::CreateFunction { args, .. } = stmt {
+                        if args.is_none() {
+                            // Find function name and add () after it if missing
+                            // The pattern is: "CREATE ... FUNCTION name RETURNS"
+                            if let Some(returns_pos) = sql_string.find(" RETURNS ") {
+                                // Check if there's already () before RETURNS
+                                let before_returns = &sql_string[..returns_pos];
+                                if !before_returns.ends_with("()") && !before_returns.ends_with(")")
+                                {
+                                    // Insert () before RETURNS
+                                    sql_string.insert_str(returns_pos, "()");
+                                }
+                            }
+                        }
+                    }
+
+                    format!("{};", sql_string)
+                })
+                .collect())
         }
         Err(_) => {
             // If parsing fails, try to split manually while respecting SQL syntax
@@ -431,6 +456,37 @@ CREATE TRIGGER trigger_update_hammerwork_queue_pause_updated_at
             result.is_ok(),
             "Migration 014 SQL should parse successfully with sqlparser-rs: {:?}",
             result
+        );
+
+        // CRITICAL: Verify that the parentheses are preserved/restored in the CREATE FUNCTION statement
+        let parsed_statements = result.unwrap();
+        assert_eq!(
+            parsed_statements.len(),
+            5,
+            "Should parse 5 statements from migration 014 with sqlparser"
+        );
+
+        // Find the CREATE FUNCTION statement
+        let create_function_stmt = parsed_statements
+            .iter()
+            .find(|stmt| stmt.contains("CREATE OR REPLACE FUNCTION"))
+            .expect("Should find CREATE FUNCTION statement");
+
+        // Verify the function name has parentheses - this is critical for PostgreSQL
+        assert!(
+            create_function_stmt.contains("update_hammerwork_queue_pause_updated_at()"),
+            "Function name must include parentheses even with no parameters. Statement: {}",
+            create_function_stmt
+        );
+
+        // Also verify the statement is syntactically correct
+        assert!(
+            create_function_stmt.contains("RETURNS TRIGGER"),
+            "Statement should contain RETURNS TRIGGER"
+        );
+        assert!(
+            create_function_stmt.contains("LANGUAGE plpgsql"),
+            "Statement should contain LANGUAGE plpgsql"
         );
     }
 

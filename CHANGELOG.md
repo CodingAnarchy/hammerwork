@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.3] - 2025-01-25
+
+### Fixed
+- **🔧 PostgreSQL Migration 014 Function Syntax Fix**
+  - Fixed critical bug where sqlparser was dropping empty parentheses from CREATE FUNCTION statements
+  - PostgreSQL requires `()` after function names even when there are no parameters
+  - Migration 014 was failing with "syntax error at or near 'RETURNS'" due to missing parentheses
+  - Added automatic restoration of missing parentheses when sqlparser formats CREATE FUNCTION statements
+  - Enhanced test coverage to explicitly verify parentheses preservation in function declarations
+  - This fix ensures migration 014 executes correctly in production environments
+
 ## [1.15.2] - 2025-01-25
 
 ### Fixed
