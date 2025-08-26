@@ -5,18 +5,26 @@ use crate::Result;
 use chrono::Utc;
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 use sqlx::{PgPool, Row};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Parse SQL text into individual statements using sqlparser-rs
 /// This properly handles quoted strings, dollar-quoted strings, and comments
 fn parse_sql_statements(
     sql: &str,
 ) -> std::result::Result<Vec<String>, sqlparser::parser::ParserError> {
+    debug!(
+        "parse_sql_statements called with {} characters of SQL",
+        sql.len()
+    );
     let dialect = PostgreSqlDialect {};
 
     // First, try to parse the entire SQL as a series of statements
     match Parser::parse_sql(&dialect, sql) {
         Ok(statements) => {
+            debug!(
+                "Successfully parsed {} statements with sqlparser",
+                statements.len()
+            );
             // Convert parsed statements back to SQL strings
             Ok(statements
                 .iter()
@@ -41,13 +49,44 @@ fn parse_sql_statements(
                         }
                     }
 
+                    // Fix sqlparser bug: it drops empty parentheses from EXECUTE FUNCTION in triggers
+                    // PostgreSQL requires () even when there are no parameters
+                    if sql_string.contains("EXECUTE FUNCTION") {
+                        debug!("Before EXECUTE FUNCTION fix: {}", sql_string);
+                        // Pattern: "EXECUTE FUNCTION function_name" should be "EXECUTE FUNCTION function_name()"
+                        // Note: semicolon might not be present yet since it's added later
+                        if let Some(execute_pos) = sql_string.find("EXECUTE FUNCTION ") {
+                            let after_execute = &sql_string[execute_pos + 17..]; // Skip "EXECUTE FUNCTION "
+
+                            // Find the end of the function name (could be end of line, semicolon, or whitespace)
+                            let end_pos = after_execute
+                                .find(';')
+                                .or_else(|| after_execute.find('\n'))
+                                .unwrap_or(after_execute.len());
+
+                            let function_part = &after_execute[..end_pos];
+                            debug!("Function part: '{}'", function_part.trim());
+
+                            // If function name doesn't end with ), add ()
+                            if !function_part.trim().ends_with(')') {
+                                let insert_pos = execute_pos + 17 + function_part.trim().len();
+                                debug!("Adding () at position {}", insert_pos);
+                                sql_string.insert_str(insert_pos, "()");
+                                debug!("After EXECUTE FUNCTION fix: {}", sql_string);
+                            }
+                        }
+                    }
+
                     format!("{};", sql_string)
                 })
                 .collect())
         }
-        Err(_) => {
+        Err(e) => {
+            error!("sqlparser failed to parse SQL: {}", e);
+            debug!("Failed SQL content: {}", sql);
             // If parsing fails, try to split manually while respecting SQL syntax
             // This is a more conservative approach for complex migrations
+            debug!("Falling back to manual SQL splitting");
             Ok(split_sql_respecting_quotes(sql))
         }
     }
@@ -195,7 +234,16 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
 
         // Parse SQL using sqlparser-rs for proper statement splitting
         let statements = match parse_sql_statements(sql) {
-            Ok(stmts) => stmts,
+            Ok(stmts) => {
+                debug!(
+                    "sqlparser-rs successfully parsed {} statements",
+                    stmts.len()
+                );
+                for (i, stmt) in stmts.iter().enumerate() {
+                    debug!("Parsed statement {}: '{}'", i + 1, stmt.trim());
+                }
+                stmts
+            }
             Err(e) => {
                 warn!(
                     "Failed to parse SQL with sqlparser, falling back to naive splitting: {}",
@@ -209,6 +257,15 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
             }
         };
 
+        debug!(
+            "Parsed {} statements for migration {}",
+            statements.len(),
+            migration.id
+        );
+        for (i, statement) in statements.iter().enumerate() {
+            debug!("Statement {}: '{}'", i + 1, statement.trim());
+        }
+
         for (i, statement) in statements.iter().enumerate() {
             // Add semicolon back if it was removed by split
             let full_statement = if statement.ends_with(';') {
@@ -218,13 +275,22 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
             };
 
             debug!(
-                "Executing statement {} of {} for migration {}",
+                "Executing statement {} of {} for migration {}: {}",
                 i + 1,
                 statements.len(),
-                migration.id
+                migration.id,
+                full_statement
             );
 
-            sqlx::query(&full_statement).execute(&mut *tx).await?;
+            if let Err(e) = sqlx::query(&full_statement).execute(&mut *tx).await {
+                error!(
+                    "Failed to execute statement {}: {} - Error: {}",
+                    i + 1,
+                    full_statement,
+                    e
+                );
+                return Err(e.into());
+            }
         }
 
         tx.commit().await?;

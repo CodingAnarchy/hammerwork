@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.4] - 2025-08-26
+
+### Fixed
+- **🔧 PostgreSQL Migration 014 Trigger Function Syntax Fix**
+  - Fixed critical bug where sqlparser was dropping empty parentheses from `EXECUTE FUNCTION` in CREATE TRIGGER statements
+  - PostgreSQL requires `()` after function names in trigger definitions even when there are no parameters
+  - Migration 014 was failing with "syntax error at or near ';'" due to missing parentheses in trigger creation
+  - Added automatic detection and restoration of missing parentheses for `EXECUTE FUNCTION` statements
+  - Enhanced migration parsing to handle both CREATE FUNCTION and CREATE TRIGGER sqlparser bugs
+  - This fix ensures migration 014 (queue pause functionality) executes correctly in production environments
+  - Improved debug logging for migration statement parsing to aid in future troubleshooting
+
 ## [1.15.3] - 2025-01-25
 
 ### Fixed

@@ -16,12 +16,13 @@ CREATE INDEX IF NOT EXISTS idx_hammerwork_queue_pause_paused_at ON hammerwork_qu
 
 -- Add function to automatically update the updated_at timestamp
 CREATE OR REPLACE FUNCTION update_hammerwork_queue_pause_updated_at()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql AS $BODY$
 BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+END
+$BODY$;
 
 -- Create trigger to automatically update updated_at
 DROP TRIGGER IF EXISTS trigger_update_hammerwork_queue_pause_updated_at ON hammerwork_queue_pause;
