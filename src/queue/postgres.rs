@@ -85,7 +85,25 @@ impl JobRow {
             id: self.id,
             queue_name: self.queue_name,
             payload: self.payload,
-            status: serde_json::from_str(&self.status)?,
+            status: {
+                // Handle both quoted (old format) and unquoted (new format) status values
+                let cleaned_str = self.status.trim_matches('"');
+                match cleaned_str {
+                    "Pending" => JobStatus::Pending,
+                    "Running" => JobStatus::Running,
+                    "Completed" => JobStatus::Completed,
+                    "Failed" => JobStatus::Failed,
+                    "Dead" => JobStatus::Dead,
+                    "TimedOut" => JobStatus::TimedOut,
+                    "Retrying" => JobStatus::Retrying,
+                    "Archived" => JobStatus::Archived,
+                    _ => {
+                        return Err(crate::error::HammerworkError::Processing(
+                            format!("Unknown job status: {}", cleaned_str),
+                        ));
+                    }
+                }
+            },
             priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
             attempts: self.attempts,
             max_attempts: self.max_attempts,
@@ -419,7 +437,21 @@ impl DeadJobRow {
             id: self.id,
             queue_name: self.queue_name,
             payload: self.payload,
-            status: serde_json::from_str(&self.status).unwrap_or(JobStatus::Dead),
+            status: {
+                // Handle both quoted (old format) and unquoted (new format) status values
+                let cleaned_str = self.status.trim_matches('"');
+                match cleaned_str {
+                    "Pending" => JobStatus::Pending,
+                    "Running" => JobStatus::Running,
+                    "Completed" => JobStatus::Completed,
+                    "Failed" => JobStatus::Failed,
+                    "Dead" => JobStatus::Dead,
+                    "TimedOut" => JobStatus::TimedOut,
+                    "Retrying" => JobStatus::Retrying,
+                    "Archived" => JobStatus::Archived,
+                    _ => JobStatus::Dead, // Default fallback for unknown status
+                }
+            },
             priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
             attempts: self.attempts,
             max_attempts: self.max_attempts,
@@ -586,7 +618,25 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 id,
                 queue_name,
                 payload,
-                status: serde_json::from_str(&status)?,
+                status: {
+                    // Handle both quoted (old format) and unquoted (new format) status values
+                    let cleaned_str = status.trim_matches('"');
+                    match cleaned_str {
+                        "Pending" => JobStatus::Pending,
+                        "Running" => JobStatus::Running,
+                        "Completed" => JobStatus::Completed,
+                        "Failed" => JobStatus::Failed,
+                        "Dead" => JobStatus::Dead,
+                        "TimedOut" => JobStatus::TimedOut,
+                        "Retrying" => JobStatus::Retrying,
+                        "Archived" => JobStatus::Archived,
+                        _ => {
+                            return Err(crate::error::HammerworkError::Processing(
+                                format!("Unknown job status: {}", cleaned_str),
+                            ));
+                        }
+                    }
+                },
                 priority: JobPriority::from_i32(priority).unwrap_or(JobPriority::Normal),
                 attempts,
                 max_attempts,
@@ -766,7 +816,25 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                         id,
                         queue_name,
                         payload,
-                        status: serde_json::from_str(&status)?,
+                        status: {
+                            // Handle both quoted (old format) and unquoted (new format) status values
+                            let cleaned_str = status.trim_matches('"');
+                            match cleaned_str {
+                                "Pending" => JobStatus::Pending,
+                                "Running" => JobStatus::Running,
+                                "Completed" => JobStatus::Completed,
+                                "Failed" => JobStatus::Failed,
+                                "Dead" => JobStatus::Dead,
+                                "TimedOut" => JobStatus::TimedOut,
+                                "Retrying" => JobStatus::Retrying,
+                                "Archived" => JobStatus::Archived,
+                                _ => {
+                                    return Err(crate::error::HammerworkError::Processing(
+                                        format!("Unknown job status: {}", cleaned_str),
+                                    ));
+                                }
+                            }
+                        },
                         priority: JobPriority::from_i32(priority).unwrap_or(JobPriority::Normal),
                         attempts,
                         max_attempts,
@@ -897,7 +965,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .bind(0i32) // completed_jobs
         .bind(0i32) // failed_jobs  
         .bind(batch.jobs.len() as i32) // pending_jobs
-        .bind(serde_json::to_string(&BatchStatus::Pending)?)
+        .bind(BatchStatus::Pending)
         .bind(serde_json::to_string(&batch.failure_mode)?)
         .bind(batch.created_at)
         .bind(serde_json::to_value(&batch.metadata)?)
@@ -2191,7 +2259,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .bind(job.timezone)
             .bind(job.batch_id)
             .bind(&job.depends_on)
-            .bind(serde_json::to_string(&job.dependency_status)?)
+            .bind(job.dependency_status.as_str())
             .bind(serde_json::to_value(&job.result_config)?)
             .bind(job.trace_id)
             .bind(job.correlation_id)
@@ -2416,8 +2484,22 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             archived_jobs.push(ArchivedJob {
                 id: row.get("id"),
                 queue_name: row.get("queue_name"),
-                status: serde_json::from_str::<JobStatus>(&row.get::<String, _>("status"))
-                    .unwrap_or(JobStatus::Dead),
+                status: {
+                    // Handle both quoted (old format) and unquoted (new format) status values
+                    let status_str: String = row.get("status");
+                    let cleaned_str = status_str.trim_matches('"');
+                    match cleaned_str {
+                        "Pending" => JobStatus::Pending,
+                        "Running" => JobStatus::Running,
+                        "Completed" => JobStatus::Completed,
+                        "Failed" => JobStatus::Failed,
+                        "Dead" => JobStatus::Dead,
+                        "TimedOut" => JobStatus::TimedOut,
+                        "Retrying" => JobStatus::Retrying,
+                        "Archived" => JobStatus::Archived,
+                        _ => JobStatus::Dead, // Default fallback for unknown status
+                    }
+                },
                 created_at: row.get("created_at"),
                 archived_at: row.get("archived_at"),
                 archival_reason: serde_json::from_str(&row.get::<String, _>("archival_reason"))
@@ -2618,7 +2700,7 @@ impl crate::queue::JobQueue<Postgres> {
         .bind(job.result_config.max_size_bytes.map(|s| s as i64))
         .bind(&job.depends_on)
         .bind(&job.dependents)
-        .bind(serde_json::to_string(&job.dependency_status)?)
+        .bind(job.dependency_status.as_str())
         .bind(job.workflow_id)
         .bind(job.workflow_name)
         .bind(job.trace_id)

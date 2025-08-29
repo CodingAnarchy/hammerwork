@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.5] - 2025-08-29
+
+### Fixed
+- **🔧 Status Field Consistency and Performance Improvements**
+  - Ensured all job status fields are consistently handled as strings across PostgreSQL and MySQL
+  - Fixed `BatchStatus` handling in MySQL `get_batch_status` to use string matching instead of JSON deserialization
+  - Replaced inefficient `serde_json::to_string()` calls with direct `.as_str()` method for `DependencyStatus` serialization
+  - Added backward compatibility for both quoted (old format) and unquoted (new format) status values in database deserialization
+  - Updated error handling to use appropriate `HammerworkError` variants instead of deprecated `Other` variant
+  - Improved performance by eliminating unnecessary JSON serialization/deserialization in status field operations
+  - Enhanced consistency between PostgreSQL and MySQL implementations for status field handling
+
 ## [1.15.4] - 2025-08-26
 
 ### Fixed

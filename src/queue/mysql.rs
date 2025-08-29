@@ -85,7 +85,25 @@ impl JobRow {
             id: uuid::Uuid::parse_str(&self.id)?,
             queue_name: self.queue_name,
             payload: self.payload,
-            status: serde_json::from_str(&self.status)?,
+            status: {
+                // Handle both quoted (old format) and unquoted (new format) status values
+                let cleaned_str = self.status.trim_matches('"');
+                match cleaned_str {
+                    "Pending" => JobStatus::Pending,
+                    "Running" => JobStatus::Running,
+                    "Completed" => JobStatus::Completed,
+                    "Failed" => JobStatus::Failed,
+                    "Dead" => JobStatus::Dead,
+                    "TimedOut" => JobStatus::TimedOut,
+                    "Retrying" => JobStatus::Retrying,
+                    "Archived" => JobStatus::Archived,
+                    _ => {
+                        return Err(crate::error::HammerworkError::Processing(
+                            format!("Unknown job status: {}", cleaned_str),
+                        ));
+                    }
+                }
+            },
             priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
             attempts: self.attempts,
             max_attempts: self.max_attempts,
@@ -444,7 +462,21 @@ impl DeadJobRow {
             id: uuid::Uuid::parse_str(&self.id)?,
             queue_name: self.queue_name,
             payload: self.payload,
-            status: serde_json::from_str(&self.status).unwrap_or(JobStatus::Dead),
+            status: {
+                // Handle both quoted (old format) and unquoted (new format) status values
+                let cleaned_str = self.status.trim_matches('"');
+                match cleaned_str {
+                    "Pending" => JobStatus::Pending,
+                    "Running" => JobStatus::Running,
+                    "Completed" => JobStatus::Completed,
+                    "Failed" => JobStatus::Failed,
+                    "Dead" => JobStatus::Dead,
+                    "TimedOut" => JobStatus::TimedOut,
+                    "Retrying" => JobStatus::Retrying,
+                    "Archived" => JobStatus::Archived,
+                    _ => JobStatus::Dead, // Default fallback for unknown status
+                }
+            },
             priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
             attempts: self.attempts,
             max_attempts: self.max_attempts,
@@ -769,7 +801,6 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId> {
-        use crate::batch::BatchStatus;
 
         // Validate the batch first
         batch.validate()?;
@@ -790,7 +821,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         .bind(0i32) // completed_jobs
         .bind(0i32) // failed_jobs  
         .bind(batch.jobs.len() as i32) // pending_jobs
-        .bind(serde_json::to_string(&BatchStatus::Pending)?)
+        .bind(crate::batch::BatchStatus::Pending)
         .bind(serde_json::to_string(&batch.failure_mode)?)
         .bind(batch.created_at)
         .bind(serde_json::to_value(&batch.metadata)?)
@@ -876,7 +907,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         let completed_jobs: i32 = batch_row.get("completed_jobs");
         let failed_jobs: i32 = batch_row.get("failed_jobs");
         let pending_jobs: i32 = batch_row.get("pending_jobs");
-        let status: String = batch_row.get("status");
+        let status_str: String = batch_row.get("status");
         let created_at: DateTime<Utc> = batch_row.get("created_at");
         let completed_at: Option<DateTime<Utc>> = batch_row.get("completed_at");
         let error_summary: Option<String> = batch_row.get("error_summary");
@@ -894,13 +925,30 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .filter_map(|(id_str, error)| uuid::Uuid::parse_str(&id_str).ok().map(|id| (id, error)))
             .collect();
 
+        let status = {
+            // Handle both quoted (old format) and unquoted (new format) status values
+            let cleaned_str = status_str.trim_matches('"');
+            match cleaned_str {
+                "Pending" => crate::batch::BatchStatus::Pending,
+                "Processing" => crate::batch::BatchStatus::Processing,
+                "Completed" => crate::batch::BatchStatus::Completed,
+                "PartiallyFailed" => crate::batch::BatchStatus::PartiallyFailed,
+                "Failed" => crate::batch::BatchStatus::Failed,
+                _ => {
+                    return Err(crate::error::HammerworkError::Batch {
+                        message: format!("Unknown batch status: {}", cleaned_str),
+                    });
+                }
+            }
+        };
+
         Ok(BatchResult {
             batch_id,
             total_jobs: total_jobs as u32,
             completed_jobs: completed_jobs as u32,
             failed_jobs: failed_jobs as u32,
             pending_jobs: pending_jobs as u32,
-            status: serde_json::from_str(&status)?,
+            status,
             created_at,
             completed_at,
             error_summary,
@@ -2041,7 +2089,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             } else {
                 Some(serde_json::to_value(&job.depends_on)?)
             })
-            .bind(serde_json::to_string(&job.dependency_status)?)
+            .bind(job.dependency_status.as_str())
             .bind(serde_json::to_value(&job.result_config)?)
             .bind(job.trace_id)
             .bind(job.correlation_id)
@@ -2255,8 +2303,22 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             archived_jobs.push(ArchivedJob {
                 id: uuid::Uuid::parse_str(&row.get::<String, _>("id"))?,
                 queue_name: row.get("queue_name"),
-                status: serde_json::from_str::<JobStatus>(&row.get::<String, _>("status"))
-                    .unwrap_or(JobStatus::Dead),
+                status: {
+                    // Handle both quoted (old format) and unquoted (new format) status values
+                    let status_str: String = row.get("status");
+                    let cleaned_str = status_str.trim_matches('"');
+                    match cleaned_str {
+                        "Pending" => JobStatus::Pending,
+                        "Running" => JobStatus::Running,
+                        "Completed" => JobStatus::Completed,
+                        "Failed" => JobStatus::Failed,
+                        "Dead" => JobStatus::Dead,
+                        "TimedOut" => JobStatus::TimedOut,
+                        "Retrying" => JobStatus::Retrying,
+                        "Archived" => JobStatus::Archived,
+                        _ => JobStatus::Dead, // Default fallback for unknown status
+                    }
+                },
                 created_at: row.get("created_at"),
                 archived_at: row.get("archived_at"),
                 archival_reason: serde_json::from_str(&row.get::<String, _>("archival_reason"))
@@ -2464,7 +2526,7 @@ impl crate::queue::JobQueue<sqlx::MySql> {
         } else {
             Some(serde_json::to_value(&job.dependents)?)
         })
-        .bind(serde_json::to_string(&job.dependency_status)?)
+        .bind(job.dependency_status.as_str())
         .bind(job.workflow_id.map(|id| id.to_string()))
         .bind(job.workflow_name)
         .bind(job.trace_id)

@@ -1,8 +1,9 @@
 mod test_utils;
 
 use hammerwork::{
-    Job,
-    batch::{JobBatch, PartialFailureMode},
+    Job, JobStatus, 
+    batch::{BatchStatus, JobBatch, PartialFailureMode},
+    queue::DatabaseQueue,
 };
 use serde_json::json;
 // use std::sync::Arc;

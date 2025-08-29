@@ -1,7 +1,8 @@
 mod test_utils;
 
 use chrono::Utc;
-use hammerwork::archive::{ArchivalReason, ArchiveEvent};
+use hammerwork::{Job, queue::DatabaseQueue, archive::{ArchivalReason, ArchiveEvent}};
+use serde_json::json;
 use uuid::Uuid;
 
 /// Test ArchiveEvent serialization and deserialization
