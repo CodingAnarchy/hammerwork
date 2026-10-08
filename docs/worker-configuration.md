@@ -156,6 +156,76 @@ pool.start().await?;
 pool.shutdown().await?;
 ```
 
+`start` spawns every worker and a supervisor, then waits until the pool shuts down.
+The workers run in their own tasks, so you can drop the `start` future (for example
+in a `tokio::select!` on a shutdown signal) and then call `shutdown`:
+
+```rust
+tokio::select! {
+    result = pool.start() => result?,
+    _ = tokio::signal::ctrl_c() => pool.shutdown().await?,
+}
+```
+
+Dropping the pool also shuts its workers down gracefully.
+
+### Supervision
+
+If a worker task stops unexpectedly (a bug that panics outside a job handler, for
+example), the pool logs it and restarts the worker after one second. A panic inside
+a job handler never reaches this point: the worker catches it and fails the job
+with the error `Job handler panicked: <message>`, which then goes through the
+normal retry / dead-letter path.
+
+Errors in the worker loop itself (the database failing while a job is dequeued or
+its outcome recorded) are logged, and the worker backs off exponentially, starting
+at the throttle's `backoff_on_error` (or the poll interval, at least 100ms) and
+capped at 60 seconds.
+
+### Graceful Shutdown
+
+On `shutdown`, idle workers stop immediately. A worker in the middle of a job stops
+polling but lets the job finish and record its outcome, for up to its shutdown grace
+period (30 seconds by default). Only then is the handler cancelled. `shutdown`
+returns once every worker has stopped.
+
+```rust
+let worker = Worker::new(queue.clone(), "reports".to_string(), handler)
+    .with_shutdown_grace_period(Duration::from_secs(120));
+```
+
+### Job Leases and Stale Job Recovery
+
+A worker that crashes, is OOM-killed or loses its pod leaves its job in `Running`.
+Hammerwork recovers these jobs with leases (requires migration `015_add_job_leases`):
+
+- While a handler runs, the worker records a heartbeat and extends the job's lease
+  every third of its lease duration (5 minutes by default). Jobs that finish sooner
+  never write a heartbeat.
+- `DatabaseQueue::requeue_stale_jobs(older_than)` reclaims `Running` jobs whose
+  lease has expired. Jobs that never recorded a lease (they had not reached their
+  first heartbeat, or were started by an older Hammerwork version) count as stale
+  once they started more than `older_than` ago.
+- A reclaimed job goes back to `Pending` and runs again immediately. The interrupted
+  run already counted as an attempt; a job with no attempts left is moved to `Dead`.
+- Every `WorkerPool` runs this reaper every 60 seconds, with `older_than` set to the
+  longest lease of its workers. Several pools or processes can reap at once safely.
+
+```rust
+let worker = Worker::new(queue.clone(), "video".to_string(), handler)
+    .with_lease_duration(Duration::from_secs(60)); // detect crashed workers within ~1 min
+
+let mut pool = WorkerPool::new()
+    // Reap every 30s; jobs without a lease are stale after 10 minutes
+    .with_stale_job_reaper(Duration::from_secs(30), Duration::from_secs(600));
+// Or turn it off and run `cargo hammerwork job requeue-stale` from a scheduler:
+// let mut pool = WorkerPool::new().without_stale_job_reaper();
+```
+
+If a lease expires while the handler is still running (for example after a long
+stop-the-world pause), the job can be reclaimed and run again elsewhere, so handlers
+should be idempotent. The worker logs a warning when it notices it lost a lease.
+
 ### Mixed Configuration Pools
 
 ```rust

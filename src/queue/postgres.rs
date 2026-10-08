@@ -2453,6 +2453,93 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
         Ok(paused_queues)
     }
+
+    async fn heartbeat_job(&self, job_id: JobId, lease: std::time::Duration) -> Result<bool> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE hammerwork_jobs SET last_heartbeat_at = $1, lease_expires_at = $2 \
+             WHERE id = $3 AND status = $4",
+        )
+        .bind(now)
+        .bind(super::saturating_add_to(now, lease))
+        .bind(job_id)
+        .bind(JobStatus::Running)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn requeue_stale_jobs(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<super::StaleJobRecovery> {
+        let now = Utc::now();
+        let cutoff = super::saturating_sub_from(now, older_than);
+
+        // The CTE claims stale rows with SKIP LOCKED so concurrent reapers never wait on
+        // (or double-process) the same row; the outer UPDATE re-checks `status` so a row
+        // that changed state after the snapshot is left alone. All SET expressions read
+        // the pre-update row, so `attempts >= max_attempts` picks Dead vs Pending.
+        let rows = sqlx::query(
+            r#"
+            WITH stale AS (
+                SELECT id FROM hammerwork_jobs
+                WHERE status = $1
+                  AND (
+                    (last_heartbeat_at IS NOT NULL
+                        AND last_heartbeat_at >= started_at
+                        AND lease_expires_at < $2)
+                    OR ((last_heartbeat_at IS NULL OR last_heartbeat_at < started_at)
+                        AND started_at < $3)
+                  )
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE hammerwork_jobs AS j
+            SET status = CASE WHEN j.attempts >= j.max_attempts THEN $4 ELSE $5 END,
+                failed_at = CASE WHEN j.attempts >= j.max_attempts THEN $2 ELSE j.failed_at END,
+                scheduled_at = CASE WHEN j.attempts >= j.max_attempts
+                                    THEN j.scheduled_at ELSE $2 END,
+                started_at = CASE WHEN j.attempts >= j.max_attempts
+                                  THEN j.started_at ELSE NULL END,
+                error_message = $6,
+                last_heartbeat_at = NULL,
+                lease_expires_at = NULL
+            FROM stale
+            WHERE j.id = stale.id AND j.status = $1
+            RETURNING j.id, j.status
+            "#,
+        )
+        .bind(JobStatus::Running)
+        .bind(now)
+        .bind(cutoff)
+        .bind(JobStatus::Dead)
+        .bind(JobStatus::Pending)
+        .bind(super::STALE_JOB_ERROR_MESSAGE)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut recovery = super::StaleJobRecovery::default();
+        for row in rows {
+            let id: uuid::Uuid = row.get("id");
+            let status: String = row.get("status");
+            if status == "Dead" {
+                recovery.dead.push(id);
+            } else {
+                recovery.requeued.push(id);
+            }
+        }
+
+        if !recovery.is_empty() {
+            tracing::warn!(
+                requeued = recovery.requeued.len(),
+                dead = recovery.dead.len(),
+                "Reclaimed stale Running jobs whose lease expired"
+            );
+        }
+
+        Ok(recovery)
+    }
 }
 
 // Helper method for enqueueing with an existing transaction

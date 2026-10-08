@@ -15,8 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `WorkerPool::from_config` creates `pool_size` workers and configures autoscaling from `WorkerConfig`
   - `WebhookManager::from_config` and `StreamManager::from_config` build managers from the `webhooks` and `streaming` sections
   - `ArchiveConfig::archival_policy` / `archival_config`, `RateLimitingConfig::throttle_for`, `WorkerConfig::autoscale_config`, `DatabaseConfig::connection_timeout`
+- **🩺 Job leases and stale job recovery** ([#19](https://github.com/CodingAnarchy/hammerwork/issues/19) C2): jobs left `Running` by a crashed or killed worker are no longer stuck forever
+  - Migration `015_add_job_leases` adds `last_heartbeat_at` and `lease_expires_at` to `hammerwork_jobs` (PostgreSQL and MySQL). Run `cargo hammerwork migration run` before upgrading workers.
+  - Workers heartbeat running jobs every third of their lease (`Worker::with_lease_duration`, default 5 minutes)
+  - `DatabaseQueue::heartbeat_job` and `DatabaseQueue::requeue_stale_jobs(older_than)` (returns `StaleJobRecovery`). Expired jobs go back to `Pending`, or to `Dead` when out of attempts. Safe to run concurrently (`FOR UPDATE SKIP LOCKED` plus a `status = 'Running'` guard). Both methods have default implementations, so custom `DatabaseQueue` implementations keep compiling.
+  - `WorkerPool` runs the reaper every 60 seconds (`with_stale_job_reaper`, `without_stale_job_reaper`)
+  - CLI: `cargo hammerwork job requeue-stale [--older-than-secs N]`
+- `Worker::with_shutdown_grace_period` (default 30 seconds) and `RetryStrategy::validate`
 
 ### Changed
+- **Breaking:** `RetryStrategy::Custom` now holds an `Arc<dyn Fn(u32) -> Duration + Send + Sync>` (`retry::CustomRetryFn`) instead of a `Box`, so it can be cloned. Code using `RetryStrategy::custom(..)` is unaffected; code constructing the variant directly must switch `Box::new` to `Arc::new`. Two `Custom` strategies now compare equal when they share the same function.
+- `WorkerPool::shutdown` now waits until every worker has stopped (bounded by each worker's shutdown grace period) instead of returning as soon as the signal is sent
 - **CI**: replaced the disabled `Integration Tests` workflow with `.github/workflows/ci.yml`: rustfmt, clippy (`--all-targets --all-features -D warnings`), unit tests, PostgreSQL 16 and MySQL 8 integration jobs, and a `cargo audit` job. Runs on pushes and pull requests to `master` and on demand (#7).
 - `DatabaseConfig::create_tables` is deprecated; tables are created by migrations (`auto_migrate`)
 - AWS KMS clients (`aws-kms` feature) now load config with `BehaviorVersion::latest()` instead of the deprecated `v2025_01_17`, matching the Kinesis client. This picks up the SDK's newer defaults, including HTTP(S) proxy settings from the environment.
@@ -45,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MySQL dequeues and the PostgreSQL weighted dequeue ignored `dependency_status` and could run a job before its dependencies completed.
 - MySQL dequeues now use `FOR UPDATE SKIP LOCKED` (MySQL 8.0+), so concurrent workers skip rows being claimed instead of blocking on them.
 - MySQL job claims run at READ COMMITTED and retry when InnoDB aborts them as deadlock victims (error 1213), which concurrent workers otherwise hit intermittently.
+- **Worker robustness** ([#17](https://github.com/CodingAnarchy/hammerwork/issues/17), [#19](https://github.com/CodingAnarchy/hammerwork/issues/19))
+  - Errors from completing, failing or retrying a job (and from dequeuing) are logged and followed by an exponential backoff that honours `ThrottleConfig::backoff_on_error`, instead of being discarded with the worker spinning hot (H1)
+  - A panicking job handler no longer kills the worker: the panic fails the job with `Job handler panicked: <message>` and goes through the normal retry / dead path (H2)
+  - `WorkerPool` supervises its workers: a worker that dies is logged and restarted instead of the pool returning on the first failure and detaching the rest (H3)
+  - `WorkerPool::shutdown` is graceful: in-flight jobs finish (up to the grace period) and record their outcome before workers stop, and `shutdown` waits for them. Dropping the pool also shuts it down. Previously shutdown cancelled the running handler and left the job `Running` (C2)
+  - Huge retry delays no longer panic in `chrono::Duration::from_std(..).unwrap()`; retry delays are clamped to 365 days (H4)
+  - `RetryStrategy::calculate_delay` no longer panics on overflow (exponential from attempt ~65, Fibonacci ~94, huge linear values) or on a NaN / negative multiplier; it saturates and clamps to `max_delay`. Jitter with an invalid factor no longer panics (H5)
+  - Cloning a `RetryStrategy::Custom` (e.g. through `Worker::clone` for autoscaling) no longer panics (H6)
+  - Webhook delivery no longer panics when truncating a response body in the middle of a multi-byte UTF-8 character (H7)
+  - The autoscaler no longer panics on a zero `evaluation_window`
 - **Archiving ([#14](https://github.com/CodingAnarchy/hammerwork/issues/14))**, PostgreSQL and MySQL:
   - `archive_jobs` now moves jobs: the archive insert and the delete from `hammerwork_jobs` run in one transaction, and candidates are selected with `FOR UPDATE SKIP LOCKED` so concurrent archivers do not collide. Previously the row stayed in `hammerwork_jobs` with its old status.
   - `get_job` falls back to the archive table and returns archived jobs with `JobStatus::Archived` (previously it returned the stale pre-archive row)

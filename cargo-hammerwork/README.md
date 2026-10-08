@@ -92,7 +92,14 @@ cargo hammerwork job enqueue --queue QUEUE --payload JSON [OPTIONS]
 cargo hammerwork job retry <JOB_ID>             # Retry a failed job
 cargo hammerwork job cancel <JOB_ID>            # Cancel a pending job
 cargo hammerwork job delete <JOB_ID>            # Remove a job
+cargo hammerwork job requeue-stale [--older-than-secs N]  # Reclaim jobs stuck in Running
 ```
+
+`job requeue-stale` moves `Running` jobs whose lease has expired (their worker crashed
+or was killed) back to `Pending`, or to `Dead` when they have no attempts left. Jobs
+that never recorded a lease are reclaimed once they started more than
+`--older-than-secs` ago (default 3600). It is safe to run alongside workers, and needs
+migration `015_add_job_leases`.
 
 ### Worker Management Commands
 
@@ -218,6 +225,7 @@ cargo-hammerwork/
 - List jobs with advanced filtering (queue, status, priority, time-based)
 - Job enqueueing with priority, delays, timeouts, and retry configuration
 - Bulk operations (retry, cancel, purge) with safety confirmations
+- Stale job recovery (`requeue-stale`) for jobs orphaned by crashed workers
 - Detailed job inspection with full lifecycle tracking
 
 #### Queue Management  
