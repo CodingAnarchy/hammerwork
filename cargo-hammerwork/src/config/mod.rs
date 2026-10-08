@@ -177,20 +177,20 @@ impl Config {
             config.default_queue = Some(queue);
         }
 
-        if let Ok(limit) = env::var("HAMMERWORK_DEFAULT_LIMIT") {
-            if let Ok(limit_num) = limit.parse() {
-                config.default_limit = Some(limit_num);
-            }
+        if let Ok(limit) = env::var("HAMMERWORK_DEFAULT_LIMIT")
+            && let Ok(limit_num) = limit.parse()
+        {
+            config.default_limit = Some(limit_num);
         }
 
         if let Ok(log_level) = env::var("HAMMERWORK_LOG_LEVEL") {
             config.log_level = Some(log_level);
         }
 
-        if let Ok(pool_size) = env::var("HAMMERWORK_POOL_SIZE") {
-            if let Ok(size_num) = pool_size.parse() {
-                config.connection_pool_size = Some(size_num);
-            }
+        if let Ok(pool_size) = env::var("HAMMERWORK_POOL_SIZE")
+            && let Ok(size_num) = pool_size.parse()
+        {
+            config.connection_pool_size = Some(size_num);
         }
 
         Ok(config)

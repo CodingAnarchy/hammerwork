@@ -33,18 +33,17 @@ fn parse_sql_statements(
 
                     // Fix sqlparser bug: it drops empty parentheses from CREATE FUNCTION
                     // PostgreSQL requires () even when there are no parameters
-                    if let sqlparser::ast::Statement::CreateFunction { args, .. } = stmt {
-                        if args.is_none() {
-                            // Find function name and add () after it if missing
-                            // The pattern is: "CREATE ... FUNCTION name RETURNS"
-                            if let Some(returns_pos) = sql_string.find(" RETURNS ") {
-                                // Check if there's already () before RETURNS
-                                let before_returns = &sql_string[..returns_pos];
-                                if !before_returns.ends_with("()") && !before_returns.ends_with(")")
-                                {
-                                    // Insert () before RETURNS
-                                    sql_string.insert_str(returns_pos, "()");
-                                }
+                    if let sqlparser::ast::Statement::CreateFunction { args, .. } = stmt
+                        && args.is_none()
+                    {
+                        // Find function name and add () after it if missing
+                        // The pattern is: "CREATE ... FUNCTION name RETURNS"
+                        if let Some(returns_pos) = sql_string.find(" RETURNS ") {
+                            // Check if there's already () before RETURNS
+                            let before_returns = &sql_string[..returns_pos];
+                            if !before_returns.ends_with("()") && !before_returns.ends_with(")") {
+                                // Insert () before RETURNS
+                                sql_string.insert_str(returns_pos, "()");
                             }
                         }
                     }

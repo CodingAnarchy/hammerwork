@@ -430,15 +430,15 @@ impl<DB: sqlx::Database> SpawnManager<DB> {
             let mut child_jobs = handler.spawn_jobs(context).await?;
 
             // Check spawn limits
-            if let Some(max_count) = config.max_spawn_count {
-                if child_jobs.len() > max_count {
-                    return Err(HammerworkError::SpawnError(
-                        SpawnError::SpawnLimitExceeded {
-                            attempted: child_jobs.len(),
-                            limit: max_count,
-                        },
-                    ));
-                }
+            if let Some(max_count) = config.max_spawn_count
+                && child_jobs.len() > max_count
+            {
+                return Err(HammerworkError::SpawnError(
+                    SpawnError::SpawnLimitExceeded {
+                        attempted: child_jobs.len(),
+                        limit: max_count,
+                    },
+                ));
             }
 
             // Apply inheritance settings

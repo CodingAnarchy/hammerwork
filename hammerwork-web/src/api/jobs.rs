@@ -314,17 +314,17 @@ where
             };
 
             // Apply status filter
-            if let Some(ref status) = filters.status {
-                if job_info.status.to_lowercase() != status.to_lowercase() {
-                    continue;
-                }
+            if let Some(ref status) = filters.status
+                && job_info.status.to_lowercase() != status.to_lowercase()
+            {
+                continue;
             }
 
             // Apply priority filter
-            if let Some(ref priority) = filters.priority {
-                if job_info.priority.to_lowercase() != priority.to_lowercase() {
-                    continue;
-                }
+            if let Some(ref priority) = filters.priority
+                && job_info.priority.to_lowercase() != priority.to_lowercase()
+            {
+                continue;
             }
 
             all_jobs.push(job_info);
@@ -686,13 +686,12 @@ where
             }
 
             // Apply status filter
-            if let Some(ref statuses) = search_request.statuses {
-                if !statuses
+            if let Some(ref statuses) = search_request.statuses
+                && !statuses
                     .iter()
                     .any(|s| s.eq_ignore_ascii_case(job.status.as_str()))
-                {
-                    continue;
-                }
+            {
+                continue;
             }
 
             // Apply priority filter
@@ -707,16 +706,16 @@ where
             }
 
             // Apply date filters
-            if let Some(ref created_after) = search_request.created_after {
-                if job.created_at < *created_after {
-                    continue;
-                }
+            if let Some(ref created_after) = search_request.created_after
+                && job.created_at < *created_after
+            {
+                continue;
             }
 
-            if let Some(ref created_before) = search_request.created_before {
-                if job.created_at > *created_before {
-                    continue;
-                }
+            if let Some(ref created_before) = search_request.created_before
+                && job.created_at > *created_before
+            {
+                continue;
             }
 
             let processing_time_ms = match (job.started_at, job.completed_at) {
@@ -779,13 +778,12 @@ where
             }
 
             // Apply additional filters
-            if let Some(ref statuses) = search_request.statuses {
-                if !statuses
+            if let Some(ref statuses) = search_request.statuses
+                && !statuses
                     .iter()
                     .any(|s| s.eq_ignore_ascii_case(job.status.as_str()))
-                {
-                    continue;
-                }
+            {
+                continue;
             }
 
             if let Some(ref priorities) = search_request.priorities {
@@ -798,16 +796,16 @@ where
                 }
             }
 
-            if let Some(ref created_after) = search_request.created_after {
-                if job.created_at < *created_after {
-                    continue;
-                }
+            if let Some(ref created_after) = search_request.created_after
+                && job.created_at < *created_after
+            {
+                continue;
             }
 
-            if let Some(ref created_before) = search_request.created_before {
-                if job.created_at > *created_before {
-                    continue;
-                }
+            if let Some(ref created_before) = search_request.created_before
+                && job.created_at > *created_before
+            {
+                continue;
             }
 
             let processing_time_ms = match (job.started_at, job.completed_at) {

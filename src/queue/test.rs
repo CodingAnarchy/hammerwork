@@ -333,10 +333,10 @@ impl TestStorage {
             })?;
 
         // Remove from old status
-        if let Some(queue_jobs) = self.queues.get_mut(&queue_name) {
-            if let Some(status_jobs) = queue_jobs.get_mut(&old_status) {
-                status_jobs.retain(|id| *id != job_id);
-            }
+        if let Some(queue_jobs) = self.queues.get_mut(&queue_name)
+            && let Some(status_jobs) = queue_jobs.get_mut(&old_status)
+        {
+            status_jobs.retain(|id| *id != job_id);
         }
 
         // Update the job status
@@ -865,10 +865,10 @@ impl DatabaseQueue for TestQueue {
 
                     if all_complete {
                         // Make the job eligible for execution
-                        if let Some(dep_job) = storage.jobs.get_mut(&dependent_id) {
-                            if dep_job.status == JobStatus::Pending {
-                                dep_job.scheduled_at = now;
-                            }
+                        if let Some(dep_job) = storage.jobs.get_mut(&dependent_id)
+                            && dep_job.status == JobStatus::Pending
+                        {
+                            dep_job.scheduled_at = now;
                         }
                     }
                 }
@@ -931,16 +931,15 @@ impl DatabaseQueue for TestQueue {
 
             // Fail all other pending jobs in the workflow
             for other_job_id in other_job_ids {
-                if let Some(j) = storage.jobs.get(&other_job_id) {
-                    if j.status == JobStatus::Pending || j.status == JobStatus::Retrying {
-                        storage
-                            .update_job_status(other_job_id, JobStatus::Failed)
-                            .ok();
-                        if let Some(j) = storage.jobs.get_mut(&other_job_id) {
-                            j.error_message =
-                                Some("Workflow failed (fail-fast policy)".to_string());
-                            j.failed_at = Some(now);
-                        }
+                if let Some(j) = storage.jobs.get(&other_job_id)
+                    && (j.status == JobStatus::Pending || j.status == JobStatus::Retrying)
+                {
+                    storage
+                        .update_job_status(other_job_id, JobStatus::Failed)
+                        .ok();
+                    if let Some(j) = storage.jobs.get_mut(&other_job_id) {
+                        j.error_message = Some("Workflow failed (fail-fast policy)".to_string());
+                        j.failed_at = Some(now);
                     }
                 }
             }
@@ -973,17 +972,17 @@ impl DatabaseQueue for TestQueue {
 
         if let Some(job) = storage.jobs.remove(&job_id) {
             // Remove from queue
-            if let Some(queue_jobs) = storage.queues.get_mut(&job.queue_name) {
-                if let Some(status_jobs) = queue_jobs.get_mut(&job.status) {
-                    status_jobs.retain(|id| *id != job_id);
-                }
+            if let Some(queue_jobs) = storage.queues.get_mut(&job.queue_name)
+                && let Some(status_jobs) = queue_jobs.get_mut(&job.status)
+            {
+                status_jobs.retain(|id| *id != job_id);
             }
 
             // Remove from batch if applicable
-            if let Some(batch_id) = job.batch_id {
-                if let Some(batch_jobs) = storage.batch_jobs.get_mut(&batch_id) {
-                    batch_jobs.retain(|id| *id != job_id);
-                }
+            if let Some(batch_id) = job.batch_id
+                && let Some(batch_jobs) = storage.batch_jobs.get_mut(&batch_id)
+            {
+                batch_jobs.retain(|id| *id != job_id);
             }
 
             // Clean up dependencies
@@ -1142,12 +1141,11 @@ impl DatabaseQueue for TestQueue {
         // Delete all jobs in the batch
         if let Some(job_ids) = storage.batch_jobs.remove(&batch_id) {
             for job_id in job_ids {
-                if let Some(job) = storage.jobs.remove(&job_id) {
-                    if let Some(queue_jobs) = storage.queues.get_mut(&job.queue_name) {
-                        if let Some(status_jobs) = queue_jobs.get_mut(&job.status) {
-                            status_jobs.retain(|id| *id != job_id);
-                        }
-                    }
+                if let Some(job) = storage.jobs.remove(&job_id)
+                    && let Some(queue_jobs) = storage.queues.get_mut(&job.queue_name)
+                    && let Some(status_jobs) = queue_jobs.get_mut(&job.status)
+                {
+                    status_jobs.retain(|id| *id != job_id);
                 }
             }
         }
@@ -1289,12 +1287,11 @@ impl DatabaseQueue for TestQueue {
         let count = dead_job_ids.len() as u64;
 
         for job_id in dead_job_ids {
-            if let Some(job) = storage.jobs.remove(&job_id) {
-                if let Some(queue_jobs) = storage.queues.get_mut(&job.queue_name) {
-                    if let Some(status_jobs) = queue_jobs.get_mut(&job.status) {
-                        status_jobs.retain(|id| *id != job_id);
-                    }
-                }
+            if let Some(job) = storage.jobs.remove(&job_id)
+                && let Some(queue_jobs) = storage.queues.get_mut(&job.queue_name)
+                && let Some(status_jobs) = queue_jobs.get_mut(&job.status)
+            {
+                status_jobs.retain(|id| *id != job_id);
             }
         }
 
@@ -1590,21 +1587,20 @@ impl DatabaseQueue for TestQueue {
         let mut frequencies = HashMap::new();
 
         for job in storage.jobs.values() {
-            if let Some(qn) = queue_name {
-                if job.queue_name != qn {
-                    continue;
-                }
+            if let Some(qn) = queue_name
+                && job.queue_name != qn
+            {
+                continue;
             }
 
             if (job.status == JobStatus::Failed
                 || job.status == JobStatus::Dead
                 || job.status == JobStatus::TimedOut)
                 && job.failed_at.or(job.timed_out_at).unwrap_or(job.created_at) >= since
+                && let Some(error) = &job.error_message
             {
-                if let Some(error) = &job.error_message {
-                    let error_key = error.split('\n').next().unwrap_or(error).to_string();
-                    *frequencies.entry(error_key).or_insert(0) += 1;
-                }
+                let error_key = error.split('\n').next().unwrap_or(error).to_string();
+                *frequencies.entry(error_key).or_insert(0) += 1;
             }
         }
 
@@ -1623,19 +1619,19 @@ impl DatabaseQueue for TestQueue {
 
         for job in storage.jobs.values() {
             // Filter by queue name if specified
-            if let Some(qn) = queue_name {
-                if job.queue_name != qn {
-                    continue;
-                }
+            if let Some(qn) = queue_name
+                && job.queue_name != qn
+            {
+                continue;
             }
 
             // Check if job is completed and within time range
-            if job.status == JobStatus::Completed {
-                if let Some(completed_at) = job.completed_at {
-                    if completed_at >= start_time && completed_at < end_time {
-                        matching_jobs.push(job.clone());
-                    }
-                }
+            if job.status == JobStatus::Completed
+                && let Some(completed_at) = job.completed_at
+                && completed_at >= start_time
+                && completed_at < end_time
+            {
+                matching_jobs.push(job.clone());
             }
         }
 
@@ -1901,10 +1897,10 @@ impl DatabaseQueue for TestQueue {
 
         if let Some((result, expires_at)) = storage.job_results.get(&job_id) {
             // Check if expired
-            if let Some(exp) = expires_at {
-                if *exp <= storage.clock.now() {
-                    return Ok(None);
-                }
+            if let Some(exp) = expires_at
+                && *exp <= storage.clock.now()
+            {
+                return Ok(None);
             }
             Ok(Some(result.clone()))
         } else {
@@ -2054,13 +2050,12 @@ impl DatabaseQueue for TestQueue {
                     if all_complete {
                         // Make the job eligible for execution
                         let now = storage.clock.now();
-                        if let Some(job) = storage.jobs.get_mut(&dependent_id) {
-                            if job.status == JobStatus::Pending
-                                && job.scheduled_at == DateTime::<Utc>::MAX_UTC
-                            {
-                                job.scheduled_at = now;
-                                resolved_jobs.push(dependent_id);
-                            }
+                        if let Some(job) = storage.jobs.get_mut(&dependent_id)
+                            && job.status == JobStatus::Pending
+                            && job.scheduled_at == DateTime::<Utc>::MAX_UTC
+                        {
+                            job.scheduled_at = now;
+                            resolved_jobs.push(dependent_id);
                         }
                     }
                 }
@@ -2121,15 +2116,15 @@ impl DatabaseQueue for TestQueue {
                     // Fail all pending jobs in the workflow
                     let current_time = storage.clock.now();
                     for job in &workflow.jobs {
-                        if let Some(j) = storage.jobs.get(&job.id) {
-                            if j.status == JobStatus::Pending {
-                                storage.update_job_status(job.id, JobStatus::Failed).ok();
-                                if let Some(j) = storage.jobs.get_mut(&job.id) {
-                                    j.error_message = Some("Dependency failed".to_string());
-                                    j.failed_at = Some(current_time);
-                                }
-                                failed_jobs.push(job.id);
+                        if let Some(j) = storage.jobs.get(&job.id)
+                            && j.status == JobStatus::Pending
+                        {
+                            storage.update_job_status(job.id, JobStatus::Failed).ok();
+                            if let Some(j) = storage.jobs.get_mut(&job.id) {
+                                j.error_message = Some("Dependency failed".to_string());
+                                j.failed_at = Some(current_time);
                             }
+                            failed_jobs.push(job.id);
                         }
                     }
                 }
@@ -2173,13 +2168,13 @@ impl DatabaseQueue for TestQueue {
         // Cancel all pending jobs
         let now = storage.clock.now();
         for job in &workflow.jobs {
-            if let Some(j) = storage.jobs.get(&job.id) {
-                if j.status == JobStatus::Pending || j.status == JobStatus::Running {
-                    storage.update_job_status(job.id, JobStatus::Failed).ok();
-                    if let Some(j) = storage.jobs.get_mut(&job.id) {
-                        j.error_message = Some("Workflow cancelled".to_string());
-                        j.failed_at = Some(now);
-                    }
+            if let Some(j) = storage.jobs.get(&job.id)
+                && (j.status == JobStatus::Pending || j.status == JobStatus::Running)
+            {
+                storage.update_job_status(job.id, JobStatus::Failed).ok();
+                if let Some(j) = storage.jobs.get_mut(&job.id) {
+                    j.error_message = Some("Workflow cancelled".to_string());
+                    j.failed_at = Some(now);
                 }
             }
         }
@@ -2212,10 +2207,10 @@ impl DatabaseQueue for TestQueue {
 
         for job in storage.jobs.values() {
             // Skip if queue_name filter doesn't match
-            if let Some(queue) = queue_name {
-                if job.queue_name != queue {
-                    continue;
-                }
+            if let Some(queue) = queue_name
+                && job.queue_name != queue
+            {
+                continue;
             }
 
             // Check if job should be archived based on policy and status
@@ -2227,10 +2222,10 @@ impl DatabaseQueue for TestQueue {
                 _ => None,
             };
 
-            if let Some(age) = age {
-                if policy.should_archive(&job.status, age) {
-                    jobs_to_archive.push(job.id);
-                }
+            if let Some(age) = age
+                && policy.should_archive(&job.status, age)
+            {
+                jobs_to_archive.push(job.id);
             }
         }
 
@@ -2345,10 +2340,10 @@ impl DatabaseQueue for TestQueue {
             }
 
             // Filter by queue if specified
-            if let Some(queue) = queue_name {
-                if job.queue_name != queue {
-                    continue;
-                }
+            if let Some(queue) = queue_name
+                && job.queue_name != queue
+            {
+                continue;
             }
 
             let payload_size = serde_json::to_string(&job.payload)
@@ -2428,10 +2423,10 @@ impl DatabaseQueue for TestQueue {
             }
 
             // Filter by queue if specified
-            if let Some(queue) = queue_name {
-                if job.queue_name != queue {
-                    continue;
-                }
+            if let Some(queue) = queue_name
+                && job.queue_name != queue
+            {
+                continue;
             }
 
             jobs_archived += 1;

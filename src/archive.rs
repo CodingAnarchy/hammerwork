@@ -907,10 +907,10 @@ where
             .await?;
 
         // Always report a final state, even when nothing was archived.
-        if stats.jobs_archived == 0 {
-            if let Some(callback) = &progress_callback {
-                callback(0, estimated_jobs);
-            }
+        if stats.jobs_archived == 0
+            && let Some(callback) = &progress_callback
+        {
+            callback(0, estimated_jobs);
         }
 
         Ok((operation_id, stats))

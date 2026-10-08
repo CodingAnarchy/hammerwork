@@ -918,10 +918,10 @@ where
             .filter(|payload| payload.should_delete_now())
             .count();
 
-        if expired_count > 0 {
-            if let Ok(mut stats) = self.stats.lock() {
-                stats.record_retention_cleanup(expired_count as u64);
-            }
+        if expired_count > 0
+            && let Ok(mut stats) = self.stats.lock()
+        {
+            stats.record_retention_cleanup(expired_count as u64);
         }
 
         expired_count

@@ -933,11 +933,11 @@ impl SpawnCommand {
                 for parent_id in &job.depends_on {
                     let parent_uuid = Uuid::parse_str(parent_id)
                         .with_context(|| format!("invalid dependency id '{}'", parent_id))?;
-                    if let Some(parent) = self.get_spawn_node(pool, &parent_uuid).await? {
-                        if !all_nodes.contains_key(&parent.id) {
-                            all_nodes.insert(parent.id.clone(), parent.clone());
-                            to_visit.push_back(parent.id.clone());
-                        }
+                    if let Some(parent) = self.get_spawn_node(pool, &parent_uuid).await?
+                        && !all_nodes.contains_key(&parent.id)
+                    {
+                        all_nodes.insert(parent.id.clone(), parent.clone());
+                        to_visit.push_back(parent.id.clone());
                     }
                 }
             }
@@ -962,13 +962,13 @@ impl SpawnCommand {
             for parent_id in &current.depends_on {
                 let parent_uuid = Uuid::parse_str(parent_id)
                     .with_context(|| format!("invalid dependency id '{}'", parent_id))?;
-                if let Some(parent) = self.get_spawn_node(pool, &parent_uuid).await? {
-                    if parent.spawn_config.is_some() {
-                        ancestors.push(parent.clone());
-                        current = parent;
-                        parent_found = true;
-                        break;
-                    }
+                if let Some(parent) = self.get_spawn_node(pool, &parent_uuid).await?
+                    && parent.spawn_config.is_some()
+                {
+                    ancestors.push(parent.clone());
+                    current = parent;
+                    parent_found = true;
+                    break;
                 }
             }
 
@@ -1224,10 +1224,10 @@ impl SpawnCommand {
 
         for node in nodes {
             for dep_id in &node.depends_on {
-                if let Some(parent) = node_map.get(dep_id) {
-                    if parent.spawn_config.is_some() {
-                        println!("        {} -->|spawns| {}", &dep_id[..8], &node.id[..8]);
-                    }
+                if let Some(parent) = node_map.get(dep_id)
+                    && parent.spawn_config.is_some()
+                {
+                    println!("        {} -->|spawns| {}", &dep_id[..8], &node.id[..8]);
                 }
             }
         }
@@ -1251,15 +1251,15 @@ impl SpawnCommand {
 
         for node in nodes {
             for dep_id in &node.depends_on {
-                if let Some(parent) = node_map.get(dep_id) {
-                    if parent.spawn_config.is_some() {
-                        edges.push(serde_json::json!({
-                            "from": dep_id,
-                            "to": node.id,
-                            "type": "spawn",
-                            "relationship": "parent_spawned_child"
-                        }));
-                    }
+                if let Some(parent) = node_map.get(dep_id)
+                    && parent.spawn_config.is_some()
+                {
+                    edges.push(serde_json::json!({
+                        "from": dep_id,
+                        "to": node.id,
+                        "type": "spawn",
+                        "relationship": "parent_spawned_child"
+                    }));
                 }
             }
         }

@@ -45,9 +45,9 @@ mod duration_secs {
         let secs = duration.as_secs();
         if secs == 0 {
             serializer.serialize_str("0s")
-        } else if secs % 3600 == 0 {
+        } else if secs.is_multiple_of(3600) {
             serializer.serialize_str(&format!("{}h", secs / 3600))
-        } else if secs % 60 == 0 {
+        } else if secs.is_multiple_of(60) {
             serializer.serialize_str(&format!("{}m", secs / 60))
         } else {
             serializer.serialize_str(&format!("{}s", secs))
@@ -313,10 +313,10 @@ impl HammerworkConfig {
         if let Ok(pool_size) = std::env::var("HAMMERWORK_WORKER_POOL_SIZE") {
             config.worker.pool_size = pool_size.parse().unwrap_or(config.worker.pool_size);
         }
-        if let Ok(timeout) = std::env::var("HAMMERWORK_JOB_TIMEOUT_SECONDS") {
-            if let Ok(seconds) = timeout.parse::<u64>() {
-                config.worker.job_timeout = StdDuration::from_secs(seconds);
-            }
+        if let Ok(timeout) = std::env::var("HAMMERWORK_JOB_TIMEOUT_SECONDS")
+            && let Ok(seconds) = timeout.parse::<u64>()
+        {
+            config.worker.job_timeout = StdDuration::from_secs(seconds);
         }
 
         // Event configuration

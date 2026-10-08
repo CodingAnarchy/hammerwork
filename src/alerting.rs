@@ -231,29 +231,29 @@ impl AlertManager {
         }
 
         // Check error rate threshold
-        if let Some(threshold) = self.config.error_rate_threshold {
-            if stats.error_rate > threshold {
-                let alert = Alert {
-                    alert_type: AlertType::HighErrorRate,
-                    severity: if stats.error_rate > threshold * 2.0 {
-                        AlertSeverity::Critical
-                    } else {
-                        AlertSeverity::Warning
-                    },
-                    queue_name: queue_name.to_string(),
-                    message: format!(
-                        "High error rate detected: {:.2}% (threshold: {:.2}%)",
-                        stats.error_rate * 100.0,
-                        threshold * 100.0
-                    ),
-                    current_value: stats.error_rate,
-                    threshold,
-                    timestamp: Utc::now(),
-                    context: self.build_context(stats),
-                };
+        if let Some(threshold) = self.config.error_rate_threshold
+            && stats.error_rate > threshold
+        {
+            let alert = Alert {
+                alert_type: AlertType::HighErrorRate,
+                severity: if stats.error_rate > threshold * 2.0 {
+                    AlertSeverity::Critical
+                } else {
+                    AlertSeverity::Warning
+                },
+                queue_name: queue_name.to_string(),
+                message: format!(
+                    "High error rate detected: {:.2}% (threshold: {:.2}%)",
+                    stats.error_rate * 100.0,
+                    threshold * 100.0
+                ),
+                current_value: stats.error_rate,
+                threshold,
+                timestamp: Utc::now(),
+                context: self.build_context(stats),
+            };
 
-                self.send_alert_if_needed(alert).await?;
-            }
+            self.send_alert_if_needed(alert).await?;
         }
 
         // Check processing time threshold
@@ -291,28 +291,28 @@ impl AlertManager {
             return Ok(());
         }
 
-        if let Some(threshold) = self.config.queue_depth_threshold {
-            if depth > threshold {
-                let alert = Alert {
-                    alert_type: AlertType::QueueDepthExceeded,
-                    severity: if depth > threshold * 2 {
-                        AlertSeverity::Critical
-                    } else {
-                        AlertSeverity::Warning
-                    },
-                    queue_name: queue_name.to_string(),
-                    message: format!(
-                        "Queue depth exceeded: {} jobs (threshold: {})",
-                        depth, threshold
-                    ),
-                    current_value: depth as f64,
-                    threshold: threshold as f64,
-                    timestamp: Utc::now(),
-                    context: HashMap::new(),
-                };
+        if let Some(threshold) = self.config.queue_depth_threshold
+            && depth > threshold
+        {
+            let alert = Alert {
+                alert_type: AlertType::QueueDepthExceeded,
+                severity: if depth > threshold * 2 {
+                    AlertSeverity::Critical
+                } else {
+                    AlertSeverity::Warning
+                },
+                queue_name: queue_name.to_string(),
+                message: format!(
+                    "Queue depth exceeded: {} jobs (threshold: {})",
+                    depth, threshold
+                ),
+                current_value: depth as f64,
+                threshold: threshold as f64,
+                timestamp: Utc::now(),
+                context: HashMap::new(),
+            };
 
-                self.send_alert_if_needed(alert).await?;
-            }
+            self.send_alert_if_needed(alert).await?;
         }
 
         Ok(())

@@ -702,21 +702,21 @@ impl WorkflowCommand {
             if let Some(job) = jobs.get(&job_id).cloned() {
                 // Visit all dependencies
                 for dep_id in &job.depends_on {
-                    if !jobs.contains_key(dep_id) {
-                        if let Some(dep_job) = self.get_job_node_by_string(pool, dep_id).await? {
-                            jobs.insert(dep_id.clone(), dep_job);
-                            to_visit.push_back(dep_id.clone());
-                        }
+                    if !jobs.contains_key(dep_id)
+                        && let Some(dep_job) = self.get_job_node_by_string(pool, dep_id).await?
+                    {
+                        jobs.insert(dep_id.clone(), dep_job);
+                        to_visit.push_back(dep_id.clone());
                     }
                 }
 
                 // Visit all dependents
                 for dep_id in &job.dependents {
-                    if !jobs.contains_key(dep_id) {
-                        if let Some(dep_job) = self.get_job_node_by_string(pool, dep_id).await? {
-                            jobs.insert(dep_id.clone(), dep_job);
-                            to_visit.push_back(dep_id.clone());
-                        }
+                    if !jobs.contains_key(dep_id)
+                        && let Some(dep_job) = self.get_job_node_by_string(pool, dep_id).await?
+                    {
+                        jobs.insert(dep_id.clone(), dep_job);
+                        to_visit.push_back(dep_id.clone());
                     }
                 }
             }
@@ -856,16 +856,16 @@ impl WorkflowCommand {
 
         // Recursively print dependents (children in the tree)
         for dependent_id in &job.dependents {
-            if let Some(dependent_job) = job_map.get(dependent_id) {
-                if !visited.contains(dependent_id) {
-                    Self::print_job_tree_node(
-                        dependent_job,
-                        job_map,
-                        visited,
-                        depth + 1,
-                        target_job_id,
-                    );
-                }
+            if let Some(dependent_job) = job_map.get(dependent_id)
+                && !visited.contains(dependent_id)
+            {
+                Self::print_job_tree_node(
+                    dependent_job,
+                    job_map,
+                    visited,
+                    depth + 1,
+                    target_job_id,
+                );
             }
         }
     }

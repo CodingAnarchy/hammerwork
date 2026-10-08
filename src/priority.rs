@@ -514,10 +514,10 @@ impl PriorityStats {
         let mut starved_priorities = Vec::new();
 
         for priority in [JobPriority::Background, JobPriority::Low] {
-            if let Some(percentage) = self.priority_distribution.get(&priority) {
-                if *percentage < threshold_percentage {
-                    starved_priorities.push(priority);
-                }
+            if let Some(percentage) = self.priority_distribution.get(&priority)
+                && *percentage < threshold_percentage
+            {
+                starved_priorities.push(priority);
             }
         }
 
