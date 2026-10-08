@@ -348,7 +348,7 @@ async fn run_performance_tests(
     );
 
     // Cleanup
-    for job_id in job_ids.into_iter().chain(batch_job_ids.into_iter()) {
+    for job_id in job_ids.into_iter().chain(batch_job_ids) {
         let _ = queue.delete_job(job_id).await;
     }
 

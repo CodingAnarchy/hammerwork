@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ); // 32 bytes base64
     }
 
-    let config = KeyManagerConfig::new()
+    let _config = KeyManagerConfig::new()
         .with_master_key_env("MASTER_KEY")
         .with_auto_rotation_enabled(true)
         .with_rotation_interval(Duration::days(90)) // Rotate every 3 months
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         namespace: Some("hammerwork-production".to_string()),
     };
 
-    let kms_config = KeyManagerConfig::new().with_external_kms(external_kms);
+    let _kms_config = KeyManagerConfig::new().with_external_kms(external_kms);
 
     println!("   KMS Service: AWS KMS");
     println!("   Region: us-east-1");
@@ -67,14 +67,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 3: Key derivation configuration for password-based keys
     println!("3. Key derivation configuration:");
 
-    let derivation_config = KeyDerivationConfig {
+    let _derivation_config = KeyDerivationConfig {
         memory_cost: 65536, // 64 MB
         time_cost: 3,       // 3 iterations
         parallelism: 4,     // 4 threads
         salt_length: 32,    // 32 bytes salt
     };
 
-    let password_config = KeyManagerConfig::new().with_audit_enabled(true);
+    let _password_config = KeyManagerConfig::new().with_audit_enabled(true);
 
     println!("   Algorithm: Argon2id");
     println!("   Memory cost: 64 MB");

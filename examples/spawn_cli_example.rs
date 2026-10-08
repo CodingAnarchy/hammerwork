@@ -11,20 +11,16 @@
 //! ```
 
 use hammerwork::Result;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DataProcessingJob {
-    file_path: String,
-    batch_size: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BatchProcessingJob {
-    batch_id: String,
-    start_offset: usize,
-    end_offset: usize,
-}
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use hammerwork::{Job, JobQueue, queue::DatabaseQueue};
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use serde_json::json;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use std::time::Duration;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use tokio::time::sleep;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use uuid::Uuid;
 
 async fn setup_database() -> Result<()> {
     #[cfg(feature = "postgres")]

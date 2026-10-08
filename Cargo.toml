@@ -203,6 +203,10 @@ required-features = ["encryption"]
 name = "key_management_example"
 required-features = ["encryption"]
 
+[[example]]
+name = "spawn_example"
+required-features = ["postgres"]
+
 [[test]]
 name = "encryption_basic_tests"
 required-features = ["encryption"]

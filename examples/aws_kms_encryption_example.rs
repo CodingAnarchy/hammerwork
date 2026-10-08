@@ -10,8 +10,8 @@
 use hammerwork::{
     Job,
     encryption::{
-        EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeyManager, KeyManagerConfig,
-        KeySource, RetentionPolicy,
+        EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeyManagerConfig, KeySource,
+        RetentionPolicy,
     },
 };
 use serde_json::json;
