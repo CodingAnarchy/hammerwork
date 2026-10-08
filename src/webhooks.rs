@@ -101,7 +101,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
-    sync::{RwLock, Semaphore},
+    sync::{RwLock, Semaphore, broadcast},
     time::{sleep, timeout},
 };
 use uuid::Uuid;
@@ -750,6 +750,17 @@ impl WebhookManager {
         let deliveries = self.deliveries.clone();
 
         self.listeners.spawn("listener", async move {
+            // Subscribe once and keep the receiver for the lifetime of the listener.
+            // Re-subscribing on every iteration would skip every event published
+            // while the previous one was being handled.
+            let mut receiver = {
+                let subscriptions = subscriptions.read().await;
+                match subscriptions.get(&webhook_id) {
+                    Some(subscription) => subscription.receiver.resubscribe(),
+                    None => return,
+                }
+            };
+
             loop {
                 // Get webhook configuration
                 let webhook = {
@@ -763,17 +774,10 @@ impl WebhookManager {
                     }
                 };
 
-                // Get subscription and receive events
-                let mut receiver = {
-                    let subscriptions = subscriptions.read().await;
-                    match subscriptions.get(&webhook_id) {
-                        Some(subscription) => subscription.receiver.resubscribe(),
-                        None => {
-                            // Subscription removed, exit task
-                            break;
-                        }
-                    }
-                };
+                // Exit once the subscription is removed
+                if !subscriptions.read().await.contains_key(&webhook_id) {
+                    break;
+                }
 
                 // Wait for events
                 match receiver.recv().await {
@@ -806,8 +810,16 @@ impl WebhookManager {
                             });
                         }
                     }
-                    Err(_) => {
-                        // Channel closed, exit task
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            "Webhook {} listener fell behind and skipped {} events; \
+                             consider a larger event buffer",
+                            webhook.name,
+                            skipped
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Event manager dropped, exit task
                         break;
                     }
                 }
