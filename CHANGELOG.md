@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Migration `018_add_job_retry_strategy` adds `hammerwork_jobs.retry_strategy` (JSON) and an index on `(batch_id, status)`. **Required**: every job query reads the new column, so run `cargo hammerwork migration run` before upgrading.
 
 ### Changed
-- **MSRV is now 1.88** (was declared as 1.86, but the dependencies already needed a newer compiler). The workspace uses resolver 3, so the committed `Cargo.lock` is resolved for 1.88, and CI builds every crate and target on 1.88.
+- **MSRV is now 1.91.1** (first raised to 1.88 for the Azure SDK 1.x, then to 1.91.1 because every AWS SDK release containing the fix for GHSA-8ffr-xgwf-xj56 in `aws-smithy-json` requires it). Was previously declared as 1.86, but dependencies already needed a newer compiler.
+ The workspace uses resolver 3, so the committed `Cargo.lock` is resolved for 1.91.1, and CI builds every crate and target on 1.91.1.
 - `Cargo.lock` is committed for reproducible builds.
 - **Breaking:** `RetryStrategy::Custom` now holds an `Arc<dyn Fn(u32) -> Duration + Send + Sync>` (`retry::CustomRetryFn`) instead of a `Box`, so it can be cloned. Code using `RetryStrategy::custom(..)` is unaffected; code constructing the variant directly must switch `Box::new` to `Arc::new`. Two `Custom` strategies now compare equal when they share the same function.
 - `WorkerPool::shutdown` now waits until every worker has stopped (bounded by each worker's shutdown grace period) instead of returning as soon as the signal is sent
