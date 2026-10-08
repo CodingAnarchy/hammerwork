@@ -535,10 +535,10 @@ pub async fn init_tracing(config: TracingConfig) -> Result<()> {
 #[cfg(feature = "tracing")]
 pub async fn shutdown_tracing() {
     let provider = TRACER_PROVIDER.lock().ok().and_then(|mut slot| slot.take());
-    if let Some(provider) = provider {
-        if let Err(e) = provider.shutdown() {
-            tracing::warn!("Failed to shut down tracer provider: {}", e);
-        }
+    if let Some(provider) = provider
+        && let Err(e) = provider.shutdown()
+    {
+        tracing::warn!("Failed to shut down tracer provider: {}", e);
     }
 }
 

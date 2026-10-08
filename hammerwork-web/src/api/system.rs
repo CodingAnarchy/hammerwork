@@ -479,14 +479,13 @@ fn get_memory_usage() -> Option<u64> {
         use std::fs;
         if let Ok(contents) = fs::read_to_string("/proc/self/status") {
             for line in contents.lines() {
-                if line.starts_with("VmRSS:") {
-                    if let Some(kb) = line
+                if let Some(rest) = line.strip_prefix("VmRSS:")
+                    && let Some(kb) = rest
                         .split_whitespace()
-                        .nth(1)
+                        .next()
                         .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        return Some(kb * 1024); // Convert KB to bytes
-                    }
+                {
+                    return Some(kb.saturating_mul(1024)); // Convert KB to bytes
                 }
             }
         }

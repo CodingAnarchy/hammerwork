@@ -251,11 +251,11 @@ impl WebSocketState {
 
         for (&connection_id, sender) in &self.connections {
             // Check if this connection is subscribed to this event type
-            if let Some(subscription_set) = self.subscriptions.get(&connection_id) {
-                if subscription_set.contains(event_type) && sender.send(ws_message.clone()).is_err()
-                {
-                    disconnected.push(connection_id);
-                }
+            if let Some(subscription_set) = self.subscriptions.get(&connection_id)
+                && subscription_set.contains(event_type)
+                && sender.send(ws_message.clone()).is_err()
+            {
+                disconnected.push(connection_id);
             }
         }
 

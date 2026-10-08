@@ -2026,11 +2026,11 @@ async fn load_master_key_from_vault(service_config: &str) -> Result<Vec<u8>, Enc
     {
         let key_str = kms::vault_read_key_field(&vault_addr, mount, secret).await?;
 
-        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&key_str) {
-            if decoded.len() == 32 {
-                info!("Successfully loaded master key from HashiCorp Vault");
-                return Ok(decoded);
-            }
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&key_str)
+            && decoded.len() == 32
+        {
+            info!("Successfully loaded master key from HashiCorp Vault");
+            return Ok(decoded);
         }
 
         // Not a base64 32-byte key: treat it as a passphrase

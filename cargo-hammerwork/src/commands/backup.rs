@@ -504,21 +504,20 @@ async fn list_backups(path: Option<String>) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_file() {
-            if let Some(ext) = path.extension() {
-                if ext == "json" || ext == "csv" {
-                    let metadata = entry.metadata()?;
-                    let size = metadata.len();
-                    let modified = metadata.modified()?;
-                    let modified_time = chrono::DateTime::<chrono::Utc>::from(modified);
+        if path.is_file()
+            && let Some(ext) = path.extension()
+            && (ext == "json" || ext == "csv")
+        {
+            let metadata = entry.metadata()?;
+            let size = metadata.len();
+            let modified = metadata.modified()?;
+            let modified_time = chrono::DateTime::<chrono::Utc>::from(modified);
 
-                    backups.push((
-                        path.file_name().unwrap().to_string_lossy().to_string(),
-                        size,
-                        modified_time,
-                    ));
-                }
-            }
+            backups.push((
+                path.file_name().unwrap().to_string_lossy().to_string(),
+                size,
+                modified_time,
+            ));
         }
     }
 

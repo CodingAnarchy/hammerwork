@@ -551,12 +551,12 @@ impl RetryStrategy {
                         "exponential retry multiplier must be finite and > 0, got {multiplier}"
                     )));
                 }
-                if let Some(JitterType::Multiplicative(factor)) = jitter {
-                    if !factor.is_finite() || !(0.0..=1.0).contains(factor) {
-                        return Err(invalid(format!(
-                            "multiplicative jitter factor must be within 0.0..=1.0, got {factor}"
-                        )));
-                    }
+                if let Some(JitterType::Multiplicative(factor)) = jitter
+                    && (!factor.is_finite() || !(0.0..=1.0).contains(factor))
+                {
+                    return Err(invalid(format!(
+                        "multiplicative jitter factor must be within 0.0..=1.0, got {factor}"
+                    )));
                 }
                 Ok(())
             }

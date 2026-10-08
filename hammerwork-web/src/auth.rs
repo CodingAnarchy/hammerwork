@@ -104,11 +104,11 @@ impl AuthState {
     /// Check if user is currently locked out
     async fn is_locked_out(&self, username: &str) -> bool {
         let attempts = self.failed_attempts.read().await;
-        if let Some((count, last_attempt)) = attempts.get(username) {
-            if *count >= self.config.max_failed_attempts {
-                let elapsed = last_attempt.elapsed();
-                return elapsed < self.config.lockout_duration;
-            }
+        if let Some((count, last_attempt)) = attempts.get(username)
+            && *count >= self.config.max_failed_attempts
+        {
+            let elapsed = last_attempt.elapsed();
+            return elapsed < self.config.lockout_duration;
         }
         false
     }

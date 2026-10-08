@@ -81,12 +81,12 @@ impl<DB: sqlx::Database + Send + Sync> SpawnHandler<DB> for FileProcessingHandle
             }
 
             // Check against spawn limit
-            if let Some(max_count) = config.max_spawn_count {
-                if files.len() > max_count {
-                    return Err(hammerwork::error::HammerworkError::InvalidJobPayload {
-                        message: format!("Too many files: {} > {}", files.len(), max_count),
-                    });
-                }
+            if let Some(max_count) = config.max_spawn_count
+                && files.len() > max_count
+            {
+                return Err(hammerwork::error::HammerworkError::InvalidJobPayload {
+                    message: format!("Too many files: {} > {}", files.len(), max_count),
+                });
             }
         } else {
             return Err(hammerwork::error::HammerworkError::InvalidJobPayload {

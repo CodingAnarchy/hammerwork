@@ -780,11 +780,12 @@ impl crate::queue::JobQueue<MySql> {
         let selected_priority = weighted_choices[selection_index];
 
         // Select the oldest job from the selected priority
-        if let Some(jobs) = priority_jobs.get(selected_priority) {
-            if let Some(selected_job) = jobs.first() {
-                let started_at = Utc::now();
-                // Update the selected job
-                sqlx::query(
+        if let Some(jobs) = priority_jobs.get(selected_priority)
+            && let Some(selected_job) = jobs.first()
+        {
+            let started_at = Utc::now();
+            // Update the selected job
+            sqlx::query(
                     "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1 WHERE id = ?"
                 )
                 .bind(JobStatus::Running)
@@ -793,15 +794,14 @@ impl crate::queue::JobQueue<MySql> {
                 .execute(&mut *tx)
                 .await?;
 
-                tx.commit().await?;
+            tx.commit().await?;
 
-                let mut job = selected_job.clone().into_job()?;
-                job.status = JobStatus::Running;
-                job.attempts += 1;
-                job.started_at = Some(started_at);
+            let mut job = selected_job.clone().into_job()?;
+            job.status = JobStatus::Running;
+            job.attempts += 1;
+            job.started_at = Some(started_at);
 
-                return Ok(Some(job));
-            }
+            return Ok(Some(job));
         }
 
         tx.rollback().await?;

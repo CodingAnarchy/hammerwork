@@ -586,10 +586,10 @@ async fn show_logs(
     ];
 
     for (timestamp, level, log_queue, message) in mock_logs.iter().take(lines_count as usize) {
-        if let Some(filter_queue) = &queue {
-            if log_queue != filter_queue {
-                continue;
-            }
+        if let Some(filter_queue) = &queue
+            && log_queue != filter_queue
+        {
+            continue;
         }
 
         let level_icon = match *level {

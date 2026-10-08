@@ -6,7 +6,7 @@ members = [
     "integrations/postgres-integration",
     "integrations/mysql-integration",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 version = "1.15.5"
@@ -16,7 +16,7 @@ repository = "https://github.com/CodingAnarchy/hammerwork"
 authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
 homepage = "https://github.com/CodingAnarchy/hammerwork"
 documentation = "https://docs.rs/hammerwork"
-rust-version = "1.86"
+rust-version = "1.88"
 
 [workspace.dependencies]
 hammerwork = { version = "1.15.5", path = "." }

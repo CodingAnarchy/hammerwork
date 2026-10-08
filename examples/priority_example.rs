@@ -323,24 +323,24 @@ async fn show_priority_statistics(
                     if let Some(priority_stats) = &stats.priority_stats {
                         info!("   Priority breakdown:");
                         for priority in JobPriority::all_priorities() {
-                            if let Some(count) = priority_stats.job_counts.get(&priority) {
-                                if *count > 0 {
-                                    let percentage = priority_stats
-                                        .priority_distribution
-                                        .get(&priority)
-                                        .copied()
-                                        .unwrap_or(0.0);
-                                    let avg_time = priority_stats
-                                        .avg_processing_times
-                                        .get(&priority)
-                                        .copied()
-                                        .unwrap_or(0.0);
+                            if let Some(count) = priority_stats.job_counts.get(&priority)
+                                && *count > 0
+                            {
+                                let percentage = priority_stats
+                                    .priority_distribution
+                                    .get(&priority)
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                let avg_time = priority_stats
+                                    .avg_processing_times
+                                    .get(&priority)
+                                    .copied()
+                                    .unwrap_or(0.0);
 
-                                    info!(
-                                        "     {:?}: {} jobs ({:.1}%, avg: {:.1}ms)",
-                                        priority, count, percentage, avg_time
-                                    );
-                                }
+                                info!(
+                                    "     {:?}: {} jobs ({:.1}%, avg: {:.1}ms)",
+                                    priority, count, percentage, avg_time
+                                );
                             }
                         }
 

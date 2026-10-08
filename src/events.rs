@@ -356,15 +356,15 @@ impl EventFilter {
 
         // Check processing time range
         if let Some(processing_time) = event.processing_time_ms {
-            if let Some(min_time) = self.min_processing_time_ms {
-                if processing_time < min_time {
-                    return false;
-                }
+            if let Some(min_time) = self.min_processing_time_ms
+                && processing_time < min_time
+            {
+                return false;
             }
-            if let Some(max_time) = self.max_processing_time_ms {
-                if processing_time > max_time {
-                    return false;
-                }
+            if let Some(max_time) = self.max_processing_time_ms
+                && processing_time > max_time
+            {
+                return false;
             }
         }
 

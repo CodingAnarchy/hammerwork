@@ -1764,15 +1764,13 @@ where
 
         // Update queue depth metrics before dequeuing
         #[cfg(feature = "metrics")]
-        if let Some(metrics_collector) = &self.metrics_collector {
-            if let Ok(queue_depth) = self.queue.get_queue_depth(&self.queue_name).await {
-                if let Err(e) = metrics_collector
-                    .update_queue_depth(&self.queue_name, queue_depth)
-                    .await
-                {
-                    warn!("Failed to update queue depth metrics: {}", e);
-                }
-            }
+        if let Some(metrics_collector) = &self.metrics_collector
+            && let Ok(queue_depth) = self.queue.get_queue_depth(&self.queue_name).await
+            && let Err(e) = metrics_collector
+                .update_queue_depth(&self.queue_name, queue_depth)
+                .await
+        {
+            warn!("Failed to update queue depth metrics: {}", e);
         }
 
         let job = if let Some(ref weights) = self.priority_weights {
@@ -1804,13 +1802,12 @@ where
                             None
                         }
                     };
-                    if let Some(last_time_value) = last_time_value {
-                        if let Err(e) = alert_manager
+                    if let Some(last_time_value) = last_time_value
+                        && let Err(e) = alert_manager
                             .check_worker_starvation(&self.queue_name, last_time_value)
                             .await
-                        {
-                            warn!("Failed to check worker starvation: {}", e);
-                        }
+                    {
+                        warn!("Failed to check worker starvation: {}", e);
                     }
                 }
 
@@ -1989,40 +1986,39 @@ where
         }
 
         // Update batch statistics for successful completion
-        if self.batch_processing_enabled {
-            if let Some(batch_id) = job.batch_id {
-                self.update_batch_stats(|stats| {
-                    stats.jobs_completed += 1;
-                    stats.total_processing_time_ms += processing_time_ms;
-                    stats.update_average_processing_time();
-                });
+        if self.batch_processing_enabled
+            && let Some(batch_id) = job.batch_id
+        {
+            self.update_batch_stats(|stats| {
+                stats.jobs_completed += 1;
+                stats.total_processing_time_ms += processing_time_ms;
+                stats.update_average_processing_time();
+            });
 
-                if let Err(e) = self.check_and_update_batch_status(batch_id).await {
-                    warn!(
-                        "Failed to update batch status for batch {}: {}",
-                        batch_id, e
-                    );
-                }
+            if let Err(e) = self.check_and_update_batch_status(batch_id).await {
+                warn!(
+                    "Failed to update batch status for batch {}: {}",
+                    batch_id, e
+                );
             }
         }
 
         // Store job result if enabled and data is provided
-        if let Some(result_data) = job_result.data {
-            if let crate::job::ResultStorage::Database = job.result_config.storage {
-                let expires_at = job.result_config.ttl.map(|ttl| {
-                    Utc::now()
-                        + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(24))
-                });
+        if let Some(result_data) = job_result.data
+            && let crate::job::ResultStorage::Database = job.result_config.storage
+        {
+            let expires_at = job.result_config.ttl.map(|ttl| {
+                Utc::now() + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(24))
+            });
 
-                if let Err(e) = self
-                    .queue
-                    .store_job_result(job_id, result_data, expires_at)
-                    .await
-                {
-                    warn!("Failed to store job result for job {}: {}", job_id, e);
-                } else {
-                    debug!("Stored result for job {}", job_id);
-                }
+            if let Err(e) = self
+                .queue
+                .store_job_result(job_id, result_data, expires_at)
+                .await
+            {
+                warn!("Failed to store job result for job {}: {}", job_id, e);
+            } else {
+                debug!("Stored result for job {}", job_id);
             }
         }
 
@@ -2492,18 +2488,18 @@ where
 
     async fn record_event(&self, event: JobEvent) {
         // Record to statistics collector
-        if let Some(stats_collector) = &self.stats_collector {
-            if let Err(e) = stats_collector.record_event(event.clone()).await {
-                warn!("Failed to record statistics event: {}", e);
-            }
+        if let Some(stats_collector) = &self.stats_collector
+            && let Err(e) = stats_collector.record_event(event.clone()).await
+        {
+            warn!("Failed to record statistics event: {}", e);
         }
 
         // Record to metrics collector
         #[cfg(feature = "metrics")]
-        if let Some(metrics_collector) = &self.metrics_collector {
-            if let Err(e) = metrics_collector.record_job_event(&event).await {
-                warn!("Failed to record metrics event: {}", e);
-            }
+        if let Some(metrics_collector) = &self.metrics_collector
+            && let Err(e) = metrics_collector.record_job_event(&event).await
+        {
+            warn!("Failed to record metrics event: {}", e);
         }
 
         // Publish to event manager for external integrations
@@ -2522,10 +2518,9 @@ where
                 | JobEventType::Failed
                 | JobEventType::Dead
                 | JobEventType::TimedOut
-        ) {
-            if let Ok(mut last_time) = self.last_job_time.write() {
-                *last_time = event.timestamp;
-            }
+        ) && let Ok(mut last_time) = self.last_job_time.write()
+        {
+            *last_time = event.timestamp;
         }
     }
 
@@ -2557,25 +2552,24 @@ where
 
                 // Update queue depth metrics
                 #[cfg(feature = "metrics")]
-                if let Some(metrics_collector) = &metrics_collector {
-                    if let Ok(queue_depth) = queue.get_queue_depth(&queue_name).await {
-                        if let Err(e) = metrics_collector
-                            .update_queue_depth(&queue_name, queue_depth)
-                            .await
-                        {
-                            warn!("Failed to update queue depth metrics: {}", e);
-                        }
+                if let Some(metrics_collector) = &metrics_collector
+                    && let Ok(queue_depth) = queue.get_queue_depth(&queue_name).await
+                {
+                    if let Err(e) = metrics_collector
+                        .update_queue_depth(&queue_name, queue_depth)
+                        .await
+                    {
+                        warn!("Failed to update queue depth metrics: {}", e);
+                    }
 
-                        // Check queue depth for alerts
-                        #[cfg(feature = "alerting")]
-                        if let Some(alert_manager) = &alert_manager {
-                            if let Err(e) = alert_manager
-                                .check_queue_depth(&queue_name, queue_depth)
-                                .await
-                            {
-                                warn!("Failed to check queue depth alerts: {}", e);
-                            }
-                        }
+                    // Check queue depth for alerts
+                    #[cfg(feature = "alerting")]
+                    if let Some(alert_manager) = &alert_manager
+                        && let Err(e) = alert_manager
+                            .check_queue_depth(&queue_name, queue_depth)
+                            .await
+                    {
+                        warn!("Failed to check queue depth alerts: {}", e);
                     }
                 }
 
@@ -2589,13 +2583,12 @@ where
                             None
                         }
                     };
-                    if let Some(last_time_value) = last_time_value {
-                        if let Err(e) = alert_manager
+                    if let Some(last_time_value) = last_time_value
+                        && let Err(e) = alert_manager
                             .check_worker_starvation(&queue_name, last_time_value)
                             .await
-                        {
-                            warn!("Failed to check worker starvation: {}", e);
-                        }
+                    {
+                        warn!("Failed to check worker starvation: {}", e);
                     }
                 }
 
