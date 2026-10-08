@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ArchiveConfig::archival_policy` / `archival_config`, `RateLimitingConfig::throttle_for`, `WorkerConfig::autoscale_config`, `DatabaseConfig::connection_timeout`
 
 ### Changed
+- **CI**: replaced the disabled `Integration Tests` workflow with `.github/workflows/ci.yml`: rustfmt, clippy (`--all-targets --all-features -D warnings`), unit tests, PostgreSQL 16 and MySQL 8 integration jobs, and an advisory `cargo audit`. Runs on pushes and pull requests to `master` and on demand (#7).
 - `DatabaseConfig::create_tables` is deprecated; tables are created by migrations (`auto_migrate`)
 
 ### Removed
