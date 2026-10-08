@@ -141,6 +141,8 @@ jobs:
         run: cargo test --workspace --all-features --lib --bins --no-run
       - name: Run unit tests (no databases)
         run: cargo test --workspace --all-features --lib --bins --no-fail-fast
+      - name: Doctests with default features
+        run: cargo test -p hammerwork --doc
 
   # Database jobs: every test file under tests/ contains both a PostgreSQL and a MySQL module,
   # and both compile under --all-features. PostgreSQL tests read DATABASE_URL, MySQL tests read

@@ -17,7 +17,8 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,no_run
+#![cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+#![cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
 //! use hammerwork::{Job, Worker, WorkerPool, JobQueue, Result, worker::JobHandler, queue::DatabaseQueue};
 //! use serde_json::json;
 //! use std::sync::Arc;
@@ -378,35 +379,43 @@ pub use tracing::{
 /// This is used throughout the crate for consistent error handling.
 pub type Result<T> = std::result::Result<T, HammerworkError>;
 
-// Compile-check the Rust examples in the README.
-#[cfg(doctest)]
-#[doc = include_str!("../README.md")]
-struct ReadmeDoctests;
+// Compile-check the Rust examples in the README and guides. The examples use most
+// optional features, so they are checked when all of them are enabled (as in CI).
+#[cfg(all(
+    doctest,
+    feature = "postgres",
+    feature = "mysql",
+    feature = "test",
+    feature = "encryption",
+    feature = "tracing",
+    feature = "streaming",
+    feature = "kafka"
+))]
+mod doc_examples {
+    #[doc = include_str!("../README.md")]
+    struct ReadmeDoctests;
 
-#[cfg(doctest)]
-#[doc = include_str!("../docs/quick-start.md")]
-struct QuickStartDoctests;
+    #[doc = include_str!("../docs/quick-start.md")]
+    struct QuickStartDoctests;
 
-#[cfg(doctest)]
-#[doc = include_str!("../docs/monitoring.md")]
-struct MonitoringDoctests;
+    #[doc = include_str!("../docs/monitoring.md")]
+    struct MonitoringDoctests;
 
-#[cfg(doctest)]
-#[doc = include_str!("../docs/migrations.md")]
-struct MigrationsDoctests;
+    #[doc = include_str!("../docs/migrations.md")]
+    struct MigrationsDoctests;
 
-#[cfg(doctest)]
-#[doc = include_str!("../docs/webhooks.md")]
-struct WebhooksDoctests;
+    #[doc = include_str!("../docs/webhooks.md")]
+    struct WebhooksDoctests;
 
-#[cfg(doctest)]
-#[doc = include_str!("../docs/integration-testing.md")]
-struct IntegrationTestingDoctests;
+    #[doc = include_str!("../docs/integration-testing.md")]
+    struct IntegrationTestingDoctests;
 
-#[cfg(doctest)]
-#[doc = include_str!("../docs/testing.md")]
-struct TestingDoctests;
+    #[doc = include_str!("../docs/testing.md")]
+    struct TestingDoctests;
 
-#[cfg(doctest)]
-#[doc = include_str!("../docs/streaming.md")]
-struct StreamingDoctests;
+    #[doc = include_str!("../docs/streaming.md")]
+    struct StreamingDoctests;
+
+    #[doc = include_str!("../docs/job-types.md")]
+    struct JobTypesDoctests;
+}

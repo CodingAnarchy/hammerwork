@@ -267,8 +267,6 @@ This enables end-to-end tracing across your entire job processing pipeline with 
 Test your job processing logic with the in-memory `TestQueue` framework:
 
 ```rust
-# #[cfg(feature = "test")]
-# mod doc {
 use hammerwork::queue::test::{TestQueue, MockClock};
 use hammerwork::{Job, JobStatus, queue::DatabaseQueue};
 use serde_json::json;
@@ -303,7 +301,6 @@ async fn test_delayed_job_processing() {
     let completed = queue.get_job(job_id).await.unwrap().unwrap();
     assert_eq!(completed.status, JobStatus::Completed);
 }
-# }
 # fn main() {}
 ```
 
