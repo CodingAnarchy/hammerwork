@@ -1,0 +1,19 @@
+# cargo-audit configuration (read by `cargo audit` and the CI `security audit` job).
+#
+# Every ignore below must carry a justification and be re-reviewed when the
+# upstream situation changes.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 -- `rsa` Marvin attack: timing side-channel that can recover
+    # plaintext from RSA *private-key decryption* (PKCS#1 v1.5). No fixed `rsa`
+    # release exists.
+    #
+    # Pulled in only by `sqlx-mysql` (via the `mysql` feature / sqlx dev-dependency).
+    # sqlx uses it solely in `connection/auth.rs` to *encrypt* the password with the
+    # server's RSA public key (`RsaPublicKey` + OAEP) for the `caching_sha2_password`
+    # / `sha256_password` auth plugins over non-TLS connections. Hammerwork never
+    # holds an RSA private key nor performs RSA decryption, so the vulnerable code
+    # path is not reachable. Remove once sqlx ships an `rsa` release with the fix.
+    "RUSTSEC-2023-0071",
+]

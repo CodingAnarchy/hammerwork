@@ -54,6 +54,11 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 #[cfg(feature = "tracing")]
 use crate::Result;
 
+/// Tracer provider installed by [`init_tracing`], kept so [`shutdown_tracing`] can flush it.
+#[cfg(feature = "tracing")]
+static TRACER_PROVIDER: std::sync::Mutex<Option<opentelemetry_sdk::trace::SdkTracerProvider>> =
+    std::sync::Mutex::new(None);
+
 /// A distributed trace identifier for tracking operations across services.
 ///
 /// Trace IDs are used to correlate all operations that are part of a single
@@ -426,74 +431,60 @@ impl Default for TracingConfig {
 /// ```
 #[cfg(feature = "tracing")]
 pub async fn init_tracing(config: TracingConfig) -> Result<()> {
-    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::{
+        Resource,
+        trace::{Sampler, SdkTracerProvider},
+    };
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     // Build resource with service information
-    let mut resource = Resource::new(vec![KeyValue::new(
-        "service.name",
-        config.service_name.clone(),
-    )]);
+    let mut resource = Resource::builder().with_service_name(config.service_name.clone());
 
     if let Some(version) = &config.service_version {
-        resource = resource.merge(&Resource::new(vec![KeyValue::new(
-            "service.version",
-            version.clone(),
-        )]));
+        resource = resource.with_attribute(KeyValue::new("service.version", version.clone()));
     }
 
     if let Some(environment) = &config.environment {
-        resource = resource.merge(&Resource::new(vec![KeyValue::new(
-            "deployment.environment",
-            environment.clone(),
-        )]));
+        resource =
+            resource.with_attribute(KeyValue::new("deployment.environment", environment.clone()));
     }
 
     // Add custom resource attributes
     for (key, value) in &config.resource_attributes {
-        resource = resource.merge(&Resource::new(vec![KeyValue::new(
-            key.clone(),
-            value.clone(),
-        )]));
+        resource = resource.with_attribute(KeyValue::new(key.clone(), value.clone()));
     }
+
+    let resource = resource.build();
 
     // Set up tracer provider based on configuration
     let tracer_provider = if let Some(endpoint) = &config.otlp_endpoint {
-        // Create OTLP exporter
-        let exporter = opentelemetry_otlp::new_exporter()
-            .tonic()
+        // Create OTLP exporter (gRPC via tonic)
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
             .with_endpoint(endpoint.clone())
-            .build_span_exporter()
+            .build()
             .map_err(|e| crate::HammerworkError::Tracing {
                 message: format!("Failed to build OTLP span exporter: {}", e),
             })?;
 
-        // Create batch span processor
-        let span_processor = opentelemetry_sdk::trace::BatchSpanProcessor::builder(
-            exporter,
-            opentelemetry_sdk::runtime::Tokio,
-        )
-        .build();
-
-        // Build tracer provider with OTLP exporter
-        opentelemetry_sdk::trace::TracerProvider::builder()
-            .with_config(
-                opentelemetry_sdk::trace::config()
-                    .with_resource(resource)
-                    .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn),
-            )
-            .with_span_processor(span_processor)
+        // Build tracer provider with a batching OTLP exporter
+        SdkTracerProvider::builder()
+            .with_resource(resource)
+            .with_sampler(Sampler::AlwaysOn)
+            .with_batch_exporter(exporter)
             .build()
     } else {
         // No-op tracer if no endpoint is configured
-        opentelemetry_sdk::trace::TracerProvider::builder()
-            .with_config(
-                opentelemetry_sdk::trace::config()
-                    .with_resource(resource)
-                    .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOff),
-            )
+        SdkTracerProvider::builder()
+            .with_resource(resource)
+            .with_sampler(Sampler::AlwaysOff)
             .build()
     };
+
+    // Keep a handle so `shutdown_tracing` can flush and shut the provider down.
+    if let Ok(mut slot) = TRACER_PROVIDER.lock() {
+        *slot = Some(tracer_provider.clone());
+    }
 
     // Set global tracer provider
     global::set_tracer_provider(tracer_provider.clone());
@@ -543,7 +534,12 @@ pub async fn init_tracing(config: TracingConfig) -> Result<()> {
 /// ```
 #[cfg(feature = "tracing")]
 pub async fn shutdown_tracing() {
-    global::shutdown_tracer_provider();
+    let provider = TRACER_PROVIDER.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(provider) = provider {
+        if let Err(e) = provider.shutdown() {
+            tracing::warn!("Failed to shut down tracer provider: {}", e);
+        }
+    }
 }
 
 /// Create a span for job processing with trace context propagation.

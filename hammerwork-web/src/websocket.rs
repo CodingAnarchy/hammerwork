@@ -160,7 +160,7 @@ impl WebSocketState {
         } else if message.is_ping() {
             // Send pong response
             if let Some(sender) = self.connections.get(&connection_id) {
-                let pong_msg = Message::pong(message.as_bytes());
+                let pong_msg = Message::pong(message.as_bytes().to_vec());
                 let _ = sender.send(pong_msg);
             }
         } else if message.is_pong() {
@@ -326,7 +326,7 @@ impl WebSocketState {
 
     /// Send ping to all connections to keep them alive
     pub async fn ping_all_connections(&self) {
-        let ping_message = Message::ping(b"ping");
+        let ping_message = Message::ping(b"ping".to_vec());
         let mut disconnected = Vec::new();
 
         for (&connection_id, sender) in &self.connections {
