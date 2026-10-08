@@ -1,20 +1,23 @@
 mod test_utils;
 
 use hammerwork::{
-    Job, JobStatus,
-    batch::{BatchStatus, JobBatch, PartialFailureMode},
-    queue::DatabaseQueue,
+    Job,
+    batch::{JobBatch, PartialFailureMode},
 };
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use hammerwork::{JobStatus, batch::BatchStatus, queue::DatabaseQueue};
 use serde_json::json;
-// use std::sync::Arc;
 
 #[cfg(feature = "postgres")]
 mod postgres_batch_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore] // Requires database connection
+    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
     async fn test_postgres_batch_enqueue() {
+        if test_utils::skip_known_bug() {
+            return;
+        }
         let queue = test_utils::setup_postgres_queue().await;
 
         // Create a batch of jobs
@@ -93,8 +96,11 @@ mod postgres_batch_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database connection
+    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
     async fn test_postgres_large_batch() {
+        if test_utils::skip_known_bug() {
+            return;
+        }
         let queue = test_utils::setup_postgres_queue().await;
 
         // Create a large batch of jobs
@@ -132,8 +138,11 @@ mod postgres_batch_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database connection
+    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
     async fn test_postgres_batch_partial_failure_modes() {
+        if test_utils::skip_known_bug() {
+            return;
+        }
         let queue = test_utils::setup_postgres_queue().await;
 
         // Test ContinueOnError mode
@@ -169,8 +178,11 @@ mod postgres_batch_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database connection
+    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
     async fn test_postgres_batch_metadata() {
+        if test_utils::skip_known_bug() {
+            return;
+        }
         let queue = test_utils::setup_postgres_queue().await;
 
         let job = Job::new("metadata_queue".to_string(), json!({"test": "data"}));

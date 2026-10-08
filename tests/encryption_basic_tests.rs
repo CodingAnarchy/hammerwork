@@ -6,8 +6,7 @@
 use chrono::{Duration, Utc};
 use hammerwork::encryption::{
     EncryptionAlgorithm, EncryptionKey, ExternalKmsConfig, KeyDerivationConfig, KeyManagerConfig,
-    KeyManagerStats, KeyOperation, KeyPurpose, KeySource, KeyStatus, parse_algorithm,
-    parse_key_purpose, parse_key_source, parse_key_status,
+    KeyManagerStats, KeyPurpose, KeySource, KeyStatus, parse_algorithm, parse_key_source,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -396,17 +395,16 @@ mod aws_kms_integration_tests {
 
         // In CI/CD environments without AWS credentials, this might fail but shouldn't panic
         // In development, it should fall back to deterministic keys
-        if result.is_ok() {
+        if let Ok(mut engine) = result {
             // Test that we can still encrypt/decrypt with the fallback
-            let mut engine = result.unwrap();
             let payload = serde_json::json!({"test": "data"});
             let encrypted = engine
                 .encrypt_payload(&payload, &Vec::<String>::new())
                 .await;
 
             // Should work with fallback implementation
-            if encrypted.is_ok() {
-                let decrypted = engine.decrypt_payload(&encrypted.unwrap()).await;
+            if let Ok(encrypted) = encrypted {
+                let decrypted = engine.decrypt_payload(&encrypted).await;
                 assert!(decrypted.is_ok());
                 assert_eq!(decrypted.unwrap(), payload);
             }
@@ -615,17 +613,16 @@ mod gcp_kms_integration_tests {
 
         // In CI/CD environments without GCP credentials, this might fail but shouldn't panic
         // In development, it should fall back to deterministic keys
-        if result.is_ok() {
+        if let Ok(mut engine) = result {
             // Test that we can still encrypt/decrypt with the fallback
-            let mut engine = result.unwrap();
             let payload = serde_json::json!({"test": "data"});
             let encrypted = engine
                 .encrypt_payload(&payload, &Vec::<String>::new())
                 .await;
 
             // Should work with fallback implementation
-            if encrypted.is_ok() {
-                let decrypted = engine.decrypt_payload(&encrypted.unwrap()).await;
+            if let Ok(encrypted) = encrypted {
+                let decrypted = engine.decrypt_payload(&encrypted).await;
                 assert!(decrypted.is_ok());
                 assert_eq!(decrypted.unwrap(), payload);
             }
@@ -866,17 +863,16 @@ mod vault_kms_integration_tests {
 
         // In CI/CD environments without Vault credentials, this might fail but shouldn't panic
         // In development, it should fall back to deterministic keys
-        if result.is_ok() {
+        if let Ok(mut engine) = result {
             // Test that we can still encrypt/decrypt with the fallback
-            let mut engine = result.unwrap();
             let payload = serde_json::json!({"test": "data"});
             let encrypted = engine
                 .encrypt_payload(&payload, &Vec::<String>::new())
                 .await;
 
             // Should work with fallback implementation
-            if encrypted.is_ok() {
-                let decrypted = engine.decrypt_payload(&encrypted.unwrap()).await;
+            if let Ok(encrypted) = encrypted {
+                let decrypted = engine.decrypt_payload(&encrypted).await;
                 assert!(decrypted.is_ok());
                 assert_eq!(decrypted.unwrap(), payload);
             }

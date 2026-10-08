@@ -6,6 +6,15 @@
 
 mod test_utils;
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use hammerwork::{Job, JobPriority, queue::DatabaseQueue, workflow::DependencyStatus};
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use serde_json::json;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use std::time::Duration;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use uuid::Uuid;
+
 /// Test that all JobRow queries include the complete field set
 #[cfg(test)]
 mod jobrow_field_tests {
@@ -15,6 +24,7 @@ mod jobrow_field_tests {
         use super::super::*;
 
         #[tokio::test]
+        #[ignore] // Requires database connection
         async fn test_get_job_includes_all_fields() {
             let queue = test_utils::setup_postgres_queue().await;
             let unique_queue = format!("pg_get_test_{}", Uuid::new_v4());
@@ -24,7 +34,7 @@ mod jobrow_field_tests {
                 .with_priority(JobPriority::High)
                 .with_timeout(Duration::from_secs(30))
                 .with_max_attempts(5)
-                .with_result_storage(ResultStorage::Database);
+                .with_result_storage(hammerwork::ResultStorage::Database);
 
             let job_id = queue.enqueue(job).await.unwrap();
 
@@ -40,18 +50,16 @@ mod jobrow_field_tests {
             // Workflow fields should have default values
             assert!(job.depends_on.is_empty());
             assert!(job.dependents.is_empty());
-            assert_eq!(
-                job.dependency_status,
-                hammerwork::workflow::DependencyStatus::None
-            );
+            assert_eq!(job.dependency_status, DependencyStatus::None);
             assert!(job.workflow_id.is_none());
             assert!(job.workflow_name.is_none());
         }
 
         #[tokio::test]
+        #[ignore] // Requires database connection
         async fn test_dequeue_includes_all_fields() {
             let queue = test_utils::setup_postgres_queue().await;
-            let unique_queue = format!("pg_dequeue_test_{}", uuid::Uuid::new_v4());
+            let unique_queue = format!("pg_dequeue_test_{}", Uuid::new_v4());
 
             let job = Job::new(unique_queue.clone(), json!({"test": "dequeue"}))
                 .with_priority(JobPriority::Critical);
@@ -71,9 +79,10 @@ mod jobrow_field_tests {
         }
 
         #[tokio::test]
+        #[ignore] // Requires database connection
         async fn test_dequeue_with_priority_weights_includes_all_fields() {
             let queue = test_utils::setup_postgres_queue().await;
-            let unique_queue = format!("pg_priority_test_{}", uuid::Uuid::new_v4());
+            let unique_queue = format!("pg_priority_test_{}", Uuid::new_v4());
 
             let weights = hammerwork::priority::PriorityWeights::default();
 
@@ -102,9 +111,10 @@ mod jobrow_field_tests {
         use super::super::*;
 
         #[tokio::test]
+        #[ignore] // Requires database connection
         async fn test_mysql_get_job_includes_all_fields() {
             let queue = test_utils::setup_mysql_queue().await;
-            let unique_queue = format!("mysql_get_test_{}", uuid::Uuid::new_v4());
+            let unique_queue = format!("mysql_get_test_{}", Uuid::new_v4());
 
             let job = Job::new(unique_queue.clone(), json!({"test": "mysql"}))
                 .with_priority(JobPriority::High)
@@ -121,16 +131,14 @@ mod jobrow_field_tests {
             // Verify dependency fields are accessible
             assert!(job.depends_on.is_empty());
             assert!(job.dependents.is_empty());
-            assert_eq!(
-                job.dependency_status,
-                hammerwork::workflow::DependencyStatus::None
-            );
+            assert_eq!(job.dependency_status, DependencyStatus::None);
         }
 
         #[tokio::test]
+        #[ignore] // Requires database connection
         async fn test_mysql_dequeue_includes_all_fields() {
             let queue = test_utils::setup_mysql_queue().await;
-            let unique_queue = format!("mysql_dequeue_test_{}", uuid::Uuid::new_v4());
+            let unique_queue = format!("mysql_dequeue_test_{}", Uuid::new_v4());
 
             let job = Job::new(unique_queue.clone(), json!({"test": "dequeue"}));
             queue.enqueue(job).await.unwrap();
@@ -146,9 +154,10 @@ mod jobrow_field_tests {
         }
 
         #[tokio::test]
+        #[ignore] // Requires database connection
         async fn test_mysql_dequeue_with_priority_weights_includes_all_fields() {
             let queue = test_utils::setup_mysql_queue().await;
-            let unique_queue = format!("mysql_priority_test_{}", uuid::Uuid::new_v4());
+            let unique_queue = format!("mysql_priority_test_{}", Uuid::new_v4());
 
             let weights = hammerwork::priority::PriorityWeights::default();
             let job = Job::new(unique_queue.clone(), json!({"test": "priority"}));
@@ -164,10 +173,7 @@ mod jobrow_field_tests {
             assert_eq!(job.queue_name, unique_queue);
             // Verify dependency fields are accessible
             assert!(job.depends_on.is_empty());
-            assert_eq!(
-                job.dependency_status,
-                hammerwork::workflow::DependencyStatus::None
-            );
+            assert_eq!(job.dependency_status, DependencyStatus::None);
         }
     }
 }
@@ -175,9 +181,12 @@ mod jobrow_field_tests {
 /// Test that workflow-specific functionality works correctly
 #[cfg(test)]
 mod workflow_field_tests {
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    use super::*;
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_postgres_job_with_dependencies() {
         let queue = test_utils::setup_postgres_queue().await;
         let unique_queue = format!("postgres_deps_test_{}", Uuid::new_v4());
@@ -202,6 +211,7 @@ mod workflow_field_tests {
 
     #[cfg(feature = "mysql")]
     #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_mysql_job_with_dependencies() {
         let queue = test_utils::setup_mysql_queue().await;
         let unique_queue = format!("mysql_deps_test_{}", Uuid::new_v4());
