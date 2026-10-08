@@ -17,12 +17,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ArchiveConfig::archival_policy` / `archival_config`, `RateLimitingConfig::throttle_for`, `WorkerConfig::autoscale_config`, `DatabaseConfig::connection_timeout`
 
 ### Changed
-- **CI**: replaced the disabled `Integration Tests` workflow with `.github/workflows/ci.yml`: rustfmt, clippy (`--all-targets --all-features -D warnings`), unit tests, PostgreSQL 16 and MySQL 8 integration jobs, and an advisory `cargo audit`. Runs on pushes and pull requests to `master` and on demand (#7).
+- **CI**: replaced the disabled `Integration Tests` workflow with `.github/workflows/ci.yml`: rustfmt, clippy (`--all-targets --all-features -D warnings`), unit tests, PostgreSQL 16 and MySQL 8 integration jobs, and a `cargo audit` job. Runs on pushes and pull requests to `master` and on demand (#7).
 - `DatabaseConfig::create_tables` is deprecated; tables are created by migrations (`auto_migrate`)
 - AWS KMS clients (`aws-kms` feature) now load config with `BehaviorVersion::latest()` instead of the deprecated `v2025_01_17`, matching the Kinesis client. This picks up the SDK's newer defaults, including HTTP(S) proxy settings from the environment.
 
 ### Removed
 - Unused `ArchiveConfig` fields `archive_directory`, `max_file_size_bytes` and `include_payloads`. Existing TOML files containing them still load.
+
+### Security
+- **`cargo audit` is clean and the CI `security audit` job is now blocking** (#7). Dependency upgrades that clear the open advisories:
+  - `azure-kv`: moved from `azure_security_keyvault` / `azure_identity` / `azure_core` 0.20 to the 1.x Azure SDK (`azure_security_keyvault_keys`, `azure_identity`, `azure_core`). Fixes RUSTSEC-2026-0275 (legacy `azure_core` logged the `authorization` header) and drops `http-types` (RUSTSEC-2026-0174), `rand` 0.7 (RUSTSEC-2026-0097), `instant` and `paste` (unmaintained).
+  - `metrics` / `hammerwork-web`: `warp` 0.3 → 0.4 (hyper 1.x, h2 0.4).
+  - `aws-kms` / `kinesis`: `aws-sdk-kms` and `aws-sdk-kinesis` no longer enable the legacy `rustls` feature (hyper 0.14 + rustls 0.21); they use the SDK's `default-https-client`.
+  - `gcp-kms` / `google-pubsub`: `google-cloud-kms` 0.6, `google-cloud-auth` 0.4, `google-cloud-pubsub` 0.25 and `google-cloud-googleapis` 0.13 replaced by the same author's renamed, maintained `gcloud-kms`, `gcloud-auth`, `gcloud-pubsub` and `gcloud-googleapis` 1.x (tonic 0.14). Drops `ring` 0.16 (RUSTSEC-2025-0009), `rustls-webpki` 0.101 (RUSTSEC-2026-0104 / -0098 / -0099) and `rustls-pemfile` (unmaintained).
+  - `tracing`: `opentelemetry` / `opentelemetry_sdk` / `opentelemetry-otlp` 0.22/0.15 → 0.33 and `tracing-opentelemetry` 0.23 → 0.34 (drops tonic 0.11 / hyper 0.14).
+  - Together these remove `h2` 0.3 (RUSTSEC-2026-0258) and `hyper` 0.14 from the dependency tree.
+  - `cargo-hammerwork`: `indicatif` 0.17 → 0.18 (drops unmaintained `number_prefix`).
+- RUSTSEC-2023-0071 (`rsa` Marvin attack, no fixed release) is ignored in `.cargo/audit.toml`: it comes only from `sqlx-mysql`, which uses RSA public-key *encryption* of the password during `caching_sha2_password` auth; the vulnerable private-key decryption path is never used.
+
+### Changed (breaking, feature-gated)
+- `azure-kv`: the Azure SDK 1.x has no `DefaultAzureCredential`. Hammerwork now picks a credential from the environment: `ClientSecretCredential` when `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` are set, `WorkloadIdentityCredential` when `AZURE_FEDERATED_TOKEN_FILE` is set, otherwise managed identity followed by the Azure CLI / Azure Developer CLI. The optional dependency (and implicit feature) `azure_security_keyvault` is renamed `azure_security_keyvault_keys`; enable `azure-kv` rather than the dependency name.
+- `tracing`: `shutdown_tracing()` now flushes and shuts down the provider installed by `init_tracing()` (OpenTelemetry 0.33 removed the global shutdown hook). Code that uses the `opentelemetry` crates directly alongside Hammerwork must move to 0.33.
 
 ### Fixed
 - `EventManager::new` panicked when `max_buffer_size` was 0 (as set by `HammerworkConfig::with_events_enabled(false)`). A zero buffer now disables event publishing.

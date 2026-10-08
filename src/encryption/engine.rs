@@ -966,85 +966,37 @@ where
         // Try to load the key from Azure Key Vault with real integration
         #[cfg(feature = "azure-kv")]
         {
-            use azure_identity::{DefaultAzureCredential, TokenCredentialOptions};
-            use azure_security_keyvault::KeyvaultClient;
-
-            // Create Azure credentials using default credential chain
-            let credential = DefaultAzureCredential::create(TokenCredentialOptions::default())
-                .map_err(|e| {
-                    EncryptionError::KeyManagement(format!(
-                        "Failed to create Azure credentials: {}",
-                        e
-                    ))
-                })?;
-
-            // Create Key Vault client
-            let client =
-                KeyvaultClient::new(&vault_url, std::sync::Arc::new(credential)).map_err(|e| {
-                    EncryptionError::KeyManagement(format!(
-                        "Failed to create Azure Key Vault client: {}",
-                        e
-                    ))
-                })?;
-
-            // Retrieve the key from the vault
-            match client.key_client().get(key_name.to_string()).await {
-                Ok(key_response) => {
-                    // Extract key material from the response
-                    if let Some(key_material) = key_response.key.k {
-                        // Decode the base64url encoded key material
-                        let decoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                            .decode(key_material)
-                            .map_err(|e| {
-                                EncryptionError::KeyManagement(format!(
-                                    "Failed to decode key material: {}",
-                                    e
-                                ))
-                            })?;
-
-                        // Ensure the key is the expected size
-                        if decoded_key.len() >= expected_size {
-                            info!("Successfully loaded encryption key from Azure Key Vault");
-                            return Ok(decoded_key[..expected_size].to_vec());
-                        } else {
-                            // If key is shorter than expected, pad it using key derivation
-                            let mut final_key = vec![0u8; expected_size];
-                            let copy_len = std::cmp::min(decoded_key.len(), expected_size);
-                            final_key[..copy_len].copy_from_slice(&decoded_key[..copy_len]);
-
-                            // Pad remaining bytes with HKDF-derived material
-                            if decoded_key.len() < expected_size {
-                                use hmac::{Hmac, Mac};
-                                use sha2::Sha256;
-                                type HmacSha256 = Hmac<Sha256>;
-
-                                let mut mac = <HmacSha256 as Mac>::new_from_slice(&decoded_key)
-                                    .map_err(|e| {
-                                        EncryptionError::KeyManagement(format!(
-                                            "HMAC creation failed: {}",
-                                            e
-                                        ))
-                                    })?;
-                                mac.update(b"azure-kv-key-derivation");
-                                mac.update(vault_url.as_bytes());
-                                mac.update(key_name.as_bytes());
-                                let derived = mac.finalize().into_bytes();
-
-                                for i in decoded_key.len()..expected_size {
-                                    final_key[i] = derived[i % derived.len()];
-                                }
-                            }
-
-                            info!(
-                                "Successfully loaded and padded encryption key from Azure Key Vault"
-                            );
-                            return Ok(final_key);
-                        }
-                    } else {
-                        return Err(EncryptionError::KeyManagement(
-                            "Azure Key Vault key response missing key material".to_string(),
-                        ));
+            match super::azure::fetch_key_material(&vault_url, key_name).await {
+                Ok(decoded_key) => {
+                    // Ensure the key is the expected size
+                    if decoded_key.len() >= expected_size {
+                        info!("Successfully loaded encryption key from Azure Key Vault");
+                        return Ok(decoded_key[..expected_size].to_vec());
                     }
+
+                    // If key is shorter than expected, pad it using key derivation
+                    let mut final_key = vec![0u8; expected_size];
+                    final_key[..decoded_key.len()].copy_from_slice(&decoded_key);
+
+                    use hmac::{Hmac, Mac};
+                    use sha2::Sha256;
+                    type HmacSha256 = Hmac<Sha256>;
+
+                    let mut mac =
+                        <HmacSha256 as Mac>::new_from_slice(&decoded_key).map_err(|e| {
+                            EncryptionError::KeyManagement(format!("HMAC creation failed: {}", e))
+                        })?;
+                    mac.update(b"azure-kv-key-derivation");
+                    mac.update(vault_url.as_bytes());
+                    mac.update(key_name.as_bytes());
+                    let derived = mac.finalize().into_bytes();
+
+                    for (i, byte) in final_key.iter_mut().enumerate().skip(decoded_key.len()) {
+                        *byte = derived[i % derived.len()];
+                    }
+
+                    info!("Successfully loaded and padded encryption key from Azure Key Vault");
+                    return Ok(final_key);
                 }
                 Err(e) => {
                     warn!("Failed to load key from Azure Key Vault: {}", e);

@@ -54,6 +54,8 @@
 //! # }
 //! ```
 
+#[cfg(feature = "azure-kv")]
+mod azure;
 pub mod engine;
 pub mod key_manager;
 

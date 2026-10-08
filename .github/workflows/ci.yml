@@ -156,10 +156,9 @@ jobs:
         run: cargo test --workspace --all-features --no-fail-fast -- --include-ignored mysql
 
   audit:
-    name: security audit (advisory)
+    name: security audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    continue-on-error: true
     permissions:
       contents: read
       checks: write
@@ -168,6 +167,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # Cargo.lock is not committed (library crate), so resolve one for the audit.
       - run: cargo generate-lockfile
+      # Fails the job on any unignored vulnerability. Ignores (with justification)
+      # live in .cargo/audit.toml, which cargo-audit reads from the workspace root.
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

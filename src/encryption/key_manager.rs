@@ -1855,8 +1855,8 @@ where
     /// Load key material directly from Azure Key Vault
     ///
     /// This method uses the Azure SDK to authenticate and retrieve key material from
-    /// Azure Key Vault. It supports automatic credential resolution through
-    /// `DefaultAzureCredential` and handles key size normalization.
+    /// Azure Key Vault. Credentials are resolved from the environment (client secret,
+    /// workload identity, then managed identity / Azure CLI) and key size is normalized.
     ///
     /// # Arguments
     ///
@@ -1869,9 +1869,10 @@ where
     ///
     /// # Security Features
     ///
-    /// - Uses `DefaultAzureCredential` for secure authentication
+    /// - Resolves credentials from the environment (client secret, workload identity,
+    ///   managed identity, Azure CLI)
     /// - Automatically handles key size normalization via HMAC-based key derivation
-    /// - Supports base64-encoded key material from Azure Key Vault
+    /// - Uses the raw `k` key material returned by Azure Key Vault
     /// - Includes proper error handling for authentication and network issues
     ///
     /// # Examples
@@ -1895,50 +1896,23 @@ where
     /// ```
     #[cfg(all(feature = "encryption", feature = "azure-kv"))]
     async fn load_from_azure_key_vault(vault_url: &str, key_name: &str) -> Result<Vec<u8>, String> {
-        use azure_identity::{DefaultAzureCredential, TokenCredentialOptions};
-        use azure_security_keyvault::KeyvaultClient;
+        let decoded_key = super::azure::fetch_key_material(vault_url, key_name).await?;
 
-        // Create Azure credentials
-        let credential = DefaultAzureCredential::create(TokenCredentialOptions::default())
-            .map_err(|e| format!("Failed to create Azure credentials: {}", e))?;
+        // Ensure the key is the correct size for AES-256 (32 bytes)
+        if decoded_key.len() >= 32 {
+            Ok(decoded_key[0..32].to_vec())
+        } else {
+            // If the key is too short, use it as input for HMAC-based key derivation
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
 
-        // Create Azure Key Vault client
-        let client = KeyvaultClient::new(vault_url, std::sync::Arc::new(credential))
-            .map_err(|e| format!("Failed to create Azure Key Vault client: {}", e))?;
-
-        // Retrieve the master key from Azure Key Vault
-        match client.key_client().get(key_name.to_string()).await {
-            Ok(key_response) => {
-                if let Some(key_material) = key_response.key.k {
-                    // Decode the base64-encoded key material
-                    let decoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(key_material)
-                        .map_err(|e| format!("Failed to decode key material: {}", e))?;
-
-                    // Ensure the key is the correct size for AES-256 (32 bytes)
-                    if decoded_key.len() >= 32 {
-                        Ok(decoded_key[0..32].to_vec())
-                    } else {
-                        // If the key is too short, use it as input for HMAC-based key derivation
-                        use hmac::{Hmac, Mac};
-                        use sha2::Sha256;
-
-                        let mut hmac = <Hmac<Sha256> as Mac>::new_from_slice(&decoded_key)
-                            .map_err(|e| format!("Failed to create HMAC: {}", e))?;
-                        hmac.update(b"azure-kv-master-key-derivation");
-                        hmac.update(vault_url.as_bytes());
-                        hmac.update(key_name.as_bytes());
-                        let result = hmac.finalize();
-                        Ok(result.into_bytes()[0..32].to_vec())
-                    }
-                } else {
-                    Err("Key material not found in Azure Key Vault response".to_string())
-                }
-            }
-            Err(e) => Err(format!(
-                "Failed to retrieve key from Azure Key Vault: {}",
-                e
-            )),
+            let mut hmac = <Hmac<Sha256> as Mac>::new_from_slice(&decoded_key)
+                .map_err(|e| format!("Failed to create HMAC: {}", e))?;
+            hmac.update(b"azure-kv-master-key-derivation");
+            hmac.update(vault_url.as_bytes());
+            hmac.update(key_name.as_bytes());
+            let result = hmac.finalize();
+            Ok(result.into_bytes()[0..32].to_vec())
         }
     }
 

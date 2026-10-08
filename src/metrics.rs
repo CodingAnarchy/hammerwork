@@ -269,19 +269,23 @@ impl PrometheusMetricsCollector {
     pub async fn start_exposition_server(&mut self) -> Result<()> {
         if let Some(addr) = self.config.exposition_addr {
             let registry = self.registry.clone();
-            let handle = tokio::spawn(async move {
-                let app = warp::path("metrics")
-                    .map(move || {
-                        let encoder = TextEncoder::new();
-                        let metric_families = registry.gather();
-                        let mut buffer = Vec::new();
-                        encoder.encode(&metric_families, &mut buffer).unwrap();
-                        String::from_utf8(buffer).unwrap()
-                    })
-                    .with(warp::reply::with::header("content-type", "text/plain"));
-
-                warp::serve(app).run(addr).await;
+            let app = warp::path("metrics").map(move || {
+                let encoder = TextEncoder::new();
+                let metric_families = registry.gather();
+                let mut buffer = Vec::new();
+                encoder.encode(&metric_families, &mut buffer).unwrap();
+                let body = String::from_utf8(buffer).unwrap();
+                let mut reply = warp::reply::Response::new(body.into());
+                reply.headers_mut().insert(
+                    warp::http::header::CONTENT_TYPE,
+                    warp::http::HeaderValue::from_static("text/plain"),
+                );
+                reply
             });
+
+            // Spawn the server future directly (not wrapped in an `async` block) to
+            // avoid a rustc higher-ranked lifetime inference issue with warp 0.4.
+            let handle = tokio::spawn(warp::serve(app).run(addr));
 
             self.server_handle = Some(handle);
         }
