@@ -4020,6 +4020,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_listener_streams_every_event_in_a_burst() {
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        let stream = StreamConfig {
+            buffer_config: BufferConfig {
+                batch_size: 10,
+                max_buffer_time_secs: 1,
+                ..Default::default()
+            },
+            enabled: true,
+            ..Default::default()
+        };
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(InMemoryProcessor))
+            .await
+            .unwrap();
+
+        // Let the listener task start and subscribe before the events are published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..100 {
+            events.publish_event(completed_event()).await.unwrap();
+        }
+
+        // Every event published back to back must reach the processor.
+        let mut total = 0;
+        for _ in 0..100 {
+            total = manager
+                .get_stream_stats(stream_id)
+                .await
+                .map_or(0, |s| s.total_events);
+            if total >= 100 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        manager.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(total, 100);
+    }
+
+    #[tokio::test]
     async fn test_shutdown_aborts_batches_after_grace_period() {
         let manager = StreamManager::new_default(Arc::new(EventManager::new_default()));
         manager.batches.spawn("batch", async {
