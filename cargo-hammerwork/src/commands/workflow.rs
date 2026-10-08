@@ -729,8 +729,18 @@ impl WorkflowCommand {
         use sqlx::Row;
 
         let id: Uuid = row.get("id");
-        let depends_on = self.parse_json_array(row.try_get("depends_on").ok())?;
-        let dependents = self.parse_json_array(row.try_get("dependents").ok())?;
+        // depends_on and dependents are UUID[] columns in PostgreSQL
+        let uuid_array = |column: &str| -> Vec<String> {
+            row.try_get::<Option<Vec<Uuid>>, _>(column)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .iter()
+                .map(Uuid::to_string)
+                .collect()
+        };
+        let depends_on = uuid_array("depends_on");
+        let dependents = uuid_array("dependents");
 
         let workflow_id: Option<String> = match row.try_get::<Option<Uuid>, _>("workflow_id") {
             Ok(Some(uuid)) => Some(uuid.to_string()),

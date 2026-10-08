@@ -203,7 +203,7 @@ impl SpawnCommand {
                    COUNT(child.id) as spawned_count,
                    parent.workflow_id, parent.workflow_name
             FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('[\"', parent.id, '\"]')::jsonb
+            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
             WHERE parent.payload ? '_spawn_config' 
                   AND parent.status IN ('Completed', 'Running')
                   {} {}
@@ -415,7 +415,7 @@ impl SpawnCommand {
                     FROM (
                         SELECT parent.id, COUNT(child.id) as spawned_count
                         FROM hammerwork_jobs parent
-                        LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('[\"', parent.id, '\"]')::jsonb
+                        LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
                         WHERE parent.payload ? '_spawn_config'
                               AND parent.created_at > NOW() - INTERVAL '{} hours'
                               {}
@@ -450,7 +450,7 @@ impl SpawnCommand {
                         FROM (
                             SELECT parent.queue_name, COUNT(child.id) as spawned_count
                             FROM hammerwork_jobs parent
-                            LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('[\"', parent.id, '\"]')::jsonb
+                            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
                             WHERE parent.payload ? '_spawn_config'
                                   AND parent.created_at > NOW() - INTERVAL '{} hours'
                                   {}
@@ -854,7 +854,7 @@ impl SpawnCommand {
                    payload->'_spawn_config' as spawn_config,
                    created_at, workflow_id, workflow_name
             FROM hammerwork_jobs
-            WHERE depends_on @> $1
+            WHERE depends_on @> ARRAY[$1::uuid]
             ORDER BY created_at
         "#;
 
@@ -862,9 +862,10 @@ impl SpawnCommand {
 
         match pool {
             DatabasePool::Postgres(pg_pool) => {
-                let parent_json = format!("[\"{}\"]", parent.id);
+                // depends_on is a UUID[] column in PostgreSQL
+                let parent_id = Uuid::parse_str(&parent.id)?;
                 let rows = sqlx::query(query)
-                    .bind(&parent_json)
+                    .bind(parent_id)
                     .fetch_all(pg_pool)
                     .await?;
 
@@ -1013,7 +1014,15 @@ impl SpawnCommand {
         use sqlx::Row;
 
         let id: Uuid = row.get("id");
-        let depends_on = self.parse_json_array(row.try_get("depends_on").ok())?;
+        // depends_on is a UUID[] column in PostgreSQL
+        let depends_on = row
+            .try_get::<Option<Vec<Uuid>>, _>("depends_on")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .iter()
+            .map(Uuid::to_string)
+            .collect();
         let spawn_config: Option<Value> = row.try_get("spawn_config").ok().flatten();
         let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
 
