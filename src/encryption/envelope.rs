@@ -393,6 +393,23 @@ mod aws {
                 key_id: key_id.to_string(),
             }
         }
+
+        /// A client for a local fake KMS at `endpoint`, with static credentials.
+        #[cfg(test)]
+        pub(super) fn for_endpoint(key_id: &str, endpoint: &str) -> Self {
+            let config = aws_sdk_kms::Config::builder()
+                .behavior_version(aws_sdk_kms::config::BehaviorVersion::latest())
+                .region(aws_sdk_kms::config::Region::new("us-east-1"))
+                .endpoint_url(endpoint)
+                .credentials_provider(aws_sdk_kms::config::Credentials::new(
+                    "AKIDTEST", "secret", None, None, "test",
+                ))
+                .build();
+            Self {
+                client: Client::from_conf(config),
+                key_id: key_id.to_string(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1000,5 +1017,225 @@ mod tests {
         );
         #[cfg(not(feature = "gcp-kms"))]
         assert!(gcp.unwrap_err().to_string().contains("gcp-kms"));
+    }
+
+    /// A fake AWS KMS (JSON 1.1 protocol) for `aws::AwsKms`. "Wraps" a data key as
+    /// `context || 0 || key`, and refuses to unwrap it under another encryption context.
+    /// Key id `missing-plaintext` returns responses without the key material.
+    #[cfg(feature = "aws-kms")]
+    async fn fake_aws_kms() -> String {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let b64 = base64::engine::general_purpose::STANDARD;
+                    loop {
+                        // Read one request (headers, then content-length bytes).
+                        let mut buffer = Vec::new();
+                        let mut chunk = [0u8; 8192];
+                        let (head, body) = loop {
+                            if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+                                let length: usize = head
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .unwrap_or(0);
+                                if buffer.len() >= end + 4 + length {
+                                    break (head, buffer[end + 4..end + 4 + length].to_vec());
+                                }
+                            }
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&body).unwrap_or_default();
+                        let target = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("x-amz-target:"))
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let context = request["EncryptionContext"]["hammerwork:key-name"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        let missing = request["KeyId"] == "missing-plaintext";
+                        let (status, reply) = match target.as_str() {
+                            "trentservice.generatedatakey" => {
+                                let size = if request["KeySpec"] == "AES_128" {
+                                    16
+                                } else {
+                                    32
+                                };
+                                let key = vec![7u8; size];
+                                let mut wrapped = context.into_bytes();
+                                wrapped.push(0);
+                                wrapped.extend_from_slice(&key);
+                                if missing {
+                                    (200, serde_json::json!({ "KeyId": "k" }))
+                                } else {
+                                    (
+                                        200,
+                                        serde_json::json!({
+                                            "KeyId": request["KeyId"],
+                                            "Plaintext": b64.encode(&key),
+                                            "CiphertextBlob": b64.encode(&wrapped),
+                                        }),
+                                    )
+                                }
+                            }
+                            "trentservice.decrypt" => {
+                                let blob = b64
+                                    .decode(request["CiphertextBlob"].as_str().unwrap_or(""))
+                                    .unwrap_or_default();
+                                let split = blob.iter().position(|b| *b == 0);
+                                match split {
+                                    _ if missing => (200, serde_json::json!({ "KeyId": "k" })),
+                                    Some(at) if blob[..at] == *context.as_bytes() => (
+                                        200,
+                                        serde_json::json!({
+                                            "KeyId": request["KeyId"],
+                                            "Plaintext": b64.encode(&blob[at + 1..]),
+                                        }),
+                                    ),
+                                    _ => (
+                                        400,
+                                        serde_json::json!({
+                                            "__type": "InvalidCiphertextException",
+                                            "message": "context mismatch"
+                                        }),
+                                    ),
+                                }
+                            }
+                            _ => (
+                                400,
+                                serde_json::json!({
+                                    "__type": "UnsupportedOperationException",
+                                    "message": target
+                                }),
+                            ),
+                        };
+                        let reply = reply.to_string();
+                        let response = format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/x-amz-json-1.1\r\ncontent-length: {}\r\n\r\n{reply}",
+                            reply.len()
+                        );
+                        if socket.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    #[cfg(feature = "aws-kms")]
+    #[tokio::test]
+    async fn test_aws_kms_wraps_and_unwraps_with_context() {
+        let endpoint = fake_aws_kms().await;
+        let kms = aws::AwsKms::for_endpoint("alias/test", &endpoint);
+        assert_eq!(kms.provider(), "aws");
+        assert_eq!(kms.kms_key_id(), "alias/test");
+
+        let data_key = kms.generate_data_key(32, "engine/k1").await.unwrap();
+        assert_eq!(data_key.plaintext, vec![7u8; 32]);
+        assert_ne!(data_key.ciphertext, data_key.plaintext);
+        assert_eq!(
+            kms.decrypt(&data_key.ciphertext, "engine/k1")
+                .await
+                .unwrap(),
+            data_key.plaintext
+        );
+        assert_eq!(
+            kms.generate_data_key(16, "engine/k1")
+                .await
+                .unwrap()
+                .plaintext
+                .len(),
+            16
+        );
+
+        // The encryption context binds the wrapped key to its name.
+        let err = kms
+            .decrypt(&data_key.ciphertext, "engine/other")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EncryptionError::KeyManagement(_)));
+        assert!(
+            err.to_string()
+                .contains("AWS KMS Decrypt with key alias/test failed"),
+            "{err}"
+        );
+
+        // Through the envelope functions, with a store.
+        let store = test_support::MemoryStore::default();
+        let created = load_or_create(&store, &kms, "engine/k1", 32).await.unwrap();
+        let again = load_or_create(&store, &kms, "engine/k1", 32).await.unwrap();
+        assert_eq!(created.key, again.key);
+    }
+
+    #[cfg(feature = "aws-kms")]
+    #[tokio::test]
+    async fn test_aws_kms_errors() {
+        let endpoint = fake_aws_kms().await;
+        let kms = aws::AwsKms::for_endpoint("alias/test", &endpoint);
+        let err = kms
+            .generate_data_key(24, "c")
+            .await
+            .err()
+            .expect("an error");
+        assert!(
+            err.to_string()
+                .contains("Unsupported key size for AWS KMS: 24 bytes"),
+            "{err}"
+        );
+
+        let missing = aws::AwsKms::for_endpoint("missing-plaintext", &endpoint);
+        let err = missing
+            .generate_data_key(32, "c")
+            .await
+            .err()
+            .expect("an error");
+        assert!(err.to_string().contains("has no plaintext key"), "{err}");
+        let err = missing.decrypt(b"x", "c").await.unwrap_err();
+        assert!(err.to_string().contains("has no plaintext"), "{err}");
+
+        // Nothing listening: a request error, not a panic.
+        let unreachable = aws::AwsKms::for_endpoint("alias/test", "http://127.0.0.1:1");
+        let err = unreachable
+            .generate_data_key(32, "c")
+            .await
+            .err()
+            .expect("an error");
+        assert!(
+            err.to_string()
+                .contains("AWS KMS GenerateDataKey with key alias/test failed"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "aws-kms")]
+    #[tokio::test]
+    async fn test_aws_kms_source_connects_with_region_and_endpoint() {
+        let endpoint = fake_aws_kms().await;
+        let source = KeySource::External(format!(
+            "aws://alias/x?region=eu-west-1&endpoint={endpoint}"
+        ));
+        let kms = parse_kms_source(&source)
+            .unwrap()
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        assert_eq!(kms.provider(), "aws");
+        assert_eq!(kms.kms_key_id(), "alias/x");
     }
 }

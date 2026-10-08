@@ -274,101 +274,104 @@ impl EncryptionEngine {
         }
     }
 
+    /// The key for [`KeySource::Generated`]`(location)`.
+    ///
+    /// Reuses the key already stored at `location` (a `file://` URL or plain path, or an
+    /// `env://` variable), so an engine restarted with the same configuration can still
+    /// decrypt what it encrypted. Only when nothing is stored there is a new random key
+    /// generated and stored. `stdout://` always generates a key and prints it (for
+    /// initial setup). A stored value that is not a valid key is an error; it is never
+    /// overwritten.
     #[cfg(feature = "encryption")]
-    async fn store_generated_key(
-        key_bytes: &[u8],
+    fn load_or_generate_key(
         location: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        expected_size: usize,
+    ) -> Result<Vec<u8>, EncryptionError> {
         use base64::Engine;
+        use std::io::Write;
 
-        // Encode the key in base64 for storage
-        let encoded_key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
-
-        // Determine storage method based on location format
-        if location.starts_with("file://") {
-            // Store in a file
-            let file_path = location.strip_prefix("file://").unwrap_or(location);
-
-            // Create directory if it doesn't exist
-            if let Some(parent) = std::path::Path::new(file_path).parent() {
-                std::fs::create_dir_all(parent)?;
+        let decode = |stored: &str, place: &str| -> Result<Vec<u8>, EncryptionError> {
+            let key = base64::engine::general_purpose::STANDARD
+                .decode(stored.trim())
+                .map_err(|e| {
+                    EncryptionError::KeyManagement(format!(
+                        "Invalid base64 key stored in {}: {}",
+                        place, e
+                    ))
+                })?;
+            if key.len() != expected_size {
+                return Err(EncryptionError::KeyManagement(format!(
+                    "Key size mismatch in {}: expected {} bytes, got {}",
+                    place,
+                    expected_size,
+                    key.len()
+                )));
             }
+            Ok(key)
+        };
+        let storage_error = |e: std::io::Error| {
+            EncryptionError::KeyManagement(format!(
+                "Failed to store generated key at {}: {}",
+                location, e
+            ))
+        };
 
-            // Write the key to file with restricted permissions
-            use std::fs::OpenOptions;
-            use std::io::Write;
+        let mut key = vec![0u8; expected_size];
+        OsRng.fill_bytes(&mut key);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&key);
 
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(file_path)?;
-
-            // Set restrictive permissions (owner read/write only)
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let permissions = std::fs::Permissions::from_mode(0o600);
-                file.set_permissions(permissions)?;
+        if let Some(var_name) = location.strip_prefix("env://") {
+            if let Ok(stored) = std::env::var(var_name) {
+                return decode(&stored, var_name);
             }
-
-            write!(file, "{}", encoded_key)?;
-            file.flush()?;
-
-            info!("Stored generated key in file: {}", file_path);
-        } else if location.starts_with("env://") {
-            // Store as environment variable (not recommended for production)
-            let env_var = location.strip_prefix("env://").unwrap_or(location);
+            // SAFETY: as for any `set_var`, the caller must not read or write the
+            // environment from other threads meanwhile.
             unsafe {
-                std::env::set_var(env_var, encoded_key);
+                std::env::set_var(var_name, encoded);
             }
-
-            info!("Stored generated key in environment variable: {}", env_var);
-        } else if location.starts_with("stdout://") {
-            // Print to stdout (useful for initial setup)
-            println!("Generated encryption key: {}", encoded_key);
+            info!("Stored generated key in environment variable: {}", var_name);
+            return Ok(key);
+        }
+        if location.starts_with("stdout://") {
+            println!("Generated encryption key: {}", encoded);
             println!("Store this key securely and set it as an environment variable.");
-        } else {
-            // Default to file storage
-            let file_path = location;
-
-            // Create directory if it doesn't exist
-            if let Some(parent) = std::path::Path::new(file_path).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            use std::fs::OpenOptions;
-            use std::io::Write;
-
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(file_path)?;
-
-            // Set restrictive permissions (owner read/write only)
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let permissions = std::fs::Permissions::from_mode(0o600);
-                file.set_permissions(permissions)?;
-            }
-
-            write!(file, "{}", encoded_key)?;
-            file.flush()?;
-
-            info!("Stored generated key in file: {}", file_path);
+            return Ok(key);
         }
 
-        Ok(())
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    async fn store_generated_key(
-        _key_bytes: &[u8],
-        _location: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Err("Encryption feature is not enabled".into())
+        let file_path = location.strip_prefix("file://").unwrap_or(location);
+        if let Some(parent) = std::path::Path::new(file_path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(storage_error)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        // `create_new`: never replace a key another process stored meanwhile.
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(file_path) {
+            Ok(mut file) => {
+                file.write_all(encoded.as_bytes())
+                    .and_then(|()| file.flush())
+                    .map_err(storage_error)?;
+                info!("Stored generated key in file: {}", file_path);
+                Ok(key)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stored = std::fs::read_to_string(file_path).map_err(|e| {
+                    EncryptionError::KeyManagement(format!(
+                        "Failed to read stored key {}: {}",
+                        file_path, e
+                    ))
+                })?;
+                info!("Loaded previously generated key from file: {}", file_path);
+                decode(&stored, file_path)
+            }
+            Err(e) => Err(storage_error(e)),
+        }
     }
 
     #[cfg(feature = "encryption")]
@@ -425,24 +428,7 @@ impl EncryptionEngine {
             KeySource::External(service_config) => {
                 load_external_key(service_config, expected_size).await
             }
-            KeySource::Generated(location) => {
-                // Generate a new random key
-                let mut key_bytes = vec![0u8; expected_size];
-                OsRng.fill_bytes(&mut key_bytes);
-
-                // Store the generated key in the specified location
-                Self::store_generated_key(&key_bytes, location)
-                    .await
-                    .map_err(|e| {
-                        EncryptionError::KeyManagement(format!(
-                            "Failed to store generated key at {}: {}",
-                            location, e
-                        ))
-                    })?;
-
-                info!("Generated and stored new encryption key at: {}", location);
-                Ok(key_bytes)
-            }
+            KeySource::Generated(location) => Self::load_or_generate_key(location, expected_size),
         }
     }
 }
@@ -1190,7 +1176,7 @@ impl EncryptionEngine {
                     }
 
                     // Recursively scan nested objects
-                    if matches!(val, Value::Object(_)) {
+                    if matches!(val, Value::Object(_) | Value::Array(_)) {
                         self.scan_object_for_pii(val, patterns, pii_fields, &field_name);
                     }
                 }
@@ -1198,7 +1184,7 @@ impl EncryptionEngine {
             Value::Array(arr) => {
                 for (i, val) in arr.iter().enumerate() {
                     let field_name = format!("{}[{}]", prefix, i);
-                    if matches!(val, Value::Object(_)) {
+                    if matches!(val, Value::Object(_) | Value::Array(_)) {
                         self.scan_object_for_pii(val, patterns, pii_fields, &field_name);
                     }
                 }
@@ -1303,32 +1289,39 @@ async fn load_from_vault(
     #[cfg(feature = "vault-kms")]
     {
         let key_str = kms::vault_read_key_field(&vault_addr, mount, secret).await?;
-
-        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&key_str) {
-            if decoded.len() == expected_size {
-                info!("Successfully loaded encryption key from HashiCorp Vault");
-                return Ok(decoded);
-            }
-            // Wrong size: truncate, or pad with a hash of the decoded key
-            let mut key = vec![0u8; expected_size];
-            let copy_len = std::cmp::min(decoded.len(), expected_size);
-            key[..copy_len].copy_from_slice(&decoded[..copy_len]);
-            if decoded.len() < expected_size {
-                let hash = Sha256::digest(&decoded);
-                for (i, byte) in key.iter_mut().enumerate().skip(decoded.len()) {
-                    *byte = hash[i % hash.len()];
-                }
-            }
-            info!("Successfully loaded and resized encryption key from HashiCorp Vault");
-            return Ok(key);
-        }
-
-        // Not base64: hash the string to the expected size
-        let hash = Sha256::digest(key_str.as_bytes());
-        let key = (0..expected_size).map(|i| hash[i % hash.len()]).collect();
-        info!("Successfully loaded and hashed encryption key from HashiCorp Vault");
-        Ok(key)
+        Ok(fit_vault_key(&key_str, expected_size))
     }
+}
+
+/// Turn the `key` field of a Vault secret into a key of `expected_size` bytes: base64
+/// key material is used as is (truncated, or padded with its SHA-256 hash when short);
+/// anything else is hashed.
+#[cfg(feature = "vault-kms")]
+fn fit_vault_key(key_str: &str, expected_size: usize) -> Vec<u8> {
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(key_str) {
+        if decoded.len() == expected_size {
+            info!("Successfully loaded encryption key from HashiCorp Vault");
+            return decoded;
+        }
+        // Wrong size: truncate, or pad with a hash of the decoded key
+        let mut key = vec![0u8; expected_size];
+        let copy_len = std::cmp::min(decoded.len(), expected_size);
+        key[..copy_len].copy_from_slice(&decoded[..copy_len]);
+        if decoded.len() < expected_size {
+            let hash = Sha256::digest(&decoded);
+            for (i, byte) in key.iter_mut().enumerate().skip(decoded.len()) {
+                *byte = hash[i % hash.len()];
+            }
+        }
+        info!("Successfully loaded and resized encryption key from HashiCorp Vault");
+        return key;
+    }
+
+    // Not base64: hash the string to the expected size
+    let hash = Sha256::digest(key_str.as_bytes());
+    let key = (0..expected_size).map(|i| hash[i % hash.len()]).collect();
+    info!("Successfully loaded and hashed encryption key from HashiCorp Vault");
+    key
 }
 
 /// Load a key from Azure Key Vault (`azure://<vault-host>/keys/<key-name>`, key name
@@ -1362,32 +1355,45 @@ async fn load_from_azure_kv(
                 ))
             })?;
 
-        if decoded_key.len() >= expected_size {
-            info!("Successfully loaded encryption key from Azure Key Vault");
-            return Ok(decoded_key[..expected_size].to_vec());
-        }
-
-        // Key is shorter than expected: pad it using key derivation
-        use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<Sha256>;
-
-        let mut final_key = vec![0u8; expected_size];
-        final_key[..decoded_key.len()].copy_from_slice(&decoded_key);
-
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&decoded_key)
-            .map_err(|e| EncryptionError::KeyManagement(format!("HMAC creation failed: {}", e)))?;
-        mac.update(b"azure-kv-key-derivation");
-        mac.update(vault_url.as_bytes());
-        mac.update(key_name.as_bytes());
-        let derived = mac.finalize().into_bytes();
-
-        for (i, byte) in final_key.iter_mut().enumerate().skip(decoded_key.len()) {
-            *byte = derived[i % derived.len()];
-        }
-
-        info!("Successfully loaded and padded encryption key from Azure Key Vault");
-        Ok(final_key)
+        fit_azure_key(&decoded_key, &vault_url, &key_name, expected_size)
     }
+}
+
+/// Turn Azure Key Vault key material into a key of `expected_size` bytes: longer
+/// material is truncated; shorter material is padded with HMAC-SHA256 output keyed by
+/// the material and bound to the vault URL and key name.
+#[cfg(feature = "azure-kv")]
+fn fit_azure_key(
+    decoded_key: &[u8],
+    vault_url: &str,
+    key_name: &str,
+    expected_size: usize,
+) -> Result<Vec<u8>, EncryptionError> {
+    if decoded_key.len() >= expected_size {
+        info!("Successfully loaded encryption key from Azure Key Vault");
+        return Ok(decoded_key[..expected_size].to_vec());
+    }
+
+    // Key is shorter than expected: pad it using key derivation
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut final_key = vec![0u8; expected_size];
+    final_key[..decoded_key.len()].copy_from_slice(decoded_key);
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(decoded_key)
+        .map_err(|e| EncryptionError::KeyManagement(format!("HMAC creation failed: {}", e)))?;
+    mac.update(b"azure-kv-key-derivation");
+    mac.update(vault_url.as_bytes());
+    mac.update(key_name.as_bytes());
+    let derived = mac.finalize().into_bytes();
+
+    for (i, byte) in final_key.iter_mut().enumerate().skip(decoded_key.len()) {
+        *byte = derived[i % derived.len()];
+    }
+
+    info!("Successfully loaded and padded encryption key from Azure Key Vault");
+    Ok(final_key)
 }
 
 #[cfg(test)]
@@ -1446,15 +1452,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_pii_field_identification() {
-        let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM);
-        let engine = EncryptionEngine::new(config).await;
-
-        // This test doesn't require the encryption feature to be enabled for PII detection
-        if engine.is_err() {
-            return; // Skip if encryption feature not enabled
-        }
-
-        let engine = engine.unwrap();
+        // It used to build an engine with the default key source (an unset environment
+        // variable) and silently return when that failed, so it never ran.
+        let engine = EncryptionEngine::new(static_engine("k", KEY_A))
+            .await
+            .unwrap();
 
         let payload = json!({
             "user_id": "123",
@@ -1538,14 +1540,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_retention_policy_cleanup() {
-        let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM);
-        let engine = EncryptionEngine::new(config).await;
-
-        if engine.is_err() {
-            return; // Skip if encryption feature not enabled
-        }
-
-        let engine = engine.unwrap();
+        let engine = EncryptionEngine::new(static_engine("k", KEY_A))
+            .await
+            .unwrap();
 
         // Create a mock encrypted payload with immediate deletion policy
         let metadata = EncryptionMetadata::new(
@@ -1979,5 +1976,390 @@ mod tests {
     #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
     async fn test_engine_kms_concurrent_first_load_mysql() {
         engine_kms_concurrent_first_load(mysql_pool().await).await;
+    }
+
+    // ---- Key sources ----
+
+    fn generated(location: &str) -> EncryptionConfig {
+        EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+            .with_key_source(KeySource::Generated(location.to_string()))
+    }
+
+    #[tokio::test]
+    async fn test_generated_key_is_stored_and_reused() {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys/engine.key");
+        let location = format!("file://{}", path.display());
+
+        let first = EncryptionEngine::new(generated(&location)).await.unwrap();
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&stored)
+                .unwrap()
+                .len(),
+            32
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the key file is private");
+        }
+        let encrypted = first
+            .encrypt_payload(&json!({"secret": 1}), &["secret"])
+            .await
+            .unwrap();
+
+        // A restart with the same configuration reuses the stored key: what was
+        // encrypted before can still be decrypted, and the file is unchanged.
+        let restarted = EncryptionEngine::new(generated(&location)).await.unwrap();
+        assert_eq!(
+            restarted.decrypt_payload(&encrypted).await.unwrap(),
+            json!({"secret": 1})
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), stored);
+
+        // A plain path works the same way.
+        let plain = EncryptionEngine::new(generated(path.to_str().unwrap()))
+            .await
+            .unwrap();
+        assert!(plain.decrypt_payload(&encrypted).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_generated_key_file_that_is_not_a_key_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for (contents, expected) in [
+            ("not base64!", "Invalid base64 key"),
+            ("c2hvcnQ=", "expected 32 bytes, got 5"),
+        ] {
+            let path = dir.path().join(format!("{}.key", contents.len()));
+            std::fs::write(&path, contents).unwrap();
+            let err = EncryptionEngine::new(generated(path.to_str().unwrap()))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                contents,
+                "an invalid stored key is never overwritten"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generated_key_storage_failure_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // The parent "directory" is a file, so the key cannot be stored.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let err = EncryptionEngine::new(generated(&format!(
+            "file://{}/engine.key",
+            blocker.display()
+        )))
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to store generated key"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generated_key_in_environment_and_stdout() {
+        let var = format!(
+            "HAMMERWORK_TEST_GENERATED_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let location = format!("env://{var}");
+        let first = EncryptionEngine::new(generated(&location)).await.unwrap();
+        assert!(std::env::var(&var).is_ok(), "the key is stored in {var}");
+        let encrypted = first
+            .encrypt_payload(&json!({"a": 1}), &[] as &[&str])
+            .await
+            .unwrap();
+        let second = EncryptionEngine::new(generated(&location)).await.unwrap();
+        assert!(second.decrypt_payload(&encrypted).await.is_ok());
+
+        // stdout:// prints a new key every time.
+        let printed = EncryptionEngine::new(generated("stdout://")).await.unwrap();
+        assert!(printed.decrypt_payload(&encrypted).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_static_and_environment_key_errors() {
+        let err = EncryptionEngine::new(static_engine("k", "not base64!"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid base64 key"), "{err}");
+        let err = EncryptionEngine::new(static_engine("k", "c2hvcnQ="))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("expected 32 bytes, got 5"),
+            "{err}"
+        );
+
+        let missing = format!("HAMMERWORK_TEST_MISSING_{}", uuid::Uuid::new_v4().simple());
+        let err = EncryptionEngine::new(
+            EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+                .with_key_source(KeySource::Environment(missing.clone())),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains(&missing), "{err}");
+
+        for (value, expected) in [
+            ("%%%", "Invalid base64 key in"),
+            ("c2hvcnQ=", "Key size mismatch in"),
+        ] {
+            let var = format!("HAMMERWORK_TEST_BAD_{}", uuid::Uuid::new_v4().simple());
+            unsafe {
+                std::env::set_var(&var, value);
+            }
+            let err = EncryptionEngine::new(
+                EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+                    .with_key_source(KeySource::Environment(var)),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    // ---- Algorithms, tampering, compression ----
+
+    #[tokio::test]
+    async fn test_chacha20_roundtrip_and_tampering() {
+        use base64::Engine as _;
+
+        let config = EncryptionConfig::new(EncryptionAlgorithm::ChaCha20Poly1305)
+            .with_key_id("chacha")
+            .with_key_source(KeySource::Static(KEY_B.to_string()));
+        let engine = EncryptionEngine::new(config).await.unwrap();
+        assert_eq!(engine.algorithm(), &EncryptionAlgorithm::ChaCha20Poly1305);
+        let payload = json!({"card": "4111", "amount": 5});
+        let encrypted = engine.encrypt_payload(&payload, &["card"]).await.unwrap();
+        assert_eq!(encrypted.decode_nonce().unwrap().len(), 12);
+        assert_eq!(encrypted.decode_tag().unwrap().len(), 16);
+        assert_eq!(engine.decrypt_payload(&encrypted).await.unwrap(), payload);
+
+        let mut tampered = encrypted.clone();
+        let mut ciphertext = encrypted.decode_ciphertext().unwrap();
+        ciphertext[0] ^= 0xff;
+        tampered.ciphertext = base64::engine::general_purpose::STANDARD.encode(ciphertext);
+        let err = engine.decrypt_payload(&tampered).await.unwrap_err();
+        assert!(
+            err.to_string().contains("ChaCha20 decryption failed"),
+            "{err}"
+        );
+
+        // Decryption follows the algorithm recorded with the payload, so an engine
+        // configured for AES with the same key can still read it; another key cannot.
+        let aes = EncryptionEngine::new(static_engine("chacha", KEY_B))
+            .await
+            .unwrap();
+        assert_eq!(aes.decrypt_payload(&encrypted).await.unwrap(), payload);
+        let other_key = EncryptionEngine::new(
+            EncryptionConfig::new(EncryptionAlgorithm::ChaCha20Poly1305)
+                .with_key_id("chacha")
+                .with_key_source(KeySource::Static(KEY_A.to_string())),
+        )
+        .await
+        .unwrap();
+        assert!(other_key.decrypt_payload(&encrypted).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_associated_data_must_match() {
+        let engine = EncryptionEngine::new(static_engine("k", KEY_A))
+            .await
+            .unwrap();
+        let payload = json!({"a": 1});
+        let encrypted = engine
+            .encrypt_payload_with_associated_data(
+                &payload,
+                &[] as &[&str],
+                RetentionPolicy::UseDefault,
+                b"job-1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .decrypt_payload_with_associated_data(&encrypted, b"job-1")
+                .await
+                .unwrap(),
+            payload
+        );
+        assert!(
+            engine
+                .decrypt_payload_with_associated_data(&encrypted, b"job-2")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compression_roundtrip_and_corruption() {
+        let engine =
+            EncryptionEngine::new(static_engine("k", KEY_A).with_compression_enabled(true))
+                .await
+                .unwrap();
+        let payload = json!({"text": "a".repeat(10_000)});
+        let encrypted = engine
+            .encrypt_payload(&payload, &[] as &[&str])
+            .await
+            .unwrap();
+        assert!(encrypted.metadata.compressed);
+        assert!(
+            encrypted.decode_ciphertext().unwrap().len() < 1_000,
+            "compressible payloads shrink"
+        );
+        assert_eq!(engine.decrypt_payload(&encrypted).await.unwrap(), payload);
+
+        // Valid ciphertext of something that is not gzip data.
+        let plain = EncryptionEngine::new(static_engine("k", KEY_A))
+            .await
+            .unwrap();
+        let mut not_gzip = plain
+            .encrypt_payload(&payload, &[] as &[&str])
+            .await
+            .unwrap();
+        not_gzip.metadata.compressed = true;
+        let err = engine.decrypt_payload(&not_gzip).await.unwrap_err();
+        assert!(err.to_string().contains("Decompression failed"), "{err}");
+    }
+
+    // ---- PII detection, retention, stats ----
+
+    #[tokio::test]
+    async fn test_identify_pii_fields_nested_and_in_arrays() {
+        let engine = EncryptionEngine::new(static_engine("k", KEY_A))
+            .await
+            .unwrap();
+        let payload = json!({
+            "user_id": 1,
+            "Email": "a@example.com",
+            "creditCardNumber": "4111",
+            "billing": {"home_address": "1 Main St", "zip_code": "12345"},
+            "contacts": [{"phone": "555"}, "not an object", {"name": "x"}],
+            "items": [1, 2, 3]
+        });
+        let mut fields = engine.identify_pii_fields(&payload);
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec![
+                "Email",
+                "billing.home_address",
+                "contacts[0].phone",
+                "creditCardNumber",
+            ]
+        );
+        assert!(engine.identify_pii_fields(&json!([1, 2])).is_empty());
+        assert!(engine.identify_pii_fields(&json!("ssn")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_data_counts_and_records() {
+        let engine = EncryptionEngine::new(static_engine("k", KEY_A))
+            .await
+            .unwrap();
+        let expired = engine
+            .encrypt_payload_with_retention(
+                &json!({"a": 1}),
+                &[] as &[&str],
+                RetentionPolicy::DeleteAt(chrono::Utc::now() - chrono::Duration::hours(1)),
+            )
+            .await
+            .unwrap();
+        let kept = engine
+            .encrypt_payload_with_retention(
+                &json!({"a": 1}),
+                &[] as &[&str],
+                RetentionPolicy::KeepIndefinitely,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.cleanup_expired_data(&[expired.clone(), kept.clone()]),
+            1
+        );
+        assert_eq!(engine.cleanup_expired_data(&[kept]), 0);
+        assert_eq!(engine.get_stats().retention_cleanups, 1);
+    }
+
+    #[cfg(feature = "vault-kms")]
+    #[test]
+    fn test_fit_vault_key() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        // The right size is used as is.
+        let exact: Vec<u8> = (0..32).collect();
+        assert_eq!(fit_vault_key(&b64(&exact), 32), exact);
+        // Longer material is truncated.
+        let long: Vec<u8> = (0..40).collect();
+        assert_eq!(fit_vault_key(&b64(&long), 32), long[..32].to_vec());
+        // Shorter material keeps its bytes and is padded deterministically.
+        let short = fit_vault_key(&b64(b"short"), 32);
+        assert_eq!(&short[..5], b"short");
+        assert_eq!(short.len(), 32);
+        assert_eq!(short, fit_vault_key(&b64(b"short"), 32));
+        assert_ne!(short[5..], [0u8; 27]);
+        // Not base64: hashed to the right size.
+        let hashed = fit_vault_key("a passphrase!", 16);
+        assert_eq!(hashed.len(), 16);
+        assert_eq!(hashed, fit_vault_key("a passphrase!", 16));
+        assert_ne!(hashed, fit_vault_key("another one!", 16));
+    }
+
+    #[cfg(feature = "azure-kv")]
+    #[test]
+    fn test_fit_azure_key() {
+        let long: Vec<u8> = (0..40).collect();
+        assert_eq!(
+            fit_azure_key(&long, "https://v", "k", 32).unwrap(),
+            long[..32].to_vec()
+        );
+        let padded = fit_azure_key(b"0123456789", "https://v", "k", 32).unwrap();
+        assert_eq!(&padded[..10], b"0123456789");
+        assert_eq!(padded.len(), 32);
+        // The padding is bound to the vault and key name.
+        assert_ne!(
+            padded,
+            fit_azure_key(b"0123456789", "https://other", "k", 32).unwrap()
+        );
+        assert_ne!(
+            padded,
+            fit_azure_key(b"0123456789", "https://v", "other", 32).unwrap()
+        );
+        assert_eq!(
+            padded,
+            fit_azure_key(b"0123456789", "https://v", "k", 32).unwrap()
+        );
+    }
+
+    #[cfg(feature = "azure-kv")]
+    #[tokio::test]
+    async fn test_azure_key_with_invalid_vault_fails() {
+        let err = load_from_azure_kv("azure://", 32).await.unwrap_err();
+        assert!(
+            matches!(err, EncryptionError::InvalidConfiguration(_)),
+            "{err}"
+        );
+        // A vault host that is not a valid URL fails before any request is made.
+        let err = load_from_azure_kv("azure://bad host/keys/k", 32)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to load key from Azure Key Vault"),
+            "{err}"
+        );
     }
 }

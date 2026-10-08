@@ -165,6 +165,10 @@ pub enum KeySource {
 
     /// Generate a random key and store it in the specified location.
     ///
+    /// The location is a file (`file:///path` or a plain path, written with mode
+    /// 0600), an environment variable of this process (`env://VAR`) or `stdout://`.
+    /// A key already stored in the file or variable is reused, so restarting with the
+    /// same configuration keeps the key; `stdout://` generates a new key every time.
     /// Useful for initial setup or testing scenarios.
     Generated(String),
 }
