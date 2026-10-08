@@ -348,22 +348,15 @@ fn retry_selector(
         }
     };
 
-    let mut extra = Vec::new();
-    if let Some(hours) = failed_since_hours {
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-        extra.push(format!(
-            "failed_at > '{}'",
-            cutoff.format("%Y-%m-%d %H:%M:%S")
-        ));
-    }
-    if max_attempts_reached {
-        extra.push("attempts >= max_attempts".to_string());
-    }
+    let failed_after = failed_since_hours
+        .map(|hours| chrono::Utc::now() - chrono::Duration::hours(i64::from(hours)));
 
     Ok(JobSelector {
         statuses,
         queue: queue.clone(),
-        extra,
+        failed_after,
+        attempts_exhausted: max_attempts_reached,
+        ..Default::default()
     })
 }
 
@@ -384,19 +377,14 @@ fn cancel_selector(
         }
     };
 
-    let mut extra = Vec::new();
-    if let Some(hours) = older_than_hours {
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-        extra.push(format!(
-            "created_at < '{}'",
-            cutoff.format("%Y-%m-%d %H:%M:%S")
-        ));
-    }
+    let created_before = older_than_hours
+        .map(|hours| chrono::Utc::now() - chrono::Duration::hours(i64::from(hours)));
 
     Ok(JobSelector {
         statuses,
         queue: queue.clone(),
-        extra,
+        created_before,
+        ..Default::default()
     })
 }
 
@@ -522,7 +510,8 @@ mod tests {
         let selector = retry_selector(&Some("emails".into()), Some("dead"), Some(2), true).unwrap();
         assert_eq!(selector.statuses, vec![JobStatus::Dead]);
         assert_eq!(selector.queue.as_deref(), Some("emails"));
-        assert_eq!(selector.extra.len(), 2);
+        assert!(selector.failed_after.is_some());
+        assert!(selector.attempts_exhausted);
 
         let all = retry_selector(&None, None, None, false).unwrap();
         assert_eq!(all.statuses, vec![JobStatus::Failed, JobStatus::Dead]);

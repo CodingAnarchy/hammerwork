@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::utils::database::{DatabasePool, JobQueueWrapper};
 use crate::utils::db_helpers::*;
 use crate::utils::job_ops::{JobSelector, retry_many, select_job_ids};
+use crate::utils::sql::{Backend, Bind, SqlParams, execute_binds, fetch_i64};
 
 #[derive(Subcommand)]
 pub enum MaintenanceCommand {
@@ -220,6 +221,38 @@ async fn purge_expired_encrypted_jobs(
     Ok(())
 }
 
+/// Which kind of old job a vacuum statement targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacuumKind {
+    Completed,
+    Failed,
+}
+
+/// The count (`delete == false`) or delete statement for jobs of `kind` older than `cutoff`.
+/// The cutoff is bound as a timestamp rather than formatted into the SQL text.
+pub fn build_vacuum_query(
+    backend: Backend,
+    kind: VacuumKind,
+    delete: bool,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let (status, column) = match kind {
+        VacuumKind::Completed => ("Completed", "completed_at"),
+        VacuumKind::Failed => ("Failed", "failed_at"),
+    };
+    let verb = if delete {
+        "DELETE FROM hammerwork_jobs"
+    } else {
+        "SELECT COUNT(*) as count FROM hammerwork_jobs"
+    };
+    let cutoff = params.time(cutoff);
+    (
+        format!("{verb} WHERE status = '{status}' AND {column} < {cutoff}"),
+        params.into_binds(),
+    )
+}
+
 async fn vacuum_jobs(
     pool: DatabasePool,
     keep_completed_days: u32,
@@ -238,17 +271,14 @@ async fn vacuum_jobs(
     let failed_cutoff = chrono::Utc::now() - chrono::Duration::days(keep_failed_days as i64);
 
     // Count jobs to delete
-    let completed_query = format!(
-        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Completed' AND completed_at < '{}'",
-        completed_cutoff.format("%Y-%m-%d %H:%M:%S")
-    );
-    let failed_query = format!(
-        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Failed' AND failed_at < '{}'",
-        failed_cutoff.format("%Y-%m-%d %H:%M:%S")
-    );
+    let backend = pool.backend();
+    let (completed_query, completed_binds) =
+        build_vacuum_query(backend, VacuumKind::Completed, false, completed_cutoff);
+    let (failed_query, failed_binds) =
+        build_vacuum_query(backend, VacuumKind::Failed, false, failed_cutoff);
 
-    let completed_count = execute_count_query(&pool, &completed_query).await?;
-    let failed_count = execute_count_query(&pool, &failed_query).await?;
+    let completed_count = fetch_i64(&pool, &completed_query, &completed_binds, "count").await?;
+    let failed_count = fetch_i64(&pool, &failed_query, &failed_binds, "count").await?;
 
     println!("🧹 Vacuum Analysis");
     println!("════════════════════");
@@ -276,21 +306,17 @@ async fn vacuum_jobs(
 
     // Delete completed jobs
     if completed_count > 0 {
-        let delete_completed_query = format!(
-            "DELETE FROM hammerwork_jobs WHERE status = 'Completed' AND completed_at < '{}'",
-            completed_cutoff.format("%Y-%m-%d %H:%M:%S")
-        );
-        execute_update_query(&pool, &delete_completed_query).await?;
+        let (delete_query, delete_binds) =
+            build_vacuum_query(backend, VacuumKind::Completed, true, completed_cutoff);
+        execute_binds(&pool, &delete_query, &delete_binds).await?;
         info!("Deleted {} completed jobs", completed_count);
     }
 
     // Delete failed jobs
     if failed_count > 0 {
-        let delete_failed_query = format!(
-            "DELETE FROM hammerwork_jobs WHERE status = 'Failed' AND failed_at < '{}'",
-            failed_cutoff.format("%Y-%m-%d %H:%M:%S")
-        );
-        execute_update_query(&pool, &delete_failed_query).await?;
+        let (delete_query, delete_binds) =
+            build_vacuum_query(backend, VacuumKind::Failed, true, failed_cutoff);
+        execute_binds(&pool, &delete_query, &delete_binds).await?;
         info!("Deleted {} failed jobs", failed_count);
     }
 
@@ -319,11 +345,8 @@ async fn cleanup_dead_jobs(
     // Find stale running jobs
     let selector = JobSelector {
         statuses: vec![JobStatus::Running],
-        queue: None,
-        extra: vec![format!(
-            "started_at < '{}'",
-            stale_cutoff.format("%Y-%m-%d %H:%M:%S")
-        )],
+        started_before: Some(stale_cutoff),
+        ..Default::default()
     };
     let stale_ids = select_job_ids(&pool, &selector).await?;
     let stale_count = stale_ids.len();
@@ -466,8 +489,8 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
     if fix && orphaned_count > 0 {
         let selector = JobSelector {
             statuses: vec![JobStatus::Running],
-            queue: None,
-            extra: vec!["started_at IS NULL".to_string()],
+            never_started: true,
+            ..Default::default()
         };
         let ids = select_job_ids(&pool, &selector).await?;
         let wrapper = pool.clone().create_job_queue();
@@ -586,5 +609,64 @@ mod tests {
         let (jobs, archived) = expired_encrypted_count_queries("?");
         assert!(jobs.contains("retention_delete_at <= ?"));
         assert!(archived.contains("retention_delete_at <= ?"));
+    }
+
+    use crate::utils::test_support::*;
+
+    #[test]
+    fn test_vacuum_query_binds_cutoff() {
+        let cutoff = chrono::Utc::now();
+        let (sql, binds) =
+            build_vacuum_query(Backend::Postgres, VacuumKind::Completed, false, cutoff);
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Completed' AND completed_at < $1"
+        );
+        assert_eq!(binds, vec![Bind::Time(cutoff)]);
+
+        let (sql, binds) = build_vacuum_query(Backend::MySql, VacuumKind::Failed, true, cutoff);
+        assert_eq!(
+            sql,
+            "DELETE FROM hammerwork_jobs WHERE status = 'Failed' AND failed_at < ?"
+        );
+        assert_eq!(binds, vec![Bind::Time(cutoff)]);
+    }
+
+    async fn vacuum_roundtrip(pool: DatabasePool) {
+        let queue = hostile_queue();
+        let mut done = SeedJob::new(&queue, "Completed");
+        done.completed_now = true;
+        seed(&pool, &done).await;
+        let mut failed = SeedJob::new(&queue, "Failed");
+        failed.failed_now = true;
+        seed(&pool, &failed).await;
+
+        let backend = pool.backend();
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let (sql, binds) = build_vacuum_query(backend, VacuumKind::Completed, false, future);
+        assert!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap() >= 1);
+        let (sql, binds) = build_vacuum_query(backend, VacuumKind::Failed, false, future);
+        assert!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap() >= 1);
+
+        // A cutoff in the distant past executes the DELETE without touching any rows
+        let past = chrono::Utc::now() - chrono::Duration::days(365 * 20);
+        let (sql, binds) = build_vacuum_query(backend, VacuumKind::Completed, true, past);
+        assert_eq!(execute_binds(&pool, &sql, &binds).await.unwrap(), 0);
+        let (sql, binds) = build_vacuum_query(backend, VacuumKind::Failed, true, past);
+        assert_eq!(execute_binds(&pool, &sql, &binds).await.unwrap(), 0);
+
+        cleanup(&pool, &[&queue]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn test_vacuum_cutoffs_are_bound_postgres() {
+        vacuum_roundtrip(pg_pool().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MYSQL_DATABASE_URL"]
+    async fn test_vacuum_cutoffs_are_bound_mysql() {
+        vacuum_roundtrip(mysql_pool().await).await;
     }
 }

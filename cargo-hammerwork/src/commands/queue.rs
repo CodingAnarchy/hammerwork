@@ -3,9 +3,12 @@ use clap::Subcommand;
 use sqlx::Row;
 use tracing::info;
 
+use crate::commands::job::priority_display;
+use crate::commands::monitor::build_status_counts_query;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
 use crate::utils::display::StatsTable;
+use crate::utils::sql::{Backend, Bind, IntervalUnit, SqlParams, bind_mysql, bind_pg, fetch_i64};
 
 #[derive(Subcommand)]
 pub enum QueueCommand {
@@ -217,6 +220,77 @@ async fn list_queues(pool: DatabasePool) -> Result<()> {
     Ok(())
 }
 
+/// `COUNT(*) as total`, optionally for one queue (bound, not interpolated).
+pub fn build_queue_total_query(backend: Backend, queue: Option<&str>) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let filter = match queue {
+        Some(q) => format!(" WHERE queue_name = {}", params.text(q)),
+        None => String::new(),
+    };
+    (
+        format!("SELECT COUNT(*) as total FROM hammerwork_jobs{filter}"),
+        params.into_binds(),
+    )
+}
+
+/// Counts by status and priority, optionally for one queue.
+pub fn build_detailed_stats_query(backend: Backend, queue: Option<&str>) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let filter = match queue {
+        Some(q) => format!(" WHERE queue_name = {}", params.text(q)),
+        None => String::new(),
+    };
+    (
+        format!(
+            "SELECT status, priority, COUNT(*) as count FROM hammerwork_jobs{filter} GROUP BY status, priority ORDER BY status, priority"
+        ),
+        params.into_binds(),
+    )
+}
+
+/// The counts shown by `queue health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthMetric {
+    Total,
+    RecentFailures,
+    LongRunning,
+}
+
+/// A `COUNT(*) as count` query for one health metric, optionally for one queue.
+pub fn build_health_query(
+    backend: Backend,
+    metric: HealthMetric,
+    queue: Option<&str>,
+) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let mut conditions = Vec::new();
+    if let Some(q) = queue {
+        conditions.push(format!("queue_name = {}", params.text(q)));
+    }
+    match metric {
+        HealthMetric::Total => {}
+        HealthMetric::RecentFailures => {
+            conditions.push(format!("failed_at > {}", params.ago(1, IntervalUnit::Hour)));
+        }
+        HealthMetric::LongRunning => {
+            conditions.push("status = 'Running'".to_string());
+            conditions.push(format!(
+                "started_at < {}",
+                params.ago(1, IntervalUnit::Hour)
+            ));
+        }
+    }
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    (
+        format!("SELECT COUNT(*) as count FROM hammerwork_jobs{where_clause}"),
+        params.into_binds(),
+    )
+}
+
 async fn show_queue_stats(pool: DatabasePool, queue: Option<String>, detailed: bool) -> Result<()> {
     if detailed {
         show_detailed_stats(pool, queue).await
@@ -226,25 +300,21 @@ async fn show_queue_stats(pool: DatabasePool, queue: Option<String>, detailed: b
 }
 
 async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<()> {
-    let mut base_query = String::from("SELECT status, COUNT(*) as count FROM hammerwork_jobs");
-
-    if let Some(queue_name) = &queue {
-        base_query.push_str(&format!(" WHERE queue_name = '{}'", queue_name));
-    }
-
-    base_query.push_str(" GROUP BY status ORDER BY status");
+    let (base_query, base_binds) = build_status_counts_query(pool.backend(), queue.as_deref());
 
     let mut table = comfy_table::Table::new();
     table.set_header(vec!["Status", "Count"]);
 
     match &pool {
         DatabasePool::Postgres(pg_pool) => {
-            let rows = sqlx::query(&base_query).fetch_all(pg_pool).await?;
+            let rows = bind_pg(sqlx::query(&base_query), &base_binds)
+                .fetch_all(pg_pool)
+                .await?;
             for row in rows {
                 let status: String = row.try_get("status")?;
                 let count: i64 = row.try_get("count")?;
 
-                let status_icon = match status.as_str() {
+                let status_icon = match status.to_lowercase().as_str() {
                     "pending" => "🟡",
                     "running" => "🔵",
                     "completed" => "🟢",
@@ -261,12 +331,14 @@ async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<(
             }
         }
         DatabasePool::MySQL(mysql_pool) => {
-            let rows = sqlx::query(&base_query).fetch_all(mysql_pool).await?;
+            let rows = bind_mysql(sqlx::query(&base_query), &base_binds)
+                .fetch_all(mysql_pool)
+                .await?;
             for row in rows {
                 let status: String = row.try_get("status")?;
                 let count: i64 = row.try_get("count")?;
 
-                let status_icon = match status.as_str() {
+                let status_icon = match status.to_lowercase().as_str() {
                     "pending" => "🟡",
                     "running" => "🔵",
                     "completed" => "🟢",
@@ -291,59 +363,38 @@ async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<(
     println!("{}", table);
 
     // Show total count
-    let total_query = if let Some(queue_name) = &queue {
-        format!(
-            "SELECT COUNT(*) as total FROM hammerwork_jobs WHERE queue_name = '{}'",
-            queue_name
-        )
-    } else {
-        "SELECT COUNT(*) as total FROM hammerwork_jobs".to_string()
-    };
-
-    match &pool {
-        DatabasePool::Postgres(pg_pool) => {
-            let total_row = sqlx::query(&total_query).fetch_one(pg_pool).await?;
-            let total: i64 = total_row.try_get("total")?;
-            println!("\n📈 Total jobs: {}", total);
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            let total_row = sqlx::query(&total_query).fetch_one(mysql_pool).await?;
-            let total: i64 = total_row.try_get("total")?;
-            println!("\n📈 Total jobs: {}", total);
-        }
-    }
+    let (total_query, total_binds) = build_queue_total_query(pool.backend(), queue.as_deref());
+    let total = fetch_i64(&pool, &total_query, &total_binds, "total").await?;
+    println!("\n📈 Total jobs: {}", total);
 
     Ok(())
 }
 
 async fn show_detailed_stats(pool: DatabasePool, queue: Option<String>) -> Result<()> {
-    let mut base_query =
-        String::from("SELECT status, priority, COUNT(*) as count FROM hammerwork_jobs");
-
-    if let Some(queue_name) = &queue {
-        base_query.push_str(&format!(" WHERE queue_name = '{}'", queue_name));
-    }
-
-    base_query.push_str(" GROUP BY status, priority ORDER BY status, priority");
+    let (base_query, base_binds) = build_detailed_stats_query(pool.backend(), queue.as_deref());
 
     let mut stats_table = StatsTable::new();
 
     match pool {
         DatabasePool::Postgres(pg_pool) => {
-            let rows = sqlx::query(&base_query).fetch_all(&pg_pool).await?;
+            let rows = bind_pg(sqlx::query(&base_query), &base_binds)
+                .fetch_all(&pg_pool)
+                .await?;
             for row in rows {
                 let status: String = row.try_get("status")?;
-                let priority: String = row.try_get("priority")?;
+                let priority = priority_display(row.try_get("priority")?);
                 let count: i64 = row.try_get("count")?;
 
                 stats_table.add_stats_row(&status, &priority, count);
             }
         }
         DatabasePool::MySQL(mysql_pool) => {
-            let rows = sqlx::query(&base_query).fetch_all(&mysql_pool).await?;
+            let rows = bind_mysql(sqlx::query(&base_query), &base_binds)
+                .fetch_all(&mysql_pool)
+                .await?;
             for row in rows {
                 let status: String = row.try_get("status")?;
-                let priority: String = row.try_get("priority")?;
+                let priority = priority_display(row.try_get("priority")?);
                 let count: i64 = row.try_get("count")?;
 
                 stats_table.add_stats_row(&status, &priority, count);
@@ -499,159 +550,54 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
     let mut health_table = comfy_table::Table::new();
     health_table.set_header(vec!["Metric", "Value", "Status"]);
 
-    let queue_filter = if let Some(q) = &queue {
-        format!(" WHERE queue_name = '{}'", q)
-    } else {
-        String::new()
-    };
-
-    match pool {
-        DatabasePool::Postgres(pg_pool) => {
-            // Total jobs
-            let total_query = format!(
-                "SELECT COUNT(*) as count FROM hammerwork_jobs{}",
-                queue_filter
-            );
-            let total_row = sqlx::query(&total_query).fetch_one(&pg_pool).await?;
-            let total_jobs: i64 = total_row.try_get("count")?;
-
-            // Failed jobs in last hour
-            let failed_query = format!(
-                "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} failed_at > NOW() - INTERVAL '1 hour'",
-                queue_filter,
-                if queue_filter.is_empty() {
-                    "WHERE"
-                } else {
-                    "AND"
-                }
-            );
-            let failed_row = sqlx::query(&failed_query).fetch_one(&pg_pool).await?;
-            let recent_failures: i64 = failed_row.try_get("count")?;
-
-            // Long-running jobs (running > 1 hour)
-            let long_running_query = format!(
-                "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} status = 'Running' AND started_at < NOW() - INTERVAL '1 hour'",
-                queue_filter,
-                if queue_filter.is_empty() {
-                    "WHERE"
-                } else {
-                    "AND"
-                }
-            );
-            let long_running_row = sqlx::query(&long_running_query).fetch_one(&pg_pool).await?;
-            let long_running: i64 = long_running_row.try_get("count")?;
-
-            // Add health metrics
-            health_table.add_row(vec![
-                "Total Jobs".to_string(),
-                total_jobs.to_string(),
-                if total_jobs < 10000 {
-                    "🟢 Good"
-                } else {
-                    "🟡 High"
-                }
-                .to_string(),
-            ]);
-
-            health_table.add_row(vec![
-                "Recent Failures (1h)".to_string(),
-                recent_failures.to_string(),
-                if recent_failures == 0 {
-                    "🟢 Good"
-                } else if recent_failures < 10 {
-                    "🟡 Moderate"
-                } else {
-                    "🔴 High"
-                }
-                .to_string(),
-            ]);
-
-            health_table.add_row(vec![
-                "Long-running Jobs (>1h)".to_string(),
-                long_running.to_string(),
-                if long_running == 0 {
-                    "🟢 Good"
-                } else if long_running < 5 {
-                    "🟡 Moderate"
-                } else {
-                    "🔴 High"
-                }
-                .to_string(),
-            ]);
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            // Similar implementation for MySQL with appropriate syntax
-            let total_query = format!(
-                "SELECT COUNT(*) as count FROM hammerwork_jobs{}",
-                queue_filter
-            );
-            let total_row = sqlx::query(&total_query).fetch_one(&mysql_pool).await?;
-            let total_jobs: i64 = total_row.try_get("count")?;
-
-            let failed_query = format!(
-                "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} failed_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)",
-                queue_filter,
-                if queue_filter.is_empty() {
-                    "WHERE"
-                } else {
-                    "AND"
-                }
-            );
-            let failed_row = sqlx::query(&failed_query).fetch_one(&mysql_pool).await?;
-            let recent_failures: i64 = failed_row.try_get("count")?;
-
-            let long_running_query = format!(
-                "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} status = 'Running' AND started_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)",
-                queue_filter,
-                if queue_filter.is_empty() {
-                    "WHERE"
-                } else {
-                    "AND"
-                }
-            );
-            let long_running_row = sqlx::query(&long_running_query)
-                .fetch_one(&mysql_pool)
-                .await?;
-            let long_running: i64 = long_running_row.try_get("count")?;
-
-            health_table.add_row(vec![
-                "Total Jobs".to_string(),
-                total_jobs.to_string(),
-                if total_jobs < 10000 {
-                    "🟢 Good"
-                } else {
-                    "🟡 High"
-                }
-                .to_string(),
-            ]);
-
-            health_table.add_row(vec![
-                "Recent Failures (1h)".to_string(),
-                recent_failures.to_string(),
-                if recent_failures == 0 {
-                    "🟢 Good"
-                } else if recent_failures < 10 {
-                    "🟡 Moderate"
-                } else {
-                    "🔴 High"
-                }
-                .to_string(),
-            ]);
-
-            health_table.add_row(vec![
-                "Long-running Jobs (>1h)".to_string(),
-                long_running.to_string(),
-                if long_running == 0 {
-                    "🟢 Good"
-                } else if long_running < 5 {
-                    "🟡 Moderate"
-                } else {
-                    "🔴 High"
-                }
-                .to_string(),
-            ]);
-        }
+    let backend = pool.backend();
+    let mut counts = [0i64; 3];
+    for (slot, metric) in counts.iter_mut().zip([
+        HealthMetric::Total,
+        HealthMetric::RecentFailures,
+        HealthMetric::LongRunning,
+    ]) {
+        let (sql, binds) = build_health_query(backend, metric, queue.as_deref());
+        *slot = fetch_i64(&pool, &sql, &binds, "count").await?;
     }
+    let [total_jobs, recent_failures, long_running] = counts;
+
+    health_table.add_row(vec![
+        "Total Jobs".to_string(),
+        total_jobs.to_string(),
+        if total_jobs < 10000 {
+            "🟢 Good"
+        } else {
+            "🟡 High"
+        }
+        .to_string(),
+    ]);
+
+    health_table.add_row(vec![
+        "Recent Failures (1h)".to_string(),
+        recent_failures.to_string(),
+        if recent_failures == 0 {
+            "🟢 Good"
+        } else if recent_failures < 10 {
+            "🟡 Moderate"
+        } else {
+            "🔴 High"
+        }
+        .to_string(),
+    ]);
+
+    health_table.add_row(vec![
+        "Long-running Jobs (>1h)".to_string(),
+        long_running.to_string(),
+        if long_running == 0 {
+            "🟢 Good"
+        } else if long_running < 5 {
+            "🟡 Moderate"
+        } else {
+            "🔴 High"
+        }
+        .to_string(),
+    ]);
 
     println!("🏥 Queue Health");
     if let Some(q) = &queue {
@@ -726,4 +672,118 @@ async fn list_paused_queues(pool: DatabasePool) -> Result<()> {
     println!("⏸️  Paused Queues");
     println!("{}", table);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::test_support::*;
+
+    #[test]
+    fn test_queue_total_and_detailed_queries_bind_queue_name() {
+        let (sql, binds) = build_queue_total_query(Backend::Postgres, Some(HOSTILE_QUEUE));
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) as total FROM hammerwork_jobs WHERE queue_name = $1"
+        );
+        assert_eq!(binds, vec![Bind::Text(HOSTILE_QUEUE.into())]);
+
+        let (sql, binds) = build_queue_total_query(Backend::MySql, None);
+        assert_eq!(sql, "SELECT COUNT(*) as total FROM hammerwork_jobs");
+        assert!(binds.is_empty());
+
+        let (sql, binds) = build_detailed_stats_query(Backend::MySql, Some(HOSTILE_QUEUE));
+        assert!(sql.contains("WHERE queue_name = ? GROUP BY status, priority"));
+        assert_eq!(binds, vec![Bind::Text(HOSTILE_QUEUE.into())]);
+        assert!(!sql.contains("DROP"));
+    }
+
+    #[test]
+    fn test_health_queries_bind_queue_then_window() {
+        let (sql, binds) = build_health_query(
+            Backend::Postgres,
+            HealthMetric::RecentFailures,
+            Some(HOSTILE_QUEUE),
+        );
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE queue_name = $1 AND failed_at > NOW() - make_interval(hours => $2::int)"
+        );
+        assert_eq!(binds, vec![Bind::Text(HOSTILE_QUEUE.into()), Bind::Int(1)]);
+
+        let (sql, binds) = build_health_query(
+            Backend::MySql,
+            HealthMetric::LongRunning,
+            Some(HOSTILE_QUEUE),
+        );
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE queue_name = ? AND status = 'Running' AND started_at < DATE_SUB(NOW(), INTERVAL ? HOUR)"
+        );
+        assert_eq!(binds.len(), 2);
+
+        let (sql, binds) = build_health_query(Backend::Postgres, HealthMetric::Total, None);
+        assert_eq!(sql, "SELECT COUNT(*) as count FROM hammerwork_jobs");
+        assert!(binds.is_empty());
+
+        let (sql, binds) = build_health_query(Backend::Postgres, HealthMetric::LongRunning, None);
+        assert!(sql.contains(
+            "WHERE status = 'Running' AND started_at < NOW() - make_interval(hours => $1::int)"
+        ));
+        assert_eq!(binds, vec![Bind::Int(1)]);
+    }
+
+    async fn queue_roundtrip(pool: DatabasePool) {
+        let hostile = hostile_queue();
+        let other = format!("other_{}", uuid::Uuid::new_v4().simple());
+        seed(&pool, &SeedJob::new(&hostile, "Pending")).await;
+        let mut failed = SeedJob::new(&hostile, "Failed");
+        failed.failed_now = true;
+        seed(&pool, &failed).await;
+        let mut running = SeedJob::new(&hostile, "Running");
+        running.started_long_ago = true;
+        seed(&pool, &running).await;
+        seed(&pool, &SeedJob::new(&other, "Pending")).await;
+
+        let backend = pool.backend();
+        let (sql, binds) = build_queue_total_query(backend, Some(&hostile));
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "total").await.unwrap(), 3);
+
+        let (sql, binds) = build_health_query(backend, HealthMetric::Total, Some(&hostile));
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 3);
+        let (sql, binds) =
+            build_health_query(backend, HealthMetric::RecentFailures, Some(&hostile));
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 1);
+        let (sql, binds) = build_health_query(backend, HealthMetric::LongRunning, Some(&hostile));
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 1);
+
+        let (sql, binds) = build_detailed_stats_query(backend, Some(&hostile));
+        let statuses = column_strings(&pool, &sql, &binds, "status").await;
+        assert_eq!(statuses, vec!["Failed", "Pending", "Running"]);
+
+        show_queue_stats(pool.clone(), Some(hostile.clone()), false)
+            .await
+            .unwrap();
+        show_queue_stats(pool.clone(), Some(hostile.clone()), true)
+            .await
+            .unwrap();
+        show_queue_health(pool.clone(), Some(hostile.clone()))
+            .await
+            .unwrap();
+
+        assert!(table_exists(&pool).await);
+        cleanup(&pool, &[&hostile, &other]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn test_queue_stats_and_health_are_injection_safe_postgres() {
+        queue_roundtrip(pg_pool().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MYSQL_DATABASE_URL"]
+    async fn test_queue_stats_and_health_are_injection_safe_mysql() {
+        queue_roundtrip(mysql_pool().await).await;
+    }
 }

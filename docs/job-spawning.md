@@ -97,10 +97,11 @@ Add spawn configuration to job payloads:
 use hammerwork::{Job, JobSpawnExt};
 use serde_json::json;
 
-// Method 1: Using JobSpawnExt trait
-let job = Job::new("large_dataset", json!({"dataset_id": "ds-123"}))
-    .with_spawn_handler("data_processor")
-    .with_spawn_config(spawn_config);
+// Method 1: Using JobSpawnExt trait. The configuration is stored in the payload under
+// `_spawn_config`, so the payload must be a JSON object; anything else is rejected with
+// `HammerworkError::InvalidJobPayload` instead of silently losing the configuration.
+let job = Job::new("large_dataset".to_string(), json!({"dataset_id": "ds-123"}))
+    .with_spawn_config(spawn_config)?;
 
 // Method 2: Manual payload configuration
 let job = Job::new(
@@ -118,6 +119,12 @@ let job = Job::new(
     })
 );
 ```
+
+Spawn configuration of encrypted jobs: the worker reads `_spawn_config` from the job's
+*decrypted* payload, so spawning works for encrypted jobs, and the spawn handler receives the
+decrypted parent. The stored row of a whole-payload-encrypted job holds only ciphertext, so
+`cargo hammerwork spawn list/stats/pending` (which query the payload in SQL) do not see
+encrypted jobs.
 
 ## Configuration Options
 

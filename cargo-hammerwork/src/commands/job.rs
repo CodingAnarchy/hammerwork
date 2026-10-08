@@ -11,6 +11,9 @@ use crate::utils::display::JobTable;
 use crate::utils::job_ops::{
     JobSelector, cancel_many, cancel_one, retry_many, retry_one, select_job_ids,
 };
+use crate::utils::sql::{
+    Backend, Bind, IntervalUnit, SqlParams, bind_mysql, bind_pg, execute_binds,
+};
 use crate::utils::validation::{validate_json_payload, validate_priority, validate_status};
 
 /// Statuses `job retry` re-runs (stored capitalized).
@@ -236,13 +239,6 @@ impl JobCommand {
     }
 }
 
-/// A bind parameter of the `job list` query.
-#[derive(Debug, Clone, PartialEq)]
-enum ListParam {
-    Text(String),
-    Int(i32),
-}
-
 /// The value the library stores in the `status` column for a CLI status name
 /// (`pending`, `timed_out`, ...). Expects a name accepted by `validate_status`.
 fn status_db_value(status: &str) -> &'static str {
@@ -259,7 +255,7 @@ fn status_db_value(status: &str) -> &'static str {
 }
 
 /// The display name of a stored integer priority.
-fn priority_display(priority: i32) -> String {
+pub fn priority_display(priority: i32) -> String {
     JobPriority::from_i32(priority)
         .map(|p| p.to_string())
         .unwrap_or_else(|_| priority.to_string())
@@ -271,7 +267,7 @@ fn priority_display(priority: i32) -> String {
 /// placeholders and MySQL syntax. Status names are mapped to the capitalized values the
 /// library stores and priorities to their integer column values.
 #[allow(clippy::too_many_arguments)]
-fn build_list_jobs_query(
+pub fn build_list_jobs_query(
     postgres: bool,
     queue: Option<&str>,
     status: Option<&str>,
@@ -280,28 +276,24 @@ fn build_list_jobs_query(
     failed: bool,
     completed: bool,
     last_hours: Option<u32>,
-) -> (String, Vec<ListParam>) {
+) -> (String, Vec<Bind>) {
     let mut conditions = Vec::new();
-    let mut params = Vec::new();
-    let placeholder = |params: &mut Vec<ListParam>, param: ListParam| {
-        params.push(param);
-        if postgres {
-            format!("${}", params.len())
-        } else {
-            "?".to_string()
-        }
-    };
+    let mut params = SqlParams::new(if postgres {
+        Backend::Postgres
+    } else {
+        Backend::MySql
+    });
 
     if let Some(queue_name) = queue {
-        let p = placeholder(&mut params, ListParam::Text(queue_name.to_string()));
+        let p = params.text(queue_name);
         conditions.push(format!("queue_name = {p}"));
     }
     if let Some(status) = status {
-        let p = placeholder(&mut params, ListParam::Text(status_db_value(status).into()));
+        let p = params.text(status_db_value(status));
         conditions.push(format!("status = {p}"));
     }
     if let Some(priority) = priority {
-        let p = placeholder(&mut params, ListParam::Int(priority.as_i32()));
+        let p = params.int(i64::from(priority.as_i32()));
         conditions.push(format!("priority = {p}"));
     }
     if failed {
@@ -311,19 +303,39 @@ fn build_list_jobs_query(
         conditions.push("status = 'Completed'".to_string());
     }
     if let Some(hours) = last_hours {
-        conditions.push(if postgres {
-            format!("created_at > NOW() - INTERVAL '{hours} hours'")
-        } else {
-            format!("created_at > DATE_SUB(NOW(), INTERVAL {hours} HOUR)")
-        });
+        let since = params.ago(hours, IntervalUnit::Hour);
+        conditions.push(format!("created_at > {since}"));
     }
 
     let mut query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs".to_string();
     if !conditions.is_empty() {
         query.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
     }
-    query.push_str(&format!(" ORDER BY created_at DESC LIMIT {limit}"));
-    (query, params)
+    let limit_clause = params.limit(limit);
+    query.push_str(&format!(" ORDER BY created_at DESC {limit_clause}"));
+    (query, params.into_binds())
+}
+
+/// The `DELETE` behind `job purge`. `status_condition` must be built from constant status
+/// names; the queue name and age are bound.
+pub fn build_purge_query(
+    backend: Backend,
+    status_condition: &str,
+    queue: Option<&str>,
+    older_than_days: Option<u32>,
+) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let mut query = format!("DELETE FROM hammerwork_jobs WHERE {status_condition}");
+    if let Some(queue_name) = queue {
+        query.push_str(&format!(" AND queue_name = {}", params.text(queue_name)));
+    }
+    if let Some(days) = older_than_days {
+        query.push_str(&format!(
+            " AND created_at < {}",
+            params.ago(days, IntervalUnit::Day)
+        ));
+    }
+    (query, params.into_binds())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -357,15 +369,9 @@ async fn list_jobs(
                 completed,
                 last_hours,
             );
-            let mut sql = sqlx::query(&query);
-            for param in params {
-                sql = match param {
-                    ListParam::Text(s) => sql.bind(s),
-                    ListParam::Int(i) => sql.bind(i),
-                };
-            }
-
-            let rows = sql.fetch_all(&pg_pool).await?;
+            let rows = bind_pg(sqlx::query(&query), &params)
+                .fetch_all(&pg_pool)
+                .await?;
             for row in rows {
                 let id: uuid::Uuid = row.try_get("id")?;
                 let queue_name: String = row.try_get("queue_name")?;
@@ -397,15 +403,9 @@ async fn list_jobs(
                 completed,
                 last_hours,
             );
-            let mut sql = sqlx::query(&query);
-            for param in params {
-                sql = match param {
-                    ListParam::Text(s) => sql.bind(s),
-                    ListParam::Int(i) => sql.bind(i),
-                };
-            }
-
-            let rows = sql.fetch_all(&mysql_pool).await?;
+            let rows = bind_mysql(sqlx::query(&query), &params)
+                .fetch_all(&mysql_pool)
+                .await?;
             for row in rows {
                 let id: String = row.try_get("id")?;
                 let queue_name: String = row.try_get("queue_name")?;
@@ -724,7 +724,7 @@ async fn retry_jobs(
             JobSelector {
                 statuses: RETRYABLE_STATUSES.to_vec(),
                 queue: Some(queue_name),
-                extra: Vec::new(),
+                ..Default::default()
             },
         ),
         None => (
@@ -780,7 +780,7 @@ async fn cancel_jobs(
             JobSelector {
                 statuses: vec![JobStatus::Pending],
                 queue: Some(queue_name),
-                extra: Vec::new(),
+                ..Default::default()
             },
         ),
         None => (
@@ -832,48 +832,13 @@ async fn purge_jobs(
     }
     let status_condition = format!("status IN ({})", statuses.join(", "));
 
-    let affected = match pool {
-        DatabasePool::Postgres(ref pg_pool) => {
-            let mut query = format!("DELETE FROM hammerwork_jobs WHERE {}", status_condition);
-
-            if queue.is_some() {
-                query.push_str(" AND queue_name = $1");
-            }
-
-            if let Some(days) = older_than_days {
-                query.push_str(&format!(
-                    " AND created_at < NOW() - INTERVAL '{} days'",
-                    days
-                ));
-            }
-
-            let mut q = sqlx::query(&query);
-            if let Some(queue_name) = &queue {
-                q = q.bind(queue_name);
-            }
-            q.execute(pg_pool).await?.rows_affected()
-        }
-        DatabasePool::MySQL(ref mysql_pool) => {
-            let mut query = format!("DELETE FROM hammerwork_jobs WHERE {}", status_condition);
-
-            if queue.is_some() {
-                query.push_str(" AND queue_name = ?");
-            }
-
-            if let Some(days) = older_than_days {
-                query.push_str(&format!(
-                    " AND created_at < DATE_SUB(NOW(), INTERVAL {} DAY)",
-                    days
-                ));
-            }
-
-            let mut q = sqlx::query(&query);
-            if let Some(queue_name) = &queue {
-                q = q.bind(queue_name);
-            }
-            q.execute(mysql_pool).await?.rows_affected()
-        }
-    };
+    let (query, binds) = build_purge_query(
+        pool.backend(),
+        &status_condition,
+        queue.as_deref(),
+        older_than_days,
+    );
+    let affected = execute_binds(&pool, &query, &binds).await?;
 
     info!("✅ Purged {} jobs", affected);
     Ok(())
@@ -882,6 +847,8 @@ async fn purge_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::sql::fetch_i64;
+    use crate::utils::test_support::*;
     use clap::Parser;
 
     #[test]
@@ -961,14 +928,17 @@ mod tests {
             query,
             "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at \
              FROM hammerwork_jobs WHERE queue_name = $1 AND status = $2 AND priority = $3 \
-             AND created_at > NOW() - INTERVAL '2 hours' ORDER BY created_at DESC LIMIT 25"
+             AND created_at > NOW() - make_interval(hours => $4::int) \
+             ORDER BY created_at DESC LIMIT $5"
         );
         assert_eq!(
             params,
             vec![
-                ListParam::Text("emails".into()),
-                ListParam::Text("TimedOut".into()),
-                ListParam::Int(3),
+                Bind::Text("emails".into()),
+                Bind::Text("TimedOut".into()),
+                Bind::Int(3),
+                Bind::Int(2),
+                Bind::Int(25),
             ]
         );
     }
@@ -987,14 +957,133 @@ mod tests {
         );
         assert!(query.contains("queue_name = ?"));
         assert!(query.contains("status IN ('Failed', 'Dead')"));
-        assert!(query.contains("DATE_SUB(NOW(), INTERVAL 1 HOUR)"));
+        assert!(query.contains("DATE_SUB(NOW(), INTERVAL ? HOUR)"));
         // User input is bound, never interpolated
         assert!(!query.contains("DROP"));
-        assert_eq!(params, vec![ListParam::Text("q'; DROP".into())]);
+        assert_eq!(
+            params,
+            vec![Bind::Text("q'; DROP".into()), Bind::Int(1), Bind::Int(10)]
+        );
 
         let (query, params) = build_list_jobs_query(false, None, None, None, 5, false, true, None);
-        assert!(query.ends_with("WHERE status = 'Completed' ORDER BY created_at DESC LIMIT 5"));
-        assert!(params.is_empty());
+        assert!(query.ends_with("WHERE status = 'Completed' ORDER BY created_at DESC LIMIT ?"));
+        assert_eq!(params, vec![Bind::Int(5)]);
+    }
+
+    #[test]
+    fn test_purge_query_binds_queue_and_age() {
+        let (query, binds) = build_purge_query(
+            Backend::Postgres,
+            "status IN ('Completed')",
+            Some(HOSTILE_QUEUE),
+            Some(7),
+        );
+        assert_eq!(
+            query,
+            "DELETE FROM hammerwork_jobs WHERE status IN ('Completed') AND queue_name = $1 \
+             AND created_at < NOW() - make_interval(days => $2::int)"
+        );
+        assert_eq!(binds, vec![Bind::Text(HOSTILE_QUEUE.into()), Bind::Int(7)]);
+
+        let (query, binds) = build_purge_query(
+            Backend::MySql,
+            "status IN ('Dead')",
+            Some(HOSTILE_QUEUE),
+            Some(3),
+        );
+        assert_eq!(
+            query,
+            "DELETE FROM hammerwork_jobs WHERE status IN ('Dead') AND queue_name = ? \
+             AND created_at < DATE_SUB(NOW(), INTERVAL ? DAY)"
+        );
+        assert_eq!(binds.len(), 2);
+
+        let (query, binds) = build_purge_query(Backend::MySql, "status IN ('Dead')", None, None);
+        assert_eq!(
+            query,
+            "DELETE FROM hammerwork_jobs WHERE status IN ('Dead')"
+        );
+        assert!(binds.is_empty());
+    }
+
+    async fn job_roundtrip(pool: DatabasePool) {
+        let hostile = hostile_queue();
+        let other = format!("other_{}", uuid::Uuid::new_v4().simple());
+        seed(&pool, &SeedJob::new(&hostile, "Pending")).await;
+        seed(&pool, &SeedJob::new(&hostile, "Completed")).await;
+        seed(&pool, &SeedJob::new(&hostile, "Completed")).await;
+        seed(&pool, &SeedJob::new(&other, "Completed")).await;
+
+        let backend = pool.backend();
+        let (query, binds) = build_list_jobs_query(
+            backend == Backend::Postgres,
+            Some(&hostile),
+            Some("completed"),
+            None,
+            1,
+            false,
+            false,
+            Some(1),
+        );
+        let queues = column_strings(&pool, &query, &binds, "queue_name").await;
+        assert_eq!(queues, vec![hostile.clone()]); // LIMIT 1, only the hostile queue
+        list_jobs(
+            pool.clone(),
+            Some(hostile.clone()),
+            None,
+            None,
+            10,
+            false,
+            false,
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+        // Nothing is a day old yet: the age filter keeps every job
+        purge_jobs(
+            pool.clone(),
+            Some(hostile.clone()),
+            true,
+            false,
+            false,
+            Some(1),
+            true,
+        )
+        .await
+        .unwrap();
+        let (sql, binds) = crate::commands::queue::build_queue_total_query(backend, Some(&hostile));
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "total").await.unwrap(), 3);
+        // Purge only touches the hostile queue's completed jobs
+        purge_jobs(
+            pool.clone(),
+            Some(hostile.clone()),
+            true,
+            false,
+            false,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "total").await.unwrap(), 1);
+        let (sql, binds) = crate::commands::queue::build_queue_total_query(backend, Some(&other));
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "total").await.unwrap(), 1);
+
+        assert!(table_exists(&pool).await);
+        cleanup(&pool, &[&hostile, &other]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn test_job_list_and_purge_are_injection_safe_postgres() {
+        job_roundtrip(pg_pool().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MYSQL_DATABASE_URL"]
+    async fn test_job_list_and_purge_are_injection_safe_mysql() {
+        job_roundtrip(mysql_pool().await).await;
     }
 
     #[test]

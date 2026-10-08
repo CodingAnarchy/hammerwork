@@ -6,8 +6,10 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use tracing::info;
 
+use crate::commands::job::priority_display;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
+use crate::utils::sql::{Backend, Bind, SqlParams, bind_mysql, bind_pg};
 
 #[derive(Subcommand)]
 pub enum BackupCommand {
@@ -118,6 +120,63 @@ impl BackupCommand {
     }
 }
 
+/// The `SELECT` that gathers the jobs to back up. The queue name is bound, never interpolated.
+pub fn build_backup_query(
+    backend: Backend,
+    queue: Option<&str>,
+    include_completed: bool,
+    include_failed: bool,
+) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let mut query = "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, failed_at, error_message FROM hammerwork_jobs WHERE 1=1".to_string();
+    let mut conditions = Vec::new();
+
+    if let Some(queue_name) = queue {
+        conditions.push(format!("queue_name = {}", params.text(queue_name)));
+    }
+    if !include_completed {
+        conditions.push("status != 'Completed'".to_string());
+    }
+    if !include_failed {
+        conditions.push("status != 'Failed'".to_string());
+    }
+    if !conditions.is_empty() {
+        query.push_str(&format!(" AND {}", conditions.join(" AND ")));
+    }
+    query.push_str(" ORDER BY created_at ASC");
+    (query, params.into_binds())
+}
+
+async fn fetch_backup_jobs(
+    pool: &DatabasePool,
+    queue: Option<&str>,
+    include_completed: bool,
+    include_failed: bool,
+) -> Result<Vec<JobData>> {
+    let (query, binds) =
+        build_backup_query(pool.backend(), queue, include_completed, include_failed);
+    info!("Creating backup with query: {}", query);
+
+    match pool {
+        DatabasePool::Postgres(pg_pool) => {
+            let rows = bind_pg(sqlx::query(&query), &binds)
+                .fetch_all(pg_pool)
+                .await?;
+            rows.into_iter()
+                .map(|row| extract_job_data_postgres(&row))
+                .collect()
+        }
+        DatabasePool::MySQL(mysql_pool) => {
+            let rows = bind_mysql(sqlx::query(&query), &binds)
+                .fetch_all(mysql_pool)
+                .await?;
+            rows.into_iter()
+                .map(|row| extract_job_data_mysql(&row))
+                .collect()
+        }
+    }
+}
+
 async fn create_backup(
     database_url: &str,
     output: &str,
@@ -129,45 +188,8 @@ async fn create_backup(
 ) -> Result<()> {
     let pool = DatabasePool::connect(database_url, pool_size).await?;
 
-    // Build query based on filters
-    let mut query = "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, failed_at, error_message FROM hammerwork_jobs WHERE 1=1".to_string();
-    let mut conditions = Vec::new();
-
-    if let Some(queue_name) = &queue {
-        conditions.push(format!("queue_name = '{}'", queue_name));
-    }
-
-    if !include_completed {
-        conditions.push("status != 'Completed'".to_string());
-    }
-
-    if !include_failed {
-        conditions.push("status != 'Failed'".to_string());
-    }
-
-    if !conditions.is_empty() {
-        query.push_str(&format!(" AND {}", conditions.join(" AND ")));
-    }
-
-    query.push_str(" ORDER BY created_at ASC");
-
-    info!("Creating backup with query: {}", query);
-
-    // Execute query and extract data based on database type
-    let job_data = match &pool {
-        DatabasePool::Postgres(pg_pool) => {
-            let rows = sqlx::query(&query).fetch_all(pg_pool).await?;
-            rows.into_iter()
-                .map(|row| extract_job_data_postgres(&row))
-                .collect::<Result<Vec<_>>>()?
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            let rows = sqlx::query(&query).fetch_all(mysql_pool).await?;
-            rows.into_iter()
-                .map(|row| extract_job_data_mysql(&row))
-                .collect::<Result<Vec<_>>>()?
-        }
-    };
+    let job_data =
+        fetch_backup_jobs(&pool, queue.as_deref(), include_completed, include_failed).await?;
 
     info!("Found {} jobs to backup", job_data.len());
 
@@ -231,11 +253,11 @@ async fn create_backup(
 
 fn extract_job_data_postgres(row: &sqlx::postgres::PgRow) -> Result<JobData> {
     Ok(JobData {
-        id: row.try_get("id")?,
+        id: row.try_get::<uuid::Uuid, _>("id")?.to_string(),
         queue_name: row.try_get("queue_name")?,
         payload: row.try_get("payload")?,
         status: row.try_get("status")?,
-        priority: row.try_get("priority")?,
+        priority: priority_display(row.try_get("priority")?),
         attempts: row.try_get("attempts")?,
         max_attempts: row.try_get("max_attempts")?,
         created_at: row.try_get("created_at")?,
@@ -253,7 +275,7 @@ fn extract_job_data_mysql(row: &sqlx::mysql::MySqlRow) -> Result<JobData> {
         queue_name: row.try_get("queue_name")?,
         payload: row.try_get("payload")?,
         status: row.try_get("status")?,
-        priority: row.try_get("priority")?,
+        priority: priority_display(row.try_get("priority")?),
         attempts: row.try_get("attempts")?,
         max_attempts: row.try_get("max_attempts")?,
         created_at: row.try_get("created_at")?,
@@ -588,5 +610,55 @@ mod tests {
     fn test_parse_backup_job_requires_id_and_queue() {
         assert!(parse_backup_job(&serde_json::json!({"queue_name": "q"})).is_err());
         assert!(parse_backup_job(&serde_json::json!({"id": "abc"})).is_err());
+    }
+
+    use crate::utils::test_support::*;
+
+    #[test]
+    fn test_backup_query_binds_queue_name() {
+        let (sql, binds) = build_backup_query(Backend::Postgres, Some(HOSTILE_QUEUE), false, true);
+        assert!(sql.contains("AND queue_name = $1 AND status != 'Completed' ORDER BY"));
+        assert_eq!(binds, vec![Bind::Text(HOSTILE_QUEUE.into())]);
+        assert!(!sql.contains("DROP"));
+
+        let (sql, binds) = build_backup_query(Backend::MySql, Some(HOSTILE_QUEUE), true, true);
+        assert!(sql.contains("WHERE 1=1 AND queue_name = ? ORDER BY created_at ASC"));
+        assert_eq!(binds.len(), 1);
+
+        let (sql, binds) = build_backup_query(Backend::MySql, None, true, true);
+        assert!(!sql.contains('?') && binds.is_empty());
+    }
+
+    async fn backup_roundtrip(pool: DatabasePool) {
+        let hostile = hostile_queue();
+        let other = format!("other_{}", uuid::Uuid::new_v4().simple());
+        seed(&pool, &SeedJob::new(&hostile, "Pending")).await;
+        seed(&pool, &SeedJob::new(&hostile, "Completed")).await;
+        seed(&pool, &SeedJob::new(&other, "Pending")).await;
+
+        let jobs = fetch_backup_jobs(&pool, Some(&hostile), true, true)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|j| j.queue_name == hostile));
+        let jobs = fetch_backup_jobs(&pool, Some(&hostile), false, true)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+
+        assert!(table_exists(&pool).await);
+        cleanup(&pool, &[&hostile, &other]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn test_backup_queue_filter_is_injection_safe_postgres() {
+        backup_roundtrip(pg_pool().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MYSQL_DATABASE_URL"]
+    async fn test_backup_queue_filter_is_injection_safe_mysql() {
+        backup_roundtrip(mysql_pool().await).await;
     }
 }

@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
+use crate::utils::sql::{Backend, Bind, IntervalUnit, SqlParams, bind_mysql, bind_pg};
 
 #[derive(Debug, Clone)]
 pub struct SpawnNode {
@@ -27,6 +28,158 @@ pub struct SpawnOperation {
     pub spawned_at: String,
     pub operation_id: Option<String>,
     pub config: Option<Value>,
+}
+
+/// The `WHERE` condition that marks a parent job as having a spawn config.
+fn spawn_config_condition(backend: Backend, column: &str) -> String {
+    match backend {
+        Backend::Postgres => format!("{column} ? '_spawn_config'"),
+        Backend::MySql => format!("JSON_EXTRACT({column}, '$._spawn_config') IS NOT NULL"),
+    }
+}
+
+/// `child` rows that depend on `parent`.
+fn spawn_child_join(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Postgres => "child.depends_on @> ARRAY[parent.id]",
+        Backend::MySql => "JSON_CONTAINS(child.depends_on, CONCAT('\"', parent.id, '\"'))",
+    }
+}
+
+/// ` AND parent.queue_name = <bound>` when a queue filter is given. Always qualified with
+/// `parent.` because the queries join `hammerwork_jobs` to itself.
+fn spawn_queue_clause(params: &mut SqlParams, queue: Option<&str>) -> String {
+    match queue {
+        Some(q) => format!(" AND parent.queue_name = {}", params.text(q)),
+        None => String::new(),
+    }
+}
+
+/// `spawn list`: parents with a spawn config and their child counts. Window, queue name and
+/// limit are all bound, in that order.
+pub fn build_spawn_list_query(
+    backend: Backend,
+    queue: Option<&str>,
+    recent: bool,
+    limit: u32,
+) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let config_cond = spawn_config_condition(backend, "parent.payload");
+    let config_select = match backend {
+        Backend::Postgres => "parent.payload->'_spawn_config'",
+        Backend::MySql => "JSON_EXTRACT(parent.payload, '$._spawn_config')",
+    };
+    let join = spawn_child_join(backend);
+    let recent_clause = if recent {
+        format!(
+            " AND parent.created_at > {}",
+            params.ago(1, IntervalUnit::Hour)
+        )
+    } else {
+        String::new()
+    };
+    let queue_clause = spawn_queue_clause(&mut params, queue);
+    let limit_clause = params.limit(limit);
+    let sql = format!(
+        "SELECT parent.id as parent_id, parent.queue_name, parent.created_at, \
+         {config_select} as spawn_config, \
+         COUNT(child.id) as spawned_count, \
+         parent.workflow_id, parent.workflow_name \
+         FROM hammerwork_jobs parent \
+         LEFT JOIN hammerwork_jobs child ON {join} \
+         WHERE {config_cond} AND parent.status IN ('Completed', 'Running'){recent_clause}{queue_clause} \
+         GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload, parent.workflow_id, parent.workflow_name \
+         ORDER BY parent.created_at DESC {limit_clause}"
+    );
+    (sql, params.into_binds())
+}
+
+/// `spawn stats`: totals over the last `hours`. Window, then queue name, are bound.
+pub fn build_spawn_stats_total_query(
+    backend: Backend,
+    hours: u32,
+    queue: Option<&str>,
+) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let config_cond = spawn_config_condition(backend, "parent.payload");
+    let join = spawn_child_join(backend);
+    let avg = match backend {
+        Backend::Postgres => "CAST(AVG(spawned_count) AS DOUBLE PRECISION)",
+        Backend::MySql => "CAST(AVG(spawned_count) AS DOUBLE)",
+    };
+    let since = params.ago(hours, IntervalUnit::Hour);
+    let queue_clause = spawn_queue_clause(&mut params, queue);
+    let sql = format!(
+        "SELECT COUNT(*) as total_spawn_ops, {avg} as avg_children, MAX(spawned_count) as max_children \
+         FROM ( \
+           SELECT parent.id, COUNT(child.id) as spawned_count \
+           FROM hammerwork_jobs parent \
+           LEFT JOIN hammerwork_jobs child ON {join} \
+           WHERE {config_cond} AND parent.created_at > {since}{queue_clause} \
+           GROUP BY parent.id \
+         ) spawn_stats"
+    );
+    (sql, params.into_binds())
+}
+
+/// `spawn stats --detailed`: per-queue breakdown over the last `hours`.
+pub fn build_spawn_stats_breakdown_query(
+    backend: Backend,
+    hours: u32,
+    queue: Option<&str>,
+) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let config_cond = spawn_config_condition(backend, "parent.payload");
+    let join = spawn_child_join(backend);
+    let avg = match backend {
+        Backend::Postgres => "CAST(AVG(spawned_count) AS DOUBLE PRECISION)",
+        Backend::MySql => "CAST(AVG(spawned_count) AS DOUBLE)",
+    };
+    let since = params.ago(hours, IntervalUnit::Hour);
+    let queue_clause = spawn_queue_clause(&mut params, queue);
+    let sql = format!(
+        "SELECT queue_name, COUNT(*) as spawn_count, {avg} as avg_children \
+         FROM ( \
+           SELECT parent.queue_name, COUNT(child.id) as spawned_count \
+           FROM hammerwork_jobs parent \
+           LEFT JOIN hammerwork_jobs child ON {join} \
+           WHERE {config_cond} AND parent.created_at > {since}{queue_clause} \
+           GROUP BY parent.id, parent.queue_name \
+         ) spawn_breakdown \
+         GROUP BY queue_name ORDER BY spawn_count DESC"
+    );
+    (sql, params.into_binds())
+}
+
+/// `spawn pending`: running or pending jobs that carry a spawn config (at most 50).
+pub fn build_pending_spawns_query(backend: Backend, queue: Option<&str>) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let config_cond = spawn_config_condition(backend, "payload");
+    let config_select = match backend {
+        Backend::Postgres => "payload->'_spawn_config'",
+        Backend::MySql => "JSON_EXTRACT(payload, '$._spawn_config')",
+    };
+    let queue_clause = match queue {
+        Some(q) => format!(" AND queue_name = {}", params.text(q)),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT id, queue_name, status, created_at, {config_select} as spawn_config \
+         FROM hammerwork_jobs \
+         WHERE {config_cond} AND status IN ('Running', 'Pending'){queue_clause} \
+         ORDER BY created_at DESC LIMIT 50"
+    );
+    (sql, params.into_binds())
+}
+
+/// The `spawn_config` column of a MySQL row as JSON text. `JSON_EXTRACT` yields a native
+/// JSON value, which sqlx will not decode as a string, so try both.
+fn mysql_spawn_config_text(row: &sqlx::mysql::MySqlRow) -> Result<Option<String>> {
+    use sqlx::Row;
+    match row.try_get::<Option<Value>, _>("spawn_config") {
+        Ok(value) => Ok(value.map(|v| v.to_string())),
+        Err(_) => Ok(row.try_get::<Option<String>, _>("spawn_config")?),
+    }
 }
 
 #[derive(Subcommand)]
@@ -184,39 +337,13 @@ impl SpawnCommand {
         queue_filter: Option<&str>,
     ) -> Result<()> {
         let limit = limit.unwrap_or(20);
-        let time_filter = if recent {
-            "AND created_at > NOW() - INTERVAL '1 hour'"
-        } else {
-            ""
-        };
-
-        let queue_clause = if let Some(queue) = queue_filter {
-            format!("AND queue_name = '{}'", queue)
-        } else {
-            String::new()
-        };
-
-        let query = format!(
-            r#"
-            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
-                   parent.payload->'_spawn_config' as spawn_config,
-                   COUNT(child.id) as spawned_count,
-                   parent.workflow_id, parent.workflow_name
-            FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
-            WHERE parent.payload ? '_spawn_config' 
-                  AND parent.status IN ('Completed', 'Running')
-                  {} {}
-            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload, parent.workflow_id, parent.workflow_name
-            ORDER BY parent.created_at DESC
-            LIMIT {}
-            "#,
-            time_filter, queue_clause, limit
-        );
+        let (query, binds) = build_spawn_list_query(pool.backend(), queue_filter, recent, limit);
 
         match pool {
             DatabasePool::Postgres(pg_pool) => {
-                let rows = sqlx::query(&query).fetch_all(&pg_pool).await?;
+                let rows = bind_pg(sqlx::query(&query), &binds)
+                    .fetch_all(&pg_pool)
+                    .await?;
 
                 println!("📊 Spawn Operations");
                 println!("{}", "=".repeat(80));
@@ -262,33 +389,9 @@ impl SpawnCommand {
                 }
             }
             DatabasePool::MySQL(mysql_pool) => {
-                // MySQL-compatible query using JSON functions
-                let mysql_query = format!(
-                    r#"
-                    SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
-                           JSON_EXTRACT(parent.payload, '$._spawn_config') as spawn_config,
-                           COUNT(child.id) as spawned_count,
-                           parent.workflow_id, parent.workflow_name
-                    FROM hammerwork_jobs parent
-                    LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
-                    WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
-                          AND parent.status IN ('Completed', 'Running')
-                          {}
-                          {}
-                    GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload, parent.workflow_id, parent.workflow_name
-                    ORDER BY parent.created_at DESC
-                    LIMIT {}
-                    "#,
-                    if recent {
-                        "AND parent.created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)"
-                    } else {
-                        ""
-                    },
-                    queue_clause,
-                    limit
-                );
-
-                let rows = sqlx::query(&mysql_query).fetch_all(&mysql_pool).await?;
+                let rows = bind_mysql(sqlx::query(&query), &binds)
+                    .fetch_all(&mysql_pool)
+                    .await?;
 
                 println!("📊 Spawn Operations");
                 println!("{}", "=".repeat(80));
@@ -310,7 +413,7 @@ impl SpawnCommand {
                     let queue_name: String = row.try_get("queue_name")?;
                     let spawned_count: i64 = row.try_get("spawned_count")?;
                     let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-                    let spawn_config_str: Option<String> = row.try_get("spawn_config")?;
+                    let spawn_config_str: Option<String> = mysql_spawn_config_text(&row)?;
 
                     let operation_id = spawn_config_str
                         .as_ref()
@@ -395,38 +498,20 @@ impl SpawnCommand {
     ) -> Result<()> {
         let hours = hours.unwrap_or(24);
 
-        let queue_clause = if let Some(queue) = queue_filter {
-            format!("AND queue_name = '{}'", queue)
-        } else {
-            String::new()
-        };
-
         println!("📈 Spawn Statistics (Last {} hours)", hours);
         println!("{}", "=".repeat(60));
 
+        let pool_backend = pool.backend();
         match pool {
             DatabasePool::Postgres(pg_pool) => {
                 // Total spawn operations
-                let total_query = format!(
-                    r#"
-                    SELECT COUNT(*) as total_spawn_ops,
-                           CAST(AVG(spawned_count) AS DOUBLE PRECISION) as avg_children,
-                           MAX(spawned_count) as max_children
-                    FROM (
-                        SELECT parent.id, COUNT(child.id) as spawned_count
-                        FROM hammerwork_jobs parent
-                        LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
-                        WHERE parent.payload ? '_spawn_config'
-                              AND parent.created_at > NOW() - INTERVAL '{} hours'
-                              {}
-                        GROUP BY parent.id
-                    ) spawn_stats
-                    "#,
-                    hours, queue_clause
-                );
+                let (total_query, total_binds) =
+                    build_spawn_stats_total_query(pool_backend, hours, queue_filter);
 
                 {
-                    let row = sqlx::query(&total_query).fetch_one(&pg_pool).await?;
+                    let row = bind_pg(sqlx::query(&total_query), &total_binds)
+                        .fetch_one(&pg_pool)
+                        .await?;
                     use sqlx::Row;
                     let total: i64 = row.try_get("total_spawn_ops")?;
                     let avg: Option<f64> = row.try_get("avg_children")?;
@@ -443,27 +528,12 @@ impl SpawnCommand {
 
                 if detailed {
                     println!("\n📋 Breakdown by Queue:");
-                    let breakdown_query = format!(
-                        r#"
-                        SELECT queue_name, 
-                               COUNT(*) as spawn_count,
-                               CAST(AVG(spawned_count) AS DOUBLE PRECISION) as avg_children
-                        FROM (
-                            SELECT parent.queue_name, COUNT(child.id) as spawned_count
-                            FROM hammerwork_jobs parent
-                            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
-                            WHERE parent.payload ? '_spawn_config'
-                                  AND parent.created_at > NOW() - INTERVAL '{} hours'
-                                  {}
-                            GROUP BY parent.id, parent.queue_name
-                        ) spawn_breakdown
-                        GROUP BY queue_name
-                        ORDER BY spawn_count DESC
-                        "#,
-                        hours, queue_clause
-                    );
+                    let (breakdown_query, breakdown_binds) =
+                        build_spawn_stats_breakdown_query(pool_backend, hours, queue_filter);
 
-                    let rows = sqlx::query(&breakdown_query).fetch_all(&pg_pool).await?;
+                    let rows = bind_pg(sqlx::query(&breakdown_query), &breakdown_binds)
+                        .fetch_all(&pg_pool)
+                        .await?;
 
                     println!(
                         "{:<20} {:<12} {:<15}",
@@ -488,26 +558,13 @@ impl SpawnCommand {
             }
             DatabasePool::MySQL(mysql_pool) => {
                 // Total spawn operations - MySQL compatible
-                let total_query = format!(
-                    r#"
-                    SELECT COUNT(*) as total_spawn_ops,
-                           CAST(AVG(spawned_count) AS DOUBLE) as avg_children,
-                           MAX(spawned_count) as max_children
-                    FROM (
-                        SELECT parent.id, COUNT(child.id) as spawned_count
-                        FROM hammerwork_jobs parent
-                        LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
-                        WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
-                              AND parent.created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)
-                              {}
-                        GROUP BY parent.id
-                    ) spawn_stats
-                    "#,
-                    hours, queue_clause
-                );
+                let (total_query, total_binds) =
+                    build_spawn_stats_total_query(pool_backend, hours, queue_filter);
 
                 {
-                    let row = sqlx::query(&total_query).fetch_one(&mysql_pool).await?;
+                    let row = bind_mysql(sqlx::query(&total_query), &total_binds)
+                        .fetch_one(&mysql_pool)
+                        .await?;
                     use sqlx::Row;
                     let total: i64 = row.try_get("total_spawn_ops")?;
                     let avg: Option<f64> = row.try_get("avg_children")?;
@@ -524,27 +581,12 @@ impl SpawnCommand {
 
                 if detailed {
                     println!("\n📋 Breakdown by Queue:");
-                    let breakdown_query = format!(
-                        r#"
-                        SELECT queue_name, 
-                               COUNT(*) as spawn_count,
-                               CAST(AVG(spawned_count) AS DOUBLE) as avg_children
-                        FROM (
-                            SELECT parent.queue_name, COUNT(child.id) as spawned_count
-                            FROM hammerwork_jobs parent
-                            LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
-                            WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
-                                  AND parent.created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)
-                                  {}
-                            GROUP BY parent.id, parent.queue_name
-                        ) spawn_breakdown
-                        GROUP BY queue_name
-                        ORDER BY spawn_count DESC
-                        "#,
-                        hours, queue_clause
-                    );
+                    let (breakdown_query, breakdown_binds) =
+                        build_spawn_stats_breakdown_query(pool_backend, hours, queue_filter);
 
-                    let rows = sqlx::query(&breakdown_query).fetch_all(&mysql_pool).await?;
+                    let rows = bind_mysql(sqlx::query(&breakdown_query), &breakdown_binds)
+                        .fetch_all(&mysql_pool)
+                        .await?;
 
                     println!(
                         "{:<20} {:<12} {:<15}",
@@ -643,32 +685,16 @@ impl SpawnCommand {
         queue_filter: Option<&str>,
         show_config: bool,
     ) -> Result<()> {
-        let queue_clause = if let Some(queue) = queue_filter {
-            format!("AND queue_name = '{}'", queue)
-        } else {
-            String::new()
-        };
+        let (query, binds) = build_pending_spawns_query(pool.backend(), queue_filter);
 
         println!("⏳ Jobs with Pending Spawn Operations");
         println!("{}", "=".repeat(70));
 
         match pool {
             DatabasePool::Postgres(pg_pool) => {
-                let query = format!(
-                    r#"
-                    SELECT id, queue_name, status, created_at, 
-                           payload->'_spawn_config' as spawn_config
-                    FROM hammerwork_jobs
-                    WHERE payload ? '_spawn_config'
-                          AND status IN ('Running', 'Pending')
-                          {}
-                    ORDER BY created_at DESC
-                    LIMIT 50
-                    "#,
-                    queue_clause
-                );
-
-                let rows = sqlx::query(&query).fetch_all(&pg_pool).await?;
+                let rows = bind_pg(sqlx::query(&query), &binds)
+                    .fetch_all(&pg_pool)
+                    .await?;
 
                 if rows.is_empty() {
                     println!("No jobs with pending spawn operations found.");
@@ -704,21 +730,9 @@ impl SpawnCommand {
                 }
             }
             DatabasePool::MySQL(mysql_pool) => {
-                let query = format!(
-                    r#"
-                    SELECT id, queue_name, status, created_at, 
-                           JSON_EXTRACT(payload, '$._spawn_config') as spawn_config
-                    FROM hammerwork_jobs
-                    WHERE JSON_EXTRACT(payload, '$._spawn_config') IS NOT NULL
-                          AND status IN ('Running', 'Pending')
-                          {}
-                    ORDER BY created_at DESC
-                    LIMIT 50
-                    "#,
-                    queue_clause
-                );
-
-                let rows = sqlx::query(&query).fetch_all(&mysql_pool).await?;
+                let rows = bind_mysql(sqlx::query(&query), &binds)
+                    .fetch_all(&mysql_pool)
+                    .await?;
 
                 if rows.is_empty() {
                     println!("No jobs with pending spawn operations found.");
@@ -731,7 +745,7 @@ impl SpawnCommand {
                     let queue_name: String = row.try_get("queue_name")?;
                     let status: String = row.try_get("status")?;
                     let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-                    let spawn_config_str: Option<String> = row.try_get("spawn_config")?;
+                    let spawn_config_str: Option<String> = mysql_spawn_config_text(&row)?;
 
                     println!(
                         "📋 Job: {} | Queue: {} | Status: {} | Created: {}",
@@ -1867,5 +1881,145 @@ mod tests {
 
         let edges = cmd.build_spawn_edges(&nodes);
         assert_eq!(edges.len(), 3); // root->level1-a, root->level1-b, level1-a->level2-a
+    }
+
+    use crate::utils::sql::fetch_i64;
+    use crate::utils::test_support::*;
+
+    #[test]
+    fn test_spawn_list_query_binds_window_queue_and_limit() {
+        let (sql, binds) = build_spawn_list_query(Backend::Postgres, Some(HOSTILE_QUEUE), true, 20);
+        assert!(sql.contains(
+            "parent.created_at > NOW() - make_interval(hours => $1::int) AND parent.queue_name = $2"
+        ));
+        assert!(sql.ends_with("ORDER BY parent.created_at DESC LIMIT $3"));
+        assert!(sql.contains("parent.payload ? '_spawn_config'"));
+        assert_eq!(
+            binds,
+            vec![
+                Bind::Int(1),
+                Bind::Text(HOSTILE_QUEUE.into()),
+                Bind::Int(20)
+            ]
+        );
+        assert!(!sql.contains("DROP"));
+
+        let (sql, binds) = build_spawn_list_query(Backend::MySql, Some(HOSTILE_QUEUE), false, 5);
+        assert!(sql.contains("AND parent.queue_name = ? GROUP BY"));
+        assert!(sql.ends_with("LIMIT ?"));
+        assert!(sql.contains("JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL"));
+        assert_eq!(binds, vec![Bind::Text(HOSTILE_QUEUE.into()), Bind::Int(5)]);
+    }
+
+    #[test]
+    fn test_spawn_stats_queries_bind_window_then_queue() {
+        for (backend, since) in [
+            (
+                Backend::Postgres,
+                "parent.created_at > NOW() - make_interval(hours => $1::int) AND parent.queue_name = $2",
+            ),
+            (
+                Backend::MySql,
+                "parent.created_at > DATE_SUB(NOW(), INTERVAL ? HOUR) AND parent.queue_name = ?",
+            ),
+        ] {
+            for (sql, binds) in [
+                build_spawn_stats_total_query(backend, 24, Some(HOSTILE_QUEUE)),
+                build_spawn_stats_breakdown_query(backend, 24, Some(HOSTILE_QUEUE)),
+            ] {
+                assert!(sql.contains(since), "{sql}");
+                assert_eq!(binds, vec![Bind::Int(24), Bind::Text(HOSTILE_QUEUE.into())]);
+            }
+        }
+        let (sql, binds) = build_spawn_stats_total_query(Backend::MySql, 24, None);
+        assert!(!sql.contains("queue_name = ?"));
+        assert_eq!(binds, vec![Bind::Int(24)]);
+    }
+
+    #[test]
+    fn test_pending_spawns_query_binds_queue_name() {
+        let (sql, binds) = build_pending_spawns_query(Backend::Postgres, Some(HOSTILE_QUEUE));
+        assert!(sql.contains("status IN ('Running', 'Pending') AND queue_name = $1 ORDER BY"));
+        assert_eq!(binds, vec![Bind::Text(HOSTILE_QUEUE.into())]);
+        let (sql, binds) = build_pending_spawns_query(Backend::MySql, None);
+        assert!(!sql.contains('?') && binds.is_empty());
+    }
+
+    async fn spawn_roundtrip(pool: DatabasePool) {
+        let hostile = hostile_queue();
+        let other = format!("other_{}", uuid::Uuid::new_v4().simple());
+        let config = r#"{"_spawn_config": {"operation_id": "op1"}}"#;
+        let mut parent = SeedJob::new(&hostile, "Completed");
+        parent.payload = config;
+        let parent_id = seed(&pool, &parent).await;
+        let mut child = SeedJob::new(&hostile, "Pending");
+        child.depends_on = Some(&parent_id);
+        seed(&pool, &child).await;
+        let mut pending = SeedJob::new(&hostile, "Pending");
+        pending.payload = config;
+        seed(&pool, &pending).await;
+        let mut elsewhere = SeedJob::new(&other, "Completed");
+        elsewhere.payload = config;
+        seed(&pool, &elsewhere).await;
+
+        let backend = pool.backend();
+        let (sql, binds) = build_spawn_list_query(backend, Some(&hostile), true, 10);
+        let queues = column_strings(&pool, &sql, &binds, "queue_name").await;
+        assert_eq!(queues, vec![hostile.clone()]);
+        assert_eq!(
+            fetch_i64(&pool, &sql, &binds, "spawned_count")
+                .await
+                .unwrap(),
+            1
+        );
+
+        let (sql, binds) = build_spawn_stats_total_query(backend, 1, Some(&hostile));
+        assert_eq!(
+            fetch_i64(&pool, &sql, &binds, "total_spawn_ops")
+                .await
+                .unwrap(),
+            2
+        );
+        let (sql, binds) = build_spawn_stats_breakdown_query(backend, 1, Some(&hostile));
+        assert_eq!(
+            column_strings(&pool, &sql, &binds, "queue_name").await,
+            vec![hostile.clone()]
+        );
+
+        let (sql, binds) = build_pending_spawns_query(backend, Some(&hostile));
+        assert_eq!(
+            column_strings(&pool, &sql, &binds, "queue_name").await,
+            vec![hostile.clone()]
+        );
+
+        let cmd = SpawnCommand::Pending {
+            database_url: None,
+            queue: None,
+            show_config: true,
+        };
+        cmd.list_spawn_operations(pool.clone(), Some(10), true, Some(&hostile))
+            .await
+            .unwrap();
+        cmd.show_spawn_stats(pool.clone(), Some(&hostile), Some(1), true)
+            .await
+            .unwrap();
+        cmd.show_pending_spawns(pool.clone(), Some(&hostile), true)
+            .await
+            .unwrap();
+
+        assert!(table_exists(&pool).await);
+        cleanup(&pool, &[&hostile, &other]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn test_spawn_queue_filter_is_injection_safe_postgres() {
+        spawn_roundtrip(pg_pool().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MYSQL_DATABASE_URL"]
+    async fn test_spawn_queue_filter_is_injection_safe_mysql() {
+        spawn_roundtrip(mysql_pool().await).await;
     }
 }
