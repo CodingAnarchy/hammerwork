@@ -37,6 +37,42 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      - name: Cargo.lock is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+  # Builds every crate and target with the declared `rust-version` against the committed
+  # Cargo.lock, which the MSRV-aware resolver (resolver = "3") keeps compatible with it.
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo check --workspace --all-features --all-targets --locked
+
+  # Advisory: the committed lockfile pins dependencies, so check that the newest
+  # semver-compatible releases still build and pass the unit tests.
+  latest-deps:
+    name: latest dependencies (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo update --verbose
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: allow
+      - run: cargo test --workspace --all-features --lib --bins
 
   clippy:
     name: clippy
