@@ -28,9 +28,105 @@ use crate::events::{EventManager, JobError, JobLifecycleEvent, JobLifecycleEvent
 
 use chrono::{DateTime, Utc};
 use sqlx::Database;
-use std::{sync::Arc, time::Duration};
-use tokio::{sync::mpsc, time::sleep};
+use std::{
+    future::Future,
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+    time::sleep,
+};
 use tracing::{debug, error, info, warn};
+
+/// Default time a worker waits for an in-flight job to finish after shutdown is requested.
+pub const DEFAULT_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+/// Default lease a worker holds on a running job. The worker renews it every third of
+/// this period; if the worker dies, the job becomes eligible for
+/// [`DatabaseQueue::requeue_stale_jobs`] once the lease expires.
+pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(300);
+
+/// Default interval at which a [`WorkerPool`] runs the stale job reaper.
+pub const DEFAULT_STALE_JOB_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Upper bound on a computed retry delay. Larger values (from a custom strategy or an
+/// unbounded backoff) are clamped so the retry timestamp stays representable in both
+/// databases.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Cap on the exponential backoff applied after consecutive worker loop errors.
+const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Floor on the error backoff so a zero poll interval can never cause a hot loop.
+const MIN_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Floor on the heartbeat interval derived from the lease duration.
+const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Delay before a [`WorkerPool`] restarts a worker that died unexpectedly.
+const WORKER_RESTART_DELAY: Duration = Duration::from_secs(1);
+
+type HandlerFuture = Pin<Box<dyn Future<Output = Result<JobResult>> + Send>>;
+
+/// Future adapter that turns a panic during `poll` into an `Err` carrying the payload.
+struct CatchUnwind<F> {
+    inner: F,
+}
+
+impl<F: Future + Unpin> Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut self.inner;
+        match std::panic::catch_unwind(AssertUnwindSafe(|| Pin::new(&mut *inner).poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+/// Describe a panic payload for an error message.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Build the error used when a job handler panics.
+fn handler_panic_error(payload: &(dyn std::any::Any + Send)) -> HammerworkError {
+    HammerworkError::Worker {
+        message: format!("Job handler panicked: {}", panic_message(payload)),
+    }
+}
+
+/// Convert a retry delay into the timestamp at which the job should run again.
+///
+/// The delay is clamped to [`MAX_RETRY_DELAY`] and the conversion never panics.
+fn retry_at_from_delay(now: DateTime<Utc>, retry_delay: Duration) -> DateTime<Utc> {
+    let delay = chrono::Duration::from_std(retry_delay.min(MAX_RETRY_DELAY))
+        .unwrap_or(chrono::Duration::MAX);
+    now.checked_add_signed(delay)
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
+/// Exponential backoff after `consecutive_errors` failed loop iterations.
+fn error_backoff(base: Duration, consecutive_errors: u32) -> Duration {
+    let base = base.max(MIN_ERROR_BACKOFF);
+    let exponent = consecutive_errors.saturating_sub(1).min(16);
+    base.checked_mul(1u32 << exponent)
+        .unwrap_or(MAX_ERROR_BACKOFF)
+        .min(MAX_ERROR_BACKOFF.max(base))
+}
 
 /// Event data for job lifecycle event hooks.
 #[derive(Debug, Clone)]
@@ -609,6 +705,10 @@ pub struct Worker<DB: Database> {
     /// Event manager for publishing job lifecycle events
     #[cfg(feature = "webhooks")]
     event_manager: Option<Arc<crate::events::EventManager>>,
+    /// How long to wait for an in-flight job to finish after shutdown is requested
+    shutdown_grace_period: Duration,
+    /// Lease held on a running job, renewed by heartbeats
+    lease_duration: Duration,
 }
 
 impl<DB: Database + Send + Sync + 'static> Clone for Worker<DB>
@@ -641,6 +741,8 @@ where
             spawn_manager: self.spawn_manager.clone(),
             #[cfg(feature = "webhooks")]
             event_manager: self.event_manager.clone(),
+            shutdown_grace_period: self.shutdown_grace_period,
+            lease_duration: self.lease_duration,
         }
     }
 }
@@ -720,6 +822,8 @@ where
             spawn_manager: None,
             #[cfg(feature = "webhooks")]
             event_manager: None,
+            shutdown_grace_period: DEFAULT_SHUTDOWN_GRACE_PERIOD,
+            lease_duration: DEFAULT_LEASE_DURATION,
         }
     }
 
@@ -791,6 +895,8 @@ where
             spawn_manager: None,
             #[cfg(feature = "webhooks")]
             event_manager: None,
+            shutdown_grace_period: DEFAULT_SHUTDOWN_GRACE_PERIOD,
+            lease_duration: DEFAULT_LEASE_DURATION,
         }
     }
 
@@ -997,6 +1103,56 @@ where
     pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = Some(timeout);
         self
+    }
+
+    /// Set how long the worker waits for an in-flight job after shutdown is requested.
+    ///
+    /// When [`WorkerPool::shutdown`] (or the worker's shutdown channel) fires while a
+    /// job is running, the worker stops polling but lets the job finish for up to this
+    /// long. Only after the grace period is the handler cancelled; the job then stays
+    /// `Running` until its lease expires and the stale job reaper reclaims it.
+    ///
+    /// Defaults to [`DEFAULT_SHUTDOWN_GRACE_PERIOD`] (30 seconds).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{Worker, JobQueue};
+    /// use std::{sync::Arc, time::Duration};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
+    /// # let queue = Arc::new(JobQueue::new(pool));
+    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|_job| Box::pin(async { Ok(()) }));
+    /// let worker = Worker::new(queue, "emails".to_string(), handler)
+    ///     .with_shutdown_grace_period(Duration::from_secs(120));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_shutdown_grace_period(mut self, grace_period: Duration) -> Self {
+        self.shutdown_grace_period = grace_period;
+        self
+    }
+
+    /// Set the lease the worker holds on a running job.
+    ///
+    /// While a handler runs, the worker records a heartbeat and extends the job's lease
+    /// every third of this duration (via [`DatabaseQueue::heartbeat_job`]). If the
+    /// worker process dies, the lease stops being renewed and
+    /// [`DatabaseQueue::requeue_stale_jobs`] reclaims the job once it expires. Shorter
+    /// leases recover crashed jobs faster at the cost of more heartbeat writes for
+    /// long-running jobs; jobs that finish within a third of the lease never write one.
+    ///
+    /// Defaults to [`DEFAULT_LEASE_DURATION`] (5 minutes). Requires migration
+    /// `015_add_job_leases`.
+    pub fn with_lease_duration(mut self, lease: Duration) -> Self {
+        self.lease_duration = lease;
+        self
+    }
+
+    /// The lease this worker holds on running jobs. See [`Worker::with_lease_duration`].
+    pub fn lease_duration(&self) -> Duration {
+        self.lease_duration
     }
 
     /// Apply a [`WorkerConfig`](crate::config::WorkerConfig).
@@ -1410,6 +1566,19 @@ where
         self
     }
 
+    /// Run the worker until a shutdown signal arrives on `shutdown_rx` (or its sender
+    /// is dropped).
+    ///
+    /// Shutdown is graceful: while idle the worker stops immediately, but a job that is
+    /// already running gets up to the configured
+    /// [shutdown grace period](Worker::with_shutdown_grace_period) to finish and record
+    /// its outcome before it is cancelled.
+    ///
+    /// Errors inside the loop (database failures while dequeuing or recording a job's
+    /// outcome) are logged and followed by an exponential backoff starting at the
+    /// throttle's `backoff_on_error` (or the poll interval), so a failing database never
+    /// causes a hot loop. A panicking job handler fails the job instead of killing the
+    /// worker.
     pub async fn run(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
         info!("Worker started for queue: {}", self.queue_name);
 
@@ -1417,15 +1586,54 @@ where
         #[cfg(any(feature = "metrics", feature = "alerting"))]
         let monitoring_task = self.start_monitoring_task();
 
+        let mut consecutive_errors: u32 = 0;
+
         loop {
-            tokio::select! {
+            // Idle phase: polling (and the sleeps between polls) is cancelled promptly
+            // when shutdown is requested.
+            let acquired = tokio::select! {
+                biased;
                 _ = shutdown_rx.recv() => {
                     info!("Worker shutting down for queue: {}", self.queue_name);
                     break;
                 }
-                _ = self.process_jobs() => {
-                    // Continue processing
+                acquired = self.acquire_job() => acquired,
+            };
+
+            let (outcome, shutting_down) = match acquired {
+                Ok(Some(job)) => self.run_job_until_done(job, &mut shutdown_rx).await,
+                Ok(None) => (Ok(()), false),
+                Err(e) => {
+                    error!("Error dequeuing job from queue {}: {}", self.queue_name, e);
+                    (Err(e), false)
                 }
+            };
+
+            match outcome {
+                Ok(()) => consecutive_errors = 0,
+                Err(e) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if !shutting_down {
+                        let backoff = error_backoff(self.error_backoff_base(), consecutive_errors);
+                        warn!(
+                            "Worker for queue {} hit an error ({} in a row), backing off for {:?}: {}",
+                            self.queue_name, consecutive_errors, backoff, e
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.recv() => {
+                                info!("Worker shutting down for queue: {}", self.queue_name);
+                                break;
+                            }
+                            _ = sleep(backoff) => {}
+                        }
+                    }
+                }
+            }
+
+            if shutting_down {
+                info!("Worker shutting down for queue: {}", self.queue_name);
+                break;
             }
         }
 
@@ -1436,7 +1644,73 @@ where
         Ok(())
     }
 
-    async fn process_jobs(&self) -> Result<()> {
+    /// Process `job` to completion. If shutdown is requested meanwhile, keep going for
+    /// up to the shutdown grace period, then cancel.
+    ///
+    /// Returns the processing outcome and whether shutdown was requested.
+    async fn run_job_until_done(
+        &self,
+        job: Job,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> (Result<()>, bool) {
+        let job_id = job.id;
+        let processing = self.process_job(job);
+        tokio::pin!(processing);
+
+        let outcome = tokio::select! {
+            biased;
+            outcome = &mut processing => return (self.log_process_outcome(job_id, outcome), false),
+            _ = shutdown_rx.recv() => {
+                info!(
+                    "Shutdown requested while job {} is running; waiting up to {:?} for it to finish",
+                    job_id, self.shutdown_grace_period
+                );
+                tokio::time::timeout(self.shutdown_grace_period, &mut processing).await
+            }
+        };
+
+        match outcome {
+            Ok(outcome) => (self.log_process_outcome(job_id, outcome), true),
+            Err(_) => {
+                warn!(
+                    "Job {} did not finish within the {:?} shutdown grace period and was \
+                     cancelled; it stays Running until its lease expires and the stale job \
+                     reaper reclaims it",
+                    job_id, self.shutdown_grace_period
+                );
+                (Ok(()), true)
+            }
+        }
+    }
+
+    fn log_process_outcome(&self, job_id: crate::job::JobId, outcome: Result<()>) -> Result<()> {
+        if let Err(ref e) = outcome {
+            error!(
+                "Failed to record the outcome of job {} on queue {}: {}",
+                job_id, self.queue_name, e
+            );
+        }
+        outcome
+    }
+
+    /// Base delay for the error backoff: the throttle's `backoff_on_error` if set,
+    /// otherwise the poll interval.
+    fn error_backoff_base(&self) -> Duration {
+        self.throttle_config
+            .as_ref()
+            .and_then(|throttle| throttle.backoff_on_error)
+            .unwrap_or(self.poll_interval)
+    }
+
+    /// Wait for capacity and try to dequeue a job.
+    ///
+    /// Returns `Ok(None)` after sleeping for the poll interval when the queue is empty
+    /// or paused, and `Err` when the dequeue itself fails.
+    async fn acquire_job(&self) -> Result<Option<Job>> {
+        // Check statistics and alert thresholds periodically
+        #[cfg(feature = "alerting")]
+        self.check_alert_thresholds().await;
+
         // Check rate limit before dequeuing jobs
         if let Some(ref rate_limiter) = self.rate_limiter {
             // Check if we can process a job (non-blocking)
@@ -1449,7 +1723,7 @@ where
                 if let Err(e) = rate_limiter.acquire().await {
                     warn!("Rate limiter error: {}", e);
                     sleep(self.poll_interval).await;
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
@@ -1462,7 +1736,7 @@ where
                     self.queue_name
                 );
                 sleep(self.poll_interval).await;
-                return Ok(());
+                return Ok(None);
             }
             Ok(false) => {
                 // Queue is not paused, continue with normal processing
@@ -1486,25 +1760,25 @@ where
             }
         }
 
-        let job_result = if let Some(ref weights) = self.priority_weights {
+        let job = if let Some(ref weights) = self.priority_weights {
             // Use priority-aware dequeuing
             self.queue
                 .dequeue_with_priority_weights(&self.queue_name, weights)
-                .await
+                .await?
         } else {
             // Use regular dequeuing
-            self.queue.dequeue(&self.queue_name).await
+            self.queue.dequeue(&self.queue_name).await?
         };
 
-        match job_result {
-            Ok(Some(job)) => {
+        match job {
+            Some(job) => {
                 debug!(
                     "Processing job: {} with priority: {:?}",
                     job.id, job.priority
                 );
-                self.process_job(job).await?;
+                Ok(Some(job))
             }
-            Ok(None) => {
+            None => {
                 // No jobs available, check for worker starvation
                 #[cfg(feature = "alerting")]
                 if let Some(alert_manager) = &self.alert_manager {
@@ -1527,25 +1801,13 @@ where
 
                 // Wait before polling again
                 sleep(self.poll_interval).await;
-            }
-            Err(e) => {
-                error!("Error dequeuing job: {}", e);
-
-                // If throttle config specifies backoff on error, apply it
-                let backoff_duration = if let Some(ref throttle_config) = self.throttle_config {
-                    throttle_config
-                        .backoff_on_error
-                        .unwrap_or(self.poll_interval)
-                } else {
-                    self.poll_interval
-                };
-
-                sleep(backoff_duration).await;
+                Ok(None)
             }
         }
+    }
 
-        // Check statistics and alert thresholds periodically
-        #[cfg(feature = "alerting")]
+    #[cfg(feature = "alerting")]
+    async fn check_alert_thresholds(&self) {
         if let (Some(alert_manager), Some(stats_collector)) =
             (&self.alert_manager, &self.stats_collector)
         {
@@ -1566,8 +1828,6 @@ where
                 }
             }
         }
-
-        Ok(())
     }
 
     async fn process_job(&self, job: Job) -> Result<()> {
@@ -1882,8 +2142,7 @@ where
                         self.retry_delay
                     };
 
-                    let retry_at =
-                        chrono::Utc::now() + chrono::Duration::from_std(retry_delay).unwrap();
+                    let retry_at = retry_at_from_delay(Utc::now(), retry_delay);
                     info!(
                         "Retrying job {} at {} (attempt {} of {})",
                         job_id,
@@ -1915,16 +2174,74 @@ where
         Ok(())
     }
 
-    /// Execute a job handler based on its type, returning a unified result
-    async fn execute_handler(&self, job: Job) -> Result<JobResult> {
+    /// Create the handler future for `job`, unifying both handler types.
+    fn start_handler(&self, job: Job) -> HandlerFuture {
         match &self.handler {
             JobHandlerType::Legacy(handler) => {
                 // Execute legacy handler and convert () to JobResult
-                handler(job).await.map(|_| JobResult::success())
+                let future = handler(job);
+                Box::pin(async move { future.await.map(|_| JobResult::success()) })
             }
-            JobHandlerType::WithResult(handler) => {
-                // Execute enhanced handler directly
-                handler(job).await
+            // Execute enhanced handler directly
+            JobHandlerType::WithResult(handler) => handler(job),
+        }
+    }
+
+    /// Execute a job handler, returning a unified result.
+    ///
+    /// A panic in the handler (while creating or polling its future) is caught and
+    /// turned into an error, so the job goes through the normal retry/failure path
+    /// instead of killing the worker. While the handler runs, the job's lease is
+    /// renewed in the background.
+    async fn execute_handler(&self, job: Job) -> Result<JobResult> {
+        let job_id = job.id;
+        let handler_future =
+            match std::panic::catch_unwind(AssertUnwindSafe(|| self.start_handler(job))) {
+                Ok(future) => future,
+                Err(payload) => {
+                    error!("Handler for job {} panicked", job_id);
+                    return Err(handler_panic_error(payload.as_ref()));
+                }
+            };
+
+        let guarded = CatchUnwind {
+            inner: handler_future,
+        };
+
+        tokio::select! {
+            biased;
+            outcome = guarded => outcome.unwrap_or_else(|payload| {
+                error!("Handler for job {} panicked", job_id);
+                Err(handler_panic_error(payload.as_ref()))
+            }),
+            () = self.maintain_lease(job_id) => Err(HammerworkError::Worker {
+                message: "job lease heartbeat stopped unexpectedly".to_string(),
+            }),
+        }
+    }
+
+    /// Renew the lease on a running job until the surrounding future is dropped.
+    ///
+    /// Heartbeats every third of the lease duration; the first one is sent after that
+    /// interval, so short jobs never pay for a heartbeat write. Never completes.
+    async fn maintain_lease(&self, job_id: crate::job::JobId) {
+        if self.lease_duration.is_zero() {
+            return std::future::pending().await;
+        }
+        let interval = (self.lease_duration / 3).max(MIN_HEARTBEAT_INTERVAL);
+        loop {
+            sleep(interval).await;
+            match self.queue.heartbeat_job(job_id, self.lease_duration).await {
+                Ok(true) => debug!("Renewed lease on job {}", job_id),
+                Ok(false) => {
+                    warn!(
+                        "Lost the lease on job {}: it is no longer Running (it may have been \
+                         reclaimed as stale); the handler keeps running",
+                        job_id
+                    );
+                    return std::future::pending().await;
+                }
+                Err(e) => warn!("Failed to renew the lease on job {}: {}", job_id, e),
             }
         }
     }
@@ -2191,9 +2508,28 @@ where
     }
 }
 
+/// A pool of [`Worker`]s run and supervised together.
+///
+/// [`WorkerPool::start`] spawns every worker plus a supervisor. A worker that dies
+/// unexpectedly (for example because of a bug that panics outside a job handler) is
+/// logged and restarted. [`WorkerPool::shutdown`] (or dropping the pool) stops all
+/// workers gracefully: each finishes its in-flight job within its shutdown grace period.
+///
+/// The pool also runs a stale job reaper that periodically calls
+/// [`DatabaseQueue::requeue_stale_jobs`] to reclaim jobs left `Running` by workers
+/// that crashed. Configure it with [`WorkerPool::with_stale_job_reaper`] or disable it
+/// with [`WorkerPool::without_stale_job_reaper`].
 pub struct WorkerPool<DB: Database> {
     workers: Vec<Worker<DB>>,
-    shutdown_tx: Vec<mpsc::Sender<()>>,
+    /// Signals shutdown to the supervisor started by `start` (dropping it also does)
+    shutdown_signal: Option<watch::Sender<bool>>,
+    /// Becomes `true` once every worker has stopped after a shutdown
+    supervisor_done: Option<watch::Receiver<bool>>,
+    /// How often the stale job reaper runs (`None` disables it)
+    reaper_interval: Option<Duration>,
+    /// Fallback staleness threshold for jobs without a lease (`None`: the longest
+    /// worker lease duration)
+    reaper_older_than: Option<Duration>,
     stats_collector: Option<Arc<dyn StatisticsCollector>>,
     /// Worker template for creating new workers during autoscaling
     worker_template: Option<Worker<DB>>,
@@ -2214,7 +2550,10 @@ where
     pub fn new() -> Self {
         Self {
             workers: Vec::new(),
-            shutdown_tx: Vec::new(),
+            shutdown_signal: None,
+            supervisor_done: None,
+            reaper_interval: Some(DEFAULT_STALE_JOB_REAPER_INTERVAL),
+            reaper_older_than: None,
             stats_collector: None,
             worker_template: None,
             autoscale_config: AutoscaleConfig::default(),
@@ -2258,6 +2597,30 @@ where
         self
     }
 
+    /// Configure the stale job reaper.
+    ///
+    /// Every `interval` the pool calls
+    /// [`DatabaseQueue::requeue_stale_jobs`]`(older_than)`, which moves `Running` jobs
+    /// whose lease expired back to `Pending` (or to `Dead` when they have no attempts
+    /// left). `older_than` only applies to jobs that never recorded a lease; by default
+    /// it is the longest [lease duration](Worker::with_lease_duration) of the pool's
+    /// workers. The reaper is enabled by default with a 60 second interval.
+    ///
+    /// Requires migration `015_add_job_leases`. Running reapers in several pools or
+    /// processes at once is safe.
+    pub fn with_stale_job_reaper(mut self, interval: Duration, older_than: Duration) -> Self {
+        self.reaper_interval = Some(interval);
+        self.reaper_older_than = Some(older_than);
+        self
+    }
+
+    /// Disable the stale job reaper (for example when it runs elsewhere, such as a
+    /// scheduled `cargo hammerwork job requeue-stale`).
+    pub fn without_stale_job_reaper(mut self) -> Self {
+        self.reaper_interval = None;
+        self
+    }
+
     /// Set a worker template for autoscaling
     /// This worker will be cloned when creating new workers
     pub fn with_worker_template(mut self, worker: Worker<DB>) -> Self {
@@ -2282,6 +2645,12 @@ where
         self.workers.push(worker);
     }
 
+    /// Start all workers and supervise them until the pool shuts down.
+    ///
+    /// Returns once every worker has stopped after [`WorkerPool::shutdown`] (or after
+    /// the pool is dropped). Workers run in their own tasks, so dropping the returned
+    /// future (for example in a `tokio::select!`) does not stop them; call
+    /// [`WorkerPool::shutdown`] afterwards to stop them gracefully.
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting worker pool with {} workers", self.workers.len());
 
@@ -2290,34 +2659,169 @@ where
             metrics.active_workers = self.workers.len();
         }
 
-        let mut handles = Vec::new();
-        self.shutdown_tx.clear();
+        let (signal_tx, signal_rx) = watch::channel(false);
+        let (done_tx, done_rx) = watch::channel(false);
+        self.shutdown_signal = Some(signal_tx);
+        self.supervisor_done = Some(done_rx);
 
-        for worker in self.workers.drain(..) {
-            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-            self.shutdown_tx.push(shutdown_tx);
-
-            let handle = tokio::spawn(async move {
-                if let Err(e) = worker.run(shutdown_rx).await {
-                    error!("Worker error: {}", e);
-                }
-            });
-            handles.push(handle);
-        }
+        let workers = std::mem::take(&mut self.workers);
+        let reaper = self.start_stale_job_reaper(&workers, signal_rx.clone());
 
         // Start autoscaling task if enabled
         if self.autoscale_config.enabled {
             self.start_autoscaling_task().await?;
         }
 
-        // Wait for all workers to complete
-        for handle in handles {
-            handle.await.map_err(|e| HammerworkError::Worker {
-                message: format!("Worker task failed: {}", e),
-            })?;
+        let supervisor = tokio::spawn(Self::supervise(workers, signal_rx, done_tx, reaper));
+
+        // Dropping a JoinHandle detaches the task, so the supervisor keeps running
+        // even if this future is dropped.
+        supervisor.await.map_err(|e| HammerworkError::Worker {
+            message: format!("Worker pool supervisor failed: {}", e),
+        })?
+    }
+
+    /// Spawn one worker task with its own shutdown channel.
+    fn spawn_worker(
+        set: &mut JoinSet<(usize, std::thread::Result<Result<()>>)>,
+        index: usize,
+        worker: Worker<DB>,
+        delay: Option<Duration>,
+    ) -> mpsc::Sender<()> {
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        set.spawn(async move {
+            if let Some(delay) = delay {
+                sleep(delay).await;
+            }
+            // Catch panics so the supervisor always knows which worker stopped.
+            let run = CatchUnwind {
+                inner: Box::pin(async move { worker.run(shutdown_rx).await }),
+            };
+            (index, run.await)
+        });
+        shutdown_tx
+    }
+
+    /// Supervise worker tasks: restart workers that stop unexpectedly, and on
+    /// shutdown signal every worker and wait for all of them to stop.
+    async fn supervise(
+        workers: Vec<Worker<DB>>,
+        mut signal_rx: watch::Receiver<bool>,
+        done_tx: watch::Sender<bool>,
+        reaper: Option<tokio::task::JoinHandle<()>>,
+    ) -> Result<()> {
+        let templates: Vec<Worker<DB>> = workers.to_vec();
+        let mut set = JoinSet::new();
+        let mut senders: Vec<mpsc::Sender<()>> = workers
+            .into_iter()
+            .enumerate()
+            .map(|(index, worker)| Self::spawn_worker(&mut set, index, worker, None))
+            .collect();
+
+        let mut shutting_down = *signal_rx.borrow();
+        if shutting_down {
+            for tx in &senders {
+                let _ = tx.try_send(());
+            }
         }
 
+        loop {
+            tokio::select! {
+                // An error means the pool (and its signal sender) was dropped: treat it
+                // as a shutdown request too.
+                _ = signal_rx.changed(), if !shutting_down => {
+                    info!("Worker pool shutting down; waiting for in-flight jobs");
+                    shutting_down = true;
+                    for tx in &senders {
+                        let _ = tx.try_send(());
+                    }
+                }
+                joined = set.join_next() => {
+                    let Some(joined) = joined else { break };
+                    let index = match joined {
+                        Ok((index, Ok(Ok(())))) => {
+                            if shutting_down {
+                                continue;
+                            }
+                            warn!("Worker {} stopped unexpectedly", index);
+                            index
+                        }
+                        Ok((index, Ok(Err(e)))) => {
+                            error!("Worker {} failed: {}", index, e);
+                            index
+                        }
+                        Ok((index, Err(payload))) => {
+                            error!(
+                                "Worker {} panicked: {}",
+                                index,
+                                panic_message(payload.as_ref())
+                            );
+                            index
+                        }
+                        Err(e) => {
+                            // Only reachable if a worker task is aborted externally.
+                            error!("Worker task ended abnormally: {}", e);
+                            continue;
+                        }
+                    };
+                    if !shutting_down {
+                        info!("Restarting worker {} in {:?}", index, WORKER_RESTART_DELAY);
+                        senders[index] = Self::spawn_worker(
+                            &mut set,
+                            index,
+                            templates[index].clone(),
+                            Some(WORKER_RESTART_DELAY),
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(reaper) = reaper {
+            reaper.abort();
+        }
+        info!("All workers stopped");
+        done_tx.send_replace(true);
         Ok(())
+    }
+
+    /// Spawn the periodic stale job reaper, if enabled.
+    fn start_stale_job_reaper(
+        &self,
+        workers: &[Worker<DB>],
+        mut signal_rx: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let interval = self.reaper_interval?;
+        let queue = Arc::clone(&workers.first()?.queue);
+        let older_than = self.reaper_older_than.unwrap_or_else(|| {
+            workers
+                .iter()
+                .map(|worker| worker.lease_duration)
+                .max()
+                .filter(|lease| !lease.is_zero())
+                .unwrap_or(DEFAULT_LEASE_DURATION)
+        });
+
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = signal_rx.changed() => break,
+                    _ = ticker.tick() => {
+                        match queue.requeue_stale_jobs(older_than).await {
+                            Ok(recovery) if !recovery.is_empty() => info!(
+                                "Stale job reaper requeued {} and marked {} dead",
+                                recovery.requeued.len(),
+                                recovery.dead.len()
+                            ),
+                            Ok(_) => {}
+                            Err(e) => warn!("Stale job reaper failed: {}", e),
+                        }
+                    }
+                }
+            }
+        }))
     }
 
     /// Start the autoscaling background task
@@ -2352,7 +2856,9 @@ where
         metrics: Arc<std::sync::RwLock<AutoscaleMetrics>>,
         history: QueueDepthHistory,
     ) {
-        let mut interval = tokio::time::interval(config.evaluation_window / 2);
+        // `interval` panics on a zero period, so never pass one through.
+        let mut interval =
+            tokio::time::interval((config.evaluation_window / 2).max(Duration::from_millis(1)));
 
         loop {
             interval.tick().await;
@@ -2487,6 +2993,11 @@ where
         }
     }
 
+    /// Shut the pool down gracefully.
+    ///
+    /// Signals every worker to stop polling, then waits until all of them have
+    /// stopped. Each worker lets its in-flight job finish within its
+    /// [shutdown grace period](Worker::with_shutdown_grace_period).
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down worker pool");
 
@@ -2496,10 +3007,14 @@ where
             info!("Autoscaling task stopped");
         }
 
-        for tx in &self.shutdown_tx {
-            if tx.send(()).await.is_err() {
-                warn!("Failed to send shutdown signal to worker");
-            }
+        if let Some(signal) = &self.shutdown_signal {
+            signal.send_replace(true);
+        }
+
+        if let Some(done) = &self.supervisor_done {
+            let mut done = done.clone();
+            // An error means the supervisor is gone, so there is nothing to wait for.
+            let _ = done.wait_for(|finished| *finished).await;
         }
 
         Ok(())
@@ -3367,5 +3882,64 @@ mod tests {
         assert_eq!(captured_events.len(), 2);
         assert!(captured_events[0].starts_with("cloned:"));
         assert!(captured_events[1].starts_with("cloned:"));
+    }
+
+    #[test]
+    fn test_retry_at_from_delay_never_panics_and_clamps() {
+        let now = Utc::now();
+        assert_eq!(
+            retry_at_from_delay(now, Duration::from_secs(30)),
+            now + chrono::Duration::seconds(30)
+        );
+        let max = now + chrono::Duration::from_std(MAX_RETRY_DELAY).unwrap();
+        assert_eq!(retry_at_from_delay(now, Duration::MAX), max);
+        assert_eq!(retry_at_from_delay(now, MAX_RETRY_DELAY * 2), max);
+        assert_eq!(
+            retry_at_from_delay(DateTime::<Utc>::MAX_UTC, Duration::from_secs(1)),
+            DateTime::<Utc>::MAX_UTC
+        );
+    }
+
+    #[test]
+    fn test_error_backoff_grows_is_capped_and_never_zero() {
+        assert_eq!(error_backoff(Duration::ZERO, 1), MIN_ERROR_BACKOFF);
+        assert_eq!(
+            error_backoff(Duration::from_secs(1), 1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            error_backoff(Duration::from_secs(1), 3),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            error_backoff(Duration::from_secs(1), u32::MAX),
+            MAX_ERROR_BACKOFF
+        );
+        // A base above the cap is honoured rather than shortened.
+        assert_eq!(
+            error_backoff(Duration::from_secs(120), 5),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catch_unwind_turns_panics_into_errors() {
+        let ok: HandlerFuture = Box::pin(async { Ok(JobResult::success()) });
+        assert!(CatchUnwind { inner: ok }.await.unwrap().is_ok());
+
+        let panicking: HandlerFuture = Box::pin(async {
+            tokio::task::yield_now().await;
+            panic!("boom")
+        });
+        let payload = CatchUnwind { inner: panicking }.await.unwrap_err();
+        let error = handler_panic_error(payload.as_ref());
+        assert_eq!(
+            error.to_string(),
+            "Worker error: Job handler panicked: boom"
+        );
+
+        let formatted: HandlerFuture = Box::pin(async { panic!("code {}", 42) });
+        let payload = CatchUnwind { inner: formatted }.await.unwrap_err();
+        assert_eq!(panic_message(payload.as_ref()), "code 42");
     }
 }
