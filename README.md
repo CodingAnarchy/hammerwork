@@ -102,6 +102,8 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 - **[Database Migrations](docs/migrations.md)** - Progressive schema updates and database setup
 - **[Job Encryption & PII Protection](docs/encryption.md)** - Enterprise encryption, key management, and data protection
 - **[Monitoring & Alerting](docs/monitoring.md)** - Prometheus metrics and notification systems
+- **[Webhooks](docs/webhooks.md)** - Event delivery to HTTP endpoints, payload templates, HMAC signatures
+- **[Event Streaming](docs/streaming.md)** - Kafka, Kinesis and Pub/Sub delivery, retries and statistics
 
 ## Basic Example
 

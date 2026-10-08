@@ -23,7 +23,8 @@
 //! - **Event filtering** - Only deliver events matching specific criteria
 //! - **Delivery tracking** - Comprehensive statistics and delivery history
 //! - **Rate limiting** - Configurable concurrent delivery limits
-//! - **Custom payload templates** - Transform events before delivery
+//! - **Custom payload templates** - Reshape events into the JSON a receiver expects
+//!   (see [`PayloadTemplate`])
 //!
 //! # Examples
 //!
@@ -192,7 +193,11 @@ pub struct WebhookConfig {
     pub enabled: bool,
     /// Secret for HMAC signature verification (optional)
     pub secret: Option<String>,
-    /// Custom payload template (optional)
+    /// Custom payload template (optional).
+    ///
+    /// A JSON document with `{{ event.* }}` placeholders; see [`PayloadTemplate`] for
+    /// the syntax. When set, the rendered template is sent instead of the raw event.
+    /// It is validated when the webhook is added.
     pub payload_template: Option<String>,
 }
 
@@ -582,8 +587,12 @@ impl WebhookManager {
         Ok(manager)
     }
 
-    /// Add a new webhook configuration
+    /// Add a new webhook configuration.
+    ///
+    /// Fails with a configuration error when the webhook is invalid (see
+    /// [`WebhookConfig::validate`]), for example an invalid payload template.
     pub async fn add_webhook(&self, webhook: WebhookConfig) -> crate::Result<()> {
+        webhook.validate()?;
         let webhook_id = webhook.id;
 
         // Subscribe to events for this webhook
@@ -696,6 +705,8 @@ impl WebhookManager {
     /// Update webhook configuration
     pub async fn update_webhook(&self, webhook: WebhookConfig) -> crate::Result<()> {
         let webhook_id = webhook.id;
+        // Validate first so an invalid update leaves the existing webhook in place.
+        webhook.validate()?;
 
         // Remove existing webhook
         self.remove_webhook(webhook_id).await?;
@@ -912,11 +923,22 @@ impl WebhookManager {
         let start_time = std::time::Instant::now();
 
         // Prepare payload
-        let payload = if let Some(ref _template) = webhook.payload_template {
-            // TODO: Implement template rendering
-            serde_json::to_value(event).unwrap_or_default()
-        } else {
-            serde_json::to_value(event).unwrap_or_default()
+        let payload = match Self::build_payload(webhook, event) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return WebhookDelivery {
+                    delivery_id,
+                    webhook_id: webhook.id,
+                    event_id: event.event_id,
+                    status_code: None,
+                    response_body: None,
+                    error_message: Some(format!("failed to build payload: {e}")),
+                    attempted_at: Utc::now(),
+                    duration_ms: Some(0),
+                    attempt_number,
+                    success: false,
+                };
+            }
         };
 
         // Build request
@@ -1014,6 +1036,17 @@ impl WebhookManager {
                     success: false,
                 }
             }
+        }
+    }
+
+    /// The request body for `event`: the rendered payload template, or the event itself.
+    fn build_payload(
+        webhook: &WebhookConfig,
+        event: &JobLifecycleEvent,
+    ) -> crate::Result<serde_json::Value> {
+        match &webhook.payload_template {
+            Some(template) => PayloadTemplate::parse(template)?.render(event),
+            None => Ok(serde_json::to_value(event)?),
         }
     }
 
@@ -1159,6 +1192,248 @@ impl WebhookConfig {
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
+    }
+
+    /// Send a rendered [`PayloadTemplate`] instead of the raw event.
+    ///
+    /// The template is validated by [`validate`](Self::validate), which
+    /// [`WebhookManager::add_webhook`] calls.
+    pub fn with_payload_template(mut self, template: impl Into<String>) -> Self {
+        self.payload_template = Some(template.into());
+        self
+    }
+
+    /// Check the configuration, returning a configuration error for an invalid
+    /// payload template.
+    pub fn validate(&self) -> crate::Result<()> {
+        if let Some(template) = &self.payload_template {
+            PayloadTemplate::parse(template).map_err(|e| {
+                crate::HammerworkError::Config(format!("webhook '{}': {}", self.name, e))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// A parsed webhook payload template.
+///
+/// A template is a JSON document. Any JSON string inside it (at any depth, but not
+/// object keys) may contain placeholders of the form `{{ path }}`, which are filled
+/// in from the [`JobLifecycleEvent`] being delivered:
+///
+/// - A string that consists of exactly one placeholder, such as `"{{event.payload}}"`,
+///   is replaced by the JSON value itself, keeping its type (object, number, `null`,
+///   and so on).
+/// - A placeholder embedded in other text, such as `"Job {{event.job_id}} failed"`,
+///   is replaced by the value's text: strings are inserted as-is, `null` becomes an
+///   empty string, and other values are inserted as compact JSON.
+///
+/// Substitution happens on the parsed JSON tree, never by pasting text into the
+/// template source, so event data cannot break out of a string or inject JSON: the
+/// rendered payload is always valid JSON, with values escaped by the serializer.
+///
+/// # Available paths
+///
+/// | Path | Value |
+/// |------|-------|
+/// | `event` | the whole event, as sent when no template is configured |
+/// | `event.event_id`, `event.job_id` | UUID strings |
+/// | `event.queue_name` | queue name |
+/// | `event.event_type` | e.g. `"completed"`, `"failed"` |
+/// | `event.priority` | e.g. `"Normal"` |
+/// | `event.timestamp` | RFC 3339 timestamp |
+/// | `event.processing_time_ms` | number or `null` |
+/// | `event.error` | error object or `null` |
+/// | `event.error.message`, `.error_type`, `.details`, `.retry_attempt` | error fields |
+/// | `event.payload` | job payload (when included in events) or `null` |
+/// | `event.payload.<key>...` | a nested payload value; numeric segments index arrays |
+/// | `event.metadata` | metadata object |
+/// | `event.metadata.<key>` | one metadata value |
+///
+/// A path that is valid but absent from a particular event (for example
+/// `event.error.message` on a completed job) renders as `null`.
+///
+/// Templates are validated when the webhook is added: invalid JSON, an unknown
+/// path, an unterminated `{{`, or a placeholder inside an object key is a
+/// configuration error. There is no escape for a literal `{{`.
+///
+/// # Examples
+///
+/// ```rust
+/// use hammerwork::webhooks::PayloadTemplate;
+///
+/// let template = PayloadTemplate::parse(r#"{
+///     "text": "Job {{event.job_id}} in {{event.queue_name}} is {{event.event_type}}",
+///     "job": "{{event.job_id}}",
+///     "data": "{{event.payload}}"
+/// }"#).unwrap();
+///
+/// assert!(PayloadTemplate::parse(r#"{"x": "{{event.nope}}"}"#).is_err());
+/// ```
+#[derive(Debug, Clone)]
+pub struct PayloadTemplate {
+    root: serde_json::Value,
+}
+
+/// One piece of a template string.
+enum TemplatePart<'a> {
+    Text(&'a str),
+    Placeholder(Vec<&'a str>),
+}
+
+impl PayloadTemplate {
+    /// Parse and validate a template.
+    pub fn parse(template: &str) -> crate::Result<Self> {
+        let root: serde_json::Value = serde_json::from_str(template).map_err(|e| {
+            crate::HammerworkError::Config(format!("payload_template is not valid JSON: {e}"))
+        })?;
+        Self::validate_value(&root)?;
+        Ok(Self { root })
+    }
+
+    /// Render the template for `event`.
+    pub fn render(&self, event: &JobLifecycleEvent) -> crate::Result<serde_json::Value> {
+        let event_value = serde_json::to_value(event)?;
+        Ok(Self::render_value(&self.root, &event_value))
+    }
+
+    fn validate_value(value: &serde_json::Value) -> crate::Result<()> {
+        match value {
+            serde_json::Value::String(text) => {
+                for part in Self::split(text)? {
+                    if let TemplatePart::Placeholder(path) = part {
+                        Self::validate_path(&path)?;
+                    }
+                }
+                Ok(())
+            }
+            serde_json::Value::Array(items) => items.iter().try_for_each(Self::validate_value),
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key.contains("{{") {
+                        return Err(crate::HammerworkError::Config(format!(
+                            "payload_template: placeholders are not allowed in object keys \
+                             ('{key}')"
+                        )));
+                    }
+                    Self::validate_value(value)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_path(path: &[&str]) -> crate::Result<()> {
+        let unknown = || {
+            crate::HammerworkError::Config(format!(
+                "payload_template: unknown placeholder '{{{{{}}}}}'",
+                path.join(".")
+            ))
+        };
+        if path.iter().any(|segment| segment.is_empty()) {
+            return Err(unknown());
+        }
+        match path {
+            ["event"] => Ok(()),
+            ["event", field, rest @ ..] => match *field {
+                "event_id" | "job_id" | "queue_name" | "event_type" | "priority" | "timestamp"
+                | "processing_time_ms"
+                    if rest.is_empty() =>
+                {
+                    Ok(())
+                }
+                "error" => match rest {
+                    [] | ["message" | "error_type" | "details" | "retry_attempt"] => Ok(()),
+                    _ => Err(unknown()),
+                },
+                "metadata" if rest.len() <= 1 => Ok(()),
+                "payload" => Ok(()),
+                _ => Err(unknown()),
+            },
+            _ => Err(unknown()),
+        }
+    }
+
+    /// Split a template string into text and placeholders.
+    fn split(text: &str) -> crate::Result<Vec<TemplatePart<'_>>> {
+        let mut parts = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find("{{") {
+            if start > 0 {
+                parts.push(TemplatePart::Text(&rest[..start]));
+            }
+            let after = &rest[start + 2..];
+            let Some(end) = after.find("}}") else {
+                return Err(crate::HammerworkError::Config(format!(
+                    "payload_template: unterminated '{{{{' in \"{text}\""
+                )));
+            };
+            let path = after[..end].trim();
+            parts.push(TemplatePart::Placeholder(
+                path.split('.').map(str::trim).collect(),
+            ));
+            rest = &after[end + 2..];
+        }
+        if !rest.is_empty() {
+            parts.push(TemplatePart::Text(rest));
+        }
+        Ok(parts)
+    }
+
+    fn render_value(value: &serde_json::Value, event: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(text) => Self::render_string(text, event),
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|item| Self::render_value(item, event))
+                    .collect(),
+            ),
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), Self::render_value(value, event)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    fn render_string(text: &str, event: &serde_json::Value) -> serde_json::Value {
+        // Validated at parse time, so splitting cannot fail here.
+        let Ok(parts) = Self::split(text) else {
+            return serde_json::Value::String(text.to_string());
+        };
+        if let [TemplatePart::Placeholder(path)] = parts.as_slice() {
+            return Self::lookup(event, path)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+        }
+        let mut rendered = String::with_capacity(text.len());
+        for part in parts {
+            match part {
+                TemplatePart::Text(text) => rendered.push_str(text),
+                TemplatePart::Placeholder(path) => match Self::lookup(event, &path) {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::String(s)) => rendered.push_str(s),
+                    Some(other) => rendered.push_str(&other.to_string()),
+                },
+            }
+        }
+        serde_json::Value::String(rendered)
+    }
+
+    /// Resolve `path` (starting with `event`) against the serialized event.
+    fn lookup<'v>(event: &'v serde_json::Value, path: &[&str]) -> Option<&'v serde_json::Value> {
+        let mut current = event;
+        for segment in path.get(1..)? {
+            current = match current {
+                serde_json::Value::Object(map) => map.get(*segment)?,
+                serde_json::Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+                _ => return None,
+            };
+        }
+        Some(current)
     }
 }
 
@@ -1634,7 +1909,7 @@ mod tests {
             },
             enabled: true,
             timeout_secs: 60,
-            payload_template: Some("custom template".to_string()),
+            payload_template: Some(r#"{"job": "{{event.job_id}}"}"#.to_string()),
         };
 
         let serialized = serde_json::to_string(&webhook_config).unwrap();
@@ -2012,5 +2287,254 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         manager.shutdown(Duration::from_secs(5)).await;
         assert_eq!(manager.task_panics(), 2);
+    }
+
+    fn template_event() -> JobLifecycleEvent {
+        let mut metadata = HashMap::new();
+        metadata.insert("region".to_string(), "eu-west-1".to_string());
+        JobLifecycleEvent {
+            event_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            queue_name: "emails".to_string(),
+            event_type: crate::events::JobLifecycleEventType::Failed,
+            priority: crate::priority::JobPriority::High,
+            timestamp: Utc::now(),
+            processing_time_ms: Some(42),
+            error: Some(crate::events::JobError {
+                message: "SMTP timeout".to_string(),
+                error_type: None,
+                details: None,
+                retry_attempt: Some(2),
+            }),
+            payload: Some(serde_json::json!({
+                "user": {"id": 7, "tags": ["a", "b"]},
+                "note": "said \"hi\""
+            })),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn test_payload_template_renders_values_with_their_types() {
+        let event = template_event();
+        let template = PayloadTemplate::parse(
+            r#"{
+                "job": "{{ event.job_id }}",
+                "queue": "{{event.queue_name}}",
+                "took": "{{event.processing_time_ms}}",
+                "attempt": "{{event.error.retry_attempt}}",
+                "user": "{{event.payload.user}}",
+                "second_tag": "{{event.payload.user.tags.1}}",
+                "region": "{{event.metadata.region}}",
+                "missing": "{{event.payload.nope}}",
+                "details": "{{event.error.details}}",
+                "constant": [1, true, null, "plain"],
+                "whole": "{{event}}"
+            }"#,
+        )
+        .unwrap();
+        let rendered = template.render(&event).unwrap();
+
+        assert_eq!(rendered["job"], event.job_id.to_string());
+        assert_eq!(rendered["queue"], "emails");
+        assert_eq!(rendered["took"], 42);
+        assert_eq!(rendered["attempt"], 2);
+        assert_eq!(
+            rendered["user"],
+            serde_json::json!({"id": 7, "tags": ["a", "b"]})
+        );
+        assert_eq!(rendered["second_tag"], "b");
+        assert_eq!(rendered["region"], "eu-west-1");
+        assert_eq!(rendered["missing"], serde_json::Value::Null);
+        assert_eq!(rendered["details"], serde_json::Value::Null);
+        assert_eq!(
+            rendered["constant"],
+            serde_json::json!([1, true, null, "plain"])
+        );
+        assert_eq!(rendered["whole"], serde_json::to_value(&event).unwrap());
+    }
+
+    #[test]
+    fn test_payload_template_interpolates_text() {
+        let event = template_event();
+        let template = PayloadTemplate::parse(
+            r#"{"text": "Job {{event.job_id}} in {{event.queue_name}} is {{event.event_type}} after {{event.processing_time_ms}}ms ({{event.payload.user.tags}}){{event.payload.nope}}"}"#,
+        )
+        .unwrap();
+        let rendered = template.render(&event).unwrap();
+        assert_eq!(
+            rendered["text"],
+            format!(
+                "Job {} in emails is failed after 42ms ([\"a\",\"b\"])",
+                event.job_id
+            )
+        );
+    }
+
+    #[test]
+    fn test_payload_template_escapes_event_data() {
+        let mut event = template_event();
+        // Data that would break out of the string if it were pasted into the JSON source.
+        event.queue_name = r#"q", "injected": true, "x": "\"#.to_string();
+        let template = PayloadTemplate::parse(
+            r#"{"queue": "{{event.queue_name}}", "text": "queue={{event.queue_name}} note={{event.payload.note}}"}"#,
+        )
+        .unwrap();
+        let rendered = template.render(&event).unwrap();
+
+        // The rendered payload round-trips through its serialized form unchanged.
+        let body = serde_json::to_string(&rendered).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reparsed, rendered);
+        let object = reparsed.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        assert!(!object.contains_key("injected"));
+        assert_eq!(object["queue"], event.queue_name.as_str());
+        assert_eq!(
+            object["text"],
+            format!("queue={} note=said \"hi\"", event.queue_name)
+        );
+    }
+
+    #[test]
+    fn test_payload_template_rejects_invalid_templates() {
+        let invalid = [
+            ("not json", "not valid JSON"),
+            (
+                r#"{"a": "{{event.nope}}"}"#,
+                "unknown placeholder '{{event.nope}}'",
+            ),
+            (r#"{"a": "{{job.id}}"}"#, "unknown placeholder"),
+            (r#"{"a": "{{event.queue_name.x}}"}"#, "unknown placeholder"),
+            (r#"{"a": "{{event.error.stack}}"}"#, "unknown placeholder"),
+            (r#"{"a": "{{event.metadata.a.b}}"}"#, "unknown placeholder"),
+            (r#"{"a": "{{event.}}"}"#, "unknown placeholder"),
+            (r#"{"a": "{{}}"}"#, "unknown placeholder"),
+            (r#"{"a": ["ok", "{{event.job_id"]}"#, "unterminated"),
+            (r#"{"{{event.job_id}}": 1}"#, "object keys"),
+        ];
+        for (template, expected) in invalid {
+            match PayloadTemplate::parse(template) {
+                Err(crate::HammerworkError::Config(message)) => {
+                    assert!(message.contains(expected), "{template}: {message}");
+                }
+                other => panic!("{template}: expected a config error, got {other:?}"),
+            }
+        }
+
+        // Plain JSON without placeholders is a valid (constant) template.
+        assert!(PayloadTemplate::parse(r#"{"static": [1, 2, 3]}"#).is_ok());
+        assert!(PayloadTemplate::parse(r#""{{event}}""#).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_add_webhook_rejects_invalid_template() {
+        let manager = WebhookManager::new_default(Arc::new(EventManager::new_default()));
+        let webhook = WebhookConfig::new("bad".to_string(), "http://127.0.0.1:1/".to_string())
+            .with_payload_template(r#"{"a": "{{event.unknown}}"}"#);
+        match manager.add_webhook(webhook).await {
+            Err(crate::HammerworkError::Config(message)) => {
+                assert!(message.contains("webhook 'bad'"), "{message}");
+                assert!(message.contains("unknown placeholder"), "{message}");
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
+        assert!(manager.list_webhooks().await.is_empty());
+
+        // An invalid update leaves the existing webhook untouched.
+        let good = WebhookConfig::new("good".to_string(), "http://127.0.0.1:1/".to_string());
+        let id = good.id;
+        manager.add_webhook(good.clone()).await.unwrap();
+        let mut bad_update = good.with_payload_template("{");
+        bad_update.id = id;
+        assert!(manager.update_webhook(bad_update).await.is_err());
+        let current = manager.get_webhook(id).await.unwrap();
+        assert!(current.payload_template.is_none());
+        manager.shutdown(Duration::from_secs(1)).await;
+    }
+
+    /// An HTTP server that answers 200 and forwards every request body.
+    async fn capturing_http_server() -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        data.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&data).to_string();
+                        let Some(header_end) = text.find("\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = text[..header_end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if data.len() >= header_end + 4 + length {
+                            let body = String::from_utf8_lossy(
+                                &data[header_end + 4..header_end + 4 + length],
+                            )
+                            .to_string();
+                            let _ = tx.send(body);
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
+                                .await;
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, rx)
+    }
+
+    #[tokio::test]
+    async fn test_delivery_sends_rendered_template() {
+        let (url, mut bodies) = capturing_http_server().await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        let webhook = WebhookConfig::new("templated".to_string(), url).with_payload_template(
+            r#"{"text": "{{event.queue_name}} job {{event.job_id}}", "job_id": "{{event.job_id}}"}"#,
+        );
+        manager.add_webhook(webhook).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let event = completed_event();
+        events.publish_event(event.clone()).await.unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(10), bodies.recv())
+            .await
+            .expect("webhook was not delivered")
+            .unwrap();
+        manager.shutdown(Duration::from_secs(5)).await;
+
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "text": format!("shutdown_queue job {}", event.job_id),
+                "job_id": event.job_id.to_string(),
+            })
+        );
     }
 }

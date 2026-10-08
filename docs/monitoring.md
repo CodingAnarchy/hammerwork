@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Basic Alerting Setup
 
 ```rust
-use hammerwork::{Worker, AlertingConfig, AlertSeverity};
+use hammerwork::{Worker, AlertingConfig, AlertSeverity, SmtpConfig};
 use std::time::Duration;
 
 let alerting_config = AlertingConfig::new()
@@ -54,7 +54,10 @@ let alerting_config = AlertingConfig::new()
     .alert_on_worker_starvation(Duration::from_minutes(5))
     .webhook("https://your-webhook.com/alerts")
     .slack("https://hooks.slack.com/your-webhook", "#alerts")
-    .email("admin@yourcompany.com")
+    .email_via_smtp(
+        "admin@yourcompany.com",
+        SmtpConfig::new("smtp.yourcompany.com", "alerts@yourcompany.com"),
+    )
     .with_cooldown(Duration::from_minutes(5));
 
 let worker = Worker::new(queue, "default".to_string(), handler)
@@ -85,10 +88,62 @@ let config = AlertingConfig::new()
 ```
 
 #### Email Alerts
+
+Email alerts are sent over SMTP (via [`lettre`](https://crates.io/crates/lettre), part
+of the `alerting` feature). Each email target carries its own SMTP settings:
+
 ```rust
+use hammerwork::alerting::{AlertingConfig, SecretSource, SmtpConfig, SmtpTls};
+
+let smtp = SmtpConfig::new("smtp.yourcompany.com", "Hammerwork <alerts@yourcompany.com>")
+    .with_credentials("alerts", SecretSource::Environment("SMTP_PASSWORD".into()))
+    .with_tls(SmtpTls::StartTls); // the default
 let config = AlertingConfig::new()
-    .email("admin@yourcompany.com");
+    .email_via_smtp("admin@yourcompany.com", smtp);
 ```
+
+| Setting | Default | Notes |
+|---------|---------|-------|
+| `host` | (required) | SMTP server |
+| `port` | 587 / 465 / 25 | depends on `tls` |
+| `from` | (required) | `alerts@example.com` or `Name <alerts@example.com>` |
+| `username` + `password` | none | both or neither; `password` is a `SecretSource` |
+| `tls` | `start_tls` | `start_tls` (required, never falls back to plain text), `implicit` (SMTPS), or `none` (local relays only) |
+| `timeout_secs` | 30 | per SMTP command |
+
+Use `SecretSource::Environment("VAR")` for the password so it stays out of code and
+configuration files; it is read when each email is sent. `SecretSource::Static` is for
+development only, and is redacted from `Debug` output.
+
+In a TOML configuration file:
+
+```toml
+[[alerting.targets]]
+[alerting.targets.Email]
+recipient = "admin@yourcompany.com"
+
+[alerting.targets.Email.smtp]
+host = "smtp.yourcompany.com"
+from = "alerts@yourcompany.com"
+username = "alerts"
+password = { Environment = "SMTP_PASSWORD" }
+tls = "start_tls"
+```
+
+An email target without SMTP settings is a configuration error:
+`AlertingConfig::validate()`, `AlertManager::try_new` and `HammerworkConfig::from_file`
+reject it. (`AlertingConfig::email(recipient)` is deprecated because it creates such a
+target. `AlertManager::new` does not fail; it logs the error and every alert to that
+target fails.)
+
+#### Delivery failures
+
+`check_thresholds`, `check_queue_depth`, `check_worker_starvation` and
+`send_custom_alert` return an error when any target could not be reached (an SMTP
+error, an unreachable webhook, a non-2xx response); the worker's monitoring task logs
+it. Every target is still tried. The cooldown for an alert only starts once at least
+one target received it, so an alert that reached no target is sent again on the next
+check.
 
 ## Background Monitoring
 

@@ -339,7 +339,9 @@ pub use workflow::{DependencyStatus, FailurePolicy, JobGroup, WorkflowId, Workfl
 pub use metrics::{MetricsConfig, PrometheusMetricsCollector};
 
 #[cfg(feature = "alerting")]
-pub use alerting::{Alert, AlertManager, AlertSeverity, AlertTarget, AlertType, AlertingConfig};
+pub use alerting::{
+    Alert, AlertManager, AlertSeverity, AlertTarget, AlertType, AlertingConfig, SmtpConfig, SmtpTls,
+};
 
 pub use events::{
     EventConfig, EventFilter, EventManager, EventManagerStats, EventSubscription, JobError,
@@ -348,8 +350,8 @@ pub use events::{
 
 #[cfg(feature = "webhooks")]
 pub use webhooks::{
-    HttpMethod, RetryPolicy, WebhookAuth, WebhookConfig as WebhookSettings, WebhookDelivery,
-    WebhookManager, WebhookManagerConfig, WebhookManagerStats, WebhookStats,
+    HttpMethod, PayloadTemplate, RetryPolicy, WebhookAuth, WebhookConfig as WebhookSettings,
+    WebhookDelivery, WebhookManager, WebhookManagerConfig, WebhookManagerStats, WebhookStats,
 };
 
 #[cfg(any(
