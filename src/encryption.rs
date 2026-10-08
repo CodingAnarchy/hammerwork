@@ -143,7 +143,9 @@ pub enum EncryptionAlgorithm {
 ///
 /// Determines where encryption keys are obtained from, enabling
 /// different security models and key management strategies.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Debug` and `Display` never show a `Static` key's material.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KeySource {
     /// Use a static key provided directly.
     ///
@@ -171,6 +173,17 @@ pub enum KeySource {
     /// same configuration keeps the key; `stdout://` generates a new key every time.
     /// Useful for initial setup or testing scenarios.
     Generated(String),
+}
+
+impl std::fmt::Debug for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeySource::Static(_) => f.write_str("Static(<redacted>)"),
+            KeySource::Environment(var) => f.debug_tuple("Environment").field(var).finish(),
+            KeySource::External(source) => f.debug_tuple("External").field(source).finish(),
+            KeySource::Generated(location) => f.debug_tuple("Generated").field(location).finish(),
+        }
+    }
 }
 
 impl Default for KeySource {
