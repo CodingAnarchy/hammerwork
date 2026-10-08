@@ -1467,9 +1467,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn enqueue_cron_job(&self, job: Job) -> Result<JobId> {
-        // For cron jobs, we use the regular enqueue method
-        // The job should already have the cron fields set
-        self.enqueue(job).await
+        self.enqueue(super::prepare_cron_job(job)?).await
     }
 
     async fn get_due_cron_jobs(&self, queue_name: Option<&str>) -> Result<Vec<Job>> {
