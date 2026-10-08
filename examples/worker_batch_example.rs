@@ -50,11 +50,10 @@ async fn batch_worker_demo(
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let batch_info = if job.batch_id.is_some() {
-                format!(" (batch: {})", job.batch_id.unwrap())
-            } else {
-                String::new()
-            };
+            let batch_info = job
+                .batch_id
+                .map(|batch_id| format!(" (batch: {})", batch_id))
+                .unwrap_or_default();
 
             match job_type {
                 "data_processing" => {

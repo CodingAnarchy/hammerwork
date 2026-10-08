@@ -794,7 +794,7 @@ where
     }
 
     // Sort by count descending
-    error_patterns.sort_by(|a, b| b.count.cmp(&a.count));
+    error_patterns.sort_by_key(|p| std::cmp::Reverse(p.count));
 
     error_patterns
 }
@@ -833,7 +833,7 @@ fn calculate_performance_metrics(
 
     // Estimate database response time based on processing time
     let database_response_time_ms = if avg_processing_time > 0.0 {
-        (avg_processing_time * 0.1).max(1.0).min(100.0) // Assume DB is 10% of processing time
+        (avg_processing_time * 0.1).clamp(1.0, 100.0) // Assume DB is 10% of processing time
     } else {
         2.0
     };

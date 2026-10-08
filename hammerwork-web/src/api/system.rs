@@ -361,12 +361,12 @@ async fn system_config_handler(
 
 /// Handler for metrics information
 async fn metrics_info_handler(
-    system_state: Arc<RwLock<SystemState>>,
+    _system_state: Arc<RwLock<SystemState>>,
 ) -> Result<impl Reply, warp::Rejection> {
-    let state = system_state.read().await;
-
     let metrics_info = MetricsInfo {
-        prometheus_enabled: cfg!(feature = "metrics"),
+        // hammerwork-web does not serve a Prometheus endpoint itself (there is no
+        // `metrics` feature on this crate), so this is always false.
+        prometheus_enabled: false,
         metrics_endpoint: "/metrics".to_string(),
         custom_metrics_count: get_custom_metrics_count(),
         last_scrape: get_last_scrape_time().await,
@@ -508,35 +508,15 @@ fn get_memory_usage() -> Option<u64> {
 
 /// Get count of custom metrics (Prometheus metrics beyond the default ones)
 fn get_custom_metrics_count() -> u32 {
-    #[cfg(feature = "metrics")]
-    {
-        // TODO: In a real implementation, you would query the Prometheus registry
-        // to count custom metrics. For now, we return a placeholder.
-        // This would typically involve accessing the global metrics registry
-        // and counting user-defined metrics vs. system metrics.
-        0
-    }
-
-    #[cfg(not(feature = "metrics"))]
-    {
-        0
-    }
+    // TODO: Query the Prometheus registry to count user-defined metrics once
+    // hammerwork-web exposes metrics. Until then this is a placeholder.
+    0
 }
 
 /// Get the last time metrics were scraped
 async fn get_last_scrape_time() -> Option<chrono::DateTime<chrono::Utc>> {
-    #[cfg(feature = "metrics")]
-    {
-        // TODO: Track actual scrape times in a real implementation
-        // This would typically be stored in a shared state or metrics registry
-        // For now, we return None as metrics scraping time tracking isn't implemented
-        None
-    }
-
-    #[cfg(not(feature = "metrics"))]
-    {
-        None
-    }
+    // TODO: Track actual scrape times once hammerwork-web exposes metrics.
+    None
 }
 
 #[cfg(test)]

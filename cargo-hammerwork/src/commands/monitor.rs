@@ -553,7 +553,7 @@ async fn show_logs(
     // 4. Support real-time tailing with --follow
 
     // Mock log entries
-    let mock_logs = vec![
+    let mock_logs = [
         (
             "2024-06-28 10:30:15",
             "INFO",

@@ -1537,7 +1537,7 @@ where
             use aws_sdk_kms::Client;
 
             // Load AWS configuration
-            let config = aws_config::defaults(aws_config::BehaviorVersion::v2025_01_17())
+            let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .region(Region::new(region.to_string()))
                 .load()
                 .await;

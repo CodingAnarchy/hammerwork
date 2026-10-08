@@ -451,7 +451,7 @@ async fn list_backups(path: Option<String>) -> Result<()> {
         return Ok(());
     }
 
-    backups.sort_by(|a, b| b.2.cmp(&a.2)); // Sort by modified time, newest first
+    backups.sort_by_key(|b| std::cmp::Reverse(b.2)); // Sort by modified time, newest first
 
     println!("📋 Available Backups");
     println!("════════════════════");

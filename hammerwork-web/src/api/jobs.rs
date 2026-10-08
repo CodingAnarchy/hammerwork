@@ -253,7 +253,7 @@ where
         if filters.status.is_none() || filters.status.as_ref().unwrap().to_lowercase() == "pending"
         {
             // Get ready jobs (pending jobs ready to be processed)
-            if let Ok(ready_jobs) = queue.get_ready_jobs(&queue_name, 100).await {
+            if let Ok(ready_jobs) = queue.get_ready_jobs(queue_name, 100).await {
                 queue_jobs.extend(ready_jobs);
             }
         }
@@ -264,7 +264,7 @@ where
         {
             // Get dead jobs
             if let Ok(dead_jobs) = queue
-                .get_dead_jobs_by_queue(&queue_name, Some(100), Some(0))
+                .get_dead_jobs_by_queue(queue_name, Some(100), Some(0))
                 .await
             {
                 queue_jobs.extend(dead_jobs);
@@ -275,7 +275,7 @@ where
             || filters.status.as_ref().unwrap().to_lowercase() == "recurring"
         {
             // Get recurring jobs
-            if let Ok(recurring_jobs) = queue.get_recurring_jobs(&queue_name).await {
+            if let Ok(recurring_jobs) = queue.get_recurring_jobs(queue_name).await {
                 queue_jobs.extend(recurring_jobs);
             }
         }
@@ -291,8 +291,8 @@ where
                 queue_name: job.queue_name.clone(),
                 status: job.status.as_str().to_string(),
                 priority: format!("{:?}", job.priority),
-                attempts: job.attempts as i32,
-                max_attempts: job.max_attempts as i32,
+                attempts: job.attempts,
+                max_attempts: job.max_attempts,
                 payload: job.payload.clone(),
                 created_at: job.created_at,
                 scheduled_at: job.scheduled_at,
@@ -356,7 +356,7 @@ where
         }
         _ => {
             // Default sort by created_at desc
-            all_jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            all_jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
         }
     }
 
@@ -616,18 +616,18 @@ where
         let mut queue_jobs = Vec::new();
 
         // Collect jobs from all sources for comprehensive search
-        if let Ok(ready_jobs) = queue.get_ready_jobs(&queue_name, 200).await {
+        if let Ok(ready_jobs) = queue.get_ready_jobs(queue_name, 200).await {
             queue_jobs.extend(ready_jobs);
         }
 
         if let Ok(dead_jobs) = queue
-            .get_dead_jobs_by_queue(&queue_name, Some(200), Some(0))
+            .get_dead_jobs_by_queue(queue_name, Some(200), Some(0))
             .await
         {
             queue_jobs.extend(dead_jobs);
         }
 
-        if let Ok(recurring_jobs) = queue.get_recurring_jobs(&queue_name).await {
+        if let Ok(recurring_jobs) = queue.get_recurring_jobs(queue_name).await {
             queue_jobs.extend(recurring_jobs);
         }
 
@@ -703,8 +703,8 @@ where
                 queue_name: job.queue_name.clone(),
                 status: job.status.as_str().to_string(),
                 priority: format!("{:?}", job.priority),
-                attempts: job.attempts as i32,
-                max_attempts: job.max_attempts as i32,
+                attempts: job.attempts,
+                max_attempts: job.max_attempts,
                 payload: job.payload.clone(),
                 created_at: job.created_at,
                 scheduled_at: job.scheduled_at,
@@ -721,7 +721,7 @@ where
         }
 
         // Also search recurring jobs
-        let recurring_jobs = match queue.get_recurring_jobs(&queue_name).await {
+        let recurring_jobs = match queue.get_recurring_jobs(queue_name).await {
             Ok(jobs) => jobs,
             Err(e) => {
                 eprintln!(
@@ -802,8 +802,8 @@ where
                 queue_name: job.queue_name.clone(),
                 status: job.status.as_str().to_string(),
                 priority: format!("{:?}", job.priority),
-                attempts: job.attempts as i32,
-                max_attempts: job.max_attempts as i32,
+                attempts: job.attempts,
+                max_attempts: job.max_attempts,
                 payload: job.payload.clone(),
                 created_at: job.created_at,
                 scheduled_at: job.scheduled_at,
@@ -821,7 +821,7 @@ where
     }
 
     // Sort by created_at desc by default
-    matching_jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    matching_jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
 
     // Apply pagination
     let total_count = matching_jobs.len() as u64;

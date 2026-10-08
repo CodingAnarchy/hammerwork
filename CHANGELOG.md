@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **CI**: replaced the disabled `Integration Tests` workflow with `.github/workflows/ci.yml`: rustfmt, clippy (`--all-targets --all-features -D warnings`), unit tests, PostgreSQL 16 and MySQL 8 integration jobs, and an advisory `cargo audit`. Runs on pushes and pull requests to `master` and on demand (#7).
 - `DatabaseConfig::create_tables` is deprecated; tables are created by migrations (`auto_migrate`)
+- AWS KMS clients (`aws-kms` feature) now load config with `BehaviorVersion::latest()` instead of the deprecated `v2025_01_17`, matching the Kinesis client. This picks up the SDK's newer defaults, including HTTP(S) proxy settings from the environment.
 
 ### Removed
 - Unused `ArchiveConfig` fields `archive_directory`, `max_file_size_bytes` and `include_payloads`. Existing TOML files containing them still load.
@@ -28,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **🔧 MySQL 8 migrations**
   - Migration statements now run over the text protocol, so the `PREPARE`/`EXECUTE` blocks in migration 010 no longer fail with error 1295
   - Replaced MariaDB-only `DROP INDEX IF EXISTS` (010) and `ADD COLUMN IF NOT EXISTS` (011) syntax with MySQL 8 compatible statements
+- Library, CLI, web dashboard, integration binaries and examples build without warnings and pass `cargo clippy -- -D warnings` ([#7](https://github.com/CodingAnarchy/hammerwork/issues/7)). `spawn_cli_example` compiles again, and `spawn_example` now declares `required-features = ["postgres"]`.
 
 ## [1.15.5] - 2025-08-29
 
