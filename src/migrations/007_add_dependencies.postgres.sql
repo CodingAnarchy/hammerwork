@@ -66,15 +66,24 @@ CREATE INDEX IF NOT EXISTS idx_hammerwork_workflows_created
 
 -- Add constraint to ensure dependency_status values are valid
 ALTER TABLE hammerwork_jobs
+DROP CONSTRAINT IF EXISTS chk_dependency_status;
+
+ALTER TABLE hammerwork_jobs
 ADD CONSTRAINT chk_dependency_status 
 CHECK (dependency_status IN ('none', 'waiting', 'satisfied', 'failed'));
 
 -- Add constraint to ensure workflow status values are valid
 ALTER TABLE hammerwork_workflows
+DROP CONSTRAINT IF EXISTS chk_workflow_status;
+
+ALTER TABLE hammerwork_workflows
 ADD CONSTRAINT chk_workflow_status
 CHECK (status IN ('running', 'completed', 'failed', 'cancelled'));
 
 -- Add constraint to ensure failure_policy values are valid
+ALTER TABLE hammerwork_workflows
+DROP CONSTRAINT IF EXISTS chk_workflow_failure_policy;
+
 ALTER TABLE hammerwork_workflows
 ADD CONSTRAINT chk_workflow_failure_policy
 CHECK (failure_policy IN ('fail_fast', 'continue_on_failure', 'manual'));

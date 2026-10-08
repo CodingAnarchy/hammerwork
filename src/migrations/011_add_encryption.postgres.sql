@@ -136,11 +136,17 @@ CREATE INDEX IF NOT EXISTS idx_hammerwork_jobs_archive_pii
 
 -- Add constraints for encryption consistency
 ALTER TABLE hammerwork_jobs
+DROP CONSTRAINT IF EXISTS check_encryption_consistency;
+
+ALTER TABLE hammerwork_jobs
 ADD CONSTRAINT check_encryption_consistency 
 CHECK (
     (is_encrypted = false AND encrypted_payload IS NULL AND encryption_nonce IS NULL AND encryption_tag IS NULL) OR
     (is_encrypted = true AND encrypted_payload IS NOT NULL AND encryption_nonce IS NOT NULL AND encryption_tag IS NOT NULL AND encryption_key_id IS NOT NULL)
 );
+
+ALTER TABLE hammerwork_jobs_archive
+DROP CONSTRAINT IF EXISTS check_archive_encryption_consistency;
 
 ALTER TABLE hammerwork_jobs_archive
 ADD CONSTRAINT check_archive_encryption_consistency 
@@ -151,8 +157,14 @@ CHECK (
 
 -- Add check constraints for valid algorithms
 ALTER TABLE hammerwork_jobs
+DROP CONSTRAINT IF EXISTS check_encryption_algorithm;
+
+ALTER TABLE hammerwork_jobs
 ADD CONSTRAINT check_encryption_algorithm 
 CHECK (encryption_algorithm IS NULL OR encryption_algorithm IN ('AES256GCM', 'ChaCha20Poly1305'));
+
+ALTER TABLE hammerwork_jobs_archive
+DROP CONSTRAINT IF EXISTS check_archive_encryption_algorithm;
 
 ALTER TABLE hammerwork_jobs_archive
 ADD CONSTRAINT check_archive_encryption_algorithm 
@@ -160,8 +172,14 @@ CHECK (encryption_algorithm IS NULL OR encryption_algorithm IN ('AES256GCM', 'Ch
 
 -- Add check constraints for retention policies
 ALTER TABLE hammerwork_jobs
+DROP CONSTRAINT IF EXISTS check_retention_policy;
+
+ALTER TABLE hammerwork_jobs
 ADD CONSTRAINT check_retention_policy 
 CHECK (retention_policy IS NULL OR retention_policy IN ('DeleteAfter', 'DeleteAt', 'KeepIndefinitely', 'DeleteImmediately', 'UseDefault'));
+
+ALTER TABLE hammerwork_jobs_archive
+DROP CONSTRAINT IF EXISTS check_archive_retention_policy;
 
 ALTER TABLE hammerwork_jobs_archive
 ADD CONSTRAINT check_archive_retention_policy 

@@ -1,5 +1,8 @@
 -- Migration 011: Add job payload encryption and key management for MySQL
 -- Adds encryption fields to jobs table and creates key management tables
+--
+-- Every statement is idempotent: MySQL DDL auto-commits, so a migration that fails
+-- part-way leaves its earlier statements applied and must be safe to re-run.
 
 -- Create encryption keys table for secure key storage and rotation
 CREATE TABLE IF NOT EXISTS hammerwork_encryption_keys (
@@ -40,98 +43,416 @@ CREATE TABLE IF NOT EXISTS hammerwork_encryption_keys (
 );
 
 -- Add encryption fields to main jobs table
-ALTER TABLE hammerwork_jobs
-    ADD COLUMN is_encrypted BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN encryption_key_id VARCHAR(255),
-    ADD COLUMN encryption_algorithm VARCHAR(50),
-    ADD COLUMN encrypted_payload LONGBLOB,
-    ADD COLUMN encryption_nonce BLOB,
-    ADD COLUMN encryption_tag BLOB,
-    ADD COLUMN encryption_metadata JSON,
-    ADD COLUMN payload_hash VARCHAR(255),
-    ADD COLUMN pii_fields JSON,
-    ADD COLUMN retention_policy VARCHAR(50),
-    ADD COLUMN retention_delete_at TIMESTAMP(6),
-    ADD COLUMN encrypted_at TIMESTAMP(6);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'is_encrypted') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN is_encrypted BOOLEAN NOT NULL DEFAULT false',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'encryption_key_id') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN encryption_key_id VARCHAR(255)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'encryption_algorithm') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN encryption_algorithm VARCHAR(50)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'encrypted_payload') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN encrypted_payload LONGBLOB',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'encryption_nonce') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN encryption_nonce BLOB',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'encryption_tag') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN encryption_tag BLOB',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'encryption_metadata') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN encryption_metadata JSON',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'payload_hash') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN payload_hash VARCHAR(255)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'pii_fields') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN pii_fields JSON',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'retention_policy') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN retention_policy VARCHAR(50)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'retention_delete_at') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN retention_delete_at TIMESTAMP(6)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'encrypted_at') = 0,
+    'ALTER TABLE hammerwork_jobs ADD COLUMN encrypted_at TIMESTAMP(6)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Add encryption fields to archive table
-ALTER TABLE hammerwork_jobs_archive
-    ADD COLUMN is_encrypted BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN encryption_key_id VARCHAR(255),
-    ADD COLUMN encryption_algorithm VARCHAR(50),
-    ADD COLUMN encrypted_payload LONGBLOB,
-    ADD COLUMN encryption_nonce BLOB,
-    ADD COLUMN encryption_tag BLOB,
-    ADD COLUMN encryption_metadata JSON,
-    ADD COLUMN payload_hash VARCHAR(255),
-    ADD COLUMN pii_fields JSON,
-    ADD COLUMN retention_policy VARCHAR(50),
-    ADD COLUMN retention_delete_at TIMESTAMP(6),
-    ADD COLUMN encrypted_at TIMESTAMP(6);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'is_encrypted') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN is_encrypted BOOLEAN NOT NULL DEFAULT false',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'encryption_key_id') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_key_id VARCHAR(255)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'encryption_algorithm') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_algorithm VARCHAR(50)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'encrypted_payload') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN encrypted_payload LONGBLOB',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'encryption_nonce') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_nonce BLOB',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'encryption_tag') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_tag BLOB',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'encryption_metadata') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN encryption_metadata JSON',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'payload_hash') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN payload_hash VARCHAR(255)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'pii_fields') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN pii_fields JSON',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'retention_policy') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN retention_policy VARCHAR(50)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'retention_delete_at') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN retention_delete_at TIMESTAMP(6)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'encrypted_at') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD COLUMN encrypted_at TIMESTAMP(6)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Create indexes for encryption keys table
-CREATE INDEX idx_hammerwork_encryption_keys_key_id
-    ON hammerwork_encryption_keys (key_id);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_encryption_keys' AND index_name = 'idx_hammerwork_encryption_keys_key_id') = 0,
+    'CREATE INDEX idx_hammerwork_encryption_keys_key_id ON hammerwork_encryption_keys (key_id)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_encryption_keys_status
-    ON hammerwork_encryption_keys (status);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_encryption_keys' AND index_name = 'idx_hammerwork_encryption_keys_status') = 0,
+    'CREATE INDEX idx_hammerwork_encryption_keys_status ON hammerwork_encryption_keys (status)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_encryption_keys_rotation
-    ON hammerwork_encryption_keys (next_rotation_at, status);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_encryption_keys' AND index_name = 'idx_hammerwork_encryption_keys_rotation') = 0,
+    'CREATE INDEX idx_hammerwork_encryption_keys_rotation ON hammerwork_encryption_keys (next_rotation_at, status)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_encryption_keys_expires
-    ON hammerwork_encryption_keys (expires_at, status);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_encryption_keys' AND index_name = 'idx_hammerwork_encryption_keys_expires') = 0,
+    'CREATE INDEX idx_hammerwork_encryption_keys_expires ON hammerwork_encryption_keys (expires_at, status)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_encryption_keys_algorithm
-    ON hammerwork_encryption_keys (algorithm, status);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_encryption_keys' AND index_name = 'idx_hammerwork_encryption_keys_algorithm') = 0,
+    'CREATE INDEX idx_hammerwork_encryption_keys_algorithm ON hammerwork_encryption_keys (algorithm, status)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Create indexes for encrypted jobs
-CREATE INDEX idx_hammerwork_jobs_encrypted
-    ON hammerwork_jobs (is_encrypted, encryption_key_id);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND index_name = 'idx_hammerwork_jobs_encrypted') = 0,
+    'CREATE INDEX idx_hammerwork_jobs_encrypted ON hammerwork_jobs (is_encrypted, encryption_key_id)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_jobs_retention_cleanup
-    ON hammerwork_jobs (retention_delete_at, is_encrypted);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND index_name = 'idx_hammerwork_jobs_retention_cleanup') = 0,
+    'CREATE INDEX idx_hammerwork_jobs_retention_cleanup ON hammerwork_jobs (retention_delete_at, is_encrypted)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_jobs_encrypted_at
-    ON hammerwork_jobs (encrypted_at);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND index_name = 'idx_hammerwork_jobs_encrypted_at') = 0,
+    'CREATE INDEX idx_hammerwork_jobs_encrypted_at ON hammerwork_jobs (encrypted_at)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Create indexes for encrypted archive jobs
-CREATE INDEX idx_hammerwork_jobs_archive_encrypted
-    ON hammerwork_jobs_archive (is_encrypted, encryption_key_id);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND index_name = 'idx_hammerwork_jobs_archive_encrypted') = 0,
+    'CREATE INDEX idx_hammerwork_jobs_archive_encrypted ON hammerwork_jobs_archive (is_encrypted, encryption_key_id)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_jobs_archive_retention_cleanup
-    ON hammerwork_jobs_archive (retention_delete_at, is_encrypted);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND index_name = 'idx_hammerwork_jobs_archive_retention_cleanup') = 0,
+    'CREATE INDEX idx_hammerwork_jobs_archive_retention_cleanup ON hammerwork_jobs_archive (retention_delete_at, is_encrypted)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Add check constraints for encryption consistency (MySQL 8.0+)
 -- Note: For older MySQL versions, these would need to be enforced in application logic
-ALTER TABLE hammerwork_jobs
-ADD CONSTRAINT check_encryption_consistency 
-CHECK (
-    (is_encrypted = false AND encrypted_payload IS NULL AND encryption_nonce IS NULL AND encryption_tag IS NULL) OR
-    (is_encrypted = true AND encrypted_payload IS NOT NULL AND encryption_nonce IS NOT NULL AND encryption_tag IS NOT NULL AND encryption_key_id IS NOT NULL)
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.table_constraints
+     WHERE constraint_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND constraint_name = 'check_encryption_consistency'
+       AND constraint_type = 'CHECK') = 0,
+    'ALTER TABLE hammerwork_jobs ADD CONSTRAINT check_encryption_consistency CHECK ((is_encrypted = false AND encrypted_payload IS NULL AND encryption_nonce IS NULL AND encryption_tag IS NULL) OR (is_encrypted = true AND encrypted_payload IS NOT NULL AND encryption_nonce IS NOT NULL AND encryption_tag IS NOT NULL AND encryption_key_id IS NOT NULL))',
+    'SELECT 1'
 );
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-ALTER TABLE hammerwork_jobs_archive
-ADD CONSTRAINT check_archive_encryption_consistency 
-CHECK (
-    (is_encrypted = false AND encrypted_payload IS NULL AND encryption_nonce IS NULL AND encryption_tag IS NULL) OR
-    (is_encrypted = true AND encrypted_payload IS NOT NULL AND encryption_nonce IS NOT NULL AND encryption_tag IS NOT NULL AND encryption_key_id IS NOT NULL)
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.table_constraints
+     WHERE constraint_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND constraint_name = 'check_archive_encryption_consistency'
+       AND constraint_type = 'CHECK') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD CONSTRAINT check_archive_encryption_consistency CHECK ((is_encrypted = false AND encrypted_payload IS NULL AND encryption_nonce IS NULL AND encryption_tag IS NULL) OR (is_encrypted = true AND encrypted_payload IS NOT NULL AND encryption_nonce IS NOT NULL AND encryption_tag IS NOT NULL AND encryption_key_id IS NOT NULL))',
+    'SELECT 1'
 );
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Add check constraints for valid algorithms
-ALTER TABLE hammerwork_jobs
-ADD CONSTRAINT check_encryption_algorithm 
-CHECK (encryption_algorithm IS NULL OR encryption_algorithm IN ('AES256GCM', 'ChaCha20Poly1305'));
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.table_constraints
+     WHERE constraint_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND constraint_name = 'check_encryption_algorithm'
+       AND constraint_type = 'CHECK') = 0,
+    'ALTER TABLE hammerwork_jobs ADD CONSTRAINT check_encryption_algorithm CHECK (encryption_algorithm IS NULL OR encryption_algorithm IN (''AES256GCM'', ''ChaCha20Poly1305''))',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-ALTER TABLE hammerwork_jobs_archive
-ADD CONSTRAINT check_archive_encryption_algorithm 
-CHECK (encryption_algorithm IS NULL OR encryption_algorithm IN ('AES256GCM', 'ChaCha20Poly1305'));
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.table_constraints
+     WHERE constraint_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND constraint_name = 'check_archive_encryption_algorithm'
+       AND constraint_type = 'CHECK') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD CONSTRAINT check_archive_encryption_algorithm CHECK (encryption_algorithm IS NULL OR encryption_algorithm IN (''AES256GCM'', ''ChaCha20Poly1305''))',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Add check constraints for retention policies
-ALTER TABLE hammerwork_jobs
-ADD CONSTRAINT check_retention_policy 
-CHECK (retention_policy IS NULL OR retention_policy IN ('DeleteAfter', 'DeleteAt', 'KeepIndefinitely', 'DeleteImmediately', 'UseDefault'));
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.table_constraints
+     WHERE constraint_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND constraint_name = 'check_retention_policy'
+       AND constraint_type = 'CHECK') = 0,
+    'ALTER TABLE hammerwork_jobs ADD CONSTRAINT check_retention_policy CHECK (retention_policy IS NULL OR retention_policy IN (''DeleteAfter'', ''DeleteAt'', ''KeepIndefinitely'', ''DeleteImmediately'', ''UseDefault''))',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-ALTER TABLE hammerwork_jobs_archive
-ADD CONSTRAINT check_archive_retention_policy 
-CHECK (retention_policy IS NULL OR retention_policy IN ('DeleteAfter', 'DeleteAt', 'KeepIndefinitely', 'DeleteImmediately', 'UseDefault'));
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.table_constraints
+     WHERE constraint_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND constraint_name = 'check_archive_retention_policy'
+       AND constraint_type = 'CHECK') = 0,
+    'ALTER TABLE hammerwork_jobs_archive ADD CONSTRAINT check_archive_retention_policy CHECK (retention_policy IS NULL OR retention_policy IN (''DeleteAfter'', ''DeleteAt'', ''KeepIndefinitely'', ''DeleteImmediately'', ''UseDefault''))',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;

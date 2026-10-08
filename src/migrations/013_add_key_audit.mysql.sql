@@ -1,4 +1,7 @@
 -- Migration 013: Add key audit logging table for MySQL
+--
+-- Every statement is idempotent: MySQL DDL auto-commits, so a migration that fails
+-- part-way leaves its earlier statements applied and must be safe to re-run.
 
 -- Create audit log table for key operations
 CREATE TABLE IF NOT EXISTS hammerwork_key_audit_log (
@@ -19,18 +22,53 @@ CREATE TABLE IF NOT EXISTS hammerwork_key_audit_log (
 );
 
 -- Create indexes for efficient audit log queries
-CREATE INDEX idx_hammerwork_key_audit_log_key_id
-    ON hammerwork_key_audit_log (key_id);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_key_audit_log' AND index_name = 'idx_hammerwork_key_audit_log_key_id') = 0,
+    'CREATE INDEX idx_hammerwork_key_audit_log_key_id ON hammerwork_key_audit_log (key_id)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_key_audit_log_timestamp
-    ON hammerwork_key_audit_log (timestamp);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_key_audit_log' AND index_name = 'idx_hammerwork_key_audit_log_timestamp') = 0,
+    'CREATE INDEX idx_hammerwork_key_audit_log_timestamp ON hammerwork_key_audit_log (timestamp)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_key_audit_log_operation
-    ON hammerwork_key_audit_log (operation);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_key_audit_log' AND index_name = 'idx_hammerwork_key_audit_log_operation') = 0,
+    'CREATE INDEX idx_hammerwork_key_audit_log_operation ON hammerwork_key_audit_log (operation)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-CREATE INDEX idx_hammerwork_key_audit_log_success
-    ON hammerwork_key_audit_log (success);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_key_audit_log' AND index_name = 'idx_hammerwork_key_audit_log_success') = 0,
+    'CREATE INDEX idx_hammerwork_key_audit_log_success ON hammerwork_key_audit_log (success)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Create composite index for common queries
-CREATE INDEX idx_hammerwork_key_audit_log_key_time
-    ON hammerwork_key_audit_log (key_id, timestamp);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_key_audit_log' AND index_name = 'idx_hammerwork_key_audit_log_key_time') = 0,
+    'CREATE INDEX idx_hammerwork_key_audit_log_key_time ON hammerwork_key_audit_log (key_id, timestamp)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
