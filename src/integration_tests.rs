@@ -151,7 +151,7 @@ mod tests {
             .enabled(true);
 
         let stream_id = stream.id;
-        stream_manager.add_stream(stream).await.unwrap();
+        stream_manager.add_stream_for_test(stream).await.unwrap();
 
         // Verify stream was added
         let stats = stream_manager.get_stats().await;
@@ -294,10 +294,19 @@ mod tests {
         )
         .with_filter(EventFilter::new().with_event_types(vec![JobLifecycleEventType::Completed]));
 
-        stream_manager.add_stream(kafka_stream).await.unwrap();
-        stream_manager.add_stream(kinesis_stream).await.unwrap();
+        stream_manager
+            .add_stream_for_test(kafka_stream)
+            .await
+            .unwrap();
+        stream_manager
+            .add_stream_for_test(kinesis_stream)
+            .await
+            .unwrap();
         if include_pubsub {
-            stream_manager.add_stream(pubsub_stream).await.unwrap();
+            stream_manager
+                .add_stream_for_test(pubsub_stream)
+                .await
+                .unwrap();
         }
 
         // Verify all components are set up
@@ -425,7 +434,7 @@ mod tests {
         )
         .with_filter(specific_filter);
 
-        stream_manager.add_stream(stream).await.unwrap();
+        stream_manager.add_stream_for_test(stream).await.unwrap();
 
         // Create matching event
         let matching_event = JobLifecycleEvent {
@@ -543,7 +552,7 @@ mod tests {
             },
         );
 
-        stream_manager.add_stream(stream).await.unwrap();
+        stream_manager.add_stream_for_test(stream).await.unwrap();
 
         // Spawn multiple tasks publishing events concurrently
         let num_tasks = 10;
@@ -645,7 +654,10 @@ mod tests {
             },
         );
 
-        stream_manager.add_stream(working_stream).await.unwrap();
+        stream_manager
+            .add_stream_for_test(working_stream)
+            .await
+            .unwrap();
 
         // Add another working webhook
         let working_webhook = WebhookConfig {
