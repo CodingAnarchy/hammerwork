@@ -54,8 +54,27 @@ pub trait DatabaseQueue: Send + Sync {
     type Database: Database;
 
     // Core job operations
+
+    /// Store a new job.
+    ///
+    /// With the database backends, a job that depends on jobs that have already
+    /// finished gets its dependency state at once: `satisfied` when they all completed, or `Failed` when one of
+    /// them failed terminally (unless that job's workflow uses
+    /// [`FailurePolicy::Manual`](crate::workflow::FailurePolicy::Manual)). The
+    /// dependencies are locked while the job is inserted, so one finishing
+    /// concurrently is applied either way.
     async fn enqueue(&self, job: Job) -> Result<JobId>;
+
+    /// Claim the next runnable job of `queue_name`: `Pending`, due (by the database
+    /// clock), not waiting on dependencies, highest priority first, then oldest.
+    /// Returns `None` when there is none or the queue is paused.
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>>;
+
+    /// Like [`dequeue`](Self::dequeue), but picks the priority level by weight among
+    /// the levels that have runnable jobs, then claims that level's oldest job (see
+    /// [`PriorityWeights`](crate::priority::PriorityWeights)). Every level with
+    /// runnable jobs and a non-zero weight is picked regularly, however many jobs of
+    /// other levels are queued.
     async fn dequeue_with_priority_weights(
         &self,
         queue_name: &str,
@@ -349,7 +368,12 @@ pub trait DatabaseQueue: Send + Sync {
     async fn get_workflow_jobs(&self, workflow_id: crate::workflow::WorkflowId)
     -> Result<Vec<Job>>;
 
-    /// Cancel a workflow and all its pending jobs.
+    /// Cancel a workflow: its unfinished jobs (`Pending`, `Retrying` and `Running`)
+    /// become `Failed` ("Workflow cancelled") and the workflow `Cancelled`.
+    ///
+    /// Running jobs cannot be interrupted; their handlers run to the end, but the
+    /// outcome is discarded ([`finish_job_run`](Self::finish_job_run) returns `None`
+    /// and heartbeats return `false`), so the job stays `Failed`.
     async fn cancel_workflow(&self, workflow_id: crate::workflow::WorkflowId) -> Result<()>;
 
     // Job archival operations
@@ -531,9 +555,12 @@ pub trait DatabaseQueue: Send + Sync {
     // Queue management operations
     /// Pause job processing for a specific queue.
     ///
-    /// When a queue is paused, workers will stop dequeuing new jobs from it,
-    /// but jobs already in progress will continue to completion. This allows
-    /// for graceful queue management without interrupting running jobs.
+    /// When a queue is paused, [`dequeue`](Self::dequeue) and
+    /// [`dequeue_with_priority_weights`](Self::dequeue_with_priority_weights) return
+    /// no jobs from it (the check is part of the dequeue query, so it also applies to
+    /// callers other than workers), but jobs already in progress continue to
+    /// completion. This allows for graceful queue management without interrupting
+    /// running jobs.
     ///
     /// # Arguments
     ///

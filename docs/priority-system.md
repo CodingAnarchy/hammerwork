@@ -64,17 +64,23 @@ let worker = Worker::new(queue, "urgent_queue".to_string(), handler)
 
 ### Understanding Weighted Selection
 
+Each weighted dequeue first finds which priority levels have a runnable job (one
+index probe per level), picks one of those levels with probability proportional to
+its weight, and claims the oldest runnable job of that level. If other workers hold
+all of that level's jobs, it tries the remaining levels the same way.
+
 ```rust
-// Example: With default weights (50, 20, 10, 5, 1)
-// If queue has: 1 Critical, 2 High, 10 Normal, 5 Low, 3 Background jobs
-// Selection probability:
-// - Critical: ~50% chance
-// - High: ~20% chance  
-// - Normal: ~10% chance
-// - Low: ~5% chance
-// - Background: ~1% chance
-// Plus 10% fairness factor ensuring lower priorities get some processing time
+// Example: with weights Critical 50, High 20, Normal 10, Low 5, Background 1
+// and runnable jobs at the High, Normal and Background levels (any number of each):
+// - High:       20 / 31 ≈ 65%
+// - Normal:     10 / 31 ≈ 32%
+// - Background:  1 / 31 ≈  3%
 ```
+
+The probability of a level depends only on the weights of the levels that have
+runnable jobs, not on how many jobs each level holds, so a lower priority is never
+starved by a long backlog of higher-priority jobs. A level with weight `0` is only
+picked when no level with runnable jobs has a weight.
 
 ## Priority Configuration Patterns
 
@@ -151,7 +157,7 @@ println!("Most active priority: {:?}", priority_stats.most_active_priority());
 if priority_stats.has_starvation_risk(0.02) { // 2% threshold
     eprintln!("WARNING: Priority starvation detected!");
     eprintln!("Lower priority jobs may not be getting processed adequately");
-    
+
     // Consider adjusting weights or fairness factor
     let adjusted_weights = PriorityWeights::builder()
         .critical(30)  // Reduce critical weight
@@ -171,26 +177,26 @@ use tokio::time::{interval, Duration};
 
 async fn monitor_priority_distribution(stats_collector: Arc<InMemoryStatsCollector>) {
     let mut monitor_interval = interval(Duration::from_secs(60));
-    
+
     loop {
         monitor_interval.tick().await;
-        
+
         let stats = stats_collector.get_priority_stats().await.unwrap();
-        
+
         // Log priority distribution
-        println!("Priority Stats - C:{} H:{} N:{} L:{} B:{}", 
+        println!("Priority Stats - C:{} H:{} N:{} L:{} B:{}",
                  stats.critical, stats.high, stats.normal, stats.low, stats.background);
-        
+
         // Alert on starvation
         if stats.has_starvation_risk(0.05) {
             eprintln!("ALERT: Priority starvation detected!");
         }
-        
+
         // Alert on priority imbalance (too much critical)
         if stats.critical_percentage() > 80.0 {
             eprintln!("ALERT: Over 80% critical jobs - may indicate system issues");
         }
-        
+
         // Alert on lack of activity
         if stats.total() == 0 {
             eprintln!("ALERT: No jobs processed in monitoring window");
@@ -250,10 +256,10 @@ async fn enqueue_with_dynamic_priority(
         f if f >= 0.3 => JobPriority::Low,
         _ => JobPriority::Background,
     };
-    
+
     let job = Job::new(job_type.to_string(), payload)
         .with_priority(priority);
-    
+
     queue.enqueue(job).await?;
     Ok(())
 }
@@ -299,7 +305,7 @@ let priority_aware_handler = Arc::new(|job: Job| {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             },
         }
-        
+
         // Process the job
         process_job(&job).await
     })
@@ -376,7 +382,7 @@ async fn check_priority_health(
     alerting: Arc<AlertingConfig>
 ) {
     let stats = stats_collector.get_priority_stats().await.unwrap();
-    
+
     if stats.has_starvation_risk(0.05) {
         // Send custom alert
         let alert_payload = json!({
@@ -386,7 +392,7 @@ async fn check_priority_health(
             "total_jobs": stats.total(),
             "recommendation": "Consider adjusting priority weights or fairness factor"
         });
-        
+
         // Send alert via webhook (implement based on your alerting setup)
         send_priority_alert(&alert_payload).await;
     }

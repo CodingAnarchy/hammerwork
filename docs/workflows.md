@@ -51,6 +51,14 @@ Jobs track their dependency state:
 - `Satisfied` - All dependencies have completed successfully
 - `Failed` - One or more dependencies failed
 
+A job may be enqueued after its dependencies have finished. Its dependency state is
+then settled when it is enqueued: `Satisfied` if every dependency completed (also when
+they have been archived), and `Failed` (the job is inserted as `Failed`, with the
+failed dependency in its `error_message`) if a dependency failed, died or timed out,
+unless that dependency's workflow uses the `Manual` failure policy, in which case the
+job waits like any other dependent. The dependencies are locked while the job is
+inserted, so a dependency that finishes at the same moment cannot leave it waiting.
+
 ## JobGroup and Workflow Creation
 
 ### Sequential Workflows
@@ -133,7 +141,7 @@ for i in 0..10 {
         "algorithm": "ml_classification"
     }))
     .depends_on(&split_job.id);
-    
+
     processing_jobs.push(job);
 }
 
@@ -289,6 +297,13 @@ match status {
 queue.cancel_workflow(workflow_id).await?;
 ```
 
+`cancel_workflow` marks every unfinished job of the workflow (`Pending`, `Retrying`
+and `Running`) as `Failed` with the error "Workflow cancelled", and the workflow as
+`Cancelled`. A job that is already running cannot be interrupted: its handler runs to
+the end, but its outcome is discarded. `finish_job_run` only records outcomes for jobs
+that are still `Running` the same run, so the job stays `Failed`, and the worker's
+heartbeats stop extending its lease. Side effects the handler performed are not undone.
+
 ### Workflow Statistics
 
 Monitor workflow execution:
@@ -311,8 +326,8 @@ Dependencies are stored as JSON arrays in the database:
 
 ```sql
 -- PostgreSQL example
-SELECT id, queue_name, depends_on, dependency_status 
-FROM hammerwork_jobs 
+SELECT id, queue_name, depends_on, dependency_status
+FROM hammerwork_jobs
 WHERE dependency_status = 'waiting';
 ```
 
@@ -322,13 +337,20 @@ The system uses optimized queries to find ready jobs:
 
 ```sql
 -- Only jobs with satisfied dependencies are eligible for dequeue
-SELECT * FROM hammerwork_jobs 
-WHERE queue_name = ? 
-  AND status = 'pending'
+SELECT * FROM hammerwork_jobs
+WHERE queue_name = ?
+  AND status = 'Pending'
   AND scheduled_at <= NOW()
-  AND (dependency_status = 'none' OR dependency_status = 'satisfied')
+  AND dependency_status IN ('none', 'satisfied')
 ORDER BY priority DESC, scheduled_at ASC;
 ```
+
+When a job completes, its waiting dependents are locked and checked with a constant
+number of queries, however many there are. On PostgreSQL `depends_on` is a `UUID[]`
+with a GIN index, which serves the dependent lookup. On MySQL `depends_on` is a JSON
+array, and the lookup (`JSON_CONTAINS`) cannot use an index, so it scans the waiting
+jobs; keep the number of jobs waiting on dependencies moderate on MySQL. Failing the
+dependents of a failed job walks the dependency graph one job at a time.
 
 ## CLI Workflow Commands
 
@@ -377,7 +399,7 @@ Define workflows in JSON or YAML:
     },
     {
       "name": "transform",
-      "queue": "etl_queue", 
+      "queue": "etl_queue",
       "payload": {"rules": "business_logic.json"},
       "depends_on": ["extract"]
     },
@@ -464,7 +486,7 @@ let daily_report = Job::new("report".to_string(), json!({}))
 Create workflows that include batch jobs:
 
 ```rust
-let batch_job = Job::new_batch("process_batch".to_string(), 
+let batch_job = Job::new_batch("process_batch".to_string(),
     vec![payload1, payload2, payload3]);
 
 let summary_job = Job::new("summarize".to_string(), json!({}))
