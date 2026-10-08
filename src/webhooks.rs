@@ -866,16 +866,7 @@ impl WebhookManager {
 
                 // Read response body
                 let response_body = match response.text().await {
-                    Ok(body) => {
-                        if body.len() > config.max_response_body_size {
-                            Some(format!(
-                                "{}... [truncated]",
-                                &body[..config.max_response_body_size]
-                            ))
-                        } else {
-                            Some(body)
-                        }
-                    }
+                    Ok(body) => Some(truncate_response_body(body, config.max_response_body_size)),
                     Err(_) => None,
                 };
 
@@ -1162,6 +1153,22 @@ pub fn verify_hmac_signature(secret: &str, payload: &[u8], signature: &str) -> b
     // Use constant-time comparison to prevent timing attacks
     expected.len() == signature.len()
         && expected.bytes().zip(signature.bytes()).all(|(a, b)| a == b)
+}
+
+/// Truncate a webhook response body to at most `max_bytes` bytes (plus a marker).
+///
+/// The response comes from a remote endpoint, so the cut point can fall inside a
+/// multi-byte UTF-8 character. Back up to the nearest character boundary instead of
+/// slicing at the raw byte offset, which would panic.
+fn truncate_response_body(body: String, max_bytes: usize) -> String {
+    if body.len() <= max_bytes {
+        return body;
+    }
+    let mut end = max_bytes;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [truncated]", &body[..end])
 }
 
 #[cfg(test)]
@@ -1668,5 +1675,22 @@ mod tests {
         assert_eq!(stats.total_attempts, 11);
         assert_eq!(stats.successful_deliveries, 8);
         assert!((stats.success_rate - 8.0 / 11.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_truncate_response_body_respects_utf8_boundaries() {
+        // Short bodies are returned unchanged.
+        assert_eq!(truncate_response_body("ok".to_string(), 10), "ok");
+
+        // "é" is 2 bytes and "😀" is 4; cutting inside either must not panic.
+        let body = "aé😀b".to_string(); // bytes: a(1) é(2) 😀(4) b(1) = 8
+        assert_eq!(truncate_response_body(body.clone(), 2), "a... [truncated]");
+        assert_eq!(truncate_response_body(body.clone(), 3), "aé... [truncated]");
+        for max in 0..body.len() {
+            let truncated = truncate_response_body(body.clone(), max);
+            assert!(truncated.ends_with("... [truncated]"));
+            assert!(truncated.len() <= max + "... [truncated]".len());
+        }
+        assert_eq!(truncate_response_body(body.clone(), body.len()), body);
     }
 }
