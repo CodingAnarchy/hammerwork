@@ -1620,9 +1620,12 @@ impl KafkaProcessor {
         // Set basic configuration
         client_config.set("bootstrap.servers", brokers.join(","));
 
-        // Apply custom configuration
+        // Apply custom configuration. `health.check.timeout.ms` is read by
+        // `health_check` and is not a librdkafka property, so it is not passed on.
         for (key, value) in &config {
-            client_config.set(key, value);
+            if key != "health.check.timeout.ms" {
+                client_config.set(key, value);
+            }
         }
 
         // Set defaults if not provided
@@ -3300,6 +3303,114 @@ mod tests {
         assert!((stats.success_rate - 951.0 / 1001.0).abs() < f64::EPSILON);
     }
 
+    /// Kafka brokers for tests that need a real cluster, from `KAFKA_BROKERS`
+    /// (comma-separated). With the `kafka` feature these tests are `#[ignore]`d
+    /// and are skipped when `KAFKA_BROKERS` is unset, so `--include-ignored`
+    /// runs without a broker still pass. The placeholder processor needs no
+    /// broker and always runs.
+    fn test_kafka_brokers() -> Option<Vec<String>> {
+        match std::env::var("KAFKA_BROKERS") {
+            Ok(brokers) => Some(brokers.split(',').map(|b| b.trim().to_string()).collect()),
+            Err(_) if cfg!(feature = "kafka") => {
+                eprintln!("skipping: KAFKA_BROKERS is not set");
+                None
+            }
+            Err(_) => Some(vec!["localhost:9092".to_string()]),
+        }
+    }
+
+    /// Whether a test that creates a real Pub/Sub client can run. With the
+    /// `google-pubsub` feature these tests are `#[ignore]`d and are skipped
+    /// when `GOOGLE_APPLICATION_CREDENTIALS` is unset.
+    fn pubsub_credentials_available() -> bool {
+        if cfg!(feature = "google-pubsub")
+            && std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").is_none()
+        {
+            eprintln!("skipping: GOOGLE_APPLICATION_CREDENTIALS is not set");
+            return false;
+        }
+        true
+    }
+
+    /// A Kafka processor pointed at a port nothing listens on, with short
+    /// timeouts, to exercise failure handling without a broker.
+    #[cfg(feature = "kafka")]
+    async fn unreachable_kafka_processor() -> KafkaProcessor {
+        let mut config = HashMap::new();
+        config.insert("message.timeout.ms".to_string(), "500".to_string());
+        config.insert("health.check.timeout.ms".to_string(), "500".to_string());
+        KafkaProcessor::new(
+            vec!["127.0.0.1:1".to_string()],
+            "test-topic".to_string(),
+            config,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "kafka")]
+    #[tokio::test]
+    async fn test_kafka_health_check_unreachable_broker() {
+        let processor = unreachable_kafka_processor().await;
+        assert!(!processor.health_check().await.unwrap());
+    }
+
+    #[cfg(feature = "kafka")]
+    #[tokio::test]
+    async fn test_kafka_batch_sending_unreachable_broker() {
+        let processor = unreachable_kafka_processor().await;
+
+        let event = JobLifecycleEvent {
+            event_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            queue_name: "test".to_string(),
+            event_type: JobLifecycleEventType::Completed,
+            priority: JobPriority::Normal,
+            timestamp: Utc::now(),
+            processing_time_ms: Some(1000),
+            error: None,
+            payload: None,
+            metadata: HashMap::new(),
+        };
+        let event_id = event.event_id;
+
+        let deliveries = processor
+            .send_batch(vec![StreamedEvent {
+                event,
+                partition_key: Some("partition-0".to_string()),
+                serialized_data: b"test data".to_vec(),
+                streamed_at: Utc::now(),
+                headers: HashMap::new(),
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].event_id, event_id);
+        assert!(!deliveries[0].success);
+        assert!(deliveries[0].error_message.is_some());
+    }
+
+    #[cfg(feature = "google-pubsub")]
+    #[tokio::test]
+    async fn test_pubsub_processor_rejects_invalid_service_account_key() {
+        let result = PubSubProcessor::new(
+            "my-project".to_string(),
+            "test-topic".to_string(),
+            Some("not a service account key".to_string()),
+            HashMap::new(),
+        )
+        .await;
+
+        match result {
+            Err(HammerworkError::Streaming { message }) => {
+                assert!(message.contains("Invalid service account credentials"));
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+            Ok(_) => panic!("invalid service account key should be rejected"),
+        }
+    }
+
     #[tokio::test]
     async fn test_kafka_processor_creation() {
         let processor = KafkaProcessor::new(
@@ -3331,7 +3442,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        feature = "google-pubsub",
+        ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"
+    )]
     async fn test_pubsub_processor_creation() {
+        if !pubsub_credentials_available() {
+            return;
+        }
         let processor = PubSubProcessor::new(
             "my-project".to_string(),
             "test-topic".to_string(),
@@ -3347,14 +3465,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(feature = "kafka", ignore = "requires Kafka: KAFKA_BROKERS")]
     async fn test_stream_processor_health_check() {
-        let processor = KafkaProcessor::new(
-            vec!["localhost:9092".to_string()],
-            "test-topic".to_string(),
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+        let Some(brokers) = test_kafka_brokers() else {
+            return;
+        };
+        let processor = KafkaProcessor::new(brokers, "test-topic".to_string(), HashMap::new())
+            .await
+            .unwrap();
 
         // Health check should pass (placeholder implementation)
         let health = processor.health_check().await.unwrap();
@@ -3362,14 +3480,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(feature = "kafka", ignore = "requires Kafka: KAFKA_BROKERS")]
     async fn test_stream_processor_batch_sending() {
-        let processor = KafkaProcessor::new(
-            vec!["localhost:9092".to_string()],
-            "test-topic".to_string(),
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
+        let Some(brokers) = test_kafka_brokers() else {
+            return;
+        };
+        let processor = KafkaProcessor::new(brokers, "test-topic".to_string(), HashMap::new())
+            .await
+            .unwrap();
 
         let event = JobLifecycleEvent {
             event_id: Uuid::new_v4(),
@@ -3562,7 +3680,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        feature = "google-pubsub",
+        ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"
+    )]
     async fn test_stream_processor_stats() {
+        if !pubsub_credentials_available() {
+            return;
+        }
         let processor = PubSubProcessor::new(
             "test-project".to_string(),
             "test-topic".to_string(),
@@ -3660,9 +3785,15 @@ mod tests {
 
         // Test Kafka processor with custom configuration
         let mut kafka_config = HashMap::new();
-        kafka_config.insert("batch.delay.ms".to_string(), "50".to_string());
-        kafka_config.insert("test.error.rate".to_string(), "0.1".to_string());
         kafka_config.insert("health.check.timeout.ms".to_string(), "1000".to_string());
+        // Simulation knobs of the placeholder processor; librdkafka rejects them.
+        #[cfg(not(feature = "kafka"))]
+        {
+            kafka_config.insert("batch.delay.ms".to_string(), "50".to_string());
+            kafka_config.insert("test.error.rate".to_string(), "0.1".to_string());
+        }
+        #[cfg(feature = "kafka")]
+        kafka_config.insert("linger.ms".to_string(), "50".to_string());
 
         let kafka_processor = KafkaProcessor::new(
             vec!["localhost:9092".to_string()],
@@ -3699,17 +3830,48 @@ mod tests {
             kinesis_stats.get("type").unwrap(),
             &serde_json::Value::String("kinesis".to_string())
         );
-        assert!(kinesis_stats.contains_key("access_key_id"));
-        assert!(kinesis_stats.contains_key("config"));
+        // The placeholder processor (without the `kinesis` feature) reports
+        // only `credentials_configured`.
+        #[cfg(feature = "kinesis")]
+        {
+            assert!(kinesis_stats.contains_key("access_key_id"));
+            assert!(kinesis_stats.contains_key("config"));
+        }
+        #[cfg(not(feature = "kinesis"))]
+        assert_eq!(
+            kinesis_stats.get("credentials_configured").unwrap(),
+            &serde_json::Value::Bool(true)
+        );
+    }
 
+    #[tokio::test]
+    #[cfg_attr(
+        feature = "google-pubsub",
+        ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"
+    )]
+    async fn test_pubsub_processor_configuration_usage() {
+        if !pubsub_credentials_available() {
+            return;
+        }
         // Test PubSub processor with service account
         let mut pubsub_config = HashMap::new();
         pubsub_config.insert("max_messages".to_string(), "1000".to_string());
 
+        // The real client needs a valid service account key; the placeholder
+        // processor accepts any string.
+        #[cfg(feature = "google-pubsub")]
+        let service_account_key = std::fs::read_to_string(
+            std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+                .expect("GOOGLE_APPLICATION_CREDENTIALS must point at a service account key"),
+        )
+        .expect("failed to read service account key");
+        #[cfg(not(feature = "google-pubsub"))]
+        let service_account_key = "service-account-key".to_string();
+
         let pubsub_processor = PubSubProcessor::new(
             "my-project".to_string(),
             "test-topic".to_string(),
-            Some("service-account-key".to_string()),
+            Some(service_account_key),
             pubsub_config,
         )
         .await
@@ -3724,6 +3886,9 @@ mod tests {
             pubsub_stats.get("service_account_configured").unwrap(),
             &serde_json::Value::Bool(true)
         );
+        // The placeholder processor (without the `google-pubsub` feature) does
+        // not report its config.
+        #[cfg(feature = "google-pubsub")]
         assert!(pubsub_stats.contains_key("config"));
     }
 }

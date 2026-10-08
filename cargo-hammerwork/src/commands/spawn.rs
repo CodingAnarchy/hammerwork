@@ -1293,7 +1293,7 @@ mod tests {
     #[test]
     fn test_spawn_command_variants() {
         // Test that all spawn command variants can be created
-        let commands = vec![
+        let commands = [
             SpawnCommand::List {
                 database_url: None,
                 limit: Some(10),
@@ -1434,7 +1434,7 @@ mod tests {
         }
 
         // Test list command parsing
-        let app = TestApp::try_parse_from(&[
+        let app = TestApp::try_parse_from([
             "test",
             "list",
             "--limit",
@@ -1459,7 +1459,7 @@ mod tests {
         }
 
         // Test tree command parsing
-        let app = TestApp::try_parse_from(&[
+        let app = TestApp::try_parse_from([
             "test",
             "tree",
             "550e8400-e29b-41d4-a716-446655440000",
@@ -1483,7 +1483,7 @@ mod tests {
         }
 
         // Test stats command parsing
-        let app = TestApp::try_parse_from(&[
+        let app = TestApp::try_parse_from([
             "test",
             "stats",
             "--hours",
@@ -1508,7 +1508,7 @@ mod tests {
         }
 
         // Test lineage command parsing
-        let app = TestApp::try_parse_from(&[
+        let app = TestApp::try_parse_from([
             "test",
             "lineage",
             "test-job-id",
@@ -1535,7 +1535,7 @@ mod tests {
         }
 
         // Test pending command parsing
-        let app = TestApp::try_parse_from(&[
+        let app = TestApp::try_parse_from([
             "test",
             "pending",
             "--queue",
@@ -1554,7 +1554,7 @@ mod tests {
         }
 
         // Test monitor command parsing
-        let app = TestApp::try_parse_from(&[
+        let app = TestApp::try_parse_from([
             "test",
             "monitor",
             "--interval",

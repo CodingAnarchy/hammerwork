@@ -170,6 +170,8 @@ mod tests {
         assert!(stream_stats.is_some());
     }
 
+    /// Webhooks plus Kafka and Kinesis streams. Neither stream backend connects
+    /// when the stream is added, so this runs without external services.
     #[tokio::test]
     #[cfg(any(
         feature = "streaming",
@@ -178,6 +180,40 @@ mod tests {
         feature = "kinesis"
     ))]
     async fn test_full_system_integration() {
+        run_full_system_integration(false).await;
+    }
+
+    /// Same as `test_full_system_integration`, plus a Pub/Sub stream. The real
+    /// Pub/Sub client needs Google credentials to be created.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
+    #[cfg_attr(
+        feature = "google-pubsub",
+        ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"
+    )]
+    async fn test_full_system_integration_with_pubsub() {
+        // Skip `--include-ignored` runs that have no Google credentials.
+        if cfg!(feature = "google-pubsub")
+            && std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").is_none()
+        {
+            eprintln!("skipping: GOOGLE_APPLICATION_CREDENTIALS is not set");
+            return;
+        }
+        run_full_system_integration(true).await;
+    }
+
+    #[cfg(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    ))]
+    async fn run_full_system_integration(include_pubsub: bool) {
         // Set up all components
         let event_manager = Arc::new(EventManager::new_default());
 
@@ -246,6 +282,7 @@ mod tests {
             EventFilter::new().with_priorities(vec![JobPriority::High, JobPriority::Critical]),
         );
 
+        let expected_streams = if include_pubsub { 3 } else { 2 };
         let pubsub_stream = StreamConfig::new(
             "pubsub_completed_jobs".to_string(),
             StreamBackend::PubSub {
@@ -259,7 +296,9 @@ mod tests {
 
         stream_manager.add_stream(kafka_stream).await.unwrap();
         stream_manager.add_stream(kinesis_stream).await.unwrap();
-        stream_manager.add_stream(pubsub_stream).await.unwrap();
+        if include_pubsub {
+            stream_manager.add_stream(pubsub_stream).await.unwrap();
+        }
 
         // Verify all components are set up
         let webhook_stats = webhook_manager.get_stats().await;
@@ -267,8 +306,8 @@ mod tests {
         assert_eq!(webhook_stats.active_webhooks, 2);
 
         let stream_stats = stream_manager.get_stats().await;
-        assert_eq!(stream_stats.total_streams, 3);
-        assert_eq!(stream_stats.active_streams, 3);
+        assert_eq!(stream_stats.total_streams, expected_streams);
+        assert_eq!(stream_stats.active_streams, expected_streams);
 
         // Publish various events
         let events = vec![
@@ -332,7 +371,7 @@ mod tests {
         let final_stream_stats = stream_manager.get_stats().await;
 
         assert_eq!(final_webhook_stats.total_webhooks, 2);
-        assert_eq!(final_stream_stats.total_streams, 3);
+        assert_eq!(final_stream_stats.total_streams, expected_streams);
     }
 
     #[tokio::test]

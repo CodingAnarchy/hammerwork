@@ -1072,7 +1072,7 @@ mod tests {
     #[test]
     fn test_workflow_command_variants() {
         // Test all command variants can be created
-        let commands = vec![
+        let commands = [
             WorkflowCommand::List {
                 database_url: None,
                 limit: Some(10),
