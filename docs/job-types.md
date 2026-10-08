@@ -4,7 +4,12 @@ Hammerwork supports various types of jobs with flexible configuration options.
 
 ## Basic Jobs
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, queue::*, worker::*};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::sync::Arc;
+# #[allow(unused_variables)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::job::Job;
 use serde_json::json;
 
@@ -16,13 +21,20 @@ let job = Job::new("email_queue".to_string(), json!({
 }));
 
 queue.enqueue(job).await?;
+# Ok(())
+# }
 ```
 
 ## Job Priority
 
 Jobs support five priority levels:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, queue::*, worker::*};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::sync::Arc;
+# #[allow(unused_variables)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::{Job, JobPriority};
 
 let high_priority_job = Job::new("urgent".to_string(), json!({"task": "urgent_task"}))
@@ -30,6 +42,8 @@ let high_priority_job = Job::new("urgent".to_string(), json!({"task": "urgent_ta
 
 let background_job = Job::new("cleanup".to_string(), json!({"task": "cleanup"}))
     .with_priority(JobPriority::Background);
+# Ok(())
+# }
 ```
 
 ### Priority Levels
@@ -43,21 +57,32 @@ let background_job = Job::new("cleanup".to_string(), json!({"task": "cleanup"}))
 
 Schedule jobs to run at a specific time:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, queue::*, worker::*};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::sync::Arc;
+# #[allow(unused_variables)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use chrono::{Utc, Duration};
 
-let delayed_job = Job::new("reminder".to_string(), json!({"user_id": 123}))
-    .with_delay(Duration::hours(24)); // Run in 24 hours
+let delayed_job = Job::with_delay("reminder".to_string(), json!({"user_id": 123}), Duration::hours(24)); // Run in 24 hours
 
 let scheduled_job = Job::new("report".to_string(), json!({"type": "weekly"}))
     .with_scheduled_at(Utc::now() + Duration::days(7));
+# Ok(())
+# }
 ```
 
 ## Job Timeouts
 
 Configure per-job or worker-level timeouts:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, queue::*, worker::*};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::sync::Arc;
+# #[allow(unused_variables)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use std::time::Duration;
 
 // Per-job timeout
@@ -67,34 +92,51 @@ let job = Job::new("long_task".to_string(), json!({"data": "..."}))
 // Worker-level default timeout
 let worker = Worker::new(queue, "default".to_string(), handler)
     .with_default_timeout(Duration::from_secs(120)); // 2 minute default
+# Ok(())
+# }
 ```
 
 ## Retry Configuration
 
 Jobs automatically retry on failure with configurable limits:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, queue::*, worker::*};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::sync::Arc;
+# #[allow(unused_variables)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let job = Job::new("api_call".to_string(), json!({"url": "https://api.example.com"}))
-    .with_max_attempts(5); // Retry up to 5 times
+    .with_max_attempts(5); // At most 5 attempts in total (the first run plus 4 retries)
 
-// Worker-level retry configuration
+// Worker-level retry configuration. The job's max_attempts is the limit;
+// with_max_retries only caps it for jobs processed by this worker.
 let worker = Worker::new(queue, "default".to_string(), handler)
     .with_max_retries(3)
-    .with_retry_delay(Duration::from_secs(30)); // Wait 30s between retries
+    .with_retry_delay(std::time::Duration::from_secs(30)); // Wait 30s between retries
+# Ok(())
+# }
 ```
 
 ## Cron Jobs
 
 Schedule recurring jobs with cron expressions:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, queue::*, worker::*};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::sync::Arc;
+# #[allow(unused_variables)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::cron::CronSchedule;
 
+let schedule = CronSchedule::with_timezone("0 0 8 * * *", "America/New_York")?; // Every day at 8 AM
 let cron_job = Job::new("daily_report".to_string(), json!({"type": "daily"}))
-    .with_cron_schedule("0 8 * * *".parse::<CronSchedule>()?)  // Every day at 8 AM
-    .with_timezone("America/New_York".to_string());
+    .with_cron(schedule)?;
 
 queue.enqueue_cron_job(cron_job).await?;
+# Ok(())
+# }
 ```
 
 ### Cron Examples
@@ -143,22 +185,25 @@ worker dequeued (see [Worker Configuration](worker-configuration.md#recording-ou
 Define how jobs are processed:
 
 ```rust
-use hammerwork::{Job, Result};
+use hammerwork::{HammerworkError, Job, worker::JobHandler};
+use std::sync::Arc;
+# async fn send_email(_to: &str) -> hammerwork::Result<()> { Ok(()) }
+# async fn generate_report(_kind: &str) -> hammerwork::Result<()> { Ok(()) }
 
 // Simple handler
-let handler = Arc::new(|job: Job| {
+let handler: JobHandler = Arc::new(|job: Job| {
     Box::pin(async move {
         match job.payload.get("task").and_then(|v| v.as_str()) {
             Some("send_email") => {
-                let email = job.payload.get("email").unwrap().as_str().unwrap();
+                let email = job.payload["email"].as_str().unwrap_or_default();
                 send_email(email).await?;
             },
             Some("generate_report") => {
-                let report_type = job.payload.get("type").unwrap().as_str().unwrap();
+                let report_type = job.payload["type"].as_str().unwrap_or_default();
                 generate_report(report_type).await?;
             },
             _ => {
-                return Err("Unknown task type".into());
+                return Err(HammerworkError::Processing("Unknown task type".to_string()));
             }
         }
         Ok(())
@@ -171,7 +216,10 @@ let handler = Arc::new(|job: Job| {
 Jobs can fail and be retried automatically:
 
 ```rust
-let handler = Arc::new(|job: Job| {
+# use hammerwork::{Job, worker::JobHandler};
+# use std::sync::Arc;
+# async fn process_job(_job: &Job) -> hammerwork::Result<String> { Ok(String::new()) }
+let handler: JobHandler = Arc::new(|job: Job| {
     Box::pin(async move {
         // Your processing logic
         match process_job(&job).await {

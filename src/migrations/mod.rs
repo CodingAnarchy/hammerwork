@@ -23,7 +23,8 @@
 //!
 //! Once migrations are complete, your application simply connects to the database:
 //!
-//! ```rust,no_run
+#![cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+#![cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
 //! use hammerwork::{Job, JobQueue, queue::DatabaseQueue};
 //! use serde_json::json;
 //! use std::sync::Arc;

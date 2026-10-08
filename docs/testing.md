@@ -602,7 +602,6 @@ For testing Worker behavior, use a real database connection with `JobQueue<DB>` 
 ### 1. Use Descriptive Queue Names
 
 ```rust
-# #[cfg(feature = "test")]
 # async fn example() -> hammerwork::Result<()> {
 # use hammerwork::{Job, queue::{DatabaseQueue, test::TestQueue}};
 # let data = serde_json::json!({});

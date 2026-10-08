@@ -630,7 +630,8 @@ pub enum JobHandlerType {
 ///
 /// ## Basic Worker
 ///
-/// ```rust,no_run
+#[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+#[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
 /// use hammerwork::{Worker, JobQueue, Job};
 /// use std::sync::Arc;
 ///
@@ -659,7 +660,8 @@ pub enum JobHandlerType {
 ///
 /// ## Worker with Priority and Rate Limiting
 ///
-/// ```rust,no_run
+#[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+#[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
 /// use hammerwork::{Worker, JobQueue, PriorityWeights, RateLimit};
 /// use std::sync::Arc;
 /// use std::time::Duration;
@@ -792,7 +794,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::{Worker, JobQueue, Job};
     /// use std::sync::Arc;
     ///
@@ -866,7 +869,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::{Worker, JobQueue, Job, worker::{JobHandlerWithResult, JobResult}};
     /// use std::sync::Arc;
     /// use serde_json::json;
@@ -937,7 +941,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::{Worker, JobQueue, InMemoryStatsCollector};
     /// use std::sync::Arc;
     ///
@@ -974,7 +979,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::Worker;
     /// use std::time::Duration;
     /// # use std::sync::Arc;
@@ -1016,7 +1022,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::Worker;
     /// # use std::sync::Arc;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1046,7 +1053,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::Worker;
     /// use std::time::Duration;
     /// # use std::sync::Arc;
@@ -1081,7 +1089,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::{Worker, retry::RetryStrategy};
     /// use std::time::Duration;
     /// # use std::sync::Arc;
@@ -1116,7 +1125,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::Worker;
     /// use std::time::Duration;
     /// # use std::sync::Arc;
@@ -1147,7 +1157,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::{Worker, JobQueue};
     /// use std::{sync::Arc, time::Duration};
     ///
@@ -1209,7 +1220,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::{HammerworkConfig, JobQueue, Worker};
     /// use std::sync::Arc;
     ///
@@ -1307,7 +1319,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::{Worker, JobQueue, events::EventManager};
     /// use std::sync::Arc;
     ///
@@ -1339,7 +1352,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::Worker;
     /// # use std::sync::Arc;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1370,7 +1384,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// # use hammerwork::{Worker, worker::{JobEventHooks, JobHookEvent}};
     /// # use std::sync::Arc;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1451,7 +1466,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1481,7 +1497,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1513,7 +1530,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1545,7 +1563,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -1575,7 +1594,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// # use hammerwork::Worker;
     /// # use std::sync::Arc;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `Job::with_scheduled_at(DateTime<Utc>)` builder to schedule a job at a specific time (the guides already used it).
 - **Real data in place of placeholders** (part of [#41](https://github.com/CodingAnarchy/hammerwork/issues/41)):
   - CLI `worker status [--queue] [--jobs]`: running jobs per queue with their lease/heartbeat state (active, expired, none), using the database clock.
   - CLI `webhook add/list/update/toggle/remove` now persist to `webhooks.json` beside `config.toml` (`HAMMERWORK_WEBHOOKS_FILE` overrides; mode 0600) instead of silently discarding the configuration, and `webhook test` sends a real request (configured method, headers, auth and HMAC signature) and fails when the endpoint is unreachable or returns an error status. Not-found and unconfirmed removals are now errors instead of exit 0.

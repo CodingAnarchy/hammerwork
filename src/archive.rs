@@ -847,7 +847,8 @@ where
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
     /// use hammerwork::{JobQueue, archive::{JobArchiver, ArchivalReason}};
     /// use std::sync::Arc;
     ///

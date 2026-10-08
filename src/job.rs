@@ -1009,6 +1009,24 @@ impl Job {
         Ok(self)
     }
 
+    /// Schedule the job to run at `scheduled_at` instead of as soon as possible.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use chrono::{Duration, Utc};
+    /// use hammerwork::Job;
+    /// use serde_json::json;
+    ///
+    /// let run_at = Utc::now() + Duration::days(7);
+    /// let job = Job::new("reports".to_string(), json!({})).with_scheduled_at(run_at);
+    /// assert_eq!(job.scheduled_at, run_at);
+    /// ```
+    pub fn with_scheduled_at(mut self, scheduled_at: DateTime<Utc>) -> Self {
+        self.scheduled_at = scheduled_at;
+        self
+    }
+
     /// Set the job as recurring without a cron schedule (for manual rescheduling)
     pub fn as_recurring(mut self) -> Self {
         self.recurring = true;
