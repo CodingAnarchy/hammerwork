@@ -1,30 +1,11 @@
 //! MySQL-specific migration runner implementation.
 
+use super::split::{Dialect, split_statements};
 use super::{Migration, MigrationRecord, MigrationRunner};
 use crate::Result;
 use chrono::Utc;
-use sqlparser::{dialect::MySqlDialect, parser::Parser};
 use sqlx::{Executor, MySqlPool, Row};
-use tracing::{debug, info, warn};
-
-/// Parse SQL text into individual statements using sqlparser-rs for MySQL
-fn parse_mysql_statements(
-    sql: &str,
-) -> std::result::Result<Vec<String>, sqlparser::parser::ParserError> {
-    let dialect = MySqlDialect {};
-
-    match Parser::parse_sql(&dialect, sql) {
-        Ok(statements) => Ok(statements.iter().map(|stmt| format!("{};", stmt)).collect()),
-        Err(_) => {
-            // Fallback to simple splitting for MySQL
-            Ok(sql
-                .split(";\n")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect())
-        }
-    }
-}
+use tracing::{debug, info};
 
 /// MySQL migration runner
 pub struct MySqlMigrationRunner {
@@ -44,20 +25,8 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
 
         let mut tx = self.pool.begin().await?;
 
-        // Parse SQL using sqlparser-rs for proper statement splitting
-        let statements = match parse_mysql_statements(sql) {
-            Ok(stmts) => stmts,
-            Err(e) => {
-                warn!(
-                    "Failed to parse MySQL SQL with sqlparser, falling back to naive splitting: {}",
-                    e
-                );
-                sql.split(";\n")
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            }
-        };
+        // Statements run exactly as written; the splitter only finds top-level `;`.
+        let statements = split_statements(sql, Dialect::MySql);
 
         for (i, statement) in statements.iter().enumerate() {
             // Add semicolon back if it was removed by split
@@ -160,34 +129,18 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
 
 #[cfg(test)]
 mod tests {
-    // Tests for MySQL migration functionality
+    use super::super::split::{Dialect, split_statements};
 
     #[test]
-    fn test_sql_statement_splitting() {
-        let multi_statement_sql = r#"
--- Comment line  
-CREATE TABLE test_table (
-    id INTEGER PRIMARY KEY
-);
-
--- Another comment
-ALTER TABLE test_table ADD COLUMN name VARCHAR(50);
-
-CREATE INDEX idx_test ON test_table (name);
-"#;
-
-        let statements: Vec<&str> = multi_statement_sql
-            .split(";\n")
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        // Should split into 3 non-empty statements
-        assert_eq!(statements.len(), 3);
-
-        // Verify each statement contains expected keywords
-        assert!(statements[0].contains("CREATE TABLE"));
-        assert!(statements[1].contains("ALTER TABLE"));
-        assert!(statements[2].contains("CREATE INDEX"));
+    fn guarded_ddl_migrations_split_into_whole_statements() {
+        let statements =
+            split_statements(include_str!("011_add_encryption.mysql.sql"), Dialect::MySql);
+        // Every PREPARE pairs with its EXECUTE and DEALLOCATE.
+        let count = |kw: &str| statements.iter().filter(|s| s.starts_with(kw)).count();
+        assert!(count("PREPARE") > 0);
+        assert_eq!(count("PREPARE"), count("EXECUTE"));
+        assert_eq!(count("PREPARE"), count("DEALLOCATE"));
+        // Quoted DDL inside `SET @sql = IF(...)` is not split at its inner text.
+        assert!(statements.iter().all(|s| !s.starts_with('\'')));
     }
 }

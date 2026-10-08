@@ -47,6 +47,9 @@ pub mod postgres;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 
+#[cfg(any(feature = "postgres", feature = "mysql", test))]
+mod split;
+
 use crate::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
