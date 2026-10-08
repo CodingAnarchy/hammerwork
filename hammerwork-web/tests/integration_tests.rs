@@ -71,24 +71,10 @@ mod tests {
         assert_dashboard_starts(config).await;
     }
 
-    /// Known bugs make the dashboard tests below fail. CI runs ignored tests, so they
-    /// only run when explicitly asked to reproduce the bugs.
-    #[cfg(any(feature = "postgres", feature = "mysql"))]
-    fn skip_known_bug() -> bool {
-        if std::env::var_os("HAMMERWORK_TEST_KNOWN_BUGS").is_some() {
-            return false;
-        }
-        eprintln!("skipping known-bug test; set HAMMERWORK_TEST_KNOWN_BUGS=1 to run it");
-        true
-    }
-
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    #[ignore = "bug: start() panics when CORS is disabled (warp allow_origin(\"none\")), see #7"]
+    #[ignore] // Requires database connection
     async fn test_dashboard_startup_without_cors() {
-        if skip_known_bug() {
-            return;
-        }
         let temp_dir = tempdir().unwrap();
         write_index(temp_dir.path());
 
@@ -112,11 +98,8 @@ mod tests {
 
     #[cfg(feature = "mysql")]
     #[tokio::test]
-    #[ignore = "bug: start() panics when CORS is disabled, and rejects MySQL URLs when the postgres feature is also enabled, see #7"]
+    #[ignore] // Requires database connection
     async fn test_dashboard_startup_with_mysql() {
-        if skip_known_bug() {
-            return;
-        }
         let temp_dir = tempdir().unwrap();
 
         let config = DashboardConfig {
