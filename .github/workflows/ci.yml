@@ -108,6 +108,7 @@ jobs:
           - postgres,encryption
           - mysql,tracing
           - postgres,streaming
+          - postgres,webhooks
     steps:
       - uses: actions/checkout@v5
       - name: Install system packages

@@ -6,7 +6,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        events::{EventFilter, EventManager, JobError, JobLifecycleEvent, JobLifecycleEventType},
+        events::{EventFilter, EventManager, JobLifecycleEvent, JobLifecycleEventType},
         priority::JobPriority,
         webhooks::{
             HttpMethod, RetryPolicy, WebhookAuth, WebhookConfig, WebhookManager,
@@ -342,7 +342,7 @@ mod tests {
                 priority: JobPriority::Normal,
                 timestamp: Utc::now(),
                 processing_time_ms: None,
-                error: Some(JobError {
+                error: Some(crate::events::JobError {
                     message: "SMTP server unavailable".to_string(),
                     error_type: Some("NetworkError".to_string()),
                     details: None,
