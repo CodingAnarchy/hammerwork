@@ -1945,6 +1945,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_listener_delivers_every_event_in_a_burst() {
+        let (url, received) = slow_http_server(Duration::ZERO).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        manager
+            .add_webhook(WebhookConfig::new("burst".to_string(), url))
+            .await
+            .unwrap();
+
+        // Let the listener task start and subscribe before the events are published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..100 {
+            events.publish_event(completed_event()).await.unwrap();
+        }
+
+        // Every event published back to back must be delivered.
+        wait_for(&received, 100).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 100);
+    }
+
+    #[tokio::test]
+    async fn test_listener_keeps_delivering_after_falling_behind() {
+        let (url, received) = slow_http_server(Duration::ZERO).await;
+        let events = Arc::new(EventManager::new(crate::events::EventConfig {
+            max_buffer_size: 4,
+            ..Default::default()
+        }));
+        let manager = WebhookManager::new_default(events.clone());
+        manager
+            .add_webhook(WebhookConfig::new("lagging".to_string(), url))
+            .await
+            .unwrap();
+
+        // Let the listener task start and subscribe before the events are published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Overrun the 4-event channel so the listener sees RecvError::Lagged.
+        for _ in 0..50 {
+            events.publish_event(completed_event()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = received.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(before >= 1, "some events from the burst must be delivered");
+
+        // The listener must survive the lag and deliver later events.
+        events.publish_event(completed_event()).await.unwrap();
+        wait_for(&received, before + 1).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
     async fn test_panicking_background_task_is_observed() {
         let manager = WebhookManager::new_default(Arc::new(EventManager::new_default()));
         assert_eq!(manager.task_panics(), 0);
