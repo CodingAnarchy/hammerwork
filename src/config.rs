@@ -705,6 +705,9 @@ impl HammerworkConfig {
     }
 
     /// Create a configuration for production use
+    // Which fields the final `..Default::default()` fills depends on the enabled features
+    // (webhooks, streaming, alerting, metrics); with none of them it's a no-op.
+    #[allow(clippy::needless_update)]
     pub fn production() -> Self {
         Self {
             database: DatabaseConfig {

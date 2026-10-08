@@ -252,7 +252,6 @@ pub mod metrics;
 #[cfg(feature = "alerting")]
 pub mod alerting;
 
-#[cfg(feature = "webhooks")]
 pub mod events;
 
 #[cfg(feature = "webhooks")]
@@ -266,7 +265,8 @@ pub mod webhooks;
 ))]
 pub mod streaming;
 
-#[cfg(test)]
+// The cross-component tests exercise events, webhooks and (optionally) streaming together.
+#[cfg(all(test, feature = "webhooks"))]
 mod integration_tests;
 
 pub use archive::{
@@ -331,7 +331,6 @@ pub use metrics::{MetricsConfig, PrometheusMetricsCollector};
 #[cfg(feature = "alerting")]
 pub use alerting::{Alert, AlertManager, AlertSeverity, AlertTarget, AlertType, AlertingConfig};
 
-#[cfg(feature = "webhooks")]
 pub use events::{
     EventConfig, EventFilter, EventManager, EventManagerStats, EventSubscription, JobError,
     JobLifecycleEvent, JobLifecycleEventBuilder, JobLifecycleEventType,
