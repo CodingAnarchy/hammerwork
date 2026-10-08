@@ -1065,8 +1065,8 @@ impl<'de> Deserialize<'de> for RetryStrategy {
                         let base_ms = base_ms.ok_or_else(|| de::Error::missing_field("base_ms"))?;
                         let increment_ms =
                             increment_ms.ok_or_else(|| de::Error::missing_field("increment_ms"))?;
-                        let max_delay_ms =
-                            max_delay_ms.ok_or_else(|| de::Error::missing_field("max_delay_ms"))?;
+                        // Absent means no maximum (TOML cannot express null).
+                        let max_delay_ms = max_delay_ms.flatten();
                         Ok(RetryStrategy::Linear {
                             base: Duration::from_millis(base_ms),
                             increment: Duration::from_millis(increment_ms),
@@ -1077,8 +1077,8 @@ impl<'de> Deserialize<'de> for RetryStrategy {
                         let base_ms = base_ms.ok_or_else(|| de::Error::missing_field("base_ms"))?;
                         let multiplier =
                             multiplier.ok_or_else(|| de::Error::missing_field("multiplier"))?;
-                        let max_delay_ms =
-                            max_delay_ms.ok_or_else(|| de::Error::missing_field("max_delay_ms"))?;
+                        // Absent means no maximum (TOML cannot express null).
+                        let max_delay_ms = max_delay_ms.flatten();
                         let jitter = jitter.unwrap_or(None);
                         Ok(RetryStrategy::Exponential {
                             base: Duration::from_millis(base_ms),
@@ -1089,8 +1089,8 @@ impl<'de> Deserialize<'de> for RetryStrategy {
                     }
                     "Fibonacci" => {
                         let base_ms = base_ms.ok_or_else(|| de::Error::missing_field("base_ms"))?;
-                        let max_delay_ms =
-                            max_delay_ms.ok_or_else(|| de::Error::missing_field("max_delay_ms"))?;
+                        // Absent means no maximum (TOML cannot express null).
+                        let max_delay_ms = max_delay_ms.flatten();
                         Ok(RetryStrategy::Fibonacci {
                             base: Duration::from_millis(base_ms),
                             max_delay: max_delay_ms.map(Duration::from_millis),
@@ -1438,5 +1438,173 @@ mod tests {
             cloned_option.unwrap().calculate_delay(1),
             Duration::from_secs(7)
         );
+    }
+
+    #[test]
+    fn test_jitter_type_serde_roundtrip_and_errors() {
+        for jitter in [
+            JitterType::Additive(Duration::from_millis(250)),
+            JitterType::Multiplicative(0.2),
+        ] {
+            let json = serde_json::to_value(&jitter).unwrap();
+            let back: JitterType = serde_json::from_value(json).unwrap();
+            assert_eq!(back, jitter);
+        }
+        assert_eq!(
+            serde_json::to_value(JitterType::Additive(Duration::from_millis(250))).unwrap(),
+            serde_json::json!({ "type": "Additive", "duration_ms": 250 })
+        );
+        // Unknown fields are ignored.
+        let jitter: JitterType = serde_json::from_value(
+            serde_json::json!({ "type": "Multiplicative", "factor": 0.5, "note": "x" }),
+        )
+        .unwrap();
+        assert_eq!(jitter, JitterType::Multiplicative(0.5));
+
+        for (bad, expected) in [
+            (serde_json::json!({ "factor": 0.5 }), "missing field `type`"),
+            (
+                serde_json::json!({ "type": "Additive" }),
+                "missing field `duration_ms`",
+            ),
+            (
+                serde_json::json!({ "type": "Multiplicative" }),
+                "missing field `factor`",
+            ),
+            (serde_json::json!({ "type": "Gaussian" }), "unknown variant"),
+            (serde_json::json!("Additive"), "a jitter type"),
+        ] {
+            let err = serde_json::from_value::<JitterType>(bad).unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+        for duplicate in [
+            r#"{"type":"Additive","type":"Additive","duration_ms":1}"#,
+            r#"{"type":"Additive","duration_ms":1,"duration_ms":2}"#,
+            r#"{"type":"Multiplicative","factor":1.0,"factor":2.0}"#,
+        ] {
+            let err = serde_json::from_str::<JitterType>(duplicate).unwrap_err();
+            assert!(err.to_string().contains("duplicate field"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_retry_strategy_serde_errors() {
+        for (bad, expected) in [
+            (
+                serde_json::json!({ "duration_ms": 1 }),
+                "missing field `type`",
+            ),
+            (
+                serde_json::json!({ "type": "Fixed" }),
+                "missing field `duration_ms`",
+            ),
+            (
+                serde_json::json!({ "type": "Linear", "increment_ms": 1 }),
+                "missing field `base_ms`",
+            ),
+            (
+                serde_json::json!({ "type": "Linear", "base_ms": 1 }),
+                "missing field `increment_ms`",
+            ),
+            (
+                serde_json::json!({ "type": "Exponential", "base_ms": 1 }),
+                "missing field `multiplier`",
+            ),
+            (serde_json::json!({ "type": "Custom" }), "unknown variant"),
+            (serde_json::json!(42), "a retry strategy"),
+        ] {
+            let err = serde_json::from_value::<RetryStrategy>(bad).unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+        for field in [
+            "type",
+            "duration_ms",
+            "base_ms",
+            "increment_ms",
+            "max_delay_ms",
+            "multiplier",
+            "jitter",
+        ] {
+            let value = match field {
+                "type" => "\"Fixed\"",
+                "jitter" => "null",
+                _ => "1",
+            };
+            let json = format!(
+                r#"{{"type":"Fixed","duration_ms":1,"{field}":{value},"{field}":{value}}}"#
+            );
+            let err = serde_json::from_str::<RetryStrategy>(&json).unwrap_err();
+            assert!(
+                err.to_string().contains("duplicate field"),
+                "{field}: {err}"
+            );
+        }
+        let custom = RetryStrategy::custom(|_| Duration::from_secs(1));
+        let err = serde_json::to_value(&custom).unwrap_err();
+        assert!(err.to_string().contains("custom retry strategy"), "{err}");
+    }
+
+    /// Strategies without a maximum delay must survive a configuration file round trip.
+    /// TOML has no null, so `max_delay_ms` is simply absent; it used to be a required
+    /// field, so such a strategy could be saved but not loaded.
+    #[test]
+    fn test_unbounded_strategies_roundtrip_through_toml() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrapper {
+            strategy: RetryStrategy,
+        }
+        for strategy in [
+            RetryStrategy::linear(Duration::from_secs(1), Duration::from_secs(2), None),
+            RetryStrategy::exponential(Duration::from_secs(1), 2.0, None),
+            RetryStrategy::exponential_with_jitter(
+                Duration::from_secs(1),
+                2.0,
+                None,
+                JitterType::Additive(Duration::from_millis(100)),
+            ),
+            RetryStrategy::fibonacci(Duration::from_secs(1), None),
+            RetryStrategy::fibonacci(Duration::from_secs(1), Some(Duration::from_secs(60))),
+        ] {
+            let text = toml::to_string(&Wrapper {
+                strategy: strategy.clone(),
+            })
+            .unwrap();
+            let back: Wrapper = toml::from_str(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(back.strategy, strategy, "{text}");
+        }
+    }
+
+    #[test]
+    fn test_retry_strategy_debug_clone_and_eq() {
+        let strategies = [
+            RetryStrategy::fixed(Duration::from_secs(1)),
+            RetryStrategy::linear(
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Some(Duration::from_secs(9)),
+            ),
+            RetryStrategy::exponential(Duration::from_secs(1), 2.0, None),
+            RetryStrategy::fibonacci(Duration::from_secs(1), Some(Duration::from_secs(9))),
+        ];
+        for (i, a) in strategies.iter().enumerate() {
+            assert_eq!(&a.clone(), a);
+            for (j, b) in strategies.iter().enumerate() {
+                assert_eq!(a == b, i == j, "{a:?} vs {b:?}");
+            }
+        }
+        assert_eq!(format!("{:?}", strategies[0]), "Fixed(1s)");
+        assert!(format!("{:?}", strategies[1]).starts_with("Linear { base: 1s"));
+        assert!(format!("{:?}", strategies[2]).contains("multiplier: 2.0"));
+        assert!(format!("{:?}", strategies[3]).starts_with("Fibonacci"));
+        let custom = RetryStrategy::custom(|attempt| Duration::from_secs(attempt as u64));
+        assert_eq!(format!("{custom:?}"), "Custom(<function>)");
+        // Functions cannot be compared: a clone (sharing the function) is equal, a
+        // separately built strategy is not.
+        assert_eq!(custom, custom.clone());
+        assert_ne!(
+            custom,
+            RetryStrategy::custom(|attempt| Duration::from_secs(attempt as u64))
+        );
+        assert_eq!(custom.clone().calculate_delay(3), Duration::from_secs(3));
     }
 }
