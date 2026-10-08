@@ -128,6 +128,22 @@ fn effective_attempt_limit(job_max_attempts: i32, worker_cap: Option<i32>) -> i3
     }
 }
 
+/// Result of one attempt to acquire a job in the worker loop.
+enum Acquired {
+    // Boxed: a `Job` is much larger than the other variants.
+    Job(Box<Job>),
+    Idle,
+    Shutdown,
+}
+
+/// Whether shutdown was requested (or the shutdown sender was dropped), without waiting.
+fn shutdown_requested(shutdown_rx: &mut mpsc::Receiver<()>) -> bool {
+    !matches!(
+        shutdown_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    )
+}
+
 /// Exponential backoff after `consecutive_errors` failed loop iterations.
 fn error_backoff(base: Duration, consecutive_errors: u32) -> Duration {
     let base = base.max(MIN_ERROR_BACKOFF);
@@ -1604,20 +1620,23 @@ where
         let mut consecutive_errors: u32 = 0;
 
         loop {
-            // Idle phase: polling (and the sleeps between polls) is cancelled promptly
-            // when shutdown is requested.
-            let acquired = tokio::select! {
-                biased;
-                _ = shutdown_rx.recv() => {
+            // Idle phase. Only the waits (poll interval, rate limiter) are interrupted by
+            // shutdown; the dequeue itself always runs to completion. Dropping a dequeue
+            // future mid-transaction can return a pooled connection with an open
+            // transaction and row locks still held.
+            if shutdown_requested(&mut shutdown_rx) {
+                info!("Worker shutting down for queue: {}", self.queue_name);
+                break;
+            }
+            let acquired = self.acquire_job(&mut shutdown_rx).await;
+
+            let (outcome, shutting_down) = match acquired {
+                Ok(Acquired::Shutdown) => {
                     info!("Worker shutting down for queue: {}", self.queue_name);
                     break;
                 }
-                acquired = self.acquire_job() => acquired,
-            };
-
-            let (outcome, shutting_down) = match acquired {
-                Ok(Some(job)) => self.run_job_until_done(job, &mut shutdown_rx).await,
-                Ok(None) => (Ok(()), false),
+                Ok(Acquired::Job(job)) => self.run_job_until_done(*job, &mut shutdown_rx).await,
+                Ok(Acquired::Idle) => (Ok(()), false),
                 Err(e) => {
                     error!("Error dequeuing job from queue {}: {}", self.queue_name, e);
                     (Err(e), false)
@@ -1719,9 +1738,10 @@ where
 
     /// Wait for capacity and try to dequeue a job.
     ///
-    /// Returns `Ok(None)` after sleeping for the poll interval when the queue is empty
-    /// or paused, and `Err` when the dequeue itself fails.
-    async fn acquire_job(&self) -> Result<Option<Job>> {
+    /// Returns `Idle` after waiting for the poll interval when the queue is empty or
+    /// paused, `Shutdown` when shutdown is requested during a wait, and `Err` when the
+    /// dequeue itself fails. Database calls are never interrupted by shutdown.
+    async fn acquire_job(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> Result<Acquired> {
         // Check statistics and alert thresholds periodically
         #[cfg(feature = "alerting")]
         self.check_alert_thresholds().await;
@@ -1735,10 +1755,14 @@ where
                     self.queue_name
                 );
                 // Wait for the rate limiter to allow processing
-                if let Err(e) = rate_limiter.acquire().await {
+                let permit = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => return Ok(Acquired::Shutdown),
+                    permit = rate_limiter.acquire() => permit,
+                };
+                if let Err(e) = permit {
                     warn!("Rate limiter error: {}", e);
-                    sleep(self.poll_interval).await;
-                    return Ok(None);
+                    return Ok(self.idle_wait(shutdown_rx).await);
                 }
             }
         }
@@ -1750,8 +1774,7 @@ where
                     "Queue '{}' is paused, skipping job dequeue",
                     self.queue_name
                 );
-                sleep(self.poll_interval).await;
-                return Ok(None);
+                return Ok(self.idle_wait(shutdown_rx).await);
             }
             Ok(false) => {
                 // Queue is not paused, continue with normal processing
@@ -1789,7 +1812,7 @@ where
                     "Processing job: {} with priority: {:?}",
                     job.id, job.priority
                 );
-                Ok(Some(job))
+                Ok(Acquired::Job(Box::new(job)))
             }
             None => {
                 // No jobs available, check for worker starvation
@@ -1812,9 +1835,18 @@ where
                 }
 
                 // Wait before polling again
-                sleep(self.poll_interval).await;
-                Ok(None)
+                Ok(self.idle_wait(shutdown_rx).await)
             }
+        }
+    }
+
+    /// Sleep for the poll interval, returning early with `Shutdown` if shutdown is
+    /// requested meanwhile.
+    async fn idle_wait(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> Acquired {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => Acquired::Shutdown,
+            _ = sleep(self.poll_interval) => Acquired::Idle,
         }
     }
 
@@ -1875,7 +1907,19 @@ where
         job: &Job,
         outcome: JobOutcome,
     ) -> Result<Option<RecordedOutcome>> {
-        match self.queue.finish_job_run(job, outcome).await? {
+        // Record the outcome in a spawned task so that it always runs to commit or
+        // rollback, even if this future is dropped (for example when the shutdown grace
+        // period expires). Cancelling a database transaction mid-flight can leave its
+        // connection in the pool with the transaction still open.
+        let queue = Arc::clone(&self.queue);
+        let finished_job = job.clone();
+        let recorded =
+            tokio::spawn(async move { queue.finish_job_run(&finished_job, outcome).await })
+                .await
+                .map_err(|e| HammerworkError::Worker {
+                    message: format!("recording the outcome of job {} failed: {e}", job.id),
+                })??;
+        match recorded {
             Some(recorded) => {
                 if let Some(next_run_at) = recorded.next_run_at {
                     info!(
