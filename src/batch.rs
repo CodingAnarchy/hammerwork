@@ -58,6 +58,12 @@ impl Type<Postgres> for BatchStatus {
     fn type_info() -> sqlx::postgres::PgTypeInfo {
         <String as Type<Postgres>>::type_info()
     }
+
+    // Accept every column type `String` decodes from (TEXT, VARCHAR, ...); the status
+    // columns are VARCHAR, which the default `compatible` (== TEXT) rejects.
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <String as Type<Postgres>>::compatible(ty)
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -101,6 +107,12 @@ impl Decode<'_, Postgres> for BatchStatus {
 impl Type<MySql> for BatchStatus {
     fn type_info() -> sqlx::mysql::MySqlTypeInfo {
         <String as Type<MySql>>::type_info()
+    }
+
+    // Accept every column type `String` decodes from (TEXT, VARCHAR, ...); the status
+    // columns are VARCHAR, which the default `compatible` (== TEXT) rejects.
+    fn compatible(ty: &sqlx::mysql::MySqlTypeInfo) -> bool {
+        <String as Type<MySql>>::compatible(ty)
     }
 }
 
@@ -415,11 +427,140 @@ impl BatchResult {
     }
 }
 
+/// Live progress of a batch, tallied from the statuses of its jobs.
+///
+/// The counters stored in `hammerwork_batches` are written once at enqueue time and
+/// never updated, so the database backends derive progress from the jobs themselves
+/// (including jobs that have since been archived).
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchProgress {
+    pub completed: u32,
+    pub failed: u32,
+    pub pending: u32,
+    pub status: BatchStatus,
+}
+
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+impl BatchProgress {
+    /// Tallies `(job_status, count)` rows for a batch of `total_jobs` jobs.
+    ///
+    /// Completed jobs count as completed; Failed, Dead and TimedOut as failed; Pending,
+    /// Retrying and Running as pending. Jobs that no longer exist (e.g. deleted) are
+    /// left out of all three counters.
+    pub fn from_status_counts<I>(
+        counts: I,
+        total_jobs: u32,
+        failure_mode: &PartialFailureMode,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (String, i64)>,
+    {
+        let (mut completed, mut failed, mut pending) = (0u32, 0u32, 0u32);
+        for (status, count) in counts {
+            let count = u32::try_from(count).unwrap_or(0);
+            match status.trim_matches('"') {
+                "Completed" => completed += count,
+                "Failed" | "Dead" | "TimedOut" => failed += count,
+                "Pending" | "Retrying" | "Running" => pending += count,
+                _ => {}
+            }
+        }
+
+        let finished = completed + failed;
+        let status = if failed > 0 && *failure_mode == PartialFailureMode::FailFast {
+            BatchStatus::Failed
+        } else if total_jobs > 0 && completed >= total_jobs {
+            BatchStatus::Completed
+        } else if total_jobs > 0 && failed >= total_jobs {
+            BatchStatus::Failed
+        } else if total_jobs > 0 && finished >= total_jobs {
+            BatchStatus::PartiallyFailed
+        } else if finished == 0 {
+            BatchStatus::Pending
+        } else {
+            BatchStatus::Processing
+        };
+
+        Self {
+            completed,
+            failed,
+            pending,
+            status,
+        }
+    }
+}
+
+/// Parses the `failure_mode` column of `hammerwork_batches`, which holds the
+/// JSON-serialized [`PartialFailureMode`] (`"FailFast"`, quotes included).
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn parse_failure_mode(value: &str) -> PartialFailureMode {
+    serde_json::from_str(value)
+        .or_else(|_| serde_json::from_value(serde_json::Value::String(value.to_string())))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Job;
     use serde_json::json;
+
+    fn counts(rows: &[(&str, i64)]) -> Vec<(String, i64)> {
+        rows.iter().map(|(s, n)| (s.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn test_batch_progress_from_status_counts() {
+        let mode = PartialFailureMode::ContinueOnError;
+
+        let p = BatchProgress::from_status_counts(counts(&[("Pending", 3)]), 3, &mode);
+        assert_eq!((p.completed, p.failed, p.pending), (0, 0, 3));
+        assert_eq!(p.status, BatchStatus::Pending);
+
+        let p = BatchProgress::from_status_counts(
+            counts(&[("Pending", 1), ("Running", 1), ("Failed", 1)]),
+            3,
+            &mode,
+        );
+        assert_eq!((p.completed, p.failed, p.pending), (0, 1, 2));
+        assert_eq!(p.status, BatchStatus::Processing);
+
+        let p =
+            BatchProgress::from_status_counts(counts(&[("Completed", 3), ("Dead", 1)]), 4, &mode);
+        assert_eq!((p.completed, p.failed, p.pending), (3, 1, 0));
+        assert_eq!(p.status, BatchStatus::PartiallyFailed);
+
+        let p = BatchProgress::from_status_counts(counts(&[("\"Completed\"", 2)]), 2, &mode);
+        assert_eq!(p.status, BatchStatus::Completed);
+
+        let p = BatchProgress::from_status_counts(counts(&[("TimedOut", 2)]), 2, &mode);
+        assert_eq!(p.status, BatchStatus::Failed);
+
+        let p = BatchProgress::from_status_counts(
+            counts(&[("Failed", 1), ("Pending", 2)]),
+            3,
+            &PartialFailureMode::FailFast,
+        );
+        assert_eq!(p.status, BatchStatus::Failed);
+    }
+
+    #[test]
+    fn test_parse_failure_mode() {
+        for mode in [
+            PartialFailureMode::ContinueOnError,
+            PartialFailureMode::FailFast,
+            PartialFailureMode::CollectErrors,
+        ] {
+            let stored = serde_json::to_string(&mode).unwrap();
+            assert_eq!(parse_failure_mode(&stored), mode);
+        }
+        assert_eq!(parse_failure_mode("FailFast"), PartialFailureMode::FailFast);
+        assert_eq!(
+            parse_failure_mode("garbage"),
+            PartialFailureMode::ContinueOnError
+        );
+    }
 
     #[test]
     fn test_job_batch_creation() {

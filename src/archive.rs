@@ -79,14 +79,52 @@ pub enum ArchivalReason {
     Maintenance,
 }
 
+impl ArchivalReason {
+    /// The stable string form stored in the `archival_reason` database column.
+    ///
+    /// ```rust
+    /// use hammerwork::archive::ArchivalReason;
+    ///
+    /// assert_eq!(ArchivalReason::Manual.as_str(), "Manual");
+    /// ```
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Automatic => "Automatic",
+            Self::Manual => "Manual",
+            Self::Compliance => "Compliance",
+            Self::Maintenance => "Maintenance",
+        }
+    }
+
+    /// Parses the value stored in the `archival_reason` database column.
+    ///
+    /// Accepts the plain form written by [`ArchivalReason::as_str`] as well as the
+    /// JSON-quoted form (`"Manual"`) that older versions may have stored, ignoring
+    /// ASCII case. Returns `None` for an unrecognised value.
+    ///
+    /// ```rust
+    /// use hammerwork::archive::ArchivalReason;
+    ///
+    /// assert_eq!(ArchivalReason::parse_from_db("Manual"), Some(ArchivalReason::Manual));
+    /// assert_eq!(ArchivalReason::parse_from_db("\"Compliance\""), Some(ArchivalReason::Compliance));
+    /// assert_eq!(ArchivalReason::parse_from_db("bogus"), None);
+    /// ```
+    pub fn parse_from_db(value: &str) -> Option<Self> {
+        let cleaned = value.trim().trim_matches('"');
+        [
+            Self::Automatic,
+            Self::Manual,
+            Self::Compliance,
+            Self::Maintenance,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str().eq_ignore_ascii_case(cleaned))
+    }
+}
+
 impl std::fmt::Display for ArchivalReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Automatic => write!(f, "Automatic"),
-            Self::Manual => write!(f, "Manual"),
-            Self::Compliance => write!(f, "Compliance"),
-            Self::Maintenance => write!(f, "Maintenance"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -640,6 +678,11 @@ pub struct ArchivedJob {
     pub archived_by: Option<String>,
 }
 
+/// Upper bound on the number of `batch_size` batches a single
+/// [`JobArchiver::archive_jobs_with_progress`] or [`JobArchiver::archive_jobs_with_events`]
+/// call processes before returning.
+pub const MAX_ARCHIVAL_BATCHES_PER_OPERATION: usize = 10_000;
+
 /// Service for managing job archival operations.
 ///
 /// The `JobArchiver` provides methods to archive jobs based on policies,
@@ -785,6 +828,11 @@ where
     /// - WebSocket event publishing for dashboard integration
     /// - Batch processing for large datasets
     ///
+    /// Jobs are archived in batches of the policy's `batch_size` until no eligible
+    /// jobs remain (bounded by [`MAX_ARCHIVAL_BATCHES_PER_OPERATION`]). The callback
+    /// receives `(processed, total)`: once with `processed == 0` before the first batch,
+    /// then after every batch, so the last call reports the final `jobs_archived`.
+    ///
     /// # Arguments
     ///
     /// * `queue` - Database queue implementation
@@ -832,31 +880,37 @@ where
         Q: crate::queue::DatabaseQueue,
     {
         let operation_id = Uuid::new_v4().to_string();
-
-        // Get the archival policy for this queue
-        let default_policy = ArchivalPolicy::default();
-        let policy = queue_name
-            .and_then(|name| self.policies.get(name))
-            .unwrap_or(&default_policy);
+        let policy = self.policy_for(queue_name);
 
         // Estimate total jobs to be archived (this is a simplified estimation)
         let estimated_jobs = self
             .estimate_archival_jobs(queue, queue_name, policy)
             .await?;
 
-        // Publish bulk archive started event
         if let Some(callback) = &progress_callback {
             callback(0, estimated_jobs);
         }
 
-        // Perform the actual archival
-        let stats = queue
-            .archive_jobs(queue_name, policy, &self.config, reason, archived_by)
+        let stats = self
+            .archive_in_batches(
+                queue,
+                queue_name,
+                policy,
+                reason,
+                archived_by,
+                |processed| {
+                    if let Some(callback) = &progress_callback {
+                        callback(processed, estimated_jobs.max(processed));
+                    }
+                },
+            )
             .await?;
 
-        // Report completion
-        if let Some(callback) = &progress_callback {
-            callback(stats.jobs_archived, estimated_jobs);
+        // Always report a final state, even when nothing was archived.
+        if stats.jobs_archived == 0 {
+            if let Some(callback) = &progress_callback {
+                callback(0, estimated_jobs);
+            }
         }
 
         Ok((operation_id, stats))
@@ -864,8 +918,11 @@ where
 
     /// Archive jobs with WebSocket event publishing for real-time dashboard updates.
     ///
-    /// This is a convenience method that wraps `archive_jobs_with_progress` and publishes
-    /// WebSocket events for dashboard integration.
+    /// Jobs are archived in batches of the policy's `batch_size` until no eligible jobs
+    /// remain, like [`JobArchiver::archive_jobs_with_progress`]. Publishes
+    /// [`ArchiveEvent::BulkArchiveStarted`], then one [`ArchiveEvent::BulkArchiveProgress`]
+    /// for every batch except the last, then [`ArchiveEvent::BulkArchiveCompleted`] with
+    /// the accumulated statistics.
     ///
     /// # Arguments
     ///
@@ -891,36 +948,111 @@ where
         F: Fn(ArchiveEvent) + Send + Sync,
     {
         let operation_id = Uuid::new_v4().to_string();
-
-        // Get the archival policy for this queue
-        let default_policy = ArchivalPolicy::default();
-        let policy = queue_name
-            .and_then(|name| self.policies.get(name))
-            .unwrap_or(&default_policy);
+        let policy = self.policy_for(queue_name);
 
         // Estimate total jobs to be archived
         let estimated_jobs = self
             .estimate_archival_jobs(queue, queue_name, policy)
             .await?;
 
-        // Publish bulk archive started event
         event_publisher(ArchiveEvent::BulkArchiveStarted {
             operation_id: operation_id.clone(),
             estimated_jobs,
         });
 
-        // Perform the actual archival
-        let stats = queue
-            .archive_jobs(queue_name, policy, &self.config, reason, archived_by)
+        // Report progress between batches. The final batch is reported by the
+        // completion event, so a single-batch run publishes only started + completed.
+        let mut pending_progress: Option<u64> = None;
+        let stats = self
+            .archive_in_batches(
+                queue,
+                queue_name,
+                policy,
+                reason,
+                archived_by,
+                |processed| {
+                    if let Some(previous) = pending_progress.replace(processed) {
+                        event_publisher(ArchiveEvent::BulkArchiveProgress {
+                            operation_id: operation_id.clone(),
+                            jobs_processed: previous,
+                            total: estimated_jobs.max(previous),
+                        });
+                    }
+                },
+            )
             .await?;
 
-        // Publish completion event
         event_publisher(ArchiveEvent::BulkArchiveCompleted {
             operation_id: operation_id.clone(),
             stats: stats.clone(),
         });
 
         Ok((operation_id, stats))
+    }
+
+    /// The policy for `queue_name`, or the default policy when none is configured.
+    fn policy_for(&self, queue_name: Option<&str>) -> &ArchivalPolicy {
+        static DEFAULT_POLICY: std::sync::OnceLock<ArchivalPolicy> = std::sync::OnceLock::new();
+        queue_name
+            .and_then(|name| self.policies.get(name))
+            .unwrap_or_else(|| DEFAULT_POLICY.get_or_init(ArchivalPolicy::default))
+    }
+
+    /// Runs `archive_jobs` repeatedly, one `policy.batch_size` batch at a time, until no
+    /// more jobs are eligible, and returns the accumulated statistics.
+    ///
+    /// `on_batch` is called after every batch that archived at least one job, with the
+    /// total number of jobs archived so far. The loop stops when a batch archives fewer
+    /// than `batch_size` jobs, or after [`MAX_ARCHIVAL_BATCHES_PER_OPERATION`] batches so
+    /// that a queue that keeps producing eligible jobs cannot keep one call running forever.
+    async fn archive_in_batches<Q, F>(
+        &self,
+        queue: &Q,
+        queue_name: Option<&str>,
+        policy: &ArchivalPolicy,
+        reason: ArchivalReason,
+        archived_by: Option<&str>,
+        mut on_batch: F,
+    ) -> Result<ArchivalStats>
+    where
+        Q: crate::queue::DatabaseQueue,
+        F: FnMut(u64),
+    {
+        let started = std::time::Instant::now();
+        let mut total = ArchivalStats::default();
+        let mut weighted_ratio = 0.0;
+
+        for _ in 0..MAX_ARCHIVAL_BATCHES_PER_OPERATION {
+            let batch = queue
+                .archive_jobs(
+                    queue_name,
+                    policy,
+                    &self.config,
+                    reason.clone(),
+                    archived_by,
+                )
+                .await?;
+
+            if batch.jobs_archived == 0 {
+                break;
+            }
+
+            total.jobs_archived += batch.jobs_archived;
+            total.bytes_archived += batch.bytes_archived;
+            weighted_ratio += batch.compression_ratio * batch.jobs_archived as f64;
+            total.last_run_at = batch.last_run_at;
+            on_batch(total.jobs_archived);
+
+            if (batch.jobs_archived as usize) < policy.batch_size {
+                break;
+            }
+        }
+
+        if total.jobs_archived > 0 {
+            total.compression_ratio = weighted_ratio / total.jobs_archived as f64;
+        }
+        total.operation_duration = started.elapsed();
+        Ok(total)
     }
 
     /// Estimate the number of jobs that would be archived by a policy.
@@ -1064,9 +1196,190 @@ pub trait ArchivalOperations {
     ) -> impl std::future::Future<Output = Result<ArchivalStats>> + Send;
 }
 
+/// Serializes and, when the policy asks for it and it helps, gzip-compresses a job
+/// payload for the archive table.
+///
+/// Returns `(stored_bytes, is_compressed, original_size)`.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn encode_archived_payload(
+    payload: &serde_json::Value,
+    policy: &ArchivalPolicy,
+    config: &ArchivalConfig,
+) -> Result<(Vec<u8>, bool, usize)> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let payload_json = serde_json::to_vec(payload)?;
+    let original_size = payload_json.len();
+    if !policy.compress_payloads {
+        return Ok((payload_json, false, original_size));
+    }
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(config.compression_level));
+    encoder.write_all(&payload_json)?;
+    let compressed = encoder.finish()?;
+    if compressed.len() < original_size {
+        Ok((compressed, true, original_size))
+    } else {
+        Ok((payload_json, false, original_size))
+    }
+}
+
+/// Reverses [`encode_archived_payload`].
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn decode_archived_payload(
+    stored: &[u8],
+    is_compressed: bool,
+) -> Result<serde_json::Value> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    if is_compressed {
+        let mut decompressed = Vec::new();
+        GzDecoder::new(stored).read_to_end(&mut decompressed)?;
+        Ok(serde_json::from_slice(&decompressed)?)
+    } else {
+        Ok(serde_json::from_slice(stored)?)
+    }
+}
+
+/// The job statuses a policy can archive, as `(retention, status, timestamp_column)`.
+///
+/// A job with `status` is eligible once `timestamp_column` is older than `retention`;
+/// statuses whose retention is `None` are not archived.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn archival_candidates(
+    policy: &ArchivalPolicy,
+) -> [(Option<Duration>, &'static str, &'static str); 4] {
+    [
+        (policy.archive_completed_after, "Completed", "completed_at"),
+        (policy.archive_failed_after, "Failed", "failed_at"),
+        (policy.archive_dead_after, "Dead", "failed_at"),
+        (policy.archive_timed_out_after, "TimedOut", "timed_out_at"),
+    ]
+}
+
+/// Resets an archived job so it can be processed again after a restore.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn reset_for_restore(mut job: Job) -> Job {
+    job.status = JobStatus::Pending;
+    job.attempts = 0;
+    job.scheduled_at = Utc::now();
+    job.started_at = None;
+    job.completed_at = None;
+    job.failed_at = None;
+    job.timed_out_at = None;
+    job.error_message = None;
+    job.result_data = None;
+    job.result_stored_at = None;
+    job.result_expires_at = None;
+    job
+}
+
+/// Parses the `status` column of the archive table (the job's status before it was
+/// archived), accepting both the plain and the legacy JSON-quoted form.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn parse_archived_status(value: &str) -> JobStatus {
+    match value.trim_matches('"') {
+        "Pending" => JobStatus::Pending,
+        "Running" => JobStatus::Running,
+        "Completed" => JobStatus::Completed,
+        "Failed" => JobStatus::Failed,
+        "Dead" => JobStatus::Dead,
+        "TimedOut" => JobStatus::TimedOut,
+        "Retrying" => JobStatus::Retrying,
+        "Archived" => JobStatus::Archived,
+        _ => JobStatus::Dead, // Fallback for unknown status values
+    }
+}
+
+/// Parses the `dependency_status` column of the archive table.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn parse_archived_dependency_status(
+    value: Option<&str>,
+) -> crate::workflow::DependencyStatus {
+    value
+        .and_then(|s| {
+            crate::workflow::DependencyStatus::parse_from_db(&s.trim_matches('"').to_lowercase())
+                .ok()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_archival_reason_db_round_trip() {
+        for reason in [
+            ArchivalReason::Automatic,
+            ArchivalReason::Manual,
+            ArchivalReason::Compliance,
+            ArchivalReason::Maintenance,
+        ] {
+            assert_eq!(reason.to_string(), reason.as_str());
+            assert_eq!(
+                ArchivalReason::parse_from_db(reason.as_str()),
+                Some(reason.clone())
+            );
+            // Legacy JSON-quoted form written by serde_json::to_string
+            let quoted = serde_json::to_string(&reason).unwrap();
+            assert_eq!(ArchivalReason::parse_from_db(&quoted), Some(reason));
+        }
+        assert_eq!(
+            ArchivalReason::parse_from_db("manual"),
+            Some(ArchivalReason::Manual)
+        );
+        assert_eq!(ArchivalReason::parse_from_db(""), None);
+        assert_eq!(ArchivalReason::parse_from_db("Unknown"), None);
+    }
+
+    #[test]
+    fn test_archived_payload_round_trip() {
+        let payload = serde_json::json!({"data": "x".repeat(500)});
+        let config = ArchivalConfig::new();
+
+        let compressing = ArchivalPolicy::new().compress_archived_payloads(true);
+        let (stored, compressed, original) =
+            encode_archived_payload(&payload, &compressing, &config).unwrap();
+        assert!(compressed);
+        assert!(stored.len() < original);
+        assert_eq!(
+            decode_archived_payload(&stored, compressed).unwrap(),
+            payload
+        );
+
+        let plain = ArchivalPolicy::new().compress_archived_payloads(false);
+        let (stored, compressed, original) =
+            encode_archived_payload(&payload, &plain, &config).unwrap();
+        assert!(!compressed);
+        assert_eq!(stored.len(), original);
+        assert_eq!(
+            decode_archived_payload(&stored, compressed).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn test_parse_archived_columns() {
+        assert_eq!(parse_archived_status("Completed"), JobStatus::Completed);
+        assert_eq!(parse_archived_status("\"TimedOut\""), JobStatus::TimedOut);
+        assert_eq!(
+            parse_archived_dependency_status(Some("satisfied")),
+            crate::workflow::DependencyStatus::Satisfied
+        );
+        // The archive table's column default is 'Pending', which is not a dependency status.
+        assert_eq!(
+            parse_archived_dependency_status(Some("Pending")),
+            crate::workflow::DependencyStatus::None
+        );
+        assert_eq!(
+            parse_archived_dependency_status(None),
+            crate::workflow::DependencyStatus::None
+        );
+    }
 
     #[test]
     fn test_archival_policy_default() {

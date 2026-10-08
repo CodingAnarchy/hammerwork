@@ -19,11 +19,8 @@ mod postgres_worker_batch_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
+    #[ignore] // Requires database connection
     async fn test_worker_batch_processing_enabled() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
         let queue_name = format!("batch_test_queue_{}", uuid::Uuid::new_v4());
         let stats_collector = Arc::new(InMemoryStatsCollector::new_default());
@@ -59,7 +56,9 @@ mod postgres_worker_batch_tests {
         let worker = Worker::new(queue.clone(), queue_name.clone(), handler)
             .with_batch_processing_enabled(true)
             .with_stats_collector(stats_collector.clone())
-            .with_poll_interval(Duration::from_millis(50));
+            .with_poll_interval(Duration::from_millis(50))
+            // Fail for good on the first attempt instead of waiting out retry delays
+            .with_max_retries(1);
 
         // Verify initial batch stats
         let initial_stats = worker.get_batch_stats();
@@ -132,11 +131,8 @@ mod postgres_worker_batch_tests {
     }
 
     #[tokio::test]
-    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
+    #[ignore] // Requires database connection
     async fn test_batch_statistics_tracking() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
         let queue_name = format!("stats_test_queue_{}", uuid::Uuid::new_v4());
 

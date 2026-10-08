@@ -84,6 +84,12 @@ impl Type<Postgres> for JobStatus {
     fn type_info() -> sqlx::postgres::PgTypeInfo {
         <String as Type<Postgres>>::type_info()
     }
+
+    // Accept every column type `String` decodes from (TEXT, VARCHAR, ...); the status
+    // columns are VARCHAR, which the default `compatible` (== TEXT) rejects.
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <String as Type<Postgres>>::compatible(ty)
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -130,6 +136,12 @@ impl Decode<'_, Postgres> for JobStatus {
 impl Type<MySql> for JobStatus {
     fn type_info() -> sqlx::mysql::MySqlTypeInfo {
         <String as Type<MySql>>::type_info()
+    }
+
+    // Accept every column type `String` decodes from (TEXT, VARCHAR, ...); the status
+    // columns are VARCHAR, which the default `compatible` (== TEXT) rejects.
+    fn compatible(ty: &sqlx::mysql::MySqlTypeInfo) -> bool {
+        <String as Type<MySql>>::compatible(ty)
     }
 }
 

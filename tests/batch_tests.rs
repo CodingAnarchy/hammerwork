@@ -8,16 +8,123 @@ use hammerwork::{
 use hammerwork::{JobStatus, batch::BatchStatus, queue::DatabaseQueue};
 use serde_json::json;
 
+/// `get_batch_status` reports progress tallied from the batch's jobs: it follows
+/// completions and failures, honours FailFast, and still counts jobs after they are
+/// archived out of `hammerwork_jobs`.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+async fn assert_batch_progress_is_live<Q: DatabaseQueue>(queue: &Q) {
+    use chrono::Duration;
+    use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason};
+
+    let queue_name = test_utils::unique_queue("batch_progress");
+    let jobs = (0..3)
+        .map(|i| Job::new(queue_name.clone(), json!({"i": i})))
+        .collect();
+    let batch = JobBatch::new("live_progress")
+        .with_jobs(jobs)
+        .with_partial_failure_handling(PartialFailureMode::FailFast);
+    let batch_id = queue.enqueue_batch(batch).await.unwrap();
+    let jobs = queue.get_batch_jobs(batch_id).await.unwrap();
+
+    let status = queue.get_batch_status(batch_id).await.unwrap();
+    assert_eq!(
+        (
+            status.pending_jobs,
+            status.completed_jobs,
+            status.failed_jobs
+        ),
+        (3, 0, 0)
+    );
+    assert_eq!(status.status, BatchStatus::Pending);
+
+    queue.complete_job(jobs[0].id).await.unwrap();
+    let status = queue.get_batch_status(batch_id).await.unwrap();
+    assert_eq!(
+        (
+            status.pending_jobs,
+            status.completed_jobs,
+            status.failed_jobs
+        ),
+        (2, 1, 0)
+    );
+    assert_eq!(status.status, BatchStatus::Processing);
+
+    // Archived jobs still count towards their batch
+    let policy = ArchivalPolicy::new()
+        .archive_completed_after(Duration::seconds(0))
+        .enabled(true);
+    let archived = queue
+        .archive_jobs(
+            Some(queue_name.as_str()),
+            &policy,
+            &ArchivalConfig::new(),
+            ArchivalReason::Automatic,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived.jobs_archived, 1);
+    let status = queue.get_batch_status(batch_id).await.unwrap();
+    assert_eq!(
+        (
+            status.pending_jobs,
+            status.completed_jobs,
+            status.failed_jobs
+        ),
+        (2, 1, 0)
+    );
+
+    // FailFast: one failure fails the batch
+    queue.fail_job(jobs[1].id, "boom").await.unwrap();
+    let status = queue.get_batch_status(batch_id).await.unwrap();
+    assert_eq!(
+        (
+            status.pending_jobs,
+            status.completed_jobs,
+            status.failed_jobs
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(status.status, BatchStatus::Failed);
+    assert_eq!(
+        status.job_errors.get(&jobs[1].id).map(String::as_str),
+        Some("boom")
+    );
+
+    queue.delete_batch(batch_id).await.unwrap();
+}
+
 #[cfg(feature = "postgres")]
 mod postgres_batch_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
+    #[ignore] // Requires database connection
+    async fn test_postgres_batch_progress_is_live() {
+        let queue = test_utils::setup_postgres_queue().await;
+        assert_batch_progress_is_live(queue.as_ref()).await;
+    }
+
+    /// The status enums decode from the VARCHAR columns they are stored in.
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_status_enums_decode_from_varchar() {
+        let queue = test_utils::setup_postgres_queue().await;
+        let batch_status: BatchStatus = sqlx::query_scalar("SELECT 'Processing'::VARCHAR")
+            .fetch_one(&queue.pool)
+            .await
+            .unwrap();
+        assert_eq!(batch_status, BatchStatus::Processing);
+        let job_status: JobStatus = sqlx::query_scalar("SELECT 'TimedOut'::VARCHAR")
+            .fetch_one(&queue.pool)
+            .await
+            .unwrap();
+        assert_eq!(job_status, JobStatus::TimedOut);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_postgres_batch_enqueue() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
 
         // Create a batch of jobs
@@ -96,11 +203,8 @@ mod postgres_batch_tests {
     }
 
     #[tokio::test]
-    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
+    #[ignore] // Requires database connection
     async fn test_postgres_large_batch() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
 
         // Create a large batch of jobs
@@ -138,11 +242,8 @@ mod postgres_batch_tests {
     }
 
     #[tokio::test]
-    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
+    #[ignore] // Requires database connection
     async fn test_postgres_batch_partial_failure_modes() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
 
         // Test ContinueOnError mode
@@ -170,19 +271,35 @@ mod postgres_batch_tests {
         // Verify batch still exists and shows partial failure
         let batch_result = queue.get_batch_status(batch_id).await.unwrap();
         assert_eq!(batch_result.total_jobs, 3);
+        // Progress is tallied from the batch's jobs, so it reflects the failure at once
         assert_eq!(batch_result.pending_jobs, 2); // Two jobs still pending
-        assert_eq!(batch_result.failed_jobs, 0); // Will be updated by worker logic
+        assert_eq!(batch_result.failed_jobs, 1);
+        assert_eq!(batch_result.completed_jobs, 0);
+        assert_eq!(batch_result.status, BatchStatus::Processing);
+        assert_eq!(
+            batch_result
+                .job_errors
+                .get(&failing_job.id)
+                .map(String::as_str),
+            Some("Simulated failure")
+        );
+
+        // Finishing the remaining jobs completes the batch with a partial failure
+        queue.complete_job(batch_jobs[0].id).await.unwrap();
+        queue.complete_job(batch_jobs[2].id).await.unwrap();
+        let batch_result = queue.get_batch_status(batch_id).await.unwrap();
+        assert_eq!(batch_result.pending_jobs, 0);
+        assert_eq!(batch_result.completed_jobs, 2);
+        assert_eq!(batch_result.failed_jobs, 1);
+        assert_eq!(batch_result.status, BatchStatus::PartiallyFailed);
 
         // Clean up
         queue.delete_batch(batch_id).await.unwrap();
     }
 
     #[tokio::test]
-    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
+    #[ignore] // Requires database connection
     async fn test_postgres_batch_metadata() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
 
         let job = Job::new("metadata_queue".to_string(), json!({"test": "data"}));
@@ -208,6 +325,30 @@ mod postgres_batch_tests {
 #[cfg(feature = "mysql")]
 mod mysql_batch_tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_batch_progress_is_live() {
+        let queue = test_utils::setup_mysql_queue().await;
+        assert_batch_progress_is_live(queue.as_ref()).await;
+    }
+
+    /// The status enums decode from the VARCHAR columns they are stored in.
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_status_enums_decode_from_varchar() {
+        let queue = test_utils::setup_mysql_queue().await;
+        let batch_status: BatchStatus = sqlx::query_scalar("SELECT CAST('Processing' AS CHAR(20))")
+            .fetch_one(&queue.pool)
+            .await
+            .unwrap();
+        assert_eq!(batch_status, BatchStatus::Processing);
+        let job_status: JobStatus = sqlx::query_scalar("SELECT CAST('TimedOut' AS CHAR(20))")
+            .fetch_one(&queue.pool)
+            .await
+            .unwrap();
+        assert_eq!(job_status, JobStatus::TimedOut);
+    }
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_mysql_batch_enqueue() {

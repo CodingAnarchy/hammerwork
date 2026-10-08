@@ -83,6 +83,79 @@ pub(crate) struct JobRow {
 /// Standard field list for selecting complete job data from hammerwork_jobs table.
 const JOB_SELECT_FIELDS: &str = "id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context, is_encrypted, encryption_key_id, encryption_algorithm, encrypted_payload, encryption_nonce, encryption_tag, encryption_metadata, payload_hash, pii_fields, retention_policy, retention_delete_at, encrypted_at";
 
+/// Columns of hammerwork_jobs_archive needed to rebuild a [`Job`].
+const ARCHIVED_JOB_FIELDS: &str = "id, queue_name, payload, payload_compressed, status, priority, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, result, result_ttl, retry_strategy, timeout_seconds, cron_schedule, next_run_at, recurring, timezone, batch_id, depends_on, dependency_status, result_config, trace_id, correlation_id, parent_span_id, span_context";
+
+/// Rebuilds a job from a hammerwork_jobs_archive row selected with [`ARCHIVED_JOB_FIELDS`].
+///
+/// The job keeps the data it had when it was archived, with status [`JobStatus::Archived`].
+fn archived_job_from_row(row: &sqlx::postgres::PgRow) -> Result<Job> {
+    let payload = crate::archive::decode_archived_payload(
+        &row.try_get::<Vec<u8>, _>("payload")?,
+        row.try_get("payload_compressed")?,
+    )?;
+
+    Ok(Job {
+        id: row.try_get("id")?,
+        queue_name: row.try_get("queue_name")?,
+        payload,
+        status: JobStatus::Archived,
+        priority: row
+            .try_get::<String, _>("priority")?
+            .parse()
+            .unwrap_or(JobPriority::Normal),
+        attempts: row.try_get("attempts")?,
+        max_attempts: row.try_get("max_attempts")?,
+        created_at: row.try_get("created_at")?,
+        scheduled_at: row.try_get("scheduled_at")?,
+        started_at: row.try_get("started_at")?,
+        completed_at: row.try_get("completed_at")?,
+        failed_at: row.try_get("failed_at")?,
+        timed_out_at: row.try_get("timed_out_at")?,
+        timeout: row
+            .try_get::<Option<i32>, _>("timeout_seconds")?
+            .map(|s| std::time::Duration::from_secs(s as u64)),
+        error_message: row.try_get("error_message")?,
+        cron_schedule: row.try_get("cron_schedule")?,
+        next_run_at: row.try_get("next_run_at")?,
+        recurring: row.try_get("recurring")?,
+        timezone: row.try_get("timezone")?,
+        batch_id: row.try_get("batch_id")?,
+        result_config: row
+            .try_get::<Option<serde_json::Value>, _>("result_config")?
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default(),
+        result_data: row.try_get("result")?,
+        result_stored_at: None,
+        result_expires_at: row.try_get("result_ttl")?,
+        retry_strategy: row
+            .try_get::<Option<String>, _>("retry_strategy")?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        depends_on: row
+            .try_get::<Option<Vec<uuid::Uuid>>, _>("depends_on")?
+            .unwrap_or_default(),
+        dependents: Vec::new(),
+        dependency_status: crate::archive::parse_archived_dependency_status(
+            row.try_get::<Option<String>, _>("dependency_status")?
+                .as_deref(),
+        ),
+        workflow_id: None,
+        workflow_name: None,
+        trace_id: row.try_get("trace_id")?,
+        correlation_id: row.try_get("correlation_id")?,
+        parent_span_id: row.try_get("parent_span_id")?,
+        span_context: row.try_get("span_context")?,
+        #[cfg(feature = "encryption")]
+        encryption_config: None,
+        pii_fields: Vec::new(),
+        #[cfg(feature = "encryption")]
+        retention_policy: None,
+        is_encrypted: false,
+        #[cfg(feature = "encryption")]
+        encrypted_payload: None,
+    })
+}
+
 impl JobRow {
     pub fn into_job(self) -> Result<Job> {
         // Extract encryption data before moving self
@@ -925,10 +998,18 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(job_row) => Ok(Some(job_row.into_job()?)),
-            None => Ok(None),
+        if let Some(job_row) = row {
+            return Ok(Some(job_row.into_job()?));
         }
+
+        // Archiving moves a job out of hammerwork_jobs; report it with status Archived.
+        let archived = sqlx::query(&format!(
+            "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive WHERE id = $1"
+        ))
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        archived.as_ref().map(archived_job_from_row).transpose()
     }
 
     async fn delete_job(&self, job_id: JobId) -> Result<()> {
@@ -1074,10 +1155,26 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         })?;
 
         let total_jobs: i32 = batch_row.get("total_jobs");
-        let completed_jobs: i32 = batch_row.get("completed_jobs");
-        let failed_jobs: i32 = batch_row.get("failed_jobs");
-        let pending_jobs: i32 = batch_row.get("pending_jobs");
-        let status: crate::batch::BatchStatus = batch_row.get("status");
+        let failure_mode =
+            crate::batch::parse_failure_mode(&batch_row.get::<String, _>("failure_mode"));
+
+        // The counters in hammerwork_batches are never updated after enqueue; tally the
+        // batch's jobs (including archived ones) instead.
+        let status_counts: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM (
+                SELECT status FROM hammerwork_jobs WHERE batch_id = $1
+                UNION ALL
+                SELECT status FROM hammerwork_jobs_archive WHERE batch_id = $1
+            ) batch_jobs GROUP BY status",
+        )
+        .bind(batch_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let progress = crate::batch::BatchProgress::from_status_counts(
+            status_counts,
+            total_jobs as u32,
+            &failure_mode,
+        );
         let created_at: DateTime<Utc> = batch_row.get("created_at");
         let completed_at: Option<DateTime<Utc>> = batch_row.get("completed_at");
         let error_summary: Option<String> = batch_row.get("error_summary");
@@ -1095,10 +1192,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         Ok(BatchResult {
             batch_id,
             total_jobs: total_jobs as u32,
-            completed_jobs: completed_jobs as u32,
-            failed_jobs: failed_jobs as u32,
-            pending_jobs: pending_jobs as u32,
-            status,
+            completed_jobs: progress.completed,
+            failed_jobs: progress.failed,
+            pending_jobs: progress.pending,
+            status: progress.status,
             created_at,
             completed_at,
             error_summary,
@@ -2028,9 +2125,6 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         archived_by: Option<&str>,
     ) -> Result<crate::archive::ArchivalStats> {
         use crate::archive::ArchivalStats;
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Write;
 
         if !policy.enabled {
             return Ok(ArchivalStats::default());
@@ -2041,172 +2135,61 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let mut bytes_archived = 0u64;
         let mut total_compression_ratio = 0.0;
 
-        // Execute transaction to archive jobs
+        // One condition per job status the policy archives, each with its own age threshold.
+        let now = Utc::now();
+        let mut thresholds = Vec::new();
+        let mut status_conditions = Vec::new();
+        let mut param = if queue_name.is_some() { 2 } else { 1 };
+        for (after, status, column) in crate::archive::archival_candidates(policy) {
+            if let Some(after) = after {
+                status_conditions.push(format!(
+                    "(status = '{status}' AND {column} IS NOT NULL AND {column} <= ${param})"
+                ));
+                thresholds.push(now - after);
+                param += 1;
+            }
+        }
+        if status_conditions.is_empty() || policy.batch_size == 0 {
+            return Ok(ArchivalStats::default());
+        }
+
+        // Lock the candidate rows so concurrent archivers (and workers) skip them
+        // instead of archiving the same job twice.
+        let select = format!(
+            "SELECT {} FROM hammerwork_jobs WHERE archived_at IS NULL{} AND ({}) \
+             ORDER BY created_at ASC LIMIT {} FOR UPDATE SKIP LOCKED",
+            JOB_SELECT_FIELDS,
+            if queue_name.is_some() {
+                " AND queue_name = $1"
+            } else {
+                ""
+            },
+            status_conditions.join(" OR "),
+            policy.batch_size
+        );
+
+        // Archiving a job moves its row: insert into the archive table and delete from
+        // the main table in the same transaction.
         let mut tx = self.pool.begin().await?;
 
-        // Build a simpler query for eligible jobs
-        let mut jobs_to_archive = Vec::new();
-
-        // Check each policy condition separately and combine results
-        if let Some(completed_after) = policy.archive_completed_after {
-            let threshold = Utc::now() - completed_after;
-            let mut query = sqlx::query_as::<_, JobRow>(
-                "SELECT * FROM hammerwork_jobs 
-                WHERE archived_at IS NULL 
-                AND status = 'Completed' 
-                AND completed_at IS NOT NULL 
-                AND completed_at <= $1
-                ORDER BY created_at ASC 
-                LIMIT $2",
-            )
-            .bind(threshold)
-            .bind(policy.batch_size as i64);
-
-            if let Some(queue) = queue_name {
-                query = sqlx::query_as::<_, JobRow>(
-                    "SELECT * FROM hammerwork_jobs 
-                    WHERE archived_at IS NULL 
-                    AND queue_name = $1
-                    AND status = 'Completed' 
-                    AND completed_at IS NOT NULL 
-                    AND completed_at <= $2
-                    ORDER BY created_at ASC 
-                    LIMIT $3",
-                )
-                .bind(queue)
-                .bind(threshold)
-                .bind(policy.batch_size as i64);
-            }
-
-            jobs_to_archive.extend(query.fetch_all(&mut *tx).await?);
+        let mut query = sqlx::query_as::<_, JobRow>(&select);
+        if let Some(queue) = queue_name {
+            query = query.bind(queue);
         }
-
-        if let Some(failed_after) = policy.archive_failed_after {
-            let threshold = Utc::now() - failed_after;
-            let mut query = sqlx::query_as::<_, JobRow>(
-                "SELECT * FROM hammerwork_jobs 
-                WHERE archived_at IS NULL 
-                AND status = 'Failed' 
-                AND failed_at IS NOT NULL 
-                AND failed_at <= $1
-                ORDER BY created_at ASC 
-                LIMIT $2",
-            )
-            .bind(threshold)
-            .bind(policy.batch_size as i64);
-
-            if let Some(queue) = queue_name {
-                query = sqlx::query_as::<_, JobRow>(
-                    "SELECT * FROM hammerwork_jobs 
-                    WHERE archived_at IS NULL 
-                    AND queue_name = $1
-                    AND status = 'Failed' 
-                    AND failed_at IS NOT NULL 
-                    AND failed_at <= $2
-                    ORDER BY created_at ASC 
-                    LIMIT $3",
-                )
-                .bind(queue)
-                .bind(threshold)
-                .bind(policy.batch_size as i64);
-            }
-
-            jobs_to_archive.extend(query.fetch_all(&mut *tx).await?);
+        for threshold in thresholds {
+            query = query.bind(threshold);
         }
+        let jobs_to_archive = query.fetch_all(&mut *tx).await?;
 
-        if let Some(dead_after) = policy.archive_dead_after {
-            let threshold = Utc::now() - dead_after;
-            let mut query = sqlx::query_as::<_, JobRow>(
-                "SELECT * FROM hammerwork_jobs 
-                WHERE archived_at IS NULL 
-                AND status = 'Dead' 
-                AND failed_at IS NOT NULL 
-                AND failed_at <= $1
-                ORDER BY created_at ASC 
-                LIMIT $2",
-            )
-            .bind(threshold)
-            .bind(policy.batch_size as i64);
-
-            if let Some(queue) = queue_name {
-                query = sqlx::query_as::<_, JobRow>(
-                    "SELECT * FROM hammerwork_jobs 
-                    WHERE archived_at IS NULL 
-                    AND queue_name = $1
-                    AND status = 'Dead' 
-                    AND failed_at IS NOT NULL 
-                    AND failed_at <= $2
-                    ORDER BY created_at ASC 
-                    LIMIT $3",
-                )
-                .bind(queue)
-                .bind(threshold)
-                .bind(policy.batch_size as i64);
-            }
-
-            jobs_to_archive.extend(query.fetch_all(&mut *tx).await?);
-        }
-
-        if let Some(timed_out_after) = policy.archive_timed_out_after {
-            let threshold = Utc::now() - timed_out_after;
-            let mut query = sqlx::query_as::<_, JobRow>(
-                "SELECT * FROM hammerwork_jobs 
-                WHERE archived_at IS NULL 
-                AND status = 'TimedOut' 
-                AND timed_out_at IS NOT NULL 
-                AND timed_out_at <= $1
-                ORDER BY created_at ASC 
-                LIMIT $2",
-            )
-            .bind(threshold)
-            .bind(policy.batch_size as i64);
-
-            if let Some(queue) = queue_name {
-                query = sqlx::query_as::<_, JobRow>(
-                    "SELECT * FROM hammerwork_jobs 
-                    WHERE archived_at IS NULL 
-                    AND queue_name = $1
-                    AND status = 'TimedOut' 
-                    AND timed_out_at IS NOT NULL 
-                    AND timed_out_at <= $2
-                    ORDER BY created_at ASC 
-                    LIMIT $3",
-                )
-                .bind(queue)
-                .bind(threshold)
-                .bind(policy.batch_size as i64);
-            }
-
-            jobs_to_archive.extend(query.fetch_all(&mut *tx).await?);
-        }
-
-        // Remove duplicates (if jobs match multiple criteria) and limit to batch size
-        jobs_to_archive.sort_by_key(|job| job.created_at);
-        jobs_to_archive.dedup_by_key(|job| job.id);
-        jobs_to_archive.truncate(policy.batch_size);
-
+        let archived_at = Utc::now();
         for job_row in jobs_to_archive {
             let job = job_row.into_job()?;
-            let payload_json = serde_json::to_vec(&job.payload)?;
-            let original_size = payload_json.len();
+            let (final_payload, is_compressed, original_size) =
+                crate::archive::encode_archived_payload(&job.payload, policy, config)?;
+            if is_compressed {
+                total_compression_ratio += original_size as f64 / final_payload.len() as f64;
+            }
 
-            let (final_payload, is_compressed) = if policy.compress_payloads {
-                let mut encoder =
-                    GzEncoder::new(Vec::new(), Compression::new(config.compression_level));
-                encoder.write_all(&payload_json)?;
-                let compressed = encoder.finish()?;
-
-                if compressed.len() < original_size {
-                    total_compression_ratio += original_size as f64 / compressed.len() as f64;
-                    (compressed, true)
-                } else {
-                    (payload_json, false)
-                }
-            } else {
-                (payload_json, false)
-            };
-
-            // Insert into archive table
             sqlx::query(
                 r#"
                 INSERT INTO hammerwork_jobs_archive (
@@ -2240,7 +2223,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .bind(job.completed_at)
             .bind(job.failed_at)
             .bind(job.timed_out_at)
-            .bind(Utc::now())
+            .bind(archived_at)
             .bind(job.error_message)
             .bind(job.result_data)
             .bind(job.result_expires_at)
@@ -2262,22 +2245,16 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .bind(job.correlation_id)
             .bind(job.parent_span_id)
             .bind(job.span_context)
-            .bind(reason.to_string())
+            .bind(reason.as_str())
             .bind(archived_by)
             .bind("hammerwork_jobs")
             .execute(&mut *tx)
             .await?;
 
-            // Update main table to mark as archived
-            sqlx::query(
-                "UPDATE hammerwork_jobs SET archived_at = $1, archival_reason = $2, archival_policy_applied = $3 WHERE id = $4"
-            )
-            .bind(Utc::now())
-            .bind(reason.to_string())
-            .bind(archived_by)
-            .bind(job.id)
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query("DELETE FROM hammerwork_jobs WHERE id = $1")
+                .bind(job.id)
+                .execute(&mut *tx)
+                .await?;
 
             jobs_archived += 1;
             bytes_archived += final_payload.len() as u64;
@@ -2306,115 +2283,34 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn restore_archived_job(&self, job_id: JobId) -> Result<Job> {
-        use flate2::read::GzDecoder;
-        use std::io::Read;
-
         let mut tx = self.pool.begin().await?;
 
-        // Get archived job
-        let archived_row = sqlx::query(
-            r#"
-            SELECT 
-                id, queue_name, payload, payload_compressed, original_payload_size,
-                status, priority, attempts, max_attempts, created_at, scheduled_at,
-                started_at, completed_at, failed_at, timed_out_at,
-                error_message, result, result_ttl, retry_strategy, timeout_seconds,
-                cron_schedule, next_run_at, recurring, timezone, batch_id,
-                depends_on, dependency_status, result_config,
-                trace_id, correlation_id, parent_span_id, span_context
-            FROM hammerwork_jobs_archive 
-            WHERE id = $1
-        "#,
-        )
+        // Lock the archived row so two concurrent restores cannot both re-insert it.
+        let archived_row = sqlx::query(&format!(
+            "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive WHERE id = $1 FOR UPDATE"
+        ))
         .bind(job_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| crate::HammerworkError::JobNotFound {
+            id: job_id.to_string(),
+        })?;
 
-        // Decompress payload if needed
-        let payload_bytes: Vec<u8> = archived_row.get("payload");
-        let is_compressed: bool = archived_row.get("payload_compressed");
+        let job = crate::archive::reset_for_restore(archived_job_from_row(&archived_row)?);
 
-        let payload_json = if is_compressed {
-            let mut decoder = GzDecoder::new(&payload_bytes[..]);
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed)?;
-            decompressed
-        } else {
-            payload_bytes
-        };
-
-        let payload: serde_json::Value = serde_json::from_slice(&payload_json)?;
-
-        // Create job object
-        let job = Job {
-            id: archived_row.get("id"),
-            queue_name: archived_row.get("queue_name"),
-            payload,
-            status: JobStatus::Pending, // Reset to pending for re-processing
-            priority: archived_row
-                .get::<String, _>("priority")
-                .parse()
-                .unwrap_or(JobPriority::Normal),
-            attempts: 0, // Reset attempts
-            max_attempts: archived_row.get("max_attempts"),
-            created_at: archived_row.get("created_at"),
-            scheduled_at: Utc::now(), // Schedule for immediate processing
-            started_at: None,
-            completed_at: None,
-            failed_at: None,
-            timed_out_at: None,
-            timeout: archived_row
-                .get::<Option<i32>, _>("timeout_seconds")
-                .map(|s| std::time::Duration::from_secs(s as u64)),
-            error_message: None, // Clear error message
-            cron_schedule: archived_row.get("cron_schedule"),
-            next_run_at: archived_row.get("next_run_at"),
-            recurring: archived_row.get("recurring"),
-            timezone: archived_row.get("timezone"),
-            batch_id: archived_row.get("batch_id"),
-            result_config: archived_row
-                .get::<Option<serde_json::Value>, _>("result_config")
-                .map(|v| serde_json::from_value(v).unwrap_or_default())
-                .unwrap_or_default(),
-            result_data: None, // Clear result data
-            result_stored_at: None,
-            result_expires_at: None,
-            retry_strategy: archived_row
-                .get::<Option<String>, _>("retry_strategy")
-                .and_then(|s| serde_json::from_str(&s).ok()),
-            depends_on: archived_row.get("depends_on"),
-            dependents: Vec::new(),
-            dependency_status: archived_row
-                .get::<Option<String>, _>("dependency_status")
-                .map(|s| serde_json::from_str(&s).unwrap_or_default())
-                .unwrap_or_default(),
-            workflow_id: None,
-            workflow_name: None,
-            trace_id: archived_row.get("trace_id"),
-            correlation_id: archived_row.get("correlation_id"),
-            parent_span_id: archived_row.get("parent_span_id"),
-            span_context: archived_row.get("span_context"),
-            #[cfg(feature = "encryption")]
-            encryption_config: None,
-            pii_fields: Vec::new(),
-            #[cfg(feature = "encryption")]
-            retention_policy: None,
-            is_encrypted: false,
-            #[cfg(feature = "encryption")]
-            encrypted_payload: None,
-        };
+        // Older versions archived a job without deleting its row from hammerwork_jobs
+        // (they only set archived_at). Drop such a leftover so the restore does not
+        // collide with it.
+        sqlx::query("DELETE FROM hammerwork_jobs WHERE id = $1 AND archived_at IS NOT NULL")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
 
         // Insert back into main table
         self.enqueue_with_tx(&mut tx, job.clone()).await?;
 
         // Remove from archive table
         sqlx::query("DELETE FROM hammerwork_jobs_archive WHERE id = $1")
-            .bind(job_id)
-            .execute(&mut *tx)
-            .await?;
-
-        // Clear archival metadata from main table
-        sqlx::query("UPDATE hammerwork_jobs SET archived_at = NULL, archival_reason = NULL, archival_policy_applied = NULL WHERE id = $1")
             .bind(job_id)
             .execute(&mut *tx)
             .await?;
@@ -2481,26 +2377,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             archived_jobs.push(ArchivedJob {
                 id: row.get("id"),
                 queue_name: row.get("queue_name"),
-                status: {
-                    // Handle both quoted (old format) and unquoted (new format) status values
-                    let status_str: String = row.get("status");
-                    let cleaned_str = status_str.trim_matches('"');
-                    match cleaned_str {
-                        "Pending" => JobStatus::Pending,
-                        "Running" => JobStatus::Running,
-                        "Completed" => JobStatus::Completed,
-                        "Failed" => JobStatus::Failed,
-                        "Dead" => JobStatus::Dead,
-                        "TimedOut" => JobStatus::TimedOut,
-                        "Retrying" => JobStatus::Retrying,
-                        "Archived" => JobStatus::Archived,
-                        _ => JobStatus::Dead, // Default fallback for unknown status
-                    }
-                },
+                status: crate::archive::parse_archived_status(&row.get::<String, _>("status")),
                 created_at: row.get("created_at"),
                 archived_at: row.get("archived_at"),
-                archival_reason: serde_json::from_str(&row.get::<String, _>("archival_reason"))
-                    .unwrap_or(crate::archive::ArchivalReason::Automatic),
+                archival_reason: crate::archive::ArchivalReason::parse_from_db(
+                    &row.get::<String, _>("archival_reason"),
+                )
+                .unwrap_or_default(),
                 original_payload_size: row
                     .get::<Option<i32>, _>("original_payload_size")
                     .map(|s| s as usize),

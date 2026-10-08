@@ -41,28 +41,186 @@ async fn assert_archived_reason_round_trips<Q: DatabaseQueue>(queue: &Q) {
     assert_eq!(archived[0].archival_reason, ArchivalReason::Manual);
 }
 
+/// Archiving moves a job out of `hammerwork_jobs` into the archive table, `get_job`
+/// still finds it (as `Archived`, with its original data), and restoring moves it back
+/// exactly once. `in_main_table` reports whether the id has a row in `hammerwork_jobs`.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+async fn assert_archive_moves_job<Q, F, Fut>(queue: &Q, in_main_table: F)
+where
+    Q: DatabaseQueue,
+    F: Fn(hammerwork::JobId) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let queue_name = test_utils::unique_queue("move_test");
+    let payload = json!({"data": "y".repeat(400)});
+    let job = Job::new(queue_name.clone(), payload.clone());
+    let job_id = queue.enqueue(job).await.unwrap();
+    queue.complete_job(job_id).await.unwrap();
+
+    let policy = ArchivalPolicy::new()
+        .archive_completed_after(Duration::seconds(0))
+        .compress_archived_payloads(true)
+        .enabled(true);
+    let stats = queue
+        .archive_jobs(
+            Some(queue_name.as_str()),
+            &policy,
+            &ArchivalConfig::new(),
+            ArchivalReason::Compliance,
+            Some("move_test"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats.jobs_archived, 1);
+    assert!(
+        !in_main_table(job_id).await,
+        "archived job left in hammerwork_jobs"
+    );
+
+    // get_job falls back to the archive table
+    let archived = queue.get_job(job_id).await.unwrap().unwrap();
+    assert_eq!(archived.status, JobStatus::Archived);
+    assert_eq!(archived.payload, payload);
+    assert_eq!(archived.queue_name, queue_name);
+    assert!(archived.completed_at.is_some());
+
+    // Archiving again finds nothing to do
+    let again = queue
+        .archive_jobs(
+            Some(queue_name.as_str()),
+            &policy,
+            &ArchivalConfig::new(),
+            ArchivalReason::Compliance,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.jobs_archived, 0);
+
+    // Restoring an id that is not archived fails cleanly
+    let missing = hammerwork::JobId::new_v4();
+    assert!(matches!(
+        queue.restore_archived_job(missing).await,
+        Err(hammerwork::HammerworkError::JobNotFound { .. })
+    ));
+
+    let restored = queue.restore_archived_job(job_id).await.unwrap();
+    assert_eq!(restored.status, JobStatus::Pending);
+    assert_eq!(restored.payload, payload);
+    assert!(in_main_table(job_id).await);
+    assert!(
+        queue
+            .list_archived_jobs(Some(queue_name.as_str()), None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        queue.get_job(job_id).await.unwrap().unwrap().status,
+        JobStatus::Pending
+    );
+
+    // A second restore finds nothing in the archive
+    assert!(matches!(
+        queue.restore_archived_job(job_id).await,
+        Err(hammerwork::HammerworkError::JobNotFound { .. })
+    ));
+
+    queue.delete_job(job_id).await.unwrap();
+    assert!(queue.get_job(job_id).await.unwrap().is_none());
+}
+
+/// Two archivers running at once over the same queue archive every job exactly once:
+/// candidate rows are locked with `FOR UPDATE SKIP LOCKED`, so neither re-archives a
+/// row the other is moving.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+async fn assert_concurrent_archivers_do_not_collide<Q: DatabaseQueue>(queue: &Q) {
+    let queue_name = test_utils::unique_queue("concurrent_archive");
+    let job_count = 12;
+    for i in 0..job_count {
+        let job_id = queue
+            .enqueue(Job::new(queue_name.clone(), json!({"i": i})))
+            .await
+            .unwrap();
+        queue.complete_job(job_id).await.unwrap();
+    }
+
+    let policy = ArchivalPolicy::new()
+        .archive_completed_after(Duration::seconds(0))
+        .with_batch_size(8)
+        .enabled(true);
+    let config = ArchivalConfig::new();
+    let archive = || {
+        queue.archive_jobs(
+            Some(queue_name.as_str()),
+            &policy,
+            &config,
+            ArchivalReason::Automatic,
+            None,
+        )
+    };
+
+    let (a, b) = tokio::join!(archive(), archive());
+    let total = a.unwrap().jobs_archived + b.unwrap().jobs_archived;
+    // Each call archives at most one batch; whatever is left goes in a final call.
+    let rest = archive().await.unwrap().jobs_archived;
+    assert_eq!(total + rest, job_count);
+
+    let archived = queue
+        .list_archived_jobs(Some(queue_name.as_str()), None, None)
+        .await
+        .unwrap();
+    assert_eq!(archived.len() as u64, job_count);
+    queue
+        .purge_archived_jobs(chrono::Utc::now() + Duration::seconds(1))
+        .await
+        .unwrap();
+}
+
 #[cfg(feature = "postgres")]
 mod postgres_archive_tests {
     use super::*;
     use chrono::Utc;
 
     #[tokio::test]
-    #[ignore = "bug: list_archived_jobs parses the stored archival_reason as JSON and always falls back to Automatic, see #7"]
+    #[ignore] // Requires database connection
     async fn test_postgres_list_archived_jobs_reason() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
         let _serial = test_utils::serial().await;
         assert_archived_reason_round_trips(queue.as_ref()).await;
     }
 
     #[tokio::test]
-    #[ignore = "bug: archive_jobs leaves archived jobs in hammerwork_jobs with their old status, see #7"]
+    #[ignore] // Requires database connection
+    async fn test_postgres_archive_moves_job_out_of_main_table() {
+        let queue = test_utils::setup_postgres_queue().await;
+        let _serial = test_utils::serial().await;
+        let pool = queue.pool.clone();
+        assert_archive_moves_job(queue.as_ref(), |id| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("SELECT 1 FROM hammerwork_jobs WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_concurrent_archivers() {
+        let queue = test_utils::setup_postgres_queue().await;
+        let _serial = test_utils::serial().await;
+        assert_concurrent_archivers_do_not_collide(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_postgres_policy_based_archival() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
         let _serial = test_utils::serial().await;
         let queue_name = test_utils::unique_queue("test_queue");
@@ -138,11 +296,8 @@ mod postgres_archive_tests {
     }
 
     #[tokio::test]
-    #[ignore = "bug: archive_jobs keeps the job row, so restore_archived_job hits a duplicate key, see #7"]
+    #[ignore] // Requires database connection
     async fn test_postgres_job_restoration() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
         let _serial = test_utils::serial().await;
         let queue_name = test_utils::unique_queue("restore_test");
@@ -407,11 +562,8 @@ mod postgres_archive_tests {
     }
 
     #[tokio::test]
-    #[ignore = "bug: restore_archived_job re-inserts a row that still exists (duplicate key), see #7"]
+    #[ignore] // Requires database connection
     async fn test_postgres_compression_verification() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
         let _serial = test_utils::serial().await;
         let queue_name = test_utils::unique_queue("compression_test");
@@ -462,11 +614,8 @@ mod postgres_archive_tests {
     }
 
     #[tokio::test]
-    #[ignore = "bug: archive_jobs leaves archived jobs in hammerwork_jobs with their old status, see #7"]
+    #[ignore] // Requires database connection
     async fn test_postgres_different_job_statuses_archival() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_postgres_queue().await;
         let _serial = test_utils::serial().await;
         let queue_name = test_utils::unique_queue("status_test");
@@ -534,22 +683,44 @@ mod mysql_archive_tests {
     use chrono::Utc;
 
     #[tokio::test]
-    #[ignore = "bug: list_archived_jobs parses the stored archival_reason as JSON and always falls back to Automatic, see #7"]
+    #[ignore] // Requires database connection
     async fn test_mysql_list_archived_jobs_reason() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_mysql_queue().await;
         let _serial = test_utils::serial().await;
         assert_archived_reason_round_trips(queue.as_ref()).await;
     }
 
     #[tokio::test]
-    #[ignore = "bug: archive_jobs leaves archived jobs in hammerwork_jobs with their old status, see #7"]
+    #[ignore] // Requires database connection
+    async fn test_mysql_archive_moves_job_out_of_main_table() {
+        let queue = test_utils::setup_mysql_queue().await;
+        let _serial = test_utils::serial().await;
+        let pool = queue.pool.clone();
+        assert_archive_moves_job(queue.as_ref(), |id| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("SELECT 1 FROM hammerwork_jobs WHERE id = ?")
+                    .bind(id.to_string())
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_concurrent_archivers() {
+        let queue = test_utils::setup_mysql_queue().await;
+        let _serial = test_utils::serial().await;
+        assert_concurrent_archivers_do_not_collide(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_mysql_basic_archival_flow() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_mysql_queue().await;
         let _serial = test_utils::serial().await;
         let queue_name = test_utils::unique_queue("mysql_test");
@@ -597,11 +768,8 @@ mod mysql_archive_tests {
     }
 
     #[tokio::test]
-    #[ignore = "bug: MySQL get_archival_stats decodes SUM() DECIMAL as i64, see #7"]
+    #[ignore] // Requires database connection
     async fn test_mysql_archival_stats() {
-        if test_utils::skip_known_bug() {
-            return;
-        }
         let queue = test_utils::setup_mysql_queue().await;
         let _serial = test_utils::serial().await;
         let queue_name = test_utils::unique_queue("mysql_stats");
