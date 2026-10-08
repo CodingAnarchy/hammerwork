@@ -12,7 +12,7 @@ mod test_utils;
 
 use chrono::{DateTime, Duration as ChronoDuration, DurationRound, Utc};
 use hammerwork::{
-    CronSchedule, HammerworkError, Job, JobId, JobOutcome, JobQueue, JobStatus, PriorityWeights,
+    CronSchedule, Job, JobId, JobOutcome, JobQueue, JobStatus, PriorityWeights,
     batch::JobBatch,
     priority::JobPriority,
     queue::DatabaseQueue,
@@ -650,6 +650,7 @@ mod postgres_tests {
 #[cfg(feature = "mysql")]
 mod mysql_tests {
     use super::*;
+    use hammerwork::HammerworkError;
     use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
     use std::str::FromStr;
 

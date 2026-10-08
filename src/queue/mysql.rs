@@ -315,6 +315,7 @@ impl JobRow {
     }
 
     /// Parses PII fields from JSON value.
+    #[cfg(feature = "encryption")]
     fn parse_pii_fields(&self) -> Vec<String> {
         self.pii_fields
             .as_ref()
