@@ -6,6 +6,7 @@ HMAC signatures. (Alert notifications are a separate system; see
 [Monitoring & Alerting](monitoring.md).)
 
 ```rust
+# async fn example() -> hammerwork::Result<()> {
 use hammerwork::events::{EventFilter, EventManager, JobLifecycleEventType};
 use hammerwork::webhooks::{WebhookConfig, WebhookManager};
 use std::{sync::Arc, time::Duration};
@@ -23,6 +24,8 @@ webhooks.add_webhook(hook).await?;
 
 // ... on shutdown:
 webhooks.shutdown(Duration::from_secs(10)).await;
+# Ok(())
+# }
 ```
 
 Without a template, the request body is the `JobLifecycleEvent` as JSON. When a
@@ -36,6 +39,8 @@ a receiver expects instead of the raw event. A template is a JSON document. JSON
 strings in it may contain `{{ path }}` placeholders:
 
 ```rust
+# use hammerwork::webhooks::WebhookConfig;
+# fn example(slack_url: String) -> hammerwork::Result<()> {
 let hook = WebhookConfig::new("slack".to_string(), slack_url)
     .with_payload_template(r#"{
         "text": "Job {{event.job_id}} on {{event.queue_name}} {{event.event_type}}: {{event.error.message}}",
@@ -45,6 +50,8 @@ let hook = WebhookConfig::new("slack".to_string(), slack_url)
             "payload": "{{event.payload}}"
         }
     }"#);
+# Ok(())
+# }
 ```
 
 Rendering rules:

@@ -21,16 +21,16 @@ Add Hammerwork to your `Cargo.toml`:
 ```toml
 [dependencies]
 # PostgreSQL support with default features (metrics, alerting)
-hammerwork = { version = "1.5", features = ["postgres"] }
+hammerwork = { version = "1.15", features = ["postgres"] }
 
 # MySQL support
-hammerwork = { version = "1.5", features = ["mysql"] }
+hammerwork = { version = "1.15", features = ["mysql"] }
 
 # With distributed tracing
-hammerwork = { version = "1.5", features = ["postgres", "tracing"] }
+hammerwork = { version = "1.15", features = ["postgres", "tracing"] }
 
 # Minimal installation without default features
-hammerwork = { version = "1.5", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.15", features = ["postgres"], default-features = false }
 
 # Additional dependencies for examples
 serde_json = "1.0"
@@ -41,7 +41,7 @@ tracing-subscriber = "0.3"
 
 ## PostgreSQL Example
 
-```rust
+```rust,no_run
 use hammerwork::{
     Result,
     job::Job,
@@ -186,7 +186,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 ## MySQL Example
 
-```rust
+```rust,no_run
 use hammerwork::{
     Result,
     job::Job,
@@ -310,25 +310,35 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 ### 2. Job Configuration
 ```rust
-let job = Job::new("queue_name".to_string(), json!({"data": "value"}))
+# use hammerwork::{Job, JobPriority};
+# use serde_json::json;
+# use std::time::Duration;
+// Delay execution by 30 seconds (or use Job::new for immediate execution)
+let job = Job::with_delay("queue_name".to_string(), json!({"data": "value"}), chrono::Duration::seconds(30))
     .with_timeout(Duration::from_secs(60))           // Custom timeout
     .with_max_attempts(5)                            // Retry attempts
-    .with_priority(JobPriority::High)                // Job priority
-    .with_delay(Duration::from_secs(30));            // Delay execution
+    .with_priority(JobPriority::High);               // Job priority
 ```
 
 ### 3. Worker Configuration
 ```rust
+# use hammerwork::{Worker, JobQueue, rate_limit::RateLimit, stats::StatisticsCollector, worker::JobHandler};
+# use std::{sync::Arc, time::Duration};
+# fn example(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, stats_collector: Arc<dyn StatisticsCollector>) {
 let worker = Worker::new(queue.clone(), "queue_name".to_string(), handler)
     .with_poll_interval(Duration::from_secs(1))      // How often to check for jobs
     .with_max_retries(3)                             // Default retry attempts
     .with_default_timeout(Duration::from_secs(30))   // Default job timeout
     .with_rate_limit(RateLimit::per_second(2))       // Rate limiting
     .with_stats_collector(stats_collector);          // Statistics collection
+# }
 ```
 
 ### 4. Statistics and Monitoring
 ```rust
+# use hammerwork::{JobQueue, queue::DatabaseQueue, stats::StatisticsCollector};
+# use std::time::Duration;
+# async fn example(queue: &JobQueue<sqlx::Postgres>, stats_collector: std::sync::Arc<dyn StatisticsCollector>) -> hammerwork::Result<()> {
 // Get system-wide statistics
 let stats = stats_collector
     .get_system_statistics(Duration::from_secs(300))
@@ -341,6 +351,8 @@ let queue_stats = stats_collector
 
 // Get database statistics
 let db_stats = queue.get_queue_stats("email").await?;
+# Ok(())
+# }
 ```
 
 ## Environment Setup

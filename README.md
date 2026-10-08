@@ -8,7 +8,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 - **🔐 Job Encryption & PII Protection**: Enterprise-grade encryption for sensitive job payloads with AES-256-GCM and ChaCha20-Poly1305, field-level PII protection, and configurable retention policies
 - **🗝️ Advanced Key Management**: Complete key lifecycle management with master key encryption, automatic rotation, audit trails, and external KMS integration
-- **🚀 Dynamic Job Spawning**: Jobs can dynamically create child jobs during execution for fan-out processing patterns, with full parent-child relationship tracking and lineage management
+- **🚀 Dynamic Job Spawning**: Jobs can dynamically create child jobs during execution for fan-out processing patterns; children record their parent as a dependency
 - **📊 Web Dashboard**: Modern real-time web interface for monitoring queues, managing jobs, and system administration with authentication and WebSocket updates
 - **🧪 TestQueue Framework**: Complete in-memory testing implementation with MockClock for deterministic testing of time-dependent features, workflows, and job processing
 - **🔍 Job Tracing & Correlation**: Comprehensive distributed tracing with OpenTelemetry integration, trace IDs, correlation IDs, and lifecycle event hooks
@@ -35,30 +35,30 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "1.12", features = ["postgres"] }
+hammerwork = { version = "1.15", features = ["postgres"] }
 # or
-hammerwork = { version = "1.12", features = ["mysql"] }
+hammerwork = { version = "1.15", features = ["mysql"] }
 
 # With encryption for PII protection
-hammerwork = { version = "1.12", features = ["postgres", "encryption"] }
+hammerwork = { version = "1.15", features = ["postgres", "encryption"] }
 
 # With AWS KMS integration for enterprise key management
-hammerwork = { version = "1.12", features = ["postgres", "encryption", "aws-kms"] }
+hammerwork = { version = "1.15", features = ["postgres", "encryption", "aws-kms"] }
 
 # With Google Cloud KMS integration for enterprise key management
-hammerwork = { version = "1.12", features = ["postgres", "encryption", "gcp-kms"] }
+hammerwork = { version = "1.15", features = ["postgres", "encryption", "gcp-kms"] }
 
 # With HashiCorp Vault KMS integration for enterprise key management
-hammerwork = { version = "1.12", features = ["postgres", "encryption", "vault-kms"] }
+hammerwork = { version = "1.15", features = ["postgres", "encryption", "vault-kms"] }
 
 # With distributed tracing
-hammerwork = { version = "1.12", features = ["postgres", "tracing"] }
+hammerwork = { version = "1.15", features = ["postgres", "tracing"] }
 
 # Full feature set
-hammerwork = { version = "1.12", features = ["postgres", "encryption", "aws-kms", "gcp-kms", "vault-kms", "tracing"] }
+hammerwork = { version = "1.15", features = ["postgres", "encryption", "aws-kms", "gcp-kms", "vault-kms", "tracing"] }
 
 # Minimal installation
-hammerwork = { version = "1.12", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.15", features = ["postgres"], default-features = false }
 ```
 
 **Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `encryption` (optional), `aws-kms` (optional), `gcp-kms` (optional), `vault-kms` (optional), `tracing` (optional), `test` (for TestQueue)
@@ -71,7 +71,7 @@ cargo install hammerwork-web --features postgres
 
 # Or add to your project
 [dependencies]
-hammerwork-web = { version = "1.12", features = ["postgres"] }
+hammerwork-web = { version = "1.15", features = ["postgres"] }
 ```
 
 Start the dashboard:
@@ -107,8 +107,8 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 
 ## Basic Example
 
-```rust
-use hammerwork::{Job, Worker, WorkerPool, JobQueue, RetryStrategy, queue::DatabaseQueue};
+```rust,no_run
+use hammerwork::{Job, Worker, WorkerPool, JobQueue, RetryStrategy, queue::DatabaseQueue, worker::JobHandler};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue = Arc::new(JobQueue::new(pool));
 
     // Create job handler
-    let handler = Arc::new(|job: Job| {
+    let handler: JobHandler = Arc::new(|job: Job| {
         Box::pin(async move {
             println!("Processing: {:?}", job.payload);
             Ok(())
@@ -143,7 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     queue.enqueue(job).await?;
 
-    pool.start().await
+    pool.start().await?;
+    Ok(())
 }
 ```
 
@@ -151,9 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Create complex data processing pipelines with job dependencies:
 
-```rust
+```rust,no_run
 use hammerwork::{Job, JobGroup, FailurePolicy, queue::DatabaseQueue};
 use serde_json::json;
+# async fn example(queue: &hammerwork::JobQueue<sqlx::Postgres>) -> hammerwork::Result<()> {
 
 // Sequential pipeline: job1 → job2 → job3
 let job1 = Job::new("process_data".to_string(), json!({"input": "raw_data.csv"}));
@@ -177,6 +179,8 @@ let workflow = JobGroup::new("data_pipeline")
 
 // Enqueue the entire workflow
 queue.enqueue_workflow(workflow).await?;
+# Ok(())
+# }
 ```
 
 Jobs will only execute when their dependencies are satisfied, enabling sophisticated data processing pipelines and business workflows.
@@ -185,8 +189,8 @@ Jobs will only execute when their dependencies are satisfied, enabling sophistic
 
 Enable comprehensive distributed tracing with OpenTelemetry integration:
 
-```rust
-use hammerwork::{Job, Worker, tracing::{TracingConfig, init_tracing}, queue::DatabaseQueue};
+```rust,no_run
+use hammerwork::{Job, JobQueue, Worker, tracing::{TracingConfig, init_tracing}, queue::DatabaseQueue, worker::JobHandler};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -224,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .depends_on(&payment_job.id);
 
     // Worker with lifecycle event hooks for observability
-    let handler = Arc::new(|job: Job| Box::pin(async move {
+    let handler: JobHandler = Arc::new(|job: Job| Box::pin(async move {
         println!("Processing: {:?}", job.payload);
         // Your business logic here
         Ok(())
@@ -263,6 +267,8 @@ This enables end-to-end tracing across your entire job processing pipeline with 
 Test your job processing logic with the in-memory `TestQueue` framework:
 
 ```rust
+# #[cfg(feature = "test")]
+# mod doc {
 use hammerwork::queue::test::{TestQueue, MockClock};
 use hammerwork::{Job, JobStatus, queue::DatabaseQueue};
 use serde_json::json;
@@ -297,6 +303,8 @@ async fn test_delayed_job_processing() {
     let completed = queue.get_job(job_id).await.unwrap().unwrap();
     assert_eq!(completed.status, JobStatus::Completed);
 }
+# }
+# fn main() {}
 ```
 
 The `TestQueue` provides complete compatibility with the `DatabaseQueue` trait while offering deterministic time control through `MockClock`, making it perfect for testing complex workflows, retry logic, and time-dependent job processing.
@@ -305,12 +313,13 @@ The `TestQueue` provides complete compatibility with the `DatabaseQueue` trait w
 
 Configure automatic job archival for compliance and database performance:
 
-```rust
+```rust,no_run
 use hammerwork::{
     archive::{ArchivalPolicy, ArchivalConfig, ArchivalReason},
     queue::DatabaseQueue
 };
-use chrono::Duration;
+use chrono::{Duration, Utc};
+# async fn example(queue: &hammerwork::JobQueue<sqlx::Postgres>, job_id: hammerwork::JobId) -> hammerwork::Result<()> {
 
 // Configure archival policy
 let policy = ArchivalPolicy::new()
@@ -356,6 +365,8 @@ let archived_jobs = queue.list_archived_jobs(
 let purged = queue.purge_archived_jobs(
     Utc::now() - Duration::days(730)  // Delete jobs archived over 2 years ago
 ).await?;
+# Ok(())
+# }
 ```
 
 Archival moves completed/failed jobs to a separate table with compressed payloads, reducing the main table size while maintaining compliance requirements.
@@ -364,7 +375,7 @@ Archival moves completed/failed jobs to a separate table with compressed payload
 
 Encrypt sensitive job payloads at rest. The queue encrypts jobs that ask for it when they are enqueued and the worker decrypts them just before calling the handler:
 
-```rust
+```rust,no_run
 use hammerwork::{
     Job, JobQueue, Worker,
     encryption::{EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource, RetentionPolicy},
@@ -482,7 +493,11 @@ hammerwork-web --database-url postgresql://localhost/hammerwork
 
 Once migrations are run, your application can use the queue directly:
 
-```rust
+```rust,no_run
+# use hammerwork::{Job, JobQueue, queue::DatabaseQueue};
+# use serde_json::json;
+# use std::sync::Arc;
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
 // In your application - no setup needed, just use the queue
 let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
 let queue = Arc::new(JobQueue::new(pool));
@@ -490,6 +505,8 @@ let queue = Arc::new(JobQueue::new(pool));
 // Start enqueuing jobs immediately
 let job = Job::new("default".to_string(), json!({"task": "send_email"}));
 queue.enqueue(job).await?;
+# Ok(())
+# }
 ```
 
 ### Database Schema

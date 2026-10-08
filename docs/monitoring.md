@@ -6,12 +6,16 @@ Hammerwork provides comprehensive monitoring capabilities through Prometheus met
 
 ### Setting up Metrics
 
-```rust
+```rust,no_run
 use hammerwork::{Worker, MetricsConfig, PrometheusMetricsCollector};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+# use hammerwork::{JobQueue, worker::JobHandler};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    # let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
+    # let queue = Arc::new(JobQueue::new(pool));
+    # let handler: JobHandler = Arc::new(|_job| Box::pin(async { Ok(()) }));
     // Configure metrics
     let metrics_config = MetricsConfig::new()
         .with_prometheus_exporter("127.0.0.1:9090".parse::<SocketAddr>().unwrap())
@@ -19,10 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_update_interval(Duration::from_secs(15));
 
     // Create metrics collector
-    let mut metrics_collector = Arc::new(PrometheusMetricsCollector::new(metrics_config)?);
-    
-    // Start HTTP server for Prometheus scraping
+    let mut metrics_collector = PrometheusMetricsCollector::new(metrics_config)?;
+
+    // Start HTTP server for Prometheus scraping (fails if the address can't be bound)
     metrics_collector.start_exposition_server().await?;
+    let metrics_collector = Arc::new(metrics_collector);
 
     // Configure worker with metrics
     let worker = Worker::new(queue, "default".to_string(), handler)
@@ -45,23 +50,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Basic Alerting Setup
 
 ```rust
+# async fn example(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler) {
 use hammerwork::{Worker, AlertingConfig, AlertSeverity, SmtpConfig};
 use std::time::Duration;
 
 let alerting_config = AlertingConfig::new()
     .alert_on_high_error_rate(0.1)  // Alert if error rate > 10%
     .alert_on_queue_depth(1000)     // Alert if queue has > 1000 jobs
-    .alert_on_worker_starvation(Duration::from_minutes(5))
+    .alert_on_worker_starvation(Duration::from_secs(5 * 60))
     .webhook("https://your-webhook.com/alerts")
     .slack("https://hooks.slack.com/your-webhook", "#alerts")
     .email_via_smtp(
         "admin@yourcompany.com",
         SmtpConfig::new("smtp.yourcompany.com", "alerts@yourcompany.com"),
     )
-    .with_cooldown(Duration::from_minutes(5));
+    .with_cooldown(Duration::from_secs(5 * 60));
 
 let worker = Worker::new(queue, "default".to_string(), handler)
     .with_alerting_config(alerting_config);
+# }
 ```
 
 ### Alert Types
@@ -76,6 +83,8 @@ let worker = Worker::new(queue, "default".to_string(), handler)
 
 #### Webhook Alerts
 ```rust
+# use hammerwork::AlertingConfig;
+# let headers = std::collections::HashMap::new();
 let config = AlertingConfig::new()
     .webhook("https://your-webhook.com/alerts")
     .webhook_with_headers("https://api.example.com/alerts", headers);
@@ -83,6 +92,7 @@ let config = AlertingConfig::new()
 
 #### Slack Integration
 ```rust
+# use hammerwork::AlertingConfig;
 let config = AlertingConfig::new()
     .slack("https://hooks.slack.com/your-webhook", "#alerts");
 ```
@@ -157,6 +167,8 @@ Workers automatically start a background monitoring task that:
 ## Custom Metrics
 
 ```rust
+# use hammerwork::{MetricsConfig, PrometheusMetricsCollector};
+# async fn example(metrics_collector: &PrometheusMetricsCollector) -> hammerwork::Result<()> {
 let metrics_config = MetricsConfig::new()
     .with_custom_gauges(vec!["custom_metric_1", "custom_metric_2"])
     .with_histograms(vec!["custom_histogram_1"]);
@@ -164,6 +176,9 @@ let metrics_config = MetricsConfig::new()
 // Update custom metrics
 metrics_collector.update_custom_gauge("custom_metric_1", "queue_name", 42.0).await?;
 metrics_collector.observe_custom_histogram("custom_histogram_1", "queue_name", 1.5).await?;
+# let _ = metrics_config;
+# Ok(())
+# }
 ```
 
 ## Disabling Monitoring
