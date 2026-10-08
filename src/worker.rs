@@ -999,6 +999,58 @@ where
         self
     }
 
+    /// Apply a [`WorkerConfig`](crate::config::WorkerConfig).
+    ///
+    /// Sets the poll interval, default job timeout, priority weights and default retry
+    /// strategy. `pool_size` and the autoscaling settings apply to a [`WorkerPool`]; see
+    /// [`WorkerPool::from_config`].
+    pub fn with_config(self, config: &crate::config::WorkerConfig) -> Self {
+        self.with_poll_interval(config.polling_interval)
+            .with_default_timeout(config.job_timeout)
+            .with_priority_weights(config.priority_weights.clone())
+            .with_default_retry_strategy(config.retry_strategy.clone())
+    }
+
+    /// Apply the worker-related sections of a [`HammerworkConfig`](crate::HammerworkConfig).
+    ///
+    /// Applies `worker` (see [`with_config`](Self::with_config)), the throttle from
+    /// `rate_limiting` that matches this worker's queue, and `alerting` (when the
+    /// `alerting` feature is enabled). Events are not applied here because the
+    /// [`EventManager`](crate::events::EventManager) must be shared with any webhook or
+    /// stream managers: build it once with `EventManager::new(config.events.clone())`
+    /// and pass it to [`with_event_manager`](Self::with_event_manager).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{HammerworkConfig, JobQueue, Worker};
+    /// use std::sync::Arc;
+    ///
+    /// # async fn example() -> hammerwork::Result<()> {
+    /// let config = HammerworkConfig::from_file("hammerwork.toml")?;
+    /// let queue = Arc::new(JobQueue::<sqlx::Postgres>::from_config(&config).await?);
+    /// let handler: hammerwork::worker::JobHandler = Arc::new(|_job| Box::pin(async { Ok(()) }));
+    ///
+    /// let worker = Worker::new(queue, "email".to_string(), handler)
+    ///     .with_hammerwork_config(&config);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_hammerwork_config(mut self, config: &crate::HammerworkConfig) -> Self {
+        self = self.with_config(&config.worker);
+
+        if let Some(throttle) = config.rate_limiting.throttle_for(&self.queue_name) {
+            self = self.with_throttle_config(throttle);
+        }
+
+        #[cfg(feature = "alerting")]
+        {
+            self = self.with_alerting_config(config.alerting.clone());
+        }
+
+        self
+    }
+
     /// Configure priority weights for job selection
     pub fn with_priority_weights(mut self, weights: PriorityWeights) -> Self {
         self.priority_weights = Some(weights);
@@ -2170,6 +2222,23 @@ where
             queue_depth_history: Arc::new(std::sync::RwLock::new(Vec::new())),
             autoscale_task: None,
         }
+    }
+
+    /// Build a pool from a [`WorkerConfig`](crate::config::WorkerConfig).
+    ///
+    /// Adds `pool_size` copies of `worker` (at least one), uses it as the autoscaling
+    /// template, and configures autoscaling from `autoscaling_enabled`, `min_workers`
+    /// and `max_workers`. Apply the per-worker settings to `worker` first with
+    /// [`Worker::with_config`] or [`Worker::with_hammerwork_config`].
+    pub fn from_config(worker: Worker<DB>, config: &crate::config::WorkerConfig) -> Self {
+        let mut pool = Self::new()
+            .with_autoscaling(config.autoscale_config())
+            .with_worker_template(worker.clone());
+        for _ in 1..config.pool_size {
+            pool.add_worker(worker.clone());
+        }
+        pool.add_worker(worker);
+        pool
     }
 
     pub fn with_stats_collector(mut self, stats_collector: Arc<dyn StatisticsCollector>) -> Self {

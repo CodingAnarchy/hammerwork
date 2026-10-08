@@ -1,7 +1,7 @@
 mod test_utils;
 
 use hammerwork::{
-    Job, JobStatus, 
+    Job, JobStatus,
     batch::{BatchStatus, JobBatch, PartialFailureMode},
     queue::DatabaseQueue,
 };

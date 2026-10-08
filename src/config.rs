@@ -5,8 +5,12 @@
 //! and monitoring options.
 
 use crate::{
-    events::EventConfig, priority::PriorityWeights, rate_limit::ThrottleConfig,
+    archive::{ArchivalConfig, ArchivalPolicy},
+    events::EventConfig,
+    priority::PriorityWeights,
+    rate_limit::ThrottleConfig,
     retry::RetryStrategy,
+    worker::AutoscaleConfig,
 };
 
 #[cfg(feature = "webhooks")]
@@ -27,7 +31,7 @@ use crate::metrics::MetricsConfig;
 use crate::streaming::StreamConfig;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, time::Duration as StdDuration};
+use std::{collections::HashMap, time::Duration as StdDuration};
 
 /// Module for serializing std::time::Duration as human-readable strings
 mod duration_secs {
@@ -337,14 +341,27 @@ pub struct DatabaseConfig {
     /// Connection timeout in seconds
     pub connection_timeout_secs: u64,
 
-    /// Whether to run migrations automatically
+    /// Whether to run migrations automatically when connecting with
+    /// [`JobQueue::from_config`](crate::JobQueue)
     pub auto_migrate: bool,
 
-    /// Whether to create tables if they don't exist
+    /// Unused. Tables are created by the migration system; set `auto_migrate` instead.
+    #[deprecated(
+        since = "1.15.6",
+        note = "tables are created by the migration system; use `auto_migrate`"
+    )]
     pub create_tables: bool,
 }
 
+impl DatabaseConfig {
+    /// Connection acquire timeout as a [`std::time::Duration`]
+    pub fn connection_timeout(&self) -> StdDuration {
+        StdDuration::from_secs(self.connection_timeout_secs)
+    }
+}
+
 impl Default for DatabaseConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             url: "postgresql://localhost/hammerwork".to_string(),
@@ -402,6 +419,20 @@ impl Default for WorkerConfig {
             min_workers: 1,
             max_workers: 16,
         }
+    }
+}
+
+impl WorkerConfig {
+    /// Build the [`AutoscaleConfig`] described by this configuration.
+    ///
+    /// Returns a disabled autoscale configuration unless `autoscaling_enabled` is set.
+    pub fn autoscale_config(&self) -> AutoscaleConfig {
+        if !self.autoscaling_enabled {
+            return AutoscaleConfig::disabled();
+        }
+        AutoscaleConfig::default()
+            .with_min_workers(self.min_workers)
+            .with_max_workers(self.max_workers)
     }
 }
 
@@ -527,9 +558,6 @@ pub struct ArchiveConfig {
     /// Whether archiving is enabled
     pub enabled: bool,
 
-    /// Directory for storing archived jobs
-    pub archive_directory: PathBuf,
-
     /// Compression level (0-9, 0=no compression)
     pub compression_level: u32,
 
@@ -537,27 +565,46 @@ pub struct ArchiveConfig {
     #[serde(with = "chrono_duration_days")]
     pub archive_after: Duration,
 
-    /// Delete archived files older than this duration
+    /// Purge archived jobs older than this duration
     #[serde(with = "chrono_duration_days_option")]
     pub delete_after: Option<Duration>,
+}
 
-    /// Maximum archive file size in bytes
-    pub max_file_size_bytes: u64,
+impl ArchiveConfig {
+    /// Build the [`ArchivalPolicy`] described by this configuration.
+    ///
+    /// `archive_after` applies to completed, failed, dead and timed out jobs, and
+    /// `delete_after` becomes the purge delay for archived jobs. A `compression_level`
+    /// of 0 disables payload compression.
+    pub fn archival_policy(&self) -> ArchivalPolicy {
+        ArchivalPolicy {
+            archive_completed_after: Some(self.archive_after),
+            archive_failed_after: Some(self.archive_after),
+            archive_dead_after: Some(self.archive_after),
+            archive_timed_out_after: Some(self.archive_after),
+            purge_archived_after: self.delete_after,
+            compress_payloads: self.compression_level > 0,
+            enabled: self.enabled,
+            ..ArchivalPolicy::default()
+        }
+    }
 
-    /// Whether to include job payloads in archives
-    pub include_payloads: bool,
+    /// Build the [`ArchivalConfig`] described by this configuration.
+    pub fn archival_config(&self) -> ArchivalConfig {
+        ArchivalConfig {
+            compression_level: self.compression_level,
+            ..ArchivalConfig::default()
+        }
+    }
 }
 
 impl Default for ArchiveConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            archive_directory: PathBuf::from("./archives"),
             compression_level: 6,
             archive_after: Duration::days(30),
             delete_after: Some(Duration::days(365)),
-            max_file_size_bytes: 100 * 1024 * 1024, // 100MB
-            include_payloads: true,
         }
     }
 }
@@ -573,6 +620,23 @@ pub struct RateLimitingConfig {
 
     /// Per-queue throttle configurations
     pub queue_throttles: HashMap<String, ThrottleConfig>,
+}
+
+impl RateLimitingConfig {
+    /// The throttle that applies to `queue_name`.
+    ///
+    /// Returns the queue-specific throttle if one is configured, otherwise the default
+    /// throttle. Returns `None` when rate limiting or the selected throttle is disabled.
+    pub fn throttle_for(&self, queue_name: &str) -> Option<ThrottleConfig> {
+        if !self.enabled {
+            return None;
+        }
+        let throttle = self
+            .queue_throttles
+            .get(queue_name)
+            .unwrap_or(&self.default_throttle);
+        throttle.enabled.then(|| throttle.clone())
+    }
 }
 
 /// Logging and tracing configuration
@@ -908,12 +972,9 @@ update_interval = 15
 
 [archive]
 enabled = false
-archive_directory = "./archives"
 compression_level = 6
 archive_after = "30d"
 delete_after = "365d"
-max_file_size_bytes = 104857600
-include_payloads = true
 
 [rate_limiting]
 enabled = false
@@ -1000,5 +1061,100 @@ service_name = "hammerwork"
         let logging_config = LoggingConfig::default();
         assert_eq!(logging_config.level, "info");
         assert!(!logging_config.json_format);
+    }
+
+    #[test]
+    fn test_database_connection_timeout() {
+        let config = DatabaseConfig {
+            connection_timeout_secs: 45,
+            ..Default::default()
+        };
+        assert_eq!(config.connection_timeout(), StdDuration::from_secs(45));
+    }
+
+    #[test]
+    fn test_worker_autoscale_config() {
+        let disabled = WorkerConfig::default().autoscale_config();
+        assert!(!disabled.enabled);
+
+        let worker = WorkerConfig {
+            autoscaling_enabled: true,
+            min_workers: 3,
+            max_workers: 12,
+            ..Default::default()
+        };
+        let autoscale = worker.autoscale_config();
+        assert!(autoscale.enabled);
+        assert_eq!(autoscale.min_workers, 3);
+        assert_eq!(autoscale.max_workers, 12);
+    }
+
+    #[test]
+    fn test_rate_limiting_throttle_for() {
+        let mut config = RateLimitingConfig {
+            enabled: false,
+            default_throttle: ThrottleConfig::new().rate_per_minute(60),
+            queue_throttles: HashMap::new(),
+        };
+        config.queue_throttles.insert(
+            "email".to_string(),
+            ThrottleConfig::new().rate_per_minute(10),
+        );
+        config.queue_throttles.insert(
+            "reports".to_string(),
+            ThrottleConfig::new().rate_per_minute(5).enabled(false),
+        );
+
+        assert!(config.throttle_for("email").is_none());
+
+        config.enabled = true;
+        assert_eq!(
+            config.throttle_for("email").unwrap().rate_per_minute,
+            Some(10)
+        );
+        assert_eq!(
+            config.throttle_for("other").unwrap().rate_per_minute,
+            Some(60)
+        );
+        assert!(config.throttle_for("reports").is_none());
+    }
+
+    #[test]
+    fn test_archive_config_conversions() {
+        let config = ArchiveConfig {
+            enabled: true,
+            compression_level: 0,
+            archive_after: Duration::days(7),
+            delete_after: None,
+        };
+
+        let policy = config.archival_policy();
+        assert!(policy.enabled);
+        assert!(!policy.compress_payloads);
+        assert_eq!(policy.archive_completed_after, Some(Duration::days(7)));
+        assert_eq!(policy.archive_failed_after, Some(Duration::days(7)));
+        assert_eq!(policy.archive_dead_after, Some(Duration::days(7)));
+        assert_eq!(policy.archive_timed_out_after, Some(Duration::days(7)));
+        assert_eq!(policy.purge_archived_after, None);
+
+        let archival = ArchiveConfig::default().archival_config();
+        assert_eq!(archival.compression_level, 6);
+    }
+
+    #[test]
+    fn test_archive_config_ignores_removed_fields() {
+        let toml = r#"
+            enabled = true
+            compression_level = 3
+            archive_after = "10d"
+            delete_after = "100d"
+            archive_directory = "./archives"
+            max_file_size_bytes = 104857600
+            include_payloads = true
+        "#;
+        let config: ArchiveConfig = toml::from_str(toml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.compression_level, 3);
+        assert_eq!(config.archive_after, Duration::days(10));
     }
 }

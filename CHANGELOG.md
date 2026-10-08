@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **⚙️ `HammerworkConfig` is now consumed by the library** ([#3](https://github.com/CodingAnarchy/hammerwork/issues/3))
+  - `JobQueue::<Postgres|MySql>::from_config` builds the connection pool from `database` (URL, pool size, connection timeout), runs migrations when `auto_migrate` is set, and registers per-queue throttles from `rate_limiting`
+  - `Worker::with_config(&WorkerConfig)` applies poll interval, job timeout, priority weights and retry strategy
+  - `Worker::with_hammerwork_config(&HammerworkConfig)` also applies the matching rate-limit throttle and alerting config
+  - `WorkerPool::from_config` creates `pool_size` workers and configures autoscaling from `WorkerConfig`
+  - `WebhookManager::from_config` and `StreamManager::from_config` build managers from the `webhooks` and `streaming` sections
+  - `ArchiveConfig::archival_policy` / `archival_config`, `RateLimitingConfig::throttle_for`, `WorkerConfig::autoscale_config`, `DatabaseConfig::connection_timeout`
+
+### Changed
+- `DatabaseConfig::create_tables` is deprecated; tables are created by migrations (`auto_migrate`)
+
+### Removed
+- Unused `ArchiveConfig` fields `archive_directory`, `max_file_size_bytes` and `include_payloads`. Existing TOML files containing them still load.
+
 ### Fixed
+- `EventManager::new` panicked when `max_buffer_size` was 0 (as set by `HammerworkConfig::with_events_enabled(false)`). A zero buffer now disables event publishing.
 - **🔧 MySQL 8 migrations**
   - Migration statements now run over the text protocol, so the `PREPARE`/`EXECUTE` blocks in migration 010 no longer fail with error 1295
   - Replaced MariaDB-only `DROP INDEX IF EXISTS` (010) and `ADD COLUMN IF NOT EXISTS` (011) syntax with MySQL 8 compatible statements

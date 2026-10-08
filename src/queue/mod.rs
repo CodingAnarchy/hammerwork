@@ -6,6 +6,7 @@
 
 use crate::{
     Result,
+    config::RateLimitingConfig,
     job::{Job, JobId},
     rate_limit::ThrottleConfig,
     stats::{DeadJobSummary, QueueStats},
@@ -799,6 +800,106 @@ impl<DB: Database> JobQueue<DB> {
     /// ```
     pub fn get_pool(&self) -> &Pool<DB> {
         &self.pool
+    }
+
+    /// Register the throttles from a [`RateLimitingConfig`] on this queue.
+    ///
+    /// Does nothing when rate limiting is disabled. Only per-queue throttles are
+    /// registered; the default throttle is applied to workers through
+    /// [`RateLimitingConfig::throttle_for`].
+    pub async fn apply_rate_limiting_config(&self, config: &RateLimitingConfig) -> Result<()> {
+        if !config.enabled {
+            return Ok(());
+        }
+        for (queue_name, throttle) in &config.queue_throttles {
+            self.set_throttle(queue_name, throttle.clone()).await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use crate::config::HammerworkConfig;
+
+#[cfg(feature = "postgres")]
+impl JobQueue<sqlx::Postgres> {
+    /// Connect to PostgreSQL using a [`HammerworkConfig`].
+    ///
+    /// Uses `database.url`, `database.pool_size` and `database.connection_timeout_secs`
+    /// to build the pool, runs migrations when `database.auto_migrate` is set, and
+    /// registers the per-queue throttles from `rate_limiting`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{HammerworkConfig, JobQueue};
+    ///
+    /// # async fn example() -> hammerwork::Result<()> {
+    /// let config = HammerworkConfig::from_file("hammerwork.toml")?;
+    /// let queue = JobQueue::<sqlx::Postgres>::from_config(&config).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_config(config: &HammerworkConfig) -> Result<Self> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(config.database.pool_size)
+            .acquire_timeout(config.database.connection_timeout())
+            .connect(&config.database.url)
+            .await?;
+
+        if config.database.auto_migrate {
+            let runner = crate::migrations::postgres::PostgresMigrationRunner::new(pool.clone());
+            crate::migrations::MigrationManager::new(Box::new(runner))
+                .run_migrations()
+                .await?;
+        }
+
+        let queue = Self::new(pool);
+        queue
+            .apply_rate_limiting_config(&config.rate_limiting)
+            .await?;
+        Ok(queue)
+    }
+}
+
+#[cfg(feature = "mysql")]
+impl JobQueue<sqlx::MySql> {
+    /// Connect to MySQL using a [`HammerworkConfig`].
+    ///
+    /// Uses `database.url`, `database.pool_size` and `database.connection_timeout_secs`
+    /// to build the pool, runs migrations when `database.auto_migrate` is set, and
+    /// registers the per-queue throttles from `rate_limiting`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::{HammerworkConfig, JobQueue};
+    ///
+    /// # async fn example() -> hammerwork::Result<()> {
+    /// let config = HammerworkConfig::from_file("hammerwork.toml")?;
+    /// let queue = JobQueue::<sqlx::MySql>::from_config(&config).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_config(config: &HammerworkConfig) -> Result<Self> {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(config.database.pool_size)
+            .acquire_timeout(config.database.connection_timeout())
+            .connect(&config.database.url)
+            .await?;
+
+        if config.database.auto_migrate {
+            let runner = crate::migrations::mysql::MySqlMigrationRunner::new(pool.clone());
+            crate::migrations::MigrationManager::new(Box::new(runner))
+                .run_migrations()
+                .await?;
+        }
+
+        let queue = Self::new(pool);
+        queue
+            .apply_rate_limiting_config(&config.rate_limiting)
+            .await?;
+        Ok(queue)
     }
 }
 

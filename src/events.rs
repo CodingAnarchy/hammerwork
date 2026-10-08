@@ -495,8 +495,13 @@ impl Default for EventConfig {
 
 impl EventManager {
     /// Create a new event manager
+    ///
+    /// A `max_buffer_size` of 0 disables event publishing: [`publish_event`](Self::publish_event)
+    /// becomes a no-op.
     pub fn new(config: EventConfig) -> Self {
-        let (sender, _) = broadcast::channel(config.max_buffer_size);
+        // tokio's broadcast channel panics on a zero capacity, so keep a minimal buffer
+        // even when publishing is disabled.
+        let (sender, _) = broadcast::channel(config.max_buffer_size.max(1));
 
         Self {
             sender,
@@ -551,6 +556,10 @@ impl EventManager {
     /// - Payload serialization fails (when checking size limits)
     /// - Any other internal serialization errors occur
     pub async fn publish_event(&self, mut event: JobLifecycleEvent) -> crate::Result<()> {
+        if self.config.max_buffer_size == 0 {
+            return Ok(());
+        }
+
         // Apply payload filtering based on configuration
         if !self.config.include_payload_default {
             event.payload = None;
@@ -869,6 +878,21 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn test_zero_buffer_disables_publishing() {
+        let manager = EventManager::new(EventConfig {
+            max_buffer_size: 0,
+            ..Default::default()
+        });
+        let event = JobLifecycleEvent::completed(
+            Uuid::new_v4(),
+            "queue".to_string(),
+            JobPriority::Normal,
+            10,
+        );
+        manager.publish_event(event).await.unwrap();
+    }
 
     #[test]
     fn test_event_filter_creation() {

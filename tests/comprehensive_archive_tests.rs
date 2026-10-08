@@ -1,7 +1,11 @@
 mod test_utils;
 
 use chrono::Utc;
-use hammerwork::{Job, queue::DatabaseQueue, archive::{ArchivalReason, ArchiveEvent}};
+use hammerwork::{
+    Job,
+    archive::{ArchivalReason, ArchiveEvent},
+    queue::DatabaseQueue,
+};
 use serde_json::json;
 use uuid::Uuid;
 

@@ -779,6 +779,16 @@ pub struct StreamManagerConfig {
     pub global_flush_interval_secs: u64,
 }
 
+impl From<&crate::config::StreamingGlobalSettings> for StreamManagerConfig {
+    fn from(settings: &crate::config::StreamingGlobalSettings) -> Self {
+        Self {
+            max_concurrent_processors: settings.max_concurrent_processors,
+            log_operations: settings.log_operations,
+            global_flush_interval_secs: settings.global_flush_interval_secs,
+        }
+    }
+}
+
 impl Default for StreamManagerConfig {
     fn default() -> Self {
         Self {
@@ -942,6 +952,19 @@ impl StreamManager {
     /// ```
     pub fn new_default(event_manager: Arc<EventManager>) -> Self {
         Self::new(event_manager, StreamManagerConfig::default())
+    }
+
+    /// Create a stream manager from the `streaming` section of a
+    /// [`HammerworkConfig`](crate::HammerworkConfig), adding every configured stream.
+    pub async fn from_config(
+        event_manager: Arc<EventManager>,
+        config: &crate::config::StreamingConfigs,
+    ) -> crate::Result<Self> {
+        let manager = Self::new(event_manager, (&config.global_settings).into());
+        for stream in &config.streams {
+            manager.add_stream(stream.clone()).await?;
+        }
+        Ok(manager)
     }
 
     /// Add a new stream configuration.
@@ -2638,6 +2661,24 @@ impl StreamConfig {
 mod tests {
     use super::*;
     use crate::{events::JobLifecycleEventType, priority::JobPriority};
+
+    #[tokio::test]
+    async fn test_stream_manager_from_config() {
+        let mut config = crate::config::StreamingConfigs::default();
+        config.global_settings.max_concurrent_processors = 3;
+        config.global_settings.log_operations = false;
+        config.global_settings.global_flush_interval_secs = 2;
+
+        let manager_config = StreamManagerConfig::from(&config.global_settings);
+        assert_eq!(manager_config.max_concurrent_processors, 3);
+        assert!(!manager_config.log_operations);
+        assert_eq!(manager_config.global_flush_interval_secs, 2);
+
+        let manager = StreamManager::from_config(Arc::new(EventManager::new_default()), &config)
+            .await
+            .unwrap();
+        assert!(manager.list_streams().await.is_empty());
+    }
 
     #[test]
     fn test_stream_config_creation() {
