@@ -2566,6 +2566,7 @@ impl PubSubProcessor {
         // Validate the health check timeout up front rather than on the first check.
         parse_health_check_timeout_ms(&config)?;
 
+        crate::ensure_rustls_crypto_provider();
         let client = Client::new(client_config)
             .await
             .map_err(|e| HammerworkError::Streaming {

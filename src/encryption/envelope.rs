@@ -524,6 +524,45 @@ mod gcp {
             let config = ClientConfig::default().with_auth().await.map_err(|e| {
                 EncryptionError::KeyManagement(format!("Failed to configure GCP KMS client: {}", e))
             })?;
+            crate::ensure_rustls_crypto_provider();
+            let client = Client::new(config).await.map_err(|e| {
+                EncryptionError::KeyManagement(format!("Failed to create GCP KMS client: {}", e))
+            })?;
+            Ok(Self {
+                client,
+                resource: resource.to_string(),
+                location: location.to_string(),
+            })
+        }
+
+        /// A client for a local fake Cloud KMS at `endpoint`, without authentication.
+        #[cfg(test)]
+        pub(super) async fn for_endpoint(
+            resource: &str,
+            location: &str,
+            endpoint: &str,
+        ) -> Result<Self, EncryptionError> {
+            /// Hands out a fixed bearer token.
+            #[derive(Debug)]
+            struct StaticToken;
+            #[async_trait::async_trait]
+            impl token_source::TokenSource for StaticToken {
+                async fn token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                    Ok("Bearer test-token".to_string())
+                }
+            }
+            impl token_source::TokenSourceProvider for StaticToken {
+                fn token_source(&self) -> std::sync::Arc<dyn token_source::TokenSource> {
+                    std::sync::Arc::new(StaticToken)
+                }
+            }
+
+            let config = ClientConfig {
+                endpoint: endpoint.to_string(),
+                token_source_provider: Box::new(StaticToken),
+                ..ClientConfig::default()
+            };
+            crate::ensure_rustls_crypto_provider();
             let client = Client::new(config).await.map_err(|e| {
                 EncryptionError::KeyManagement(format!("Failed to create GCP KMS client: {}", e))
             })?;
@@ -1237,5 +1276,26 @@ mod tests {
             .unwrap();
         assert_eq!(kms.provider(), "aws");
         assert_eq!(kms.kms_key_id(), "alias/x");
+    }
+
+    /// Creating a Cloud KMS client used to panic: the Google Cloud clients need a
+    /// process-default rustls crypto provider, and with both of rustls' backends in the
+    /// dependency tree none could be chosen. A connection failure is now an error.
+    #[cfg(feature = "gcp-kms")]
+    #[tokio::test]
+    async fn test_gcp_kms_client_failure_is_an_error_not_a_panic() {
+        let result = gcp::GcpKms::for_endpoint(
+            "projects/p/locations/l/keyRings/r/cryptoKeys/k",
+            "projects/p/locations/l",
+            "http://127.0.0.1:1",
+        )
+        .await;
+        let err = result.err().expect("nothing listens on port 1");
+        assert!(matches!(err, EncryptionError::KeyManagement(_)), "{err}");
+        assert!(
+            err.to_string().contains("Failed to create GCP KMS client"),
+            "{err}"
+        );
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 }

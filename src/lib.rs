@@ -278,6 +278,20 @@ pub mod streaming;
 #[cfg(all(test, feature = "webhooks"))]
 mod integration_tests;
 
+/// Install rustls' aws-lc-rs crypto provider as the process default, unless one is
+/// already installed.
+///
+/// The Google Cloud clients build their TLS configuration from the process-default
+/// provider. Hammerwork's dependency tree enables both of rustls' crypto backends, so
+/// rustls cannot pick one itself and panics when such a client is created.
+#[cfg(any(feature = "gcp-kms", feature = "google-pubsub"))]
+pub(crate) fn ensure_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Fails only if another thread installed a provider meanwhile, which is fine.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 pub use archive::{
     ArchivalConfig, ArchivalPolicy, ArchivalReason, ArchivalStats, ArchiveEvent, ArchivedJob,
     JobArchiver,
