@@ -673,6 +673,295 @@ where
     assert_eq!(handled.load(Ordering::SeqCst), 0);
 }
 
+/// A local HTTP endpoint that records the JSON body of every request it receives.
+#[cfg(feature = "alerting")]
+async fn capture_server() -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/alerts", listener.local_addr().unwrap());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let body = loop {
+                    let Ok(read) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    if buffer.len() >= end + 4 + length {
+                        break buffer[end + 4..end + 4 + length].to_vec();
+                    }
+                };
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+                if let Ok(json) = serde_json::from_slice(&body) {
+                    let _ = tx.send(json);
+                }
+            });
+        }
+    });
+    (url, rx)
+}
+
+/// Wait for an alert of `alert_type` on `rx`.
+#[cfg(feature = "alerting")]
+async fn next_alert(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    alert_type: &str,
+) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let alert = rx.recv().await.expect("capture server stopped");
+            if alert["alert_type"] == alert_type {
+                return alert;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {alert_type} alert"))
+}
+
+/// A worker configured with alerting sends queue depth alerts (from its monitoring
+/// task) and worker starvation alerts (when it finds no work) to the webhook target.
+#[cfg(feature = "alerting")]
+async fn worker_sends_queue_depth_and_starvation_alerts<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    use hammerwork::alerting::AlertingConfig;
+
+    let (url, mut alerts) = capture_server().await;
+    let noop: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
+
+    // Queue depth: a paused queue with 3 jobs, threshold 2.
+    let deep = test_utils::unique_queue("cfg_alert_depth");
+    queue.pause_queue(&deep, None).await.unwrap();
+    let ids = enqueue_many(&queue, &deep, 3).await;
+    let mut config = HammerworkConfig::new();
+    config.alerting = AlertingConfig::new().alert_on_queue_depth(2).webhook(&url);
+    let worker = Worker::new(Arc::clone(&queue), deep.clone(), Arc::clone(&noop))
+        .with_poll_interval(Duration::from_millis(20))
+        .with_hammerwork_config(&config);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+    let alert = next_alert(&mut alerts, "QueueDepthExceeded").await;
+    assert_eq!(alert["queue_name"], deep.as_str());
+    assert_eq!(alert["current_value"], 3.0);
+    assert_eq!(alert["threshold"], 2.0);
+    shutdown_tx.send(()).await.unwrap();
+    task.await.unwrap().unwrap();
+    queue.resume_queue(&deep, None).await.unwrap();
+    delete_jobs(&queue, &ids).await;
+
+    // Starvation: an empty queue and a 50ms threshold.
+    let idle = test_utils::unique_queue("cfg_alert_starved");
+    let worker = Worker::new(Arc::clone(&queue), idle.clone(), noop)
+        .with_poll_interval(Duration::from_millis(20))
+        .with_alerting_config(
+            AlertingConfig::new()
+                .alert_on_worker_starvation(Duration::from_millis(50))
+                .webhook(&url),
+        );
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+    let alert = next_alert(&mut alerts, "WorkerStarvation").await;
+    assert_eq!(alert["queue_name"], idle.as_str());
+    shutdown_tx.send(()).await.unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// A worker with an alert manager and a statistics collector raises a high error rate
+/// alert once its failed jobs push the error rate over the threshold.
+#[cfg(feature = "alerting")]
+async fn worker_sends_error_rate_alerts<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    use hammerwork::{
+        alerting::{AlertManager, AlertingConfig},
+        stats::InMemoryStatsCollector,
+    };
+
+    let (url, mut alerts) = capture_server().await;
+    let queue_name = test_utils::unique_queue("cfg_alert_errors");
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(
+            queue
+                .enqueue(Job::new(queue_name.clone(), json!({})).with_max_attempts(1))
+                .await
+                .unwrap(),
+        );
+    }
+    let failing: JobHandler = Arc::new(|_job: Job| {
+        Box::pin(async {
+            Err(HammerworkError::Worker {
+                message: "always fails".to_string(),
+            })
+        })
+    });
+    let manager = Arc::new(AlertManager::new(
+        AlertingConfig::new()
+            .alert_on_high_error_rate(0.5)
+            .webhook(&url),
+    ));
+    let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), failing)
+        .with_poll_interval(Duration::from_millis(20))
+        .with_stats_collector(Arc::new(InMemoryStatsCollector::new_default()))
+        .with_alert_manager(manager);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+    let alert = next_alert(&mut alerts, "HighErrorRate").await;
+    assert_eq!(alert["queue_name"], queue_name.as_str());
+    assert!(alert["current_value"].as_f64().unwrap() > 0.5);
+    shutdown_tx.send(()).await.unwrap();
+    task.await.unwrap().unwrap();
+    delete_jobs(&queue, &ids).await;
+}
+
+/// A worker with a Prometheus collector records job outcomes and the queue depth.
+#[cfg(feature = "metrics")]
+async fn worker_records_prometheus_metrics<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    use hammerwork::metrics::{MetricsConfig, PrometheusMetricsCollector};
+
+    let queue_name = test_utils::unique_queue("cfg_metrics");
+    let ok = queue
+        .enqueue(Job::new(queue_name.clone(), json!({ "fail": false })))
+        .await
+        .unwrap();
+    let dead = queue
+        .enqueue(Job::new(queue_name.clone(), json!({ "fail": true })).with_max_attempts(1))
+        .await
+        .unwrap();
+    let handler: JobHandler = Arc::new(|job: Job| {
+        Box::pin(async move {
+            if job.payload["fail"] == true {
+                Err(HammerworkError::Worker {
+                    message: "connection refused".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        })
+    });
+    let collector = Arc::new(PrometheusMetricsCollector::new(MetricsConfig::new()).unwrap());
+    let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+        .with_poll_interval(Duration::from_millis(20))
+        .with_metrics_collector(Arc::clone(&collector));
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+    assert!(
+        wait_for_jobs(&queue, &[ok, dead], Duration::from_secs(10), |job| {
+            matches!(job.status, JobStatus::Completed | JobStatus::Dead)
+        })
+        .await
+    );
+    shutdown_tx.send(()).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    let text = collector.get_metrics_text().unwrap();
+    let line = |metric: &str, labels: &[&str]| {
+        text.lines()
+            .find(|line| {
+                line.starts_with(metric)
+                    && line.contains(&format!("queue=\"{queue_name}\""))
+                    && labels.iter().all(|label| line.contains(label))
+            })
+            .unwrap_or_else(|| panic!("no {metric} {labels:?} line in:\n{text}"))
+            .to_string()
+    };
+    assert!(line("hammerwork_jobs_total", &["status=\"completed\""]).ends_with(" 1"));
+    assert!(line("hammerwork_jobs_total", &["status=\"dead\""]).ends_with(" 1"));
+    assert!(
+        line(
+            "hammerwork_jobs_failed_total",
+            &["error_type=\"exhausted\""]
+        )
+        .ends_with(" 1")
+    );
+    line("hammerwork_job_duration_seconds_count", &[]);
+    line("hammerwork_queue_depth", &[]);
+    delete_jobs(&queue, &[ok, dead]).await;
+}
+
+/// A worker with an event manager publishes lifecycle events for its jobs.
+#[cfg(feature = "webhooks")]
+async fn worker_publishes_lifecycle_events<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    use hammerwork::events::{EventFilter, EventManager, JobLifecycleEventType};
+
+    let queue_name = test_utils::unique_queue("cfg_events");
+    let events = Arc::new(EventManager::new_default());
+    let mut subscription = events
+        .subscribe(EventFilter::new().with_queue_names(vec![queue_name.clone()]))
+        .await
+        .unwrap();
+    let id = queue
+        .enqueue(Job::new(queue_name.clone(), json!({})))
+        .await
+        .unwrap();
+    let noop: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
+    let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), noop)
+        .with_poll_interval(Duration::from_millis(20))
+        .with_event_manager(Arc::clone(&events));
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !seen.contains(&JobLifecycleEventType::Completed) {
+            let event = subscription.receiver.recv().await.unwrap();
+            if event.job_id == id {
+                assert_eq!(event.queue_name, queue_name);
+                assert_eq!(event.metadata["worker_queue"], queue_name);
+                seen.push(event.event_type);
+            }
+        }
+    })
+    .await
+    .expect("lifecycle events for the job");
+    assert_eq!(
+        seen,
+        vec![
+            JobLifecycleEventType::Started,
+            JobLifecycleEventType::Completed
+        ]
+    );
+    shutdown_tx.send(()).await.unwrap();
+    task.await.unwrap().unwrap();
+    delete_jobs(&queue, &[id]).await;
+}
+
 #[cfg(feature = "postgres")]
 mod postgres_tests {
     use super::*;
@@ -742,6 +1031,34 @@ mod postgres_tests {
     #[ignore] // Requires database connection
     async fn test_postgres_worker_backs_off_on_errors_and_stops_promptly() {
         worker_backs_off_on_errors_and_stops_promptly(broken_queue().await).await;
+    }
+
+    #[cfg(feature = "alerting")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_worker_sends_queue_depth_and_starvation_alerts() {
+        worker_sends_queue_depth_and_starvation_alerts(queue().await).await;
+    }
+
+    #[cfg(feature = "alerting")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_worker_sends_error_rate_alerts() {
+        worker_sends_error_rate_alerts(queue().await).await;
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_worker_records_prometheus_metrics() {
+        worker_records_prometheus_metrics(queue().await).await;
+    }
+
+    #[cfg(feature = "webhooks")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_worker_publishes_lifecycle_events() {
+        worker_publishes_lifecycle_events(queue().await).await;
     }
 }
 
@@ -814,5 +1131,33 @@ mod mysql_tests {
     #[ignore] // Requires database connection
     async fn test_mysql_worker_backs_off_on_errors_and_stops_promptly() {
         worker_backs_off_on_errors_and_stops_promptly(broken_queue().await).await;
+    }
+
+    #[cfg(feature = "alerting")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_worker_sends_queue_depth_and_starvation_alerts() {
+        worker_sends_queue_depth_and_starvation_alerts(queue().await).await;
+    }
+
+    #[cfg(feature = "alerting")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_worker_sends_error_rate_alerts() {
+        worker_sends_error_rate_alerts(queue().await).await;
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_worker_records_prometheus_metrics() {
+        worker_records_prometheus_metrics(queue().await).await;
+    }
+
+    #[cfg(feature = "webhooks")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_worker_publishes_lifecycle_events() {
+        worker_publishes_lifecycle_events(queue().await).await;
     }
 }

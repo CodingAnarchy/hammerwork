@@ -6,7 +6,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 /// Statistics for job processing over a time window
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatistics {
-    /// Total number of jobs processed in the time window
+    /// Number of job runs that finished in the time window: every recorded event
+    /// except `Started` (a run is counted by its outcome)
     pub total_processed: u64,
     /// Number of successfully completed jobs
     pub completed: u64,
@@ -26,7 +27,8 @@ pub struct JobStatistics {
     pub max_processing_time_ms: u64,
     /// Job throughput per minute
     pub throughput_per_minute: f64,
-    /// Error rate (failed + dead + timed out jobs / total processed)
+    /// Error rate: failed, dead, timed out and retried (failed but retried) runs over
+    /// `total_processed`
     pub error_rate: f64,
     /// Priority-based statistics breakdown
     pub priority_stats: Option<PriorityStats>,
@@ -226,7 +228,12 @@ impl InMemoryStatsCollector {
             };
         }
 
-        let total_processed = events.len() as u64;
+        // A run is counted once, when it finishes: `Started` marks the beginning of a
+        // run that is counted by its outcome event.
+        let total_processed = events
+            .iter()
+            .filter(|e| e.event_type != JobEventType::Started)
+            .count() as u64;
         let completed = events
             .iter()
             .filter(|e| e.event_type == JobEventType::Completed)
@@ -242,6 +249,10 @@ impl InMemoryStatsCollector {
         let timed_out = events
             .iter()
             .filter(|e| e.event_type == JobEventType::TimedOut)
+            .count() as u64;
+        let retried = events
+            .iter()
+            .filter(|e| e.event_type == JobEventType::Retried)
             .count() as u64;
         let running = events
             .iter()
@@ -263,7 +274,7 @@ impl InMemoryStatsCollector {
             };
 
         let error_rate = if total_processed > 0 {
-            (failed + dead + timed_out) as f64 / total_processed as f64
+            (failed + dead + timed_out + retried) as f64 / total_processed as f64
         } else {
             0.0
         };
@@ -564,8 +575,10 @@ mod tests {
             .get_queue_statistics("test_queue", Duration::from_secs(60))
             .await
             .unwrap();
-        assert_eq!(stats.total_processed, 2);
+        // One run: `Started` is not counted separately from its outcome.
+        assert_eq!(stats.total_processed, 1);
         assert_eq!(stats.completed, 1);
+        assert_eq!(stats.error_rate, 0.0);
         assert_eq!(stats.avg_processing_time_ms, 1000.0);
     }
 
@@ -671,7 +684,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stats.total_processed, 5);
+        assert_eq!(stats.total_processed, 4, "Started is not a finished run");
         assert_eq!(stats.completed, 2);
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.dead, 1);
@@ -679,7 +692,7 @@ mod tests {
         assert_eq!(stats.avg_processing_time_ms, 1000.0); // (1500 + 500) / 2
         assert_eq!(stats.min_processing_time_ms, 500);
         assert_eq!(stats.max_processing_time_ms, 1500);
-        assert_eq!(stats.error_rate, 0.4); // (1 failed + 1 dead + 0 timed out) / 5 total
+        assert_eq!(stats.error_rate, 0.5); // (1 failed + 1 dead) / 4 finished runs
     }
 
     #[tokio::test]
@@ -957,12 +970,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stats.total_processed, 4);
+        assert_eq!(stats.total_processed, 3, "Started is not a finished run");
         assert_eq!(stats.completed, 1);
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.timed_out, 1);
         assert_eq!(stats.running, 1);
-        assert_eq!(stats.error_rate, 0.5); // (1 failed + 1 timed out) / 4 total
+        assert_eq!(stats.error_rate, 2.0 / 3.0); // (1 failed + 1 timed out) / 3 runs
         assert_eq!(stats.avg_processing_time_ms, 3000.0); // (1000 + 5000) / 2
     }
 
@@ -983,5 +996,33 @@ mod tests {
 
         // Test all variants exist
         assert_eq!(event_types.len(), 6);
+    }
+
+    /// A queue where every run fails must report a 100% error rate (`Started` events
+    /// used to be counted as processed jobs, capping the error rate at 50%), and a run
+    /// that failed but is retried counts as an error.
+    #[tokio::test]
+    async fn test_error_rate_counts_runs_not_events() {
+        let collector = InMemoryStatsCollector::new_default();
+        for event_type in [
+            JobEventType::Started,
+            JobEventType::Dead,
+            JobEventType::Started,
+            JobEventType::Retried,
+        ] {
+            collector
+                .record_event(create_test_job_event(
+                    "failing", event_type, None, None, None,
+                ))
+                .await
+                .unwrap();
+        }
+        let stats = collector
+            .get_queue_statistics("failing", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(stats.total_processed, 2);
+        assert_eq!(stats.error_rate, 1.0);
+        assert_eq!(stats.throughput_per_minute, 2.0);
     }
 }
