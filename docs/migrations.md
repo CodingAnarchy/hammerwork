@@ -26,6 +26,11 @@ Migrations are organized chronologically and represent the evolution of Hammerwo
 8. **008_add_result_config** - Add result configuration storage fields
 9. **009_add_tracing** - Add distributed tracing and correlation fields
 10. **010_add_archival** - Add job archival support and archive table
+11. **011_add_encryption** - Add encryption fields and key storage
+12. **012_optimize_dependencies** - Optimize dependency lookups
+13. **013_add_key_audit** - Add encryption key audit table
+14. **014_add_queue_pause** - Add queue pause state table
+15. **015_add_job_leases** - Add `last_heartbeat_at` and `lease_expires_at` for job leases and stale job recovery
 
 ## Running Migrations
 

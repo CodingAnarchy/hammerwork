@@ -258,6 +258,8 @@ struct TestStorage {
     job_results: HashMap<JobId, (serde_json::Value, Option<DateTime<Utc>>)>,
     /// Paused queues information
     paused_queues: HashMap<String, QueuePauseInfo>,
+    /// Job leases: job_id -> (last heartbeat, lease expiry)
+    leases: HashMap<JobId, (DateTime<Utc>, DateTime<Utc>)>,
     /// Mock clock for time control
     clock: MockClock,
 }
@@ -275,6 +277,7 @@ impl TestStorage {
             throttle_configs: HashMap::new(),
             job_results: HashMap::new(),
             paused_queues: HashMap::new(),
+            leases: HashMap::new(),
             clock,
         }
     }
@@ -2459,6 +2462,68 @@ impl DatabaseQueue for TestQueue {
         let storage = self.storage.read().await;
         Ok(storage.paused_queues.values().cloned().collect())
     }
+
+    async fn heartbeat_job(&self, job_id: JobId, lease: std::time::Duration) -> Result<bool> {
+        let mut storage = self.storage.write().await;
+        let running = storage
+            .jobs
+            .get(&job_id)
+            .is_some_and(|job| job.status == JobStatus::Running);
+        if !running {
+            return Ok(false);
+        }
+        let now = storage.clock.now();
+        storage
+            .leases
+            .insert(job_id, (now, super::saturating_add_to(now, lease)));
+        Ok(true)
+    }
+
+    async fn requeue_stale_jobs(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<super::StaleJobRecovery> {
+        let mut storage = self.storage.write().await;
+        let now = storage.clock.now();
+        let cutoff = super::saturating_sub_from(now, older_than);
+
+        let stale: Vec<(JobId, bool)> = storage
+            .jobs
+            .values()
+            .filter(|job| job.status == JobStatus::Running)
+            .filter_map(|job| {
+                let started_at = job.started_at?;
+                let is_stale = match storage.leases.get(&job.id) {
+                    Some((heartbeat, expires)) if *heartbeat >= started_at => *expires < now,
+                    _ => started_at < cutoff,
+                };
+                is_stale.then_some((job.id, job.attempts >= job.max_attempts))
+            })
+            .collect();
+
+        let mut recovery = super::StaleJobRecovery::default();
+        for (job_id, exhausted) in stale {
+            storage.leases.remove(&job_id);
+            if exhausted {
+                storage.update_job_status(job_id, JobStatus::Dead)?;
+                if let Some(job) = storage.jobs.get_mut(&job_id) {
+                    job.failed_at = Some(now);
+                    job.error_message = Some(super::STALE_JOB_ERROR_MESSAGE.to_string());
+                }
+                recovery.dead.push(job_id);
+            } else {
+                storage.update_job_status(job_id, JobStatus::Pending)?;
+                if let Some(job) = storage.jobs.get_mut(&job_id) {
+                    job.scheduled_at = now;
+                    job.started_at = None;
+                    job.error_message = Some(super::STALE_JOB_ERROR_MESSAGE.to_string());
+                }
+                recovery.requeued.push(job_id);
+            }
+        }
+
+        Ok(recovery)
+    }
 }
 
 #[cfg(test)]
@@ -2789,5 +2854,73 @@ mod tests {
         assert_eq!(stats.statistics.completed, 2);
         assert_eq!(stats.statistics.dead, 1); // One job marked as dead
         assert_eq!(stats.statistics.total_processed, 3); // 2 completed + 1 dead
+    }
+
+    #[tokio::test]
+    async fn test_requeue_stale_jobs_uses_leases_and_fallback() {
+        let queue = TestQueue::new();
+        let clock = queue.clock();
+
+        let leased = queue
+            .enqueue(Job::new("stale".to_string(), json!({"n": 1})))
+            .await
+            .unwrap();
+        let unleased = queue
+            .enqueue(Job::new("stale".to_string(), json!({"n": 2})))
+            .await
+            .unwrap();
+        let exhausted = queue
+            .enqueue(Job::new("stale".to_string(), json!({"n": 3})).with_max_attempts(0))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            queue.dequeue("stale").await.unwrap().unwrap();
+        }
+        assert!(
+            queue
+                .heartbeat_job(leased, std::time::Duration::from_secs(30))
+                .await
+                .unwrap()
+        );
+
+        // Nothing is stale yet.
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert!(recovery.is_empty());
+
+        // After 60s the lease has expired but the 600s fallback has not.
+        clock.advance(chrono::Duration::seconds(60));
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert_eq!(recovery.requeued, vec![leased]);
+        assert!(recovery.dead.is_empty());
+
+        // After the fallback window the un-leased jobs are reclaimed too.
+        clock.advance(chrono::Duration::seconds(600));
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert_eq!(recovery.requeued, vec![unleased]);
+        assert_eq!(recovery.dead, vec![exhausted]);
+
+        let job = queue.get_job(leased).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(
+            queue.get_job(exhausted).await.unwrap().unwrap().status,
+            JobStatus::Dead
+        );
+
+        // A heartbeat for a job that is no longer Running reports a lost lease.
+        assert!(
+            !queue
+                .heartbeat_job(exhausted, std::time::Duration::from_secs(30))
+                .await
+                .unwrap()
+        );
     }
 }

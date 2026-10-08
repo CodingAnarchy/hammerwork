@@ -2451,6 +2451,112 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         Ok(paused_queues)
     }
+
+    async fn heartbeat_job(&self, job_id: JobId, lease: std::time::Duration) -> Result<bool> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE hammerwork_jobs SET last_heartbeat_at = ?, lease_expires_at = ? \
+             WHERE id = ? AND status = ?",
+        )
+        .bind(now)
+        .bind(super::saturating_add_to(now, lease))
+        .bind(job_id.to_string())
+        .bind(JobStatus::Running)
+        .execute(&self.pool)
+        .await?;
+
+        // MySQL reports "rows changed", not "rows matched"; the timestamps always change
+        // (microsecond precision), so 0 means the job is no longer Running.
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn requeue_stale_jobs(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<super::StaleJobRecovery> {
+        let now = Utc::now();
+        let cutoff = super::saturating_sub_from(now, older_than);
+        let mut tx = self.pool.begin().await?;
+
+        // Claim stale rows with SKIP LOCKED so concurrent reapers never wait on (or
+        // double-process) the same row. Each UPDATE re-checks `status` as well.
+        let candidates = sqlx::query(
+            r#"
+            SELECT id, attempts, max_attempts FROM hammerwork_jobs
+            WHERE status = ?
+              AND (
+                (last_heartbeat_at IS NOT NULL
+                    AND last_heartbeat_at >= started_at
+                    AND lease_expires_at < ?)
+                OR ((last_heartbeat_at IS NULL OR last_heartbeat_at < started_at)
+                    AND started_at < ?)
+              )
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(JobStatus::Running)
+        .bind(now)
+        .bind(cutoff)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut recovery = super::StaleJobRecovery::default();
+        for row in candidates {
+            let id_str: String = row.get("id");
+            let id = uuid::Uuid::parse_str(&id_str)?;
+            let attempts: i32 = row.get("attempts");
+            let max_attempts: i32 = row.get("max_attempts");
+
+            let exhausted = attempts >= max_attempts;
+            let result = if exhausted {
+                sqlx::query(
+                    "UPDATE hammerwork_jobs SET status = ?, failed_at = ?, error_message = ?, \
+                     last_heartbeat_at = NULL, lease_expires_at = NULL \
+                     WHERE id = ? AND status = ?",
+                )
+                .bind(JobStatus::Dead)
+                .bind(now)
+                .bind(super::STALE_JOB_ERROR_MESSAGE)
+                .bind(&id_str)
+                .bind(JobStatus::Running)
+                .execute(&mut *tx)
+                .await?
+            } else {
+                sqlx::query(
+                    "UPDATE hammerwork_jobs SET status = ?, scheduled_at = ?, started_at = NULL, \
+                     error_message = ?, last_heartbeat_at = NULL, lease_expires_at = NULL \
+                     WHERE id = ? AND status = ?",
+                )
+                .bind(JobStatus::Pending)
+                .bind(now)
+                .bind(super::STALE_JOB_ERROR_MESSAGE)
+                .bind(&id_str)
+                .bind(JobStatus::Running)
+                .execute(&mut *tx)
+                .await?
+            };
+
+            if result.rows_affected() == 1 {
+                if exhausted {
+                    recovery.dead.push(id);
+                } else {
+                    recovery.requeued.push(id);
+                }
+            }
+        }
+
+        tx.commit().await?;
+
+        if !recovery.is_empty() {
+            tracing::warn!(
+                requeued = recovery.requeued.len(),
+                dead = recovery.dead.len(),
+                "Reclaimed stale Running jobs whose lease expired"
+            );
+        }
+
+        Ok(recovery)
+    }
 }
 
 // Helper method for enqueueing with an existing transaction

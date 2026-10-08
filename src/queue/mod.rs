@@ -622,6 +622,122 @@ pub trait DatabaseQueue: Send + Sync {
     /// # }
     /// ```
     async fn get_paused_queues(&self) -> Result<Vec<QueuePauseInfo>>;
+
+    // Lease / stale job recovery
+
+    /// Record a heartbeat for a `Running` job and extend its lease to `now + lease`.
+    ///
+    /// Workers call this periodically while a handler runs. The lease tells
+    /// [`requeue_stale_jobs`](Self::requeue_stale_jobs) that the job is still owned by a
+    /// live worker.
+    ///
+    /// Returns `false` when the job is no longer `Running` (for example because a reaper
+    /// already reclaimed it), which means the caller has lost its lease.
+    ///
+    /// The default implementation returns an error, for backends that predate leases.
+    async fn heartbeat_job(&self, job_id: JobId, lease: std::time::Duration) -> Result<bool> {
+        let _ = (job_id, lease);
+        Err(crate::HammerworkError::Queue {
+            message: "job leases are not supported by this queue backend".to_string(),
+        })
+    }
+
+    /// Reclaim jobs left in `Running` by workers that crashed or were killed.
+    ///
+    /// A `Running` job is stale when:
+    /// - it has a lease from its current run (a heartbeat recorded after `started_at`)
+    ///   and that lease has expired, or
+    /// - it has no lease from its current run (it has not heartbeated yet, or was
+    ///   started by a worker that predates leases) and it started more than
+    ///   `older_than` ago.
+    ///
+    /// Stale jobs whose `attempts` have reached `max_attempts` are moved to `Dead`;
+    /// the others go back to `Pending` and are scheduled immediately. The interrupted
+    /// run already counted as an attempt when the job was dequeued.
+    ///
+    /// Safe to call from several processes at once: rows are claimed with row locks
+    /// (`FOR UPDATE SKIP LOCKED`) and only updated while still `Running`, so each stale
+    /// job is reclaimed exactly once.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::DatabaseQueue;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// let recovery = queue.requeue_stale_jobs(Duration::from_secs(300)).await?;
+    /// println!(
+    ///     "requeued {} jobs, marked {} dead",
+    ///     recovery.requeued.len(),
+    ///     recovery.dead.len()
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The default implementation returns an error, for backends that predate leases.
+    async fn requeue_stale_jobs(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<StaleJobRecovery> {
+        let _ = older_than;
+        Err(crate::HammerworkError::Queue {
+            message: "stale job recovery is not supported by this queue backend".to_string(),
+        })
+    }
+}
+
+/// The outcome of [`DatabaseQueue::requeue_stale_jobs`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleJobRecovery {
+    /// Stale jobs moved back to `Pending` to be retried.
+    pub requeued: Vec<JobId>,
+    /// Stale jobs that had no attempts left and were moved to `Dead`.
+    pub dead: Vec<JobId>,
+}
+
+impl StaleJobRecovery {
+    /// Total number of jobs reclaimed.
+    pub fn total(&self) -> usize {
+        self.requeued.len() + self.dead.len()
+    }
+
+    /// Whether no stale jobs were found.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// Error message recorded on a job reclaimed by [`DatabaseQueue::requeue_stale_jobs`].
+pub const STALE_JOB_ERROR_MESSAGE: &str =
+    "Job lease expired while Running; the worker is presumed dead and the job was reclaimed";
+
+/// Convert a `std::time::Duration` to a `chrono::Duration`, saturating on overflow.
+pub(crate) fn saturating_chrono_duration(duration: std::time::Duration) -> chrono::Duration {
+    chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
+}
+
+/// `now - duration`, saturating at the minimum representable timestamp.
+#[cfg_attr(
+    not(any(feature = "postgres", feature = "mysql", feature = "test")),
+    allow(dead_code)
+)]
+pub(crate) fn saturating_sub_from(
+    now: DateTime<Utc>,
+    duration: std::time::Duration,
+) -> DateTime<Utc> {
+    now.checked_sub_signed(saturating_chrono_duration(duration))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
+/// `now + duration`, saturating at the maximum representable timestamp.
+pub(crate) fn saturating_add_to(
+    now: DateTime<Utc>,
+    duration: std::time::Duration,
+) -> DateTime<Utc> {
+    now.checked_add_signed(saturating_chrono_duration(duration))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 /// A generic job queue implementation that works with multiple database backends.

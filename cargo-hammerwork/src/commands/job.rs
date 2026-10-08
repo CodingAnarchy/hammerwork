@@ -94,6 +94,26 @@ pub enum JobCommand {
         #[arg(long, help = "Confirm the purge operation")]
         confirm: bool,
     },
+    #[command(
+        about = "Reclaim jobs stuck in Running after a worker crashed",
+        long_about = "Reclaim jobs left in Running by workers that crashed or were killed.\n\n\
+            A Running job is stale when its lease (renewed by worker heartbeats) has \
+            expired, or, if it never recorded a lease, when it started more than \
+            --older-than-secs ago. Stale jobs with attempts left go back to Pending; \
+            the rest are marked Dead. Safe to run while workers and other reapers are \
+            running. Requires migration 015_add_job_leases.\n\n\
+            Example: cargo hammerwork job requeue-stale --older-than-secs 3600"
+    )]
+    RequeueStale {
+        #[arg(short = 'u', long, help = "Database connection URL")]
+        database_url: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 3600,
+            help = "For jobs without a lease: reclaim if started more than N seconds ago"
+        )]
+        older_than_secs: u64,
+    },
 }
 
 impl JobCommand {
@@ -180,6 +200,11 @@ impl JobCommand {
                 )
                 .await?;
             }
+            JobCommand::RequeueStale {
+                older_than_secs, ..
+            } => {
+                requeue_stale_jobs(pool, *older_than_secs).await?;
+            }
         }
         Ok(())
     }
@@ -192,6 +217,7 @@ impl JobCommand {
             JobCommand::Retry { database_url, .. } => database_url,
             JobCommand::Cancel { database_url, .. } => database_url,
             JobCommand::Purge { database_url, .. } => database_url,
+            JobCommand::RequeueStale { database_url, .. } => database_url,
         };
 
         url_option
@@ -572,6 +598,32 @@ async fn enqueue_job(
     Ok(())
 }
 
+async fn requeue_stale_jobs(pool: DatabasePool, older_than_secs: u64) -> Result<()> {
+    let older_than = std::time::Duration::from_secs(older_than_secs);
+    let recovery = match pool.create_job_queue() {
+        crate::utils::database::JobQueueWrapper::Postgres(queue) => {
+            queue.requeue_stale_jobs(older_than).await?
+        }
+        crate::utils::database::JobQueueWrapper::MySQL(queue) => {
+            queue.requeue_stale_jobs(older_than).await?
+        }
+    };
+
+    for id in &recovery.requeued {
+        info!("↩️  Requeued stale job {}", id);
+    }
+    for id in &recovery.dead {
+        info!("💀 Marked stale job {} dead (no attempts left)", id);
+    }
+    info!(
+        "✅ Reclaimed {} stale jobs ({} requeued, {} dead)",
+        recovery.total(),
+        recovery.requeued.len(),
+        recovery.dead.len()
+    );
+    Ok(())
+}
+
 async fn retry_jobs(
     pool: DatabasePool,
     job_id: Option<String>,
@@ -786,6 +838,52 @@ async fn purge_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: JobCommand,
+    }
+
+    #[test]
+    fn test_requeue_stale_parses_with_default_threshold() {
+        let cli = TestCli::try_parse_from(["test", "requeue-stale"]).unwrap();
+        match cli.command {
+            JobCommand::RequeueStale {
+                database_url,
+                older_than_secs,
+            } => {
+                assert!(database_url.is_none());
+                assert_eq!(older_than_secs, 3600);
+            }
+            _ => panic!("expected RequeueStale"),
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "requeue-stale",
+            "--older-than-secs",
+            "120",
+            "-u",
+            "postgres://localhost/db",
+        ])
+        .unwrap();
+        match cli.command {
+            JobCommand::RequeueStale {
+                database_url,
+                older_than_secs,
+            } => {
+                assert_eq!(database_url.as_deref(), Some("postgres://localhost/db"));
+                assert_eq!(older_than_secs, 120);
+            }
+            _ => panic!("expected RequeueStale"),
+        }
+
+        assert!(
+            TestCli::try_parse_from(["test", "requeue-stale", "--older-than-secs", "-5"]).is_err()
+        );
+    }
 
     #[test]
     fn test_list_jobs_query_postgres_binds_typed_params() {
