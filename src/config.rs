@@ -890,6 +890,11 @@ impl PayloadEncryptionConfig {
     /// A disabled section is only checked for settings that need it enabled.
     pub fn validate(&self) -> crate::Result<()> {
         let error = |message: &str| Err(crate::HammerworkError::Config(message.to_string()));
+        // The purge also runs with encryption disabled (jobs encrypted earlier still
+        // expire), and a zero interval would run it in a tight loop.
+        if self.purge_interval_secs == Some(0) {
+            return error("encryption.purge_interval_secs must be greater than zero");
+        }
         if !self.enabled {
             if !self.encrypted_queues.is_empty() {
                 return error(
@@ -908,9 +913,6 @@ impl PayloadEncryptionConfig {
         }
         if self.decryption_keys.keys().any(String::is_empty) {
             return error("encryption.decryption_keys has an empty key id");
-        }
-        if self.purge_interval_secs == Some(0) {
-            return error("encryption.purge_interval_secs must be greater than zero");
         }
         if self.encrypted_queues.iter().any(String::is_empty) {
             return error("encryption.encrypted_queues has an empty queue name");
