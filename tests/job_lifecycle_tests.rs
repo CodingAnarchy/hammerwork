@@ -659,6 +659,62 @@ where
     }
 }
 
+/// Many workers completing jobs at once must neither block each other for long nor
+/// leave locks or open transactions behind: afterwards a new job is immediately
+/// dequeueable and every job can be deleted.
+async fn concurrent_completions_do_not_block<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+    for _ in 0..5 {
+        let queue_name = test_utils::unique_queue("concurrent_complete");
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            ids.push(
+                queue
+                    .enqueue(Job::new(queue_name.clone(), json!({ "i": i })))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                let queue_name = queue_name.clone();
+                tokio::spawn(async move {
+                    while let Some(job) = queue.dequeue(&queue_name).await.unwrap() {
+                        queue.complete_job(job.id).await.unwrap();
+                    }
+                })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        })
+        .await
+        .expect("concurrent completions must not hang");
+
+        let probe = queue
+            .enqueue(Job::new(queue_name.clone(), json!({ "probe": true })))
+            .await
+            .unwrap();
+        let dequeued = queue.dequeue(&queue_name).await.unwrap();
+        assert_eq!(dequeued.map(|job| job.id), Some(probe));
+        ids.push(probe);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for id in ids {
+                queue.delete_job(id).await.unwrap();
+            }
+        })
+        .await
+        .expect("no locks may be left behind");
+    }
+}
+
 /// H6: a FailFast batch stops running its jobs after the first terminal failure, and
 /// the batch row records the outcome.
 async fn batch_failure_modes_are_enforced<DB>(queue: Arc<JobQueue<DB>>)
@@ -885,6 +941,12 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore] // Requires database connection
+    async fn test_postgres_concurrent_completions_do_not_block() {
+        concurrent_completions_do_not_block(test_utils::setup_postgres_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_postgres_batch_failure_modes_are_enforced() {
         batch_failure_modes_are_enforced(test_utils::setup_postgres_queue().await).await;
     }
@@ -955,6 +1017,12 @@ mod mysql_tests {
     #[ignore] // Requires database connection
     async fn test_mysql_concurrent_parent_completions_release_child() {
         concurrent_parent_completions_release_child(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_concurrent_completions_do_not_block() {
+        concurrent_completions_do_not_block(test_utils::setup_mysql_queue().await).await;
     }
 
     #[tokio::test]
