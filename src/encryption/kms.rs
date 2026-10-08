@@ -62,69 +62,6 @@ pub(crate) fn aws_key_config(
     Ok((key_id, region, endpoint))
 }
 
-/// Ask AWS KMS for a new data key (`GenerateDataKey`) of `size` bytes (16 or 32).
-#[cfg(feature = "aws-kms")]
-pub(crate) async fn aws_generate_data_key(
-    key_id: &str,
-    region: &str,
-    endpoint: Option<&str>,
-    size: usize,
-) -> Result<Vec<u8>, EncryptionError> {
-    use aws_config::Region;
-    use aws_sdk_kms::{Client, error::DisplayErrorContext, types::DataKeySpec};
-
-    let key_spec = match size {
-        32 => DataKeySpec::Aes256,
-        16 => DataKeySpec::Aes128,
-        _ => {
-            return Err(EncryptionError::KeyManagement(format!(
-                "Unsupported key size for AWS KMS: {} bytes",
-                size
-            )));
-        }
-    };
-
-    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(Region::new(region.to_string()));
-    if let Some(endpoint) = endpoint {
-        loader = loader.endpoint_url(endpoint);
-    }
-    let config = loader.load().await;
-    let client = Client::new(&config);
-
-    let response = client
-        .generate_data_key()
-        .key_id(key_id)
-        .key_spec(key_spec)
-        .send()
-        .await
-        .map_err(|e| {
-            EncryptionError::KeyManagement(format!(
-                "Failed to load key {} from AWS KMS: {}",
-                key_id,
-                DisplayErrorContext(&e)
-            ))
-        })?;
-
-    let key_material = response
-        .plaintext
-        .ok_or_else(|| {
-            EncryptionError::KeyManagement(
-                "AWS KMS GenerateDataKey response has no plaintext key".to_string(),
-            )
-        })?
-        .into_inner();
-
-    if key_material.len() != size {
-        return Err(EncryptionError::KeyManagement(format!(
-            "AWS KMS returned key with incorrect length: expected {}, got {}",
-            size,
-            key_material.len()
-        )));
-    }
-    Ok(key_material)
-}
-
 /// Vault address from the `addr` parameter, falling back to `VAULT_ADDR`.
 pub(crate) fn vault_address(params: &HashMap<&str, &str>) -> Result<String, EncryptionError> {
     params
@@ -216,52 +153,6 @@ pub(crate) fn gcp_location(key_resource: &str) -> Result<String, EncryptionError
             key_resource
         ))),
     }
-}
-
-/// Ask GCP KMS for `size` random bytes (`GenerateRandomBytes`) in `location`.
-#[cfg(feature = "gcp-kms")]
-pub(crate) async fn gcp_generate_random_bytes(
-    location: String,
-    size: usize,
-) -> Result<Vec<u8>, EncryptionError> {
-    use google_cloud_kms::client::{Client, ClientConfig};
-    use google_cloud_kms::grpc::kms::v1::GenerateRandomBytesRequest;
-
-    let client_config = ClientConfig::default().with_auth().await.map_err(|e| {
-        EncryptionError::KeyManagement(format!("Failed to configure GCP KMS client: {}", e))
-    })?;
-    let client = Client::new(client_config).await.map_err(|e| {
-        EncryptionError::KeyManagement(format!("Failed to create GCP KMS client: {}", e))
-    })?;
-
-    let length_bytes = i32::try_from(size).map_err(|_| {
-        EncryptionError::KeyManagement(format!("Unsupported key size for GCP KMS: {}", size))
-    })?;
-    let req = GenerateRandomBytesRequest {
-        location,
-        length_bytes,
-        protection_level: 1, // SOFTWARE
-    };
-
-    let data = client
-        .generate_random_bytes(req, None)
-        .await
-        .map_err(|e| {
-            EncryptionError::KeyManagement(format!(
-                "Failed to generate random bytes from GCP KMS: {}",
-                e
-            ))
-        })?
-        .data;
-
-    if data.len() != size {
-        return Err(EncryptionError::KeyManagement(format!(
-            "GCP KMS returned key with incorrect length: expected {}, got {}",
-            size,
-            data.len()
-        )));
-    }
-    Ok(data)
 }
 
 /// Parse `azure://<vault-host>/keys/<key-name>` into the vault URL and key name.

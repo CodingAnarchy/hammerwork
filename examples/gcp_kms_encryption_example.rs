@@ -76,8 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             Err(e) => {
-                println!("   ⚠️  GCP KMS not available (key loading failed): {}", e);
-                println!("   This is normal in development without proper GCP credentials");
+                println!("   ⚠️  GCP KMS engine not created: {}", e);
+                println!(
+                    "   gcp:// keys are generated once by the KMS and stored KMS-encrypted in \
+                     the database, so production code creates the engine with \
+                     EncryptionEngine::new_with_pool(config, &pool)"
+                );
             }
         }
     } else {
@@ -203,6 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("      - cloudkms.cryptoKeys.encrypt");
     println!("      - cloudkms.cryptoKeys.decrypt");
     println!("      - cloudkms.cryptoKeys.get");
+    println!("      - cloudkms.locations.generateRandomBytes");
     println!("      - cloudkms.cryptoKeys.list");
     println!();
     println!("   4. Set environment variables (optional):");

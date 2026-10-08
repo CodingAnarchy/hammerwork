@@ -57,6 +57,7 @@
 #[cfg(feature = "azure-kv")]
 mod azure;
 pub mod engine;
+mod envelope;
 pub mod key_manager;
 mod kms;
 
