@@ -14,18 +14,16 @@ mod postgres_tests {
     #[ignore] // Requires database connection
     async fn test_postgres_full_workflow() {
         let queue = test_utils::setup_postgres_queue().await;
+        let queue_name = test_utils::unique_queue("test_queue");
 
         // Create and enqueue a job
-        let job = Job::new(
-            "test_queue".to_string(),
-            json!({"message": "Hello, World!"}),
-        );
+        let job = Job::new(queue_name.clone(), json!({"message": "Hello, World!"}));
         let job_id = job.id;
 
         queue.enqueue(job).await.unwrap();
 
         // Dequeue the job
-        let dequeued_job = queue.dequeue("test_queue").await.unwrap();
+        let dequeued_job = queue.dequeue(&queue_name).await.unwrap();
         assert!(dequeued_job.is_some());
         let dequeued_job = dequeued_job.unwrap();
         assert_eq!(dequeued_job.id, job_id);
@@ -48,15 +46,16 @@ mod postgres_tests {
     #[ignore] // Requires database connection
     async fn test_postgres_retry_workflow() {
         let queue = test_utils::setup_postgres_queue().await;
+        let queue_name = test_utils::unique_queue("retry_queue");
 
         // Create and enqueue a job
-        let job = Job::new("retry_queue".to_string(), json!({"will_fail": true}));
+        let job = Job::new(queue_name.clone(), json!({"will_fail": true}));
         let job_id = job.id;
 
         queue.enqueue(job).await.unwrap();
 
         // Dequeue and fail the job
-        let dequeued_job = queue.dequeue("retry_queue").await.unwrap().unwrap();
+        let dequeued_job = queue.dequeue(&queue_name).await.unwrap().unwrap();
         queue
             .fail_job(dequeued_job.id, "Intentional failure")
             .await
@@ -78,21 +77,22 @@ mod postgres_tests {
     #[ignore] // Requires database connection
     async fn test_postgres_delayed_job() {
         let queue = test_utils::setup_postgres_queue().await;
+        let queue_name = test_utils::unique_queue("delayed_queue");
 
         // Create a delayed job (1 second in the future)
         let delay = chrono::Duration::seconds(1);
-        let job = Job::with_delay("delayed_queue".to_string(), json!({"delayed": true}), delay);
+        let job = Job::with_delay(queue_name.clone(), json!({"delayed": true}), delay);
         let job_id = job.id;
 
         queue.enqueue(job).await.unwrap();
 
         // Try to dequeue immediately - should get nothing
-        let immediate_dequeue = queue.dequeue("delayed_queue").await.unwrap();
+        let immediate_dequeue = queue.dequeue(&queue_name).await.unwrap();
         assert!(immediate_dequeue.is_none());
 
         // Wait for the delay and try again
         sleep(Duration::from_secs(2)).await;
-        let delayed_dequeue = queue.dequeue("delayed_queue").await.unwrap();
+        let delayed_dequeue = queue.dequeue(&queue_name).await.unwrap();
         assert!(delayed_dequeue.is_some());
 
         let dequeued_job = delayed_dequeue.unwrap();
@@ -115,18 +115,16 @@ mod mysql_tests {
     #[ignore] // Requires database connection
     async fn test_mysql_full_workflow() {
         let queue = test_utils::setup_mysql_queue().await;
+        let queue_name = test_utils::unique_queue("test_queue");
 
         // Create and enqueue a job
-        let job = Job::new(
-            "test_queue".to_string(),
-            json!({"message": "Hello, MySQL!"}),
-        );
+        let job = Job::new(queue_name.clone(), json!({"message": "Hello, MySQL!"}));
         let job_id = job.id;
 
         queue.enqueue(job).await.unwrap();
 
         // Dequeue the job
-        let dequeued_job = queue.dequeue("test_queue").await.unwrap();
+        let dequeued_job = queue.dequeue(&queue_name).await.unwrap();
         assert!(dequeued_job.is_some());
         let dequeued_job = dequeued_job.unwrap();
         assert_eq!(dequeued_job.id, job_id);
@@ -149,10 +147,11 @@ mod mysql_tests {
     #[ignore] // Requires database connection
     async fn test_mysql_concurrent_dequeue() {
         let queue = test_utils::setup_mysql_queue().await;
+        let queue_name = test_utils::unique_queue("concurrent_queue");
 
         // Create multiple jobs
         for i in 0..5 {
-            let job = Job::new("concurrent_queue".to_string(), json!({"index": i}));
+            let job = Job::new(queue_name.clone(), json!({"index": i}));
             queue.enqueue(job).await.unwrap();
         }
 
@@ -160,17 +159,21 @@ mod mysql_tests {
         let mut handles = Vec::new();
         for _ in 0..3 {
             let queue_clone = queue.clone();
-            let handle = tokio::spawn(async move { queue_clone.dequeue("concurrent_queue").await });
+            let queue_name = queue_name.clone();
+            let handle = tokio::spawn(async move { queue_clone.dequeue(&queue_name).await });
             handles.push(handle);
         }
 
         let mut successful_dequeues = 0;
+        let mut dequeued_ids = std::collections::HashSet::new();
         for handle in handles {
             let result = handle.await.unwrap().unwrap();
-            if result.is_some() {
+            if let Some(job) = result {
                 successful_dequeues += 1;
+                // No job may be handed to two workers
+                assert!(dequeued_ids.insert(job.id), "job {} dequeued twice", job.id);
                 // Complete the job to clean up
-                queue.complete_job(result.unwrap().id).await.unwrap();
+                queue.complete_job(job.id).await.unwrap();
             }
         }
 

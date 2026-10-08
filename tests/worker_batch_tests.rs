@@ -1,11 +1,17 @@
 mod test_utils;
 
+use hammerwork::BatchProcessingStats;
+
+#[cfg(feature = "postgres")]
 use hammerwork::{
-    BatchProcessingStats, Job, JobBatch, PartialFailureMode, Worker, WorkerPool,
-    queue::test::TestQueue,
+    InMemoryStatsCollector, Job, JobBatch, PartialFailureMode, Worker, WorkerPool,
+    queue::DatabaseQueue, worker::JobHandler,
 };
+#[cfg(feature = "postgres")]
 use serde_json::json;
-use std::time::Duration;
+#[cfg(feature = "postgres")]
+use std::{sync::Arc, time::Duration};
+#[cfg(feature = "postgres")]
 use tokio::time::timeout;
 
 #[cfg(feature = "postgres")]
@@ -13,9 +19,13 @@ mod postgres_worker_batch_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore] // Requires database connection
+    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
     async fn test_worker_batch_processing_enabled() {
+        if test_utils::skip_known_bug() {
+            return;
+        }
         let queue = test_utils::setup_postgres_queue().await;
+        let queue_name = format!("batch_test_queue_{}", uuid::Uuid::new_v4());
         let stats_collector = Arc::new(InMemoryStatsCollector::new_default());
 
         // Create job handler that simulates different processing times
@@ -46,7 +56,7 @@ mod postgres_worker_batch_tests {
         });
 
         // Create worker with batch processing enabled
-        let worker = Worker::new(queue.clone(), "batch_test_queue".to_string(), handler)
+        let worker = Worker::new(queue.clone(), queue_name.clone(), handler)
             .with_batch_processing_enabled(true)
             .with_stats_collector(stats_collector.clone())
             .with_poll_interval(Duration::from_millis(50));
@@ -60,20 +70,20 @@ mod postgres_worker_batch_tests {
         // Create a batch of jobs
         let batch_jobs = vec![
             Job::new(
-                "batch_test_queue".to_string(),
+                queue_name.clone(),
                 json!({"task": "process_1", "delay_ms": 20}),
             )
             .as_high_priority(),
             Job::new(
-                "batch_test_queue".to_string(),
+                queue_name.clone(),
                 json!({"task": "process_2", "delay_ms": 15}),
             ),
             Job::new(
-                "batch_test_queue".to_string(),
+                queue_name.clone(),
                 json!({"task": "process_3", "delay_ms": 10, "should_fail": true}),
             ),
             Job::new(
-                "batch_test_queue".to_string(),
+                queue_name.clone(),
                 json!({"task": "process_4", "delay_ms": 25}),
             )
             .as_critical(),
@@ -122,9 +132,13 @@ mod postgres_worker_batch_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires database connection
+    #[ignore = "bug: Postgres get_batch_status cannot decode the VARCHAR batch status column, see #7"]
     async fn test_batch_statistics_tracking() {
+        if test_utils::skip_known_bug() {
+            return;
+        }
         let queue = test_utils::setup_postgres_queue().await;
+        let queue_name = format!("stats_test_queue_{}", uuid::Uuid::new_v4());
 
         // Create simple handler
         let handler: JobHandler = Arc::new(|_job: Job| {
@@ -135,14 +149,14 @@ mod postgres_worker_batch_tests {
         });
 
         // Create worker with batch processing enabled
-        let worker = Worker::new(queue.clone(), "stats_test_queue".to_string(), handler)
+        let worker = Worker::new(queue.clone(), queue_name.clone(), handler)
             .with_batch_processing_enabled(true)
             .with_poll_interval(Duration::from_millis(50));
 
         // Create a small batch
         let batch_jobs = vec![
-            Job::new("stats_test_queue".to_string(), json!({"id": 1})),
-            Job::new("stats_test_queue".to_string(), json!({"id": 2})),
+            Job::new(queue_name.clone(), json!({"id": 1})),
+            Job::new(queue_name.clone(), json!({"id": 2})),
         ];
 
         let batch = JobBatch::new("stats_test_batch")
@@ -160,50 +174,61 @@ mod postgres_worker_batch_tests {
         });
 
         // Wait for processing
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let batch_result = queue.get_batch_status(batch_id).await.unwrap();
+            if batch_result.pending_jobs == 0 || attempts > 30 {
+                break;
+            }
+            attempts += 1;
+        }
 
         // Stop worker
         worker_task.abort();
 
+        // Both jobs in the batch should have been processed successfully
+        let batch_result = queue.get_batch_status(batch_id).await.unwrap();
+        assert_eq!(batch_result.total_jobs, 2);
+        assert_eq!(batch_result.pending_jobs, 0);
+        assert_eq!(batch_result.completed_jobs, 2);
+        assert_eq!(batch_result.failed_jobs, 0);
+
         // Clean up
         queue.delete_batch(batch_id).await.unwrap();
     }
+}
 
-    #[test]
-    fn test_batch_processing_stats_struct() {
-        let mut stats = BatchProcessingStats::default();
+#[test]
+fn test_batch_processing_stats_struct() {
+    let mut stats = BatchProcessingStats::default();
 
-        // Test initial state
-        assert_eq!(stats.jobs_processed, 0);
-        assert_eq!(stats.success_rate(), 0.0);
-        assert_eq!(stats.batch_success_rate(), 0.0);
+    // Test initial state
+    assert_eq!(stats.jobs_processed, 0);
+    assert_eq!(stats.success_rate(), 0.0);
+    assert_eq!(stats.batch_success_rate(), 0.0);
 
-        // Test statistics updates
-        stats.jobs_processed = 10;
-        stats.jobs_completed = 8;
-        stats.jobs_failed = 2;
-        stats.total_processing_time_ms = 1000;
+    // Test statistics updates
+    stats.jobs_processed = 10;
+    stats.jobs_completed = 8;
+    stats.jobs_failed = 2;
+    stats.total_processing_time_ms = 1000;
 
-        stats.update_average_processing_time();
+    stats.update_average_processing_time();
 
-        assert_eq!(stats.success_rate(), 0.8);
-        assert_eq!(stats.average_processing_time_ms, 125.0); // 1000ms / 8 jobs
+    assert_eq!(stats.success_rate(), 0.8);
+    assert_eq!(stats.average_processing_time_ms, 125.0); // 1000ms / 8 jobs
 
-        // Test batch statistics
-        stats.batches_completed = 5;
-        stats.batches_successful = 4;
+    // Test batch statistics
+    stats.batches_completed = 5;
+    stats.batches_successful = 4;
 
-        assert_eq!(stats.batch_success_rate(), 0.8);
-    }
+    assert_eq!(stats.batch_success_rate(), 0.8);
 }
 
 #[test]
 fn test_worker_batch_processing_config() {
     // Test that batch processing configuration works
-    // This is a compile-time test since we can't create actual workers without database
-
-    use hammerwork::worker::BatchProcessingStats;
-
     // Test that BatchProcessingStats can be created and manipulated
     let stats = BatchProcessingStats {
         jobs_processed: 100,

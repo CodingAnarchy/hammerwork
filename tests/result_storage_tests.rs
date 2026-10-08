@@ -3,16 +3,80 @@
 mod test_utils;
 
 use hammerwork::{
+    Job,
     job::{ResultConfig, ResultStorage},
     worker::JobResult,
 };
 use serde_json::json;
+use std::time::Duration;
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use hammerwork::{
+    JobStatus, Worker, WorkerPool, queue::DatabaseQueue, worker::JobHandlerWithResult,
+};
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use std::sync::Arc;
+
+/// Poll until the job reaches `Completed`, returning whether it did within `timeout`.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+async fn wait_for_completion<Q: DatabaseQueue>(
+    queue: &Q,
+    job_id: hammerwork::JobId,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(job) = queue.get_job(job_id).await.unwrap()
+            && job.status == JobStatus::Completed
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Store a result on a dequeued job, then complete it: the result must still be
+/// retrievable afterwards.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+async fn assert_result_survives_job_completion<Q: DatabaseQueue>(queue: &Q) {
+    let queue_name = format!("completion_test_{}", uuid::Uuid::new_v4());
+    let job = Job::new(queue_name.clone(), json!({"test": "completion"}))
+        .with_result_storage(ResultStorage::Database);
+    let job_id = queue.enqueue(job).await.unwrap();
+
+    let dequeued = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    assert_eq!(dequeued.id, job_id);
+    assert_eq!(dequeued.result_config.storage, ResultStorage::Database);
+
+    let result_data = json!({"completed": true});
+    queue
+        .store_job_result(job_id, result_data.clone(), None)
+        .await
+        .unwrap();
+    queue.complete_job(job_id).await.unwrap();
+
+    let job = queue.get_job(job_id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Completed);
+    assert_eq!(
+        queue.get_job_result(job_id).await.unwrap(),
+        Some(result_data)
+    );
+}
 
 #[cfg(feature = "postgres")]
 mod postgres_tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_result_survives_job_completion() {
+        let queue = test_utils::setup_postgres_queue().await;
+        assert_result_survives_job_completion(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_job_result_storage_and_retrieval() {
         let queue = test_utils::setup_postgres_queue().await;
 
@@ -48,6 +112,7 @@ mod postgres_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_result_expiration() {
         let queue = test_utils::setup_postgres_queue().await;
 
@@ -75,6 +140,7 @@ mod postgres_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_cleanup_expired_results() {
         let queue = test_utils::setup_postgres_queue().await;
 
@@ -105,8 +171,15 @@ mod postgres_tests {
         }
 
         // Clean up expired results
+        // Other tests share the table and may leave expired results behind
+        // concurrently, so the count is a lower bound; the per-job checks below
+        // verify exactly which of our results were removed.
         let cleaned_count = queue.cleanup_expired_results().await.unwrap();
-        assert_eq!(cleaned_count, 3);
+        assert!(
+            cleaned_count >= 3,
+            "expected at least 3 expired results cleaned, got {}",
+            cleaned_count
+        );
 
         // Verify only non-expired results remain
         for (i, job_id) in job_ids.iter().enumerate() {
@@ -120,6 +193,7 @@ mod postgres_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_worker_automatic_result_storage() {
         let queue = test_utils::setup_postgres_queue().await;
         let unique_queue = format!("auto_result_test_{}", uuid::Uuid::new_v4());
@@ -155,26 +229,11 @@ mod postgres_tests {
         // Start the worker pool for a short time to process the job
         let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
-        // Wait for the job to be processed (check status periodically)
-        let mut attempts = 0;
-        let max_attempts = 40; // Wait up to 20 seconds
-        let mut job_completed = false;
-
-        while attempts < max_attempts {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            // Check if job is completed
-            if let Some(job) = queue.get_job(job_id).await.unwrap() {
-                if job.status == JobStatus::Completed {
-                    job_completed = true;
-                    break;
-                }
-            }
-            attempts += 1;
-        }
-
-        // Ensure job was completed
-        assert!(job_completed, "Job should have completed within timeout");
+        // Wait for the job to be processed
+        assert!(
+            wait_for_completion(queue.as_ref(), job_id, Duration::from_secs(20)).await,
+            "Job should have completed within timeout"
+        );
 
         // Verify result was automatically stored
         let stored_result = queue.get_job_result(job_id).await.unwrap();
@@ -192,12 +251,13 @@ mod postgres_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_worker_legacy_handler_compatibility() {
         let queue = test_utils::setup_postgres_queue().await;
         let unique_queue = format!("legacy_test_{}", uuid::Uuid::new_v4());
 
         // Create a legacy handler (returns ())
-        let legacy_handler: JobHandler = Arc::new(|_job| {
+        let legacy_handler: hammerwork::worker::JobHandler = Arc::new(|_job| {
             Box::pin(async move {
                 // Just complete successfully without result data
                 Ok(())
@@ -219,20 +279,11 @@ mod postgres_tests {
 
         let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
-        // Wait for the job to be processed (check status periodically)
-        let mut attempts = 0;
-        let max_attempts = 20; // Wait up to 10 seconds
-        while attempts < max_attempts {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            // Check if job is completed
-            if let Some(job) = queue.get_job(job_id).await.unwrap() {
-                if job.status == JobStatus::Completed {
-                    break;
-                }
-            }
-            attempts += 1;
-        }
+        // Wait for the job to be processed
+        assert!(
+            wait_for_completion(queue.as_ref(), job_id, Duration::from_secs(10)).await,
+            "Job should have completed within timeout"
+        );
 
         // Verify no result was stored (legacy handler returns no data)
         let stored_result = queue.get_job_result(job_id).await.unwrap();
@@ -245,6 +296,7 @@ mod postgres_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_result_storage_none_configuration() {
         let queue = test_utils::setup_postgres_queue().await;
 
@@ -256,11 +308,11 @@ mod postgres_tests {
             })
         });
 
-        let worker =
-            Worker::new_with_result_handler(queue.clone(), "test_queue".to_string(), handler);
+        let unique_queue = format!("no_storage_test_{}", uuid::Uuid::new_v4());
+        let worker = Worker::new_with_result_handler(queue.clone(), unique_queue.clone(), handler);
 
         // Create a job with result storage disabled
-        let job = Job::new("test_queue".to_string(), json!({"task": "no_storage"}))
+        let job = Job::new(unique_queue, json!({"task": "no_storage"}))
             .with_result_storage(ResultStorage::None);
 
         let job_id = queue.enqueue(job).await.unwrap();
@@ -272,35 +324,16 @@ mod postgres_tests {
         let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
         // Wait for job processing
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            wait_for_completion(queue.as_ref(), job_id, Duration::from_secs(10)).await,
+            "Job should have completed within timeout"
+        );
 
         // Verify no result was stored despite handler returning data
         let stored_result = queue.get_job_result(job_id).await.unwrap();
         assert!(stored_result.is_none());
 
         worker_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_result_config_builder_methods() {
-        // Test the job builder methods for result configuration
-        let job1 =
-            Job::new("test".to_string(), json!({})).with_result_storage(ResultStorage::Database);
-        assert_eq!(job1.result_config.storage, ResultStorage::Database);
-
-        let job2 =
-            Job::new("test".to_string(), json!({})).with_result_ttl(Duration::from_secs(7200));
-        assert_eq!(job2.result_config.ttl, Some(Duration::from_secs(7200)));
-
-        let config = ResultConfig {
-            storage: ResultStorage::Database,
-            ttl: Some(Duration::from_secs(3600)),
-            max_size_bytes: Some(1024 * 1024), // 1MB
-        };
-        let job3 = Job::new("test".to_string(), json!({})).with_result_config(config.clone());
-        assert_eq!(job3.result_config.storage, config.storage);
-        assert_eq!(job3.result_config.ttl, config.ttl);
-        assert_eq!(job3.result_config.max_size_bytes, config.max_size_bytes);
     }
 }
 
@@ -309,6 +342,14 @@ mod mysql_tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_result_survives_job_completion() {
+        let queue = test_utils::setup_mysql_queue().await;
+        assert_result_survives_job_completion(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_mysql_result_storage() {
         let queue = test_utils::setup_mysql_queue().await;
 
@@ -335,6 +376,7 @@ mod mysql_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_mysql_worker_integration() {
         let queue = test_utils::setup_mysql_queue().await;
 
@@ -365,16 +407,14 @@ mod mysql_tests {
 
         let worker_handle = tokio::spawn(async move { worker_pool.start().await });
 
-        // Wait for job processing with longer timeout
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-
-        // Check job status first
-        let job = queue.get_job(job_id).await.unwrap();
-        println!("Job status: {:?}", job.map(|j| j.status));
+        // Wait for job processing
+        assert!(
+            wait_for_completion(queue.as_ref(), job_id, Duration::from_secs(10)).await,
+            "Job should have completed within timeout"
+        );
 
         // Verify result storage
         let result = queue.get_job_result(job_id).await.unwrap();
-        println!("Retrieved result: {:?}", result);
         assert!(result.is_some());
         assert_eq!(result.unwrap()["mysql_worker"], true);
 
@@ -383,6 +423,26 @@ mod mysql_tests {
 }
 
 // Tests that work regardless of database backend
+#[tokio::test]
+async fn test_result_config_builder_methods() {
+    // Test the job builder methods for result configuration
+    let job1 = Job::new("test".to_string(), json!({})).with_result_storage(ResultStorage::Database);
+    assert_eq!(job1.result_config.storage, ResultStorage::Database);
+
+    let job2 = Job::new("test".to_string(), json!({})).with_result_ttl(Duration::from_secs(7200));
+    assert_eq!(job2.result_config.ttl, Some(Duration::from_secs(7200)));
+
+    let config = ResultConfig {
+        storage: ResultStorage::Database,
+        ttl: Some(Duration::from_secs(3600)),
+        max_size_bytes: Some(1024 * 1024), // 1MB
+    };
+    let job3 = Job::new("test".to_string(), json!({})).with_result_config(config.clone());
+    assert_eq!(job3.result_config.storage, config.storage);
+    assert_eq!(job3.result_config.ttl, config.ttl);
+    assert_eq!(job3.result_config.max_size_bytes, config.max_size_bytes);
+}
+
 #[tokio::test]
 async fn test_result_types() {
     // Test JobResult creation methods
