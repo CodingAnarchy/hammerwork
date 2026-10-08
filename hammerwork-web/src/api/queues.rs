@@ -573,7 +573,7 @@ where
                     job_id: job.id.to_string(),
                     error_message: error_msg,
                     occurred_at: job.failed_at.unwrap_or(job.created_at),
-                    attempts: job.attempts as i32,
+                    attempts: job.attempts,
                 })
             })
             .collect()

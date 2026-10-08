@@ -188,10 +188,7 @@ impl WebSocketState {
                     connection_id, event_types
                 );
                 // Store subscription preferences per connection
-                let subscription_set = self
-                    .subscriptions
-                    .entry(connection_id)
-                    .or_insert_with(std::collections::HashSet::new);
+                let subscription_set = self.subscriptions.entry(connection_id).or_default();
                 for event_type in event_types {
                     subscription_set.insert(event_type);
                 }
@@ -255,10 +252,9 @@ impl WebSocketState {
         for (&connection_id, sender) in &self.connections {
             // Check if this connection is subscribed to this event type
             if let Some(subscription_set) = self.subscriptions.get(&connection_id) {
-                if subscription_set.contains(event_type) {
-                    if sender.send(ws_message.clone()).is_err() {
-                        disconnected.push(connection_id);
-                    }
+                if subscription_set.contains(event_type) && sender.send(ws_message.clone()).is_err()
+                {
+                    disconnected.push(connection_id);
                 }
             }
         }
@@ -319,7 +315,7 @@ impl WebSocketState {
         };
 
         // Send to the broadcast channel
-        if let Err(_) = self.broadcast_sender.send(broadcast_message) {
+        if self.broadcast_sender.send(broadcast_message).is_err() {
             return Err(anyhow::anyhow!(
                 "Failed to send archive event to broadcast channel"
             ));

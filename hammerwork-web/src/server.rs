@@ -220,9 +220,9 @@ impl WebDashboard {
             }
             #[cfg(not(feature = "postgres"))]
             {
-                return Err(anyhow::anyhow!(
+                Err(anyhow::anyhow!(
                     "PostgreSQL support not enabled. Rebuild with --features postgres"
-                ));
+                ))
             }
         } else if self.config.database_url.starts_with("mysql") {
             #[cfg(feature = "mysql")]
@@ -238,16 +238,16 @@ impl WebDashboard {
                 }
                 #[cfg(all(feature = "postgres", feature = "mysql"))]
                 {
-                    return Err(anyhow::anyhow!(
+                    Err(anyhow::anyhow!(
                         "MySQL database URL provided but PostgreSQL is the default when both features are enabled"
-                    ));
+                    ))
                 }
             }
             #[cfg(not(feature = "mysql"))]
             {
-                return Err(anyhow::anyhow!(
+                Err(anyhow::anyhow!(
                     "MySQL support not enabled. Rebuild with --features mysql"
-                ));
+                ))
             }
         } else {
             Err(anyhow::anyhow!("Unsupported database URL format"))
