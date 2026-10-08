@@ -611,6 +611,12 @@ fn is_deadlock(error: &crate::HammerworkError) -> bool {
     )
 }
 
+/// Whether MySQL refused to change transaction characteristics because the session is
+/// still inside a transaction (ER_CANT_CHANGE_TX_CHARACTERISTICS, 1568 / SQLSTATE 25001).
+fn is_open_transaction_error(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db_error) if db_error.code().as_deref() == Some("25001"))
+}
+
 /// Runs a job claim, retrying with a short backoff when InnoDB aborts it as a deadlock
 /// victim. Concurrent `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` claims can still
 /// deadlock on secondary index locks; the aborted transaction has been rolled back, so
@@ -640,9 +646,21 @@ impl crate::queue::JobQueue<MySql> {
     async fn begin_claim_transaction(
         conn: &mut sqlx::pool::PoolConnection<MySql>,
     ) -> Result<sqlx::Transaction<'_, MySql>> {
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            .execute(&mut **conn)
-            .await?;
+        const SET_READ_COMMITTED: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED";
+        if let Err(error) = sqlx::query(SET_READ_COMMITTED).execute(&mut **conn).await {
+            // ER_CANT_CHANGE_TX_CHARACTERISTICS (1568): the pooled connection is still
+            // inside a transaction that was abandoned without COMMIT/ROLLBACK (e.g. a
+            // future dropped mid-transaction). Roll it back so its row locks are released,
+            // then continue.
+            if !is_open_transaction_error(&error) {
+                return Err(error.into());
+            }
+            tracing::warn!(
+                "pooled MySQL connection had an abandoned open transaction; rolling it back"
+            );
+            sqlx::Executor::execute(&mut **conn, "ROLLBACK").await?;
+            sqlx::query(SET_READ_COMMITTED).execute(&mut **conn).await?;
+        }
         Ok(sqlx::Connection::begin(&mut **conn).await?)
     }
 
