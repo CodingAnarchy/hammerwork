@@ -650,20 +650,21 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
         use crate::job::JobStatus;
 
-        // MySQL doesn't support FOR UPDATE SKIP LOCKED in the same way
-        // This is a simplified version - in production you might want advisory locks
+        // Lock and claim in one transaction. SKIP LOCKED (MySQL 8.0+) lets concurrent
+        // workers move past rows another worker is claiming instead of blocking on them.
         let mut tx = self.pool.begin().await?;
 
         let row = sqlx::query_as::<_, JobRow>(&format!(
             r#"
             SELECT {}
-            FROM hammerwork_jobs 
-            WHERE queue_name = ? 
-            AND status = ? 
-            AND scheduled_at <= ?
-            ORDER BY priority DESC, scheduled_at ASC 
+            FROM hammerwork_jobs
+            WHERE queue_name = ?
+              AND status = ?
+              AND scheduled_at <= ?
+              AND (dependency_status = 'none' OR dependency_status = 'satisfied')
+            ORDER BY priority DESC, scheduled_at ASC
             LIMIT 1
-            FOR UPDATE
+            FOR UPDATE SKIP LOCKED
             "#,
             JOB_SELECT_FIELDS
         ))
@@ -718,13 +719,14 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         let available_jobs = sqlx::query_as::<_, JobRow>(&format!(
             r#"
             SELECT {}
-            FROM hammerwork_jobs 
-            WHERE queue_name = ? 
-            AND status = ? 
-            AND scheduled_at <= ?
-            ORDER BY priority DESC, scheduled_at ASC 
+            FROM hammerwork_jobs
+            WHERE queue_name = ?
+              AND status = ?
+              AND scheduled_at <= ?
+              AND (dependency_status = 'none' OR dependency_status = 'satisfied')
+            ORDER BY priority DESC, scheduled_at ASC
             LIMIT 20
-            FOR UPDATE
+            FOR UPDATE SKIP LOCKED
             "#,
             JOB_SELECT_FIELDS
         ))
