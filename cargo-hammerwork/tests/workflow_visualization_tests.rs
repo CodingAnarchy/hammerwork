@@ -288,6 +288,7 @@ fn test_all_workflow_command_variants_structure() {
             WorkflowCommand::Create {
                 database_url: Some("postgres://test".to_string()),
                 name: "test-workflow".to_string(),
+                jobs_file: "jobs.json".to_string(),
                 failure_policy: Some("continue_on_failure".to_string()),
                 metadata: Some(r#"{"env": "production"}"#.to_string()),
             },

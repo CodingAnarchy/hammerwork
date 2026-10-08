@@ -295,3 +295,131 @@ pub fn format_size(bytes: Option<i64>) -> String {
         None => "N/A".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_formatting_picks_the_largest_units() {
+        assert_eq!(format_duration(Some(0)), "0s");
+        assert_eq!(format_duration(Some(59)), "59s");
+        assert_eq!(format_duration(Some(60)), "1m 0s");
+        assert_eq!(format_duration(Some(125)), "2m 5s");
+        assert_eq!(format_duration(Some(3599)), "59m 59s");
+        assert_eq!(format_duration(Some(3600)), "1h 0m");
+        assert_eq!(format_duration(Some(7260)), "2h 1m");
+        assert_eq!(format_duration(None), "N/A");
+    }
+
+    #[test]
+    fn size_formatting_switches_units_at_powers_of_1024() {
+        assert_eq!(format_size(Some(0)), "0B");
+        assert_eq!(format_size(Some(1023)), "1023B");
+        assert_eq!(format_size(Some(1024)), "1.0KB");
+        assert_eq!(format_size(Some(1536)), "1.5KB");
+        assert_eq!(format_size(Some(1024 * 1024 - 1)), "1024.0KB");
+        assert_eq!(format_size(Some(1024 * 1024)), "1.0MB");
+        assert_eq!(format_size(Some(5 * 1024 * 1024 * 1024)), "5.0GB");
+        assert_eq!(format_size(None), "N/A");
+    }
+
+    #[test]
+    fn job_table_shows_header_icons_and_short_ids() {
+        let mut table = JobTable::new();
+        for (status, priority) in [
+            ("Pending", "critical"),
+            ("running", "high"),
+            ("Completed", "normal"),
+            ("Failed", "low"),
+            ("Dead", "background"),
+            ("Retrying", "weird"),
+            ("TimedOut", "normal"),
+        ] {
+            table.add_job_row(
+                "550e8400-e29b-41d4-a716-446655440000",
+                "emails",
+                status,
+                priority,
+                3,
+                "2024-01-01 10:00:00",
+                "2024-01-01 10:05:00",
+            );
+        }
+        // An id shorter than eight characters is shown as is.
+        table.add_job_row("abc", "q", "pending", "normal", 0, "c", "s");
+        let out = table.to_string();
+        for header in [
+            "ID",
+            "Queue",
+            "Status",
+            "Priority",
+            "Attempts",
+            "Created At",
+            "Scheduled At",
+        ] {
+            assert!(out.contains(header), "{header} in {out}");
+        }
+        for expected in [
+            "550e8400",
+            "🟡 Pending",
+            "🔵 running",
+            "🟢 Completed",
+            "🔴 Failed",
+            "💀 Dead",
+            "🟠 Retrying",
+            "🚨 critical",
+            "⚡ high",
+            "📝 normal",
+            "🐌 low",
+            "💤 background",
+            "2024-01-01 10:05:00",
+        ] {
+            assert!(out.contains(expected), "{expected} in {out}");
+        }
+        assert!(!out.contains("550e8400-e29b"), "ids are truncated: {out}");
+        // Unknown statuses and priorities are shown without an icon.
+        assert!(out.contains("TimedOut") && !out.contains("🟠 TimedOut"));
+        assert!(out.contains("weird"));
+        assert!(out.contains("abc"));
+    }
+
+    #[test]
+    fn stats_table_maps_known_names_to_icons_and_unknown_to_question_marks() {
+        let mut stats = StatsTable::default();
+        stats.add_stats_row("Pending", "normal", 42);
+        stats.add_stats_row("Running", "high", 5);
+        stats.add_stats_row("Completed", "critical", 1337);
+        stats.add_stats_row("Failed", "low", 1);
+        stats.add_stats_row("Dead", "background", 2);
+        stats.add_stats_row("Retrying", "normal", 3);
+        stats.add_stats_row("Mystery", "7", 9);
+        let out = stats.to_string();
+        for expected in [
+            "🟡 Pending",
+            "🔵 Running",
+            "🟢 Completed",
+            "🔴 Failed",
+            "💀 Dead",
+            "🟠 Retrying",
+            "❓ Mystery",
+            "📝 normal",
+            "⚡ high",
+            "🚨 critical",
+            "🐌 low",
+            "💤 background",
+            "❓ 7",
+            "1337",
+        ] {
+            assert!(out.contains(expected), "{expected} in {out}");
+        }
+    }
+
+    #[test]
+    fn create_table_is_an_empty_table() {
+        let mut table = create_table();
+        assert!(table.is_empty());
+        table.add_row(vec!["a"]);
+        assert!(table.to_string().contains('a'));
+    }
+}

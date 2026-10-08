@@ -88,6 +88,16 @@ impl SqlParams {
         self.bind(Bind::Time(value))
     }
 
+    /// A text id bound against a UUID column. PostgreSQL needs the `::uuid` cast (it will not
+    /// compare a text parameter with a `uuid` column); MySQL stores ids as text.
+    pub fn uuid(&mut self, value: &str) -> String {
+        let p = self.text(value);
+        match self.backend {
+            Backend::Postgres => format!("{p}::uuid"),
+            Backend::MySql => p,
+        }
+    }
+
     /// `LIMIT <placeholder>`.
     pub fn limit(&mut self, limit: u32) -> String {
         format!("LIMIT {}", self.int(i64::from(limit)))
@@ -103,8 +113,12 @@ impl SqlParams {
             (Backend::Postgres, IntervalUnit::Day) => {
                 format!("NOW() - make_interval(days => {p}::int)")
             }
-            (Backend::MySql, IntervalUnit::Hour) => format!("DATE_SUB(NOW(), INTERVAL {p} HOUR)"),
-            (Backend::MySql, IntervalUnit::Day) => format!("DATE_SUB(NOW(), INTERVAL {p} DAY)"),
+            (Backend::MySql, IntervalUnit::Hour) => {
+                format!("DATE_SUB(UTC_TIMESTAMP(6), INTERVAL {p} HOUR)")
+            }
+            (Backend::MySql, IntervalUnit::Day) => {
+                format!("DATE_SUB(UTC_TIMESTAMP(6), INTERVAL {p} DAY)")
+            }
         }
     }
 
@@ -186,6 +200,16 @@ mod tests {
     use crate::utils::test_support::HOSTILE_QUEUE;
 
     #[test]
+    fn uuid_placeholders_cast_only_on_postgres() {
+        let mut p = SqlParams::new(Backend::Postgres);
+        assert_eq!(p.text("x"), "$1");
+        assert_eq!(p.uuid("00000000-0000-0000-0000-000000000000"), "$2::uuid");
+        let mut m = SqlParams::new(Backend::MySql);
+        assert_eq!(m.uuid("id"), "?");
+        assert_eq!(m.binds(), &[Bind::Text("id".into())]);
+    }
+
+    #[test]
     fn postgres_placeholders_are_numbered_in_order() {
         let mut p = SqlParams::new(Backend::Postgres);
         assert_eq!(p.text("a"), "$1");
@@ -207,7 +231,7 @@ mod tests {
         assert_eq!(p.limit(10), "LIMIT ?");
         assert_eq!(
             p.ago(3, IntervalUnit::Day),
-            "DATE_SUB(NOW(), INTERVAL ? DAY)"
+            "DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? DAY)"
         );
         assert_eq!(
             p.into_binds(),

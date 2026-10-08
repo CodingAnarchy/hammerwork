@@ -6,7 +6,6 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::utils::database::{DatabasePool, JobQueueWrapper};
-use crate::utils::db_helpers::*;
 use crate::utils::job_ops::{JobSelector, retry_many, select_job_ids};
 use crate::utils::sql::{Backend, Bind, SqlParams, execute_binds, fetch_i64};
 
@@ -408,32 +407,24 @@ async fn reindex_database(pool: DatabasePool, confirm: bool) -> Result<()> {
 
     match &pool {
         DatabasePool::Postgres(pg_pool) => {
-            // PostgreSQL index rebuilding
+            // PostgreSQL index rebuilding: every Hammerwork table in the current schema
             println!("🔄 Rebuilding PostgreSQL indexes...");
 
-            sqlx::query("REINDEX INDEX idx_hammerwork_queue_priority")
-                .execute(pg_pool)
-                .await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_status")
-                .execute(pg_pool)
-                .await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_scheduled")
-                .execute(pg_pool)
-                .await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_cron")
-                .execute(pg_pool)
-                .await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_batch")
-                .execute(pg_pool)
-                .await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_failed_at")
-                .execute(pg_pool)
-                .await?;
-            sqlx::query("REINDEX INDEX idx_hammerwork_completed_at")
-                .execute(pg_pool)
-                .await?;
+            let tables: Vec<String> = sqlx::query_scalar(
+                "SELECT tablename::text FROM pg_tables \
+                 WHERE schemaname = current_schema() AND tablename LIKE 'hammerwork\\_%' \
+                 ORDER BY tablename",
+            )
+            .fetch_all(pg_pool)
+            .await?;
+            for table in &tables {
+                // Names come from the catalog; quote them anyway.
+                sqlx::query(&format!("REINDEX TABLE \"{}\"", table.replace('"', "\"\"")))
+                    .execute(pg_pool)
+                    .await?;
+            }
 
-            println!("✅ PostgreSQL indexes rebuilt");
+            println!("✅ PostgreSQL indexes rebuilt ({} tables)", tables.len());
         }
         DatabasePool::MySQL(mysql_pool) => {
             // MySQL doesn't have REINDEX, but we can optimize tables
@@ -482,7 +473,7 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
 
     // Check for orphaned jobs
     let orphaned_query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Running' AND started_at IS NULL";
-    let orphaned_count = execute_count_query(&pool, orphaned_query).await?;
+    let orphaned_count = fetch_i64(&pool, orphaned_query, &[], "count").await?;
 
     println!("Orphaned running jobs (no start time): {}", orphaned_count);
 
@@ -501,14 +492,14 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
     // Check for invalid priorities
     let invalid_priority_query =
         "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE priority NOT BETWEEN 0 AND 4";
-    let invalid_priority_count = execute_count_query(&pool, invalid_priority_query).await?;
+    let invalid_priority_count = fetch_i64(&pool, invalid_priority_query, &[], "count").await?;
 
     println!("Jobs with invalid priority: {}", invalid_priority_count);
 
     if fix && invalid_priority_count > 0 {
         let fix_priority_query =
             "UPDATE hammerwork_jobs SET priority = 2 WHERE priority NOT BETWEEN 0 AND 4";
-        execute_update_query(&pool, fix_priority_query).await?;
+        execute_binds(&pool, fix_priority_query, &[]).await?;
         println!(
             "✅ Fixed {} jobs with invalid priority",
             invalid_priority_count
@@ -518,13 +509,13 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
     // Check for negative attempts
     let negative_attempts_query =
         "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE attempts < 0";
-    let negative_attempts_count = execute_count_query(&pool, negative_attempts_query).await?;
+    let negative_attempts_count = fetch_i64(&pool, negative_attempts_query, &[], "count").await?;
 
     println!("Jobs with negative attempts: {}", negative_attempts_count);
 
     if fix && negative_attempts_count > 0 {
         let fix_attempts_query = "UPDATE hammerwork_jobs SET attempts = 0 WHERE attempts < 0";
-        execute_update_query(&pool, fix_attempts_query).await?;
+        execute_binds(&pool, fix_attempts_query, &[]).await?;
         println!(
             "✅ Fixed {} jobs with negative attempts",
             negative_attempts_count
@@ -669,4 +660,269 @@ mod tests {
     async fn test_vacuum_cutoffs_are_bound_mysql() {
         vacuum_roundtrip(mysql_pool().await).await;
     }
+
+    fn parse(args: &[&str]) -> MaintenanceCommand {
+        let mut argv = vec!["test"];
+        argv.extend_from_slice(args);
+        TestCli::try_parse_from(argv).unwrap().command
+    }
+
+    #[test]
+    fn parses_every_subcommand_with_its_flags() {
+        match parse(&["vacuum"]) {
+            MaintenanceCommand::Vacuum {
+                keep_completed_days,
+                keep_failed_days,
+                confirm,
+                dry_run,
+                ..
+            } => {
+                assert_eq!((keep_completed_days, keep_failed_days), (30, 7));
+                assert!(!confirm && !dry_run);
+            }
+            _ => panic!("expected Vacuum"),
+        }
+        match parse(&[
+            "vacuum",
+            "--keep-completed-days",
+            "3",
+            "--keep-failed-days",
+            "1",
+            "--confirm",
+            "--dry-run",
+        ]) {
+            MaintenanceCommand::Vacuum {
+                keep_completed_days,
+                keep_failed_days,
+                confirm,
+                dry_run,
+                ..
+            } => {
+                assert_eq!((keep_completed_days, keep_failed_days), (3, 1));
+                assert!(confirm && dry_run);
+            }
+            _ => panic!("expected Vacuum"),
+        }
+        match parse(&["dead-jobs", "--stale-hours", "2", "--dry-run"]) {
+            MaintenanceCommand::DeadJobs {
+                stale_hours,
+                confirm,
+                dry_run,
+                ..
+            } => assert_eq!((stale_hours, confirm, dry_run), (2, false, true)),
+            _ => panic!("expected DeadJobs"),
+        }
+        assert!(matches!(
+            parse(&["dead-jobs"]),
+            MaintenanceCommand::DeadJobs {
+                stale_hours: 24,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["reindex", "--confirm"]),
+            MaintenanceCommand::Reindex { confirm: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["analyze", "-u", "u"]),
+            MaintenanceCommand::Analyze {
+                database_url: Some(_)
+            }
+        ));
+        assert!(matches!(
+            parse(&["check", "--fix"]),
+            MaintenanceCommand::Check { fix: true, .. }
+        ));
+    }
+
+    #[test]
+    fn database_url_comes_from_the_flag_then_the_config() {
+        let config = config_for("postgres://config/db");
+        for args in [
+            &["vacuum"][..],
+            &["dead-jobs"],
+            &["reindex"],
+            &["analyze"],
+            &["check"],
+            &["purge-encrypted"],
+        ] {
+            assert_eq!(
+                parse(args).get_database_url(&config).unwrap(),
+                "postgres://config/db"
+            );
+            assert!(parse(args).get_database_url(&Config::default()).is_err());
+        }
+        assert_eq!(
+            parse(&["check", "-u", "mysql://flag/db"])
+                .get_database_url(&config)
+                .unwrap(),
+            "mysql://flag/db"
+        );
+    }
+
+    async fn maintenance_commands(base_url: String) {
+        // These commands act on every queue, so they get a database of their own.
+        let db = ScratchDb::create(&base_url).await;
+        let pool = &db.pool;
+        let config = db.config();
+        let run = |args: &[&str]| {
+            let cmd = parse(args);
+            let config = config.clone();
+            async move { cmd.execute(&config).await }
+        };
+        let q = "maint";
+
+        // --- vacuum: only jobs older than the keep window go
+        let mut completed = SeedJob::new(q, "Completed");
+        completed.completed_now = true;
+        let old_completed = seed(pool, &completed).await;
+        backdate(pool, &old_completed, "completed_at", 40).await;
+        let new_completed = seed(pool, &completed).await;
+        let mut failed = SeedJob::new(q, "Failed");
+        failed.failed_now = true;
+        let old_failed = seed(pool, &failed).await;
+        backdate(pool, &old_failed, "failed_at", 10).await;
+        let new_failed = seed(pool, &failed).await;
+        let pending = seed(pool, &SeedJob::new(q, "Pending")).await;
+        let remaining = || async { count_jobs(pool, q, None).await };
+        assert_eq!(remaining().await, 5);
+
+        run(&["vacuum"]).await.unwrap(); // refuses without --confirm
+        run(&["vacuum", "--dry-run"]).await.unwrap();
+        assert_eq!(remaining().await, 5, "neither deletes anything");
+        run(&["vacuum", "--confirm"]).await.unwrap();
+        assert_eq!(remaining().await, 3);
+        for kept in [&new_completed, &new_failed, &pending] {
+            assert!(job_column(pool, kept, "status").await.is_some());
+        }
+        for gone in [&old_completed, &old_failed] {
+            assert!(job_column(pool, gone, "status").await.is_none());
+        }
+        run(&["vacuum", "--confirm"]).await.unwrap(); // nothing left to do
+        // shorter windows catch the recent ones too
+        run(&[
+            "vacuum",
+            "--confirm",
+            "--keep-completed-days",
+            "0",
+            "--keep-failed-days",
+            "0",
+        ])
+        .await
+        .unwrap();
+        assert_eq!(count_jobs(pool, q, Some("Pending")).await, 1);
+        assert_eq!(remaining().await, 1, "pending jobs are never vacuumed");
+
+        // --- dead-jobs: stale Running jobs are marked Dead, fresh ones are left alone
+        let mut stale = SeedJob::new(q, "Running");
+        stale.started_long_ago = true;
+        let stale_id = seed(pool, &stale).await;
+        let fresh_id = seed(pool, &SeedJob::new(q, "Running")).await;
+        backdate(pool, &fresh_id, "started_at", 0).await;
+        run(&["dead-jobs"]).await.unwrap(); // needs --confirm
+        run(&["dead-jobs", "--dry-run", "--stale-hours", "1"])
+            .await
+            .unwrap();
+        assert_eq!(job_status(pool, &stale_id).await, "Running");
+        run(&["dead-jobs", "--confirm", "--stale-hours", "1"])
+            .await
+            .unwrap();
+        assert_eq!(job_status(pool, &stale_id).await, "Dead");
+        assert_eq!(job_status(pool, &fresh_id).await, "Running");
+        assert!(
+            job_column(pool, &stale_id, "error_message")
+                .await
+                .unwrap_or_default()
+                .contains("inactivity")
+        );
+        run(&["dead-jobs", "--confirm", "--stale-hours", "1"])
+            .await
+            .unwrap(); // none left
+
+        // --- check: reports, and --fix repairs minor corruption
+        let orphan = seed(pool, &SeedJob::new(q, "Running")).await; // Running, never started
+        let bad_priority = seed(pool, &SeedJob::new(q, "Pending")).await;
+        exec_sql(
+            pool,
+            &format!("UPDATE hammerwork_jobs SET priority = 9 WHERE id = '{bad_priority}'"),
+        )
+        .await;
+        let bad_attempts = seed(pool, &SeedJob::new(q, "Pending")).await;
+        exec_sql(
+            pool,
+            &format!("UPDATE hammerwork_jobs SET attempts = -2 WHERE id = '{bad_attempts}'"),
+        )
+        .await;
+        run(&["check"]).await.unwrap();
+        assert_eq!(job_status(pool, &orphan).await, "Running");
+        assert_eq!(
+            job_column(pool, &bad_priority, "priority").await.as_deref(),
+            Some("9")
+        );
+        run(&["check", "--fix"]).await.unwrap();
+        assert_eq!(
+            job_column(pool, &bad_priority, "priority").await.as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            job_column(pool, &bad_attempts, "attempts").await.as_deref(),
+            Some("0")
+        );
+        assert_ne!(
+            job_status(pool, &orphan).await,
+            "Running",
+            "the orphaned job is released"
+        );
+        run(&["check"]).await.unwrap(); // clean now
+
+        // --- reindex / analyze
+        run(&["reindex"]).await.unwrap(); // needs --confirm
+        run(&["reindex", "--confirm"]).await.unwrap();
+        run(&["analyze"]).await.unwrap();
+
+        // --- purge-encrypted: only finished jobs past their retention are deleted
+        let expired = seed(pool, &SeedJob::new(q, "Completed")).await;
+        let not_yet = seed(pool, &SeedJob::new(q, "Completed")).await;
+        let running = seed(pool, &SeedJob::new(q, "Running")).await;
+        let (past, future) = match pool.backend() {
+            Backend::Postgres => ("NOW() - INTERVAL '1 hour'", "NOW() + INTERVAL '1 hour'"),
+            Backend::MySql => (
+                "DATE_SUB(UTC_TIMESTAMP(6), INTERVAL 1 HOUR)",
+                "DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 1 HOUR)",
+            ),
+        };
+        let blob = match pool.backend() {
+            Backend::Postgres => "decode('00', 'hex')",
+            Backend::MySql => "UNHEX('00')",
+        };
+        for (id, when) in [(&expired, past), (&not_yet, future), (&running, past)] {
+            exec_sql(
+                pool,
+                &format!(
+                    "UPDATE hammerwork_jobs SET is_encrypted = true, retention_delete_at = {when}, \
+                     encrypted_payload = {blob}, encryption_nonce = {blob}, encryption_tag = {blob}, \
+                     encryption_key_id = 'test-key' WHERE id = '{id}'"
+                ),
+            )
+            .await;
+        }
+        let (jobs, archived) = count_expired_encrypted_jobs(pool).await.unwrap();
+        assert_eq!((jobs, archived), (1, 0));
+        run(&["purge-encrypted", "--dry-run"]).await.unwrap();
+        run(&["purge-encrypted"]).await.unwrap(); // needs --confirm
+        assert!(job_column(pool, &expired, "status").await.is_some());
+        run(&["purge-encrypted", "--confirm"]).await.unwrap();
+        assert!(job_column(pool, &expired, "status").await.is_none());
+        assert!(job_column(pool, &not_yet, "status").await.is_some());
+        assert!(job_column(pool, &running, "status").await.is_some());
+
+        assert!(table_exists(pool).await);
+        db.drop_db().await;
+    }
+
+    db_tests!(
+        maintenance_commands,
+        test_maintenance_commands_postgres,
+        test_maintenance_commands_mysql
+    );
 }
