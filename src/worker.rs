@@ -3298,92 +3298,13 @@ where
     ) -> Result<Option<usize>> {
         // Get current queue depth
         let current_depth = queue.get_queue_depth(queue_name).await?;
-        Ok(Self::apply_queue_depth(
+        Ok(apply_queue_depth(
             current_depth,
             Utc::now(),
             config,
             metrics,
             history,
         ))
-    }
-
-    /// Record a queue depth sample and decide whether to scale.
-    ///
-    /// Returns the new worker count (within `min_workers..=max_workers`) when the
-    /// average depth per worker crossed a threshold outside the cooldown period.
-    fn apply_queue_depth(
-        current_depth: u64,
-        now: DateTime<Utc>,
-        config: &AutoscaleConfig,
-        metrics: &Arc<std::sync::RwLock<AutoscaleMetrics>>,
-        history: &QueueDepthHistory,
-    ) -> Option<usize> {
-        // Update queue depth history, dropping entries outside the evaluation window
-        let avg_depth = match history.write() {
-            Ok(mut hist) => {
-                hist.push((now, current_depth));
-                let cutoff = now
-                    - chrono::Duration::from_std(config.evaluation_window)
-                        .unwrap_or(chrono::Duration::seconds(30));
-                hist.retain(|(timestamp, _)| *timestamp > cutoff);
-                if hist.is_empty() {
-                    current_depth as f64
-                } else {
-                    hist.iter().map(|(_, depth)| *depth as f64).sum::<f64>() / hist.len() as f64
-                }
-            }
-            Err(_) => current_depth as f64,
-        };
-
-        let mut m = metrics.write().ok()?;
-        m.current_queue_depth = current_depth;
-        m.avg_queue_depth = avg_depth;
-
-        // Check cooldown period
-        let time_since_last = m
-            .last_scale_time
-            .map(|t| now - t)
-            .and_then(|d| d.to_std().ok())
-            .unwrap_or(config.cooldown_period);
-        m.time_since_last_scale = time_since_last;
-        if time_since_last < config.cooldown_period {
-            return None;
-        }
-
-        // Calculate queue depth per worker
-        let depth_per_worker = if m.active_workers > 0 {
-            avg_depth / m.active_workers as f64
-        } else {
-            avg_depth
-        };
-
-        let decision = if depth_per_worker > config.scale_up_threshold as f64
-            && m.active_workers < config.max_workers
-        {
-            ScalingDecision::ScaleUp
-        } else if depth_per_worker < config.scale_down_threshold as f64
-            && m.active_workers > config.min_workers
-        {
-            ScalingDecision::ScaleDown
-        } else {
-            return None;
-        };
-
-        let new_count = match decision {
-            ScalingDecision::ScaleUp => {
-                (m.active_workers + config.scale_step).min(config.max_workers)
-            }
-            ScalingDecision::ScaleDown => {
-                (m.active_workers.saturating_sub(config.scale_step)).max(config.min_workers)
-            }
-        };
-        info!(
-            "Autoscaling: {:?} from {} to {} workers (avg queue depth: {:.1})",
-            decision, m.active_workers, new_count, m.avg_queue_depth
-        );
-        m.active_workers = new_count;
-        m.last_scale_time = Some(now);
-        Some(new_count)
     }
 
     /// Get current autoscaling metrics
@@ -3435,6 +3356,83 @@ where
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Record a queue depth sample and decide whether to scale.
+///
+/// Returns the new worker count (within `min_workers..=max_workers`) when the
+/// average depth per worker crossed a threshold outside the cooldown period.
+fn apply_queue_depth(
+    current_depth: u64,
+    now: DateTime<Utc>,
+    config: &AutoscaleConfig,
+    metrics: &Arc<std::sync::RwLock<AutoscaleMetrics>>,
+    history: &QueueDepthHistory,
+) -> Option<usize> {
+    // Update queue depth history, dropping entries outside the evaluation window
+    let avg_depth = match history.write() {
+        Ok(mut hist) => {
+            hist.push((now, current_depth));
+            let cutoff = now
+                - chrono::Duration::from_std(config.evaluation_window)
+                    .unwrap_or(chrono::Duration::seconds(30));
+            hist.retain(|(timestamp, _)| *timestamp > cutoff);
+            if hist.is_empty() {
+                current_depth as f64
+            } else {
+                hist.iter().map(|(_, depth)| *depth as f64).sum::<f64>() / hist.len() as f64
+            }
+        }
+        Err(_) => current_depth as f64,
+    };
+
+    let mut m = metrics.write().ok()?;
+    m.current_queue_depth = current_depth;
+    m.avg_queue_depth = avg_depth;
+
+    // Check cooldown period
+    let time_since_last = m
+        .last_scale_time
+        .map(|t| now - t)
+        .and_then(|d| d.to_std().ok())
+        .unwrap_or(config.cooldown_period);
+    m.time_since_last_scale = time_since_last;
+    if time_since_last < config.cooldown_period {
+        return None;
+    }
+
+    // Calculate queue depth per worker
+    let depth_per_worker = if m.active_workers > 0 {
+        avg_depth / m.active_workers as f64
+    } else {
+        avg_depth
+    };
+
+    let decision = if depth_per_worker > config.scale_up_threshold as f64
+        && m.active_workers < config.max_workers
+    {
+        ScalingDecision::ScaleUp
+    } else if depth_per_worker < config.scale_down_threshold as f64
+        && m.active_workers > config.min_workers
+    {
+        ScalingDecision::ScaleDown
+    } else {
+        return None;
+    };
+
+    let new_count = match decision {
+        ScalingDecision::ScaleUp => (m.active_workers + config.scale_step).min(config.max_workers),
+        ScalingDecision::ScaleDown => {
+            (m.active_workers.saturating_sub(config.scale_step)).max(config.min_workers)
+        }
+    };
+    info!(
+        "Autoscaling: {:?} from {} to {} workers (avg queue depth: {:.1})",
+        decision, m.active_workers, new_count, m.avg_queue_depth
+    );
+    m.active_workers = new_count;
+    m.last_scale_time = Some(now);
+    Some(new_count)
 }
 
 /// Spawn a task that calls `run` every `interval` (first right away) until shutdown is
@@ -4211,8 +4209,7 @@ mod tests {
         let (metrics, history) = autoscale_state(1);
         // 10 jobs for 1 worker is above the threshold of 4 per worker; the step of 5
         // is capped at max_workers.
-        let decision =
-            WorkerPool::<TestDb>::apply_queue_depth(10, Utc::now(), &config, &metrics, &history);
+        let decision = apply_queue_depth(10, Utc::now(), &config, &metrics, &history);
         assert_eq!(decision, Some(3));
         let m = metrics.read().unwrap().clone();
         assert_eq!(m.active_workers, 3);
@@ -4221,8 +4218,7 @@ mod tests {
         assert!(m.last_scale_time.is_some());
 
         // At max_workers it never goes higher, however deep the queue.
-        let decision =
-            WorkerPool::<TestDb>::apply_queue_depth(1000, Utc::now(), &config, &metrics, &history);
+        let decision = apply_queue_depth(1000, Utc::now(), &config, &metrics, &history);
         assert_eq!(decision, None);
         assert_eq!(metrics.read().unwrap().active_workers, 3);
     }
@@ -4231,11 +4227,9 @@ mod tests {
     fn autoscaling_scales_down_to_min_workers() {
         let config = fast_autoscale().with_scale_step(2);
         let (metrics, history) = autoscale_state(3);
-        let decision =
-            WorkerPool::<TestDb>::apply_queue_depth(0, Utc::now(), &config, &metrics, &history);
+        let decision = apply_queue_depth(0, Utc::now(), &config, &metrics, &history);
         assert_eq!(decision, Some(1));
-        let decision =
-            WorkerPool::<TestDb>::apply_queue_depth(0, Utc::now(), &config, &metrics, &history);
+        let decision = apply_queue_depth(0, Utc::now(), &config, &metrics, &history);
         assert_eq!(decision, None, "never below min_workers");
         assert_eq!(metrics.read().unwrap().active_workers, 1);
     }
@@ -4244,25 +4238,19 @@ mod tests {
     fn autoscaling_holds_between_thresholds_and_during_cooldown() {
         let (metrics, history) = autoscale_state(2);
         // 6 jobs / 2 workers = 3 per worker: between the thresholds (1 and 4).
-        let decision = WorkerPool::<TestDb>::apply_queue_depth(
-            6,
-            Utc::now(),
-            &fast_autoscale(),
-            &metrics,
-            &history,
-        );
+        let decision = apply_queue_depth(6, Utc::now(), &fast_autoscale(), &metrics, &history);
         assert_eq!(decision, None);
 
         let config = fast_autoscale().with_cooldown_period(Duration::from_secs(3600));
         let (metrics, history) = autoscale_state(1);
         let now = Utc::now();
         assert_eq!(
-            WorkerPool::<TestDb>::apply_queue_depth(100, now, &config, &metrics, &history),
+            apply_queue_depth(100, now, &config, &metrics, &history),
             Some(2),
             "the first decision is not in a cooldown"
         );
         assert_eq!(
-            WorkerPool::<TestDb>::apply_queue_depth(
+            apply_queue_depth(
                 100,
                 now + chrono::Duration::seconds(1),
                 &config,
@@ -4286,7 +4274,7 @@ mod tests {
         let (metrics, history) = autoscale_state(1);
         let start = Utc::now();
         for (offset, depth) in [(0, 30), (4, 10), (8, 20)] {
-            WorkerPool::<TestDb>::apply_queue_depth(
+            apply_queue_depth(
                 depth,
                 start + chrono::Duration::seconds(offset),
                 &config,
@@ -4297,7 +4285,7 @@ mod tests {
         assert_eq!(metrics.read().unwrap().avg_queue_depth, 20.0);
 
         // 12 seconds later the first sample (at 0s) is outside the 10s window.
-        WorkerPool::<TestDb>::apply_queue_depth(
+        apply_queue_depth(
             40,
             start + chrono::Duration::seconds(12),
             &config,
@@ -4309,13 +4297,6 @@ mod tests {
         assert_eq!(m.avg_queue_depth, (10.0 + 20.0 + 40.0) / 3.0);
         assert_eq!(m.current_queue_depth, 40);
     }
-
-    #[cfg(feature = "postgres")]
-    type TestDb = sqlx::Postgres;
-    #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-    type TestDb = sqlx::MySql;
-    #[cfg(not(any(feature = "postgres", feature = "mysql")))]
-    type TestDb = sqlx::Postgres;
 
     /// A worker on a pool that never connects (no database is needed to inspect how a
     /// worker is configured).
