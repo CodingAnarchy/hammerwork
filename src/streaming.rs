@@ -1422,11 +1422,9 @@ impl StreamManager {
                 let stream = {
                     let streams = streams.read().await;
                     match streams.get(&stream_id) {
-                        Some(stream) if stream.enabled => stream.clone(),
-                        _ => {
-                            // Stream disabled or removed, exit task
-                            break;
-                        }
+                        Some(stream) => stream.clone(),
+                        // Stream removed, exit task
+                        None => break,
                     }
                 };
 
@@ -1476,8 +1474,15 @@ impl StreamManager {
                 // Try to receive new events (with timeout to allow periodic flushing)
                 match tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await {
                     Ok(Ok(event)) => {
-                        // Check if event matches stream filter
-                        if stream.filter.matches(&event) {
+                        // A disabled stream drops events (but keeps listening, so
+                        // that enabling it again resumes delivery). Check the current
+                        // state: it may have changed while waiting.
+                        let enabled = streams
+                            .read()
+                            .await
+                            .get(&stream_id)
+                            .is_some_and(|stream| stream.enabled);
+                        if enabled && stream.filter.matches(&event) {
                             event_buffer.push(event);
                         }
                     }
@@ -4858,5 +4863,112 @@ mod tests {
             }
             other => panic!("expected a streaming error, got {other:?}"),
         }
+    }
+
+    /// Disabling a stream stops delivery, enabling it resumes, and removing it drops
+    /// its configuration, statistics and subscription. Unknown ids are errors.
+    #[tokio::test]
+    async fn test_stream_enable_disable_and_remove() {
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        let processor = InMemoryProcessor::default();
+        let stream = test_stream(1, immediate_retries(1));
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(processor.clone()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(manager.get_stream(stream_id).await.unwrap().id, stream_id);
+        assert_eq!(manager.list_streams().await.len(), 1);
+        assert_eq!(manager.get_all_stream_stats().await.len(), 1);
+        assert_eq!(manager.get_stats().await.active_streams, 1);
+
+        manager.disable_stream(stream_id).await.unwrap();
+        assert!(!manager.get_stream(stream_id).await.unwrap().enabled);
+        assert_eq!(manager.get_stats().await.active_streams, 0);
+        events.publish_event(completed_event()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            processor.delivered_ids().is_empty(),
+            "disabled streams send nothing"
+        );
+
+        manager.enable_stream(stream_id).await.unwrap();
+        let event = completed_event();
+        let event_id = event.event_id;
+        events.publish_event(event).await.unwrap();
+        wait_for_total_events(&manager, stream_id, 1).await;
+        assert_eq!(processor.delivered_ids(), vec![event_id]);
+
+        manager.remove_stream(stream_id).await.unwrap();
+        assert!(manager.get_stream(stream_id).await.is_none());
+        assert!(manager.get_stream_stats(stream_id).await.is_none());
+        assert!(manager.list_streams().await.is_empty());
+        events.publish_event(completed_event()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            processor.delivered_ids().len(),
+            1,
+            "removed streams send nothing"
+        );
+
+        let unknown = Uuid::new_v4();
+        for result in [
+            manager.enable_stream(unknown).await,
+            manager.disable_stream(unknown).await,
+        ] {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("not found"), "{err}");
+        }
+        // Removing an unknown stream is a no-op.
+        manager.remove_stream(unknown).await.unwrap();
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    #[test]
+    fn test_partition_keys_for_job_id_and_hashed_metadata() {
+        let mut event = completed_event();
+        event
+            .metadata
+            .insert("tenant".to_string(), "acme".to_string());
+
+        assert_eq!(
+            StreamManager::calculate_partition_key(&event, &PartitioningStrategy::JobId),
+            Some(event.job_id.to_string())
+        );
+        assert_eq!(
+            StreamManager::calculate_partition_key(
+                &event,
+                &PartitioningStrategy::Custom {
+                    metadata_key: "missing".to_string()
+                }
+            ),
+            None
+        );
+
+        let by_tenant = PartitioningStrategy::Hash {
+            fields: vec![
+                PartitionField::MetadataKey("tenant".to_string()),
+                PartitionField::JobId,
+            ],
+        };
+        let key = StreamManager::calculate_partition_key(&event, &by_tenant).unwrap();
+        assert!(key.parse::<u32>().unwrap() < 1000);
+        assert_eq!(
+            StreamManager::calculate_partition_key(&event, &by_tenant),
+            Some(key.clone()),
+            "deterministic"
+        );
+        let mut other = event.clone();
+        other
+            .metadata
+            .insert("tenant".to_string(), "globex".to_string());
+        assert_ne!(
+            StreamManager::calculate_partition_key(&other, &by_tenant),
+            Some(key),
+            "the metadata value is part of the key"
+        );
     }
 }
