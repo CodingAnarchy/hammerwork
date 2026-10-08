@@ -3,6 +3,8 @@
 //! Each scenario is written once against the `DatabaseQueue` trait and run against
 //! both backends.
 
+#![cfg(any(feature = "postgres", feature = "mysql"))]
+
 mod test_utils;
 
 use hammerwork::{

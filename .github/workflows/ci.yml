@@ -54,6 +54,38 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # The other jobs build with --all-features, which hides code that only compiles when some
+  # unrelated feature happens to be on. Check the library with each database backend alone,
+  # with no features, and with the optional subsystems on top of a single backend.
+  features:
+    name: feature combinations
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - postgres
+          - mysql
+          - postgres,mysql
+          - postgres,encryption
+          - mysql,tracing
+          # TODO(#23): add postgres,streaming once the backend placeholders fail fast.
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.features }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: clippy -p hammerwork --no-default-features --features "${{ matrix.features }}"
+        run: cargo clippy -p hammerwork --lib --tests --no-default-features --features "${{ matrix.features }}" -- -D warnings
+
   test:
     name: unit tests
     runs-on: ubuntu-latest

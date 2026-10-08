@@ -732,6 +732,10 @@ pub(crate) fn saturating_sub_from(
 }
 
 /// `now + duration`, saturating at the maximum representable timestamp.
+#[cfg_attr(
+    not(any(feature = "postgres", feature = "mysql", feature = "test")),
+    allow(dead_code)
+)]
 pub(crate) fn saturating_add_to(
     now: DateTime<Utc>,
     duration: std::time::Duration,
