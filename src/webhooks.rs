@@ -101,7 +101,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
-    sync::{RwLock, Semaphore},
+    sync::{RwLock, Semaphore, broadcast},
     time::{sleep, timeout},
 };
 use uuid::Uuid;
@@ -750,6 +750,17 @@ impl WebhookManager {
         let deliveries = self.deliveries.clone();
 
         self.listeners.spawn("listener", async move {
+            // Subscribe once and keep the receiver for the lifetime of the listener.
+            // Re-subscribing on every iteration would skip every event published
+            // while the previous one was being handled.
+            let mut receiver = {
+                let subscriptions = subscriptions.read().await;
+                match subscriptions.get(&webhook_id) {
+                    Some(subscription) => subscription.receiver.resubscribe(),
+                    None => return,
+                }
+            };
+
             loop {
                 // Get webhook configuration
                 let webhook = {
@@ -763,17 +774,10 @@ impl WebhookManager {
                     }
                 };
 
-                // Get subscription and receive events
-                let mut receiver = {
-                    let subscriptions = subscriptions.read().await;
-                    match subscriptions.get(&webhook_id) {
-                        Some(subscription) => subscription.receiver.resubscribe(),
-                        None => {
-                            // Subscription removed, exit task
-                            break;
-                        }
-                    }
-                };
+                // Exit once the subscription is removed
+                if !subscriptions.read().await.contains_key(&webhook_id) {
+                    break;
+                }
 
                 // Wait for events
                 match receiver.recv().await {
@@ -806,8 +810,16 @@ impl WebhookManager {
                             });
                         }
                     }
-                    Err(_) => {
-                        // Channel closed, exit task
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            "Webhook {} listener fell behind and skipped {} events; \
+                             consider a larger event buffer",
+                            webhook.name,
+                            skipped
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Event manager dropped, exit task
                         break;
                     }
                 }
@@ -1930,6 +1942,58 @@ mod tests {
         events.publish_event(completed_event()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_listener_delivers_every_event_in_a_burst() {
+        let (url, received) = slow_http_server(Duration::ZERO).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        manager
+            .add_webhook(WebhookConfig::new("burst".to_string(), url))
+            .await
+            .unwrap();
+
+        // Let the listener task start and subscribe before the events are published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..100 {
+            events.publish_event(completed_event()).await.unwrap();
+        }
+
+        // Every event published back to back must be delivered.
+        wait_for(&received, 100).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 100);
+    }
+
+    #[tokio::test]
+    async fn test_listener_keeps_delivering_after_falling_behind() {
+        let (url, received) = slow_http_server(Duration::ZERO).await;
+        let events = Arc::new(EventManager::new(crate::events::EventConfig {
+            max_buffer_size: 4,
+            ..Default::default()
+        }));
+        let manager = WebhookManager::new_default(events.clone());
+        manager
+            .add_webhook(WebhookConfig::new("lagging".to_string(), url))
+            .await
+            .unwrap();
+
+        // Let the listener task start and subscribe before the events are published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Overrun the 4-event channel so the listener sees RecvError::Lagged.
+        for _ in 0..50 {
+            events.publish_event(completed_event()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = received.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(before >= 1, "some events from the burst must be delivered");
+
+        // The listener must survive the lag and deliver later events.
+        events.publish_event(completed_event()).await.unwrap();
+        wait_for(&received, before + 1).await;
+        manager.shutdown(Duration::from_secs(5)).await;
     }
 
     #[tokio::test]

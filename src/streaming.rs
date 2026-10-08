@@ -167,7 +167,7 @@ use aws_config::BehaviorVersion;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, broadcast};
 use uuid::Uuid;
 
 /// Module for serializing UUID as string for TOML compatibility
@@ -1345,6 +1345,17 @@ impl StreamManager {
             let mut event_buffer: Vec<JobLifecycleEvent> = Vec::new();
             let mut last_flush = std::time::Instant::now();
 
+            // Subscribe once and keep the receiver for the lifetime of the listener.
+            // Re-subscribing on every iteration would skip every event published
+            // while the previous one was being handled.
+            let mut receiver = {
+                let subscriptions = subscriptions.read().await;
+                match subscriptions.get(&stream_id) {
+                    Some(subscription) => subscription.receiver.resubscribe(),
+                    None => return,
+                }
+            };
+
             loop {
                 // Get stream configuration
                 let stream = {
@@ -1358,17 +1369,10 @@ impl StreamManager {
                     }
                 };
 
-                // Get subscription and receive events
-                let mut receiver = {
-                    let subscriptions = subscriptions.read().await;
-                    match subscriptions.get(&stream_id) {
-                        Some(subscription) => subscription.receiver.resubscribe(),
-                        None => {
-                            // Subscription removed, exit task
-                            break;
-                        }
-                    }
-                };
+                // Exit once the subscription is removed
+                if !subscriptions.read().await.contains_key(&stream_id) {
+                    break;
+                }
 
                 // Check if we should flush the buffer
                 let should_flush = event_buffer.len() >= stream.buffer_config.batch_size
@@ -1414,8 +1418,16 @@ impl StreamManager {
                             event_buffer.push(event);
                         }
                     }
-                    Ok(Err(_)) => {
-                        // Channel closed, exit task
+                    Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                        tracing::warn!(
+                            "Stream {} listener fell behind and skipped {} events; \
+                             consider a larger event buffer",
+                            stream.name,
+                            skipped
+                        );
+                    }
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        // Event manager dropped, exit task
                         break;
                     }
                     Err(_) => {
@@ -4005,6 +4017,47 @@ mod tests {
         let stats = manager.get_stream_stats(stream_id).await.unwrap();
         assert_eq!(stats.total_events, 1);
         assert_eq!(manager.task_panics(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_listener_streams_every_event_in_a_burst() {
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        let stream = StreamConfig {
+            buffer_config: BufferConfig {
+                batch_size: 10,
+                max_buffer_time_secs: 1,
+                ..Default::default()
+            },
+            enabled: true,
+            ..Default::default()
+        };
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(InMemoryProcessor))
+            .await
+            .unwrap();
+
+        // Let the listener task start and subscribe before the events are published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..100 {
+            events.publish_event(completed_event()).await.unwrap();
+        }
+
+        // Every event published back to back must reach the processor.
+        let mut total = 0;
+        for _ in 0..100 {
+            total = manager
+                .get_stream_stats(stream_id)
+                .await
+                .map_or(0, |s| s.total_events);
+            if total >= 100 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        manager.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(total, 100);
     }
 
     #[tokio::test]
