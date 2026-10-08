@@ -242,6 +242,14 @@ pub mod rate_limit;
 pub mod retry;
 pub mod spawn;
 pub mod stats;
+#[cfg(any(
+    feature = "webhooks",
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
+mod task_tracker;
 pub mod tracing;
 pub mod worker;
 pub mod workflow;

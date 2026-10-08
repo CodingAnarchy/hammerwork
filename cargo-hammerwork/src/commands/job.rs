@@ -1,14 +1,21 @@
 use anyhow::Result;
 use clap::Subcommand;
 use hammerwork::queue::DatabaseQueue;
-use hammerwork::{Job, JobPriority};
+use hammerwork::{Job, JobPriority, JobStatus};
 use sqlx::Row;
 use tracing::info;
 
 use crate::config::Config;
-use crate::utils::database::DatabasePool;
+use crate::utils::database::{DatabasePool, JobQueueWrapper};
 use crate::utils::display::JobTable;
+use crate::utils::job_ops::{
+    JobSelector, cancel_many, cancel_one, retry_many, retry_one, select_job_ids,
+};
 use crate::utils::validation::{validate_json_payload, validate_priority, validate_status};
+
+/// Statuses `job retry` re-runs (stored capitalized).
+const RETRYABLE_STATUSES: [JobStatus; 3] =
+    [JobStatus::Failed, JobStatus::Dead, JobStatus::TimedOut];
 
 #[derive(Subcommand)]
 pub enum JobCommand {
@@ -81,7 +88,7 @@ pub enum JobCommand {
     Purge {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short, long, help = "Queue name to filter by")]
+        #[arg(short = 'Q', long, help = "Queue name to filter by")]
         queue: Option<String>,
         #[arg(long, help = "Only purge completed jobs")]
         completed: bool,
@@ -644,63 +651,47 @@ async fn retry_jobs(
         return Err(anyhow::anyhow!("Must specify --job-id, --queue, or --all"));
     }
 
-    let (query, affected) = match pool {
-        DatabasePool::Postgres(ref pg_pool) => {
-            if let Some(id) = job_id {
-                let job_uuid = uuid::Uuid::parse_str(&id)?;
-                let result = sqlx::query(
-                    "UPDATE hammerwork_jobs SET status = 'pending', attempts = 0, scheduled_at = NOW() 
-                     WHERE id = $1 AND status IN ('failed', 'dead')"
-                )
-                .bind(job_uuid)
-                .execute(pg_pool).await?;
-                ("single job".to_string(), result.rows_affected())
-            } else if let Some(queue_name) = queue {
-                let result = sqlx::query(
-                    "UPDATE hammerwork_jobs SET status = 'pending', attempts = 0, scheduled_at = NOW() 
-                     WHERE queue_name = $1 AND status IN ('failed', 'dead')"
-                )
-                .bind(&queue_name)
-                .execute(pg_pool).await?;
-                (format!("queue '{}'", queue_name), result.rows_affected())
-            } else {
-                let result = sqlx::query(
-                    "UPDATE hammerwork_jobs SET status = 'pending', attempts = 0, scheduled_at = NOW() 
-                     WHERE status IN ('failed', 'dead')"
-                )
-                .execute(pg_pool).await?;
-                ("all failed jobs".to_string(), result.rows_affected())
-            }
+    let wrapper = pool.clone().create_job_queue();
+
+    // A single job: report the library's verdict (not found / invalid transition).
+    if let Some(id) = job_id {
+        let job_uuid = uuid::Uuid::parse_str(&id)?;
+        match &wrapper {
+            JobQueueWrapper::Postgres(q) => retry_one(q, job_uuid).await?,
+            JobQueueWrapper::MySQL(q) => retry_one(q, job_uuid).await?,
         }
-        DatabasePool::MySQL(ref mysql_pool) => {
-            if let Some(id) = job_id {
-                let result = sqlx::query(
-                    "UPDATE hammerwork_jobs SET status = 'pending', attempts = 0, scheduled_at = NOW() 
-                     WHERE id = ? AND status IN ('failed', 'dead')"
-                )
-                .bind(id)
-                .execute(mysql_pool).await?;
-                ("single job".to_string(), result.rows_affected())
-            } else if let Some(queue_name) = queue {
-                let result = sqlx::query(
-                    "UPDATE hammerwork_jobs SET status = 'pending', attempts = 0, scheduled_at = NOW() 
-                     WHERE queue_name = ? AND status IN ('failed', 'dead')"
-                )
-                .bind(&queue_name)
-                .execute(mysql_pool).await?;
-                (format!("queue '{}'", queue_name), result.rows_affected())
-            } else {
-                let result = sqlx::query(
-                    "UPDATE hammerwork_jobs SET status = 'pending', attempts = 0, scheduled_at = NOW() 
-                     WHERE status IN ('failed', 'dead')"
-                )
-                .execute(mysql_pool).await?;
-                ("all failed jobs".to_string(), result.rows_affected())
-            }
-        }
+        info!("✅ Retried job {}", job_uuid);
+        return Ok(());
+    }
+
+    let (scope, selector) = match queue {
+        Some(queue_name) => (
+            format!("queue '{}'", queue_name),
+            JobSelector {
+                statuses: RETRYABLE_STATUSES.to_vec(),
+                queue: Some(queue_name),
+                extra: Vec::new(),
+            },
+        ),
+        None => (
+            "all failed jobs".to_string(),
+            JobSelector {
+                statuses: RETRYABLE_STATUSES.to_vec(),
+                ..Default::default()
+            },
+        ),
     };
 
-    info!("✅ Retried {} jobs for {}", affected, query);
+    let ids = select_job_ids(&pool, &selector).await?;
+    let result = retry_many(&wrapper, &ids).await;
+
+    info!("✅ Retried {} jobs for {}", result.succeeded, scope);
+    if !result.skipped.is_empty() {
+        info!(
+            "⚠️  Skipped {} jobs that changed state or could not be retried",
+            result.skipped.len()
+        );
+    }
     Ok(())
 }
 
@@ -716,57 +707,41 @@ async fn cancel_jobs(
         ));
     }
 
-    let (query, affected) = match pool {
-        DatabasePool::Postgres(ref pg_pool) => {
-            if let Some(id) = job_id {
-                let job_uuid = uuid::Uuid::parse_str(&id)?;
-                let result =
-                    sqlx::query("DELETE FROM hammerwork_jobs WHERE id = $1 AND status = 'pending'")
-                        .bind(job_uuid)
-                        .execute(pg_pool)
-                        .await?;
-                ("single job".to_string(), result.rows_affected())
-            } else if let Some(queue_name) = queue {
-                let result = sqlx::query(
-                    "DELETE FROM hammerwork_jobs WHERE queue_name = $1 AND status = 'pending'",
-                )
-                .bind(&queue_name)
-                .execute(pg_pool)
-                .await?;
-                (format!("queue '{}'", queue_name), result.rows_affected())
-            } else {
-                let result = sqlx::query("DELETE FROM hammerwork_jobs WHERE status = 'pending'")
-                    .execute(pg_pool)
-                    .await?;
-                ("all pending jobs".to_string(), result.rows_affected())
-            }
+    let wrapper = pool.clone().create_job_queue();
+    let allowed = [JobStatus::Pending];
+
+    if let Some(id) = job_id {
+        let job_uuid = uuid::Uuid::parse_str(&id)?;
+        match &wrapper {
+            JobQueueWrapper::Postgres(q) => cancel_one(q, job_uuid, &allowed).await?,
+            JobQueueWrapper::MySQL(q) => cancel_one(q, job_uuid, &allowed).await?,
         }
-        DatabasePool::MySQL(ref mysql_pool) => {
-            if let Some(id) = job_id {
-                let result =
-                    sqlx::query("DELETE FROM hammerwork_jobs WHERE id = ? AND status = 'pending'")
-                        .bind(id)
-                        .execute(mysql_pool)
-                        .await?;
-                ("single job".to_string(), result.rows_affected())
-            } else if let Some(queue_name) = queue {
-                let result = sqlx::query(
-                    "DELETE FROM hammerwork_jobs WHERE queue_name = ? AND status = 'pending'",
-                )
-                .bind(&queue_name)
-                .execute(mysql_pool)
-                .await?;
-                (format!("queue '{}'", queue_name), result.rows_affected())
-            } else {
-                let result = sqlx::query("DELETE FROM hammerwork_jobs WHERE status = 'pending'")
-                    .execute(mysql_pool)
-                    .await?;
-                ("all pending jobs".to_string(), result.rows_affected())
-            }
-        }
+        info!("✅ Cancelled job {}", job_uuid);
+        return Ok(());
+    }
+
+    let (scope, selector) = match queue {
+        Some(queue_name) => (
+            format!("queue '{}'", queue_name),
+            JobSelector {
+                statuses: vec![JobStatus::Pending],
+                queue: Some(queue_name),
+                extra: Vec::new(),
+            },
+        ),
+        None => (
+            "all pending jobs".to_string(),
+            JobSelector {
+                statuses: vec![JobStatus::Pending],
+                ..Default::default()
+            },
+        ),
     };
 
-    info!("✅ Cancelled {} jobs for {}", affected, query);
+    let ids = select_job_ids(&pool, &selector).await?;
+    let result = cancel_many(&wrapper, &ids, &allowed).await;
+
+    info!("✅ Cancelled {} jobs for {}", result.succeeded, scope);
     Ok(())
 }
 
@@ -790,26 +765,25 @@ async fn purge_jobs(
         return Ok(());
     }
 
-    let mut conditions = Vec::new();
-
+    // Statuses are stored capitalized; the queue name is bound, never interpolated.
+    let mut statuses = Vec::new();
     if completed {
-        conditions.push("status = 'completed'");
+        statuses.push("'Completed'");
     }
     if dead {
-        conditions.push("status = 'dead'");
+        statuses.push("'Dead'");
     }
     if failed {
-        conditions.push("status = 'failed'");
+        statuses.push("'Failed'");
     }
-
-    let status_condition = format!("({})", conditions.join(" OR "));
+    let status_condition = format!("status IN ({})", statuses.join(", "));
 
     let affected = match pool {
         DatabasePool::Postgres(ref pg_pool) => {
             let mut query = format!("DELETE FROM hammerwork_jobs WHERE {}", status_condition);
 
-            if let Some(queue_name) = queue {
-                query.push_str(&format!(" AND queue_name = '{}'", queue_name));
+            if queue.is_some() {
+                query.push_str(" AND queue_name = $1");
             }
 
             if let Some(days) = older_than_days {
@@ -819,14 +793,17 @@ async fn purge_jobs(
                 ));
             }
 
-            let result = sqlx::query(&query).execute(pg_pool).await?;
-            result.rows_affected()
+            let mut q = sqlx::query(&query);
+            if let Some(queue_name) = &queue {
+                q = q.bind(queue_name);
+            }
+            q.execute(pg_pool).await?.rows_affected()
         }
         DatabasePool::MySQL(ref mysql_pool) => {
             let mut query = format!("DELETE FROM hammerwork_jobs WHERE {}", status_condition);
 
-            if let Some(queue_name) = queue {
-                query.push_str(&format!(" AND queue_name = '{}'", queue_name));
+            if queue.is_some() {
+                query.push_str(" AND queue_name = ?");
             }
 
             if let Some(days) = older_than_days {
@@ -836,8 +813,11 @@ async fn purge_jobs(
                 ));
             }
 
-            let result = sqlx::query(&query).execute(mysql_pool).await?;
-            result.rows_affected()
+            let mut q = sqlx::query(&query);
+            if let Some(queue_name) = &queue {
+                q = q.bind(queue_name);
+            }
+            q.execute(mysql_pool).await?.rows_affected()
         }
     };
 

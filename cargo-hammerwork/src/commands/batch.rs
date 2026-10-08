@@ -6,8 +6,10 @@ use std::io::{BufRead, BufReader};
 use tracing::info;
 
 use crate::config::Config;
+use hammerwork::JobStatus;
+
 use crate::utils::database::DatabasePool;
-use crate::utils::db_helpers::*;
+use crate::utils::job_ops::{JobSelector, cancel_many, retry_many, select_job_ids};
 
 #[derive(Subcommand)]
 pub enum BatchCommand {
@@ -328,6 +330,76 @@ async fn insert_single_job(
     Ok(())
 }
 
+/// Build the selector for `batch retry` from its CLI filters.
+fn retry_selector(
+    queue: &Option<String>,
+    status: Option<&str>,
+    failed_since_hours: Option<u32>,
+    max_attempts_reached: bool,
+) -> Result<JobSelector> {
+    let statuses = match status {
+        Some("failed") => vec![JobStatus::Failed],
+        Some("dead") => vec![JobStatus::Dead],
+        None => vec![JobStatus::Failed, JobStatus::Dead],
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Invalid status filter. Use 'failed' or 'dead'"
+            ));
+        }
+    };
+
+    let mut extra = Vec::new();
+    if let Some(hours) = failed_since_hours {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+        extra.push(format!(
+            "failed_at > '{}'",
+            cutoff.format("%Y-%m-%d %H:%M:%S")
+        ));
+    }
+    if max_attempts_reached {
+        extra.push("attempts >= max_attempts".to_string());
+    }
+
+    Ok(JobSelector {
+        statuses,
+        queue: queue.clone(),
+        extra,
+    })
+}
+
+/// Build the selector for `batch cancel` from its CLI filters.
+fn cancel_selector(
+    queue: &Option<String>,
+    status: Option<&str>,
+    older_than_hours: Option<u32>,
+) -> Result<JobSelector> {
+    let statuses = match status {
+        Some("pending") => vec![JobStatus::Pending],
+        Some("running") => vec![JobStatus::Running],
+        None => vec![JobStatus::Pending, JobStatus::Running],
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Invalid status filter. Use 'pending' or 'running'"
+            ));
+        }
+    };
+
+    let mut extra = Vec::new();
+    if let Some(hours) = older_than_hours {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+        extra.push(format!(
+            "created_at < '{}'",
+            cutoff.format("%Y-%m-%d %H:%M:%S")
+        ));
+    }
+
+    Ok(JobSelector {
+        statuses,
+        queue: queue.clone(),
+        extra,
+    })
+}
+
 async fn batch_retry(
     pool: DatabasePool,
     queue: Option<String>,
@@ -344,48 +416,14 @@ async fn batch_retry(
         return Ok(());
     }
 
-    // Build filter conditions
-    let mut conditions = Vec::new();
-
-    if let Some(queue_name) = &queue {
-        conditions.push(format!("queue_name = '{}'", queue_name));
-    }
-
-    match status.as_deref() {
-        Some("failed") => conditions.push("status = 'Failed'".to_string()),
-        Some("dead") => conditions.push("status = 'Dead'".to_string()),
-        None => conditions.push("status IN ('Failed', 'Dead')".to_string()),
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Invalid status filter. Use 'failed' or 'dead'"
-            ));
-        }
-    }
-
-    if let Some(hours) = failed_since_hours {
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-        conditions.push(format!(
-            "failed_at > '{}'",
-            cutoff.format("%Y-%m-%d %H:%M:%S")
-        ));
-    }
-
-    if max_attempts_reached {
-        conditions.push("attempts >= max_attempts".to_string());
-    }
-
-    let where_clause = if conditions.is_empty() {
-        "1=1".to_string()
-    } else {
-        conditions.join(" AND ")
-    };
-
-    // Count jobs to retry
-    let count_query = format!(
-        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE {}",
-        where_clause
-    );
-    let job_count = execute_count_query(&pool, &count_query).await?;
+    let selector = retry_selector(
+        &queue,
+        status.as_deref(),
+        failed_since_hours,
+        max_attempts_reached,
+    )?;
+    let ids = select_job_ids(&pool, &selector).await?;
+    let job_count = ids.len();
 
     println!("🔄 Batch Retry Analysis");
     println!("═══════════════════════");
@@ -409,17 +447,18 @@ async fn batch_retry(
 
     info!("Retrying {} jobs", job_count);
 
-    // Update jobs to retry
-    let update_query = format!(
-        "UPDATE hammerwork_jobs SET status = 'Pending', attempts = 0, scheduled_at = '{}', error_message = NULL WHERE {}",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-        where_clause
-    );
-
-    let updated = execute_update_query(&pool, &update_query).await?;
+    // Each job goes through the library's guarded transition (and its side effects).
+    let wrapper = pool.create_job_queue();
+    let result = retry_many(&wrapper, &ids).await;
 
     println!("✅ Batch retry completed");
-    println!("   Retried {} jobs", updated);
+    println!("   Retried {} jobs", result.succeeded);
+    if !result.skipped.is_empty() {
+        println!(
+            "   Skipped {} jobs that changed state or could not be retried",
+            result.skipped.len()
+        );
+    }
 
     Ok(())
 }
@@ -439,44 +478,9 @@ async fn batch_cancel(
         return Ok(());
     }
 
-    // Build filter conditions
-    let mut conditions = Vec::new();
-
-    if let Some(queue_name) = &queue {
-        conditions.push(format!("queue_name = '{}'", queue_name));
-    }
-
-    match status.as_deref() {
-        Some("pending") => conditions.push("status = 'Pending'".to_string()),
-        Some("running") => conditions.push("status = 'Running'".to_string()),
-        None => conditions.push("status IN ('Pending', 'Running')".to_string()),
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Invalid status filter. Use 'pending' or 'running'"
-            ));
-        }
-    }
-
-    if let Some(hours) = older_than_hours {
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-        conditions.push(format!(
-            "created_at < '{}'",
-            cutoff.format("%Y-%m-%d %H:%M:%S")
-        ));
-    }
-
-    let where_clause = if conditions.is_empty() {
-        "1=1".to_string()
-    } else {
-        conditions.join(" AND ")
-    };
-
-    // Count jobs to cancel
-    let count_query = format!(
-        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE {}",
-        where_clause
-    );
-    let job_count = execute_count_query(&pool, &count_query).await?;
+    let selector = cancel_selector(&queue, status.as_deref(), older_than_hours)?;
+    let ids = select_job_ids(&pool, &selector).await?;
+    let job_count = ids.len();
 
     println!("🚫 Batch Cancel Analysis");
     println!("═══════════════════════");
@@ -494,12 +498,41 @@ async fn batch_cancel(
 
     info!("Cancelling {} jobs", job_count);
 
-    // Delete jobs
-    let delete_query = format!("DELETE FROM hammerwork_jobs WHERE {}", where_clause);
-    let deleted = execute_update_query(&pool, &delete_query).await?;
+    let wrapper = pool.create_job_queue();
+    let result = cancel_many(&wrapper, &ids, &selector.statuses).await;
 
     println!("✅ Batch cancel completed");
-    println!("   Cancelled {} jobs", deleted);
+    println!("   Cancelled {} jobs", result.succeeded);
+    if !result.skipped.is_empty() {
+        println!(
+            "   Skipped {} jobs that changed state before they could be cancelled",
+            result.skipped.len()
+        );
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_selector_uses_capitalized_statuses() {
+        let selector = retry_selector(&Some("emails".into()), Some("dead"), Some(2), true).unwrap();
+        assert_eq!(selector.statuses, vec![JobStatus::Dead]);
+        assert_eq!(selector.queue.as_deref(), Some("emails"));
+        assert_eq!(selector.extra.len(), 2);
+
+        let all = retry_selector(&None, None, None, false).unwrap();
+        assert_eq!(all.statuses, vec![JobStatus::Failed, JobStatus::Dead]);
+        assert!(retry_selector(&None, Some("bogus"), None, false).is_err());
+    }
+
+    #[test]
+    fn cancel_selector_validates_status() {
+        let sel = cancel_selector(&None, None, None).unwrap();
+        assert_eq!(sel.statuses, vec![JobStatus::Pending, JobStatus::Running]);
+        assert!(cancel_selector(&None, Some("failed"), None).is_err());
+    }
 }

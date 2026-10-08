@@ -97,6 +97,7 @@ use tracing::info;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone)]
 pub enum DatabasePool {
     Postgres(PgPool),
     MySQL(MySqlPool),

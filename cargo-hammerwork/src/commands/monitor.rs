@@ -275,7 +275,7 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
         DatabasePool::Postgres(ref pg_pool) => {
             let result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE status = 'running' AND started_at < NOW() - INTERVAL '1 hour'",
+                 WHERE status = 'Running' AND started_at < NOW() - INTERVAL '1 hour'",
             )
             .fetch_one(pg_pool)
             .await?;
@@ -284,7 +284,7 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
         DatabasePool::MySQL(ref mysql_pool) => {
             let result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE status = 'running' AND started_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)",
+                 WHERE status = 'Running' AND started_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)",
             )
             .fetch_one(mysql_pool)
             .await?;
@@ -313,7 +313,7 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
 
             let failed_result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE status = 'failed' AND failed_at > NOW() - INTERVAL '1 hour'",
+                 WHERE status = 'Failed' AND failed_at > NOW() - INTERVAL '1 hour'",
             )
             .fetch_one(pg_pool)
             .await?;
@@ -333,7 +333,7 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
 
             let failed_result = sqlx::query(
                 "SELECT COUNT(*) as count FROM hammerwork_jobs 
-                 WHERE status = 'failed' AND failed_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)",
+                 WHERE status = 'Failed' AND failed_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)",
             )
             .fetch_one(mysql_pool)
             .await?;
@@ -422,8 +422,8 @@ async fn show_metrics(
             let throughput_result = sqlx::query(&format!(
                 "SELECT 
                     COUNT(*) as total_jobs,
-                    COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_jobs,
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_jobs
+                    COUNT(CASE WHEN status = 'Completed' THEN 1 END) as completed_jobs,
+                    COUNT(CASE WHEN status = 'Failed' THEN 1 END) as failed_jobs
                  FROM hammerwork_jobs 
                  WHERE created_at > NOW() - INTERVAL '{}'{}",
                 pg_interval, queue_filter
@@ -460,7 +460,7 @@ async fn show_metrics(
             let avg_time_result = sqlx::query(&format!(
                 "SELECT CAST(AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) AS DOUBLE PRECISION) as avg_duration
                  FROM hammerwork_jobs 
-                 WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '{}'{}",
+                 WHERE status = 'Completed' AND completed_at > NOW() - INTERVAL '{}'{}",
                 pg_interval, queue_filter
             ))
             .fetch_one(&pg_pool)
@@ -474,8 +474,8 @@ async fn show_metrics(
             let throughput_result = sqlx::query(&format!(
                 "SELECT 
                     COUNT(*) as total_jobs,
-                    COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_jobs,
-                    COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_jobs
+                    COUNT(CASE WHEN status = 'Completed' THEN 1 END) as completed_jobs,
+                    COUNT(CASE WHEN status = 'Failed' THEN 1 END) as failed_jobs
                  FROM hammerwork_jobs 
                  WHERE created_at > DATE_SUB(NOW(), INTERVAL {}){}",
                 mysql_interval, queue_filter
@@ -512,7 +512,7 @@ async fn show_metrics(
             let avg_time_result = sqlx::query(&format!(
                 "SELECT CAST(AVG(TIMESTAMPDIFF(SECOND, started_at, completed_at)) AS DOUBLE) as avg_duration
                  FROM hammerwork_jobs 
-                 WHERE status = 'completed' AND completed_at > DATE_SUB(NOW(), INTERVAL {}){}",
+                 WHERE status = 'Completed' AND completed_at > DATE_SUB(NOW(), INTERVAL {}){}",
                 mysql_interval, queue_filter
             ))
             .fetch_one(&mysql_pool)

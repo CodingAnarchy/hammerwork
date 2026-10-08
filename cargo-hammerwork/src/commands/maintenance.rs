@@ -1,10 +1,13 @@
 use anyhow::Result;
 use clap::Subcommand;
+use hammerwork::JobStatus;
+use hammerwork::queue::DatabaseQueue;
 use tracing::info;
 
 use crate::config::Config;
-use crate::utils::database::DatabasePool;
+use crate::utils::database::{DatabasePool, JobQueueWrapper};
 use crate::utils::db_helpers::*;
+use crate::utils::job_ops::{JobSelector, retry_many, select_job_ids};
 
 #[derive(Subcommand)]
 pub enum MaintenanceCommand {
@@ -214,11 +217,16 @@ async fn cleanup_dead_jobs(
     let stale_cutoff = chrono::Utc::now() - chrono::Duration::hours(stale_hours as i64);
 
     // Find stale running jobs
-    let query = format!(
-        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Running' AND started_at < '{}'",
-        stale_cutoff.format("%Y-%m-%d %H:%M:%S")
-    );
-    let stale_count = execute_count_query(&pool, &query).await?;
+    let selector = JobSelector {
+        statuses: vec![JobStatus::Running],
+        queue: None,
+        extra: vec![format!(
+            "started_at < '{}'",
+            stale_cutoff.format("%Y-%m-%d %H:%M:%S")
+        )],
+    };
+    let stale_ids = select_job_ids(&pool, &selector).await?;
+    let stale_count = stale_ids.len();
 
     println!("🔍 Dead Jobs Analysis");
     println!("═══════════════════════");
@@ -239,15 +247,30 @@ async fn cleanup_dead_jobs(
 
     info!("Marking {} stale jobs as dead", stale_count);
 
-    // Mark stale jobs as dead
-    let update_query = format!(
-        "UPDATE hammerwork_jobs SET status = 'Dead', error_message = 'Job marked as dead due to inactivity' WHERE status = 'Running' AND started_at < '{}'",
-        stale_cutoff.format("%Y-%m-%d %H:%M:%S")
-    );
-    execute_update_query(&pool, &update_query).await?;
+    // Mark stale jobs as dead through the library's guarded transition.
+    const REASON: &str = "Job marked as dead due to inactivity";
+    let mut marked = 0usize;
+    match pool.clone().create_job_queue() {
+        JobQueueWrapper::Postgres(queue) => {
+            for id in &stale_ids {
+                match queue.mark_job_dead(*id, REASON).await {
+                    Ok(()) => marked += 1,
+                    Err(e) => tracing::warn!("Skipped job {}: {}", id, e),
+                }
+            }
+        }
+        JobQueueWrapper::MySQL(queue) => {
+            for id in &stale_ids {
+                match queue.mark_job_dead(*id, REASON).await {
+                    Ok(()) => marked += 1,
+                    Err(e) => tracing::warn!("Skipped job {}: {}", id, e),
+                }
+            }
+        }
+    }
 
     println!("✅ Dead jobs cleanup completed");
-    println!("   Marked {} jobs as dead", stale_count);
+    println!("   Marked {} jobs as dead", marked);
 
     Ok(())
 }
@@ -341,19 +364,27 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
     println!("Orphaned running jobs (no start time): {}", orphaned_count);
 
     if fix && orphaned_count > 0 {
-        let fix_query = "UPDATE hammerwork_jobs SET status = 'Pending' WHERE status = 'Running' AND started_at IS NULL";
-        execute_update_query(&pool, fix_query).await?;
-        println!("✅ Fixed {} orphaned jobs", orphaned_count);
+        let selector = JobSelector {
+            statuses: vec![JobStatus::Running],
+            queue: None,
+            extra: vec!["started_at IS NULL".to_string()],
+        };
+        let ids = select_job_ids(&pool, &selector).await?;
+        let wrapper = pool.clone().create_job_queue();
+        let result = retry_many(&wrapper, &ids).await;
+        println!("✅ Fixed {} orphaned jobs", result.succeeded);
     }
 
     // Check for invalid priorities
-    let invalid_priority_query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE priority NOT IN ('background', 'low', 'normal', 'high', 'critical')";
+    let invalid_priority_query =
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE priority NOT BETWEEN 0 AND 4";
     let invalid_priority_count = execute_count_query(&pool, invalid_priority_query).await?;
 
     println!("Jobs with invalid priority: {}", invalid_priority_count);
 
     if fix && invalid_priority_count > 0 {
-        let fix_priority_query = "UPDATE hammerwork_jobs SET priority = 'normal' WHERE priority NOT IN ('background', 'low', 'normal', 'high', 'critical')";
+        let fix_priority_query =
+            "UPDATE hammerwork_jobs SET priority = 2 WHERE priority NOT BETWEEN 0 AND 4";
         execute_update_query(&pool, fix_priority_query).await?;
         println!(
             "✅ Fixed {} jobs with invalid priority",
