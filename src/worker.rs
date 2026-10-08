@@ -2681,6 +2681,13 @@ where
 /// [`DatabaseQueue::requeue_stale_jobs`] to reclaim jobs left `Running` by workers
 /// that crashed. Configure it with [`WorkerPool::with_stale_job_reaper`] or disable it
 /// with [`WorkerPool::without_stale_job_reaper`].
+///
+/// Optionally, the pool also enforces the retention of encrypted jobs by calling
+/// [`DatabaseQueue::purge_expired_encrypted_jobs`] periodically
+/// ([`WorkerPool::with_encrypted_job_purge`]).
+///
+/// These maintenance tasks run each pass in its own task, so shutting the pool down
+/// never cancels a pass part-way through its database transaction.
 pub struct WorkerPool<DB: Database> {
     workers: Vec<Worker<DB>>,
     /// Signals shutdown to the supervisor started by `start` (dropping it also does)
@@ -2692,6 +2699,8 @@ pub struct WorkerPool<DB: Database> {
     /// Fallback staleness threshold for jobs without a lease (`None`: the longest
     /// worker lease duration)
     reaper_older_than: Option<Duration>,
+    /// How often encrypted jobs whose retention ended are purged (`None`: never)
+    encrypted_job_purge_interval: Option<Duration>,
     stats_collector: Option<Arc<dyn StatisticsCollector>>,
     /// Worker template for creating new workers during autoscaling
     worker_template: Option<Worker<DB>>,
@@ -2716,6 +2725,7 @@ where
             supervisor_done: None,
             reaper_interval: Some(DEFAULT_STALE_JOB_REAPER_INTERVAL),
             reaper_older_than: None,
+            encrypted_job_purge_interval: None,
             stats_collector: None,
             worker_template: None,
             autoscale_config: AutoscaleConfig::default(),
@@ -2740,6 +2750,21 @@ where
         }
         pool.add_worker(worker);
         pool
+    }
+
+    /// Build a pool from a [`HammerworkConfig`](crate::config::HammerworkConfig).
+    ///
+    /// Like [`WorkerPool::from_config`] with `config.worker`, and also schedules the
+    /// encrypted job retention purge every `encryption.purge_interval_secs`, when set
+    /// ([`WorkerPool::with_encrypted_job_purge`]). Validates the `encryption` section.
+    pub fn from_hammerwork_config(
+        worker: Worker<DB>,
+        config: &crate::config::HammerworkConfig,
+    ) -> Result<Self> {
+        config.encryption.validate()?;
+        let mut pool = Self::from_config(worker, &config.worker);
+        pool.encrypted_job_purge_interval = config.encryption.purge_interval();
+        Ok(pool)
     }
 
     pub fn with_stats_collector(mut self, stats_collector: Arc<dyn StatisticsCollector>) -> Self {
@@ -2780,6 +2805,27 @@ where
     /// scheduled `cargo hammerwork job requeue-stale`).
     pub fn without_stale_job_reaper(mut self) -> Self {
         self.reaper_interval = None;
+        self
+    }
+
+    /// Purge encrypted jobs whose retention period ended every `interval`.
+    ///
+    /// The pool calls [`DatabaseQueue::purge_expired_encrypted_jobs`], which deletes
+    /// finished encrypted jobs (and archived ones) past their `retention_delete_at`; it
+    /// needs no encryption key. Off by default: without it, run
+    /// `cargo hammerwork maintenance purge-encrypted` on a schedule. Running purges in
+    /// several pools or processes at once is safe.
+    ///
+    /// The first purge runs when the pool starts. Each purge runs in its own task, so
+    /// shutting the pool down never cancels one part-way through its transaction.
+    pub fn with_encrypted_job_purge(mut self, interval: Duration) -> Self {
+        self.encrypted_job_purge_interval = Some(interval);
+        self
+    }
+
+    /// Disable the encrypted job retention purge (the default).
+    pub fn without_encrypted_job_purge(mut self) -> Self {
+        self.encrypted_job_purge_interval = None;
         self
     }
 
@@ -2827,14 +2873,20 @@ where
         self.supervisor_done = Some(done_rx);
 
         let workers = std::mem::take(&mut self.workers);
-        let reaper = self.start_stale_job_reaper(&workers, signal_rx.clone());
+        let maintenance: Vec<tokio::task::JoinHandle<()>> = [
+            self.start_stale_job_reaper(&workers, signal_rx.clone()),
+            self.start_encrypted_job_purge(&workers, signal_rx.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
         // Start autoscaling task if enabled
         if self.autoscale_config.enabled {
             self.start_autoscaling_task().await?;
         }
 
-        let supervisor = tokio::spawn(Self::supervise(workers, signal_rx, done_tx, reaper));
+        let supervisor = tokio::spawn(Self::supervise(workers, signal_rx, done_tx, maintenance));
 
         // Dropping a JoinHandle detaches the task, so the supervisor keeps running
         // even if this future is dropped.
@@ -2870,7 +2922,7 @@ where
         workers: Vec<Worker<DB>>,
         mut signal_rx: watch::Receiver<bool>,
         done_tx: watch::Sender<bool>,
-        reaper: Option<tokio::task::JoinHandle<()>>,
+        maintenance: Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<()> {
         let templates: Vec<Worker<DB>> = workers.to_vec();
         let mut set = JoinSet::new();
@@ -2939,8 +2991,9 @@ where
             }
         }
 
-        if let Some(reaper) = reaper {
-            reaper.abort();
+        // Stops the maintenance loops; a pass already running finishes in its own task
+        for task in maintenance {
+            task.abort();
         }
         info!("All workers stopped");
         done_tx.send_replace(true);
@@ -2951,7 +3004,7 @@ where
     fn start_stale_job_reaper(
         &self,
         workers: &[Worker<DB>],
-        mut signal_rx: watch::Receiver<bool>,
+        signal_rx: watch::Receiver<bool>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let interval = self.reaper_interval?;
         let queue = Arc::clone(&workers.first()?.queue);
@@ -2964,23 +3017,40 @@ where
                 .unwrap_or(DEFAULT_LEASE_DURATION)
         });
 
-        Some(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = signal_rx.changed() => break,
-                    _ = ticker.tick() => {
-                        match queue.requeue_stale_jobs(older_than).await {
-                            Ok(recovery) if !recovery.is_empty() => info!(
-                                "Stale job reaper requeued {} and marked {} dead",
-                                recovery.requeued.len(),
-                                recovery.dead.len()
-                            ),
-                            Ok(_) => {}
-                            Err(e) => warn!("Stale job reaper failed: {}", e),
-                        }
-                    }
+        Some(spawn_periodic(interval, signal_rx, move || {
+            let queue = Arc::clone(&queue);
+            async move {
+                match queue.requeue_stale_jobs(older_than).await {
+                    Ok(recovery) if !recovery.is_empty() => info!(
+                        "Stale job reaper requeued {} and marked {} dead",
+                        recovery.requeued.len(),
+                        recovery.dead.len()
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!("Stale job reaper failed: {}", e),
+                }
+            }
+        }))
+    }
+
+    /// Spawn the periodic encrypted job retention purge, if enabled.
+    fn start_encrypted_job_purge(
+        &self,
+        workers: &[Worker<DB>],
+        signal_rx: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let interval = self.encrypted_job_purge_interval?;
+        let queue = Arc::clone(&workers.first()?.queue);
+        Some(spawn_periodic(interval, signal_rx, move || {
+            let queue = Arc::clone(&queue);
+            async move {
+                match queue.purge_expired_encrypted_jobs().await {
+                    Ok(purge) if purge.total() > 0 => info!(
+                        "Encrypted job purge deleted {} jobs and {} archived jobs",
+                        purge.jobs, purge.archived_jobs
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!("Encrypted job purge failed: {}", e),
                 }
             }
         }))
@@ -3195,6 +3265,41 @@ where
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Spawn a task that calls `run` every `interval` (first right away) until shutdown is
+/// signalled on `signal_rx` (or its sender is dropped).
+///
+/// Each run is spawned as its own task and awaited, so neither the shutdown signal nor
+/// aborting the returned handle cancels a run part-way: database work always reaches
+/// commit or rollback instead of leaving a pooled connection inside a transaction.
+fn spawn_periodic<F, Fut>(
+    interval: Duration,
+    mut signal_rx: watch::Receiver<bool>,
+    run: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = signal_rx.changed() => break,
+                _ = ticker.tick() => {}
+            }
+            if *signal_rx.borrow() {
+                break;
+            }
+            if let Err(e) = tokio::spawn(run()).await
+                && e.is_panic()
+            {
+                error!("Periodic maintenance task panicked: {}", e);
+            }
+        }
+    })
 }
 
 impl<DB: Database> Drop for WorkerPool<DB> {
@@ -4103,5 +4208,79 @@ mod tests {
         let formatted: HandlerFuture = Box::pin(async { panic!("code {}", 42) });
         let payload = CatchUnwind { inner: formatted }.await.unwrap_err();
         assert_eq!(panic_message(payload.as_ref()), "code 42");
+    }
+
+    #[tokio::test]
+    async fn spawn_periodic_runs_until_shutdown() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (signal_tx, signal_rx) = watch::channel(false);
+        let counter = Arc::clone(&runs);
+        let task = spawn_periodic(Duration::from_millis(10), signal_rx, move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        signal_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop stops on shutdown")
+            .unwrap();
+        let seen = runs.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(seen >= 2, "ran {seen} times");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), seen);
+    }
+
+    /// Shutting down (or aborting the loop, as the pool's supervisor does) while a run is
+    /// in flight must not cancel the run: it would drop a database transaction mid-way.
+    #[tokio::test]
+    async fn spawn_periodic_never_cancels_a_run() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let (signal_tx, signal_rx) = watch::channel(false);
+        let (run_started, run_finished) = (Arc::clone(&started), Arc::clone(&finished));
+        let task = spawn_periodic(Duration::from_secs(3600), signal_rx, move || {
+            let (started, finished) = (Arc::clone(&run_started), Arc::clone(&run_finished));
+            async move {
+                started.notify_one();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                finished.store(true, Ordering::SeqCst);
+            }
+        });
+        started.notified().await;
+        signal_tx.send_replace(true);
+        task.abort();
+        assert!(!finished.load(Ordering::SeqCst));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the in-flight run completed after the loop was stopped"
+        );
+    }
+
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    #[test]
+    fn encrypted_job_purge_is_opt_in_and_configurable() {
+        #[cfg(feature = "postgres")]
+        type Db = sqlx::Postgres;
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        type Db = sqlx::MySql;
+
+        let pool = WorkerPool::<Db>::new();
+        assert_eq!(pool.encrypted_job_purge_interval, None);
+        let pool = pool.with_encrypted_job_purge(Duration::from_secs(30));
+        assert_eq!(
+            pool.encrypted_job_purge_interval,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            pool.without_encrypted_job_purge()
+                .encrypted_job_purge_interval,
+            None
+        );
     }
 }

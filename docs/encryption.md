@@ -224,11 +224,90 @@ How it works:
 - **The engine decides.** The queue's engine sets the algorithm, key and compression. A job whose config names another algorithm, or a `key_id` other than the engine's, is rejected. Jobs without an encryption config are stored unchanged, also on a queue with an engine.
 - **Fail closed.** Enqueueing a job that has an encryption config on a queue without an engine fails with `HammerworkError::Encryption`.
 - **Dequeue and reads.** `dequeue`, `get_job`, `get_batch_jobs` and the other reads return jobs as stored: `is_encrypted` is `true`, `payload` is redacted and `encrypted_payload` holds the ciphertext. The web dashboard and `cargo hammerwork job show` therefore show the redacted payload (`job show` also prints the key id, algorithm and retention). They never need a key.
-- **Workers.** A worker decrypts the job (`JobQueue::decrypt_job`) just before it calls the handler; only the handler sees the plaintext. Event hooks, webhooks and the recorded outcome keep using the redacted job. If the payload cannot be decrypted (the worker's queue has no engine, the engine does not have the job's key, or the data was tampered with) the run fails with `Cannot decrypt the payload of job ...` and goes through the normal retry / dead path; the handler is not called.
+- **Workers.** A worker decrypts the job (`JobQueue::decrypt_job`) just before it calls the handler; only the handler sees the plaintext. Event hooks, webhooks and the recorded outcome keep using the redacted job. If the payload cannot be decrypted (the worker's queue has no engine, the engine does not have the job's key, the data was tampered with, or the ciphertext belongs to another job; see [Binding the ciphertext to its job](#binding-the-ciphertext-to-its-job)) the run fails with `Cannot decrypt the payload of job ...` and goes through the normal retry / dead path; the handler is not called.
 - **Reading the plaintext yourself.** `queue.decrypt_job(job).await?` returns the job with its plaintext payload.
 - **Without the `encryption` feature** a build cannot encrypt or decrypt. It still reads `is_encrypted`, so its workers fail encrypted jobs instead of running them with the redacted payload, and archiving and restoring still carry the ciphertext.
 
 The payload hash stored with the ciphertext is an HMAC-SHA256 keyed by the data key (`hmac-sha256:<hex>`), not a plain SHA-256, so a low-entropy value (an SSN, a card number) cannot be recovered from it by brute force. Payloads encrypted by earlier versions with a plain SHA-256 still decrypt.
+
+### Binding the ciphertext to its job
+
+The ciphertext of a job is bound to that job. It is encrypted with AEAD associated data made of the job's id, queue name, key id, algorithm, PII field list and the list of fields that were encrypted (`encryption::job_payload::job_associated_data`). Decryption recomputes the associated data from the stored row, so with write access to the database, an attacker who:
+
+- swaps the `encrypted_payload` / `encryption_nonce` / `encryption_tag` of two jobs,
+- moves a job to another queue (`queue_name`), or
+- changes its key id, algorithm or `pii_fields`
+
+gets a job that fails to decrypt (the worker fails the run without calling the handler) instead of one that decrypts as another job's data. The associated data is not stored; only the format is recorded, as `format_version` in `encryption_metadata`:
+
+| `format_version` | Meaning |
+|---|---|
+| missing or `0` | No associated data. Payloads written before this change (and payloads encrypted directly with `EncryptionEngine::encrypt_payload`). They still decrypt, and are not re-encrypted. |
+| `1` | Bound to the job as described above. Written by `JobQueue` and `TestQueue` for every newly encrypted job. |
+| anything else | Written by a newer version: refused. |
+
+Resetting `format_version` to `0` on a bound payload does not get around the binding: the ciphertext then fails authentication without the associated data it was encrypted with. Payloads written in the old format can still be swapped among themselves; re-enqueue those jobs if that matters. The retention columns are not covered: anyone who can write to the table can also delete or keep rows.
+
+Archiving and restoring keep the job id, queue name and encryption columns, so restored jobs decrypt. `EncryptionEngine::encrypt_payload_with_associated_data` / `decrypt_payload_with_associated_data` expose the same mechanism for payloads you encrypt yourself.
+
+### Archived encrypted jobs
+
+Archiving moves the ciphertext to `hammerwork_jobs_archive` without decrypting it. `get_job` of an archived job returns it with `status == Archived`, `is_encrypted`, `pii_fields` and the redacted payload, but not the ciphertext, so `decrypt_job` on it fails with an error that says to restore it. To read the plaintext of an archived job, restore it first:
+
+```rust
+let job = queue.restore_archived_job(job_id).await?; // back in hammerwork_jobs, ciphertext unchanged
+let job = queue.get_job(job_id).await?.unwrap();
+let plaintext = queue.decrypt_job(job).await?.payload;
+```
+
+There is no decrypt-on-read for the archive: archived jobs are cold data, and keeping the plaintext path to the live table keeps one place (restore) where an archived payload comes back. Retention still applies to archived jobs (see [Enforcing Retention](#enforcing-retention)).
+
+### Encrypting whole queues
+
+`JobQueue::with_encrypted_queues(["payments"])` (or `["*"]` for every queue) encrypts every job enqueued to those queues, also jobs created without `with_encryption`: they get the engine's algorithm and key id, and their PII fields (if any) or whole payload is encrypted. Jobs with their own encryption config are unaffected. This is how a queue configured from `hammerwork.toml` encrypts without code changes.
+
+### Configuration file
+
+`JobQueue::from_config` reads an optional `[encryption]` section of `HammerworkConfig` (`PayloadEncryptionConfig`) and sets up the engine itself:
+
+```toml
+[encryption]
+enabled = true
+algorithm = "AES256GCM"                          # or "ChaCha20Poly1305"
+key_source = "env://HAMMERWORK_ENCRYPTION_KEY"   # or aws://, gcp://, vault://, azure://
+key_id = "payments-2027"                         # default "default"
+compression = false
+default_retention_secs = 2592000                 # retention of UseDefault jobs (30 days)
+purge_interval_secs = 3600                       # WorkerPool::from_hammerwork_config purges hourly
+encrypted_queues = ["payments"]                  # encrypt these queues' jobs ("*": all)
+
+[encryption.decryption_keys]                     # decrypt-only keys of earlier key ids
+"payments-2026" = "env://HAMMERWORK_KEY_2026"
+```
+
+```rust
+let config = HammerworkConfig::from_file("hammerwork.toml")?;
+let queue = Arc::new(JobQueue::<sqlx::Postgres>::from_config(&config).await?);
+let pool = WorkerPool::from_hammerwork_config(worker, &config)?;
+```
+
+- **Keys are referenced, never written in the file.** `key_source` and the `decryption_keys` values are `KeySourceRef`s: `env://VAR` (a base64 key in that environment variable) or a KMS URI (`aws://`, `gcp://`, `vault://`, `azure://`, each needing its cargo feature). Static keys and anything else are rejected when the file is loaded, and the error does not repeat the value. `Debug` output and `save_to_file` only ever contain these references.
+- **Fails closed.** Unknown fields (for example a key under a guessed name) and unknown algorithms are load errors. `from_config` fails if the section is enabled but the key cannot be loaded, if `encrypted_queues` is set while `enabled = false`, if a decryption key reuses the encryption key id, or if the build lacks the `encryption` feature.
+- **Environment.** `HammerworkConfig::from_env` reads `HAMMERWORK_ENCRYPTION_ENABLED`, `_ALGORITHM`, `_KEY_SOURCE`, `_KEY_ID`, `_COMPRESSION`, `_DEFAULT_RETENTION_SECS`, `_PURGE_INTERVAL_SECS`, `_ENCRYPTED_QUEUES` (comma-separated) and `_DECRYPTION_KEYS` (`id=source,id=source`). Invalid values are errors. `HAMMERWORK_ENCRYPTION_KEY` itself is the default key source (the key), not a setting.
+- `aws://` and `gcp://` sources work: the engine is created with `EncryptionEngine::new_with_pool` on the queue's pool.
+
+### Testing with `TestQueue`
+
+The in-memory `TestQueue` (feature `test`) applies the same semantics when given an engine, so unit tests exercise the real redaction and decryption paths:
+
+```rust
+let queue = TestQueue::new().with_encryption(EncryptionEngine::new(config.clone()).await?);
+let id = queue.enqueue(Job::new("payments".into(), json!({"card": "4111"})).with_encryption(config)).await?;
+let stored = queue.get_job(id).await?.unwrap();          // {"encrypted": true}, is_encrypted
+let opened = queue.decrypt_job(stored).await?;           // what a handler sees
+```
+
+It seals jobs in `enqueue`, `enqueue_batch`, `enqueue_workflow` and `enqueue_cron_job`, rejects jobs with an encryption config when it has no engine, binds ciphertexts to their jobs, supports `with_encrypted_queues`, hides the ciphertext of archived jobs until they are restored, and implements `purge_expired_encrypted_jobs` against its `MockClock`.
 
 ### Key Rotation for Job Payloads
 
@@ -383,7 +462,15 @@ let policy = RetentionPolicy::UseDefault;
 
 ### Enforcing Retention
 
-When a job is encrypted, its retention policy (`Job::with_retention_policy`, or `UseDefault`, which uses the engine's `default_retention`) is stored in `retention_policy` and the deletion time in `retention_delete_at`. Nothing is deleted automatically; run the purge periodically:
+When a job is encrypted, its retention policy (`Job::with_retention_policy`, or `UseDefault`, which uses the engine's `default_retention`) is stored in `retention_policy` and the deletion time in `retention_delete_at`. Expired jobs are deleted by a purge, which you run periodically. The simplest way is to let a `WorkerPool` schedule it:
+
+```rust
+let mut pool = WorkerPool::new()
+    .with_encrypted_job_purge(Duration::from_secs(3600)); // off by default
+// or WorkerPool::from_hammerwork_config(worker, &config)? with encryption.purge_interval_secs
+```
+
+The pool runs the first purge when it starts and then every interval, on its first worker's queue. Each purge runs in its own task, so shutting the pool down never cancels one part-way through its transaction. Several pools or processes purging at once is safe. Without a pool purge, call it yourself:
 
 ```rust
 let purge = queue.purge_expired_encrypted_jobs().await?;

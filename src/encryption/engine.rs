@@ -20,7 +20,10 @@ use tracing::info;
 
 #[cfg(feature = "encryption")]
 use {
-    aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce, aead::Aead},
+    aes_gcm::{
+        Aes256Gcm, Key, KeyInit, Nonce,
+        aead::{Aead, Payload},
+    },
     base64::Engine,
     chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChaChaNonce},
     rand::{RngCore, rngs::OsRng},
@@ -628,7 +631,27 @@ impl EncryptionEngine {
         pii_fields: &[impl AsRef<str>],
         retention_policy: RetentionPolicy,
     ) -> Result<EncryptedPayload, EncryptionError> {
-        let result = self.encrypt_value(payload, pii_fields, retention_policy);
+        self.encrypt_payload_with_associated_data(payload, pii_fields, retention_policy, &[])
+            .await
+    }
+
+    /// Encrypts a payload and authenticates `associated_data` with it.
+    ///
+    /// The associated data is not stored: [`EncryptionEngine::decrypt_payload_with_associated_data`]
+    /// must be given the same bytes, or decryption fails. Use it to bind the ciphertext
+    /// to its context (for job payloads, [`JobQueue`](crate::JobQueue) binds it to the
+    /// job id, queue name, key id, algorithm and PII fields; see
+    /// [`job_payload`](super::job_payload)), so a ciphertext copied into another context
+    /// cannot be decrypted there. Empty associated data is the same as none
+    /// ([`EncryptionEngine::encrypt_payload_with_retention`]).
+    pub async fn encrypt_payload_with_associated_data(
+        &self,
+        payload: &Value,
+        pii_fields: &[impl AsRef<str>],
+        retention_policy: RetentionPolicy,
+        associated_data: &[u8],
+    ) -> Result<EncryptedPayload, EncryptionError> {
+        let result = self.encrypt_value(payload, pii_fields, retention_policy, associated_data);
         if result.is_err()
             && let Ok(mut stats) = self.stats.lock()
         {
@@ -642,6 +665,7 @@ impl EncryptionEngine {
         payload: &Value,
         pii_fields: &[impl AsRef<str>],
         retention_policy: RetentionPolicy,
+        associated_data: &[u8],
     ) -> Result<EncryptedPayload, EncryptionError> {
         let start_time = Instant::now();
         let key = self.active_key()?;
@@ -659,7 +683,8 @@ impl EncryptionEngine {
             payload_bytes
         };
 
-        let (ciphertext, nonce, tag) = self.encrypt_data(&key, &data_to_encrypt)?;
+        let (ciphertext, nonce, tag) =
+            self.encrypt_data(&key, &data_to_encrypt, associated_data)?;
 
         let pii_field_names: Vec<String> =
             pii_fields.iter().map(|f| f.as_ref().to_string()).collect();
@@ -724,7 +749,21 @@ impl EncryptionEngine {
         &self,
         encrypted_payload: &EncryptedPayload,
     ) -> Result<Value, EncryptionError> {
-        let result = self.decrypt_value(encrypted_payload);
+        self.decrypt_payload_with_associated_data(encrypted_payload, &[])
+            .await
+    }
+
+    /// Decrypts a payload encrypted by
+    /// [`EncryptionEngine::encrypt_payload_with_associated_data`].
+    ///
+    /// Fails with [`EncryptionError::DecryptionFailed`] unless `associated_data` is
+    /// exactly the associated data the payload was encrypted with.
+    pub async fn decrypt_payload_with_associated_data(
+        &self,
+        encrypted_payload: &EncryptedPayload,
+        associated_data: &[u8],
+    ) -> Result<Value, EncryptionError> {
+        let result = self.decrypt_value(encrypted_payload, associated_data);
         if result.is_err()
             && let Ok(mut stats) = self.stats.lock()
         {
@@ -736,6 +775,7 @@ impl EncryptionEngine {
     fn decrypt_value(
         &self,
         encrypted_payload: &EncryptedPayload,
+        associated_data: &[u8],
     ) -> Result<Value, EncryptionError> {
         let start_time = Instant::now();
         let lock_error =
@@ -774,7 +814,7 @@ impl EncryptionEngine {
         let mut first_error = None;
         let mut decrypted = None;
         for key in &candidates {
-            match self.decrypt_data(&ciphertext, &nonce, &tag, key, algorithm) {
+            match self.decrypt_data(&ciphertext, &nonce, &tag, key, algorithm, associated_data) {
                 Ok(data) => {
                     decrypted = Some((key, data));
                     break;
@@ -969,7 +1009,9 @@ impl EncryptionEngine {
         &self,
         key: &[u8],
         data: &[u8],
+        aad: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), EncryptionError> {
+        let payload = Payload { msg: data, aad };
         check_key_size(key)?;
         match self.config.algorithm {
             EncryptionAlgorithm::AES256GCM => {
@@ -982,7 +1024,7 @@ impl EncryptionEngine {
                 let nonce = Nonce::from_slice(&nonce_bytes);
 
                 // Encrypt the data
-                let ciphertext_with_tag = cipher.encrypt(nonce, data).map_err(|e| {
+                let ciphertext_with_tag = cipher.encrypt(nonce, payload).map_err(|e| {
                     EncryptionError::EncryptionFailed(format!("AES encryption failed: {}", e))
                 })?;
 
@@ -1003,7 +1045,7 @@ impl EncryptionEngine {
                 let nonce = ChaChaNonce::from_slice(&nonce_bytes);
 
                 // Encrypt the data
-                let ciphertext_with_tag = cipher.encrypt(nonce, data).map_err(|e| {
+                let ciphertext_with_tag = cipher.encrypt(nonce, payload).map_err(|e| {
                     EncryptionError::EncryptionFailed(format!("ChaCha20 encryption failed: {}", e))
                 })?;
 
@@ -1025,6 +1067,7 @@ impl EncryptionEngine {
         tag: &[u8],
         key: &[u8],
         algorithm: &EncryptionAlgorithm,
+        aad: &[u8],
     ) -> Result<Vec<u8>, EncryptionError> {
         // The nonce and tag come from storage: reject wrong sizes instead of panicking
         // in `from_slice`.
@@ -1050,7 +1093,13 @@ impl EncryptionEngine {
                 let nonce = Nonce::from_slice(nonce);
 
                 cipher
-                    .decrypt(nonce, ciphertext_with_tag.as_slice())
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: ciphertext_with_tag.as_slice(),
+                            aad,
+                        },
+                    )
                     .map_err(|e| {
                         EncryptionError::DecryptionFailed(format!("AES decryption failed: {}", e))
                     })
@@ -1061,7 +1110,13 @@ impl EncryptionEngine {
                 let nonce = ChaChaNonce::from_slice(nonce);
 
                 cipher
-                    .decrypt(nonce, ciphertext_with_tag.as_slice())
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: ciphertext_with_tag.as_slice(),
+                            aad,
+                        },
+                    )
                     .map_err(|e| {
                         EncryptionError::DecryptionFailed(format!(
                             "ChaCha20 decryption failed: {}",

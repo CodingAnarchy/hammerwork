@@ -512,6 +512,9 @@ impl JobRow {
                 encrypted_at,
                 delete_at: self.retention_delete_at,
                 payload_hash: self.payload_hash.clone().unwrap_or_default(),
+                format_version: crate::encryption::EncryptionMetadata::format_version_from_json(
+                    metadata_json,
+                ),
             }
         } else {
             // Build basic metadata from available fields
@@ -538,6 +541,7 @@ impl JobRow {
                 encrypted_at: self.encrypted_at.unwrap_or(self.created_at),
                 delete_at: self.retention_delete_at,
                 payload_hash: self.payload_hash.clone().unwrap_or_default(),
+                format_version: crate::encryption::EncryptionMetadata::FORMAT_UNBOUND,
             }
         };
 
