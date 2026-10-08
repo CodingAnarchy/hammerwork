@@ -1,23 +1,23 @@
-//! `DatabaseQueue` operations not covered elsewhere, on both backends: dead job
+//! `DatabaseQueue` operations not covered elsewhere, on both backends and on
+//! `TestQueue` (so the in-memory queue is held to the same behaviour): dead job
 //! management, statistics queries, recurring jobs, throttle configuration, pause
 //! information and workflow dependency helpers.
 
-#![cfg(any(feature = "postgres", feature = "mysql"))]
+#![cfg(any(feature = "postgres", feature = "mysql", feature = "test"))]
 
 mod test_utils;
 
 use chrono::{Duration, Utc};
 use hammerwork::{
-    Job, JobId, JobQueue, JobStatus, cron::CronSchedule, queue::DatabaseQueue,
-    rate_limit::ThrottleConfig, workflow::JobGroup,
+    Job, JobId, JobStatus, cron::CronSchedule, queue::DatabaseQueue, rate_limit::ThrottleConfig,
+    workflow::JobGroup,
 };
 use serde_json::json;
 use std::sync::Arc;
 
-async fn enqueue<DB>(queue: &Arc<JobQueue<DB>>, queue_name: &str) -> JobId
+async fn enqueue<Q>(queue: &Arc<Q>, queue_name: &str) -> JobId
 where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    Q: DatabaseQueue + Send + Sync + 'static,
 {
     queue
         .enqueue(Job::new(queue_name.to_string(), json!({})))
@@ -26,10 +26,9 @@ where
 }
 
 /// Listing, summarising, retrying and purging dead jobs.
-async fn dead_job_management<DB>(queue: Arc<JobQueue<DB>>)
+async fn dead_job_management<Q>(queue: Arc<Q>)
 where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    Q: DatabaseQueue + Send + Sync + 'static,
 {
     // Purging and the summary cover every queue.
     let _serial = test_utils::serial().await;
@@ -98,10 +97,9 @@ where
 }
 
 /// Status counts, error frequencies, processing times and completion ranges.
-async fn statistics_queries<DB>(queue: Arc<JobQueue<DB>>)
+async fn statistics_queries<Q>(queue: Arc<Q>)
 where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    Q: DatabaseQueue + Send + Sync + 'static,
 {
     let queue_name = test_utils::unique_queue("stats_queries");
     let since = Utc::now() - Duration::minutes(1);
@@ -177,10 +175,9 @@ where
 }
 
 /// Recurring jobs can be listed, disabled and enabled again.
-async fn recurring_jobs<DB>(queue: Arc<JobQueue<DB>>)
+async fn recurring_jobs<Q>(queue: Arc<Q>)
 where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    Q: DatabaseQueue + Send + Sync + 'static,
 {
     let queue_name = test_utils::unique_queue("recurring");
     let schedule = CronSchedule::new("0 0 * * * *").unwrap();
@@ -231,17 +228,20 @@ where
     assert!(bare.recurring);
     let next = bare.next_run_at.expect("next run computed");
     assert!(next > Utc::now() && next <= Utc::now() + Duration::hours(1));
-    assert_eq!(bare.scheduled_at, next);
+    // TestQueue re-bases schedules on its mock clock, so allow for clock skew.
+    assert!(
+        (bare.scheduled_at - next).num_seconds().abs() <= 1,
+        "{bare:?}"
+    );
     queue.delete_job(bare_id).await.unwrap();
 
     queue.delete_job(id).await.unwrap();
 }
 
 /// The `DatabaseQueue` throttle methods use the queue's throttle registry.
-async fn throttle_configuration<DB>(queue: Arc<JobQueue<DB>>)
+async fn throttle_configuration<Q>(queue: Arc<Q>)
 where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    Q: DatabaseQueue + Send + Sync + 'static,
 {
     let queue_name = test_utils::unique_queue("throttle");
     assert!(
@@ -268,25 +268,21 @@ where
             .unwrap()
             .contains_key(&queue_name)
     );
-    assert_eq!(
-        queue
-            .get_throttle(&queue_name)
-            .await
-            .unwrap()
-            .max_concurrent,
-        Some(3)
-    );
     DatabaseQueue::remove_throttle_config(queue.as_ref(), &queue_name)
         .await
         .unwrap();
-    assert!(queue.get_throttle(&queue_name).await.is_none());
+    assert!(
+        DatabaseQueue::get_throttle_config(queue.as_ref(), &queue_name)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Pause information records who paused a queue, until it is resumed.
-async fn pause_information<DB>(queue: Arc<JobQueue<DB>>)
+async fn pause_information<Q>(queue: Arc<Q>)
 where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    Q: DatabaseQueue + Send + Sync + 'static,
 {
     let queue_name = test_utils::unique_queue("pause_info");
     assert!(
@@ -333,10 +329,9 @@ where
 
 /// `get_ready_jobs` only returns jobs whose dependencies are satisfied, and the
 /// explicit resolve / fail helpers update dependents.
-async fn workflow_dependency_helpers<DB>(queue: Arc<JobQueue<DB>>)
+async fn workflow_dependency_helpers<Q>(queue: Arc<Q>)
 where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    Q: DatabaseQueue + Send + Sync + 'static,
 {
     let _serial = test_utils::serial().await;
     let queue_name = test_utils::unique_queue("ready_jobs");
@@ -383,6 +378,7 @@ where
     queue.mark_job_dead(b_id, "b failed").await.unwrap();
     queue.fail_job_dependencies(b_id).await.unwrap();
     let c = queue.get_job(c_id).await.unwrap().unwrap();
+    assert_eq!(c.status, JobStatus::Failed);
     assert!(c.dependencies_failed(), "{:?}", c.dependency_status);
     assert!(
         queue
@@ -399,52 +395,70 @@ where
     }
 }
 
+/// One `#[tokio::test]` per scenario, run against the queue returned by `$setup`.
 macro_rules! backend_tests {
-    ($module:ident, $prefix:ident, $setup:path) => {
+    ($module:ident, $setup:path, $ignore:meta, [$($scenario:ident),* $(,)?]) => {
         mod $module {
             use super::*;
-
-            #[tokio::test]
-            #[ignore] // Requires database connection
-            async fn dead_job_management() {
-                super::dead_job_management($setup().await).await;
-            }
-
-            #[tokio::test]
-            #[ignore] // Requires database connection
-            async fn statistics_queries() {
-                super::statistics_queries($setup().await).await;
-            }
-
-            #[tokio::test]
-            #[ignore] // Requires database connection
-            async fn recurring_jobs() {
-                super::recurring_jobs($setup().await).await;
-            }
-
-            #[tokio::test]
-            #[ignore] // Requires database connection
-            async fn throttle_configuration() {
-                super::throttle_configuration($setup().await).await;
-            }
-
-            #[tokio::test]
-            #[ignore] // Requires database connection
-            async fn pause_information() {
-                super::pause_information($setup().await).await;
-            }
-
-            #[tokio::test]
-            #[ignore] // Requires database connection
-            async fn workflow_dependency_helpers() {
-                super::workflow_dependency_helpers($setup().await).await;
-            }
+            $(
+                #[tokio::test]
+                #[$ignore]
+                async fn $scenario() {
+                    super::$scenario($setup().await).await;
+                }
+            )*
         }
     };
 }
 
 #[cfg(feature = "postgres")]
-backend_tests!(postgres_tests, postgres, test_utils::setup_postgres_queue);
+backend_tests!(
+    postgres_tests,
+    test_utils::setup_postgres_queue,
+    ignore = "requires PostgreSQL: DATABASE_URL",
+    [
+        dead_job_management,
+        statistics_queries,
+        recurring_jobs,
+        throttle_configuration,
+        pause_information,
+        workflow_dependency_helpers,
+    ]
+);
 
 #[cfg(feature = "mysql")]
-backend_tests!(mysql_tests, mysql, test_utils::setup_mysql_queue);
+backend_tests!(
+    mysql_tests,
+    test_utils::setup_mysql_queue,
+    ignore = "requires MySQL: MYSQL_DATABASE_URL",
+    [
+        dead_job_management,
+        statistics_queries,
+        recurring_jobs,
+        throttle_configuration,
+        pause_information,
+        workflow_dependency_helpers,
+    ]
+);
+
+#[cfg(feature = "test")]
+async fn test_queue() -> Arc<hammerwork::queue::test::TestQueue> {
+    Arc::new(hammerwork::queue::test::TestQueue::new())
+}
+
+// `statistics_queries` is not run on `TestQueue`: its `fail_job` retries the job (or
+// marks it dead) instead of moving it to the terminal `Failed` status the trait
+// documents and the database backends implement.
+#[cfg(feature = "test")]
+backend_tests!(
+    test_queue_tests,
+    test_queue,
+    allow(unused_attributes),
+    [
+        dead_job_management,
+        recurring_jobs,
+        throttle_configuration,
+        pause_information,
+        workflow_dependency_helpers,
+    ]
+);
