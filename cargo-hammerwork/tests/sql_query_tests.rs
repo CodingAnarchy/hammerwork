@@ -179,97 +179,6 @@ mod mysql_tests {
 mod unit_tests {
 
     #[test]
-    fn test_query_building_logic() {
-        // Test PostgreSQL query building
-        let mut conditions = Vec::new();
-        let queue = Some("test_queue".to_string());
-        let status = Some("pending".to_string());
-        let priority = Some("high".to_string());
-        let limit = 50u32;
-
-        if queue.is_some() {
-            conditions.push(format!("queue_name = ${}", conditions.len() + 1));
-        }
-
-        if status.is_some() {
-            conditions.push(format!("status = ${}", conditions.len() + 1));
-        }
-
-        if priority.is_some() {
-            conditions.push(format!("priority = ${}", conditions.len() + 1));
-        }
-
-        let mut query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs".to_string();
-
-        if !conditions.is_empty() {
-            query.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
-        }
-
-        query.push_str(" ORDER BY created_at DESC");
-        query.push_str(&format!(" LIMIT {}", limit));
-
-        // Verify query structure
-        assert!(query.contains("WHERE"));
-        assert!(query.contains("queue_name = $1"));
-        assert!(query.contains("status = $2"));
-        assert!(query.contains("priority = $3"));
-        assert!(query.contains("ORDER BY created_at DESC"));
-        assert!(query.contains("LIMIT 50"));
-
-        println!("Generated PostgreSQL query: {}", query);
-    }
-
-    #[test]
-    fn test_mysql_query_building_logic() {
-        // Test MySQL query building (uses ? placeholders)
-        let mut conditions = Vec::new();
-        let queue = Some("test_queue".to_string());
-        let status = Some("pending".to_string());
-        let limit = 50u32;
-
-        if queue.is_some() {
-            conditions.push("queue_name = ?".to_string());
-        }
-
-        if status.is_some() {
-            conditions.push("status = ?".to_string());
-        }
-
-        let mut query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs".to_string();
-
-        if !conditions.is_empty() {
-            query.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
-        }
-
-        // Test MySQL interval syntax
-        let hours = 24u32;
-        if !conditions.is_empty() {
-            query.push_str(&format!(
-                " AND created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)",
-                hours
-            ));
-        } else {
-            query.push_str(&format!(
-                " WHERE created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)",
-                hours
-            ));
-        }
-
-        query.push_str(" ORDER BY created_at DESC");
-        query.push_str(&format!(" LIMIT {}", limit));
-
-        // Verify query structure
-        assert!(query.contains("WHERE"));
-        assert!(query.contains("queue_name = ?"));
-        assert!(query.contains("status = ?"));
-        assert!(query.contains("DATE_SUB(NOW(), INTERVAL 24 HOUR)"));
-        assert!(query.contains("ORDER BY created_at DESC"));
-        assert!(query.contains("LIMIT 50"));
-
-        println!("Generated MySQL query: {}", query);
-    }
-
-    #[test]
     fn test_query_validation_functions() {
         // Test status validation
         assert!(is_valid_status("pending"));
@@ -327,25 +236,6 @@ mod unit_tests {
 mod error_handling_tests {
 
     #[test]
-    fn test_sql_injection_prevention() {
-        // Test that we're using parameterized queries correctly
-        let malicious_input = "'; DROP TABLE hammerwork_jobs; --";
-
-        // This should be safe because we use bind parameters
-        let query = "SELECT * FROM hammerwork_jobs WHERE queue_name = $1";
-
-        // Verify the query structure doesn't include the malicious input directly
-        assert!(!query.contains("DROP TABLE"));
-        assert!(query.contains("$1")); // Parameterized
-
-        println!("Safe parameterized query: {}", query);
-        println!(
-            "Malicious input would be bound as parameter: {}",
-            malicious_input
-        );
-    }
-
-    #[test]
     fn test_limit_validation() {
         // Test reasonable limits
         let limit = 1000u32;
@@ -357,282 +247,258 @@ mod error_handling_tests {
     }
 }
 
+/// Validates the CLI's real query builders (not copies of their SQL): every user-supplied
+/// value must be a bound parameter, placeholders must match the binds, and the statements must
+/// run on the database with a hostile queue name.
 #[cfg(test)]
-mod spawn_query_tests {
+mod builder_tests {
     use super::*;
+    use cargo_hammerwork::commands::backup::build_backup_query;
+    use cargo_hammerwork::commands::cron::{build_cron_count_query, build_next_executions_query};
+    use cargo_hammerwork::commands::job::{build_list_jobs_query, build_purge_query};
+    use cargo_hammerwork::commands::maintenance::{VacuumKind, build_vacuum_query};
+    use cargo_hammerwork::commands::monitor::{
+        build_avg_time_query, build_recent_jobs_query, build_status_counts_query,
+        build_throughput_query,
+    };
+    use cargo_hammerwork::commands::queue::{
+        HealthMetric, build_detailed_stats_query, build_health_query, build_queue_total_query,
+    };
+    use cargo_hammerwork::commands::spawn::{
+        build_pending_spawns_query, build_spawn_list_query, build_spawn_stats_breakdown_query,
+        build_spawn_stats_total_query,
+    };
+    use cargo_hammerwork::utils::job_ops::JobSelector;
+    use cargo_hammerwork::utils::sql::{Backend, Bind, bind_mysql, bind_pg};
+    use hammerwork::{JobPriority, JobStatus};
+
+    const HOSTILE: &str = "it's; DROP TABLE hammerwork_jobs --";
+
+    /// Every builder that takes a queue name, with options that exercise each clause.
+    fn queue_scoped_queries(backend: Backend) -> Vec<(&'static str, String, Vec<Bind>)> {
+        let q = Some(HOSTILE);
+        let now = chrono::Utc::now();
+        let mut out = Vec::new();
+        let mut add = |name: &'static str, (sql, binds): (String, Vec<Bind>)| {
+            out.push((name, sql, binds));
+        };
+        add("cron_count", build_cron_count_query(backend, q, true));
+        add(
+            "cron_next",
+            build_next_executions_query(backend, q, Some(now)),
+        );
+        add("status_counts", build_status_counts_query(backend, q));
+        add("recent_jobs", build_recent_jobs_query(backend, q));
+        add("throughput", build_throughput_query(backend, 24, q));
+        add("avg_time", build_avg_time_query(backend, 168, q));
+        add("queue_total", build_queue_total_query(backend, q));
+        add("detailed_stats", build_detailed_stats_query(backend, q));
+        for metric in [
+            HealthMetric::Total,
+            HealthMetric::RecentFailures,
+            HealthMetric::LongRunning,
+        ] {
+            add("health", build_health_query(backend, metric, q));
+        }
+        add("backup", build_backup_query(backend, q, false, false));
+        add("spawn_list", build_spawn_list_query(backend, q, true, 20));
+        add("spawn_stats", build_spawn_stats_total_query(backend, 24, q));
+        add(
+            "spawn_breakdown",
+            build_spawn_stats_breakdown_query(backend, 24, q),
+        );
+        add("spawn_pending", build_pending_spawns_query(backend, q));
+        add(
+            "job_list",
+            build_list_jobs_query(
+                backend == Backend::Postgres,
+                q,
+                Some("pending"),
+                Some(JobPriority::High),
+                50,
+                false,
+                false,
+                Some(24),
+            ),
+        );
+        add(
+            "job_purge",
+            build_purge_query(backend, "status IN ('Completed')", q, Some(7)),
+        );
+        add(
+            "job_selector",
+            JobSelector {
+                statuses: vec![JobStatus::Failed, JobStatus::Dead],
+                queue: Some(HOSTILE.to_string()),
+                failed_after: Some(now),
+                created_before: Some(now),
+                started_before: Some(now),
+                never_started: true,
+                attempts_exhausted: true,
+            }
+            .sql(backend),
+        );
+        out
+    }
+
+    /// Queries without a queue name that still take bound values.
+    fn other_queries(backend: Backend) -> Vec<(&'static str, String, Vec<Bind>)> {
+        let now = chrono::Utc::now();
+        let mut out = Vec::new();
+        for (kind, delete) in [
+            (VacuumKind::Completed, false),
+            (VacuumKind::Completed, true),
+            (VacuumKind::Failed, false),
+            (VacuumKind::Failed, true),
+        ] {
+            let (sql, binds) = build_vacuum_query(backend, kind, delete, now);
+            out.push(("vacuum", sql, binds));
+        }
+        out
+    }
+
+    /// The `$n` placeholders in `sql`, as the highest index plus whether 1..=max are all used.
+    fn postgres_placeholders(sql: &str) -> (usize, bool) {
+        let mut seen = std::collections::BTreeSet::new();
+        let bytes = sql.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$' {
+                let digits: String = sql[i + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = digits.parse::<usize>() {
+                    seen.insert(n);
+                }
+            }
+            i += 1;
+        }
+        let max = seen.iter().next_back().copied().unwrap_or(0);
+        (max, (1..=max).all(|n| seen.contains(&n)))
+    }
+
+    fn assert_parameterized(name: &str, backend: Backend, sql: &str, binds: &[Bind]) {
+        match backend {
+            Backend::Postgres => {
+                let (max, contiguous) = postgres_placeholders(sql);
+                assert_eq!(max, binds.len(), "{name}: $n vs binds in {sql}");
+                assert!(contiguous, "{name}: gap in placeholders in {sql}");
+            }
+            Backend::MySql => {
+                assert_eq!(
+                    sql.matches('?').count(),
+                    binds.len(),
+                    "{name}: ? vs binds in {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_queue_names_are_bound_never_interpolated() {
+        for backend in [Backend::Postgres, Backend::MySql] {
+            for (name, sql, binds) in queue_scoped_queries(backend) {
+                assert!(
+                    !sql.contains("DROP"),
+                    "{name}: queue name leaked into {sql}"
+                );
+                assert!(
+                    !sql.contains("it's"),
+                    "{name}: queue name leaked into {sql}"
+                );
+                assert!(
+                    binds.contains(&Bind::Text(HOSTILE.to_string())),
+                    "{name}: queue name is not bound ({backend:?})"
+                );
+                assert_parameterized(name, backend, &sql, &binds);
+            }
+            for (name, sql, binds) in other_queries(backend) {
+                assert_parameterized(name, backend, &sql, &binds);
+            }
+        }
+    }
+
+    #[test]
+    fn test_numbers_and_timestamps_are_bound_not_formatted() {
+        // LIMIT and the interval amounts must be placeholders, even for plain integers.
+        let (sql, binds) = build_spawn_list_query(Backend::Postgres, None, true, 20);
+        assert!(sql.ends_with("LIMIT $2"), "{sql}");
+        assert_eq!(binds, vec![Bind::Int(1), Bind::Int(20)]);
+
+        let (sql, binds) = build_purge_query(Backend::MySql, "status IN ('Dead')", None, Some(30));
+        assert!(sql.ends_with("INTERVAL ? DAY)"), "{sql}");
+        assert_eq!(binds, vec![Bind::Int(30)]);
+
+        let (sql, _) = build_list_jobs_query(true, None, None, None, 5, false, false, Some(3));
+        assert!(sql.contains("make_interval(hours => $1::int)"), "{sql}");
+        assert!(sql.ends_with("LIMIT $2"), "{sql}");
+    }
 
     #[tokio::test]
     #[ignore] // Requires database connection
-    async fn test_postgres_spawn_list_queries() -> Result<()> {
+    async fn test_postgres_builders_run_with_hostile_queue_name() -> Result<()> {
         let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://postgres:hammerwork@localhost:5433/hammerwork".to_string()
         });
-
         let pool = PgPool::connect(&database_url).await?;
 
-        // Test spawn operations listing query
-        let query = r#"
-            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
-                   parent.payload->'_spawn_config' as spawn_config,
-                   COUNT(child.id) as spawned_count,
-                   parent.workflow_id, parent.workflow_name
-            FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
-            WHERE parent.payload ? '_spawn_config' 
-                  AND parent.status IN ('Completed', 'Running')
-            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload, parent.workflow_id, parent.workflow_name
-            ORDER BY parent.created_at DESC
-            LIMIT 20
-        "#;
+        let all = queue_scoped_queries(Backend::Postgres)
+            .into_iter()
+            .chain(other_queries(Backend::Postgres));
+        for (name, sql, binds) in all {
+            if name == "job_purge" || name == "vacuum" && sql.starts_with("DELETE") {
+                // Writes: run them inside a rolled-back transaction
+                let mut tx = pool.begin().await?;
+                bind_pg(sqlx::query(&sql), &binds)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {e}\n{sql}"));
+                tx.rollback().await?;
+            } else {
+                bind_pg(sqlx::query(&sql), &binds)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {e}\n{sql}"));
+            }
+        }
 
-        let _rows = sqlx::query(query).fetch_all(&pool).await?;
-        // Should succeed even if no spawn operations exist
-
-        // Test with recent filter
-        let query_recent = r#"
-            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
-                   parent.payload->'_spawn_config' as spawn_config,
-                   COUNT(child.id) as spawned_count
-            FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
-            WHERE parent.payload ? '_spawn_config' 
-                  AND parent.status IN ('Completed', 'Running')
-                  AND parent.created_at > NOW() - INTERVAL '1 hour'
-            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
-            ORDER BY parent.created_at DESC
-            LIMIT 10
-        "#;
-
-        let _rows = sqlx::query(query_recent).fetch_all(&pool).await?;
-        // Verify query executes without error
-
+        // The table survived
+        sqlx::query("SELECT 1 FROM hammerwork_jobs LIMIT 1")
+            .fetch_all(&pool)
+            .await?;
         Ok(())
     }
 
     #[tokio::test]
     #[ignore] // Requires database connection
-    async fn test_postgres_spawn_stats_queries() -> Result<()> {
-        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://postgres:hammerwork@localhost:5433/hammerwork".to_string()
-        });
-
-        let pool = PgPool::connect(&database_url).await?;
-
-        // Test spawn statistics aggregation
-        let query = r#"
-            SELECT COUNT(*) as total_spawn_ops,
-                   AVG(spawned_count) as avg_children,
-                   MAX(spawned_count) as max_children
-            FROM (
-                SELECT parent.id, COUNT(child.id) as spawned_count
-                FROM hammerwork_jobs parent
-                LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
-                WHERE parent.payload ? '_spawn_config'
-                      AND parent.created_at > NOW() - INTERVAL '24 hours'
-                GROUP BY parent.id
-            ) spawn_stats
-        "#;
-
-        let row = sqlx::query(query).fetch_one(&pool).await?;
-        let total: i64 = row.get("total_spawn_ops");
-        assert!(total >= 0);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_spawn_list_queries() -> Result<()> {
+    async fn test_mysql_builders_run_with_hostile_queue_name() -> Result<()> {
         let database_url = std::env::var("MYSQL_DATABASE_URL")
-            .unwrap_or_else(|_| "mysql://root:hammerwork@localhost:3307/hammerwork".to_string());
-
+            .unwrap_or_else(|_| "mysql://root:password@localhost:3306/hammerwork".to_string());
         let pool = MySqlPool::connect(&database_url).await?;
 
-        // Test MySQL spawn operations listing query
-        let query = r#"
-            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
-                   JSON_EXTRACT(parent.payload, '$._spawn_config') as spawn_config,
-                   COUNT(child.id) as spawned_count,
-                   parent.workflow_id, parent.workflow_name
-            FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
-            WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
-                  AND parent.status IN ('Completed', 'Running')
-            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload, parent.workflow_id, parent.workflow_name
-            ORDER BY parent.created_at DESC
-            LIMIT 20
-        "#;
+        let all = queue_scoped_queries(Backend::MySql)
+            .into_iter()
+            .chain(other_queries(Backend::MySql));
+        for (name, sql, binds) in all {
+            if name == "job_purge" || name == "vacuum" && sql.starts_with("DELETE") {
+                let mut tx = pool.begin().await?;
+                bind_mysql(sqlx::query(&sql), &binds)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {e}\n{sql}"));
+                tx.rollback().await?;
+            } else {
+                bind_mysql(sqlx::query(&sql), &binds)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {e}\n{sql}"));
+            }
+        }
 
-        let _rows = sqlx::query(query).fetch_all(&pool).await?;
-        // Should succeed even if no spawn operations exist
-
-        // Test with recent filter using MySQL syntax
-        let query_recent = r#"
-            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
-                   JSON_EXTRACT(parent.payload, '$._spawn_config') as spawn_config,
-                   COUNT(child.id) as spawned_count
-            FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
-            WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
-                  AND parent.status IN ('Completed', 'Running')
-                  AND parent.created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
-            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
-            ORDER BY parent.created_at DESC
-            LIMIT 10
-        "#;
-
-        let _rows = sqlx::query(query_recent).fetch_all(&pool).await?;
-        // Verify query executes without error
-
+        sqlx::query("SELECT 1 FROM hammerwork_jobs LIMIT 1")
+            .fetch_all(&pool)
+            .await?;
         Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_spawn_stats_queries() -> Result<()> {
-        let database_url = std::env::var("MYSQL_DATABASE_URL")
-            .unwrap_or_else(|_| "mysql://root:hammerwork@localhost:3307/hammerwork".to_string());
-
-        let pool = MySqlPool::connect(&database_url).await?;
-
-        // Test MySQL spawn statistics aggregation
-        let query = r#"
-            SELECT COUNT(*) as total_spawn_ops,
-                   AVG(spawned_count) as avg_children,
-                   MAX(spawned_count) as max_children
-            FROM (
-                SELECT parent.id, COUNT(child.id) as spawned_count
-                FROM hammerwork_jobs parent
-                LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
-                WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
-                      AND parent.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
-                GROUP BY parent.id
-            ) spawn_stats
-        "#;
-
-        let row = sqlx::query(query).fetch_one(&pool).await?;
-        let total: i64 = row.get("total_spawn_ops");
-        assert!(total >= 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_spawn_query_building_postgres() {
-        // Test PostgreSQL spawn query building
-        let recent = true;
-        let queue_filter = Some("spawn_queue");
-        let limit = 20u32;
-
-        let mut query = r#"
-            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
-                   parent.payload->'_spawn_config' as spawn_config,
-                   COUNT(child.id) as spawned_count
-            FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
-            WHERE parent.payload ? '_spawn_config' 
-                  AND parent.status IN ('Completed', 'Running')"#
-            .to_string();
-
-        if recent {
-            query.push_str(" AND parent.created_at > NOW() - INTERVAL '1 hour'");
-        }
-
-        if let Some(queue) = queue_filter {
-            query.push_str(&format!(" AND parent.queue_name = '{}'", queue));
-        }
-
-        query.push_str(
-            r#"
-            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
-            ORDER BY parent.created_at DESC"#,
-        );
-
-        query.push_str(&format!(" LIMIT {}", limit));
-
-        // Verify query structure
-        assert!(query.contains("payload ? '_spawn_config'"));
-        assert!(query.contains("depends_on @>"));
-        assert!(query.contains("INTERVAL '1 hour'"));
-        assert!(query.contains("parent.queue_name = 'spawn_queue'"));
-        assert!(query.contains("LIMIT 20"));
-    }
-
-    #[test]
-    fn test_spawn_query_building_mysql() {
-        // Test MySQL spawn query building
-        let recent = true;
-        let queue_filter = Some("spawn_queue");
-        let limit = 20u32;
-
-        let mut query = r#"
-            SELECT parent.id as parent_id, parent.queue_name, parent.created_at,
-                   JSON_EXTRACT(parent.payload, '$._spawn_config') as spawn_config,
-                   COUNT(child.id) as spawned_count
-            FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON JSON_CONTAINS(child.depends_on, CONCAT('"', parent.id, '"'))
-            WHERE JSON_EXTRACT(parent.payload, '$._spawn_config') IS NOT NULL
-                  AND parent.status IN ('Completed', 'Running')"#.to_string();
-
-        if recent {
-            query.push_str(" AND parent.created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)");
-        }
-
-        if let Some(queue) = queue_filter {
-            query.push_str(&format!(" AND parent.queue_name = '{}'", queue));
-        }
-
-        query.push_str(
-            r#"
-            GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload
-            ORDER BY parent.created_at DESC"#,
-        );
-
-        query.push_str(&format!(" LIMIT {}", limit));
-
-        // Verify query structure
-        assert!(query.contains("JSON_EXTRACT(parent.payload, '$._spawn_config')"));
-        assert!(query.contains("JSON_CONTAINS(child.depends_on"));
-        assert!(query.contains("DATE_SUB(NOW(), INTERVAL 1 HOUR)"));
-        assert!(query.contains("parent.queue_name = 'spawn_queue'"));
-        assert!(query.contains("LIMIT 20"));
-    }
-
-    #[test]
-    fn test_spawn_tree_query_building() {
-        // Test spawn tree query construction
-        let job_id = "550e8400-e29b-41d4-a716-446655440000";
-
-        let postgres_query = format!(
-            r#"
-            SELECT id, queue_name, status, depends_on,
-                   payload->'_spawn_config' as spawn_config,
-                   created_at, workflow_id, workflow_name
-            FROM hammerwork_jobs
-            WHERE depends_on @> '["{}"]'
-            ORDER BY created_at
-            "#,
-            job_id
-        );
-
-        let mysql_query = format!(
-            r#"
-            SELECT id, queue_name, status, depends_on,
-                   JSON_EXTRACT(payload, '$._spawn_config') as spawn_config,
-                   created_at, workflow_id, workflow_name
-            FROM hammerwork_jobs
-            WHERE JSON_CONTAINS(depends_on, '"{}"')
-            ORDER BY created_at
-            "#,
-            job_id
-        );
-
-        // Verify both queries contain the job ID
-        assert!(postgres_query.contains(job_id));
-        assert!(mysql_query.contains(job_id));
-
-        // Verify database-specific syntax
-        assert!(postgres_query.contains("@>"));
-        assert!(mysql_query.contains("JSON_CONTAINS"));
     }
 }

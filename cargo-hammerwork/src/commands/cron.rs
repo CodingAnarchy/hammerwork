@@ -6,6 +6,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
 use crate::utils::db_helpers::*;
+use crate::utils::sql::{Backend, Bind, SqlParams, fetch_i64};
 
 #[derive(Subcommand)]
 pub enum CronCommand {
@@ -183,6 +184,43 @@ impl CronCommand {
     }
 }
 
+/// `COUNT(*)` of cron jobs, optionally restricted to one queue and to recurring jobs.
+/// The queue name is bound, never interpolated.
+pub fn build_cron_count_query(
+    backend: Backend,
+    queue: Option<&str>,
+    active_only: bool,
+) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let mut query =
+        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE cron_schedule IS NOT NULL".to_string();
+    if let Some(queue_name) = queue {
+        query.push_str(&format!(" AND queue_name = {}", params.text(queue_name)));
+    }
+    if active_only {
+        query.push_str(" AND recurring = true");
+    }
+    (query, params.into_binds())
+}
+
+/// `COUNT(*)` of recurring cron jobs due on or before `cutoff` (if given). Both the queue name
+/// and the cutoff are bound.
+pub fn build_next_executions_query(
+    backend: Backend,
+    queue: Option<&str>,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> (String, Vec<Bind>) {
+    let mut params = SqlParams::new(backend);
+    let mut query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE cron_schedule IS NOT NULL AND recurring = true".to_string();
+    if let Some(queue_name) = queue {
+        query.push_str(&format!(" AND queue_name = {}", params.text(queue_name)));
+    }
+    if let Some(cutoff) = cutoff {
+        query.push_str(&format!(" AND next_run_at <= {}", params.time(cutoff)));
+    }
+    (query, params.into_binds())
+}
+
 async fn list_cron_jobs(
     pool: DatabasePool,
     queue: Option<String>,
@@ -192,19 +230,8 @@ async fn list_cron_jobs(
     println!("📅 Cron Jobs");
     println!("═══════════");
 
-    // Simplified implementation - cron functionality coming soon
-    let mut query =
-        "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE cron_schedule IS NOT NULL".to_string();
-
-    if let Some(queue_name) = &queue {
-        query = format!("{} AND queue_name = '{}'", query, queue_name);
-    }
-
-    if active_only {
-        query = format!("{} AND recurring = true", query);
-    }
-
-    let count = execute_count_query(&pool, &query).await?;
+    let (query, binds) = build_cron_count_query(pool.backend(), queue.as_deref(), active_only);
+    let count = fetch_i64(&pool, &query, &binds, "count").await?;
 
     if count == 0 {
         println!("📅 No cron jobs found");
@@ -360,23 +387,9 @@ async fn show_next_executions(
     println!("⏰ Upcoming Cron Job Executions");
     println!("═══════════════════════════════");
 
-    // Simplified implementation
-    let mut query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE cron_schedule IS NOT NULL AND recurring = true".to_string();
-
-    if let Some(queue_name) = &queue {
-        query = format!("{} AND queue_name = '{}'", query, queue_name);
-    }
-
-    if let Some(hour_limit) = hours {
-        let cutoff = chrono::Utc::now() + chrono::Duration::hours(hour_limit as i64);
-        query = format!(
-            "{} AND next_run_at <= '{}'",
-            query,
-            cutoff.format("%Y-%m-%d %H:%M:%S")
-        );
-    }
-
-    let total_jobs = execute_count_query(&pool, &query).await?;
+    let cutoff = hours.map(|h| chrono::Utc::now() + chrono::Duration::hours(i64::from(h)));
+    let (query, binds) = build_next_executions_query(pool.backend(), queue.as_deref(), cutoff);
+    let total_jobs = fetch_i64(&pool, &query, &binds, "count").await?;
 
     if total_jobs == 0 {
         println!("📅 No upcoming cron job executions found");
@@ -489,4 +502,89 @@ fn is_valid_cron_expression(expr: &str) -> bool {
     // Basic validation - should have 5 or 6 parts separated by spaces
     let parts: Vec<&str> = expr.split_whitespace().collect();
     parts.len() >= 5 && parts.len() <= 6
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::test_support::*;
+
+    #[test]
+    fn test_cron_count_query_binds_queue_name() {
+        let (sql, binds) = build_cron_count_query(Backend::Postgres, Some(HOSTILE_QUEUE), true);
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE cron_schedule IS NOT NULL AND queue_name = $1 AND recurring = true"
+        );
+        assert_eq!(binds, vec![Bind::Text(HOSTILE_QUEUE.into())]);
+        assert!(!sql.contains("DROP"));
+
+        let (sql, binds) = build_cron_count_query(Backend::MySql, Some(HOSTILE_QUEUE), false);
+        assert!(sql.ends_with("AND queue_name = ?"));
+        assert_eq!(binds.len(), 1);
+
+        let (sql, binds) = build_cron_count_query(Backend::MySql, None, false);
+        assert!(!sql.contains('?') && binds.is_empty());
+    }
+
+    #[test]
+    fn test_next_executions_query_binds_queue_then_cutoff() {
+        let cutoff = chrono::Utc::now();
+        let (sql, binds) =
+            build_next_executions_query(Backend::Postgres, Some(HOSTILE_QUEUE), Some(cutoff));
+        assert!(sql.ends_with("AND queue_name = $1 AND next_run_at <= $2"));
+        assert_eq!(
+            binds,
+            vec![Bind::Text(HOSTILE_QUEUE.into()), Bind::Time(cutoff)]
+        );
+
+        let (sql, binds) = build_next_executions_query(Backend::MySql, None, Some(cutoff));
+        assert!(sql.ends_with("AND next_run_at <= ?"));
+        assert_eq!(binds, vec![Bind::Time(cutoff)]);
+    }
+
+    async fn cron_roundtrip(pool: DatabasePool) {
+        let hostile = hostile_queue();
+        let other = format!("other_{}", uuid::Uuid::new_v4().simple());
+        let mut job = SeedJob::new(&hostile, "Pending");
+        job.cron = true;
+        seed(&pool, &job).await;
+        seed(&pool, &job).await;
+        let mut job = SeedJob::new(&other, "Pending");
+        job.cron = true;
+        seed(&pool, &job).await;
+
+        let (sql, binds) = build_cron_count_query(pool.backend(), Some(&hostile), true);
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 2);
+
+        let cutoff = chrono::Utc::now() + chrono::Duration::hours(2);
+        let (sql, binds) =
+            build_next_executions_query(pool.backend(), Some(&hostile), Some(cutoff));
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 2);
+        let early = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let (sql, binds) = build_next_executions_query(pool.backend(), Some(&hostile), Some(early));
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 0);
+
+        list_cron_jobs(pool.clone(), Some(hostile.clone()), true, false)
+            .await
+            .unwrap();
+        show_next_executions(pool.clone(), Some(hostile.clone()), 5, Some(2))
+            .await
+            .unwrap();
+
+        assert!(table_exists(&pool).await);
+        cleanup(&pool, &[&hostile, &other]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn test_cron_queue_filter_is_injection_safe_postgres() {
+        cron_roundtrip(pg_pool().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MYSQL_DATABASE_URL"]
+    async fn test_cron_queue_filter_is_injection_safe_mysql() {
+        cron_roundtrip(mysql_pool().await).await;
+    }
 }
