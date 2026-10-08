@@ -658,7 +658,7 @@ impl crate::queue::JobQueue<MySql> {
             tracing::warn!(
                 "pooled MySQL connection had an abandoned open transaction; rolling it back"
             );
-            sqlx::query("ROLLBACK").execute(&mut **conn).await?;
+            sqlx::Executor::execute(&mut **conn, "ROLLBACK").await?;
             sqlx::query(SET_READ_COMMITTED).execute(&mut **conn).await?;
         }
         Ok(sqlx::Connection::begin(&mut **conn).await?)

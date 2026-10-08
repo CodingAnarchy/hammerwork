@@ -170,4 +170,47 @@ mod mysql_tests {
     async fn test_mysql_dequeue_skips_jobs_waiting_on_dependencies() {
         dequeue_skips_jobs_waiting_on_dependencies(test_utils::setup_mysql_queue().await).await;
     }
+
+    /// A pooled connection returned while still inside a transaction (as happens when a
+    /// future is dropped mid-transaction) must not break later claims on it.
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_dequeue_recovers_connection_left_in_transaction() {
+        use sqlx::mysql::MySqlPoolOptions;
+
+        // A single connection, so the dequeue below gets the abandoned one.
+        let pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&test_utils::mysql_url())
+            .await
+            .unwrap();
+        let queue = Arc::new(JobQueue::new(pool.clone()));
+        let queue_name = test_utils::unique_queue("abandoned_transaction");
+        let job_id = queue
+            .enqueue(Job::new(queue_name.clone(), json!({ "n": 1 })))
+            .await
+            .unwrap();
+
+        {
+            // Open a transaction behind sqlx's back and return the connection to the pool.
+            let mut conn = pool.acquire().await.unwrap();
+            // Text protocol: BEGIN can't be sent as a prepared statement.
+            sqlx::Executor::execute(&mut *conn, "BEGIN").await.unwrap();
+            sqlx::query("SELECT id FROM hammerwork_jobs WHERE id = ? FOR UPDATE")
+                .bind(job_id.to_string())
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+
+        let job = queue
+            .dequeue(&queue_name)
+            .await
+            .expect("dequeue must recover the abandoned transaction")
+            .expect("the job must be claimable once the abandoned locks are released");
+        assert_eq!(job.id, job_id);
+        assert_eq!(job.status, JobStatus::Running);
+
+        queue.delete_job(job_id).await.unwrap();
+    }
 }
