@@ -108,13 +108,35 @@ queue.enqueue_cron_job(cron_job).await?;
 
 Jobs progress through these states:
 
-1. **Pending** - Waiting to be processed
+1. **Pending** - Waiting to be processed (also after a failed or timed-out run that will be retried)
 2. **Running** - Currently being processed
 3. **Completed** - Successfully finished
-4. **Failed** - Failed but may retry
-5. **Dead** - Failed permanently (exhausted retries)
-6. **TimedOut** - Exceeded timeout duration
-7. **Retrying** - Scheduled for retry
+4. **Failed** - Failed without running out of attempts: set by `fail_job`, or when a
+   job is cancelled because a dependency, its fail-fast workflow or its fail-fast batch
+   failed. Terminal; `retry_job` re-runs it.
+5. **Dead** - Failed permanently (its last attempt failed). `retry_dead_job` re-runs it.
+6. **TimedOut** - Its last attempt exceeded the timeout (earlier timeouts are retried).
+   `retry_dead_job` re-runs it.
+7. **Retrying** - Scheduled for retry (used by `TestQueue`)
+
+A job runs at most `max_attempts` times. Recurring (cron) jobs never end in a terminal
+status from a worker: after a completed, dead or timed-out run they go back to
+`Pending` for their next scheduled run.
+
+Status changes are guarded. Manual transitions only apply from these statuses, and
+return `HammerworkError::InvalidJobTransition` otherwise:
+
+| Method | Allowed from |
+|---|---|
+| `complete_job`, `fail_job` | `Pending`, `Running`, `Retrying` |
+| `retry_job` | `Running`, `Retrying`, `Failed`, `TimedOut` |
+| `mark_job_dead` | `Pending`, `Running`, `Retrying`, `Failed`, `TimedOut` |
+| `mark_job_timed_out` | `Running` |
+| `reschedule_cron_job` | any status except `Completed` and `Archived` (recurring jobs only) |
+| `retry_dead_job` | `Dead`, `TimedOut` |
+
+Workers record their runs with `finish_job_run`, which only applies to the run the
+worker dequeued (see [Worker Configuration](worker-configuration.md#recording-outcomes-and-zombie-workers)).
 
 ## Job Handlers
 

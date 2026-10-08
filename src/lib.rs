@@ -310,7 +310,7 @@ pub use job::{Job, JobId, JobStatus, ResultConfig, ResultStorage};
 pub use priority::{
     JobPriority, PriorityError, PrioritySelectionStrategy, PriorityStats, PriorityWeights,
 };
-pub use queue::{JobQueue, StaleJobRecovery};
+pub use queue::{JobOutcome, JobQueue, JobTransition, RecordedOutcome, StaleJobRecovery};
 pub use rate_limit::{RateLimit, RateLimiter, ThrottleConfig};
 pub use retry::{JitterType, RetryStrategy, fibonacci};
 pub use spawn::{JobSpawnExt, SpawnConfig, SpawnHandler, SpawnManager, SpawnResult};

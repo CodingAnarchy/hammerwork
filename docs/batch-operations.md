@@ -122,6 +122,14 @@ let batch = JobBatch::new("mixed_priority_batch")
 
 ## Failure Handling Modes
 
+Inserting a batch is all-or-nothing: every job is stored with the same fields as
+`enqueue` (result storage, dependencies, workflow, tracing and retry strategy) in one
+transaction, whatever the failure mode.
+
+`get_batch_status` tallies progress from the batch's jobs. The `hammerwork_batches` row
+moves to `Processing` when its first job finishes, and its counters, final status and
+`completed_at` are written when the last job finishes (or when it fails fast).
+
 Batches support three failure handling modes:
 
 ### ContinueOnError
@@ -136,7 +144,11 @@ let batch = JobBatch::new("resilient_batch")
 
 ### FailFast
 
-Stop processing immediately on first failure:
+Stop processing on the first failure. When a job of the batch fails terminally (its
+last attempt failed or timed out, or it was failed manually), the batch's jobs that have
+not started yet are marked `Failed` ("Batch failed: job ... failed") in the same
+transaction, so no worker picks them up. Jobs already running finish normally. Retried
+attempts do not trigger it.
 
 ```rust
 let batch = JobBatch::new("critical_batch")

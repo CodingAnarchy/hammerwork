@@ -8,6 +8,16 @@ pub enum HammerworkError {
     #[error("Job not found: {id}")]
     JobNotFound { id: String },
 
+    /// A manual status transition was requested from a status it does not apply to,
+    /// e.g. completing a `TimedOut` job or retrying a `Dead` one with `retry_job`.
+    /// See [`JobTransition::allowed_from`](crate::queue::JobTransition::allowed_from).
+    #[error("Job {job_id} cannot be {transition} from status {status}")]
+    InvalidJobTransition {
+        job_id: String,
+        status: String,
+        transition: String,
+    },
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 

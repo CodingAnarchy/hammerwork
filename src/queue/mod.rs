@@ -18,6 +18,9 @@ use sqlx::{Database, Pool};
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 use tokio::sync::RwLock;
 
+pub mod lifecycle;
+pub use lifecycle::{JobOutcome, JobTransition, RecordedOutcome};
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
@@ -58,8 +61,28 @@ pub trait DatabaseQueue: Send + Sync {
         queue_name: &str,
         weights: &crate::priority::PriorityWeights,
     ) -> Result<Option<Job>>;
+
+    /// Manually mark a job `Completed`.
+    ///
+    /// Only applies to `Pending`, `Running` or `Retrying` jobs (see
+    /// [`JobTransition::allowed_from`]); other statuses return
+    /// [`HammerworkError::InvalidJobTransition`](crate::HammerworkError::InvalidJobTransition)
+    /// and a missing job `JobNotFound`. Dependents whose dependencies have all
+    /// completed become runnable and workflow/batch progress is updated, in the same
+    /// transaction. Workers record outcomes with [`finish_job_run`](Self::finish_job_run).
     async fn complete_job(&self, job_id: JobId) -> Result<()>;
+
+    /// Manually mark a job `Failed` (a terminal status that is not retried
+    /// automatically; [`retry_job`](Self::retry_job) re-runs it).
+    ///
+    /// Only applies to `Pending`, `Running` or `Retrying` jobs. Applies the failure to
+    /// dependents and to the job's workflow and batch like any terminal failure.
     async fn fail_job(&self, job_id: JobId, error_message: &str) -> Result<()>;
+
+    /// Manually move a job back to `Pending`, to run at `retry_at`.
+    ///
+    /// Only applies to `Running`, `Retrying`, `Failed` or `TimedOut` jobs. `Dead` jobs
+    /// are re-run with [`retry_dead_job`](Self::retry_dead_job).
     async fn retry_job(&self, job_id: JobId, retry_at: DateTime<Utc>) -> Result<()>;
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>>;
     async fn delete_job(&self, job_id: JobId) -> Result<()>;
@@ -81,10 +104,12 @@ pub trait DatabaseQueue: Send + Sync {
     async fn delete_batch(&self, batch_id: crate::batch::BatchId) -> Result<()>;
 
     // Dead job management
-    /// Mark a job as dead (exhausted all retries)
+    /// Manually mark a job as dead (exhausted all retries).
+    ///
+    /// Only applies to `Pending`, `Running`, `Retrying`, `Failed` or `TimedOut` jobs.
     async fn mark_job_dead(&self, job_id: JobId, error_message: &str) -> Result<()>;
 
-    /// Mark a job as timed out
+    /// Manually mark a `Running` job as timed out (a terminal status).
     async fn mark_job_timed_out(&self, job_id: JobId, error_message: &str) -> Result<()>;
 
     /// Get all dead jobs with optional pagination
@@ -98,7 +123,8 @@ pub trait DatabaseQueue: Send + Sync {
         offset: Option<u32>,
     ) -> Result<Vec<Job>>;
 
-    /// Retry a dead job (reset its status and retry count)
+    /// Re-run a terminally failed (`Dead` or `TimedOut`) job: back to `Pending` with its
+    /// attempts reset. Other statuses return `InvalidJobTransition`.
     async fn retry_dead_job(&self, job_id: JobId) -> Result<()>;
 
     /// Purge dead jobs older than the specified date
@@ -153,7 +179,10 @@ pub trait DatabaseQueue: Send + Sync {
     /// Get jobs that are ready to run based on their cron schedule
     async fn get_due_cron_jobs(&self, queue_name: Option<&str>) -> Result<Vec<Job>>;
 
-    /// Reschedule a completed cron job for its next execution
+    /// Reschedule a recurring job for its next execution: back to `Pending` at
+    /// `next_run_at` with its attempts reset.
+    ///
+    /// Applies to recurring jobs in any status except `Completed` and `Archived`.
     async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()>;
 
     /// Get all recurring jobs for a queue
@@ -623,6 +652,78 @@ pub trait DatabaseQueue: Send + Sync {
     /// ```
     async fn get_paused_queues(&self) -> Result<Vec<QueuePauseInfo>>;
 
+    // Run outcomes
+
+    /// Record how a run of a job dequeued by a worker ended.
+    ///
+    /// `run` is the job as returned by the dequeue. The outcome only applies while the
+    /// job is still `Running` that same run (same `attempts` and `started_at`); if it is
+    /// not (the stale-job reaper reclaimed it, an operator changed it, or another worker
+    /// is running a newer attempt) nothing is written and `Ok(None)` is returned, so a
+    /// late or zombie worker can never overwrite newer state.
+    ///
+    /// In the same transaction as the status change:
+    /// - a recurring job whose run completed, died or timed out is rescheduled for its
+    ///   next cron occurrence (`Pending`, attempts reset). A failed run's error and
+    ///   `failed_at`/`timed_out_at` stay on the job until its next run.
+    /// - on completion, dependents whose dependencies have all completed move from
+    ///   `waiting` to `satisfied`;
+    /// - on a terminal failure the workflow's
+    ///   [`FailurePolicy`](crate::workflow::FailurePolicy) is applied (`FailFast` fails
+    ///   the workflow's pending jobs, `ContinueOnFailure` fails the jobs that depend on
+    ///   this one, `Manual` leaves them waiting) and a `FailFast` batch fails its
+    ///   pending jobs;
+    /// - workflow counters and status, and batch status, are updated.
+    ///
+    /// The default implementation composes the manual methods without a transaction,
+    /// for backends that predate this method.
+    async fn finish_job_run(
+        &self,
+        run: &Job,
+        outcome: JobOutcome,
+    ) -> Result<Option<RecordedOutcome>> {
+        let Some(current) = self.get_job(run.id).await? else {
+            return Ok(None);
+        };
+        if !lifecycle::Guard::Run(run).admits(&current) {
+            return Ok(None);
+        }
+        let next_run_at = match outcome.terminal_status() {
+            Some(_) if current.recurring => current.calculate_next_run(),
+            _ => None,
+        };
+        let mut recorded = match outcome {
+            JobOutcome::Completed => {
+                if next_run_at.is_none() {
+                    self.complete_job(run.id).await?;
+                }
+                RecordedOutcome::new(crate::job::JobStatus::Completed)
+            }
+            JobOutcome::Retry { retry_at, .. } => {
+                self.retry_job(run.id, retry_at).await?;
+                RecordedOutcome::new(crate::job::JobStatus::Pending)
+            }
+            JobOutcome::Dead { error } => {
+                self.mark_job_dead(run.id, &error).await?;
+                RecordedOutcome::new(crate::job::JobStatus::Dead)
+            }
+            JobOutcome::TimedOut { error } => {
+                self.mark_job_timed_out(run.id, &error).await?;
+                RecordedOutcome::new(crate::job::JobStatus::TimedOut)
+            }
+        };
+        if let Some(next) = next_run_at {
+            self.reschedule_cron_job(run.id, next).await?;
+            recorded.status = crate::job::JobStatus::Pending;
+            recorded.next_run_at = Some(next);
+        } else if recorded.status == crate::job::JobStatus::Completed {
+            recorded.unblocked = self.resolve_job_dependencies(run.id).await?;
+        } else if recorded.status != crate::job::JobStatus::Pending {
+            recorded.cancelled = self.fail_job_dependencies(run.id).await?;
+        }
+        Ok(Some(recorded))
+    }
+
     // Lease / stale job recovery
 
     /// Record a heartbeat for a `Running` job and extend its lease to `now + lease`.
@@ -712,6 +813,95 @@ impl StaleJobRecovery {
 /// Error message recorded on a job reclaimed by [`DatabaseQueue::requeue_stale_jobs`].
 pub const STALE_JOB_ERROR_MESSAGE: &str =
     "Job lease expired while Running; the worker is presumed dead and the job was reclaimed";
+
+/// Whether a database error aborted the transaction as a deadlock or serialization
+/// victim (SQLSTATE `40001` on both backends, `40P01` on PostgreSQL). The transaction
+/// was rolled back, so it is safe to run again.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn is_transaction_conflict(error: &crate::HammerworkError) -> bool {
+    matches!(
+        error,
+        crate::HammerworkError::Database(sqlx::Error::Database(db_error))
+            if matches!(db_error.code().as_deref(), Some("40001") | Some("40P01"))
+    )
+}
+
+/// Run a transaction, retrying a few times with a short backoff when the database
+/// aborts it as a deadlock or serialization victim.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) async fn retry_on_conflict<F, Fut, T>(mut transaction: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        match transaction().await {
+            Err(error) if attempt < ATTEMPTS && is_transaction_conflict(&error) => {
+                tokio::time::sleep(std::time::Duration::from_millis(5 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// End `tx` according to `result`: commit on success, roll back on error.
+///
+/// Rolling back explicitly (instead of relying on the rollback a dropped transaction
+/// queues on its connection) guarantees the connection never goes back to the pool
+/// with an open transaction still holding row locks.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) async fn end_transaction<DB: sqlx::Database, T>(
+    tx: sqlx::Transaction<'_, DB>,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => {
+            tx.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!("Failed to roll back transaction after error: {rollback_error}");
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The JSON stored in the `retry_strategy` column for `job`.
+///
+/// A [`RetryStrategy::Custom`](crate::retry::RetryStrategy::Custom) holds a closure and
+/// cannot be persisted, so enqueueing a job that carries one is rejected; set it as the
+/// worker's default with
+/// [`Worker::with_default_retry_strategy`](crate::worker::Worker::with_default_retry_strategy)
+/// instead.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn retry_strategy_json(job: &Job) -> Result<Option<serde_json::Value>> {
+    match &job.retry_strategy {
+        None => Ok(None),
+        Some(crate::retry::RetryStrategy::Custom(_)) => {
+            Err(crate::HammerworkError::InvalidJobPayload {
+                message: format!(
+                    "job {} has a custom retry strategy, which cannot be stored; use \
+                     Worker::with_default_retry_strategy for custom strategies",
+                    job.id
+                ),
+            })
+        }
+        Some(strategy) => Ok(Some(serde_json::to_value(strategy)?)),
+    }
+}
+
+/// Decode the `retry_strategy` column; unknown or invalid values decode as `None`.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn retry_strategy_from_json(
+    value: Option<serde_json::Value>,
+) -> Option<crate::retry::RetryStrategy> {
+    value.and_then(|value| serde_json::from_value(value).ok())
+}
 
 /// Convert a `std::time::Duration` to a `chrono::Duration`, saturating on overflow.
 pub(crate) fn saturating_chrono_duration(duration: std::time::Duration) -> chrono::Duration {
