@@ -161,7 +161,14 @@ cargo hammerwork maintenance cleanup            # Remove old completed jobs
 cargo hammerwork maintenance vacuum             # Optimize database
 cargo hammerwork maintenance analyze            # Update table statistics
 cargo hammerwork maintenance health             # Database health check
+
+# Enforce retention policies of encrypted jobs: delete finished encrypted jobs
+# (and archived ones) whose retention period has ended. Needs no encryption key.
+cargo hammerwork maintenance purge-encrypted --dry-run
+cargo hammerwork maintenance purge-encrypted --confirm
 ```
+
+`cargo hammerwork job show` prints the redacted payload of an encrypted job (the CLI never decrypts) together with its key id, algorithm and retention.
 
 ### Workflow Commands
 

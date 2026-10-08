@@ -504,6 +504,14 @@ fn print_job_details_postgres(row: &sqlx::postgres::PgRow) -> Result<()> {
         println!("Error: {}", error);
     }
 
+    print_encryption_details(&EncryptionDetails {
+        is_encrypted: row.try_get("is_encrypted")?,
+        key_id: row.try_get("encryption_key_id")?,
+        algorithm: row.try_get("encryption_algorithm")?,
+        retention_policy: row.try_get("retention_policy")?,
+        retention_delete_at: row.try_get("retention_delete_at")?,
+    });
+
     let payload: serde_json::Value = row.try_get("payload")?;
     println!("Payload: {}", serde_json::to_string_pretty(&payload)?);
 
@@ -550,10 +558,56 @@ fn print_job_details_mysql(row: &sqlx::mysql::MySqlRow) -> Result<()> {
         println!("Error: {}", error);
     }
 
+    print_encryption_details(&EncryptionDetails {
+        is_encrypted: row.try_get("is_encrypted")?,
+        key_id: row.try_get("encryption_key_id")?,
+        algorithm: row.try_get("encryption_algorithm")?,
+        retention_policy: row.try_get("retention_policy")?,
+        retention_delete_at: row.try_get("retention_delete_at")?,
+    });
+
     let payload: serde_json::Value = row.try_get("payload")?;
     println!("Payload: {}", serde_json::to_string_pretty(&payload)?);
 
     Ok(())
+}
+
+/// Encryption columns of a job row, as shown by `job show`.
+struct EncryptionDetails {
+    is_encrypted: bool,
+    key_id: Option<String>,
+    algorithm: Option<String>,
+    retention_policy: Option<String>,
+    retention_delete_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Lines describing a job's payload encryption (empty for a plaintext job). The CLI
+/// never decrypts: an encrypted job's payload is shown in its redacted stored form.
+fn encryption_detail_lines(details: &EncryptionDetails) -> Vec<String> {
+    if !details.is_encrypted {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "Encrypted: yes ({}, key {}); the payload below is redacted",
+        details.algorithm.as_deref().unwrap_or("unknown algorithm"),
+        details.key_id.as_deref().unwrap_or("unknown")
+    )];
+    match (&details.retention_policy, details.retention_delete_at) {
+        (Some(policy), Some(delete_at)) => lines.push(format!(
+            "Retention: {} (delete after {})",
+            policy,
+            delete_at.format("%Y-%m-%d %H:%M:%S UTC")
+        )),
+        (Some(policy), None) => lines.push(format!("Retention: {}", policy)),
+        _ => {}
+    }
+    lines
+}
+
+fn print_encryption_details(details: &EncryptionDetails) {
+    for line in encryption_detail_lines(details) {
+        println!("{}", line);
+    }
 }
 
 async fn enqueue_job(
@@ -951,5 +1005,36 @@ mod tests {
         assert_eq!(priority_display(2), "normal");
         assert_eq!(priority_display(4), "critical");
         assert_eq!(priority_display(42), "42");
+    }
+
+    #[test]
+    fn test_encryption_detail_lines() {
+        let plain = EncryptionDetails {
+            is_encrypted: false,
+            key_id: None,
+            algorithm: None,
+            retention_policy: None,
+            retention_delete_at: None,
+        };
+        assert!(encryption_detail_lines(&plain).is_empty());
+
+        let delete_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let encrypted = EncryptionDetails {
+            is_encrypted: true,
+            key_id: Some("key-1".into()),
+            algorithm: Some("AES256GCM".into()),
+            retention_policy: Some("DeleteAfter".into()),
+            retention_delete_at: Some(delete_at),
+        };
+        let lines = encryption_detail_lines(&encrypted);
+        assert_eq!(
+            lines,
+            vec![
+                "Encrypted: yes (AES256GCM, key key-1); the payload below is redacted",
+                "Retention: DeleteAfter (delete after 2026-01-02 03:04:05 UTC)",
+            ]
+        );
     }
 }

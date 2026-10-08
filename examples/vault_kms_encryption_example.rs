@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_compression_enabled(true);
 
         match EncryptionEngine::new(vault_kms_config).await {
-            Ok(mut engine) => {
+            Ok(engine) => {
                 println!("   ✅ Vault KMS encryption engine created successfully");
 
                 // Test encryption with Vault KMS

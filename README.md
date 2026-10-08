@@ -360,74 +360,70 @@ Archival moves completed/failed jobs to a separate table with compressed payload
 
 ## Job Encryption Example
 
-Protect sensitive job payloads with enterprise-grade encryption:
+Encrypt sensitive job payloads at rest. The queue encrypts jobs that ask for it when they are enqueued and the worker decrypts them just before calling the handler:
 
 ```rust
 use hammerwork::{
-    Job, JobQueue, 
-    encryption::{EncryptionConfig, EncryptionAlgorithm, KeySource, RetentionPolicy},
-    queue::DatabaseQueue
+    Job, JobQueue, Worker,
+    encryption::{EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource, RetentionPolicy},
+    queue::DatabaseQueue,
+    worker::JobHandler,
 };
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup database and queue with encryption
     let pool = sqlx::PgPool::connect("postgresql://localhost/mydb").await?;
-    let queue = Arc::new(JobQueue::new(pool));
 
-    // Configure encryption for PII protection
+    // HAMMERWORK_ENCRYPTION_KEY holds a base64-encoded 32-byte key
     let encryption_config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
-        .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()))
-        // Or use AWS KMS for enterprise key management:
-        // .with_key_source(KeySource::External("aws://alias/hammerwork-key?region=us-east-1".to_string()))
-        // Or use Google Cloud KMS for enterprise key management:
-        // .with_key_source(KeySource::External("gcp://projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY".to_string()))
-        // Or use HashiCorp Vault KMS for enterprise key management:
-        // .with_key_source(KeySource::External("vault://secret/hammerwork/encryption-key".to_string()))
-        .with_key_rotation_enabled(true);
+        .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()));
+    // For aws:// and gcp:// KMS sources use EncryptionEngine::new_with_pool(config, &pool)
+    let engine = EncryptionEngine::new(encryption_config.clone()).await?;
+    let queue = Arc::new(JobQueue::new(pool).with_encryption(engine));
 
-    // Create job with encrypted PII fields
     let payment_job = Job::new("payment_processing".to_string(), json!({
         "user_id": "user123",
-        "credit_card": "4111-1111-1111-1111",  // PII - will be encrypted
-        "ssn": "123-45-6789",                  // PII - will be encrypted  
+        "credit_card": "4111-1111-1111-1111",  // encrypted
+        "ssn": "123-45-6789",                  // encrypted
         "amount": 299.99,
         "merchant": "Online Store"
     }))
     .with_encryption(encryption_config)
-    .with_pii_fields(vec!["credit_card", "ssn"])  // Specify which fields contain PII
-    .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(7 * 24 * 60 * 60))); // 7 days
+    .with_pii_fields(vec!["credit_card", "ssn"])  // only these fields are encrypted
+    .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(7 * 24 * 60 * 60)));
 
-    // Enqueue encrypted job
+    // Stored as {"user_id": "user123", "credit_card": "[ENCRYPTED]", "ssn": "[ENCRYPTED]", ...}
+    // with the ciphertext in the encrypted_payload column
     queue.enqueue(payment_job).await?;
 
-    // Job handler processes decrypted payload transparently
-    let handler = Arc::new(|job: Job| {
+    // The worker decrypts the payload before calling the handler
+    let handler: JobHandler = Arc::new(|job: Job| {
         Box::pin(async move {
-            // Payload is automatically decrypted before reaching handler
-            println!("Processing payment: {:?}", job.payload);
-            
-            // PII fields are available in plain text for processing
-            let credit_card = job.payload["credit_card"].as_str().unwrap();
-            let ssn = job.payload["ssn"].as_str().unwrap();
-            
-            // Your business logic here - encryption is transparent
+            let credit_card = job.payload["credit_card"].as_str().unwrap_or_default();
+            println!("Charging card ending in {}", &credit_card[credit_card.len().saturating_sub(4)..]);
             Ok(())
         })
     });
+    let worker = Worker::new(queue.clone(), "payment_processing".to_string(), handler);
+
+    // Delete finished encrypted jobs whose retention period ended (or run
+    // `cargo hammerwork maintenance purge-encrypted --confirm` periodically)
+    queue.purge_expired_encrypted_jobs().await?;
 
     Ok(())
 }
 ```
 
-Key features:
-- **Automatic Encryption**: PII fields are automatically encrypted when jobs are enqueued
-- **Transparent Decryption**: Job handlers receive decrypted payloads transparently
-- **Field-Level Protection**: Only specified PII fields are encrypted, keeping metadata accessible
-- **Retention Policies**: Automatic deletion of encrypted data after compliance periods
-- **Key Management**: Enterprise key rotation, audit trails, and external KMS integration
+What you get:
+- **Encryption at rest**: the `payload` column holds `{"encrypted": true}` (whole payload) or the payload with the `pii_fields` replaced by `"[ENCRYPTED]"`; the AES-256-GCM or ChaCha20-Poly1305 ciphertext, nonce and tag are stored in separate columns. PostgreSQL and MySQL.
+- **Fail closed**: enqueueing a job with an encryption config on a queue without an engine is an error; a worker that cannot decrypt a job (no engine, unknown key, tampered data) fails it without running the handler.
+- **Decryption only for the handler**: `dequeue`, `get_job`, the web dashboard and the CLI show the stored, redacted payload. Call `JobQueue::decrypt_job` to read the plaintext.
+- **Retention**: `DatabaseQueue::purge_expired_encrypted_jobs` deletes finished encrypted jobs past their retention time. Archiving and restoring move the ciphertext without decrypting it.
+- **Key management**: decrypt-only keys for rotated key ids (`EncryptionEngine::with_decryption_key`), KMS-wrapped data keys (AWS, GCP), Vault and Azure Key Vault sources, and the `KeyManager` for stored keys and audit trails.
+
+See [Job Encryption & PII Protection](docs/encryption.md) for details.
 
 ## Web Dashboard
 

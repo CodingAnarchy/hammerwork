@@ -787,6 +787,50 @@ pub trait DatabaseQueue: Send + Sync {
             message: "stale job recovery is not supported by this queue backend".to_string(),
         })
     }
+
+    /// Enforces the retention policies of encrypted jobs: deletes finished encrypted jobs
+    /// whose retention period has ended.
+    ///
+    /// A job encrypted with a retention policy (`Job::with_retention_policy`, or the
+    /// engine's `default_retention`) has `retention_delete_at` set when it is enqueued.
+    /// Once that time has passed and the job is finished (`Completed`, `Failed`, `Dead`
+    /// or `TimedOut`), this deletes the job row, including its ciphertext, redacted
+    /// payload and result. Archived encrypted jobs past their retention time are deleted
+    /// from the archive table too. `RetentionPolicy::DeleteImmediately` jobs are deleted
+    /// as soon as they finish. Pending and running jobs are never deleted, even when
+    /// their retention time has passed.
+    ///
+    /// Run it periodically, e.g. from a cron job or with
+    /// `cargo hammerwork maintenance purge-encrypted`. It needs no encryption key.
+    ///
+    /// The default implementation returns an error, for backends without encryption
+    /// support.
+    async fn purge_expired_encrypted_jobs(&self) -> Result<EncryptedJobPurge> {
+        Err(crate::HammerworkError::Queue {
+            message: "encrypted job retention is not supported by this queue backend".to_string(),
+        })
+    }
+}
+
+/// Job statuses after which an encrypted job may be deleted by
+/// [`DatabaseQueue::purge_expired_encrypted_jobs`]. Safe to format into a query.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) const FINISHED_STATUS_SQL: &str = "'Completed', 'Failed', 'Dead', 'TimedOut'";
+
+/// The outcome of [`DatabaseQueue::purge_expired_encrypted_jobs`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedJobPurge {
+    /// Jobs deleted from `hammerwork_jobs`.
+    pub jobs: u64,
+    /// Jobs deleted from `hammerwork_jobs_archive`.
+    pub archived_jobs: u64,
+}
+
+impl EncryptedJobPurge {
+    /// Total number of jobs deleted.
+    pub fn total(&self) -> u64 {
+        self.jobs + self.archived_jobs
+    }
 }
 
 /// The outcome of [`DatabaseQueue::requeue_stale_jobs`].
@@ -895,6 +939,98 @@ pub(crate) fn retry_strategy_json(job: &Job) -> Result<Option<serde_json::Value>
     }
 }
 
+/// The encryption columns of a job row (migration 011), as written by the inserts.
+#[derive(Debug, Default)]
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) struct EncryptionColumns {
+    pub is_encrypted: bool,
+    pub key_id: Option<String>,
+    pub algorithm: Option<&'static str>,
+    pub ciphertext: Option<Vec<u8>>,
+    pub nonce: Option<Vec<u8>>,
+    pub tag: Option<Vec<u8>>,
+    pub metadata: Option<serde_json::Value>,
+    pub payload_hash: Option<String>,
+    pub retention_policy: Option<&'static str>,
+    pub retention_delete_at: Option<DateTime<Utc>>,
+    pub encrypted_at: Option<DateTime<Utc>>,
+}
+
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+impl EncryptionColumns {
+    /// The columns for `job`, which must already be sealed ([`JobQueue::seal_jobs`]).
+    ///
+    /// Refuses a job that has an encryption config but no ciphertext, so a code path that
+    /// forgot to seal its jobs fails instead of storing the plaintext.
+    pub(crate) fn for_job(job: &Job) -> Result<Self> {
+        if !job.is_encrypted {
+            if job.has_encryption() {
+                return Err(crate::HammerworkError::Encryption {
+                    message: format!(
+                        "Job {} has an encryption config but its payload was not encrypted",
+                        job.id
+                    ),
+                });
+            }
+            return Ok(Self::default());
+        }
+
+        #[cfg(feature = "encryption")]
+        {
+            use crate::encryption::{EncryptionAlgorithm, RetentionPolicy};
+
+            let encrypted = job.encrypted_payload.as_ref().ok_or_else(|| {
+                crate::HammerworkError::Encryption {
+                    message: format!(
+                        "Job {} is marked encrypted but has no encrypted payload",
+                        job.id
+                    ),
+                }
+            })?;
+            let metadata = &encrypted.metadata;
+            Ok(Self {
+                is_encrypted: true,
+                key_id: Some(metadata.key_id.clone()),
+                algorithm: Some(match metadata.algorithm {
+                    EncryptionAlgorithm::AES256GCM => "AES256GCM",
+                    EncryptionAlgorithm::ChaCha20Poly1305 => "ChaCha20Poly1305",
+                }),
+                ciphertext: Some(encrypted.decode_ciphertext()?),
+                nonce: Some(encrypted.decode_nonce()?),
+                tag: Some(encrypted.decode_tag()?),
+                metadata: Some(serde_json::to_value(metadata)?),
+                payload_hash: Some(metadata.payload_hash.clone()),
+                retention_policy: Some(match metadata.retention_policy {
+                    // A retention too long to represent never expires
+                    RetentionPolicy::DeleteAfter(_) if metadata.delete_at.is_none() => {
+                        "KeepIndefinitely"
+                    }
+                    RetentionPolicy::DeleteAfter(_) => "DeleteAfter",
+                    RetentionPolicy::DeleteAt(_) => "DeleteAt",
+                    RetentionPolicy::KeepIndefinitely => "KeepIndefinitely",
+                    RetentionPolicy::DeleteImmediately => "DeleteImmediately",
+                    RetentionPolicy::UseDefault => "UseDefault",
+                }),
+                retention_delete_at: metadata.delete_at,
+                encrypted_at: Some(metadata.encrypted_at),
+            })
+        }
+        #[cfg(not(feature = "encryption"))]
+        Err(crate::HammerworkError::Encryption {
+            message: format!(
+                "Job {} is marked encrypted; storing encrypted jobs needs the `encryption` feature",
+                job.id
+            ),
+        })
+    }
+}
+
+/// `pii_fields` of a job as stored (`NULL` when there are none).
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn pii_fields_column(job: &Job) -> Option<Vec<String>> {
+    (!job.pii_fields.is_empty()).then(|| job.pii_fields.clone())
+}
+
 /// Decode the `retry_strategy` column; unknown or invalid values decode as `None`.
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn retry_strategy_from_json(
@@ -966,6 +1102,9 @@ pub struct JobQueue<DB: Database> {
     pub pool: Pool<DB>,
     pub(crate) _phantom: PhantomData<DB>,
     pub(crate) throttle_configs: Arc<RwLock<HashMap<String, ThrottleConfig>>>,
+    /// Engine that encrypts the payloads of jobs with an encryption config
+    #[cfg(feature = "encryption")]
+    pub(crate) encryption: Option<Arc<crate::encryption::EncryptionEngine>>,
 }
 
 impl<DB: Database> Clone for JobQueue<DB> {
@@ -974,6 +1113,8 @@ impl<DB: Database> Clone for JobQueue<DB> {
             pool: self.pool.clone(),
             _phantom: PhantomData,
             throttle_configs: self.throttle_configs.clone(),
+            #[cfg(feature = "encryption")]
+            encryption: self.encryption.clone(),
         }
     }
 }
@@ -1005,6 +1146,142 @@ impl<DB: Database> JobQueue<DB> {
             pool,
             _phantom: PhantomData,
             throttle_configs: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "encryption")]
+            encryption: None,
+        }
+    }
+
+    /// Encrypts job payloads at rest with `engine`.
+    ///
+    /// Jobs with an encryption config ([`Job::with_encryption`](crate::Job::with_encryption))
+    /// are encrypted by `enqueue`, `enqueue_batch`, `enqueue_workflow` and
+    /// `enqueue_cron_job` before they are written: the ciphertext goes to the
+    /// `encrypted_payload` column and the `payload` column holds only a redacted
+    /// placeholder (see [`encryption::job_payload`](crate::encryption::job_payload)).
+    /// Workers decrypt the payload just before calling the handler (see
+    /// [`JobQueue::decrypt_job`]).
+    ///
+    /// The engine's configuration decides the algorithm, key and compression. A job whose
+    /// config names a different algorithm or key id is rejected. Jobs without an
+    /// encryption config are stored as before.
+    ///
+    /// Without an engine, enqueueing a job that has an encryption config fails with
+    /// [`HammerworkError::Encryption`](crate::HammerworkError::Encryption): payloads are
+    /// never stored in plaintext by mistake.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(all(feature = "encryption", feature = "postgres"))]
+    /// # {
+    /// use hammerwork::{Job, JobQueue, queue::DatabaseQueue};
+    /// use hammerwork::encryption::{EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource};
+    /// use serde_json::json;
+    ///
+    /// # async fn example(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+    ///     .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()));
+    /// let engine = EncryptionEngine::new(config.clone()).await?;
+    /// let queue = JobQueue::new(pool).with_encryption(engine);
+    ///
+    /// let job = Job::new("payments".to_string(), json!({"card": "4111-1111-1111-1111", "amount": 10}))
+    ///     .with_encryption(config)
+    ///     .with_pii_fields(vec!["card"]);
+    /// queue.enqueue(job).await?; // stored as {"card": "[ENCRYPTED]", "amount": 10}
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    #[cfg(feature = "encryption")]
+    pub fn with_encryption(
+        mut self,
+        engine: impl Into<Arc<crate::encryption::EncryptionEngine>>,
+    ) -> Self {
+        self.encryption = Some(engine.into());
+        self
+    }
+
+    /// The engine set with [`JobQueue::with_encryption`], if any.
+    #[cfg(feature = "encryption")]
+    pub fn encryption_engine(&self) -> Option<&Arc<crate::encryption::EncryptionEngine>> {
+        self.encryption.as_ref()
+    }
+
+    /// Encrypts the payloads of `jobs` that have an encryption config, before they are
+    /// written. Fails (and nothing should be written) if a job needs encryption the
+    /// queue cannot provide.
+    #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+    pub(crate) async fn seal_jobs(&self, jobs: &mut [Job]) -> Result<()> {
+        for job in jobs.iter_mut() {
+            if !job.has_encryption() || job.is_encrypted {
+                continue;
+            }
+            #[cfg(feature = "encryption")]
+            {
+                let engine =
+                    self.encryption
+                        .as_ref()
+                        .ok_or_else(|| crate::HammerworkError::Encryption {
+                            message: format!(
+                                "Job {} has an encryption config but the queue has no encryption \
+                             engine; configure one with JobQueue::with_encryption",
+                                job.id
+                            ),
+                        })?;
+                crate::encryption::job_payload::seal_job(engine, job).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `job` with its payload decrypted.
+    ///
+    /// Jobs are stored and returned by the queue (`dequeue`, `get_job`, listings) in
+    /// their stored form: an encrypted job has `is_encrypted == true`, the ciphertext in
+    /// `encrypted_payload` (with the `encryption` feature) and a redacted `payload`.
+    /// Workers call this just before running the handler, so only the handler sees the
+    /// plaintext. Call it yourself to read an encrypted job's payload.
+    ///
+    /// A job that is not encrypted is returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`HammerworkError::Encryption`](crate::HammerworkError::Encryption) when the job is
+    /// encrypted and the queue has no encryption engine (or the `encryption` feature is
+    /// disabled), the engine does not have the job's key, or decryption or the integrity
+    /// check fails.
+    pub async fn decrypt_job(&self, job: Job) -> Result<Job> {
+        if !job.is_encrypted {
+            return Ok(job);
+        }
+        #[cfg(feature = "encryption")]
+        {
+            let engine =
+                self.encryption
+                    .as_ref()
+                    .ok_or_else(|| crate::HammerworkError::Encryption {
+                        message: format!(
+                            "Job {} has an encrypted payload but the queue has no encryption \
+                         engine; configure one with JobQueue::with_encryption",
+                            job.id
+                        ),
+                    })?;
+            let job_id = job.id;
+            crate::encryption::job_payload::open_job(engine, job)
+                .await
+                .map_err(|e| crate::HammerworkError::Encryption {
+                    message: format!("Cannot decrypt the payload of job {}: {}", job_id, e),
+                })
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            Err(crate::HammerworkError::Encryption {
+                message: format!(
+                    "Job {} has an encrypted payload; decrypting it needs the `encryption` \
+                     feature and an encryption engine (JobQueue::with_encryption)",
+                    job.id
+                ),
+            })
         }
     }
 

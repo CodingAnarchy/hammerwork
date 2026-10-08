@@ -51,6 +51,23 @@ pub enum MaintenanceCommand {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
     },
+    #[command(
+        about = "Delete finished encrypted jobs whose retention period has ended",
+        long_about = "Enforce the retention policies of encrypted jobs. Deletes jobs with an \
+            encrypted payload whose retention_delete_at has passed and that are finished \
+            (Completed, Failed, Dead or TimedOut), and archived encrypted jobs past their \
+            retention time. Pending and running jobs are never deleted. No encryption key \
+            is needed. Run it periodically, e.g. from cron.\n\n\
+            Example: cargo hammerwork maintenance purge-encrypted --confirm"
+    )]
+    PurgeEncrypted {
+        #[arg(short = 'u', long, help = "Database connection URL")]
+        database_url: Option<String>,
+        #[arg(long, help = "Confirm the purge")]
+        confirm: bool,
+        #[arg(long, help = "Dry run - count the jobs that would be deleted")]
+        dry_run: bool,
+    },
     #[command(about = "Check database integrity and job consistency")]
     Check {
         #[arg(short = 'u', long, help = "Database connection URL")]
@@ -99,6 +116,11 @@ impl MaintenanceCommand {
             MaintenanceCommand::Check { fix, .. } => {
                 check_database(pool, *fix).await?;
             }
+            MaintenanceCommand::PurgeEncrypted {
+                confirm, dry_run, ..
+            } => {
+                purge_expired_encrypted_jobs(pool, *confirm, *dry_run).await?;
+            }
         }
         Ok(())
     }
@@ -110,6 +132,7 @@ impl MaintenanceCommand {
             MaintenanceCommand::Reindex { database_url, .. } => database_url,
             MaintenanceCommand::Analyze { database_url, .. } => database_url,
             MaintenanceCommand::Check { database_url, .. } => database_url,
+            MaintenanceCommand::PurgeEncrypted { database_url, .. } => database_url,
         };
 
         url.as_ref()
@@ -118,6 +141,83 @@ impl MaintenanceCommand {
             .ok_or_else(|| anyhow::anyhow!("Database URL is required"))
             .map(|s| s.to_string())
     }
+}
+
+/// Queries counting the jobs `purge-encrypted` would delete, from `hammerwork_jobs` and
+/// `hammerwork_jobs_archive`. Each takes the current time as its only bind parameter
+/// (`placeholder`); they mirror `DatabaseQueue::purge_expired_encrypted_jobs`.
+fn expired_encrypted_count_queries(placeholder: &str) -> (String, String) {
+    (
+        format!(
+            "SELECT COUNT(*) AS count FROM hammerwork_jobs WHERE is_encrypted = true \
+             AND retention_delete_at IS NOT NULL AND retention_delete_at <= {placeholder} \
+             AND status IN ('Completed', 'Failed', 'Dead', 'TimedOut')"
+        ),
+        format!(
+            "SELECT COUNT(*) AS count FROM hammerwork_jobs_archive WHERE is_encrypted = true \
+             AND retention_delete_at IS NOT NULL AND retention_delete_at <= {placeholder}"
+        ),
+    )
+}
+
+async fn count_expired_encrypted_jobs(pool: &DatabasePool) -> Result<(i64, i64)> {
+    let now = chrono::Utc::now();
+    Ok(match pool {
+        DatabasePool::Postgres(pg) => {
+            let (jobs, archived) = expired_encrypted_count_queries("$1");
+            (
+                sqlx::query_scalar(&jobs).bind(now).fetch_one(pg).await?,
+                sqlx::query_scalar(&archived)
+                    .bind(now)
+                    .fetch_one(pg)
+                    .await?,
+            )
+        }
+        DatabasePool::MySQL(my) => {
+            let (jobs, archived) = expired_encrypted_count_queries("?");
+            (
+                sqlx::query_scalar(&jobs).bind(now).fetch_one(my).await?,
+                sqlx::query_scalar(&archived)
+                    .bind(now)
+                    .fetch_one(my)
+                    .await?,
+            )
+        }
+    })
+}
+
+async fn purge_expired_encrypted_jobs(
+    pool: DatabasePool,
+    confirm: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        let (jobs, archived) = count_expired_encrypted_jobs(&pool).await?;
+        println!("🔐 Encrypted jobs past their retention period");
+        println!("Jobs: {}", jobs);
+        println!("Archived jobs: {}", archived);
+        println!("\n💡 This was a dry run. Use --confirm to delete these jobs.");
+        return Ok(());
+    }
+    if !confirm {
+        println!(
+            "⚠️  This permanently deletes encrypted jobs whose retention period has ended. \
+             Use --confirm to proceed or --dry-run to preview."
+        );
+        return Ok(());
+    }
+
+    let purge = match pool.create_job_queue() {
+        JobQueueWrapper::Postgres(queue) => queue.purge_expired_encrypted_jobs().await?,
+        JobQueueWrapper::MySQL(queue) => queue.purge_expired_encrypted_jobs().await?,
+    };
+    println!(
+        "✅ Deleted {} encrypted jobs past their retention period ({} jobs, {} archived)",
+        purge.total(),
+        purge.jobs,
+        purge.archived_jobs
+    );
+    Ok(())
 }
 
 async fn vacuum_jobs(
@@ -421,4 +521,70 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    }
+
+    #[test]
+    fn test_purge_encrypted_arguments() {
+        let cli = TestCli::try_parse_from(["test", "purge-encrypted"]).unwrap();
+        match cli.command {
+            MaintenanceCommand::PurgeEncrypted {
+                database_url,
+                confirm,
+                dry_run,
+            } => {
+                assert!(database_url.is_none());
+                assert!(!confirm);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected PurgeEncrypted"),
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "purge-encrypted",
+            "--confirm",
+            "-u",
+            "mysql://localhost/db",
+        ])
+        .unwrap();
+        match cli.command {
+            MaintenanceCommand::PurgeEncrypted {
+                database_url,
+                confirm,
+                dry_run,
+            } => {
+                assert_eq!(database_url.as_deref(), Some("mysql://localhost/db"));
+                assert!(confirm);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected PurgeEncrypted"),
+        }
+    }
+
+    #[test]
+    fn test_expired_encrypted_count_queries() {
+        let (jobs, archived) = expired_encrypted_count_queries("$1");
+        assert!(jobs.contains("FROM hammerwork_jobs WHERE is_encrypted = true"));
+        assert!(jobs.contains("retention_delete_at <= $1"));
+        // Pending and running jobs are never purged
+        assert!(jobs.contains("status IN ('Completed', 'Failed', 'Dead', 'TimedOut')"));
+        assert!(!jobs.contains("Pending"));
+        assert!(archived.contains("FROM hammerwork_jobs_archive WHERE is_encrypted = true"));
+        assert!(archived.contains("retention_delete_at <= $1"));
+
+        let (jobs, archived) = expired_encrypted_count_queries("?");
+        assert!(jobs.contains("retention_delete_at <= ?"));
+        assert!(archived.contains("retention_delete_at <= ?"));
+    }
 }
