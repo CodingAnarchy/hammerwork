@@ -521,10 +521,11 @@ impl<DB: sqlx::Database> Default for SpawnManager<DB> {
 ///
 /// // Create a job that will spawn children with default config
 /// let job = Job::new("file_batch".to_string(), json!({"files": ["a.txt", "b.txt"]}))
-///     .with_spawning();
+///     .with_spawning()?;
 ///
 /// // Check that spawn config was added to payload
 /// assert!(job.payload.get("_spawn_config").is_some());
+/// # Ok::<(), hammerwork::HammerworkError>(())
 /// ```
 ///
 /// ## Custom Spawn Configuration
@@ -544,12 +545,13 @@ impl<DB: sqlx::Database> Default for SpawnManager<DB> {
 ///
 /// let job = Job::new("data_processing".to_string(), json!({"records": 5000}))
 ///     .as_high_priority()
-///     .with_spawn_config(spawn_config);
+///     .with_spawn_config(spawn_config)?;
 ///
 /// // Verify the configuration is stored
 /// let stored_config = job.payload.get("_spawn_config").unwrap();
 /// let parsed_config: SpawnConfig = serde_json::from_value(stored_config.clone()).unwrap();
 /// assert_eq!(parsed_config.max_spawn_count, Some(10));
+/// # Ok::<(), hammerwork::HammerworkError>(())
 /// ```
 ///
 /// ## Fan-out Processing Pattern
@@ -565,34 +567,106 @@ impl<DB: sqlx::Database> Default for SpawnManager<DB> {
 ///     json!({"user_ids": user_ids})
 /// )
 /// .as_high_priority()
-/// .with_spawning(); // Uses default spawn configuration
+/// .with_spawning()?; // Uses default spawn configuration
 ///
 /// // When this job completes, the spawn handler will create
 /// // individual notification jobs for each user
+/// # Ok::<(), hammerwork::HammerworkError>(())
+/// ```
+///
+/// ## Payload requirement
+///
+/// The configuration lives in the payload, so a non-object payload is rejected
+/// instead of silently dropping the configuration:
+///
+/// ```rust
+/// use hammerwork::{Job, spawn::JobSpawnExt};
+/// use serde_json::json;
+///
+/// let job = Job::new("queue".to_string(), json!([1, 2, 3]));
+/// assert!(job.with_spawning().is_err());
 /// ```
 pub trait JobSpawnExt {
     /// Enable spawning for this job with the given configuration.
-    fn with_spawn_config(self, config: SpawnConfig) -> Self;
+    ///
+    /// The configuration is stored in the job payload under
+    /// [`SPAWN_CONFIG_KEY`] (`"_spawn_config"`), so the payload must be a JSON object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HammerworkError::InvalidJobPayload`] if the payload is not a JSON object
+    /// (the configuration would have nowhere to live), or a serialization error if the
+    /// configuration cannot be serialized. The job is never silently left without its
+    /// spawn configuration.
+    fn with_spawn_config(self, config: SpawnConfig) -> Result<Self>
+    where
+        Self: Sized;
 
     /// Enable spawning for this job with default configuration.
-    fn with_spawning(self) -> Self;
+    ///
+    /// # Errors
+    ///
+    /// Same as [`JobSpawnExt::with_spawn_config`].
+    fn with_spawning(self) -> Result<Self>
+    where
+        Self: Sized;
 }
 
 impl JobSpawnExt for Job {
-    fn with_spawn_config(mut self, config: SpawnConfig) -> Self {
-        // Store spawn config in job metadata (we'll need to add this field to Job)
-        // For now, we'll use a convention in the payload
-        if let Some(payload_obj) = self.payload.as_object_mut() {
-            payload_obj.insert(
-                "_spawn_config".to_string(),
-                serde_json::to_value(config).unwrap(),
-            );
-        }
-        self
+    fn with_spawn_config(mut self, config: SpawnConfig) -> Result<Self> {
+        let value = serde_json::to_value(config)?;
+        let kind = json_kind(&self.payload);
+        let payload_obj =
+            self.payload
+                .as_object_mut()
+                .ok_or_else(|| HammerworkError::InvalidJobPayload {
+                    message: format!(
+                        "a job's spawn configuration is stored in its payload under \
+                         `{SPAWN_CONFIG_KEY}`, so the payload must be a JSON object (got {kind})"
+                    ),
+                })?;
+        payload_obj.insert(SPAWN_CONFIG_KEY.to_string(), value);
+        Ok(self)
     }
 
-    fn with_spawning(self) -> Self {
+    fn with_spawning(self) -> Result<Self> {
         self.with_spawn_config(SpawnConfig::default())
+    }
+}
+
+/// The payload key under which a job's [`SpawnConfig`] is stored.
+///
+/// The job schema has no dedicated spawn column, so the configuration travels in the
+/// payload. A worker reads it from the job's *decrypted* payload, so spawning works for
+/// encrypted jobs too; the stored (encrypted) row, however, does not expose the key to SQL,
+/// which means `cargo hammerwork spawn` queries only see jobs whose payload is stored in
+/// the clear.
+pub const SPAWN_CONFIG_KEY: &str = "_spawn_config";
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Read the spawn configuration out of a job payload.
+///
+/// Returns `Ok(None)` when the payload carries no [`SPAWN_CONFIG_KEY`], and an error when the
+/// key is present but is not a valid [`SpawnConfig`], so a misconfigured job is reported
+/// instead of silently never spawning.
+pub fn spawn_config_from_payload(payload: &serde_json::Value) -> Result<Option<SpawnConfig>> {
+    match payload.get(SPAWN_CONFIG_KEY) {
+        None => Ok(None),
+        Some(value) => serde_json::from_value::<SpawnConfig>(value.clone())
+            .map(Some)
+            .map_err(|e| HammerworkError::InvalidJobPayload {
+                message: format!("invalid `{SPAWN_CONFIG_KEY}` in job payload: {e}"),
+            }),
     }
 }
 
@@ -656,5 +730,54 @@ mod tests {
 
         let types = manager.registered_types();
         assert!(types.contains(&"test_job".to_string()));
+    }
+
+    #[test]
+    fn test_with_spawn_config_stores_config_in_object_payload() {
+        let job = Job::new("q".to_string(), json!({"a": 1}))
+            .with_spawn_config(SpawnConfig {
+                max_spawn_count: Some(7),
+                operation_id: Some("op".to_string()),
+                ..SpawnConfig::default()
+            })
+            .unwrap();
+        assert_eq!(job.payload["a"], 1);
+        let config = spawn_config_from_payload(&job.payload).unwrap().unwrap();
+        assert_eq!(config.max_spawn_count, Some(7));
+        assert_eq!(config.operation_id.as_deref(), Some("op"));
+
+        let job = Job::new("q".to_string(), json!({}))
+            .with_spawning()
+            .unwrap();
+        assert!(job.payload.get(SPAWN_CONFIG_KEY).is_some());
+    }
+
+    #[test]
+    fn test_with_spawn_config_rejects_non_object_payloads() {
+        for payload in [
+            json!(null),
+            json!(3),
+            json!("text"),
+            json!([1, 2]),
+            json!(true),
+        ] {
+            let job = Job::new("q".to_string(), payload.clone());
+            let err = job.with_spawning().unwrap_err();
+            assert!(
+                matches!(err, HammerworkError::InvalidJobPayload { .. }),
+                "{payload}: {err}"
+            );
+            assert!(err.to_string().contains("must be a JSON object"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_spawn_config_from_payload() {
+        assert!(spawn_config_from_payload(&json!({})).unwrap().is_none());
+        assert!(spawn_config_from_payload(&json!("x")).unwrap().is_none());
+        let err = spawn_config_from_payload(&json!({"_spawn_config": {"max_spawn_count": "many"}}))
+            .unwrap_err();
+        assert!(matches!(err, HammerworkError::InvalidJobPayload { .. }));
+        assert!(err.to_string().contains("_spawn_config"));
     }
 }

@@ -1084,6 +1084,74 @@ where
     ));
 }
 
+/// An encrypted job's `_spawn_config` lives inside the ciphertext, so the worker reads it
+/// from the decrypted payload; the spawn handler also sees the plaintext parent.
+async fn encrypted_job_spawns_children<DB>(plain: Arc<JobQueue<DB>>)
+where
+    DB: Inspect + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    use hammerwork::spawn::{ClosureSpawnHandler, JobSpawnExt, SpawnContext, SpawnManager};
+
+    let queue = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
+    let queue_name = test_utils::unique_queue("enc_spawn");
+    let child_queue = format!("{queue_name}_child");
+
+    let mut manager: SpawnManager<DB> = SpawnManager::new();
+    let handler_child_queue = child_queue.clone();
+    manager.register_handler(
+        queue_name.clone(),
+        ClosureSpawnHandler::new(move |context: SpawnContext<DB>| {
+            let children = context.parent_job.payload["children"].as_u64().unwrap_or(0);
+            Ok((0..children)
+                .map(|i| Job::new(handler_child_queue.clone(), json!({ "i": i })))
+                .collect())
+        }),
+    );
+
+    let card = secret("card");
+    let id = queue
+        .enqueue(
+            Job::new(queue_name.clone(), json!({"card": card, "children": 2}))
+                .with_encryption(config("k1"))
+                .with_retention_policy(long_retention())
+                .with_spawning()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The configuration is not visible in the stored row
+    let stored = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(stored.payload, json!({"encrypted": true}));
+    assert!(stored.payload.get("_spawn_config").is_none());
+
+    let handler: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
+    let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+        .with_poll_interval(Duration::from_millis(50))
+        .with_spawn_manager(Arc::new(manager));
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+    let job = wait_for_job(&queue, id, |job| {
+        !matches!(job.status, JobStatus::Pending | JobStatus::Running)
+    })
+    .await;
+    assert_eq!(job.status, JobStatus::Completed);
+
+    // Both children were enqueued (they depend on the completed parent, so they are ready)
+    let mut children = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while children.len() < 2 && Instant::now() < deadline {
+        match queue.dequeue(&child_queue).await.unwrap() {
+            Some(child) => children.push(child),
+            None => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    shutdown_tx.send(()).await.unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(children.len(), 2, "encrypted parent spawned its children");
+    assert!(children.iter().all(|c| c.depends_on == vec![id]));
+}
+
 #[cfg(feature = "postgres")]
 mod postgres {
     use super::*;
@@ -1104,6 +1172,12 @@ mod postgres {
     #[ignore] // Requires database connection
     async fn test_postgres_batch_and_workflow_are_encrypted() {
         batch_and_workflow_are_encrypted(test_utils::setup_postgres_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_encrypted_job_spawns_children() {
+        encrypted_job_spawns_children(test_utils::setup_postgres_queue().await).await;
     }
 
     #[tokio::test]
@@ -1194,6 +1268,12 @@ mod mysql {
     #[ignore] // Requires database connection
     async fn test_mysql_batch_and_workflow_are_encrypted() {
         batch_and_workflow_are_encrypted(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_encrypted_job_spawns_children() {
+        encrypted_job_spawns_children(test_utils::setup_mysql_queue().await).await;
     }
 
     #[tokio::test]

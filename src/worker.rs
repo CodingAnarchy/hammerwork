@@ -1998,6 +1998,11 @@ where
             Err(e) => return self.handle_failure(&job, e, attempts_left).await,
         };
 
+        // Spawning reads `_spawn_config` from the decrypted payload: for an encrypted job the
+        // stored payload is a placeholder or redacted, so the configuration is only visible
+        // here.
+        let spawn_parent = self.spawn_manager.is_some().then(|| handler_job.clone());
+
         // Determine timeout duration (job-specific or default)
         let timeout_duration = job.timeout.or(self.default_timeout);
 
@@ -2010,7 +2015,10 @@ where
         };
 
         match handler_result {
-            Ok(Ok(job_result)) => self.handle_success(&job, job_result, start_time).await,
+            Ok(Ok(job_result)) => {
+                self.handle_success(&job, spawn_parent, job_result, start_time)
+                    .await
+            }
             Ok(Err(e)) => self.handle_failure(&job, e, attempts_left).await,
             Err(timeout) => self.handle_timeout(&job, timeout, attempts_left).await,
         }
@@ -2019,6 +2027,7 @@ where
     async fn handle_success(
         &self,
         job: &Job,
+        spawn_parent: Option<Job>,
         job_result: JobResult,
         start_time: DateTime<Utc>,
     ) -> Result<()> {
@@ -2076,13 +2085,13 @@ where
 
         // Handle job spawning if spawn manager is configured
         if let Some(spawn_manager) = &self.spawn_manager {
-            // Check if spawn config is present in job payload
-            if let Some(spawn_config_value) = job.payload.get("_spawn_config") {
-                if let Ok(spawn_config) =
-                    serde_json::from_value::<crate::spawn::SpawnConfig>(spawn_config_value.clone())
-                {
+            // The parent handed to spawn handlers is the decrypted job, so encrypted jobs spawn
+            // like any other (their stored payload does not carry the configuration).
+            let parent = spawn_parent.as_ref().unwrap_or(job);
+            match crate::spawn::spawn_config_from_payload(&parent.payload) {
+                Ok(Some(spawn_config)) => {
                     match spawn_manager
-                        .execute_spawn(job.clone(), spawn_config, self.queue.clone())
+                        .execute_spawn(parent.clone(), spawn_config, self.queue.clone())
                         .await
                     {
                         Ok(Some(spawn_result)) => {
@@ -2114,8 +2123,10 @@ where
                             warn!("Failed to spawn child jobs for job {}: {}", job_id, e);
                         }
                     }
-                } else {
-                    debug!("Invalid spawn config in job payload for job {}", job_id);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Not spawning children for job {}: {}", job_id, e);
                 }
             }
         }
