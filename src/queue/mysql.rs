@@ -1754,9 +1754,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         super::retry_on_conflict(|| async {
             let mut conn = self.pool.acquire().await?;
             let mut tx = Self::begin_claim_transaction(&mut conn).await?;
-            let resolved = Self::resolve_dependents(&mut tx, completed_job_id).await?;
-            tx.commit().await?;
-            Ok(resolved)
+            let result = Self::resolve_dependents(&mut tx, completed_job_id).await;
+            super::end_transaction(tx, result).await
         })
         .await
     }
@@ -1788,9 +1787,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         super::retry_on_conflict(|| async {
             let mut conn = self.pool.acquire().await?;
             let mut tx = Self::begin_claim_transaction(&mut conn).await?;
-            let failed = Self::fail_dependents(&mut tx, failed_job_id, Utc::now()).await?;
-            tx.commit().await?;
-            Ok(failed)
+            let result = Self::fail_dependents(&mut tx, failed_job_id, Utc::now()).await;
+            super::end_transaction(tx, result).await
         })
         .await
     }
@@ -2297,9 +2295,19 @@ impl crate::queue::JobQueue<MySql> {
         &self,
         older_than: std::time::Duration,
     ) -> Result<super::StaleJobRecovery> {
+        let mut conn = self.pool.acquire().await?;
+        // READ COMMITTED, like the dequeue: no gap locks on the Running range.
+        let mut tx = Self::begin_claim_transaction(&mut conn).await?;
+        let result = Self::requeue_stale_jobs_in_tx(&mut tx, older_than).await;
+        super::end_transaction(tx, result).await
+    }
+
+    async fn requeue_stale_jobs_in_tx(
+        conn: &mut sqlx::MySqlConnection,
+        older_than: std::time::Duration,
+    ) -> Result<super::StaleJobRecovery> {
         let now = Utc::now();
         let cutoff = super::saturating_sub_from(now, older_than);
-        let mut tx = self.pool.begin().await?;
 
         // Claim stale rows with SKIP LOCKED so concurrent reapers never wait on (or
         // double-process) the same row. Each UPDATE re-checks `status` as well.
@@ -2320,7 +2328,7 @@ impl crate::queue::JobQueue<MySql> {
         .bind(JobStatus::Running)
         .bind(now)
         .bind(cutoff)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?;
 
         let mut recovery = super::StaleJobRecovery::default();
@@ -2340,7 +2348,7 @@ impl crate::queue::JobQueue<MySql> {
                 .bind(super::STALE_JOB_ERROR_MESSAGE)
                 .bind(&id_str)
                 .bind(JobStatus::Running)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?
             } else {
                 sqlx::query(
@@ -2353,7 +2361,7 @@ impl crate::queue::JobQueue<MySql> {
                 .bind(super::STALE_JOB_ERROR_MESSAGE)
                 .bind(&id_str)
                 .bind(JobStatus::Running)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?
             };
 
@@ -2362,7 +2370,7 @@ impl crate::queue::JobQueue<MySql> {
                     // A reclaimed job that died is a terminal failure like any other:
                     // reschedule it if recurring, otherwise apply it to its dependents,
                     // workflow and batch.
-                    Self::after_terminal(&mut tx, &job, JobStatus::Dead, now, true).await?;
+                    Self::after_terminal(conn, &job, JobStatus::Dead, now, true).await?;
                     recovery.dead.push(job.id);
                 } else {
                     recovery.requeued.push(job.id);
@@ -2370,7 +2378,6 @@ impl crate::queue::JobQueue<MySql> {
             }
         }
 
-        tx.commit().await?;
         Ok(recovery)
     }
 }
@@ -2402,6 +2409,9 @@ const INSERT_JOB_COLUMNS: &str = "id, queue_name, payload, status, priority, att
 /// Rows per multi-row INSERT; 33 placeholders per row stays far below MySQL's 65535
 /// and keeps statements well under the default `max_allowed_packet`.
 const INSERT_CHUNK_ROWS: usize = 200;
+
+/// Ids per `id IN (...)` statement when locking or failing jobs by id.
+const ID_CHUNK: usize = 500;
 
 fn result_storage_str(storage: &crate::job::ResultStorage) -> &'static str {
     match storage {
@@ -2520,33 +2530,40 @@ impl crate::queue::JobQueue<MySql> {
     ) -> Result<TransitionResult> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = Self::begin_claim_transaction(&mut conn).await?;
+        let result =
+            Self::transition_in_tx(&mut tx, job_id, guard, target, reschedule_recurring).await;
+        super::end_transaction(tx, result).await
+    }
 
+    async fn transition_in_tx(
+        conn: &mut sqlx::MySqlConnection,
+        job_id: JobId,
+        guard: Guard<'_>,
+        target: &Target,
+        reschedule_recurring: bool,
+    ) -> Result<TransitionResult> {
         let row = sqlx::query_as::<_, JobRow>(&format!(
             "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = ? FOR UPDATE"
         ))
         .bind(job_id.to_string())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
         let Some(row) = row else {
-            tx.rollback().await?;
             return Ok(TransitionResult::NotFound);
         };
         let job = row.into_job()?;
         if !guard.admits(&job) {
-            tx.rollback().await?;
             return Ok(TransitionResult::Rejected(job.status));
         }
 
         let now = Utc::now();
-        Self::write_target(&mut tx, job_id, target, now).await?;
+        Self::write_target(conn, job_id, target, now).await?;
         let recorded = match target.terminal_status() {
             Some(status) => {
-                Self::after_terminal(&mut tx, &job, status, now, reschedule_recurring).await?
+                Self::after_terminal(conn, &job, status, now, reschedule_recurring).await?
             }
             None => RecordedOutcome::new(JobStatus::Pending),
         };
-
-        tx.commit().await?;
         Ok(TransitionResult::Applied(recorded))
     }
 
@@ -2723,6 +2740,59 @@ impl crate::queue::JobQueue<MySql> {
         }))
     }
 
+    /// Lock the rows among `candidates` that still match `condition`, by primary key
+    /// and in id order, and return their `columns`.
+    ///
+    /// Callers find candidates with a non-locking read first. A locking read that has
+    /// to scan (e.g. `JSON_CONTAINS`, which no index serves) would lock or wait on
+    /// every row it scans, including rows that concurrent dequeues and transitions
+    /// hold; locking by primary key touches only the rows we change.
+    async fn lock_rows_by_id(
+        conn: &mut sqlx::MySqlConnection,
+        candidates: &[String],
+        columns: &str,
+        condition: &str,
+    ) -> Result<Vec<sqlx::mysql::MySqlRow>> {
+        let mut rows = Vec::new();
+        for chunk in candidates.chunks(ID_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let query = format!(
+                "SELECT {columns} FROM hammerwork_jobs WHERE id IN ({placeholders}) \
+                 AND {condition} ORDER BY id FOR UPDATE"
+            );
+            let mut select = sqlx::query(&query);
+            for id in chunk {
+                select = select.bind(id);
+            }
+            rows.extend(select.fetch_all(&mut *conn).await?);
+        }
+        Ok(rows)
+    }
+
+    /// Set `status = 'Failed'` on the (already locked) jobs `ids`, recording `error`.
+    /// Jobs still waiting on dependencies get `dependency_status = 'failed'`.
+    async fn fail_jobs_by_id(
+        conn: &mut sqlx::MySqlConnection,
+        ids: &[String],
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        for chunk in ids.chunks(ID_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let query = format!(
+                "UPDATE hammerwork_jobs SET status = 'Failed', failed_at = ?, error_message = ?, \
+                 dependency_status = CASE WHEN dependency_status IN ('waiting', 'satisfied') \
+                 THEN 'failed' ELSE dependency_status END WHERE id IN ({placeholders})"
+            );
+            let mut update = sqlx::query(&query).bind(now).bind(error);
+            for id in chunk {
+                update = update.bind(id);
+            }
+            update.execute(&mut *conn).await?;
+        }
+        Ok(())
+    }
+
     /// Mark `waiting` dependents of `completed_job_id` whose dependencies have all
     /// completed as `satisfied`, so they can be dequeued.
     ///
@@ -2733,18 +2803,19 @@ impl crate::queue::JobQueue<MySql> {
         conn: &mut sqlx::MySqlConnection,
         completed_job_id: JobId,
     ) -> Result<Vec<JobId>> {
-        let dependents = sqlx::query(
-            r#"
-            SELECT id, depends_on FROM hammerwork_jobs
-            WHERE JSON_CONTAINS(depends_on, ?)
-              AND dependency_status = 'waiting'
-              AND status = 'Pending'
-            ORDER BY id
-            FOR UPDATE
-            "#,
+        let candidates: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM hammerwork_jobs WHERE JSON_CONTAINS(depends_on, ?) \
+             AND dependency_status = 'waiting' AND status = 'Pending'",
         )
         .bind(serde_json::json!([completed_job_id.to_string()]))
         .fetch_all(&mut *conn)
+        .await?;
+        let dependents = Self::lock_rows_by_id(
+            conn,
+            &candidates,
+            "id, depends_on",
+            "dependency_status = 'waiting' AND status = 'Pending'",
+        )
         .await?;
 
         let mut resolved = Vec::new();
@@ -2799,41 +2870,62 @@ impl crate::queue::JobQueue<MySql> {
         failed_job_id: JobId,
         now: DateTime<Utc>,
     ) -> Result<Vec<JobId>> {
+        const CONDITION: &str =
+            "dependency_status IN ('waiting', 'satisfied') AND status = 'Pending'";
         let mut failed = Vec::new();
         let mut to_check = vec![failed_job_id];
         while let Some(current) = to_check.pop() {
-            let ids: Vec<String> = sqlx::query_scalar(
-                r#"
-                SELECT id FROM hammerwork_jobs
-                WHERE JSON_CONTAINS(depends_on, ?)
-                  AND dependency_status IN ('waiting', 'satisfied')
-                  AND status = 'Pending'
-                ORDER BY id
-                FOR UPDATE
-                "#,
-            )
+            let candidates: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT id FROM hammerwork_jobs WHERE JSON_CONTAINS(depends_on, ?) AND {CONDITION}"
+            ))
             .bind(serde_json::json!([current.to_string()]))
             .fetch_all(&mut *conn)
             .await?;
+            let ids: Vec<String> = Self::lock_rows_by_id(conn, &candidates, "id", CONDITION)
+                .await?
+                .iter()
+                .map(|row| row.try_get("id"))
+                .collect::<std::result::Result<_, _>>()?;
+            if ids.is_empty() {
+                continue;
+            }
+            Self::fail_jobs_by_id(
+                conn,
+                &ids,
+                &lifecycle::dependency_failed_message(current),
+                now,
+            )
+            .await?;
 
             for id in parse_ids(ids)? {
-                if failed.contains(&id) {
-                    continue;
+                if !failed.contains(&id) {
+                    failed.push(id);
+                    to_check.push(id);
                 }
-                sqlx::query(
-                    "UPDATE hammerwork_jobs SET dependency_status = 'failed', \
-                     status = 'Failed', failed_at = ?, error_message = ? WHERE id = ?",
-                )
-                .bind(now)
-                .bind(lifecycle::dependency_failed_message(current))
-                .bind(id.to_string())
-                .execute(&mut *conn)
-                .await?;
-                failed.push(id);
-                to_check.push(id);
             }
         }
         Ok(failed)
+    }
+
+    /// Fail the jobs among `candidates` that have not started yet (`Pending` or
+    /// `Retrying`), recording `error`. Returns the jobs failed.
+    async fn fail_unstarted(
+        conn: &mut sqlx::MySqlConnection,
+        candidates: &[String],
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<JobId>> {
+        let ids: Vec<String> =
+            Self::lock_rows_by_id(conn, candidates, "id", "status IN ('Pending', 'Retrying')")
+                .await?
+                .iter()
+                .map(|row| row.try_get("id"))
+                .collect::<std::result::Result<_, _>>()?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Self::fail_jobs_by_id(conn, &ids, error, now).await?;
+        parse_ids(ids)
     }
 
     /// Fail the pending jobs of a fail-fast workflow after `failed_job_id` failed.
@@ -2843,38 +2935,21 @@ impl crate::queue::JobQueue<MySql> {
         failed_job_id: JobId,
         now: DateTime<Utc>,
     ) -> Result<Vec<JobId>> {
-        let ids: Vec<String> = sqlx::query_scalar(
+        let candidates: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM hammerwork_jobs WHERE workflow_id = ? AND id <> ? \
-             AND status IN ('Pending', 'Retrying') ORDER BY id FOR UPDATE",
+             AND status IN ('Pending', 'Retrying')",
         )
         .bind(workflow_id)
         .bind(failed_job_id.to_string())
         .fetch_all(&mut *conn)
         .await?;
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        sqlx::query(
-            r#"
-            UPDATE hammerwork_jobs
-            SET status = 'Failed',
-                failed_at = ?,
-                error_message = ?,
-                dependency_status = CASE WHEN dependency_status = 'waiting'
-                                         THEN 'failed' ELSE dependency_status END
-            WHERE workflow_id = ?
-              AND id <> ?
-              AND status IN ('Pending', 'Retrying')
-            "#,
+        Self::fail_unstarted(
+            conn,
+            &candidates,
+            &lifecycle::workflow_failed_message(failed_job_id),
+            now,
         )
-        .bind(now)
-        .bind(lifecycle::workflow_failed_message(failed_job_id))
-        .bind(workflow_id)
-        .bind(failed_job_id.to_string())
-        .execute(&mut *conn)
-        .await?;
-        parse_ids(ids)
+        .await
     }
 
     /// Recompute a workflow's counters and status from its jobs.
@@ -2942,25 +3017,20 @@ impl crate::queue::JobQueue<MySql> {
         let fail_fast = status != JobStatus::Completed && mode == PartialFailureMode::FailFast;
         let mut cancelled = Vec::new();
         if fail_fast {
-            let ids: Vec<String> = sqlx::query_scalar(
+            let candidates: Vec<String> = sqlx::query_scalar(
                 "SELECT id FROM hammerwork_jobs WHERE batch_id = ? \
-                 AND status IN ('Pending', 'Retrying') ORDER BY id FOR UPDATE",
+                 AND status IN ('Pending', 'Retrying')",
             )
             .bind(&batch)
             .fetch_all(&mut *conn)
             .await?;
-            if !ids.is_empty() {
-                sqlx::query(
-                    "UPDATE hammerwork_jobs SET status = 'Failed', failed_at = ?, \
-                     error_message = ? WHERE batch_id = ? AND status IN ('Pending', 'Retrying')",
-                )
-                .bind(now)
-                .bind(lifecycle::batch_failed_message(job_id))
-                .bind(&batch)
-                .execute(&mut *conn)
-                .await?;
-            }
-            cancelled = parse_ids(ids)?;
+            cancelled = Self::fail_unstarted(
+                conn,
+                &candidates,
+                &lifecycle::batch_failed_message(job_id),
+                now,
+            )
+            .await?;
         }
 
         let unfinished: i64 = sqlx::query_scalar(&format!(
@@ -3034,30 +3104,32 @@ impl crate::queue::JobQueue<MySql> {
         update: sqlx::query::Query<'_, MySql, sqlx::mysql::MySqlArguments>,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        let row =
-            sqlx::query("SELECT status, recurring FROM hammerwork_jobs WHERE id = ? FOR UPDATE")
-                .bind(job_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some(row) = row else {
-            tx.rollback().await?;
-            return Err(lifecycle::rejection_error(job_id, transition, None));
-        };
-        let status: String = row.try_get("status")?;
-        let recurring: bool = row.try_get("recurring")?;
-        let allowed = lifecycle::job_status_from_db(&status)
-            .is_some_and(|status| transition.is_allowed_from(status))
-            && (transition != JobTransition::RescheduleCron || recurring);
-        if !allowed {
-            tx.rollback().await?;
-            return Err(lifecycle::rejection_error(
-                job_id,
-                transition,
-                Some(&status),
-            ));
+        let result = async {
+            let row = sqlx::query(
+                "SELECT status, recurring FROM hammerwork_jobs WHERE id = ? FOR UPDATE",
+            )
+            .bind(job_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(row) = row else {
+                return Err(lifecycle::rejection_error(job_id, transition, None));
+            };
+            let status: String = row.try_get("status")?;
+            let recurring: bool = row.try_get("recurring")?;
+            let allowed = lifecycle::job_status_from_db(&status)
+                .is_some_and(|status| transition.is_allowed_from(status))
+                && (transition != JobTransition::RescheduleCron || recurring);
+            if !allowed {
+                return Err(lifecycle::rejection_error(
+                    job_id,
+                    transition,
+                    Some(&status),
+                ));
+            }
+            update.execute(&mut *tx).await?;
+            Ok(())
         }
-        update.execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(())
+        .await;
+        super::end_transaction(tx, result).await
     }
 }

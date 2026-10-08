@@ -847,6 +847,30 @@ where
     }
 }
 
+/// End `tx` according to `result`: commit on success, roll back on error.
+///
+/// Rolling back explicitly (instead of relying on the rollback a dropped transaction
+/// queues on its connection) guarantees the connection never goes back to the pool
+/// with an open transaction still holding row locks.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) async fn end_transaction<DB: sqlx::Database, T>(
+    tx: sqlx::Transaction<'_, DB>,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => {
+            tx.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!("Failed to roll back transaction after error: {rollback_error}");
+            }
+            Err(error)
+        }
+    }
+}
+
 /// The JSON stored in the `retry_strategy` column for `job`.
 ///
 /// A [`RetryStrategy::Custom`](crate::retry::RetryStrategy::Custom) holds a closure and

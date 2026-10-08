@@ -1639,9 +1639,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     async fn resolve_job_dependencies(&self, completed_job_id: JobId) -> Result<Vec<JobId>> {
         super::retry_on_conflict(|| async {
             let mut tx = self.pool.begin().await?;
-            let resolved = Self::resolve_dependents(&mut tx, completed_job_id).await?;
-            tx.commit().await?;
-            Ok(resolved)
+            let result = Self::resolve_dependents(&mut tx, completed_job_id).await;
+            super::end_transaction(tx, result).await
         })
         .await
     }
@@ -1672,9 +1671,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>> {
         super::retry_on_conflict(|| async {
             let mut tx = self.pool.begin().await?;
-            let failed = Self::fail_dependents(&mut tx, failed_job_id, Utc::now()).await?;
-            tx.commit().await?;
-            Ok(failed)
+            let result = Self::fail_dependents(&mut tx, failed_job_id, Utc::now()).await;
+            super::end_transaction(tx, result).await
         })
         .await
     }
@@ -2194,9 +2192,17 @@ impl crate::queue::JobQueue<Postgres> {
         &self,
         older_than: std::time::Duration,
     ) -> Result<super::StaleJobRecovery> {
+        let mut tx = self.pool.begin().await?;
+        let result = Self::requeue_stale_jobs_in_tx(&mut tx, older_than).await;
+        super::end_transaction(tx, result).await
+    }
+
+    async fn requeue_stale_jobs_in_tx(
+        conn: &mut sqlx::PgConnection,
+        older_than: std::time::Duration,
+    ) -> Result<super::StaleJobRecovery> {
         let now = Utc::now();
         let cutoff = super::saturating_sub_from(now, older_than);
-        let mut tx = self.pool.begin().await?;
 
         // The CTE claims stale rows with SKIP LOCKED so concurrent reapers never wait on
         // (or double-process) the same row; the outer UPDATE re-checks `status` so a row
@@ -2237,7 +2243,7 @@ impl crate::queue::JobQueue<Postgres> {
         .bind(JobStatus::Dead)
         .bind(JobStatus::Pending)
         .bind(super::STALE_JOB_ERROR_MESSAGE)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?;
 
         let mut recovery = super::StaleJobRecovery::default();
@@ -2258,13 +2264,12 @@ impl crate::queue::JobQueue<Postgres> {
                 "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = $1"
             ))
             .bind(id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *conn)
             .await?;
             let job = row.into_job()?;
-            Self::after_terminal(&mut tx, &job, JobStatus::Dead, now, true).await?;
+            Self::after_terminal(conn, &job, JobStatus::Dead, now, true).await?;
         }
 
-        tx.commit().await?;
         Ok(recovery)
     }
 }
@@ -2394,33 +2399,40 @@ impl crate::queue::JobQueue<Postgres> {
         reschedule_recurring: bool,
     ) -> Result<TransitionResult> {
         let mut tx = self.pool.begin().await?;
+        let result =
+            Self::transition_in_tx(&mut tx, job_id, guard, target, reschedule_recurring).await;
+        super::end_transaction(tx, result).await
+    }
 
+    async fn transition_in_tx(
+        conn: &mut sqlx::PgConnection,
+        job_id: JobId,
+        guard: Guard<'_>,
+        target: &Target,
+        reschedule_recurring: bool,
+    ) -> Result<TransitionResult> {
         let row = sqlx::query_as::<_, JobRow>(&format!(
             "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = $1 FOR UPDATE"
         ))
         .bind(job_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
         let Some(row) = row else {
-            tx.rollback().await?;
             return Ok(TransitionResult::NotFound);
         };
         let job = row.into_job()?;
         if !guard.admits(&job) {
-            tx.rollback().await?;
             return Ok(TransitionResult::Rejected(job.status));
         }
 
         let now = Utc::now();
-        Self::write_target(&mut tx, job_id, target, now).await?;
+        Self::write_target(conn, job_id, target, now).await?;
         let recorded = match target.terminal_status() {
             Some(status) => {
-                Self::after_terminal(&mut tx, &job, status, now, reschedule_recurring).await?
+                Self::after_terminal(conn, &job, status, now, reschedule_recurring).await?
             }
             None => RecordedOutcome::new(JobStatus::Pending),
         };
-
-        tx.commit().await?;
         Ok(TransitionResult::Applied(recorded))
     }
 
