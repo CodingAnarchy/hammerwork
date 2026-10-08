@@ -213,6 +213,21 @@ println!("  Space saved: {} MB ({:.1}% compression)",
          stats.average_compression_ratio * 100.0);
 ```
 
+### What Archiving Does to a Job
+
+Archiving **moves** each eligible job: in one transaction the row is copied into
+`hammerwork_jobs_archive` (payload compressed when the policy asks for it) and deleted
+from `hammerwork_jobs`. Candidate rows are locked with `FOR UPDATE SKIP LOCKED`
+(PostgreSQL, and MySQL 8.0+), so concurrent archivers never archive the same job twice.
+
+`queue.get_job(id)` still finds an archived job: it falls back to the archive table and
+returns the job as it was archived, with `status == JobStatus::Archived`.
+`list_archived_jobs` reports the job's status *before* it was archived.
+
+`queue.archive_jobs(...)` processes at most `batch_size` jobs per call.
+`JobArchiver::archive_jobs_with_progress` / `archive_jobs_with_events` call it repeatedly
+until no eligible jobs remain, reporting progress after each batch.
+
 ## Restoring Archived Jobs
 
 ### Individual Job Restoration
@@ -228,6 +243,9 @@ println!("Restored job: {} from queue: {}",
 // The job is now back in the main jobs table with 'pending' status
 // and can be processed normally
 ```
+
+Restoring moves the row back in one transaction. Restoring an id that is not in the
+archive returns `HammerworkError::JobNotFound`.
 
 ### Bulk Restoration
 

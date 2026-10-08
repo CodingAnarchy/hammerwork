@@ -94,6 +94,12 @@
 //! assert_eq!(auth_config.max_failed_attempts, 5);
 //! ```
 
+// The dashboard needs a database backend to serve anything.
+#[cfg(not(any(feature = "postgres", feature = "mysql")))]
+compile_error!(
+    "hammerwork-web needs a database backend: enable the `postgres` (default) and/or `mysql` feature"
+);
+
 pub mod api;
 pub mod auth;
 pub mod config;

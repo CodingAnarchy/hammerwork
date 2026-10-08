@@ -203,11 +203,8 @@ async fn test_multiple_archivers_shared_pool_comprehensive() {
 /// Test JobArchiver event publishing functionality
 #[cfg(feature = "postgres")]
 #[tokio::test]
-#[ignore = "bug: JobArchiver archives only one policy batch_size batch per call, see #7"]
+#[ignore] // Requires database connection
 async fn test_jobarchiver_event_publishing_comprehensive() {
-    if test_utils::skip_known_bug() {
-        return;
-    }
     let queue = test_utils::setup_postgres_queue().await;
     let _serial = test_utils::serial().await;
     let queue_name = test_utils::unique_queue("event_test");
@@ -268,7 +265,23 @@ async fn test_jobarchiver_event_publishing_comprehensive() {
 
     // Analyze published events
     let published_events = std::mem::take(&mut *events.lock().unwrap());
-    assert_eq!(published_events.len(), 2); // BulkArchiveStarted + BulkArchiveCompleted
+    // 3 jobs with batch_size 2 take two batches: BulkArchiveStarted, one
+    // BulkArchiveProgress after the first batch, then BulkArchiveCompleted.
+    assert_eq!(published_events.len(), 3, "events: {published_events:?}");
+
+    match &published_events[1] {
+        ArchiveEvent::BulkArchiveProgress {
+            operation_id: op_id,
+            jobs_processed,
+            total,
+        } => {
+            assert_eq!(op_id, &operation_id);
+            assert_eq!(*jobs_processed, 2);
+            assert_eq!(*total, 3);
+        }
+        other => panic!("Expected BulkArchiveProgress event, got {other:?}"),
+    }
+    let published_events = [published_events[0].clone(), published_events[2].clone()];
 
     // Verify event structure and content
     match &published_events[0] {
@@ -304,11 +317,8 @@ async fn test_jobarchiver_event_publishing_comprehensive() {
 /// Test JobArchiver progress tracking functionality
 #[cfg(feature = "postgres")]
 #[tokio::test]
-#[ignore = "bug: JobArchiver archives only one policy batch_size batch per call, see #7"]
+#[ignore] // Requires database connection
 async fn test_jobarchiver_progress_tracking_comprehensive() {
-    if test_utils::skip_known_bug() {
-        return;
-    }
     let queue = test_utils::setup_postgres_queue().await;
     let _serial = test_utils::serial().await;
     let queue_name = test_utils::unique_queue("progress_test");

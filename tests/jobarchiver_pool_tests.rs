@@ -254,11 +254,8 @@ async fn test_pool_sharing_pattern() {
 /// Benchmark test for JobArchiver with public pool
 #[cfg(feature = "postgres")]
 #[tokio::test]
-#[ignore = "bug: JobArchiver archives only one policy batch_size batch per call, see #7"]
+#[ignore] // Requires database connection
 async fn test_jobarchiver_performance_with_public_pool() {
-    if test_utils::skip_known_bug() {
-        return;
-    }
     let queue = test_utils::setup_postgres_queue().await;
     let _serial = test_utils::serial().await;
     let queue_name = test_utils::unique_queue("perf_test");

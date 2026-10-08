@@ -50,7 +50,9 @@ use crate::{
     config::DashboardConfig,
     websocket::WebSocketState,
 };
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use hammerwork::JobQueue;
+use hammerwork::queue::DatabaseQueue;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{error, info};
@@ -124,18 +126,52 @@ impl WebDashboard {
         })
     }
 
-    /// Start the web server
+    /// Start the web server.
+    ///
+    /// The database backend is chosen from the scheme of `database_url`
+    /// (`postgres://`/`postgresql://` or `mysql://`), so with both the `postgres` and
+    /// `mysql` features enabled the dashboard serves either kind of database.
     pub async fn start(self) -> Result<()> {
-        let bind_addr: SocketAddr = self.config.bind_addr().parse()?;
+        match DatabaseBackend::from_url(&self.config.database_url)? {
+            #[cfg(feature = "postgres")]
+            DatabaseBackend::Postgres => {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(self.config.pool_size)
+                    .connect(&self.config.database_url)
+                    .await?;
+                info!(
+                    "Connected to PostgreSQL with {} connections",
+                    self.config.pool_size
+                );
+                self.serve(JobQueue::new(pool), "PostgreSQL").await
+            }
+            #[cfg(feature = "mysql")]
+            DatabaseBackend::MySql => {
+                let pool = sqlx::mysql::MySqlPoolOptions::new()
+                    .max_connections(self.config.pool_size)
+                    .connect(&self.config.database_url)
+                    .await?;
+                info!(
+                    "Connected to MySQL with {} connections",
+                    self.config.pool_size
+                );
+                self.serve(JobQueue::new(pool), "MySQL").await
+            }
+        }
+    }
 
-        // Detect database type and create job queue
-        let (queue, database_type) = self.create_job_queue_with_type().await?;
+    /// Serve the dashboard for an already connected job queue.
+    async fn serve<Q>(self, queue: Q, database_type: &str) -> Result<()>
+    where
+        Q: DatabaseQueue + Send + Sync + 'static,
+    {
+        let bind_addr: SocketAddr = self.config.bind_addr().parse()?;
         let queue = Arc::new(queue);
 
         // Create system state
         let system_state = Arc::new(RwLock::new(SystemState::new(
             self.config.clone(),
-            database_type,
+            database_type.to_string(),
             self.config.pool_size,
         )));
 
@@ -160,16 +196,6 @@ impl WebDashboard {
             .or(websocket_routes)
             .or(static_routes)
             .recover(handle_auth_rejection);
-
-        // Apply CORS if enabled (simplified approach)
-        let routes = routes.with(if self.config.enable_cors {
-            warp::cors()
-                .allow_any_origin()
-                .allow_headers(vec!["content-type", "authorization"])
-                .allow_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-        } else {
-            warp::cors().allow_origin("none") // Effectively disable CORS
-        });
 
         info!("Starting web server on {}", bind_addr);
 
@@ -199,67 +225,30 @@ impl WebDashboard {
         let websocket_state_broadcast = self.websocket_state.clone();
         WebSocketState::start_broadcast_listener(websocket_state_broadcast).await?;
 
-        // Start the server
-        warp::serve(routes).run(bind_addr).await;
+        // Start the server. With CORS disabled no CORS filter is installed at all, so
+        // browsers apply their default same-origin policy.
+        if self.config.enable_cors {
+            let cors = warp::cors()
+                .allow_any_origin()
+                .allow_headers(vec!["content-type", "authorization"])
+                .allow_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"]);
+            warp::serve(routes.with(cors)).run(bind_addr).await;
+        } else {
+            warp::serve(routes).run(bind_addr).await;
+        }
 
         Ok(())
     }
 
-    /// Create job queue from database URL and return database type
-    async fn create_job_queue_with_type(&self) -> Result<(QueueType, String)> {
-        // Determine database type from URL and create appropriate queue
-        if self.config.database_url.starts_with("postgres") {
-            #[cfg(feature = "postgres")]
-            {
-                let pg_pool = sqlx::PgPool::connect(&self.config.database_url).await?;
-                info!(
-                    "Connected to PostgreSQL with {} connections",
-                    self.config.pool_size
-                );
-                Ok((JobQueue::new(pg_pool), "PostgreSQL".to_string()))
-            }
-            #[cfg(not(feature = "postgres"))]
-            {
-                Err(anyhow::anyhow!(
-                    "PostgreSQL support not enabled. Rebuild with --features postgres"
-                ))
-            }
-        } else if self.config.database_url.starts_with("mysql") {
-            #[cfg(feature = "mysql")]
-            {
-                #[cfg(all(feature = "mysql", not(feature = "postgres")))]
-                {
-                    let mysql_pool = sqlx::MySqlPool::connect(&self.config.database_url).await?;
-                    info!(
-                        "Connected to MySQL with {} connections",
-                        self.config.pool_size
-                    );
-                    Ok((JobQueue::new(mysql_pool), "MySQL".to_string()))
-                }
-                #[cfg(all(feature = "postgres", feature = "mysql"))]
-                {
-                    Err(anyhow::anyhow!(
-                        "MySQL database URL provided but PostgreSQL is the default when both features are enabled"
-                    ))
-                }
-            }
-            #[cfg(not(feature = "mysql"))]
-            {
-                Err(anyhow::anyhow!(
-                    "MySQL support not enabled. Rebuild with --features mysql"
-                ))
-            }
-        } else {
-            Err(anyhow::anyhow!("Unsupported database URL format"))
-        }
-    }
-
     /// Create API routes with authentication
-    fn create_api_routes_static(
-        queue: Arc<QueueType>,
+    fn create_api_routes_static<Q>(
+        queue: Arc<Q>,
         auth_state: AuthState,
         system_state: Arc<RwLock<SystemState>>,
-    ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone {
+    ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
+    where
+        Q: DatabaseQueue + Send + Sync + 'static,
+    {
         // Health check endpoint (no auth required)
         let health = warp::path("health")
             .and(warp::path::end())
@@ -327,17 +316,40 @@ impl WebDashboard {
     }
 }
 
-#[cfg(all(feature = "postgres", not(feature = "mysql")))]
-type QueueType = JobQueue<sqlx::Postgres>;
+/// The database backend a dashboard connects to, chosen from the database URL scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseBackend {
+    #[cfg(feature = "postgres")]
+    Postgres,
+    #[cfg(feature = "mysql")]
+    MySql,
+}
 
-#[cfg(all(feature = "mysql", not(feature = "postgres")))]
-type QueueType = JobQueue<sqlx::MySql>;
-
-#[cfg(all(feature = "postgres", feature = "mysql"))]
-type QueueType = JobQueue<sqlx::Postgres>; // Default to PostgreSQL when both are enabled
-
-#[cfg(all(not(feature = "postgres"), not(feature = "mysql")))]
-compile_error!("At least one database feature (postgres or mysql) must be enabled");
+impl DatabaseBackend {
+    /// Picks the backend for `url` from its scheme, failing for an unknown scheme or a
+    /// backend whose feature is not enabled.
+    fn from_url(url: &str) -> Result<Self> {
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            #[cfg(feature = "postgres")]
+            return Ok(Self::Postgres);
+            #[cfg(not(feature = "postgres"))]
+            return Err(anyhow::anyhow!(
+                "PostgreSQL support not enabled. Rebuild with --features postgres"
+            ));
+        }
+        if url.starts_with("mysql://") {
+            #[cfg(feature = "mysql")]
+            return Ok(Self::MySql);
+            #[cfg(not(feature = "mysql"))]
+            return Err(anyhow::anyhow!(
+                "MySQL support not enabled. Rebuild with --features mysql"
+            ));
+        }
+        Err(anyhow::anyhow!(
+            "Unsupported database URL (expected postgres://, postgresql:// or mysql://)"
+        ))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -352,6 +364,28 @@ mod tests {
 
         let dashboard = WebDashboard::new(config).await;
         assert!(dashboard.is_ok());
+    }
+
+    #[test]
+    fn test_database_backend_from_url() {
+        #[cfg(feature = "postgres")]
+        {
+            assert_eq!(
+                DatabaseBackend::from_url("postgres://localhost/db").unwrap(),
+                DatabaseBackend::Postgres
+            );
+            assert_eq!(
+                DatabaseBackend::from_url("postgresql://localhost/db").unwrap(),
+                DatabaseBackend::Postgres
+            );
+        }
+        #[cfg(feature = "mysql")]
+        assert_eq!(
+            DatabaseBackend::from_url("mysql://localhost/db").unwrap(),
+            DatabaseBackend::MySql
+        );
+        assert!(DatabaseBackend::from_url("sqlite://db").is_err());
+        assert!(DatabaseBackend::from_url("postgresx://db").is_err());
     }
 
     #[test]

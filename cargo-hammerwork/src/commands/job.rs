@@ -203,6 +203,96 @@ impl JobCommand {
     }
 }
 
+/// A bind parameter of the `job list` query.
+#[derive(Debug, Clone, PartialEq)]
+enum ListParam {
+    Text(String),
+    Int(i32),
+}
+
+/// The value the library stores in the `status` column for a CLI status name
+/// (`pending`, `timed_out`, ...). Expects a name accepted by `validate_status`.
+fn status_db_value(status: &str) -> &'static str {
+    match status.to_lowercase().as_str() {
+        "pending" => "Pending",
+        "running" => "Running",
+        "completed" => "Completed",
+        "failed" => "Failed",
+        "dead" => "Dead",
+        "retrying" => "Retrying",
+        "timed_out" | "timedout" => "TimedOut",
+        _ => "Pending",
+    }
+}
+
+/// The display name of a stored integer priority.
+fn priority_display(priority: i32) -> String {
+    JobPriority::from_i32(priority)
+        .map(|p| p.to_string())
+        .unwrap_or_else(|_| priority.to_string())
+}
+
+/// Builds the parameterized `job list` query.
+///
+/// `postgres` selects `$n` placeholders and PostgreSQL interval syntax, otherwise `?`
+/// placeholders and MySQL syntax. Status names are mapped to the capitalized values the
+/// library stores and priorities to their integer column values.
+#[allow(clippy::too_many_arguments)]
+fn build_list_jobs_query(
+    postgres: bool,
+    queue: Option<&str>,
+    status: Option<&str>,
+    priority: Option<JobPriority>,
+    limit: u32,
+    failed: bool,
+    completed: bool,
+    last_hours: Option<u32>,
+) -> (String, Vec<ListParam>) {
+    let mut conditions = Vec::new();
+    let mut params = Vec::new();
+    let placeholder = |params: &mut Vec<ListParam>, param: ListParam| {
+        params.push(param);
+        if postgres {
+            format!("${}", params.len())
+        } else {
+            "?".to_string()
+        }
+    };
+
+    if let Some(queue_name) = queue {
+        let p = placeholder(&mut params, ListParam::Text(queue_name.to_string()));
+        conditions.push(format!("queue_name = {p}"));
+    }
+    if let Some(status) = status {
+        let p = placeholder(&mut params, ListParam::Text(status_db_value(status).into()));
+        conditions.push(format!("status = {p}"));
+    }
+    if let Some(priority) = priority {
+        let p = placeholder(&mut params, ListParam::Int(priority.as_i32()));
+        conditions.push(format!("priority = {p}"));
+    }
+    if failed {
+        conditions.push("status IN ('Failed', 'Dead')".to_string());
+    }
+    if completed {
+        conditions.push("status = 'Completed'".to_string());
+    }
+    if let Some(hours) = last_hours {
+        conditions.push(if postgres {
+            format!("created_at > NOW() - INTERVAL '{hours} hours'")
+        } else {
+            format!("created_at > DATE_SUB(NOW(), INTERVAL {hours} HOUR)")
+        });
+    }
+
+    let mut query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs".to_string();
+    if !conditions.is_empty() {
+        query.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
+    }
+    query.push_str(&format!(" ORDER BY created_at DESC LIMIT {limit}"));
+    (query, params)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn list_jobs(
     pool: DatabasePool,
@@ -218,72 +308,36 @@ async fn list_jobs(
     if let Some(ref s) = status {
         validate_status(s)?;
     }
-    if let Some(ref p) = priority {
-        validate_priority(p)?;
-    }
-
-    // Build dynamic query conditions
-    let mut conditions = Vec::new();
-    // Dynamic query building for complex filtering
-
-    if let Some(queue_name) = &queue {
-        // Escape single quotes to prevent SQL injection
-        let escaped_queue = queue_name.replace("'", "''");
-        conditions.push(format!("queue_name = '{}'", escaped_queue));
-    }
-
-    if let Some(status_str) = &status {
-        let escaped_status = status_str.replace("'", "''");
-        conditions.push(format!("status = '{}'", escaped_status));
-    }
-
-    if let Some(priority_str) = &priority {
-        let escaped_priority = priority_str.replace("'", "''");
-        conditions.push(format!("priority = '{}'", escaped_priority));
-    }
-
-    if failed {
-        conditions.push("status IN ('failed', 'dead')".to_string());
-    }
-
-    if completed {
-        conditions.push("status = 'completed'".to_string());
-    }
+    let priority = priority.as_deref().map(validate_priority).transpose()?;
 
     let mut job_table = JobTable::new();
 
     match pool {
         DatabasePool::Postgres(pg_pool) => {
-            // Build PostgreSQL query
-            let mut query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs".to_string();
-
-            if !conditions.is_empty() {
-                query.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
+            let (query, params) = build_list_jobs_query(
+                true,
+                queue.as_deref(),
+                status.as_deref(),
+                priority,
+                limit,
+                failed,
+                completed,
+                last_hours,
+            );
+            let mut sql = sqlx::query(&query);
+            for param in params {
+                sql = match param {
+                    ListParam::Text(s) => sql.bind(s),
+                    ListParam::Int(i) => sql.bind(i),
+                };
             }
 
-            if let Some(hours) = last_hours {
-                if conditions.is_empty() {
-                    query.push_str(&format!(
-                        " WHERE created_at > NOW() - INTERVAL '{} hours'",
-                        hours
-                    ));
-                } else {
-                    query.push_str(&format!(
-                        " AND created_at > NOW() - INTERVAL '{} hours'",
-                        hours
-                    ));
-                }
-            }
-
-            query.push_str(" ORDER BY created_at DESC");
-            query.push_str(&format!(" LIMIT {}", limit));
-
-            let rows = sqlx::query(&query).fetch_all(&pg_pool).await?;
+            let rows = sql.fetch_all(&pg_pool).await?;
             for row in rows {
                 let id: uuid::Uuid = row.try_get("id")?;
                 let queue_name: String = row.try_get("queue_name")?;
                 let status: String = row.try_get("status")?;
-                let priority: String = row.try_get("priority")?;
+                let priority: i32 = row.try_get("priority")?;
                 let attempts: i32 = row.try_get("attempts")?;
                 let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
                 let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
@@ -292,7 +346,7 @@ async fn list_jobs(
                     &id.to_string(),
                     &queue_name,
                     &status,
-                    &priority,
+                    &priority_display(priority),
                     attempts,
                     &created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
                     &scheduled_at.format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -300,36 +354,30 @@ async fn list_jobs(
             }
         }
         DatabasePool::MySQL(mysql_pool) => {
-            // Build MySQL query with different interval syntax
-            let mut query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs".to_string();
-
-            if !conditions.is_empty() {
-                query.push_str(&format!(" WHERE {}", conditions.join(" AND ")));
+            let (query, params) = build_list_jobs_query(
+                false,
+                queue.as_deref(),
+                status.as_deref(),
+                priority,
+                limit,
+                failed,
+                completed,
+                last_hours,
+            );
+            let mut sql = sqlx::query(&query);
+            for param in params {
+                sql = match param {
+                    ListParam::Text(s) => sql.bind(s),
+                    ListParam::Int(i) => sql.bind(i),
+                };
             }
 
-            if let Some(hours) = last_hours {
-                if conditions.is_empty() {
-                    query.push_str(&format!(
-                        " WHERE created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)",
-                        hours
-                    ));
-                } else {
-                    query.push_str(&format!(
-                        " AND created_at > DATE_SUB(NOW(), INTERVAL {} HOUR)",
-                        hours
-                    ));
-                }
-            }
-
-            query.push_str(" ORDER BY created_at DESC");
-            query.push_str(&format!(" LIMIT {}", limit));
-
-            let rows = sqlx::query(&query).fetch_all(&mysql_pool).await?;
+            let rows = sql.fetch_all(&mysql_pool).await?;
             for row in rows {
                 let id: String = row.try_get("id")?;
                 let queue_name: String = row.try_get("queue_name")?;
                 let status: String = row.try_get("status")?;
-                let priority: String = row.try_get("priority")?;
+                let priority: i32 = row.try_get("priority")?;
                 let attempts: i32 = row.try_get("attempts")?;
                 let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
                 let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
@@ -338,7 +386,7 @@ async fn list_jobs(
                     &id,
                     &queue_name,
                     &status,
-                    &priority,
+                    &priority_display(priority),
                     attempts,
                     &created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
                     &scheduled_at.format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -733,4 +781,71 @@ async fn purge_jobs(
 
     info!("✅ Purged {} jobs", affected);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_list_jobs_query_postgres_binds_typed_params() {
+        let (query, params) = build_list_jobs_query(
+            true,
+            Some("emails"),
+            Some("timed_out"),
+            Some(JobPriority::High),
+            25,
+            false,
+            false,
+            Some(2),
+        );
+        assert_eq!(
+            query,
+            "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at \
+             FROM hammerwork_jobs WHERE queue_name = $1 AND status = $2 AND priority = $3 \
+             AND created_at > NOW() - INTERVAL '2 hours' ORDER BY created_at DESC LIMIT 25"
+        );
+        assert_eq!(
+            params,
+            vec![
+                ListParam::Text("emails".into()),
+                ListParam::Text("TimedOut".into()),
+                ListParam::Int(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_list_jobs_query_mysql_and_flags() {
+        let (query, params) = build_list_jobs_query(
+            false,
+            Some("q'; DROP"),
+            None,
+            None,
+            10,
+            true,
+            false,
+            Some(1),
+        );
+        assert!(query.contains("queue_name = ?"));
+        assert!(query.contains("status IN ('Failed', 'Dead')"));
+        assert!(query.contains("DATE_SUB(NOW(), INTERVAL 1 HOUR)"));
+        // User input is bound, never interpolated
+        assert!(!query.contains("DROP"));
+        assert_eq!(params, vec![ListParam::Text("q'; DROP".into())]);
+
+        let (query, params) = build_list_jobs_query(false, None, None, None, 5, false, true, None);
+        assert!(query.ends_with("WHERE status = 'Completed' ORDER BY created_at DESC LIMIT 5"));
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_status_and_priority_mapping() {
+        assert_eq!(status_db_value("pending"), "Pending");
+        assert_eq!(status_db_value("DEAD"), "Dead");
+        assert_eq!(status_db_value("timed_out"), "TimedOut");
+        assert_eq!(priority_display(2), "normal");
+        assert_eq!(priority_display(4), "critical");
+        assert_eq!(priority_display(42), "42");
+    }
 }

@@ -33,19 +33,21 @@ mod postgres_tests {
 
         // Test query with status filter
         let query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs WHERE status = $1 ORDER BY created_at DESC LIMIT 10";
-        let rows = sqlx::query(query).bind("pending").fetch_all(&pool).await?;
+        // The library stores capitalized status names
+        let rows = sqlx::query(query).bind("Pending").fetch_all(&pool).await?;
         assert!(rows.len() <= 10);
 
         // Test query with priority filter
         let query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs WHERE priority = $1 ORDER BY created_at DESC LIMIT 10";
-        let rows = sqlx::query(query).bind("normal").fetch_all(&pool).await?;
+        // priority is an INTEGER column (JobPriority::Normal = 2)
+        let rows = sqlx::query(query).bind(2_i32).fetch_all(&pool).await?;
         assert!(rows.len() <= 10);
 
         // Test query with multiple conditions
         let query = "SELECT id, queue_name, status, priority, attempts, created_at, scheduled_at FROM hammerwork_jobs WHERE queue_name = $1 AND status = $2 ORDER BY created_at DESC LIMIT 10";
         let rows = sqlx::query(query)
             .bind("test_queue")
-            .bind("pending")
+            .bind("Pending")
             .fetch_all(&pool)
             .await?;
         assert!(rows.len() <= 10);
@@ -375,7 +377,7 @@ mod spawn_query_tests {
                    COUNT(child.id) as spawned_count,
                    parent.workflow_id, parent.workflow_name
             FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('["', parent.id, '"]')::jsonb
+            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
             WHERE parent.payload ? '_spawn_config' 
                   AND parent.status IN ('Completed', 'Running')
             GROUP BY parent.id, parent.queue_name, parent.created_at, parent.payload, parent.workflow_id, parent.workflow_name
@@ -383,9 +385,8 @@ mod spawn_query_tests {
             LIMIT 20
         "#;
 
-        let rows = sqlx::query(query).fetch_all(&pool).await?;
+        let _rows = sqlx::query(query).fetch_all(&pool).await?;
         // Should succeed even if no spawn operations exist
-        assert!(rows.len() >= 0);
 
         // Test with recent filter
         let query_recent = r#"
@@ -393,7 +394,7 @@ mod spawn_query_tests {
                    parent.payload->'_spawn_config' as spawn_config,
                    COUNT(child.id) as spawned_count
             FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('["', parent.id, '"]')::jsonb
+            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
             WHERE parent.payload ? '_spawn_config' 
                   AND parent.status IN ('Completed', 'Running')
                   AND parent.created_at > NOW() - INTERVAL '1 hour'
@@ -402,9 +403,8 @@ mod spawn_query_tests {
             LIMIT 10
         "#;
 
-        let rows = sqlx::query(query_recent).fetch_all(&pool).await?;
+        let _rows = sqlx::query(query_recent).fetch_all(&pool).await?;
         // Verify query executes without error
-        assert!(rows.len() >= 0);
 
         Ok(())
     }
@@ -426,7 +426,7 @@ mod spawn_query_tests {
             FROM (
                 SELECT parent.id, COUNT(child.id) as spawned_count
                 FROM hammerwork_jobs parent
-                LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('["', parent.id, '"]')::jsonb
+                LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
                 WHERE parent.payload ? '_spawn_config'
                       AND parent.created_at > NOW() - INTERVAL '24 hours'
                 GROUP BY parent.id
@@ -463,9 +463,8 @@ mod spawn_query_tests {
             LIMIT 20
         "#;
 
-        let rows = sqlx::query(query).fetch_all(&pool).await?;
+        let _rows = sqlx::query(query).fetch_all(&pool).await?;
         // Should succeed even if no spawn operations exist
-        assert!(rows.len() >= 0);
 
         // Test with recent filter using MySQL syntax
         let query_recent = r#"
@@ -482,9 +481,8 @@ mod spawn_query_tests {
             LIMIT 10
         "#;
 
-        let rows = sqlx::query(query_recent).fetch_all(&pool).await?;
+        let _rows = sqlx::query(query_recent).fetch_all(&pool).await?;
         // Verify query executes without error
-        assert!(rows.len() >= 0);
 
         Ok(())
     }
@@ -531,9 +529,10 @@ mod spawn_query_tests {
                    parent.payload->'_spawn_config' as spawn_config,
                    COUNT(child.id) as spawned_count
             FROM hammerwork_jobs parent
-            LEFT JOIN hammerwork_jobs child ON child.depends_on @> CONCAT('["', parent.id, '"]')::jsonb
+            LEFT JOIN hammerwork_jobs child ON child.depends_on @> ARRAY[parent.id]
             WHERE parent.payload ? '_spawn_config' 
-                  AND parent.status IN ('Completed', 'Running')"#.to_string();
+                  AND parent.status IN ('Completed', 'Running')"#
+            .to_string();
 
         if recent {
             query.push_str(" AND parent.created_at > NOW() - INTERVAL '1 hour'");
@@ -629,8 +628,8 @@ mod spawn_query_tests {
         );
 
         // Verify both queries contain the job ID
-        assert!(postgres_query.contains(&job_id));
-        assert!(mysql_query.contains(&job_id));
+        assert!(postgres_query.contains(job_id));
+        assert!(mysql_query.contains(job_id));
 
         // Verify database-specific syntax
         assert!(postgres_query.contains("@>"));

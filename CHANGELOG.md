@@ -40,6 +40,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing`: `shutdown_tracing()` now flushes and shuts down the provider installed by `init_tracing()` (OpenTelemetry 0.33 removed the global shutdown hook). Code that uses the `opentelemetry` crates directly alongside Hammerwork must move to 0.33.
 
 ### Fixed
+- **Archiving ([#14](https://github.com/CodingAnarchy/hammerwork/issues/14))**, PostgreSQL and MySQL:
+  - `archive_jobs` now moves jobs: the archive insert and the delete from `hammerwork_jobs` run in one transaction, and candidates are selected with `FOR UPDATE SKIP LOCKED` so concurrent archivers do not collide. Previously the row stayed in `hammerwork_jobs` with its old status.
+  - `get_job` falls back to the archive table and returns archived jobs with `JobStatus::Archived` (previously it returned the stale pre-archive row)
+  - `restore_archived_job` no longer fails with a duplicate key; it moves the row back atomically and returns `HammerworkError::JobNotFound` for an id that is not archived. Rows left in `hammerwork_jobs` by the old archiver are cleaned up on restore.
+  - `list_archived_jobs` reports the stored `ArchivalReason` instead of always `Automatic`. Added `ArchivalReason::as_str` / `parse_from_db` (accepts the plain and legacy JSON-quoted forms).
+  - MySQL `get_archival_stats` no longer fails to decode `SUM()` results (`DECIMAL`)
+  - `JobArchiver::archive_jobs_with_progress` / `archive_jobs_with_events` archive batch after batch until no eligible jobs remain (bounded by `MAX_ARCHIVAL_BATCHES_PER_OPERATION`) instead of a single `batch_size` batch. The progress callback is called after each batch; `archive_jobs_with_events` publishes `BulkArchiveProgress` between batches.
+- **Batches ([#14](https://github.com/CodingAnarchy/hammerwork/issues/14))**:
+  - PostgreSQL `get_batch_status` failed to decode the `VARCHAR` status column. `BatchStatus` and `JobStatus` now accept every column type `String` decodes from.
+  - `get_batch_status` (PostgreSQL and MySQL) reports live progress tallied from the batch's jobs, including archived ones. The counters stored in `hammerwork_batches` were never updated after enqueue, so pending/completed/failed counts and the status were frozen.
+- **hammerwork-web ([#14](https://github.com/CodingAnarchy/hammerwork/issues/14))**:
+  - `WebDashboard::start()` no longer panics when CORS is disabled; no CORS filter is installed in that case
+  - With both `postgres` and `mysql` features enabled, the dashboard picks the backend from the database URL scheme instead of rejecting MySQL URLs. The pool now honours `pool_size`.
+  - Building without a database feature fails with a single clear `compile_error!`
+- **cargo-hammerwork ([#14](https://github.com/CodingAnarchy/hammerwork/issues/14))**:
+  - `spawn` and `workflow` commands on PostgreSQL treated `depends_on`/`dependents` as JSONB, but they are `UUID[]` (since migration 012); the queries failed with `operator does not exist: uuid[] @> jsonb`
+  - `job list` compared the integer `priority` column with a name (`integer = text` on PostgreSQL), filtered by lowercase status names the library never stores, and failed to decode `priority`. It now binds parameters instead of interpolating them, maps status names to stored values and priorities to integers.
 - `EventManager::new` panicked when `max_buffer_size` was 0 (as set by `HammerworkConfig::with_events_enabled(false)`). A zero buffer now disables event publishing.
 - **🔧 MySQL 8 migrations**
   - Migration statements now run over the text protocol, so the `PREPARE`/`EXECUTE` blocks in migration 010 no longer fail with error 1295
