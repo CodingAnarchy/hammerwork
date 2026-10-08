@@ -98,7 +98,7 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(row.get::<i64, _>("count") > 0)
+        Ok(row.try_get::<i64, _>("count")? > 0)
     }
 
     async fn create_migration_table(&self) -> Result<()> {
@@ -130,9 +130,12 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
         let mut records = Vec::new();
         for row in rows {
             records.push(MigrationRecord {
-                migration_id: row.get("migration_id"),
-                executed_at: row.get("executed_at"),
-                execution_time_ms: row.get::<i64, _>("execution_time_ms") as u64,
+                migration_id: row.try_get("migration_id")?,
+                executed_at: row.try_get("executed_at")?,
+                execution_time_ms: crate::queue::db_int(
+                    row.try_get::<i64, _>("execution_time_ms")?,
+                    "execution_time_ms",
+                )?,
             });
         }
 

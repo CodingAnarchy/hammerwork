@@ -3,7 +3,7 @@
 //! This module provides the PostgreSQL-specific implementation of the `DatabaseQueue` trait,
 //! optimized for PostgreSQL's JSONB and advanced querying capabilities.
 
-use super::lifecycle::{self, Guard, Target, TransitionResult};
+use super::lifecycle::{self, Guard, ParentState, Target, TransitionResult};
 use super::{
     DatabaseQueue, DeadJobSummary, JobOutcome, JobTransition, QueueStats, RecordedOutcome,
 };
@@ -162,7 +162,8 @@ fn archived_job_from_row(row: &sqlx::postgres::PgRow) -> Result<Job> {
         timed_out_at: row.try_get("timed_out_at")?,
         timeout: row
             .try_get::<Option<i32>, _>("timeout_seconds")?
-            .map(|s| std::time::Duration::from_secs(s as u64)),
+            .map(|s| super::db_seconds(s, "timeout_seconds"))
+            .transpose()?,
         error_message: row.try_get("error_message")?,
         cron_schedule: row.try_get("cron_schedule")?,
         next_run_at: row.try_get("next_run_at")?,
@@ -171,14 +172,16 @@ fn archived_job_from_row(row: &sqlx::postgres::PgRow) -> Result<Job> {
         batch_id: row.try_get("batch_id")?,
         result_config: row
             .try_get::<Option<serde_json::Value>, _>("result_config")?
-            .and_then(|v| serde_json::from_value(v).ok())
+            .map(serde_json::from_value)
+            .transpose()?
             .unwrap_or_default(),
         result_data: row.try_get("result")?,
         result_stored_at: None,
         result_expires_at: row.try_get("result_ttl")?,
         retry_strategy: row
             .try_get::<Option<String>, _>("retry_strategy")?
-            .and_then(|s| serde_json::from_str(&s).ok()),
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?,
         depends_on: row
             .try_get::<Option<Vec<uuid::Uuid>>, _>("depends_on")?
             .unwrap_or_default(),
@@ -253,7 +256,8 @@ impl JobRow {
             timed_out_at: self.timed_out_at,
             timeout: self
                 .timeout_seconds
-                .map(|s| std::time::Duration::from_secs(s as u64)),
+                .map(|s| super::db_seconds(s, "timeout_seconds"))
+                .transpose()?,
             error_message: self.error_message,
             cron_schedule: self.cron_schedule,
             next_run_at: self.next_run_at,
@@ -273,19 +277,24 @@ impl JobRow {
                     .unwrap_or(crate::job::ResultStorage::None),
                 ttl: self
                     .result_ttl_seconds
-                    .map(|s| std::time::Duration::from_secs(s as u64)),
-                max_size_bytes: self.result_max_size_bytes.map(|b| b as usize),
+                    .map(|s| super::db_seconds(s, "result_ttl_seconds"))
+                    .transpose()?,
+                max_size_bytes: self
+                    .result_max_size_bytes
+                    .map(|b| super::db_int(b, "result_max_size_bytes"))
+                    .transpose()?,
             },
             result_data: self.result_data,
             result_stored_at: self.result_stored_at,
             result_expires_at: self.result_expires_at,
-            retry_strategy: super::retry_strategy_from_json(self.retry_strategy),
+            retry_strategy: super::retry_strategy_from_json(self.retry_strategy)?,
             depends_on: self.depends_on,
             dependents: self.dependents,
             dependency_status: self
                 .dependency_status
-                .as_ref()
-                .and_then(|s| crate::workflow::DependencyStatus::parse_from_db(s).ok())
+                .as_deref()
+                .map(crate::workflow::DependencyStatus::parse_from_db)
+                .transpose()?
                 .unwrap_or(crate::workflow::DependencyStatus::None),
             workflow_id: self.workflow_id,
             workflow_name: self.workflow_name,
@@ -552,8 +561,8 @@ pub(crate) struct DeadJobRow {
 }
 
 impl DeadJobRow {
-    pub fn into_job(self) -> Job {
-        Job {
+    pub fn into_job(self) -> Result<Job> {
+        Ok(Job {
             id: self.id,
             queue_name: self.queue_name,
             payload: self.payload,
@@ -583,7 +592,8 @@ impl DeadJobRow {
             timed_out_at: self.timed_out_at,
             timeout: self
                 .timeout_seconds
-                .map(|s| std::time::Duration::from_secs(s as u64)),
+                .map(|s| super::db_seconds(s, "timeout_seconds"))
+                .transpose()?,
             error_message: self.error_message,
             cron_schedule: None,
             next_run_at: None,
@@ -612,7 +622,7 @@ impl DeadJobRow {
             is_encrypted: false,
             #[cfg(feature = "encryption")]
             encrypted_payload: None,
-        }
+        })
     }
 }
 
@@ -622,145 +632,74 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn enqueue(&self, mut job: Job) -> Result<JobId> {
         self.seal_jobs(std::slice::from_mut(&mut job)).await?;
-        let mut conn = self.pool.acquire().await?;
-        insert_jobs(&mut conn, std::slice::from_ref(&job)).await?;
+        if job.depends_on.is_empty() {
+            let mut conn = self.pool.acquire().await?;
+            insert_jobs(&mut conn, std::slice::from_ref(&job)).await?;
+            return Ok(job.id);
+        }
+        // A job with dependencies is inserted together with a check of its
+        // dependencies' current state (see `insert_dependent_jobs`).
+        super::retry_on_conflict(|| async {
+            let mut tx = self.pool.begin().await?;
+            let mut jobs = vec![job.clone()];
+            let result = insert_dependent_jobs(&mut tx, &mut jobs).await;
+            super::end_transaction(tx, result).await
+        })
+        .await?;
         Ok(job.id)
     }
 
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
-        let query = format!(
-            r#"
-            UPDATE hammerwork_jobs
-            SET status = $1, started_at = $2, attempts = attempts + 1
-            WHERE id = (
-                SELECT id FROM hammerwork_jobs
-                WHERE queue_name = $3 AND status = $4 AND scheduled_at <= $5
-                  AND (dependency_status = 'none' OR dependency_status = 'satisfied')
-                ORDER BY priority DESC, scheduled_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            RETURNING {}
-            "#,
-            JOB_SELECT_FIELDS
-        );
-        let now = Utc::now();
-        let row = sqlx::query_as::<_, JobRow>(&query)
-            .bind(JobStatus::Running)
-            .bind(now)
+        let row = sqlx::query_as::<_, JobRow>(&claim_sql(false))
             .bind(queue_name)
-            .bind(JobStatus::Pending)
-            .bind(now)
             .fetch_optional(&self.pool)
             .await?;
 
         row.map(JobRow::into_job).transpose()
     }
+
     async fn dequeue_with_priority_weights(
         &self,
         queue_name: &str,
         weights: &crate::priority::PriorityWeights,
     ) -> Result<Option<Job>> {
-        use crate::priority::JobPriority;
-
         if weights.is_strict() {
             // Use strict priority - same as regular dequeue
             return self.dequeue(queue_name).await;
         }
 
-        // Lock up to 20 runnable candidates and claim one of them in the same
-        // transaction, so the row locks taken by `FOR UPDATE SKIP LOCKED` are held
-        // until the claim commits. Without the transaction, the locks are released as
-        // soon as the SELECT finishes and two workers can claim the same job.
-        let mut tx = self.pool.begin().await?;
+        // Which priority levels have a runnable job: one index probe per level, so
+        // every level is considered however many jobs of other levels are queued.
+        let levels: Vec<i32> =
+            sqlx::query_scalar(&super::runnable_priorities_sql(RUNNABLE_IN_QUEUE_SQL))
+                .bind(queue_name)
+                .fetch_all(&self.pool)
+                .await?;
+        let mut candidates: Vec<JobPriority> = levels
+            .into_iter()
+            .filter_map(|level| JobPriority::from_i32(level).ok())
+            .collect();
 
-        let candidates = sqlx::query(
-            r#"
-            SELECT id, priority
-            FROM hammerwork_jobs
-            WHERE queue_name = $1
-              AND status = $2
-              AND scheduled_at <= $3
-              AND (dependency_status = 'none' OR dependency_status = 'satisfied')
-            ORDER BY priority DESC, scheduled_at ASC
-            LIMIT 20
-            FOR UPDATE SKIP LOCKED
-            "#,
-        )
-        .bind(queue_name)
-        .bind(JobStatus::Pending)
-        .bind(Utc::now())
-        .fetch_all(&mut *tx)
-        .await?;
-
-        if candidates.is_empty() {
-            tx.rollback().await?;
-            return Ok(None);
-        }
-
-        // Group candidate ids by priority, keeping the oldest-first order from the query
-        let mut priority_jobs: std::collections::HashMap<JobPriority, Vec<uuid::Uuid>> =
-            std::collections::HashMap::new();
-        for row in &candidates {
-            let priority_val: i32 = row.try_get("priority")?;
-            let priority = JobPriority::from_i32(priority_val).unwrap_or(JobPriority::Normal);
-            priority_jobs
-                .entry(priority)
-                .or_default()
-                .push(row.try_get("id")?);
-        }
-
-        // Calculate weighted selection
-        let mut weighted_choices = Vec::new();
-        for priority in priority_jobs.keys() {
-            let weight = weights.get_weight(*priority);
-            for _ in 0..weight {
-                weighted_choices.push(priority);
+        // Pick a level by weight and claim its oldest runnable job. If other workers
+        // hold all of that level's jobs (SKIP LOCKED found none), try another level.
+        let mut attempt = 0;
+        while let Some(priority) = super::pick_weighted_priority(
+            &candidates,
+            weights,
+            super::weighted_seed(queue_name, attempt),
+        ) {
+            let claimed = sqlx::query_as::<_, JobRow>(&claim_sql(true))
+                .bind(queue_name)
+                .bind(priority.as_i32())
+                .fetch_optional(&self.pool)
+                .await?;
+            if let Some(row) = claimed {
+                return row.into_job().map(Some);
             }
+            candidates.retain(|candidate| *candidate != priority);
+            attempt += 1;
         }
-
-        if weighted_choices.is_empty() {
-            tx.rollback().await?;
-            return Ok(None);
-        }
-
-        // Use a simple hash-based selection instead of thread_rng for Send compatibility
-        let selection_index = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            queue_name.hash(&mut hasher);
-            Utc::now()
-                .timestamp_nanos_opt()
-                .unwrap_or(0)
-                .hash(&mut hasher);
-            (hasher.finish() as usize) % weighted_choices.len()
-        };
-        let selected_priority = weighted_choices[selection_index];
-
-        let Some(&job_id) = priority_jobs
-            .get(selected_priority)
-            .and_then(|ids| ids.first())
-        else {
-            tx.rollback().await?;
-            return Ok(None);
-        };
-
-        let claimed = sqlx::query_as::<_, JobRow>(&format!(
-            "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 \
-             WHERE id = $3 AND status = $4 RETURNING {}",
-            JOB_SELECT_FIELDS
-        ))
-        .bind(JobStatus::Running)
-        .bind(Utc::now())
-        .bind(job_id)
-        .bind(JobStatus::Pending)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        claimed.map(JobRow::into_job).transpose()
+        Ok(None)
     }
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
@@ -858,7 +797,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         // Insert batch metadata
         sqlx::query(
             r#"
-            INSERT INTO hammerwork_batches 
+            INSERT INTO hammerwork_batches
             (id, batch_name, total_jobs, completed_jobs, failed_jobs, pending_jobs, status, failure_mode, created_at, metadata)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#
@@ -867,7 +806,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .bind(&batch.name)
         .bind(batch.jobs.len() as i32)
         .bind(0i32) // completed_jobs
-        .bind(0i32) // failed_jobs  
+        .bind(0i32) // failed_jobs
         .bind(batch.jobs.len() as i32) // pending_jobs
         .bind(BatchStatus::Pending)
         .bind(serde_json::to_string(&batch.failure_mode)?)
@@ -878,7 +817,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
         // Insert the jobs with the same columns as `enqueue` (result config,
         // dependencies, workflow, tracing, retry strategy and encryption included).
-        insert_jobs(&mut tx, &jobs).await?;
+        insert_dependent_jobs(&mut tx, &mut jobs).await?;
 
         tx.commit().await?;
         Ok(batch.id)
@@ -903,9 +842,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             id: batch_id.to_string(),
         })?;
 
-        let total_jobs: i32 = batch_row.get("total_jobs");
+        let total_jobs: u32 =
+            super::db_int(batch_row.try_get::<i32, _>("total_jobs")?, "total_jobs")?;
         let failure_mode =
-            crate::batch::parse_failure_mode(&batch_row.get::<String, _>("failure_mode"));
+            crate::batch::parse_failure_mode(&batch_row.try_get::<String, _>("failure_mode")?);
 
         // The counters in hammerwork_batches are never updated after enqueue; tally the
         // batch's jobs (including archived ones) instead.
@@ -921,12 +861,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .await?;
         let progress = crate::batch::BatchProgress::from_status_counts(
             status_counts,
-            total_jobs as u32,
+            total_jobs,
             &failure_mode,
         );
-        let created_at: DateTime<Utc> = batch_row.get("created_at");
-        let completed_at: Option<DateTime<Utc>> = batch_row.get("completed_at");
-        let error_summary: Option<String> = batch_row.get("error_summary");
+        let created_at: DateTime<Utc> = batch_row.try_get("created_at")?;
+        let completed_at: Option<DateTime<Utc>> = batch_row.try_get("completed_at")?;
+        let error_summary: Option<String> = batch_row.try_get("error_summary")?;
 
         // Get job errors for CollectErrors mode
         let job_errors: Vec<(uuid::Uuid, String)> = sqlx::query_as(
@@ -940,7 +880,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
         Ok(BatchResult {
             batch_id,
-            total_jobs: total_jobs as u32,
+            total_jobs,
             completed_jobs: progress.completed,
             failed_jobs: progress.failed,
             pending_jobs: progress.pending,
@@ -1014,7 +954,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|row| row.into_job()).collect())
+        rows.into_iter().map(|row| row.into_job()).collect()
     }
 
     async fn get_dead_jobs_by_queue(
@@ -1036,20 +976,19 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|row| row.into_job()).collect())
+        rows.into_iter().map(|row| row.into_job()).collect()
     }
 
     async fn retry_dead_job(&self, job_id: JobId) -> Result<()> {
         let transition = JobTransition::RetryDead;
         let result = sqlx::query(&format!(
-            "UPDATE hammerwork_jobs SET status = $1, attempts = 0, scheduled_at = $2, \
+            "UPDATE hammerwork_jobs SET status = $1, attempts = 0, scheduled_at = now(), \
              started_at = NULL, failed_at = NULL, timed_out_at = NULL, \
              last_heartbeat_at = NULL, lease_expires_at = NULL \
-             WHERE id = $3 AND status IN ({})",
+             WHERE id = $2 AND status IN ({})",
             transition.sql_status_list()
         ))
         .bind(JobStatus::Pending)
-        .bind(Utc::now())
         .bind(job_id)
         .execute(&self.pool)
         .await?;
@@ -1072,8 +1011,6 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn get_dead_job_summary(&self) -> Result<DeadJobSummary> {
-        use std::collections::HashMap;
-
         // Get total dead job count
         let total_dead_jobs: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM hammerwork_jobs WHERE status = $1")
@@ -1105,15 +1042,15 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .fetch_all(&self.pool)
         .await?;
 
-        let dead_jobs_by_queue: HashMap<String, u64> = dead_jobs_by_queue_rows
-            .into_iter()
-            .map(|(queue, count)| (queue, count as u64))
-            .collect();
+        let dead_jobs_by_queue = super::count_map(dead_jobs_by_queue_rows, "dead job count")?;
 
-        let error_patterns: HashMap<String, u64> = error_patterns_rows
-            .into_iter()
-            .filter_map(|(error, count)| error.map(|e| (e, count as u64)))
-            .collect();
+        let error_patterns = super::count_map(
+            error_patterns_rows
+                .into_iter()
+                .filter_map(|(error, count)| error.map(|e| (e, count)))
+                .collect(),
+            "error count",
+        )?;
 
         let (oldest_dead_job, newest_dead_job) = timestamps
             .first()
@@ -1121,7 +1058,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .unwrap_or((None, None));
 
         Ok(DeadJobSummary {
-            total_dead_jobs: total_dead_jobs.0 as u64,
+            total_dead_jobs: super::db_int(total_dead_jobs.0, "dead job count")?,
             dead_jobs_by_queue,
             oldest_dead_job,
             newest_dead_job,
@@ -1131,7 +1068,6 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_queue_stats(&self, queue_name: &str) -> Result<QueueStats> {
         use crate::stats::JobStatistics;
-        use std::collections::HashMap;
         use std::time::Duration;
 
         // Get job counts by status
@@ -1142,10 +1078,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut counts = HashMap::new();
-        for (status, count) in status_counts {
-            counts.insert(status, count as u64);
-        }
+        let counts = super::count_map(status_counts, "job count")?;
 
         let pending_count = counts.get("Pending").copied().unwrap_or(0);
         let running_count = counts.get("Running").copied().unwrap_or(0);
@@ -1204,10 +1137,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(status_counts
-            .into_iter()
-            .map(|(status, count)| (status, count as u64))
-            .collect())
+        super::count_map(status_counts, "job count")
     }
 
     async fn get_priority_stats(&self, queue_name: &str) -> Result<crate::priority::PriorityStats> {
@@ -1230,19 +1160,21 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 _ => crate::priority::JobPriority::Normal, // Default fallback
             };
 
-            *stats.job_counts.entry(priority).or_insert(0) = count as u64;
+            *stats.job_counts.entry(priority).or_insert(0) = super::db_int(count, "job count")?;
         }
 
         // Calculate additional statistics if we have processing time data
-        let processing_times: Vec<(i32, i64)> = sqlx::query_as(
-            r#"SELECT priority, EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000 as processing_ms
-               FROM hammerwork_jobs 
+        // EXTRACT returns NUMERIC; cast it so it decodes as a float.
+        let processing_times: Vec<(i32, f64)> = sqlx::query_as(
+            r#"SELECT priority,
+                      CAST(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000
+                           AS DOUBLE PRECISION) AS processing_ms
+               FROM hammerwork_jobs
                WHERE queue_name = $1 AND started_at IS NOT NULL AND completed_at IS NOT NULL"#,
         )
         .bind(queue_name)
         .fetch_all(&self.pool)
-        .await
-        .unwrap_or_default();
+        .await?;
 
         // Group processing times by priority and calculate averages
         let mut priority_times: std::collections::HashMap<crate::priority::JobPriority, Vec<f64>> =
@@ -1261,7 +1193,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             priority_times
                 .entry(priority)
                 .or_default()
-                .push(processing_ms as f64);
+                .push(processing_ms);
         }
 
         // Calculate average processing times for each priority
@@ -1283,11 +1215,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     ) -> Result<Vec<i64>> {
         let times: Vec<(Option<i64>,)> = sqlx::query_as(
             r#"
-            SELECT EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000 as processing_time_ms
-            FROM hammerwork_jobs 
-            WHERE queue_name = $1 
-            AND started_at IS NOT NULL 
-            AND completed_at IS NOT NULL 
+            SELECT CAST(ROUND(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
+                        AS BIGINT) AS processing_time_ms
+            FROM hammerwork_jobs
+            WHERE queue_name = $1
+            AND started_at IS NOT NULL
+            AND completed_at IS NOT NULL
             AND completed_at >= $2
             ORDER BY completed_at DESC
             LIMIT 1000
@@ -1325,10 +1258,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 .await?
         };
 
-        Ok(error_frequencies
-            .into_iter()
-            .map(|(error, count)| (error, count as u64))
-            .collect())
+        super::count_map(error_frequencies, "error count")
     }
 
     async fn get_jobs_completed_in_range(
@@ -1347,11 +1277,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let query = if queue_name.is_some() {
             format!(
                 r#"
-                SELECT {} 
-                FROM hammerwork_jobs 
-                WHERE queue_name = $1 
-                  AND status = 'completed' 
-                  AND completed_at >= $2 
+                SELECT {}
+                FROM hammerwork_jobs
+                WHERE queue_name = $1
+                  AND status = 'Completed'
+                  AND completed_at >= $2
                   AND completed_at < $3
                 ORDER BY completed_at DESC
                 {}
@@ -1361,10 +1291,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         } else {
             format!(
                 r#"
-                SELECT {} 
-                FROM hammerwork_jobs 
-                WHERE status = 'completed' 
-                  AND completed_at >= $1 
+                SELECT {}
+                FROM hammerwork_jobs
+                WHERE status = 'Completed'
+                  AND completed_at >= $1
                   AND completed_at < $2
                 ORDER BY completed_at DESC
                 {}
@@ -1402,11 +1332,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             format!(
                 r#"
                 SELECT {}
-                FROM hammerwork_jobs 
-                WHERE recurring = TRUE 
+                FROM hammerwork_jobs
+                WHERE recurring = TRUE
                 AND queue_name = $1
-                AND (next_run_at IS NULL OR next_run_at <= $2)
-                AND status = $3
+                AND (next_run_at IS NULL OR next_run_at <= now())
+                AND status = $2
                 ORDER BY next_run_at ASC
                 "#,
                 JOB_SELECT_FIELDS
@@ -1415,10 +1345,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             format!(
                 r#"
                 SELECT {}
-                FROM hammerwork_jobs 
-                WHERE recurring = TRUE 
-                AND (next_run_at IS NULL OR next_run_at <= $1)
-                AND status = $2
+                FROM hammerwork_jobs
+                WHERE recurring = TRUE
+                AND (next_run_at IS NULL OR next_run_at <= now())
+                AND status = $1
                 ORDER BY next_run_at ASC
                 "#,
                 JOB_SELECT_FIELDS
@@ -1428,13 +1358,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let rows = if let Some(queue) = queue_name {
             sqlx::query_as::<_, JobRow>(&query)
                 .bind(queue)
-                .bind(Utc::now())
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
         } else {
             sqlx::query_as::<_, JobRow>(&query)
-                .bind(Utc::now())
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
@@ -1521,15 +1449,18 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn get_queue_depth(&self, queue_name: &str) -> Result<u64> {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 AND status = $2",
+        // The status is a literal (not a bind parameter) so the planner can prove the
+        // partial polling index `(queue_name, status, ...) WHERE status IN ('Pending',
+        // 'Retrying')` applies even to a generic plan, and only reads this queue's
+        // entries instead of every pending job.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM hammerwork_jobs WHERE queue_name = $1 AND status = 'Pending'",
         )
         .bind(queue_name)
-        .bind(JobStatus::Pending)
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(count.0 as u64)
+        super::db_int(count, "queue depth")
     }
 
     // Job result storage and retrieval operations
@@ -1540,10 +1471,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE hammerwork_jobs SET result_data = $1, result_stored_at = $2, result_expires_at = $3 WHERE id = $4"
+            "UPDATE hammerwork_jobs SET result_data = $1, result_stored_at = now(), result_expires_at = $2 WHERE id = $3"
         )
         .bind(result_data)
-        .bind(Utc::now())
         .bind(expires_at)
         .bind(job_id)
         .execute(&self.pool)
@@ -1554,18 +1484,14 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_job_result(&self, job_id: JobId) -> Result<Option<serde_json::Value>> {
         let row = sqlx::query(
-            "SELECT result_data FROM hammerwork_jobs WHERE id = $1 AND result_data IS NOT NULL AND (result_expires_at IS NULL OR result_expires_at > $2)"
+            "SELECT result_data FROM hammerwork_jobs WHERE id = $1 AND result_data IS NOT NULL AND (result_expires_at IS NULL OR result_expires_at > now())"
         )
         .bind(job_id)
-        .bind(Utc::now())
         .fetch_optional(&self.pool)
         .await?;
 
         match row {
-            Some(row) => {
-                let result_data: Option<serde_json::Value> = row.get("result_data");
-                Ok(result_data)
-            }
+            Some(row) => Ok(row.try_get("result_data")?),
             None => Ok(None),
         }
     }
@@ -1583,9 +1509,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn cleanup_expired_results(&self) -> Result<u64> {
         let result = sqlx::query(
-            "UPDATE hammerwork_jobs SET result_data = NULL, result_stored_at = NULL, result_expires_at = NULL WHERE result_expires_at IS NOT NULL AND result_expires_at <= $1"
+            "UPDATE hammerwork_jobs SET result_data = NULL, result_stored_at = NULL, result_expires_at = NULL WHERE result_expires_at IS NOT NULL AND result_expires_at <= now()"
         )
-        .bind(Utc::now())
         .execute(&self.pool)
         .await?;
 
@@ -1628,9 +1553,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .await?;
 
         // Insert all jobs in the workflow
-        for job in &jobs {
-            self.insert_job_in_transaction(&mut tx, job).await?;
-        }
+        insert_dependent_jobs(&mut tx, &mut jobs).await?;
 
         tx.commit().await?;
 
@@ -1668,19 +1591,22 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             }
 
             let workflow = JobGroup {
-                id: row.get("id"),
-                name: row.get("name"),
-                status: WorkflowStatus::parse_from_db(row.get("status"))?,
-                created_at: row.get("created_at"),
-                completed_at: row.get("completed_at"),
-                failed_at: row.get("failed_at"),
-                failure_policy: FailurePolicy::parse_from_db(row.get("failure_policy"))?,
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                status: WorkflowStatus::parse_from_db(row.try_get("status")?)?,
+                created_at: row.try_get("created_at")?,
+                completed_at: row.try_get("completed_at")?,
+                failed_at: row.try_get("failed_at")?,
+                failure_policy: FailurePolicy::parse_from_db(row.try_get("failure_policy")?)?,
                 jobs,
                 dependencies,
-                total_jobs: row.get::<i32, _>("total_jobs") as usize,
-                completed_jobs: row.get::<i32, _>("completed_jobs") as usize,
-                failed_jobs: row.get::<i32, _>("failed_jobs") as usize,
-                metadata: row.get("metadata"),
+                total_jobs: super::db_int(row.try_get::<i32, _>("total_jobs")?, "total_jobs")?,
+                completed_jobs: super::db_int(
+                    row.try_get::<i32, _>("completed_jobs")?,
+                    "completed_jobs",
+                )?,
+                failed_jobs: super::db_int(row.try_get::<i32, _>("failed_jobs")?, "failed_jobs")?,
+                metadata: row.try_get("metadata")?,
             };
 
             Ok(Some(workflow))
@@ -1706,15 +1632,14 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 WHERE queue_name = $1
                 AND status = 'Pending'
                 AND dependency_status IN ('none', 'satisfied')
-                AND scheduled_at <= $2
+                AND scheduled_at <= now()
                 ORDER BY priority DESC, scheduled_at ASC
-                LIMIT $3
+                LIMIT $2
                 "#,
             JOB_SELECT_FIELDS
         ))
         .bind(queue_name)
-        .bind(chrono::Utc::now())
-        .bind(limit as i64)
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
 
@@ -1724,7 +1649,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>> {
         super::retry_on_conflict(|| async {
             let mut tx = self.pool.begin().await?;
-            let result = Self::fail_dependents(&mut tx, failed_job_id, Utc::now()).await;
+            let result = async {
+                let now = db_now(&mut tx).await?;
+                Self::fail_dependents(&mut tx, failed_job_id, now).await
+            }
+            .await;
             super::end_transaction(tx, result).await
         })
         .await
@@ -1751,41 +1680,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn cancel_workflow(&self, workflow_id: crate::workflow::WorkflowId) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-
-        // Cancel all pending jobs in the workflow
-        sqlx::query(
-            r#"
-            UPDATE hammerwork_jobs
-            SET status = 'Failed',
-                failed_at = $2,
-                error_message = 'Workflow cancelled'
-            WHERE workflow_id = $1
-            AND status = 'Pending'
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(chrono::Utc::now())
-        .execute(&mut *tx)
-        .await?;
-
-        // Update workflow status
-        sqlx::query(
-            r#"
-            UPDATE hammerwork_workflows
-            SET status = 'cancelled',
-                failed_at = $2
-            WHERE id = $1
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(chrono::Utc::now())
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(())
+        super::retry_on_conflict(|| async {
+            let mut tx = self.pool.begin().await?;
+            let result = Self::cancel_workflow_in_tx(&mut tx, workflow_id).await;
+            super::end_transaction(tx, result).await
+        })
+        .await
     }
 
     // Job archival operations
@@ -1904,7 +1804,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .bind(job.result_expires_at)
             .bind(
                 job.retry_strategy
-                    .map(|rs| serde_json::to_string(&rs).unwrap_or_default()),
+                    .map(|rs| serde_json::to_string(&rs))
+                    .transpose()?,
             )
             .bind(job.timeout.map(|t| t.as_secs() as i32))
             .bind(job.priority.weight() as i32)
@@ -2076,20 +1977,21 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let mut archived_jobs = Vec::new();
         for row in rows {
             archived_jobs.push(ArchivedJob {
-                id: row.get("id"),
-                queue_name: row.get("queue_name"),
-                status: crate::archive::parse_archived_status(&row.get::<String, _>("status")),
-                created_at: row.get("created_at"),
-                archived_at: row.get("archived_at"),
+                id: row.try_get("id")?,
+                queue_name: row.try_get("queue_name")?,
+                status: crate::archive::parse_archived_status(&row.try_get::<String, _>("status")?),
+                created_at: row.try_get("created_at")?,
+                archived_at: row.try_get("archived_at")?,
                 archival_reason: crate::archive::ArchivalReason::parse_from_db(
-                    &row.get::<String, _>("archival_reason"),
+                    &row.try_get::<String, _>("archival_reason")?,
                 )
                 .unwrap_or_default(),
                 original_payload_size: row
-                    .get::<Option<i32>, _>("original_payload_size")
-                    .map(|s| s as usize),
-                payload_compressed: row.get("payload_compressed"),
-                archived_by: row.get("archived_by"),
+                    .try_get::<Option<i32>, _>("original_payload_size")?
+                    .map(|s| super::db_int(s, "original_payload_size"))
+                    .transpose()?,
+                payload_compressed: row.try_get("payload_compressed")?,
+                archived_by: row.try_get("archived_by")?,
             });
         }
 
@@ -2111,7 +2013,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     ) -> Result<crate::archive::ArchivalStats> {
         use crate::archive::ArchivalStats;
 
-        let mut base_query = "SELECT 
+        let mut base_query = "SELECT
             COUNT(*) as job_count,
             COALESCE(SUM(original_payload_size), 0) as total_original_size,
             COALESCE(SUM(LENGTH(payload)), 0) as total_compressed_size,
@@ -2130,10 +2032,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
         let row = query.fetch_one(&self.pool).await?;
 
-        let job_count: i64 = row.get("job_count");
-        let total_original_size: i64 = row.get("total_original_size");
-        let total_compressed_size: i64 = row.get("total_compressed_size");
-        let last_archived_at: Option<DateTime<Utc>> = row.get("last_archived_at");
+        let job_count: i64 = row.try_get("job_count")?;
+        let total_original_size: i64 = row.try_get("total_original_size")?;
+        let total_compressed_size: i64 = row.try_get("total_compressed_size")?;
+        let last_archived_at: Option<DateTime<Utc>> = row.try_get("last_archived_at")?;
 
         let compression_ratio = if total_compressed_size > 0 {
             total_original_size as f64 / total_compressed_size as f64
@@ -2142,9 +2044,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         };
 
         Ok(ArchivalStats {
-            jobs_archived: job_count as u64,
+            jobs_archived: super::db_int(job_count, "archived job count")?,
             jobs_purged: 0, // This would need separate tracking
-            bytes_archived: total_compressed_size as u64,
+            bytes_archived: super::db_int(total_compressed_size, "archived bytes")?,
             bytes_purged: 0,
             compression_ratio,
             operation_duration: std::time::Duration::from_secs(0),
@@ -2158,8 +2060,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             r#"
             INSERT INTO hammerwork_queue_pause (queue_name, paused_by, paused_at, created_at, updated_at)
             VALUES ($1, $2, NOW(), NOW(), NOW())
-            ON CONFLICT (queue_name) 
-            DO UPDATE SET 
+            ON CONFLICT (queue_name)
+            DO UPDATE SET
                 paused_by = EXCLUDED.paused_by,
                 paused_at = NOW(),
                 updated_at = NOW()
@@ -2202,15 +2104,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(row) => Ok(Some(super::QueuePauseInfo {
-                queue_name: row.get("queue_name"),
-                paused_at: row.get("paused_at"),
-                paused_by: row.get("paused_by"),
-                reason: row.get("reason"),
-            })),
-            None => Ok(None),
-        }
+        row.as_ref().map(pause_info_from_row).transpose()
     }
 
     async fn get_paused_queues(&self) -> Result<Vec<super::QueuePauseInfo>> {
@@ -2220,27 +2114,16 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .fetch_all(&self.pool)
         .await?;
 
-        let paused_queues = rows
-            .into_iter()
-            .map(|row| super::QueuePauseInfo {
-                queue_name: row.get("queue_name"),
-                paused_at: row.get("paused_at"),
-                paused_by: row.get("paused_by"),
-                reason: row.get("reason"),
-            })
-            .collect();
-
-        Ok(paused_queues)
+        rows.iter().map(pause_info_from_row).collect()
     }
 
     async fn heartbeat_job(&self, job_id: JobId, lease: std::time::Duration) -> Result<bool> {
-        let now = Utc::now();
+        // The lease is measured on the database clock, like the reaper that checks it.
         let result = sqlx::query(
-            "UPDATE hammerwork_jobs SET last_heartbeat_at = $1, lease_expires_at = $2 \
-             WHERE id = $3 AND status = $4",
+            "UPDATE hammerwork_jobs SET last_heartbeat_at = now(), \
+             lease_expires_at = now() + $1 WHERE id = $2 AND status = $3",
         )
-        .bind(now)
-        .bind(super::saturating_add_to(now, lease))
+        .bind(super::clamp_interval(lease))
         .bind(job_id)
         .bind(JobStatus::Running)
         .execute(&self.pool)
@@ -2268,8 +2151,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn purge_expired_encrypted_jobs(&self) -> Result<super::EncryptedJobPurge> {
-        let now = Utc::now();
         let mut tx = self.pool.begin().await?;
+        let now = db_now(&mut tx).await?;
         let jobs = sqlx::query(&format!(
             "DELETE FROM hammerwork_jobs WHERE is_encrypted = true \
              AND retention_delete_at IS NOT NULL AND retention_delete_at <= $1 \
@@ -2319,7 +2202,7 @@ impl crate::queue::JobQueue<Postgres> {
         conn: &mut sqlx::PgConnection,
         older_than: std::time::Duration,
     ) -> Result<super::StaleJobRecovery> {
-        let now = Utc::now();
+        let now = db_now(conn).await?;
         let cutoff = super::saturating_sub_from(now, older_than);
 
         // The CTE claims stale rows with SKIP LOCKED so concurrent reapers never wait on
@@ -2366,8 +2249,8 @@ impl crate::queue::JobQueue<Postgres> {
 
         let mut recovery = super::StaleJobRecovery::default();
         for row in rows {
-            let id: uuid::Uuid = row.get("id");
-            let status: String = row.get("status");
+            let id: uuid::Uuid = row.try_get("id")?;
+            let status: String = row.try_get("status")?;
             if status == "Dead" {
                 recovery.dead.push(id);
             } else {
@@ -2401,15 +2284,6 @@ impl crate::queue::JobQueue<Postgres> {
     ) -> Result<JobId> {
         insert_jobs(tx, std::slice::from_ref(&job)).await?;
         Ok(job.id)
-    }
-
-    /// Helper method to insert a job within a transaction
-    async fn insert_job_in_transaction(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        job: &Job,
-    ) -> Result<()> {
-        insert_jobs(tx, std::slice::from_ref(job)).await
     }
 }
 
@@ -2501,6 +2375,112 @@ async fn insert_jobs(conn: &mut sqlx::PgConnection, jobs: &[Job]) -> Result<()> 
     Ok(())
 }
 
+/// The current time by the database clock.
+///
+/// Due times, run timestamps, leases and cron schedules are all compared with and
+/// derived from the database clock, so clock skew between application servers does
+/// not shift scheduling. Inside a transaction this is the transaction's start time.
+async fn db_now(conn: &mut sqlx::PgConnection) -> Result<DateTime<Utc>> {
+    Ok(sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *conn)
+        .await?)
+}
+
+/// A `hammerwork_queue_pause` row.
+fn pause_info_from_row(row: &sqlx::postgres::PgRow) -> Result<super::QueuePauseInfo> {
+    Ok(super::QueuePauseInfo {
+        queue_name: row.try_get("queue_name")?,
+        paused_at: row.try_get("paused_at")?,
+        paused_by: row.try_get("paused_by")?,
+        reason: row.try_get("reason")?,
+    })
+}
+
+/// The condition for a job of queue `$1` (alias `j`) that can be dequeued now: pending,
+/// due by the database clock, not waiting on dependencies, and its queue not paused.
+///
+/// Status and dependency values are literals so the planner can use the partial
+/// polling indexes; the pause check is uncorrelated and runs once per query.
+const RUNNABLE_IN_QUEUE_SQL: &str = "j.queue_name = $1 AND j.status = 'Pending' \
+     AND j.scheduled_at <= now() AND j.dependency_status IN ('none', 'satisfied') \
+     AND NOT EXISTS (SELECT 1 FROM hammerwork_queue_pause p WHERE p.queue_name = $1)";
+
+/// Claims the next runnable job of queue `$1` (of priority `$2` when `by_priority`),
+/// highest priority and oldest first, in one statement. `FOR UPDATE SKIP LOCKED` lets
+/// concurrent workers pass over rows another worker is claiming.
+fn claim_sql(by_priority: bool) -> String {
+    format!(
+        "UPDATE hammerwork_jobs SET status = 'Running', started_at = now(), \
+         attempts = attempts + 1 \
+         WHERE id = (SELECT j.id FROM hammerwork_jobs j WHERE {RUNNABLE_IN_QUEUE_SQL}{} \
+         ORDER BY j.priority DESC, j.scheduled_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) \
+         RETURNING {JOB_SELECT_FIELDS}",
+        if by_priority {
+            " AND j.priority = $2"
+        } else {
+            ""
+        }
+    )
+}
+
+/// Insert `jobs`, settling the dependency state of those that depend on jobs that
+/// already finished (see [`lifecycle::settle_new_dependents`]).
+///
+/// The dependencies are locked `FOR SHARE` before their state is read and stay locked
+/// until the caller's transaction commits. A dependency finishing concurrently either
+/// finishes first (its transition holds the row lock, so we read its final state) or
+/// waits for this insert to commit, after which its transition sees the new jobs and
+/// releases or fails them as usual. Either way no new job is left waiting forever.
+async fn insert_dependent_jobs(conn: &mut sqlx::PgConnection, jobs: &mut [Job]) -> Result<()> {
+    let parents = lifecycle::external_dependencies(jobs);
+    if parents.is_empty() {
+        return insert_jobs(conn, jobs).await;
+    }
+
+    let mut states = HashMap::new();
+    let stored: Vec<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT j.id, j.status, w.failure_policy FROM hammerwork_jobs j \
+         LEFT JOIN hammerwork_workflows w ON w.id = j.workflow_id \
+         WHERE j.id = ANY($1) ORDER BY j.id FOR SHARE OF j",
+    )
+    .bind(&parents)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (id, status, policy) in stored {
+        states.insert(id, ParentState::from_db(&status, policy.as_deref()));
+    }
+    // Finished dependencies may already have been archived.
+    let archived: Vec<(uuid::Uuid, String)> =
+        sqlx::query_as("SELECT id, status FROM hammerwork_jobs_archive WHERE id = ANY($1)")
+            .bind(&parents)
+            .fetch_all(&mut *conn)
+            .await?;
+    for (id, status) in archived {
+        states
+            .entry(id)
+            .or_insert_with(|| ParentState::from_archived(&status));
+    }
+
+    let now = db_now(conn).await?;
+    let failed = lifecycle::settle_new_dependents(jobs, &states, now);
+    insert_jobs(conn, jobs).await?;
+
+    // Jobs inserted as failed count towards their workflow's progress.
+    let mut workflows: Vec<uuid::Uuid> = jobs
+        .iter()
+        .filter(|job| failed.contains(&job.id))
+        .filter_map(|job| job.workflow_id)
+        .collect();
+    workflows.sort_unstable();
+    workflows.dedup();
+    for id in workflows {
+        if let Some(workflow) = crate::queue::JobQueue::<Postgres>::lock_workflow(conn, id).await? {
+            crate::queue::JobQueue::<Postgres>::refresh_workflow(conn, &workflow, now).await?;
+        }
+    }
+    Ok(())
+}
+
 /// The locked `hammerwork_workflows` row of a job's workflow.
 struct LockedWorkflow {
     id: uuid::Uuid,
@@ -2561,8 +2541,9 @@ impl crate::queue::JobQueue<Postgres> {
             return Ok(TransitionResult::Rejected(job.status));
         }
 
-        let now = Utc::now();
-        Self::write_target(conn, job_id, target, now).await?;
+        let now = db_now(conn).await?;
+        let target = target.on_db_clock(&guard, now);
+        Self::write_target(conn, job_id, &target, now).await?;
         let recorded = match target.terminal_status() {
             Some(status) => {
                 Self::after_terminal(conn, &job, status, now, reschedule_recurring).await?
@@ -2634,7 +2615,7 @@ impl crate::queue::JobQueue<Postgres> {
         reschedule_recurring: bool,
     ) -> Result<RecordedOutcome> {
         if reschedule_recurring && job.recurring {
-            if let Some(next_run_at) = job.calculate_next_run() {
+            if let Some(next_run_at) = lifecycle::next_cron_run(job, now) {
                 Self::reschedule_after_run(conn, job.id, next_run_at, status).await?;
                 let mut recorded = RecordedOutcome::new(JobStatus::Pending);
                 recorded.next_run_at = Some(next_run_at);
@@ -2742,16 +2723,19 @@ impl crate::queue::JobQueue<Postgres> {
     /// Mark `waiting` dependents of `completed_job_id` whose dependencies have all
     /// completed as `satisfied`, so they can be dequeued.
     ///
-    /// The dependents are locked (in id order) before their dependencies are counted.
+    /// The dependents are locked (in id order) before their dependencies are checked.
     /// Two parents completing at once therefore take turns on a shared child, and the
-    /// second one (READ COMMITTED) sees the first one's committed completion.
+    /// second one (READ COMMITTED, so a new snapshot for the next statement) sees the
+    /// first one's committed completion. The check and the update are one set-based
+    /// statement for all dependents (the GIN index on `depends_on` serves the `@>`
+    /// lookup), so the number of queries does not grow with the number of dependents.
     async fn resolve_dependents(
         conn: &mut sqlx::PgConnection,
         completed_job_id: JobId,
     ) -> Result<Vec<JobId>> {
-        let dependents = sqlx::query(
+        let dependents: Vec<uuid::Uuid> = sqlx::query_scalar(
             r#"
-            SELECT id, depends_on FROM hammerwork_jobs
+            SELECT id FROM hammerwork_jobs
             WHERE depends_on @> ARRAY[$1]::uuid[]
               AND dependency_status = 'waiting'
               AND status = 'Pending'
@@ -2762,41 +2746,80 @@ impl crate::queue::JobQueue<Postgres> {
         .bind(completed_job_id)
         .fetch_all(&mut *conn)
         .await?;
-
-        let mut resolved = Vec::new();
-        for row in dependents {
-            let id: uuid::Uuid = row.try_get("id")?;
-            let mut depends_on: Vec<uuid::Uuid> = row.try_get("depends_on")?;
-            depends_on.sort_unstable();
-            depends_on.dedup();
-
-            // Completed parents may already have been archived.
-            let completed: i64 = sqlx::query_scalar(
-                r#"
-                SELECT COUNT(DISTINCT id) FROM (
-                    SELECT id FROM hammerwork_jobs
-                    WHERE id = ANY($1) AND status = 'Completed'
-                    UNION ALL
-                    SELECT id FROM hammerwork_jobs_archive
-                    WHERE id = ANY($1) AND status = 'Completed'
-                ) done
-                "#,
-            )
-            .bind(&depends_on)
-            .fetch_one(&mut *conn)
-            .await?;
-
-            if completed == depends_on.len() as i64 {
-                sqlx::query(
-                    "UPDATE hammerwork_jobs SET dependency_status = 'satisfied' WHERE id = $1",
-                )
-                .bind(id)
-                .execute(&mut *conn)
-                .await?;
-                resolved.push(id);
-            }
+        if dependents.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(resolved)
+
+        // Completed dependencies may already have been archived.
+        Ok(sqlx::query_scalar(
+            r#"
+            UPDATE hammerwork_jobs j
+            SET dependency_status = 'satisfied'
+            WHERE j.id = ANY($1)
+              AND NOT EXISTS (
+                SELECT 1 FROM unnest(j.depends_on) AS dependency(id)
+                WHERE NOT EXISTS (
+                        SELECT 1 FROM hammerwork_jobs d
+                        WHERE d.id = dependency.id AND d.status = 'Completed')
+                  AND NOT EXISTS (
+                        SELECT 1 FROM hammerwork_jobs_archive a
+                        WHERE a.id = dependency.id AND a.status = 'Completed')
+              )
+            RETURNING j.id
+            "#,
+        )
+        .bind(&dependents)
+        .fetch_all(&mut *conn)
+        .await?)
+    }
+
+    /// Cancel a workflow: its unfinished jobs (pending, retrying and **running**) become
+    /// `Failed` with "Workflow cancelled", and the workflow `cancelled`.
+    ///
+    /// A running job keeps running in its worker (a handler cannot be interrupted), but
+    /// its outcome is discarded: `finish_job_run` only records outcomes for jobs that
+    /// are still `Running` the same run, and heartbeats stop extending the lease.
+    async fn cancel_workflow_in_tx(
+        conn: &mut sqlx::PgConnection,
+        workflow_id: crate::workflow::WorkflowId,
+    ) -> Result<()> {
+        // Serializes with the terminal transitions of the workflow's jobs.
+        Self::lock_workflow(conn, workflow_id).await?;
+        let now = db_now(conn).await?;
+        sqlx::query(&format!(
+            r#"
+            UPDATE hammerwork_jobs
+            SET status = 'Failed',
+                failed_at = $2,
+                error_message = $3,
+                dependency_status = CASE WHEN dependency_status = 'waiting'
+                                         THEN 'failed' ELSE dependency_status END,
+                last_heartbeat_at = NULL,
+                lease_expires_at = NULL
+            WHERE workflow_id = $1
+              AND status IN ({})
+            "#,
+            lifecycle::UNFINISHED_STATUS_SQL
+        ))
+        .bind(workflow_id)
+        .bind(now)
+        .bind(lifecycle::WORKFLOW_CANCELLED_MESSAGE)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_workflows
+            SET status = 'cancelled',
+                failed_at = COALESCE(failed_at, $2)
+            WHERE id = $1
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
     }
 
     /// Fail every pending job that (transitively) depends on `failed_job_id`.
@@ -2974,7 +2997,11 @@ impl crate::queue::JobQueue<Postgres> {
         .bind(batch_id)
         .fetch_all(&mut *conn)
         .await?;
-        let progress = BatchProgress::from_status_counts(counts, total_jobs as u32, &mode);
+        let progress = BatchProgress::from_status_counts(
+            counts,
+            super::db_int(total_jobs, "total_jobs")?,
+            &mode,
+        );
 
         sqlx::query(
             r#"

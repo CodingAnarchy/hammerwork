@@ -689,7 +689,7 @@ pub trait DatabaseQueue: Send + Sync {
             return Ok(None);
         }
         let next_run_at = match outcome.terminal_status() {
-            Some(_) if current.recurring => current.calculate_next_run(),
+            Some(_) if current.recurring => lifecycle::next_cron_run(&current, Utc::now()),
             _ => None,
         };
         let mut recorded = match outcome {
@@ -1035,8 +1035,122 @@ pub(crate) fn pii_fields_column(job: &Job) -> Option<Vec<String>> {
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn retry_strategy_from_json(
     value: Option<serde_json::Value>,
-) -> Option<crate::retry::RetryStrategy> {
-    value.and_then(|value| serde_json::from_value(value).ok())
+) -> Result<Option<crate::retry::RetryStrategy>> {
+    // A stored strategy that no longer decodes is corrupt data: report it instead of
+    // silently running the job with the worker's default strategy.
+    Ok(value.map(serde_json::from_value).transpose()?)
+}
+
+/// Convert an integer read from the database into the type the API exposes (e.g. a
+/// `COUNT(*)` `i64` into `u64`), failing instead of wrapping on out-of-range values.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn db_int<T, S>(value: S, column: &str) -> Result<T>
+where
+    T: TryFrom<S>,
+    S: Copy + std::fmt::Display,
+{
+    T::try_from(value).map_err(|_| crate::HammerworkError::Queue {
+        message: format!("{column} read from the database is out of range: {value}"),
+    })
+}
+
+/// A duration in whole seconds read from the database (e.g. `timeout_seconds`).
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn db_seconds<S>(value: S, column: &str) -> Result<std::time::Duration>
+where
+    u64: TryFrom<S>,
+    S: Copy + std::fmt::Display,
+{
+    Ok(std::time::Duration::from_secs(db_int(value, column)?))
+}
+
+/// Turn `(key, COUNT(*))` rows into a map, rejecting negative counts.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn count_map(rows: Vec<(String, i64)>, column: &str) -> Result<HashMap<String, u64>> {
+    rows.into_iter()
+        .map(|(key, count)| Ok((key, db_int(count, column)?)))
+        .collect()
+}
+
+/// The priorities a weighted dequeue tries.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) const ALL_PRIORITIES: [crate::priority::JobPriority; 5] = [
+    crate::priority::JobPriority::Critical,
+    crate::priority::JobPriority::High,
+    crate::priority::JobPriority::Normal,
+    crate::priority::JobPriority::Low,
+    crate::priority::JobPriority::Background,
+];
+
+/// SQL selecting the priority levels in `priorities` that have a job matching
+/// `runnable` (a condition on the alias `j`, ending with the priority check).
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn runnable_priorities_sql(runnable: &str) -> String {
+    let levels = ALL_PRIORITIES
+        .iter()
+        .map(|priority| format!("SELECT {} AS priority", priority.as_i32()))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    format!(
+        "SELECT levels.priority FROM ({levels}) levels \
+         WHERE EXISTS (SELECT 1 FROM hammerwork_jobs j WHERE {runnable} \
+         AND j.priority = levels.priority)"
+    )
+}
+
+/// Pick one of `candidates` (the priorities that have runnable jobs) by weight.
+///
+/// The probability of a priority is its weight over the candidates' total weight, so
+/// every priority with a runnable job and a non-zero weight is chosen regularly, no
+/// matter how many jobs of higher priority are queued. Priorities with weight zero
+/// are only chosen when no candidate has a weight (then the highest one wins).
+/// `seed` drives the choice; callers pass something that varies between calls.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn pick_weighted_priority(
+    candidates: &[crate::priority::JobPriority],
+    weights: &crate::priority::PriorityWeights,
+    seed: u64,
+) -> Option<crate::priority::JobPriority> {
+    let total: u64 = candidates
+        .iter()
+        .map(|priority| u64::from(weights.get_weight(*priority)))
+        .sum();
+    if total == 0 {
+        return candidates.iter().copied().max();
+    }
+    let mut point = seed % total;
+    for priority in candidates {
+        let weight = u64::from(weights.get_weight(*priority));
+        if point < weight {
+            return Some(*priority);
+        }
+        point -= weight;
+    }
+    None
+}
+
+/// A seed for [`pick_weighted_priority`]: a hash of the queue name and the current
+/// time (hash-based so the future stays `Send`).
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn weighted_seed(queue_name: &str, attempt: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    queue_name.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The longest lease or staleness window passed to the database as an interval;
+/// longer durations are clamped to it (100 years).
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn clamp_interval(duration: std::time::Duration) -> chrono::Duration {
+    const MAX: std::time::Duration = std::time::Duration::from_secs(100 * 365 * 24 * 3600);
+    saturating_chrono_duration(duration.min(MAX))
 }
 
 /// Convert a `std::time::Duration` to a `chrono::Duration`, saturating on overflow.
@@ -1058,10 +1172,7 @@ pub(crate) fn saturating_sub_from(
 }
 
 /// `now + duration`, saturating at the maximum representable timestamp.
-#[cfg_attr(
-    not(any(feature = "postgres", feature = "mysql", feature = "test")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(feature = "test"), allow(dead_code))]
 pub(crate) fn saturating_add_to(
     now: DateTime<Utc>,
     duration: std::time::Duration,
