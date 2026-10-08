@@ -283,8 +283,8 @@ pub use archive::{
 };
 pub use batch::{BatchId, BatchResult, BatchStatus, JobBatch, PartialFailureMode};
 pub use config::{
-    ArchiveConfig, DatabaseConfig, HammerworkConfig, LoggingConfig, RateLimitingConfig,
-    WorkerConfig,
+    ArchiveConfig, DatabaseConfig, HammerworkConfig, KeySourceRef, LoggingConfig,
+    PayloadEncryptionAlgorithm, PayloadEncryptionConfig, RateLimitingConfig, WorkerConfig,
 };
 
 #[cfg(any(

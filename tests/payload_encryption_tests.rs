@@ -10,11 +10,12 @@ mod test_utils;
 
 use chrono::Utc;
 use hammerwork::{
-    HammerworkError, Job, JobId, JobQueue, JobStatus, Worker,
+    HammerworkError, Job, JobId, JobQueue, JobStatus, Worker, WorkerPool,
     archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason},
     batch::JobBatch,
     encryption::{
-        EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource, RetentionPolicy,
+        EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, EncryptionMetadata, KeySource,
+        RetentionPolicy, encrypted_payload_placeholder,
     },
     queue::DatabaseQueue,
     worker::JobHandler,
@@ -40,6 +41,25 @@ trait Inspect: sqlx::Database {
         table: &'static str,
         id: JobId,
     ) -> impl Future<Output = String> + Send;
+
+    /// Swaps the ciphertext, nonce and tag of jobs `a` and `b`, as an attacker with write
+    /// access to the table could.
+    fn swap_ciphertexts(
+        pool: &sqlx::Pool<Self>,
+        a: JobId,
+        b: JobId,
+    ) -> impl Future<Output = ()> + Send;
+
+    /// Moves job `id` to queue `queue_name` directly in the table.
+    fn set_queue_name(
+        pool: &sqlx::Pool<Self>,
+        id: JobId,
+        queue_name: &str,
+    ) -> impl Future<Output = ()> + Send;
+
+    /// Removes `format_version` from the stored encryption metadata, as written by the
+    /// release before ciphertexts were bound to their job.
+    fn strip_format_version(pool: &sqlx::Pool<Self>, id: JobId) -> impl Future<Output = ()> + Send;
 }
 
 #[cfg(feature = "postgres")]
@@ -72,6 +92,55 @@ impl Inspect for sqlx::Postgres {
             .unwrap();
         hex.to_lowercase()
     }
+
+    async fn swap_ciphertexts(pool: &sqlx::PgPool, a: JobId, b: JobId) {
+        let select = "SELECT encrypted_payload, encryption_nonce, encryption_tag \
+                      FROM hammerwork_jobs WHERE id = $1";
+        type Cipher = (Vec<u8>, Vec<u8>, Vec<u8>);
+        let ca: Cipher = sqlx::query_as(select)
+            .bind(a)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let cb: Cipher = sqlx::query_as(select)
+            .bind(b)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        for (id, (ciphertext, nonce, tag)) in [(a, cb), (b, ca)] {
+            sqlx::query(
+                "UPDATE hammerwork_jobs SET encrypted_payload = $1, encryption_nonce = $2, \
+                 encryption_tag = $3 WHERE id = $4",
+            )
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(tag)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn set_queue_name(pool: &sqlx::PgPool, id: JobId, queue_name: &str) {
+        sqlx::query("UPDATE hammerwork_jobs SET queue_name = $1 WHERE id = $2")
+            .bind(queue_name)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn strip_format_version(pool: &sqlx::PgPool, id: JobId) {
+        sqlx::query(
+            "UPDATE hammerwork_jobs SET encryption_metadata = encryption_metadata - 'format_version' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 }
 
 #[cfg(feature = "mysql")]
@@ -99,6 +168,56 @@ impl Inspect for sqlx::MySql {
         .await
         .unwrap();
         hex.to_lowercase()
+    }
+
+    async fn swap_ciphertexts(pool: &sqlx::MySqlPool, a: JobId, b: JobId) {
+        let select = "SELECT encrypted_payload, encryption_nonce, encryption_tag \
+                      FROM hammerwork_jobs WHERE id = ?";
+        type Cipher = (Vec<u8>, Vec<u8>, Vec<u8>);
+        let ca: Cipher = sqlx::query_as(select)
+            .bind(a.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let cb: Cipher = sqlx::query_as(select)
+            .bind(b.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        for (id, (ciphertext, nonce, tag)) in [(a, cb), (b, ca)] {
+            sqlx::query(
+                "UPDATE hammerwork_jobs SET encrypted_payload = ?, encryption_nonce = ?, \
+                 encryption_tag = ? WHERE id = ?",
+            )
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(tag)
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn set_queue_name(pool: &sqlx::MySqlPool, id: JobId, queue_name: &str) {
+        sqlx::query("UPDATE hammerwork_jobs SET queue_name = ? WHERE id = ?")
+            .bind(queue_name)
+            .bind(id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn strip_format_version(pool: &sqlx::MySqlPool, id: JobId) {
+        sqlx::query(
+            "UPDATE hammerwork_jobs \
+             SET encryption_metadata = JSON_REMOVE(encryption_metadata, '$.format_version') \
+             WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }
 
@@ -503,6 +622,8 @@ where
     DB: Inspect + Send + Sync + 'static,
     JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
 {
+    // Purges run across all queues; keep them apart from the worker pool purge test
+    let _serial = test_utils::serial().await;
     let queue = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
     let queue_name = test_utils::unique_queue("enc_retention");
     let archive_queue = test_utils::unique_queue("enc_retention_archive");
@@ -644,6 +765,9 @@ where
         archived.payload,
         json!({"ssn": "[ENCRYPTED]", "visible": 1})
     );
+    // The ciphertext stays in the archive table: decrypting needs a restore
+    let err = queue.decrypt_job(archived).await.unwrap_err();
+    assert!(err.to_string().contains("restore_archived_job"), "{err}");
 
     let restored = plain.restore_archived_job(id).await.unwrap();
     assert!(restored.is_encrypted);
@@ -689,6 +813,275 @@ where
     assert_eq!(job.status, JobStatus::Completed);
     assert_eq!(seen, vec![payload]);
     queue.delete_job(id).await.unwrap();
+}
+
+/// Swapping the ciphertext, nonce and tag of two jobs in the table makes both fail to
+/// decrypt, instead of each decrypting as the other's payload (#38).
+async fn swapped_ciphertexts_do_not_decrypt<DB>(plain: Arc<JobQueue<DB>>)
+where
+    DB: Inspect + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let queue = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
+    let queue_name = test_utils::unique_queue("enc_swap");
+    let enqueue = |payload: Value| {
+        queue.enqueue(
+            Job::new(queue_name.clone(), payload)
+                .with_encryption(config("k1"))
+                .with_retention_policy(long_retention())
+                .with_max_attempts(1),
+        )
+    };
+    let a = enqueue(json!({"account": "a"})).await.unwrap();
+    let b = enqueue(json!({"account": "b"})).await.unwrap();
+    let stored = queue.get_job(a).await.unwrap().unwrap();
+    assert_eq!(
+        stored.encrypted_payload.unwrap().metadata.format_version,
+        EncryptionMetadata::FORMAT_JOB_BOUND
+    );
+
+    DB::swap_ciphertexts(&queue.pool, a, b).await;
+    for id in [a, b] {
+        let job = queue.get_job(id).await.unwrap().unwrap();
+        let err = queue.decrypt_job(job).await.unwrap_err();
+        assert!(matches!(err, HammerworkError::Encryption { .. }), "{err}");
+    }
+
+    // A worker fails the run without calling the handler
+    let (job, seen) = run_worker_until_done(&queue, &queue_name, a).await;
+    assert_eq!(job.status, JobStatus::Dead);
+    assert!(
+        seen.is_empty(),
+        "the handler must not see another job's payload"
+    );
+
+    // Swapping back restores both
+    DB::swap_ciphertexts(&queue.pool, a, b).await;
+    let job = queue.get_job(b).await.unwrap().unwrap();
+    assert_eq!(
+        queue.decrypt_job(job).await.unwrap().payload,
+        json!({"account": "b"})
+    );
+
+    for id in [a, b] {
+        queue.delete_job(id).await.unwrap();
+    }
+}
+
+/// Moving an encrypted job to another queue in the table makes it fail to decrypt.
+async fn moved_job_does_not_decrypt<DB>(plain: Arc<JobQueue<DB>>)
+where
+    DB: Inspect + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let queue = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
+    let queue_name = test_utils::unique_queue("enc_moved");
+    let payload = json!({"ssn": secret("moved"), "visible": 1});
+    let id = queue
+        .enqueue(
+            Job::new(queue_name.clone(), payload.clone())
+                .with_encryption(config("k1"))
+                .with_pii_fields(vec!["ssn"])
+                .with_retention_policy(long_retention()),
+        )
+        .await
+        .unwrap();
+
+    let other = test_utils::unique_queue("enc_moved_to");
+    DB::set_queue_name(&queue.pool, id, &other).await;
+    let job = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(job.queue_name, other);
+    assert!(queue.decrypt_job(job).await.is_err());
+
+    DB::set_queue_name(&queue.pool, id, &queue_name).await;
+    let job = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(queue.decrypt_job(job).await.unwrap().payload, payload);
+    queue.delete_job(id).await.unwrap();
+}
+
+/// Payloads written before ciphertexts were bound to their job (no associated data, no
+/// `format_version` in the metadata) still decrypt and run.
+async fn legacy_unbound_payload_decrypts<DB>(plain: Arc<JobQueue<DB>>)
+where
+    DB: Inspect + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let engine = engine("k1", KEY_A).await;
+    let queue_name = test_utils::unique_queue("enc_legacy");
+    let payload = json!({"secret": secret("legacy")});
+
+    // What the previous release stored: the engine's encryption without associated data
+    let legacy = engine
+        .encrypt_payload_with_retention(&payload, &[] as &[&str], long_retention())
+        .await
+        .unwrap();
+    let mut job = Job::new(queue_name.clone(), encrypted_payload_placeholder())
+        .with_encryption(config("k1"))
+        .with_retention_policy(long_retention());
+    job.is_encrypted = true;
+    job.encrypted_payload = Some(legacy);
+    let queue = encrypted_queue(&plain, engine).await;
+    let id = queue.enqueue(job).await.unwrap();
+    DB::strip_format_version(&queue.pool, id).await;
+
+    let stored = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(
+        stored
+            .encrypted_payload
+            .as_ref()
+            .unwrap()
+            .metadata
+            .format_version,
+        EncryptionMetadata::FORMAT_UNBOUND
+    );
+    assert_eq!(queue.decrypt_job(stored).await.unwrap().payload, payload);
+
+    let (job, seen) = run_worker_until_done(&queue, &queue_name, id).await;
+    assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
+    assert_eq!(seen, vec![payload]);
+    queue.delete_job(id).await.unwrap();
+}
+
+/// `WorkerPool::with_encrypted_job_purge` deletes expired encrypted jobs on its own.
+async fn worker_pool_purges_expired_jobs<DB>(plain: Arc<JobQueue<DB>>)
+where
+    DB: Inspect + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+    let queue = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
+    let queue_name = test_utils::unique_queue("enc_pool_purge");
+    let encrypted = |policy: RetentionPolicy| {
+        Job::new(queue_name.clone(), json!({"secret": secret("pool")}))
+            .with_encryption(config("k1"))
+            .with_retention_policy(policy)
+    };
+    let past = Utc::now() - chrono::Duration::hours(1);
+    let expired = queue
+        .enqueue(encrypted(RetentionPolicy::DeleteAt(past)))
+        .await
+        .unwrap();
+    let kept = queue.enqueue(encrypted(long_retention())).await.unwrap();
+    for id in [expired, kept] {
+        queue.complete_job(id).await.unwrap();
+    }
+
+    let handler: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
+    let worker = Worker::new(Arc::clone(&plain), queue_name.clone(), handler)
+        .with_poll_interval(Duration::from_millis(50));
+    let mut pool = WorkerPool::new()
+        .without_autoscaling()
+        .without_stale_job_reaper()
+        .with_encrypted_job_purge(Duration::from_millis(100));
+    pool.add_worker(worker);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    tokio::select! {
+        result = pool.start() => panic!("pool stopped early: {result:?}"),
+        _ = async {
+            while queue.get_job(expired).await.unwrap().is_some() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        } => {}
+    }
+    pool.shutdown().await.unwrap();
+
+    assert!(
+        queue.get_job(expired).await.unwrap().is_none(),
+        "the pool purged the expired job"
+    );
+    assert!(queue.get_job(kept).await.unwrap().is_some());
+    queue.delete_job(kept).await.unwrap();
+}
+
+/// `JobQueue::from_config` with an `[encryption]` section encrypts without code: jobs
+/// on `encrypted_queues` are encrypted, and jobs under an older key id decrypt with the
+/// configured decryption key. Invalid sections fail closed.
+async fn configured_queue_encrypts<DB, F, Fut>(plain: Arc<JobQueue<DB>>, connect: F, url: String)
+where
+    DB: Inspect + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    F: Fn(hammerwork::HammerworkConfig) -> Fut,
+    Fut: Future<Output = hammerwork::Result<JobQueue<DB>>>,
+{
+    // Read by the `env://` key sources below; every test sets the same values
+    unsafe {
+        std::env::set_var("HAMMERWORK_TEST_CONFIG_KEY", KEY_B);
+        std::env::set_var("HAMMERWORK_TEST_CONFIG_OLD_KEY", KEY_A);
+    }
+    let queue_name = test_utils::unique_queue("enc_config");
+    let toml = format!(
+        r#"
+        enabled = true
+        key_source = "env://HAMMERWORK_TEST_CONFIG_KEY"
+        key_id = "configured"
+        encrypted_queues = ["{queue_name}"]
+        default_retention_secs = 2592000
+
+        [decryption_keys]
+        k1 = "env://HAMMERWORK_TEST_CONFIG_OLD_KEY"
+        "#
+    );
+    let mut hw_config = hammerwork::HammerworkConfig::new().with_database_url(&url);
+    hw_config.database.pool_size = 2;
+    hw_config.encryption = toml::from_str(&toml).unwrap();
+    let configured = Arc::new(connect(hw_config.clone()).await.unwrap());
+
+    // A plain job on an encrypted queue is encrypted with the configured key
+    let marker = secret("configured");
+    let payload = json!({"secret": marker});
+    let id = configured
+        .enqueue(Job::new(queue_name.clone(), payload.clone()))
+        .await
+        .unwrap();
+    assert_row_has_no_plaintext(&configured.pool, "hammerwork_jobs", id, &marker).await;
+    let stored = configured.get_job(id).await.unwrap().unwrap();
+    assert!(stored.is_encrypted);
+    let metadata = &stored.encrypted_payload.as_ref().unwrap().metadata;
+    assert_eq!(metadata.key_id, "configured");
+    assert!(metadata.delete_at.is_some(), "default retention applies");
+    let (job, seen) = run_worker_until_done(&configured, &queue_name, id).await;
+    assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
+    assert_eq!(seen, vec![payload.clone()]);
+    configured.delete_job(id).await.unwrap();
+
+    // Other queues are unaffected
+    let other = test_utils::unique_queue("enc_config_other");
+    let id = configured
+        .enqueue(Job::new(other, json!({"visible": 1})))
+        .await
+        .unwrap();
+    assert!(!configured.get_job(id).await.unwrap().unwrap().is_encrypted);
+    configured.delete_job(id).await.unwrap();
+
+    // A job written under the old key id decrypts with the configured decryption key
+    let old = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
+    let id = old
+        .enqueue(
+            Job::new(queue_name.clone(), payload.clone())
+                .with_encryption(config("k1"))
+                .with_retention_policy(long_retention()),
+        )
+        .await
+        .unwrap();
+    let stored = configured.get_job(id).await.unwrap().unwrap();
+    assert_eq!(
+        configured.decrypt_job(stored).await.unwrap().payload,
+        payload
+    );
+    configured.delete_job(id).await.unwrap();
+
+    // Fail closed: a missing key, and an invalid section
+    let mut missing = hw_config.clone();
+    missing.encryption.key_source =
+        hammerwork::KeySourceRef::parse("env://HAMMERWORK_TEST_CONFIG_UNSET_KEY").unwrap();
+    assert!(connect(missing).await.is_err());
+    let mut invalid = hw_config.clone();
+    invalid.encryption.enabled = false;
+    assert!(matches!(
+        connect(invalid).await,
+        Err(HammerworkError::Config(_))
+    ));
 }
 
 #[cfg(feature = "postgres")]
@@ -742,6 +1135,43 @@ mod postgres {
     async fn test_postgres_plain_jobs_unchanged() {
         plain_jobs_unchanged(test_utils::setup_postgres_queue().await).await;
     }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_swapped_ciphertexts_do_not_decrypt() {
+        swapped_ciphertexts_do_not_decrypt(test_utils::setup_postgres_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_moved_job_does_not_decrypt() {
+        moved_job_does_not_decrypt(test_utils::setup_postgres_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_legacy_unbound_payload_decrypts() {
+        legacy_unbound_payload_decrypts(test_utils::setup_postgres_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_worker_pool_purges_expired_jobs() {
+        worker_pool_purges_expired_jobs(test_utils::setup_postgres_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_configured_queue_encrypts() {
+        let plain = test_utils::setup_postgres_queue().await;
+        let url = test_utils::postgres_url();
+        configured_queue_encrypts(
+            plain,
+            |config| async move { JobQueue::<sqlx::Postgres>::from_config(&config).await },
+            url,
+        )
+        .await;
+    }
 }
 
 #[cfg(feature = "mysql")]
@@ -794,5 +1224,42 @@ mod mysql {
     #[ignore] // Requires database connection
     async fn test_mysql_plain_jobs_unchanged() {
         plain_jobs_unchanged(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_swapped_ciphertexts_do_not_decrypt() {
+        swapped_ciphertexts_do_not_decrypt(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_moved_job_does_not_decrypt() {
+        moved_job_does_not_decrypt(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_legacy_unbound_payload_decrypts() {
+        legacy_unbound_payload_decrypts(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_worker_pool_purges_expired_jobs() {
+        worker_pool_purges_expired_jobs(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_configured_queue_encrypts() {
+        let plain = test_utils::setup_mysql_queue().await;
+        let url = test_utils::mysql_url();
+        configured_queue_encrypts(
+            plain,
+            |config| async move { JobQueue::<sqlx::MySql>::from_config(&config).await },
+            url,
+        )
+        .await;
     }
 }

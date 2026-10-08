@@ -589,9 +589,37 @@ pub struct EncryptionMetadata {
 
     /// Hash of the original payload for integrity verification.
     pub payload_hash: String,
+
+    /// Format of the ciphertext: which associated data it was encrypted with.
+    ///
+    /// - `0` ([`EncryptionMetadata::FORMAT_UNBOUND`]): no associated data. Payloads
+    ///   encrypted directly with [`EncryptionEngine::encrypt_payload`], and job payloads
+    ///   written before ciphertexts were bound to their job, have this format (it is the
+    ///   default when the field is missing).
+    /// - `1` ([`EncryptionMetadata::FORMAT_JOB_BOUND`]): job payloads bound to their job
+    ///   (id, queue name, key id, algorithm and PII fields) as associated data; see
+    ///   [`job_payload`].
+    #[serde(default)]
+    pub format_version: u32,
 }
 
 impl EncryptionMetadata {
+    /// [`EncryptionMetadata::format_version`] of a ciphertext without associated data.
+    pub const FORMAT_UNBOUND: u32 = 0;
+
+    /// [`EncryptionMetadata::format_version`] of a job payload bound to its job.
+    pub const FORMAT_JOB_BOUND: u32 = 1;
+
+    /// The [`EncryptionMetadata::format_version`] recorded in a stored metadata JSON
+    /// object (`0` when it is missing, as in payloads written by earlier versions).
+    pub fn format_version_from_json(metadata: &serde_json::Value) -> u32 {
+        metadata
+            .get("format_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+            .unwrap_or(Self::FORMAT_UNBOUND)
+    }
+
     /// Creates new encryption metadata.
     ///
     /// # Arguments
@@ -642,6 +670,7 @@ impl EncryptionMetadata {
             encrypted_at: now,
             delete_at,
             payload_hash,
+            format_version: Self::FORMAT_UNBOUND,
         }
     }
 

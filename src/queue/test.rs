@@ -41,7 +41,7 @@ use crate::{
     batch::{BatchId, BatchResult, BatchStatus, JobBatch},
     job::{Job, JobId, JobStatus},
     priority::{JobPriority, PriorityWeights},
-    queue::{DatabaseQueue, QueuePauseInfo},
+    queue::{DatabaseQueue, PayloadEncryption, QueuePauseInfo},
     rate_limit::ThrottleConfig,
     stats::{DeadJobSummary, QueueStats},
     workflow::{JobGroup, WorkflowId, WorkflowStatus},
@@ -553,6 +553,7 @@ impl TestStorage {
 pub struct TestQueue {
     storage: Arc<RwLock<TestStorage>>,
     clock: MockClock,
+    encryption: PayloadEncryption,
 }
 
 impl TestQueue {
@@ -574,6 +575,7 @@ impl TestQueue {
         Self {
             storage: Arc::new(RwLock::new(TestStorage::new(clock.clone()))),
             clock,
+            encryption: PayloadEncryption::default(),
         }
     }
 
@@ -607,6 +609,7 @@ impl TestQueue {
         Self {
             storage: Arc::new(RwLock::new(TestStorage::new(clock.clone()))),
             clock,
+            encryption: PayloadEncryption::default(),
         }
     }
 
@@ -633,6 +636,81 @@ impl TestQueue {
     /// ```
     pub fn clock(&self) -> &MockClock {
         &self.clock
+    }
+
+    /// Encrypts job payloads with `engine`, like
+    /// [`JobQueue::with_encryption`](crate::JobQueue::with_encryption).
+    ///
+    /// The in-memory queue then applies the same encryption semantics as the database
+    /// backends, so unit tests exercise them: jobs with an encryption config are stored
+    /// sealed (redacted `payload`, `is_encrypted`, ciphertext in `encrypted_payload`) and
+    /// returned that way by `dequeue` and `get_job`; [`TestQueue::decrypt_job`] opens them
+    /// like a worker does; enqueueing a job with an encryption config fails without an
+    /// engine; and [`DatabaseQueue::purge_expired_encrypted_jobs`] enforces retention
+    /// against the queue's [`MockClock`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "encryption")]
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use hammerwork::encryption::{EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource};
+    /// use hammerwork::queue::test::TestQueue;
+    /// use hammerwork::{Job, queue::DatabaseQueue};
+    /// use serde_json::json;
+    ///
+    /// let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM).with_key_source(
+    ///     KeySource::Static("QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=".to_string()),
+    /// );
+    /// let queue = TestQueue::new().with_encryption(EncryptionEngine::new(config.clone()).await?);
+    ///
+    /// let job = Job::new("payments".to_string(), json!({"card": "4111", "amount": 10}))
+    ///     .with_encryption(config)
+    ///     .with_pii_fields(vec!["card"]);
+    /// let id = queue.enqueue(job).await?;
+    ///
+    /// let stored = queue.get_job(id).await?.unwrap();
+    /// assert_eq!(stored.payload, json!({"card": "[ENCRYPTED]", "amount": 10}));
+    /// let opened = queue.decrypt_job(stored).await?;
+    /// assert_eq!(opened.payload, json!({"card": "4111", "amount": 10}));
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "encryption"))]
+    /// # fn main() {}
+    /// ```
+    #[cfg(feature = "encryption")]
+    pub fn with_encryption(
+        mut self,
+        engine: impl Into<Arc<crate::encryption::EncryptionEngine>>,
+    ) -> Self {
+        self.encryption.engine = Some(engine.into());
+        self
+    }
+
+    /// Encrypts every job enqueued to `queues` (`"*"` for all), like
+    /// [`JobQueue::with_encrypted_queues`](crate::JobQueue::with_encrypted_queues).
+    #[cfg(feature = "encryption")]
+    pub fn with_encrypted_queues<I, S>(mut self, queues: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.encryption.encrypted_queues = queues.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The engine set with [`TestQueue::with_encryption`], if any.
+    #[cfg(feature = "encryption")]
+    pub fn encryption_engine(&self) -> Option<&Arc<crate::encryption::EncryptionEngine>> {
+        self.encryption.engine.as_ref()
+    }
+
+    /// Returns `job` with its payload decrypted, like
+    /// [`JobQueue::decrypt_job`](crate::JobQueue::decrypt_job) (which workers call just
+    /// before the handler). Unencrypted jobs are returned unchanged.
+    pub async fn decrypt_job(&self, job: Job) -> Result<Job> {
+        self.encryption.open(job).await
     }
 
     /// Get the number of jobs in a specific status for a queue.
@@ -750,6 +828,7 @@ impl DatabaseQueue for TestQueue {
     type Database = TestDatabaseType;
 
     async fn enqueue(&self, mut job: Job) -> Result<JobId> {
+        self.encryption.seal(std::slice::from_mut(&mut job)).await?;
         let mut storage = self.storage.write().await;
 
         // Set timestamps using the mock clock
@@ -968,7 +1047,17 @@ impl DatabaseQueue for TestQueue {
 
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
         let storage = self.storage.read().await;
-        Ok(storage.jobs.get(&job_id).cloned())
+        #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
+        let mut job = storage.jobs.get(&job_id).cloned();
+        // Like the database backends: the ciphertext of an archived job stays in the
+        // archive and is not loaded, so it must be restored to be decrypted.
+        #[cfg(feature = "encryption")]
+        if let Some(job) = job.as_mut()
+            && job.status == JobStatus::Archived
+        {
+            job.encrypted_payload = None;
+        }
+        Ok(job)
     }
 
     async fn delete_job(&self, job_id: JobId) -> Result<()> {
@@ -1005,6 +1094,7 @@ impl DatabaseQueue for TestQueue {
 
     // Batch operations
     async fn enqueue_batch(&self, mut batch: JobBatch) -> Result<BatchId> {
+        self.encryption.seal(&mut batch.jobs).await?;
         let mut storage = self.storage.write().await;
 
         batch.created_at = storage.clock.now();
@@ -1940,6 +2030,7 @@ impl DatabaseQueue for TestQueue {
 
     // Workflow and dependency management
     async fn enqueue_workflow(&self, mut workflow: JobGroup) -> Result<WorkflowId> {
+        self.encryption.seal(&mut workflow.jobs).await?;
         let mut storage = self.storage.write().await;
 
         workflow.created_at = storage.clock.now();
@@ -2549,6 +2640,48 @@ impl DatabaseQueue for TestQueue {
 
         Ok(recovery)
     }
+
+    async fn purge_expired_encrypted_jobs(&self) -> Result<super::EncryptedJobPurge> {
+        #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
+        let mut purge = super::EncryptedJobPurge::default();
+        #[cfg(feature = "encryption")]
+        {
+            let storage = self.storage.read().await;
+            let now = storage.clock.now();
+            let expired: Vec<(JobId, bool)> = storage
+                .jobs
+                .values()
+                .filter(|job| job.is_encrypted)
+                .filter(|job| {
+                    matches!(
+                        job.status,
+                        JobStatus::Completed
+                            | JobStatus::Failed
+                            | JobStatus::Dead
+                            | JobStatus::TimedOut
+                            | JobStatus::Archived
+                    )
+                })
+                .filter(|job| {
+                    job.encrypted_payload
+                        .as_ref()
+                        .and_then(|encrypted| encrypted.metadata.delete_at)
+                        .is_some_and(|delete_at| delete_at <= now)
+                })
+                .map(|job| (job.id, job.status == JobStatus::Archived))
+                .collect();
+            drop(storage);
+            for (job_id, archived) in expired {
+                self.delete_job(job_id).await?;
+                if archived {
+                    purge.archived_jobs += 1;
+                } else {
+                    purge.jobs += 1;
+                }
+            }
+        }
+        Ok(purge)
+    }
 }
 
 #[cfg(test)]
@@ -2969,5 +3102,235 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[cfg(feature = "encryption")]
+    mod encryption {
+        use super::*;
+        use crate::archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason};
+        use crate::encryption::{
+            EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource, RetentionPolicy,
+        };
+
+        const KEY: &str = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=";
+
+        fn config() -> EncryptionConfig {
+            EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+                .with_key_id("k1")
+                .with_key_source(KeySource::Static(KEY.to_string()))
+        }
+
+        async fn encrypted_queue() -> TestQueue {
+            TestQueue::new().with_encryption(EncryptionEngine::new(config()).await.unwrap())
+        }
+
+        #[tokio::test]
+        async fn jobs_are_stored_sealed_and_decrypt() {
+            let queue = encrypted_queue().await;
+            let payload = json!({"ssn": "123-45-6789", "amount": 5});
+            let id = queue
+                .enqueue(
+                    Job::new("q".into(), payload.clone())
+                        .with_encryption(config())
+                        .with_pii_fields(vec!["ssn"]),
+                )
+                .await
+                .unwrap();
+
+            let stored = queue.get_job(id).await.unwrap().unwrap();
+            assert!(stored.is_encrypted);
+            assert_eq!(stored.payload, json!({"ssn": "[ENCRYPTED]", "amount": 5}));
+            assert!(stored.encrypted_payload.is_some());
+
+            let dequeued = queue.dequeue("q").await.unwrap().unwrap();
+            assert_eq!(
+                dequeued.payload, stored.payload,
+                "dequeue returns the stored form"
+            );
+            let opened = queue.decrypt_job(dequeued).await.unwrap();
+            assert!(!opened.is_encrypted);
+            assert_eq!(opened.payload, payload);
+
+            // Unencrypted jobs pass through
+            let plain = queue
+                .enqueue(Job::new("q".into(), json!({"a": 1})))
+                .await
+                .unwrap();
+            let plain = queue.get_job(plain).await.unwrap().unwrap();
+            assert_eq!(
+                queue.decrypt_job(plain).await.unwrap().payload,
+                json!({"a": 1})
+            );
+        }
+
+        #[tokio::test]
+        async fn batch_and_workflow_are_sealed() {
+            let queue = encrypted_queue().await;
+            let job = || Job::new("q".into(), json!({"secret": 1})).with_encryption(config());
+            let batch = JobBatch::new("b").with_jobs(vec![job(), job()]);
+            let batch_id = queue.enqueue_batch(batch).await.unwrap();
+            for stored in queue.get_batch_jobs(batch_id).await.unwrap() {
+                assert!(stored.is_encrypted);
+                assert_eq!(stored.payload, json!({"encrypted": true}));
+            }
+
+            let workflow = JobGroup::new("w").add_job(job());
+            let workflow_id = queue.enqueue_workflow(workflow).await.unwrap();
+            for stored in queue.get_workflow_jobs(workflow_id).await.unwrap() {
+                assert!(stored.is_encrypted);
+                assert_eq!(
+                    queue.decrypt_job(stored).await.unwrap().payload,
+                    json!({"secret": 1})
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn fails_closed_without_an_engine() {
+            let queue = TestQueue::new();
+            let err = queue
+                .enqueue(Job::new("q".into(), json!({"secret": 1})).with_encryption(config()))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, HammerworkError::Encryption { .. }), "{err}");
+            assert!(queue.get_all_jobs().await.is_empty(), "nothing is stored");
+
+            // A sealed job cannot be opened by a queue without the engine
+            let sealed = encrypted_queue().await;
+            let id = sealed
+                .enqueue(Job::new("q".into(), json!({"secret": 1})).with_encryption(config()))
+                .await
+                .unwrap();
+            let stored = sealed.get_job(id).await.unwrap().unwrap();
+            assert!(queue.decrypt_job(stored).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn tampering_is_detected() {
+            let queue = encrypted_queue().await;
+            let a = queue
+                .enqueue(Job::new("q".into(), json!({"who": "a"})).with_encryption(config()))
+                .await
+                .unwrap();
+            let b = queue
+                .enqueue(Job::new("q".into(), json!({"who": "b"})).with_encryption(config()))
+                .await
+                .unwrap();
+            let mut job_a = queue.get_job(a).await.unwrap().unwrap();
+            let job_b = queue.get_job(b).await.unwrap().unwrap();
+            job_a.encrypted_payload = job_b.encrypted_payload.clone();
+            assert!(queue.decrypt_job(job_a).await.is_err());
+
+            let mut moved = job_b;
+            moved.queue_name = "other".into();
+            assert!(queue.decrypt_job(moved).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn encrypted_queues_encrypt_without_a_job_config() {
+            let queue = encrypted_queue().await.with_encrypted_queues(["secure"]);
+            let id = queue
+                .enqueue(Job::new("secure".into(), json!({"secret": 1})))
+                .await
+                .unwrap();
+            let stored = queue.get_job(id).await.unwrap().unwrap();
+            assert!(stored.is_encrypted);
+            assert_eq!(
+                queue.decrypt_job(stored).await.unwrap().payload,
+                json!({"secret": 1})
+            );
+
+            let other = queue
+                .enqueue(Job::new("open".into(), json!({"visible": 1})))
+                .await
+                .unwrap();
+            assert!(!queue.get_job(other).await.unwrap().unwrap().is_encrypted);
+
+            let all = encrypted_queue().await.with_encrypted_queues(["*"]);
+            let id = all
+                .enqueue(Job::new("any".into(), json!({"ssn": "1"})).with_pii_fields(vec!["ssn"]))
+                .await
+                .unwrap();
+            let stored = all.get_job(id).await.unwrap().unwrap();
+            assert_eq!(stored.payload, json!({"ssn": "[ENCRYPTED]"}));
+        }
+
+        #[tokio::test]
+        async fn archived_jobs_must_be_restored_to_decrypt() {
+            let queue = encrypted_queue().await;
+            let id = queue
+                .enqueue(Job::new("q".into(), json!({"secret": 1})).with_encryption(config()))
+                .await
+                .unwrap();
+            queue.dequeue("q").await.unwrap();
+            queue.complete_job(id).await.unwrap();
+            queue.clock().advance(chrono::Duration::seconds(10));
+            let stats = queue
+                .archive_jobs(
+                    Some("q"),
+                    &ArchivalPolicy::new()
+                        .archive_completed_after(chrono::Duration::seconds(0))
+                        .enabled(true),
+                    &ArchivalConfig::new(),
+                    ArchivalReason::Manual,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(stats.jobs_archived, 1);
+
+            let archived = queue.get_job(id).await.unwrap().unwrap();
+            assert_eq!(archived.status, JobStatus::Archived);
+            assert!(archived.is_encrypted);
+            let err = queue.decrypt_job(archived).await.unwrap_err();
+            assert!(err.to_string().contains("restore_archived_job"), "{err}");
+
+            queue.restore_archived_job(id).await.unwrap();
+            let restored = queue.get_job(id).await.unwrap().unwrap();
+            assert_eq!(
+                queue.decrypt_job(restored).await.unwrap().payload,
+                json!({"secret": 1})
+            );
+        }
+
+        #[tokio::test]
+        async fn retention_purge_uses_the_mock_clock() {
+            let queue = encrypted_queue().await;
+            let enqueue = |policy: RetentionPolicy| {
+                let queue = queue.clone();
+                async move {
+                    queue
+                        .enqueue(
+                            Job::new("q".into(), json!({"secret": 1}))
+                                .with_encryption(config())
+                                .with_retention_policy(policy),
+                        )
+                        .await
+                        .unwrap()
+                }
+            };
+            let hour = RetentionPolicy::DeleteAfter(std::time::Duration::from_secs(3600));
+            let done = enqueue(hour.clone()).await;
+            let pending = enqueue(hour).await;
+            let kept = enqueue(RetentionPolicy::KeepIndefinitely).await;
+            for id in [done, kept] {
+                queue.complete_job(id).await.unwrap();
+            }
+
+            assert_eq!(
+                queue.purge_expired_encrypted_jobs().await.unwrap().total(),
+                0,
+                "nothing has expired yet"
+            );
+            queue.clock().advance(chrono::Duration::hours(2));
+            let purge = queue.purge_expired_encrypted_jobs().await.unwrap();
+            assert_eq!(purge.jobs, 1);
+            assert!(queue.get_job(done).await.unwrap().is_none());
+            assert!(
+                queue.get_job(pending).await.unwrap().is_some(),
+                "not finished"
+            );
+            assert!(queue.get_job(kept).await.unwrap().is_some());
+        }
     }
 }

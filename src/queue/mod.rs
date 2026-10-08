@@ -30,6 +30,9 @@ pub mod mysql;
 #[cfg(feature = "test")]
 pub mod test;
 
+mod payload_encryption;
+pub(crate) use payload_encryption::PayloadEncryption;
+
 /// Information about a queue's pause state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuePauseInfo {
@@ -1240,9 +1243,8 @@ pub struct JobQueue<DB: Database> {
     pub pool: Pool<DB>,
     pub(crate) _phantom: PhantomData<DB>,
     pub(crate) throttle_configs: Arc<RwLock<HashMap<String, ThrottleConfig>>>,
-    /// Engine that encrypts the payloads of jobs with an encryption config
-    #[cfg(feature = "encryption")]
-    pub(crate) encryption: Option<Arc<crate::encryption::EncryptionEngine>>,
+    /// Encrypts and decrypts job payloads (see [`JobQueue::with_encryption`])
+    pub(crate) encryption: PayloadEncryption,
 }
 
 impl<DB: Database> Clone for JobQueue<DB> {
@@ -1251,7 +1253,6 @@ impl<DB: Database> Clone for JobQueue<DB> {
             pool: self.pool.clone(),
             _phantom: PhantomData,
             throttle_configs: self.throttle_configs.clone(),
-            #[cfg(feature = "encryption")]
             encryption: self.encryption.clone(),
         }
     }
@@ -1284,8 +1285,7 @@ impl<DB: Database> JobQueue<DB> {
             pool,
             _phantom: PhantomData,
             throttle_configs: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(feature = "encryption")]
-            encryption: None,
+            encryption: PayloadEncryption::default(),
         }
     }
 
@@ -1335,14 +1335,36 @@ impl<DB: Database> JobQueue<DB> {
         mut self,
         engine: impl Into<Arc<crate::encryption::EncryptionEngine>>,
     ) -> Self {
-        self.encryption = Some(engine.into());
+        self.encryption.engine = Some(engine.into());
+        self
+    }
+
+    /// Encrypts every job enqueued to `queues` (`"*"` for all queues), even jobs without an
+    /// encryption config.
+    ///
+    /// Such a job is encrypted as if it had been created with
+    /// `Job::with_encryption(EncryptionConfig::new(<engine algorithm>).with_key_id(<engine key id>))`:
+    /// the whole payload, or only its [PII fields](crate::Job::with_pii_fields) if it has
+    /// any. Jobs with their own encryption config are unaffected. Needs an engine
+    /// ([`JobQueue::with_encryption`]); without one, enqueueing to these queues behaves as
+    /// if they were not listed. Replaces the queues set before.
+    ///
+    /// Set by [`JobQueue::from_config`](JobQueue#method.from_config) from
+    /// `encryption.encrypted_queues`.
+    #[cfg(feature = "encryption")]
+    pub fn with_encrypted_queues<I, S>(mut self, queues: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.encryption.encrypted_queues = queues.into_iter().map(Into::into).collect();
         self
     }
 
     /// The engine set with [`JobQueue::with_encryption`], if any.
     #[cfg(feature = "encryption")]
     pub fn encryption_engine(&self) -> Option<&Arc<crate::encryption::EncryptionEngine>> {
-        self.encryption.as_ref()
+        self.encryption.engine.as_ref()
     }
 
     /// Encrypts the payloads of `jobs` that have an encryption config, before they are
@@ -1350,26 +1372,7 @@ impl<DB: Database> JobQueue<DB> {
     /// queue cannot provide.
     #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
     pub(crate) async fn seal_jobs(&self, jobs: &mut [Job]) -> Result<()> {
-        for job in jobs.iter_mut() {
-            if !job.has_encryption() || job.is_encrypted {
-                continue;
-            }
-            #[cfg(feature = "encryption")]
-            {
-                let engine =
-                    self.encryption
-                        .as_ref()
-                        .ok_or_else(|| crate::HammerworkError::Encryption {
-                            message: format!(
-                                "Job {} has an encryption config but the queue has no encryption \
-                             engine; configure one with JobQueue::with_encryption",
-                                job.id
-                            ),
-                        })?;
-                crate::encryption::job_payload::seal_job(engine, job).await?;
-            }
-        }
-        Ok(())
+        self.encryption.seal(jobs).await
     }
 
     /// Returns `job` with its payload decrypted.
@@ -1387,40 +1390,17 @@ impl<DB: Database> JobQueue<DB> {
     /// [`HammerworkError::Encryption`](crate::HammerworkError::Encryption) when the job is
     /// encrypted and the queue has no encryption engine (or the `encryption` feature is
     /// disabled), the engine does not have the job's key, or decryption or the integrity
-    /// check fails.
+    /// check fails. Decryption also fails when the ciphertext does not belong to this job:
+    /// it was copied from another job, or the job was moved to another queue or had its
+    /// key id, algorithm or PII fields changed (see
+    /// [`encryption::job_payload`](crate::encryption::job_payload)).
+    ///
+    /// An archived job (as returned by `get_job` for a job in `hammerwork_jobs_archive`)
+    /// cannot be decrypted: its ciphertext stays in the archive table and is not loaded.
+    /// Restore it with [`DatabaseQueue::restore_archived_job`] and decrypt the restored
+    /// job. This fails with an error saying so.
     pub async fn decrypt_job(&self, job: Job) -> Result<Job> {
-        if !job.is_encrypted {
-            return Ok(job);
-        }
-        #[cfg(feature = "encryption")]
-        {
-            let engine =
-                self.encryption
-                    .as_ref()
-                    .ok_or_else(|| crate::HammerworkError::Encryption {
-                        message: format!(
-                            "Job {} has an encrypted payload but the queue has no encryption \
-                         engine; configure one with JobQueue::with_encryption",
-                            job.id
-                        ),
-                    })?;
-            let job_id = job.id;
-            crate::encryption::job_payload::open_job(engine, job)
-                .await
-                .map_err(|e| crate::HammerworkError::Encryption {
-                    message: format!("Cannot decrypt the payload of job {}: {}", job_id, e),
-                })
-        }
-        #[cfg(not(feature = "encryption"))]
-        {
-            Err(crate::HammerworkError::Encryption {
-                message: format!(
-                    "Job {} has an encrypted payload; decrypting it needs the `encryption` \
-                     feature and an encryption engine (JobQueue::with_encryption)",
-                    job.id
-                ),
-            })
-        }
+        self.encryption.open(job).await
     }
 
     /// Set throttling configuration for a specific queue.
@@ -1546,13 +1526,85 @@ impl<DB: Database> JobQueue<DB> {
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 use crate::config::HammerworkConfig;
 
+#[cfg(all(any(feature = "postgres", feature = "mysql"), feature = "encryption"))]
+impl<DB: crate::encryption::KeyManagerBackend> JobQueue<DB> {
+    /// Sets up payload encryption from an `[encryption]` configuration section.
+    ///
+    /// When `config.enabled`, builds an `EncryptionEngine` with the configured
+    /// algorithm, key source, key id, compression and default retention (with
+    /// `EncryptionEngine::new_with_pool`, so `aws://` and `gcp://` keys work), adds the
+    /// decrypt-only `decryption_keys`, and sets it with `JobQueue::with_encryption` and
+    /// `encrypted_queues` with `JobQueue::with_encrypted_queues`. Does nothing when the
+    /// section is disabled. Called by `from_config`.
+    ///
+    /// Fails closed: an invalid section, a key that cannot be loaded, or an enabled
+    /// section in a build without the `encryption` feature is an error, never a queue
+    /// that silently stores plaintext.
+    pub async fn apply_encryption_config(
+        self,
+        config: &crate::config::PayloadEncryptionConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        if !config.enabled {
+            return Ok(self);
+        }
+        let mut engine = crate::encryption::EncryptionEngine::new_with_pool(
+            config.encryption_config()?,
+            &self.pool,
+        )
+        .await?;
+        for (key_id, source) in &config.decryption_keys {
+            engine = engine
+                .with_decryption_key(key_id.clone(), &source.key_source())
+                .await?;
+        }
+        Ok(self
+            .with_encryption(engine)
+            .with_encrypted_queues(config.encrypted_queues.iter().cloned()))
+    }
+}
+
+#[cfg(all(
+    any(feature = "postgres", feature = "mysql"),
+    not(feature = "encryption")
+))]
+impl<DB: Database> JobQueue<DB> {
+    /// Sets up payload encryption from an `[encryption]` configuration section.
+    ///
+    /// When `config.enabled`, builds an `EncryptionEngine` with the configured
+    /// algorithm, key source, key id, compression and default retention (with
+    /// `EncryptionEngine::new_with_pool`, so `aws://` and `gcp://` keys work), adds the
+    /// decrypt-only `decryption_keys`, and sets it with `JobQueue::with_encryption` and
+    /// `encrypted_queues` with `JobQueue::with_encrypted_queues`. Does nothing when the
+    /// section is disabled. Called by `from_config`.
+    ///
+    /// Fails closed: an invalid section, a key that cannot be loaded, or an enabled
+    /// section in a build without the `encryption` feature is an error, never a queue
+    /// that silently stores plaintext.
+    pub async fn apply_encryption_config(
+        self,
+        config: &crate::config::PayloadEncryptionConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        if !config.enabled {
+            return Ok(self);
+        }
+        Err(crate::HammerworkError::Config(
+            "encryption.enabled is set but hammerwork was built without the `encryption` \
+             feature"
+                .to_string(),
+        ))
+    }
+}
+
 #[cfg(feature = "postgres")]
 impl JobQueue<sqlx::Postgres> {
     /// Connect to PostgreSQL using a [`HammerworkConfig`].
     ///
     /// Uses `database.url`, `database.pool_size` and `database.connection_timeout_secs`
-    /// to build the pool, runs migrations when `database.auto_migrate` is set, and
-    /// registers the per-queue throttles from `rate_limiting`.
+    /// to build the pool, runs migrations when `database.auto_migrate` is set,
+    /// registers the per-queue throttles from `rate_limiting`, and sets up payload
+    /// encryption from `encryption` (see `JobQueue::apply_encryption_config`).
     ///
     /// # Examples
     ///
@@ -1579,7 +1631,9 @@ impl JobQueue<sqlx::Postgres> {
                 .await?;
         }
 
-        let queue = Self::new(pool);
+        let queue = Self::new(pool)
+            .apply_encryption_config(&config.encryption)
+            .await?;
         queue
             .apply_rate_limiting_config(&config.rate_limiting)
             .await?;
@@ -1592,8 +1646,9 @@ impl JobQueue<sqlx::MySql> {
     /// Connect to MySQL using a [`HammerworkConfig`].
     ///
     /// Uses `database.url`, `database.pool_size` and `database.connection_timeout_secs`
-    /// to build the pool, runs migrations when `database.auto_migrate` is set, and
-    /// registers the per-queue throttles from `rate_limiting`.
+    /// to build the pool, runs migrations when `database.auto_migrate` is set,
+    /// registers the per-queue throttles from `rate_limiting`, and sets up payload
+    /// encryption from `encryption` (see `JobQueue::apply_encryption_config`).
     ///
     /// # Examples
     ///
@@ -1620,7 +1675,9 @@ impl JobQueue<sqlx::MySql> {
                 .await?;
         }
 
-        let queue = Self::new(pool);
+        let queue = Self::new(pool)
+            .apply_encryption_config(&config.encryption)
+            .await?;
         queue
             .apply_rate_limiting_config(&config.rate_limiting)
             .await?;
