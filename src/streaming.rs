@@ -1014,10 +1014,18 @@ impl StreamManager {
     /// # }
     /// ```
     pub async fn add_stream(&self, stream: StreamConfig) -> crate::Result<()> {
-        let stream_id = stream.id;
-
         // Create processor for this stream
         let processor = self.create_processor(&stream).await?;
+        self.add_stream_with_processor(stream, processor).await
+    }
+
+    /// Register a stream with an already-created processor.
+    async fn add_stream_with_processor(
+        &self,
+        stream: StreamConfig,
+        processor: Box<dyn StreamProcessor + Send + Sync>,
+    ) -> crate::Result<()> {
+        let stream_id = stream.id;
 
         // Subscribe to events for this stream
         let subscription = self.event_manager.subscribe(stream.filter.clone()).await?;
@@ -1066,6 +1074,24 @@ impl StreamManager {
         }
 
         Ok(())
+    }
+
+    /// Test helper: add a stream, using an in-memory processor for backends
+    /// whose cargo feature is disabled (their real constructors fail fast).
+    /// Backends that are compiled in still use their real processor.
+    #[cfg(test)]
+    pub(crate) async fn add_stream_for_test(&self, stream: StreamConfig) -> crate::Result<()> {
+        let backend_compiled = match &stream.backend {
+            StreamBackend::Kafka { .. } => cfg!(feature = "kafka"),
+            StreamBackend::Kinesis { .. } => cfg!(feature = "kinesis"),
+            StreamBackend::PubSub { .. } => cfg!(feature = "google-pubsub"),
+        };
+        if backend_compiled {
+            self.add_stream(stream).await
+        } else {
+            self.add_stream_with_processor(stream, Box::new(InMemoryProcessor))
+                .await
+        }
     }
 
     /// Remove a stream configuration
@@ -1600,14 +1626,6 @@ pub struct KafkaProcessor {
     config: HashMap<String, String>,
 }
 
-#[cfg(not(feature = "kafka"))]
-/// Placeholder Kafka processor (requires kafka feature flag)
-pub struct KafkaProcessor {
-    brokers: Vec<String>,
-    topic: String,
-    config: HashMap<String, String>,
-}
-
 #[cfg(feature = "kafka")]
 impl KafkaProcessor {
     pub async fn new(
@@ -1645,21 +1663,6 @@ impl KafkaProcessor {
 
         Ok(Self {
             producer,
-            topic,
-            config,
-        })
-    }
-}
-
-#[cfg(not(feature = "kafka"))]
-impl KafkaProcessor {
-    pub async fn new(
-        brokers: Vec<String>,
-        topic: String,
-        config: HashMap<String, String>,
-    ) -> crate::Result<Self> {
-        Ok(Self {
-            brokers,
             topic,
             config,
         })
@@ -1871,115 +1874,43 @@ impl StreamProcessor for KafkaProcessor {
 }
 
 #[cfg(not(feature = "kafka"))]
+/// Uninhabited stand-in compiled when the `kafka` feature is disabled.
+///
+/// [`KafkaProcessor::new`] always fails, so a value of this type can never exist and
+/// streams for this backend are rejected when they are configured.
+pub struct KafkaProcessor(std::convert::Infallible);
+
+#[cfg(not(feature = "kafka"))]
+impl KafkaProcessor {
+    /// Always fails: Kafka support requires the `kafka` feature.
+    pub async fn new(
+        _brokers: Vec<String>,
+        _topic: String,
+        _config: HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        Err(HammerworkError::Streaming {
+            message: "Kafka support requires the `kafka` feature of hammerwork".to_string(),
+        })
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
 #[async_trait::async_trait]
 impl StreamProcessor for KafkaProcessor {
-    async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
-        // Placeholder implementation - requires kafka feature flag
-        let start_time = Utc::now();
-        let mut deliveries = Vec::new();
-
-        // Simulate batch processing with configuration-based delays
-        let batch_delay_ms = self
-            .config
-            .get("batch.delay.ms")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(10);
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(batch_delay_ms)).await;
-
-        // Simulate potential failures based on configuration
-        let error_rate = self
-            .config
-            .get("test.error.rate")
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
-
-        for event in events {
-            let success = rand::random::<f64>() > error_rate;
-            let duration = start_time
-                .signed_duration_since(Utc::now())
-                .num_milliseconds()
-                .unsigned_abs();
-
-            deliveries.push(StreamDelivery {
-                delivery_id: Uuid::new_v4(),
-                stream_id: Uuid::new_v4(), // Would be passed in
-                event_id: event.event.event_id,
-                success,
-                error_message: if success {
-                    None
-                } else {
-                    Some(format!(
-                        "Simulated Kafka delivery failure to topic: {}",
-                        self.topic
-                    ))
-                },
-                attempted_at: start_time,
-                duration_ms: Some(duration),
-                attempt_number: 1,
-                partition: event.partition_key,
-            });
-        }
-        Ok(deliveries)
+    async fn send_batch(&self, _events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
+        match self.0 {}
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
-        // Placeholder implementation - requires kafka feature flag
-        let health_check_timeout_ms = self
-            .config
-            .get("health.check.timeout.ms")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5000);
-
-        // Simulate health check with configurable timeout
-        tokio::time::timeout(
-            tokio::time::Duration::from_millis(health_check_timeout_ms),
-            async {
-                // Simulate checking each broker
-                for broker in &self.brokers {
-                    tracing::debug!("Health checking Kafka broker: {}", broker);
-                    // In real implementation, would ping broker
-                }
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap_or(Ok(false))
+        match self.0 {}
     }
 
     async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
-        let mut stats = HashMap::new();
-        stats.insert(
-            "type".to_string(),
-            serde_json::Value::String("kafka".to_string()),
-        );
-        stats.insert(
-            "brokers".to_string(),
-            serde_json::Value::Array(
-                self.brokers
-                    .iter()
-                    .map(|b| serde_json::Value::String(b.clone()))
-                    .collect(),
-            ),
-        );
-        stats.insert(
-            "topic".to_string(),
-            serde_json::Value::String(self.topic.clone()),
-        );
-        stats.insert(
-            "config".to_string(),
-            serde_json::Value::Object(
-                self.config
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                    .collect(),
-            ),
-        );
-        Ok(stats)
+        match self.0 {}
     }
 
     async fn shutdown(&self) -> crate::Result<()> {
-        Ok(())
+        match self.0 {}
     }
 }
 
@@ -1992,16 +1923,6 @@ pub struct KinesisProcessor {
     secret_access_key: Option<String>,
     config: HashMap<String, String>,
     client: KinesisClient,
-}
-
-/// Placeholder Kinesis processor when kinesis feature is disabled
-#[cfg(not(feature = "kinesis"))]
-pub struct KinesisProcessor {
-    region: String,
-    stream_name: String,
-    access_key_id: Option<String>,
-    secret_access_key: Option<String>,
-    config: HashMap<String, String>,
 }
 
 #[cfg(feature = "kinesis")]
@@ -2047,25 +1968,6 @@ impl KinesisProcessor {
             secret_access_key,
             config,
             client,
-        })
-    }
-}
-
-#[cfg(not(feature = "kinesis"))]
-impl KinesisProcessor {
-    pub async fn new(
-        region: String,
-        stream_name: String,
-        access_key_id: Option<String>,
-        secret_access_key: Option<String>,
-        config: HashMap<String, String>,
-    ) -> crate::Result<Self> {
-        Ok(Self {
-            region,
-            stream_name,
-            access_key_id,
-            secret_access_key,
-            config,
         })
     }
 }
@@ -2253,64 +2155,45 @@ impl StreamProcessor for KinesisProcessor {
 }
 
 #[cfg(not(feature = "kinesis"))]
+/// Uninhabited stand-in compiled when the `kinesis` feature is disabled.
+///
+/// [`KinesisProcessor::new`] always fails, so a value of this type can never exist and
+/// streams for this backend are rejected when they are configured.
+pub struct KinesisProcessor(std::convert::Infallible);
+
+#[cfg(not(feature = "kinesis"))]
+impl KinesisProcessor {
+    /// Always fails: AWS Kinesis support requires the `kinesis` feature.
+    pub async fn new(
+        _region: String,
+        _stream_name: String,
+        _access_key_id: Option<String>,
+        _secret_access_key: Option<String>,
+        _config: HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        Err(HammerworkError::Streaming {
+            message: "AWS Kinesis support requires the `kinesis` feature of hammerwork".to_string(),
+        })
+    }
+}
+
+#[cfg(not(feature = "kinesis"))]
 #[async_trait::async_trait]
 impl StreamProcessor for KinesisProcessor {
-    async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
-        // Placeholder implementation when feature is disabled
-        let mut deliveries = Vec::new();
-        for event in events {
-            deliveries.push(StreamDelivery {
-                delivery_id: Uuid::new_v4(),
-                stream_id: Uuid::new_v4(),
-                event_id: event.event.event_id,
-                success: false,
-                error_message: Some("AWS Kinesis feature not enabled. Enable 'kinesis' feature to use this backend.".to_string()),
-                attempted_at: Utc::now(),
-                duration_ms: Some(0),
-                attempt_number: 1,
-                partition: event.partition_key,
-            });
-        }
-        Ok(deliveries)
+    async fn send_batch(&self, _events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
+        match self.0 {}
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
-        Ok(false) // Always unhealthy when feature is disabled
+        match self.0 {}
     }
 
     async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
-        let mut stats = HashMap::new();
-        stats.insert(
-            "type".to_string(),
-            serde_json::Value::String("kinesis".to_string()),
-        );
-        stats.insert(
-            "region".to_string(),
-            serde_json::Value::String(self.region.clone()),
-        );
-        stats.insert(
-            "stream_name".to_string(),
-            serde_json::Value::String(self.stream_name.clone()),
-        );
-        stats.insert(
-            "credentials_configured".to_string(),
-            serde_json::Value::Bool(
-                self.access_key_id.is_some() && self.secret_access_key.is_some(),
-            ),
-        );
-        stats.insert(
-            "feature_enabled".to_string(),
-            serde_json::Value::Bool(false),
-        );
-        stats.insert(
-            "error".to_string(),
-            serde_json::Value::String("AWS Kinesis feature not enabled".to_string()),
-        );
-        Ok(stats)
+        match self.0 {}
     }
 
     async fn shutdown(&self) -> crate::Result<()> {
-        Ok(())
+        match self.0 {}
     }
 }
 
@@ -2322,15 +2205,6 @@ pub struct PubSubProcessor {
     service_account_key: Option<String>,
     config: HashMap<String, String>,
     publisher: Publisher,
-}
-
-/// Placeholder Pub/Sub processor when google-pubsub feature is disabled
-#[cfg(not(feature = "google-pubsub"))]
-pub struct PubSubProcessor {
-    project_id: String,
-    topic_name: String,
-    service_account_key: Option<String>,
-    config: HashMap<String, String>,
 }
 
 #[cfg(feature = "google-pubsub")]
@@ -2383,23 +2257,6 @@ impl PubSubProcessor {
             service_account_key,
             config,
             publisher,
-        })
-    }
-}
-
-#[cfg(not(feature = "google-pubsub"))]
-impl PubSubProcessor {
-    pub async fn new(
-        project_id: String,
-        topic_name: String,
-        service_account_key: Option<String>,
-        config: HashMap<String, String>,
-    ) -> crate::Result<Self> {
-        Ok(Self {
-            project_id,
-            topic_name,
-            service_account_key,
-            config,
         })
     }
 }
@@ -2547,62 +2404,45 @@ impl StreamProcessor for PubSubProcessor {
 }
 
 #[cfg(not(feature = "google-pubsub"))]
+/// Uninhabited stand-in compiled when the `google-pubsub` feature is disabled.
+///
+/// [`PubSubProcessor::new`] always fails, so a value of this type can never exist and
+/// streams for this backend are rejected when they are configured.
+pub struct PubSubProcessor(std::convert::Infallible);
+
+#[cfg(not(feature = "google-pubsub"))]
+impl PubSubProcessor {
+    /// Always fails: Google Pub/Sub support requires the `google-pubsub` feature.
+    pub async fn new(
+        _project_id: String,
+        _topic_name: String,
+        _service_account_key: Option<String>,
+        _config: HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        Err(HammerworkError::Streaming {
+            message: "Google Pub/Sub support requires the `google-pubsub` feature of hammerwork"
+                .to_string(),
+        })
+    }
+}
+
+#[cfg(not(feature = "google-pubsub"))]
 #[async_trait::async_trait]
 impl StreamProcessor for PubSubProcessor {
-    async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
-        // Placeholder implementation when feature is disabled
-        let mut deliveries = Vec::new();
-        for event in events {
-            deliveries.push(StreamDelivery {
-                delivery_id: Uuid::new_v4(),
-                stream_id: Uuid::new_v4(),
-                event_id: event.event.event_id,
-                success: false,
-                error_message: Some("Google Pub/Sub feature not enabled. Enable 'google-pubsub' feature to use this backend.".to_string()),
-                attempted_at: Utc::now(),
-                duration_ms: Some(0),
-                attempt_number: 1,
-                partition: event.partition_key,
-            });
-        }
-        Ok(deliveries)
+    async fn send_batch(&self, _events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
+        match self.0 {}
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
-        Ok(false) // Always unhealthy when feature is disabled
+        match self.0 {}
     }
 
     async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
-        let mut stats = HashMap::new();
-        stats.insert(
-            "type".to_string(),
-            serde_json::Value::String("pubsub".to_string()),
-        );
-        stats.insert(
-            "project_id".to_string(),
-            serde_json::Value::String(self.project_id.clone()),
-        );
-        stats.insert(
-            "topic_name".to_string(),
-            serde_json::Value::String(self.topic_name.clone()),
-        );
-        stats.insert(
-            "service_account_configured".to_string(),
-            serde_json::Value::Bool(self.service_account_key.is_some()),
-        );
-        stats.insert(
-            "feature_enabled".to_string(),
-            serde_json::Value::Bool(false),
-        );
-        stats.insert(
-            "error".to_string(),
-            serde_json::Value::String("Google Pub/Sub feature not enabled".to_string()),
-        );
-        Ok(stats)
+        match self.0 {}
     }
 
     async fn shutdown(&self) -> crate::Result<()> {
-        Ok(())
+        match self.0 {}
     }
 }
 
@@ -2657,6 +2497,44 @@ impl StreamConfig {
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
+    }
+}
+
+/// Broker-less processor for tests that need a working stream without any
+/// backend feature enabled. Acknowledges every event.
+#[cfg(test)]
+struct InMemoryProcessor;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl StreamProcessor for InMemoryProcessor {
+    async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
+        Ok(events
+            .into_iter()
+            .map(|event| StreamDelivery {
+                delivery_id: Uuid::new_v4(),
+                stream_id: Uuid::nil(),
+                event_id: event.event.event_id,
+                success: true,
+                error_message: None,
+                attempted_at: Utc::now(),
+                duration_ms: Some(0),
+                attempt_number: 1,
+                partition: event.partition_key,
+            })
+            .collect())
+    }
+
+    async fn health_check(&self) -> crate::Result<bool> {
+        Ok(true)
+    }
+
+    async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
+        Ok(HashMap::new())
+    }
+
+    async fn shutdown(&self) -> crate::Result<()> {
+        Ok(())
     }
 }
 
@@ -3159,7 +3037,7 @@ mod tests {
         let stream_id = stream_config.id;
 
         // Add stream
-        manager.add_stream(stream_config).await.unwrap();
+        manager.add_stream_for_test(stream_config).await.unwrap();
 
         let stats = manager.get_stats().await;
         assert_eq!(stats.total_streams, 1);
@@ -3190,7 +3068,7 @@ mod tests {
         let stream_config = StreamConfig::new("test-stream".to_string(), backend);
         let stream_id = stream_config.id;
 
-        manager.add_stream(stream_config).await.unwrap();
+        manager.add_stream_for_test(stream_config).await.unwrap();
 
         // Initially enabled
         let stats = manager.get_stats().await;
@@ -3304,28 +3182,26 @@ mod tests {
     }
 
     /// Kafka brokers for tests that need a real cluster, from `KAFKA_BROKERS`
-    /// (comma-separated). With the `kafka` feature these tests are `#[ignore]`d
-    /// and are skipped when `KAFKA_BROKERS` is unset, so `--include-ignored`
-    /// runs without a broker still pass. The placeholder processor needs no
-    /// broker and always runs.
+    /// (comma-separated). These tests are `#[ignore]`d and are skipped when
+    /// `KAFKA_BROKERS` is unset, so `--include-ignored` runs without a broker
+    /// still pass.
+    #[cfg(feature = "kafka")]
     fn test_kafka_brokers() -> Option<Vec<String>> {
         match std::env::var("KAFKA_BROKERS") {
             Ok(brokers) => Some(brokers.split(',').map(|b| b.trim().to_string()).collect()),
-            Err(_) if cfg!(feature = "kafka") => {
+            Err(_) => {
                 eprintln!("skipping: KAFKA_BROKERS is not set");
                 None
             }
-            Err(_) => Some(vec!["localhost:9092".to_string()]),
         }
     }
 
     /// Whether a test that creates a real Pub/Sub client can run. With the
     /// `google-pubsub` feature these tests are `#[ignore]`d and are skipped
     /// when `GOOGLE_APPLICATION_CREDENTIALS` is unset.
+    #[cfg(feature = "google-pubsub")]
     fn pubsub_credentials_available() -> bool {
-        if cfg!(feature = "google-pubsub")
-            && std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").is_none()
-        {
+        if std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").is_none() {
             eprintln!("skipping: GOOGLE_APPLICATION_CREDENTIALS is not set");
             return false;
         }
@@ -3411,6 +3287,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn test_kafka_processor_creation() {
         let processor = KafkaProcessor::new(
@@ -3424,6 +3301,7 @@ mod tests {
         assert_eq!(processor.topic, "test-topic");
     }
 
+    #[cfg(feature = "kinesis")]
     #[tokio::test]
     async fn test_kinesis_processor_creation() {
         let processor = KinesisProcessor::new(
@@ -3441,11 +3319,9 @@ mod tests {
         assert!(processor.access_key_id.is_none());
     }
 
+    #[cfg(feature = "google-pubsub")]
     #[tokio::test]
-    #[cfg_attr(
-        feature = "google-pubsub",
-        ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"
-    )]
+    #[ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"]
     async fn test_pubsub_processor_creation() {
         if !pubsub_credentials_available() {
             return;
@@ -3464,8 +3340,9 @@ mod tests {
         assert!(processor.service_account_key.is_none());
     }
 
+    #[cfg(feature = "kafka")]
     #[tokio::test]
-    #[cfg_attr(feature = "kafka", ignore = "requires Kafka: KAFKA_BROKERS")]
+    #[ignore = "requires Kafka: KAFKA_BROKERS"]
     async fn test_stream_processor_health_check() {
         let Some(brokers) = test_kafka_brokers() else {
             return;
@@ -3474,13 +3351,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Health check should pass (placeholder implementation)
         let health = processor.health_check().await.unwrap();
         assert!(health);
     }
 
+    #[cfg(feature = "kafka")]
     #[tokio::test]
-    #[cfg_attr(feature = "kafka", ignore = "requires Kafka: KAFKA_BROKERS")]
+    #[ignore = "requires Kafka: KAFKA_BROKERS"]
     async fn test_stream_processor_batch_sending() {
         let Some(brokers) = test_kafka_brokers() else {
             return;
@@ -3679,11 +3556,9 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "google-pubsub")]
     #[tokio::test]
-    #[cfg_attr(
-        feature = "google-pubsub",
-        ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"
-    )]
+    #[ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"]
     async fn test_stream_processor_stats() {
         if !pubsub_credentials_available() {
             return;
@@ -3779,20 +3654,11 @@ mod tests {
         assert_eq!(missing_partition, None);
     }
 
+    #[cfg(feature = "kafka")]
     #[tokio::test]
-    async fn test_stream_processor_configuration_usage() {
-        // Test that configuration fields are properly used in stream processors
-
-        // Test Kafka processor with custom configuration
+    async fn test_kafka_processor_configuration_usage() {
         let mut kafka_config = HashMap::new();
         kafka_config.insert("health.check.timeout.ms".to_string(), "1000".to_string());
-        // Simulation knobs of the placeholder processor; librdkafka rejects them.
-        #[cfg(not(feature = "kafka"))]
-        {
-            kafka_config.insert("batch.delay.ms".to_string(), "50".to_string());
-            kafka_config.insert("test.error.rate".to_string(), "0.1".to_string());
-        }
-        #[cfg(feature = "kafka")]
         kafka_config.insert("linger.ms".to_string(), "50".to_string());
 
         let kafka_processor = KafkaProcessor::new(
@@ -3810,8 +3676,11 @@ mod tests {
             &serde_json::Value::String("kafka".to_string())
         );
         assert!(stats.contains_key("config"));
+    }
 
-        // Test Kinesis processor with AWS credentials
+    #[cfg(feature = "kinesis")]
+    #[tokio::test]
+    async fn test_kinesis_processor_configuration_usage() {
         let mut kinesis_config = HashMap::new();
         kinesis_config.insert("retries".to_string(), "3".to_string());
 
@@ -3830,25 +3699,13 @@ mod tests {
             kinesis_stats.get("type").unwrap(),
             &serde_json::Value::String("kinesis".to_string())
         );
-        // The placeholder processor (without the `kinesis` feature) reports
-        // only `credentials_configured`.
-        #[cfg(feature = "kinesis")]
-        {
-            assert!(kinesis_stats.contains_key("access_key_id"));
-            assert!(kinesis_stats.contains_key("config"));
-        }
-        #[cfg(not(feature = "kinesis"))]
-        assert_eq!(
-            kinesis_stats.get("credentials_configured").unwrap(),
-            &serde_json::Value::Bool(true)
-        );
+        assert!(kinesis_stats.contains_key("access_key_id"));
+        assert!(kinesis_stats.contains_key("config"));
     }
 
+    #[cfg(feature = "google-pubsub")]
     #[tokio::test]
-    #[cfg_attr(
-        feature = "google-pubsub",
-        ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"
-    )]
+    #[ignore = "requires Google Pub/Sub: GOOGLE_APPLICATION_CREDENTIALS"]
     async fn test_pubsub_processor_configuration_usage() {
         if !pubsub_credentials_available() {
             return;
@@ -3857,16 +3714,12 @@ mod tests {
         let mut pubsub_config = HashMap::new();
         pubsub_config.insert("max_messages".to_string(), "1000".to_string());
 
-        // The real client needs a valid service account key; the placeholder
-        // processor accepts any string.
-        #[cfg(feature = "google-pubsub")]
+        // The real client needs a valid service account key.
         let service_account_key = std::fs::read_to_string(
             std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
                 .expect("GOOGLE_APPLICATION_CREDENTIALS must point at a service account key"),
         )
         .expect("failed to read service account key");
-        #[cfg(not(feature = "google-pubsub"))]
-        let service_account_key = "service-account-key".to_string();
 
         let pubsub_processor = PubSubProcessor::new(
             "my-project".to_string(),
@@ -3886,9 +3739,87 @@ mod tests {
             pubsub_stats.get("service_account_configured").unwrap(),
             &serde_json::Value::Bool(true)
         );
-        // The placeholder processor (without the `google-pubsub` feature) does
-        // not report its config.
-        #[cfg(feature = "google-pubsub")]
         assert!(pubsub_stats.contains_key("config"));
+    }
+
+    #[cfg(any(
+        not(feature = "kafka"),
+        not(feature = "kinesis"),
+        not(feature = "google-pubsub")
+    ))]
+    fn assert_feature_error(result: crate::Result<()>, feature: &str) {
+        match result {
+            Err(HammerworkError::Streaming { message }) => {
+                assert!(
+                    message.contains(&format!("`{feature}` feature")),
+                    "{message}"
+                );
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+            Ok(()) => panic!("stream for a disabled backend must be rejected"),
+        }
+    }
+
+    #[cfg(not(feature = "kafka"))]
+    #[tokio::test]
+    async fn test_kafka_stream_rejected_without_feature() {
+        let direct = KafkaProcessor::new(vec![], "t".to_string(), HashMap::new()).await;
+        assert_feature_error(direct.map(|_| ()), "kafka");
+
+        let manager = StreamManager::new(
+            Arc::new(EventManager::new_default()),
+            StreamManagerConfig::default(),
+        );
+        let stream = StreamConfig::new(
+            "kafka".to_string(),
+            StreamBackend::Kafka {
+                brokers: vec!["localhost:9092".to_string()],
+                topic: "t".to_string(),
+                config: HashMap::new(),
+            },
+        );
+        assert_feature_error(manager.add_stream(stream).await, "kafka");
+        assert!(manager.list_streams().await.is_empty());
+    }
+
+    #[cfg(not(feature = "kinesis"))]
+    #[tokio::test]
+    async fn test_kinesis_stream_rejected_without_feature() {
+        let manager = StreamManager::new(
+            Arc::new(EventManager::new_default()),
+            StreamManagerConfig::default(),
+        );
+        let stream = StreamConfig::new(
+            "kinesis".to_string(),
+            StreamBackend::Kinesis {
+                region: "us-east-1".to_string(),
+                stream_name: "s".to_string(),
+                access_key_id: None,
+                secret_access_key: None,
+                config: HashMap::new(),
+            },
+        );
+        assert_feature_error(manager.add_stream(stream).await, "kinesis");
+        assert!(manager.list_streams().await.is_empty());
+    }
+
+    #[cfg(not(feature = "google-pubsub"))]
+    #[tokio::test]
+    async fn test_pubsub_stream_rejected_without_feature() {
+        let manager = StreamManager::new(
+            Arc::new(EventManager::new_default()),
+            StreamManagerConfig::default(),
+        );
+        let stream = StreamConfig::new(
+            "pubsub".to_string(),
+            StreamBackend::PubSub {
+                project_id: "p".to_string(),
+                topic_name: "t".to_string(),
+                service_account_key: None,
+                config: HashMap::new(),
+            },
+        );
+        assert_feature_error(manager.add_stream(stream).await, "google-pubsub");
+        assert!(manager.list_streams().await.is_empty());
     }
 }

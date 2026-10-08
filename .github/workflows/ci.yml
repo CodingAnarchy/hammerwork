@@ -71,7 +71,7 @@ jobs:
           - postgres,mysql
           - postgres,encryption
           - mysql,tracing
-          # TODO(#23): add postgres,streaming once the backend placeholders fail fast.
+          - postgres,streaming
     steps:
       - uses: actions/checkout@v5
       - name: Install system packages
