@@ -60,9 +60,9 @@ macro_rules! try_api {
 }
 
 pub mod archive;
+pub mod history;
 pub mod jobs;
 pub mod queues;
-pub mod spawn;
 pub mod stats;
 pub mod system;
 

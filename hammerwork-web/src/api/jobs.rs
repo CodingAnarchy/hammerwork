@@ -218,7 +218,7 @@ where
 }
 
 /// Handler for listing jobs
-async fn list_jobs_handler<T>(
+pub(crate) async fn list_jobs_handler<T>(
     queue: Arc<T>,
     pagination: PaginationParams,
     filters: FilterParams,

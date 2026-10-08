@@ -2,11 +2,12 @@ use anyhow::Result;
 use clap::Subcommand;
 use serde_json::json;
 use std::collections::HashMap;
-use tracing::{error, info};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::utils::display::create_table;
+use hammerwork::webhooks::WebhookConfig;
 
 #[derive(Clone, Subcommand)]
 pub enum WebhookCommand {
@@ -70,13 +71,6 @@ pub enum WebhookCommand {
         job_id: Option<String>,
         #[arg(long, help = "Test queue name", default_value = "test")]
         queue: String,
-    },
-    #[command(about = "Show webhook statistics")]
-    Stats {
-        #[arg(short, long, help = "Webhook ID or name")]
-        webhook: Option<String>,
-        #[arg(long, help = "Time window in hours", default_value = "24")]
-        hours: u64,
     },
     #[command(about = "Enable or disable a webhook")]
     Toggle {
@@ -159,9 +153,6 @@ pub async fn handle_webhook_command(command: WebhookCommand, config: &Config) ->
             job_id,
             queue,
         } => test_webhook(config, webhook, event_type, job_id, queue).await,
-        WebhookCommand::Stats { webhook, hours } => {
-            show_webhook_stats(config, webhook, hours).await
-        }
         WebhookCommand::Toggle { webhook, enable } => toggle_webhook(config, webhook, enable).await,
         WebhookCommand::Update {
             webhook,
@@ -208,8 +199,8 @@ async fn list_webhooks(config: &Config, detailed: bool) -> Result<()> {
             println!("  URL: {}", webhook.url);
             println!("  Method: {}", webhook.method);
             println!("  Enabled: {}", webhook.enabled);
-            println!("  Timeout: {}s", webhook.timeout);
-            println!("  Max Retries: {}", webhook.max_retries);
+            println!("  Timeout: {}s", webhook.timeout_secs);
+            println!("  Max Retries: {}", webhook.retry_policy.max_attempts);
 
             if !webhook.headers.is_empty() {
                 println!("  Headers:");
@@ -306,8 +297,7 @@ async fn add_webhook(
 
 async fn remove_webhook(config: &Config, webhook_id: String, confirm: bool) -> Result<()> {
     if !confirm {
-        error!("❌ Use --confirm to confirm webhook removal");
-        return Ok(());
+        return Err(anyhow::anyhow!("Use --confirm to confirm webhook removal"));
     }
 
     let mut webhooks = load_webhooks_config(config)?;
@@ -316,8 +306,7 @@ async fn remove_webhook(config: &Config, webhook_id: String, confirm: bool) -> R
     webhooks.retain(|w| w.name != webhook_id && w.id.to_string() != webhook_id);
 
     if webhooks.len() == initial_len {
-        error!("❌ Webhook '{}' not found", webhook_id);
-        return Ok(());
+        return Err(anyhow::anyhow!("Webhook '{}' not found", webhook_id));
     }
 
     save_webhooks_config(config, webhooks)?;
@@ -326,49 +315,177 @@ async fn remove_webhook(config: &Config, webhook_id: String, confirm: bool) -> R
 }
 
 async fn test_webhook(
-    _config: &Config,
+    config: &Config,
     webhook_id: String,
     event_type: String,
     job_id: Option<String>,
     queue: String,
 ) -> Result<()> {
-    // Create a test event
-    let test_event = json!({
-        "event_type": event_type,
-        "job_id": job_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-        "queue_name": queue,
-        "priority": "Normal",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "test": true
-    });
+    let webhooks = load_webhooks_config(config)?;
+    let webhook = find_webhook(&webhooks, &webhook_id)?;
+    let job_id = match job_id {
+        Some(id) => Uuid::parse_str(&id).map_err(|e| anyhow::anyhow!("Invalid job ID: {e}"))?,
+        None => Uuid::new_v4(),
+    };
+    let event = build_test_event(webhook, &event_type, job_id, &queue)?;
 
-    info!("🧪 Testing webhook '{}' with event:", webhook_id);
-    println!("{}", serde_json::to_string_pretty(&test_event)?);
+    println!(
+        "Sending test event to webhook '{}' ({}):",
+        webhook.name, webhook.url
+    );
+    if !webhook.enabled {
+        println!("(note: this webhook is disabled; the test is sent anyway)");
+    }
+    println!("{}", serde_json::to_string_pretty(&event)?);
 
-    // TODO: Implement actual webhook testing by loading configuration and sending request
-    info!("✅ Test event would be sent to webhook (implementation pending)");
-    Ok(())
+    let outcome = send_test_event(webhook, &event).await?;
+    println!(
+        "Response: HTTP {} in {}ms",
+        outcome.status, outcome.duration_ms
+    );
+    if !outcome.body.is_empty() {
+        println!("Body: {}", outcome.body);
+    }
+    if outcome.success {
+        println!("Webhook test succeeded.");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "Webhook test failed: endpoint answered HTTP {}",
+            outcome.status
+        ))
+    }
 }
 
-async fn show_webhook_stats(_config: &Config, webhook: Option<String>, hours: u64) -> Result<()> {
-    // TODO: Implement webhook statistics display
-    if let Some(webhook_id) = webhook {
-        info!(
-            "📊 Statistics for webhook '{}' (last {} hours):",
-            webhook_id, hours
-        );
-    } else {
-        info!("📊 Statistics for all webhooks (last {} hours):", hours);
+/// Result of delivering the test event.
+#[derive(Debug)]
+pub struct TestOutcome {
+    pub status: u16,
+    pub success: bool,
+    pub duration_ms: u64,
+    /// Response body, truncated to a printable length.
+    pub body: String,
+}
+
+/// Builds a sample lifecycle event of the given type for `webhook`.
+fn build_test_event(
+    webhook: &WebhookConfig,
+    event_type: &str,
+    job_id: Uuid,
+    queue: &str,
+) -> Result<hammerwork::events::JobLifecycleEvent> {
+    use hammerwork::events::{JobError, JobLifecycleEvent, JobLifecycleEventType};
+    use hammerwork::priority::JobPriority;
+
+    let event_type = parse_event_types(event_type)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("An event type is required"))?;
+    let is_error = matches!(
+        event_type,
+        JobLifecycleEventType::Failed
+            | JobLifecycleEventType::Dead
+            | JobLifecycleEventType::TimedOut
+    );
+    let is_completed = event_type == JobLifecycleEventType::Completed;
+
+    let mut metadata = HashMap::new();
+    metadata.insert("test".to_string(), "true".to_string());
+    Ok(JobLifecycleEvent {
+        event_id: Uuid::new_v4(),
+        job_id,
+        queue_name: queue.to_string(),
+        event_type,
+        priority: JobPriority::Normal,
+        timestamp: chrono::Utc::now(),
+        processing_time_ms: is_completed.then_some(123),
+        error: is_error.then(|| JobError {
+            message: "Test error from `cargo hammerwork webhook test`".to_string(),
+            error_type: Some("test".to_string()),
+            details: None,
+            retry_attempt: None,
+        }),
+        payload: webhook
+            .filter
+            .include_payload
+            .then(|| json!({"test": true})),
+        metadata,
+    })
+}
+
+/// Sends `event` to the webhook the way the library's delivery does: configured
+/// method, custom headers, authentication, and an `X-Hammerwork-Signature` HMAC header
+/// when a secret is set. A single attempt, no retries. Transport errors (DNS, connect,
+/// timeout) are returned as `Err`; any HTTP response is returned as an outcome.
+pub async fn send_test_event(
+    webhook: &WebhookConfig,
+    event: &hammerwork::events::JobLifecycleEvent,
+) -> Result<TestOutcome> {
+    use hammerwork::HttpMethod;
+    use hammerwork::webhooks::WebhookAuth;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(webhook.timeout_secs.max(1)))
+        .user_agent(concat!("hammerwork-cli/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let body = serde_json::to_string(&serde_json::to_value(event)?)?;
+
+    let mut request = match webhook.method {
+        HttpMethod::Post => client.post(&webhook.url),
+        HttpMethod::Put => client.put(&webhook.url),
+        HttpMethod::Patch => client.patch(&webhook.url),
+    };
+    for (key, value) in &webhook.headers {
+        request = request.header(key, value);
+    }
+    match &webhook.auth {
+        Some(WebhookAuth::Bearer { token }) => {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        Some(WebhookAuth::Basic { username, password }) => {
+            request = request.basic_auth(username, Some(password));
+        }
+        Some(WebhookAuth::ApiKey {
+            header_name,
+            api_key,
+        }) => {
+            request = request.header(header_name, api_key);
+        }
+        Some(WebhookAuth::Custom { headers }) => {
+            for (key, value) in headers {
+                request = request.header(key, value);
+            }
+        }
+        None => {}
+    }
+    if let Some(secret) = &webhook.secret {
+        let signature = hammerwork::webhooks::generate_hmac_signature(secret, body.as_bytes());
+        request = request.header("X-Hammerwork-Signature", format!("sha256={signature}"));
     }
 
-    // Placeholder for webhook statistics
-    println!("Total deliveries: 0");
-    println!("Successful: 0");
-    println!("Failed: 0");
-    println!("Success rate: 0%");
-    println!("Average response time: 0ms");
+    let started = std::time::Instant::now();
+    let response = request
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Webhook test failed: could not deliver request: {e}"))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let body: String = text.chars().take(500).collect();
+    Ok(TestOutcome {
+        status: status.as_u16(),
+        success: status.is_success(),
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        body,
+    })
+}
 
-    Ok(())
+fn find_webhook<'a>(webhooks: &'a [WebhookConfig], id_or_name: &str) -> Result<&'a WebhookConfig> {
+    webhooks
+        .iter()
+        .find(|w| w.name == id_or_name || w.id.to_string() == id_or_name)
+        .ok_or_else(|| anyhow::anyhow!("Webhook '{}' not found", id_or_name))
 }
 
 async fn toggle_webhook(config: &Config, webhook_id: String, enable: bool) -> Result<()> {
@@ -385,9 +502,7 @@ async fn toggle_webhook(config: &Config, webhook_id: String, enable: bool) -> Re
             let status = if enable { "enabled" } else { "disabled" };
             info!("✅ Webhook '{}' {}", webhook_id, status);
         }
-        None => {
-            error!("❌ Webhook '{}' not found", webhook_id);
-        }
+        None => return Err(anyhow::anyhow!("Webhook '{}' not found", webhook_id)),
     }
 
     Ok(())
@@ -426,10 +541,10 @@ async fn update_webhook(
                 w.method = parse_http_method(&new_method)?;
             }
             if let Some(new_timeout) = timeout {
-                w.timeout = new_timeout;
+                w.timeout_secs = new_timeout;
             }
             if let Some(new_max_retries) = max_retries {
-                w.max_retries = new_max_retries;
+                w.retry_policy.max_attempts = new_max_retries;
             }
 
             // Update filters
@@ -449,9 +564,7 @@ async fn update_webhook(
             save_webhooks_config(config, webhooks)?;
             info!("✅ Webhook '{}' updated successfully", webhook_id);
         }
-        None => {
-            error!("❌ Webhook '{}' not found", webhook_id);
-        }
+        None => return Err(anyhow::anyhow!("Webhook '{}' not found", webhook_id)),
     }
 
     Ok(())
@@ -477,7 +590,7 @@ fn create_webhook_config(
     timeout: u64,
     max_retries: u32,
     include_payload: bool,
-) -> Result<WebhookConfigEntry> {
+) -> Result<WebhookConfig> {
     use hammerwork::events::EventFilter;
     use hammerwork::webhooks::{RetryPolicy, WebhookAuth};
 
@@ -531,7 +644,7 @@ fn create_webhook_config(
         retry_on_status_codes: vec![408, 429, 500, 502, 503, 504],
     };
 
-    Ok(WebhookConfigEntry {
+    Ok(WebhookConfig {
         id: Uuid::new_v4(),
         name,
         url,
@@ -540,10 +653,10 @@ fn create_webhook_config(
         filter,
         retry_policy,
         auth,
-        timeout,
+        timeout_secs: timeout,
         enabled: true,
         secret,
-        max_retries,
+        payload_template: None,
     })
 }
 
@@ -626,35 +739,242 @@ fn parse_headers(headers_str: &str) -> Result<HashMap<String, String>> {
 
 // Configuration persistence functions
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct WebhookConfigEntry {
-    id: Uuid,
-    name: String,
-    url: String,
-    method: hammerwork::HttpMethod,
-    headers: HashMap<String, String>,
-    filter: hammerwork::events::EventFilter,
-    retry_policy: hammerwork::webhooks::RetryPolicy,
-    auth: Option<hammerwork::webhooks::WebhookAuth>,
-    timeout: u64,
-    enabled: bool,
-    secret: Option<String>,
-    max_retries: u32,
+// Configuration persistence
+//
+// Webhooks are stored as JSON next to the CLI's `config.toml` (the TOML file only holds
+// flat scalar settings). The file may contain secrets, so it is written owner-only.
+
+fn load_webhooks_config(config: &Config) -> Result<Vec<WebhookConfig>> {
+    read_webhooks(&config.webhooks_file_path()?)
 }
 
-fn load_webhooks_config(_config: &Config) -> Result<Vec<WebhookConfigEntry>> {
-    // TODO: Implement loading from configuration file
-    Ok(Vec::new())
+fn save_webhook_config(config: &Config, webhook: WebhookConfig) -> Result<()> {
+    let path = config.webhooks_file_path()?;
+    let mut webhooks = read_webhooks(&path)?;
+    if webhooks.iter().any(|w| w.name == webhook.name) {
+        return Err(anyhow::anyhow!(
+            "A webhook named '{}' already exists",
+            webhook.name
+        ));
+    }
+    webhooks.push(webhook);
+    write_webhooks(&path, &webhooks)
 }
 
-fn save_webhook_config(_config: &Config, _webhook: WebhookConfigEntry) -> Result<()> {
-    // TODO: Implement saving to configuration file
-    info!("Webhook configuration would be saved (implementation pending)");
+fn save_webhooks_config(config: &Config, webhooks: Vec<WebhookConfig>) -> Result<()> {
+    write_webhooks(&config.webhooks_file_path()?, &webhooks)
+}
+
+/// Reads the webhook list; a missing file is an empty list, a corrupt one is an error.
+fn read_webhooks(path: &std::path::Path) -> Result<Vec<WebhookConfig>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) if content.trim().is_empty() => Ok(Vec::new()),
+        Ok(content) => serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Invalid webhook file {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(anyhow::anyhow!("Cannot read {}: {e}", path.display())),
+    }
+}
+
+/// Writes the list atomically (temp file + rename), owner-read/write only on Unix.
+fn write_webhooks(path: &std::path::Path, webhooks: &[WebhookConfig]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(webhooks)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-fn save_webhooks_config(_config: &Config, _webhooks: Vec<WebhookConfigEntry>) -> Result<()> {
-    // TODO: Implement saving to configuration file
-    info!("Webhooks configuration would be saved (implementation pending)");
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: WebhookCommand,
+    }
+
+    fn sample(url: &str) -> WebhookConfig {
+        create_webhook_config(
+            "ci".into(),
+            url.into(),
+            "POST".into(),
+            None,
+            None,
+            None,
+            Some("X-Custom=yes".into()),
+            Some("tok123".into()),
+            None,
+            None,
+            None,
+            Some("s3cret".into()),
+            5,
+            2,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// Serves one request, answers with `status`, and returns the raw request text.
+    async fn one_shot_server(status: u16) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                data.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&data).to_string();
+                if let Some(idx) = text.find("\r\n\r\n") {
+                    let len = text[..idx]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= idx + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let reply =
+                format!("HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&data).to_string()
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn test_stats_subcommand_was_removed() {
+        assert!(TestCli::try_parse_from(["t", "stats"]).is_err());
+        assert!(TestCli::try_parse_from(["t", "test", "-w", "x"]).is_ok());
+    }
+
+    #[test]
+    fn test_webhook_file_roundtrip_preserves_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("webhooks.json");
+        assert!(read_webhooks(&path).unwrap().is_empty());
+
+        let hook = sample("http://localhost/x");
+        write_webhooks(&path, std::slice::from_ref(&hook)).unwrap();
+        let loaded = read_webhooks(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, hook.id);
+        assert_eq!(loaded[0].headers.get("X-Custom").unwrap(), "yes");
+        assert_eq!(loaded[0].timeout_secs, 5);
+        assert_eq!(loaded[0].retry_policy.max_attempts, 2);
+        assert_eq!(loaded[0].secret.as_deref(), Some("s3cret"));
+        assert!(loaded[0].auth.is_some());
+        assert!(loaded[0].filter.include_payload);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn test_corrupt_webhook_file_is_an_error_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhooks.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(read_webhooks(&path).is_err());
+    }
+
+    #[test]
+    fn test_find_webhook_by_name_or_id() {
+        let hook = sample("http://localhost/x");
+        let id = hook.id.to_string();
+        let list = vec![hook];
+        assert!(find_webhook(&list, "ci").is_ok());
+        assert!(find_webhook(&list, &id).is_ok());
+        assert!(find_webhook(&list, "nope").is_err());
+    }
+
+    #[test]
+    fn test_build_test_event_marks_test_and_rejects_unknown_type() {
+        let hook = sample("http://localhost/x");
+        let event = build_test_event(&hook, "failed", Uuid::new_v4(), "q").unwrap();
+        assert_eq!(event.queue_name, "q");
+        assert!(event.error.is_some());
+        assert_eq!(event.metadata.get("test").unwrap(), "true");
+        assert!(event.payload.is_some(), "include_payload was set");
+        assert!(build_test_event(&hook, "bogus", Uuid::new_v4(), "q").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_test_event_delivers_with_auth_headers_and_valid_signature() {
+        let (url, server) = one_shot_server(200).await;
+        let hook = sample(&url);
+        let event = build_test_event(&hook, "completed", Uuid::new_v4(), "q").unwrap();
+        let outcome = send_test_event(&hook, &event).await.unwrap();
+        assert!(outcome.success);
+        assert_eq!(outcome.status, 200);
+        assert_eq!(outcome.body, "ok");
+
+        let raw = server.await.unwrap();
+        let lower = raw.to_ascii_lowercase();
+        assert!(raw.starts_with("POST /hook"));
+        assert!(lower.contains("authorization: bearer tok123"));
+        assert!(lower.contains("x-custom: yes"));
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let sig = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("x-hammerwork-signature:")
+                    .then(|| l.split_once(':').unwrap().1.trim().to_string())
+            })
+            .expect("signature header");
+        let hex = sig.strip_prefix("sha256=").unwrap();
+        assert!(hammerwork::webhooks::verify_hmac_signature(
+            "s3cret",
+            body.as_bytes(),
+            hex
+        ));
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["event_type"], "completed");
+        assert_eq!(parsed["metadata"]["test"], "true");
+    }
+
+    #[tokio::test]
+    async fn test_send_test_event_reports_http_failure() {
+        let (url, _server) = one_shot_server(500).await;
+        let hook = sample(&url);
+        let event = build_test_event(&hook, "completed", Uuid::new_v4(), "q").unwrap();
+        let outcome = send_test_event(&hook, &event).await.unwrap();
+        assert!(!outcome.success);
+        assert_eq!(outcome.status, 500);
+    }
+
+    #[tokio::test]
+    async fn test_send_test_event_connection_refused_is_an_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let hook = sample(&url);
+        let event = build_test_event(&hook, "completed", Uuid::new_v4(), "q").unwrap();
+        assert!(send_test_event(&hook, &event).await.is_err());
+    }
 }

@@ -104,12 +104,15 @@ migration `015_add_job_leases`.
 ### Worker Management Commands
 
 ```bash
-# Worker control and monitoring
-cargo hammerwork worker start [--queue QUEUE] [--workers N]
-cargo hammerwork worker stop [--queue QUEUE]    # Graceful shutdown
-cargo hammerwork worker status [--queue QUEUE]  # Worker pool status
-cargo hammerwork worker restart [--queue QUEUE] # Restart workers
+# Running jobs and the worker leases (heartbeats) behind them, per queue
+cargo hammerwork worker status [--queue QUEUE] [--jobs]
 ```
+
+Hammerwork has no worker registry: workers live inside your applications, so the CLI
+cannot list, start or stop them. `worker status` reports what the database records: the
+`Running` jobs of each queue with their lease (`last_heartbeat_at` / `lease_expires_at`)
+and flags expired leases, which mean a worker stopped heartbeating. Reclaim those jobs
+with `job requeue-stale`. Needs migration `015_add_job_leases`.
 
 ### Queue Management Commands
 
@@ -129,8 +132,25 @@ cargo hammerwork queue resume --queue QUEUE     # Resume processing
 cargo hammerwork monitor dashboard              # Live dashboard
 cargo hammerwork monitor health [--format json] # System health check
 cargo hammerwork monitor metrics [--period 1h]  # Performance metrics
-cargo hammerwork monitor logs [--tail]          # Log streaming
 ```
+
+### Webhook Commands
+
+```bash
+cargo hammerwork webhook add --name ci --url https://example.com/hook [--auth-token T] [--secret S]
+cargo hammerwork webhook list [--detailed]
+cargo hammerwork webhook update|toggle|remove ...
+cargo hammerwork webhook test --webhook ci [--event-type failed]   # Sends a real request
+```
+
+Webhooks are stored as JSON in `webhooks.json` next to `config.toml` (override with
+`HAMMERWORK_WEBHOOKS_FILE`; written owner-only because it can hold tokens and secrets).
+`webhook test` sends one sample event to the URL with the configured method, headers,
+authentication and `X-Hammerwork-Signature` HMAC, prints the response, and exits non-zero
+if the endpoint is unreachable or answers with an error status. The file is a registry
+for the CLI only: delivery from your application is configured in code with
+`WebhookManager`. There is no `webhook stats` (delivery statistics only exist in the
+memory of the process running the manager) and no `streaming` command.
 
 ### Batch Operation Commands
 

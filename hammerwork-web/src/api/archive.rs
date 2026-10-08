@@ -537,25 +537,9 @@ where
                 }
             }
 
-            // Generate some mock recent operations (in a real implementation, these would be tracked)
-            let recent_operations = vec![
-                RecentOperation {
-                    operation_type: "archive".to_string(),
-                    jobs_affected: stats.jobs_archived,
-                    executed_at: chrono::Utc::now() - chrono::Duration::hours(2),
-                    executed_by: Some("system".to_string()),
-                    reason: Some("Automated archival".to_string()),
-                    queue_name: filters.queue.clone(),
-                },
-                RecentOperation {
-                    operation_type: "purge".to_string(),
-                    jobs_affected: stats.jobs_purged,
-                    executed_at: chrono::Utc::now() - chrono::Duration::hours(4),
-                    executed_by: Some("system".to_string()),
-                    reason: Some("Automated purge".to_string()),
-                    queue_name: filters.queue.clone(),
-                },
-            ];
+            // Archive/purge operations are not recorded anywhere, so there is no history to
+            // report; an empty list is the truth.
+            let recent_operations: Vec<RecentOperation> = Vec::new();
 
             let response = StatsResponse {
                 stats,

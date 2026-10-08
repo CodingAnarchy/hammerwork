@@ -95,20 +95,20 @@
 //! use hammerwork_web::api::stats::PerformanceMetrics;
 //!
 //! let metrics = PerformanceMetrics {
-//!     database_response_time_ms: 5.2,
+//!     database_response_time_ms: Some(5.2),
 //!     average_queue_depth: 15.5,
 //!     jobs_per_second: 8.3,
 //!     memory_usage_mb: Some(512.0),
 //!     cpu_usage_percent: Some(45.2),
-//!     active_workers: 12,
-//!     worker_utilization: 0.75,
+//!     active_workers: None, // not tracked: there is no worker registry
+//!     worker_utilization: None,
 //! };
 //!
-//! assert_eq!(metrics.database_response_time_ms, 5.2);
-//! assert_eq!(metrics.active_workers, 12);
-//! assert_eq!(metrics.worker_utilization, 0.75);
+//! assert_eq!(metrics.database_response_time_ms, Some(5.2));
+//! assert_eq!(metrics.active_workers, None);
 //! ```
 
+use super::history::{ErrorGroup, JobHistory, MAX_BUCKETS, hour_floor};
 use super::{ApiResponse, error_reply, json_reply};
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
@@ -191,7 +191,8 @@ pub struct HourlyTrend {
     pub completed: u64,
     pub failed: u64,
     pub throughput: f64,
-    pub avg_processing_time_ms: f64,
+    /// Mean run time of jobs completed in the hour; `null` when none completed.
+    pub avg_processing_time_ms: Option<f64>,
     pub error_rate: f64,
 }
 
@@ -210,13 +211,16 @@ pub struct ErrorPattern {
 /// Performance metrics
 #[derive(Debug, Serialize)]
 pub struct PerformanceMetrics {
-    pub database_response_time_ms: f64,
+    /// Measured time to fetch the queue statistics for this response.
+    pub database_response_time_ms: Option<f64>,
     pub average_queue_depth: f64,
     pub jobs_per_second: f64,
     pub memory_usage_mb: Option<f64>,
     pub cpu_usage_percent: Option<f64>,
-    pub active_workers: u32,
-    pub worker_utilization: f64,
+    /// Always `null`: Hammerwork has no worker registry, so worker counts are unknown.
+    pub active_workers: Option<u32>,
+    /// Always `null`, see `active_workers`.
+    pub worker_utilization: Option<f64>,
 }
 
 /// Time range for statistics queries
@@ -240,7 +244,7 @@ pub fn routes<T>(
     system_state: Arc<tokio::sync::RwLock<crate::api::system::SystemState>>,
 ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
 where
-    T: DatabaseQueue + Send + Sync + 'static,
+    T: JobHistory + 'static,
 {
     let queue_filter = warp::any().map(move || queue.clone());
     let state_filter = warp::any().map(move || system_state.clone());
@@ -258,6 +262,7 @@ where
         .and(warp::path::end())
         .and(warp::get())
         .and(queue_filter.clone())
+        .and(state_filter.clone())
         .and(warp::query::<StatsQuery>())
         .and_then(detailed_stats_handler);
 
@@ -356,17 +361,22 @@ where
 /// Handler for detailed statistics
 async fn detailed_stats_handler<T>(
     queue: Arc<T>,
+    system_state: Arc<tokio::sync::RwLock<crate::api::system::SystemState>>,
     query: StatsQuery,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
-    // For now, return basic stats. In a real implementation, this would
-    // use the time_range and other query parameters to fetch historical data
-    let _ = query;
+    let now = chrono::Utc::now();
+    let (start, end) = match resolve_range(&query, now) {
+        Ok(range) => range,
+        Err(message) => return Ok(error_reply(StatusCode::BAD_REQUEST, message)),
+    };
 
+    let db_started = std::time::Instant::now();
     match queue.get_all_queue_stats().await {
         Ok(all_stats) => {
+            let db_ms = db_started.elapsed().as_secs_f64() * 1000.0;
             // Convert hammerwork stats to our API format
             let mut queue_stats: Vec<QueueStats> = Vec::new();
             for stats in all_stats.iter() {
@@ -397,19 +407,18 @@ where
                 });
             }
 
-            // Generate realistic data based on actual statistics
             let hourly_trends = try_api!(
-                generate_hourly_trends(&queue, &all_stats).await,
+                compute_trends(&*queue, start, end).await,
                 "Failed to compute hourly trends"
             );
             let error_patterns = try_api!(
-                generate_error_patterns(&queue, &all_stats).await,
+                generate_error_patterns(&*queue, start).await,
                 "Failed to compute error patterns"
             );
-            let performance_metrics = calculate_performance_metrics(&all_stats);
+            let performance_metrics = calculate_performance_metrics(&all_stats, db_ms);
 
-            // Generate overview from the stats
-            let overview = generate_overview_from_stats(&all_stats);
+            let uptime_seconds = system_state.read().await.uptime_seconds().max(0) as u64;
+            let overview = generate_overview_from_stats(&all_stats, uptime_seconds);
 
             let detailed = DetailedStats {
                 overview,
@@ -428,26 +437,39 @@ where
     }
 }
 
-/// Handler for trend analysis
+/// The `[start, end)` window of a stats request: `time_range` when given (validated),
+/// otherwise the last 24 hours (23 whole hours plus the current one).
+fn resolve_range(
+    query: &StatsQuery,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), String> {
+    match &query.time_range {
+        Some(range) => {
+            if range.start >= range.end {
+                Err("time_range.start must be before time_range.end".to_string())
+            } else if range.end - range.start > chrono::Duration::hours(MAX_BUCKETS) {
+                Err(format!("time_range may span at most {} hours", MAX_BUCKETS))
+            } else {
+                Ok((range.start, range.end))
+            }
+        }
+        None => Ok((hour_floor(now) - chrono::Duration::hours(23), now)),
+    }
+}
+
+/// Handler for trend analysis: hourly completed/failed counts from the database.
 async fn trends_handler<T>(queue: Arc<T>, query: StatsQuery) -> Result<impl Reply, warp::Rejection>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
-    // For now, return mock trend data
-    // In a real implementation, this would query historical data based on the time range
-    let _ = (queue, query);
-
-    let trends: Vec<HourlyTrend> = (0..24)
-        .map(|hour| HourlyTrend {
-            hour: chrono::Utc::now() - chrono::Duration::hours(23 - hour),
-            completed: (hour * 10 + 50) as u64,
-            failed: (hour / 4) as u64,
-            throughput: 5.0 + (hour as f64 * 0.5),
-            avg_processing_time_ms: 100.0 + (hour as f64 * 2.0),
-            error_rate: 0.01 + (hour as f64 * 0.001),
-        })
-        .collect();
-
+    let (start, end) = match resolve_range(&query, chrono::Utc::now()) {
+        Ok(range) => range,
+        Err(message) => return Ok(error_reply(StatusCode::BAD_REQUEST, message)),
+    };
+    let trends = try_api!(
+        compute_trends(&*queue, start, end).await,
+        "Failed to compute hourly trends"
+    );
     Ok(json_reply(&ApiResponse::success(trends)))
 }
 
@@ -555,7 +577,10 @@ fn assess_system_health(stats: &[hammerwork::stats::QueueStats]) -> SystemHealth
 }
 
 /// Generate system overview from queue statistics
-fn generate_overview_from_stats(stats: &[hammerwork::stats::QueueStats]) -> SystemOverview {
+fn generate_overview_from_stats(
+    stats: &[hammerwork::stats::QueueStats],
+    uptime_seconds: u64,
+) -> SystemOverview {
     let mut total_pending = 0;
     let mut total_running = 0;
     let mut total_completed = 0;
@@ -602,7 +627,7 @@ fn generate_overview_from_stats(stats: &[hammerwork::stats::QueueStats]) -> Syst
         overall_error_rate,
         avg_processing_time_ms: avg_processing_time,
         system_health: health,
-        uptime_seconds: 0,
+        uptime_seconds,
         last_updated: chrono::Utc::now(),
     }
 }
@@ -659,181 +684,119 @@ where
         .collect())
 }
 
-/// Generate hourly trends from queue statistics
-async fn generate_hourly_trends<T>(
-    queue: &Arc<T>,
-    all_stats: &[hammerwork::stats::QueueStats],
+/// Hourly trends for `[start, end)` computed from the database (zero-filled).
+async fn compute_trends<T>(
+    queue: &T,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
 ) -> hammerwork::Result<Vec<HourlyTrend>>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
-    let now = chrono::Utc::now();
-    let mut trends = Vec::new();
+    let buckets = queue.hourly_activity(None, start, end).await?;
+    Ok(buckets.into_iter().map(trend_from_bucket).collect())
+}
 
-    // Generate trends for the last 24 hours using actual database queries
-    for i in 0..24 {
-        let hour_start = now - chrono::Duration::hours(23 - i);
-        let hour_end = hour_start + chrono::Duration::hours(1);
-
-        let mut hour_processing_times = Vec::new();
-
-        // Get completed jobs for this specific hour across all queues
-        let completed_jobs = queue
-            .get_jobs_completed_in_range(None, hour_start, hour_end, Some(1000))
-            .await?;
-        let hour_completed = completed_jobs.len() as u64;
-
-        // Collect processing times for completed jobs
-        for job in completed_jobs {
-            if let (Some(started_at), Some(completed_at)) = (job.started_at, job.completed_at) {
-                let processing_time = (completed_at - started_at).num_milliseconds() as f64;
-                hour_processing_times.push(processing_time);
-            }
-        }
-
-        // Get failed jobs for this hour using error frequencies
-        // Since we don't have a direct method for failed jobs in time range,
-        // we'll estimate based on error frequencies for this hour
-        let error_frequencies = queue.get_error_frequencies(None, hour_start).await?;
-        let hour_failed = {
-            // This gives us errors since hour_start, so we need to estimate for just this hour
-            let total_errors_since_start = error_frequencies.values().sum::<u64>();
-
-            // For recent hours, use a more accurate estimate
-            if i < 3 {
-                // For the last 3 hours, assume more recent distribution
-                total_errors_since_start / ((i + 1) as u64).max(1)
-            } else {
-                // For older hours, use a smaller fraction
-                total_errors_since_start / 24 // Rough hourly average
-            }
-        };
-
-        // Calculate throughput (jobs per second for this hour)
-        let hour_throughput = (hour_completed + hour_failed) as f64 / 3600.0;
-
-        // Calculate average processing time for this hour
-        let avg_processing_time_ms = if !hour_processing_times.is_empty() {
-            hour_processing_times.iter().sum::<f64>() / hour_processing_times.len() as f64
-        } else {
-            // If no processing times available, use overall average from stats
-            if !all_stats.is_empty() {
-                all_stats
-                    .iter()
-                    .map(|s| s.statistics.avg_processing_time_ms)
-                    .sum::<f64>()
-                    / all_stats.len() as f64
-            } else {
-                0.0
-            }
-        };
-
-        let error_rate = if (hour_completed + hour_failed) > 0 {
-            hour_failed as f64 / (hour_completed + hour_failed) as f64
+fn trend_from_bucket(bucket: super::history::HourBucket) -> HourlyTrend {
+    let total = bucket.completed + bucket.failed;
+    HourlyTrend {
+        hour: bucket.hour,
+        completed: bucket.completed,
+        failed: bucket.failed,
+        throughput: total as f64 / 3600.0,
+        avg_processing_time_ms: bucket.avg_processing_time_ms,
+        error_rate: if total > 0 {
+            bucket.failed as f64 / total as f64
         } else {
             0.0
-        };
-
-        trends.push(HourlyTrend {
-            hour: hour_start,
-            completed: hour_completed,
-            failed: hour_failed,
-            throughput: hour_throughput,
-            avg_processing_time_ms,
-            error_rate,
-        });
+        },
     }
-
-    Ok(trends)
 }
 
-/// Generate error patterns from queue statistics
+/// Error patterns of failures since `since`, grouped by error type.
+///
+/// Built from the 500 most frequent distinct error messages, so counts and percentages
+/// are exact unless the failure set has more distinct messages than that.
 async fn generate_error_patterns<T>(
-    queue: &Arc<T>,
-    all_stats: &[hammerwork::stats::QueueStats],
+    queue: &T,
+    since: chrono::DateTime<chrono::Utc>,
 ) -> hammerwork::Result<Vec<ErrorPattern>>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
-    let mut error_patterns = Vec::new();
-    let total_errors = all_stats.iter().map(|s| s.dead_count).sum::<u64>();
-
-    if total_errors == 0 {
-        return Ok(error_patterns);
-    }
-
-    // Collect error messages from dead jobs across all queues
-    let mut error_messages = Vec::new();
-    for stats in all_stats {
-        let dead_jobs = queue
-            .get_dead_jobs_by_queue(&stats.queue_name, Some(20), Some(0))
-            .await?;
-        for job in dead_jobs {
-            if let Some(error_msg) = job.error_message {
-                error_messages.push((error_msg, job.failed_at.unwrap_or(job.created_at)));
-            }
-        }
-    }
-
-    // Group similar error messages
-    let mut error_counts = std::collections::HashMap::new();
-    let mut error_first_seen = std::collections::HashMap::new();
-
-    for (error_msg, failed_at) in error_messages {
-        let error_type = extract_error_type(&error_msg);
-        let count = error_counts.entry(error_type.clone()).or_insert(0);
-        *count += 1;
-
-        error_first_seen
-            .entry(error_type.clone())
-            .or_insert_with(|| (error_msg, failed_at));
-    }
-
-    // Convert to error patterns
-    for (error_type, count) in error_counts {
-        let percentage = (count as f64 / total_errors as f64) * 100.0;
-        let Some((sample_message, first_seen)) = error_first_seen.get(&error_type) else {
-            continue;
-        };
-
-        error_patterns.push(ErrorPattern {
-            error_type: error_type.clone(),
-            count,
-            percentage,
-            sample_message: sample_message.clone(),
-            first_seen: *first_seen,
-            last_seen: chrono::Utc::now(), // In a real implementation, track actual last seen
-            affected_queues: vec![error_type], // In a real implementation, track actual affected queues
-        });
-    }
-
-    // Sort by count descending
-    error_patterns.sort_by_key(|p| std::cmp::Reverse(p.count));
-
-    Ok(error_patterns)
+    Ok(group_error_patterns(queue.error_groups(since, 500).await?))
 }
 
-/// Calculate performance metrics from queue statistics
+/// Folds per-(queue, message) groups into one pattern per error type with real
+/// first/last-seen times and the set of affected queues.
+fn group_error_patterns(groups: Vec<ErrorGroup>) -> Vec<ErrorPattern> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    struct Agg {
+        count: u64,
+        sample: (u64, String),
+        first_seen: chrono::DateTime<chrono::Utc>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+        queues: BTreeSet<String>,
+    }
+
+    let total: u64 = groups.iter().map(|g| g.count).sum();
+    let mut by_type: BTreeMap<String, Agg> = BTreeMap::new();
+    for group in groups {
+        let error_type = extract_error_type(&group.message);
+        let agg = by_type.entry(error_type).or_insert_with(|| Agg {
+            count: 0,
+            sample: (0, group.message.clone()),
+            first_seen: group.first_seen,
+            last_seen: group.last_seen,
+            queues: BTreeSet::new(),
+        });
+        agg.count += group.count;
+        if group.count > agg.sample.0 {
+            agg.sample = (group.count, group.message.clone());
+        }
+        agg.first_seen = agg.first_seen.min(group.first_seen);
+        agg.last_seen = agg.last_seen.max(group.last_seen);
+        agg.queues.insert(group.queue_name);
+    }
+
+    let mut patterns: Vec<ErrorPattern> = by_type
+        .into_iter()
+        .map(|(error_type, agg)| ErrorPattern {
+            error_type,
+            count: agg.count,
+            percentage: if total > 0 {
+                agg.count as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
+            sample_message: agg.sample.1,
+            first_seen: agg.first_seen,
+            last_seen: agg.last_seen,
+            affected_queues: agg.queues.into_iter().collect(),
+        })
+        .collect();
+    patterns.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.error_type.cmp(&b.error_type))
+    });
+    patterns
+}
+
+/// Calculate performance metrics from queue statistics.
+///
+/// `database_response_time_ms` is the measured time of the statistics query. Worker
+/// counts and utilization are `None`: running jobs are not workers, and there is no
+/// worker registry to count them from.
 fn calculate_performance_metrics(
     all_stats: &[hammerwork::stats::QueueStats],
+    database_response_time_ms: f64,
 ) -> PerformanceMetrics {
-    let total_jobs = all_stats
-        .iter()
-        .map(|s| s.pending_count + s.running_count + s.completed_count + s.dead_count)
-        .sum::<u64>();
     let total_throughput = all_stats
         .iter()
         .map(|s| s.statistics.throughput_per_minute)
         .sum::<f64>();
-    let avg_processing_time = if !all_stats.is_empty() {
-        all_stats
-            .iter()
-            .map(|s| s.statistics.avg_processing_time_ms)
-            .sum::<f64>()
-            / all_stats.len() as f64
-    } else {
-        0.0
-    };
 
     let average_queue_depth = if !all_stats.is_empty() {
         all_stats
@@ -845,25 +808,14 @@ fn calculate_performance_metrics(
         0.0
     };
 
-    // Estimate database response time based on processing time
-    let database_response_time_ms = if avg_processing_time > 0.0 {
-        (avg_processing_time * 0.1).clamp(1.0, 100.0) // Assume DB is 10% of processing time
-    } else {
-        2.0
-    };
-
     PerformanceMetrics {
-        database_response_time_ms,
+        database_response_time_ms: Some(database_response_time_ms),
         average_queue_depth,
         jobs_per_second: total_throughput / 60.0, // Convert from per minute to per second
-        memory_usage_mb: None,                    // Would need system monitoring
-        cpu_usage_percent: None,                  // Would need system monitoring
-        active_workers: all_stats.iter().map(|s| s.running_count as u32).sum(),
-        worker_utilization: if total_jobs > 0 {
-            all_stats.iter().map(|s| s.running_count).sum::<u64>() as f64 / total_jobs as f64
-        } else {
-            0.0
-        },
+        memory_usage_mb: None,
+        cpu_usage_percent: None,
+        active_workers: None,
+        worker_utilization: None,
     }
 }
 
@@ -901,16 +853,130 @@ mod tests {
     use super::*;
     use crate::api::test_support::{body_json, unreachable_queue};
 
+    fn state() -> Arc<tokio::sync::RwLock<crate::api::system::SystemState>> {
+        Arc::new(tokio::sync::RwLock::new(
+            crate::api::system::SystemState::new(
+                crate::DashboardConfig::default(),
+                "PostgreSQL".to_string(),
+                1,
+            ),
+        ))
+    }
+
+    fn empty_query() -> StatsQuery {
+        serde_json::from_value(serde_json::json!({})).unwrap()
+    }
+
     #[tokio::test]
     async fn test_detailed_stats_returns_500_when_database_is_down() {
-        let query: StatsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
-        let response = detailed_stats_handler(unreachable_queue(), query)
+        let response = detailed_stats_handler(unreachable_queue(), state(), empty_query())
             .await
             .unwrap()
             .into_response();
         let (status, body) = body_json(response).await;
         assert_eq!(status, 500);
         assert_eq!(body["success"], false);
+    }
+
+    #[tokio::test]
+    async fn test_trends_returns_500_when_database_is_down() {
+        let response = trends_handler(unreachable_queue(), empty_query())
+            .await
+            .unwrap()
+            .into_response();
+        let (status, body) = body_json(response).await;
+        assert_eq!(status, 500);
+        assert_eq!(body["success"], false);
+    }
+
+    #[tokio::test]
+    async fn test_trends_rejects_invalid_time_range() {
+        let inverted: StatsQuery = serde_json::from_value(serde_json::json!({
+            "time_range": {"start": "2024-01-02T00:00:00Z", "end": "2024-01-01T00:00:00Z"}
+        }))
+        .unwrap();
+        let response = trends_handler(unreachable_queue(), inverted)
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(body_json(response).await.0, 400);
+
+        let too_long: StatsQuery = serde_json::from_value(serde_json::json!({
+            "time_range": {"start": "2020-01-01T00:00:00Z", "end": "2024-01-01T00:00:00Z"}
+        }))
+        .unwrap();
+        let response = trends_handler(unreachable_queue(), too_long)
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(body_json(response).await.0, 400);
+    }
+
+    #[test]
+    fn test_default_range_is_24_hourly_buckets() {
+        let now = chrono::Utc::now();
+        let (start, end) = resolve_range(&empty_query(), now).unwrap();
+        assert_eq!(end, now);
+        assert_eq!(crate::api::history::hour_range(start, end).len(), 24);
+    }
+
+    #[test]
+    fn test_trend_from_bucket_computes_rates_without_inventing_values() {
+        let hour = hour_floor(chrono::Utc::now());
+        let busy = trend_from_bucket(crate::api::history::HourBucket {
+            hour,
+            completed: 3,
+            failed: 1,
+            avg_processing_time_ms: Some(40.0),
+        });
+        assert_eq!(busy.error_rate, 0.25);
+        assert_eq!(busy.throughput, 4.0 / 3600.0);
+        let idle = trend_from_bucket(crate::api::history::HourBucket {
+            hour,
+            completed: 0,
+            failed: 0,
+            avg_processing_time_ms: None,
+        });
+        assert_eq!(idle.error_rate, 0.0);
+        assert_eq!(idle.avg_processing_time_ms, None);
+    }
+
+    #[test]
+    fn test_group_error_patterns_uses_real_times_and_queues() {
+        let now = chrono::Utc::now();
+        let t = |h| now - chrono::Duration::hours(h);
+        let group = |queue: &str, msg: &str, count, first, last| ErrorGroup {
+            queue_name: queue.to_string(),
+            message: msg.to_string(),
+            count,
+            first_seen: t(first),
+            last_seen: t(last),
+        };
+        let patterns = group_error_patterns(vec![
+            group("emails", "connection refused by host a", 6, 10, 2),
+            group("reports", "connection reset", 2, 8, 1),
+            group("emails", "request timeout", 2, 5, 3),
+        ]);
+        assert_eq!(patterns.len(), 2);
+        let conn = &patterns[0];
+        assert_eq!(conn.error_type, "Connection Error");
+        assert_eq!(conn.count, 8);
+        assert_eq!(conn.percentage, 80.0);
+        assert_eq!(conn.sample_message, "connection refused by host a");
+        assert_eq!(conn.affected_queues, vec!["emails", "reports"]);
+        assert_eq!(conn.first_seen, t(10));
+        assert_eq!(conn.last_seen, t(1));
+        assert_eq!(patterns[1].affected_queues, vec!["emails"]);
+        assert!(group_error_patterns(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn test_performance_metrics_report_unknowns_as_none() {
+        let metrics = calculate_performance_metrics(&[], 3.5);
+        assert_eq!(metrics.database_response_time_ms, Some(3.5));
+        assert_eq!(metrics.active_workers, None);
+        assert_eq!(metrics.worker_utilization, None);
+        assert_eq!(metrics.memory_usage_mb, None);
     }
 
     #[test]

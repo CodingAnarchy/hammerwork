@@ -108,12 +108,6 @@ enum Commands {
         #[command(subcommand)]
         command: WebhookCommand,
     },
-
-    #[command(about = "Event streaming management (Kafka, Kinesis, PubSub)")]
-    Streaming {
-        #[command(subcommand)]
-        command: StreamingCommand,
-    },
 }
 
 #[tokio::main]
@@ -223,9 +217,6 @@ async fn execute_command(command: &Commands, config: &mut Config) -> Result<()> 
         }
         Commands::Webhook { command } => {
             handle_webhook_command(command.clone(), config).await?;
-        }
-        Commands::Streaming { command } => {
-            handle_streaming_command(command.clone(), config).await?;
         }
     }
 

@@ -693,12 +693,14 @@ class HammerworkDashboard {
 
     // Queue actions
     async clearQueue(queueName) {
-        if (!confirm(`Clear all jobs from queue "${queueName}"?`)) {
+        if (!confirm(`Delete all completed jobs from queue "${queueName}"?`)) {
             return;
         }
         
         try {
-            const response = await this.apiCall(`/api/queues/${encodeURIComponent(queueName)}/clear`, 'POST');
+            const response = await this.apiCall(`/api/queues/${encodeURIComponent(queueName)}/actions`, 'POST', {
+                action: 'clear_completed'
+            });
             if (response.success) {
                 this.showSuccess('Queue cleared successfully');
                 this.loadQueues();
