@@ -1620,9 +1620,12 @@ impl KafkaProcessor {
         // Set basic configuration
         client_config.set("bootstrap.servers", brokers.join(","));
 
-        // Apply custom configuration
+        // Apply custom configuration. `health.check.timeout.ms` is read by
+        // `health_check` and is not a librdkafka property, so it is not passed on.
         for (key, value) in &config {
-            client_config.set(key, value);
+            if key != "health.check.timeout.ms" {
+                client_config.set(key, value);
+            }
         }
 
         // Set defaults if not provided
