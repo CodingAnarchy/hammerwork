@@ -457,6 +457,18 @@ impl Default for WebhookManagerConfig {
     }
 }
 
+impl From<&crate::config::WebhookGlobalSettings> for WebhookManagerConfig {
+    fn from(settings: &crate::config::WebhookGlobalSettings) -> Self {
+        Self {
+            max_concurrent_deliveries: settings.max_concurrent_deliveries,
+            max_response_body_size: settings.max_response_body_size,
+            log_deliveries: settings.log_deliveries,
+            user_agent: settings.user_agent.clone(),
+            ..Self::default()
+        }
+    }
+}
+
 impl WebhookManager {
     /// Create a new webhook manager
     pub fn new(event_manager: Arc<EventManager>, config: WebhookManagerConfig) -> Self {
@@ -479,6 +491,19 @@ impl WebhookManager {
     /// Create a new webhook manager with default configuration
     pub fn new_default(event_manager: Arc<EventManager>) -> Self {
         Self::new(event_manager, WebhookManagerConfig::default())
+    }
+
+    /// Create a webhook manager from the `webhooks` section of a
+    /// [`HammerworkConfig`](crate::HammerworkConfig), registering every configured webhook.
+    pub async fn from_config(
+        event_manager: Arc<EventManager>,
+        config: &crate::config::WebhookConfigs,
+    ) -> crate::Result<Self> {
+        let manager = Self::new(event_manager, (&config.global_settings).into());
+        for webhook in &config.webhooks {
+            manager.add_webhook(webhook.clone()).await?;
+        }
+        Ok(manager)
     }
 
     /// Add a new webhook configuration
@@ -1142,6 +1167,26 @@ pub fn verify_hmac_signature(secret: &str, payload: &[u8], signature: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_webhook_manager_from_config() {
+        let mut config = crate::config::WebhookConfigs::default();
+        config.global_settings.max_concurrent_deliveries = 7;
+        config.global_settings.user_agent = "custom-agent".to_string();
+        config.webhooks.push(WebhookConfig::new(
+            "hook".to_string(),
+            "https://example.com/webhook".to_string(),
+        ));
+
+        let manager_config = WebhookManagerConfig::from(&config.global_settings);
+        assert_eq!(manager_config.max_concurrent_deliveries, 7);
+        assert_eq!(manager_config.user_agent, "custom-agent");
+
+        let manager = WebhookManager::from_config(Arc::new(EventManager::new_default()), &config)
+            .await
+            .unwrap();
+        assert_eq!(manager.list_webhooks().await.len(), 1);
+    }
 
     #[test]
     fn test_webhook_config_creation() {

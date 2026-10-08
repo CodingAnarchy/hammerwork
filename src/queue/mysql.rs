@@ -98,9 +98,10 @@ impl JobRow {
                     "Retrying" => JobStatus::Retrying,
                     "Archived" => JobStatus::Archived,
                     _ => {
-                        return Err(crate::error::HammerworkError::Processing(
-                            format!("Unknown job status: {}", cleaned_str),
-                        ));
+                        return Err(crate::error::HammerworkError::Processing(format!(
+                            "Unknown job status: {}",
+                            cleaned_str
+                        )));
                     }
                 }
             },
@@ -801,7 +802,6 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn enqueue_batch(&self, batch: crate::batch::JobBatch) -> Result<crate::batch::BatchId> {
-
         // Validate the batch first
         batch.validate()?;
 
