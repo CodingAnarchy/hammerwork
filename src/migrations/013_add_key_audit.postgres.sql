@@ -19,18 +19,18 @@ CREATE TABLE IF NOT EXISTS hammerwork_key_audit_log (
 );
 
 -- Create indexes for efficient audit log queries
-CREATE INDEX idx_hammerwork_key_audit_log_key_id
+CREATE INDEX IF NOT EXISTS idx_hammerwork_key_audit_log_key_id
     ON hammerwork_key_audit_log (key_id);
 
-CREATE INDEX idx_hammerwork_key_audit_log_timestamp
+CREATE INDEX IF NOT EXISTS idx_hammerwork_key_audit_log_timestamp
     ON hammerwork_key_audit_log (timestamp);
 
-CREATE INDEX idx_hammerwork_key_audit_log_operation
+CREATE INDEX IF NOT EXISTS idx_hammerwork_key_audit_log_operation
     ON hammerwork_key_audit_log (operation);
 
-CREATE INDEX idx_hammerwork_key_audit_log_success
+CREATE INDEX IF NOT EXISTS idx_hammerwork_key_audit_log_success
     ON hammerwork_key_audit_log (success);
 
 -- Create composite index for common queries
-CREATE INDEX idx_hammerwork_key_audit_log_key_time
+CREATE INDEX IF NOT EXISTS idx_hammerwork_key_audit_log_key_time
     ON hammerwork_key_audit_log (key_id, timestamp);
