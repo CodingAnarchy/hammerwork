@@ -292,7 +292,21 @@ impl HammerworkConfig {
     pub fn from_file(path: &str) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
+        config.validate_delivery_targets()?;
         Ok(config)
+    }
+
+    /// Reject alert and webhook settings that could never deliver anything (an email
+    /// alert target without SMTP settings, an invalid webhook payload template), so
+    /// they fail when the file is loaded instead of when the first alert or event fires.
+    fn validate_delivery_targets(&self) -> crate::Result<()> {
+        #[cfg(feature = "alerting")]
+        self.alerting.validate()?;
+        #[cfg(feature = "webhooks")]
+        for webhook in &self.webhooks.webhooks {
+            webhook.validate()?;
+        }
+        Ok(())
     }
 
     /// Save configuration to a TOML file
@@ -1548,6 +1562,47 @@ service_name = "hammerwork"
         config.save_to_file(path.to_str().unwrap()).unwrap();
         let loaded = HammerworkConfig::from_file(path.to_str().unwrap()).unwrap();
         assert_eq!(loaded.encryption, section);
+    }
+
+    #[cfg(all(feature = "alerting", feature = "webhooks"))]
+    #[test]
+    fn test_from_file_rejects_targets_that_cannot_deliver() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hammerwork.toml");
+        let path = path.to_str().unwrap();
+
+        // An email alert target without SMTP settings.
+        let mut config = HammerworkConfig::default();
+        config
+            .alerting
+            .targets
+            .push(crate::alerting::AlertTarget::Email {
+                recipient: "oncall@example.com".to_string(),
+                smtp: None,
+            });
+        config.save_to_file(path).unwrap();
+        let err = HammerworkConfig::from_file(path).unwrap_err();
+        assert!(err.to_string().contains("no SMTP settings"), "{err}");
+
+        // With SMTP settings it loads.
+        config.alerting.targets = vec![crate::alerting::AlertTarget::Email {
+            recipient: "oncall@example.com".to_string(),
+            smtp: Some(crate::alerting::SmtpConfig::new(
+                "smtp.example.com",
+                "alerts@example.com",
+            )),
+        }];
+        config.save_to_file(path).unwrap();
+        HammerworkConfig::from_file(path).unwrap();
+
+        // A webhook with an invalid payload template.
+        config.webhooks.webhooks.push(
+            crate::webhooks::WebhookConfig::new("hook".into(), "https://example.com".into())
+                .with_payload_template(r#"{"x": "{{event.missing}}"}"#),
+        );
+        config.save_to_file(path).unwrap();
+        let err = HammerworkConfig::from_file(path).unwrap_err();
+        assert!(err.to_string().contains("unknown placeholder"), "{err}");
     }
 
     #[test]

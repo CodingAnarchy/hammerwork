@@ -88,10 +88,24 @@ impl AlertingConfig {
         self
     }
 
-    /// Add an email alert target
+    /// Add an email alert target without SMTP settings.
+    ///
+    /// Such a target cannot send anything: [`validate`](Self::validate) and
+    /// [`AlertManager::try_new`] reject it. Use [`email_via_smtp`](Self::email_via_smtp).
+    #[deprecated(note = "email targets need SMTP settings; use `email_via_smtp`")]
     pub fn email(mut self, recipient: &str) -> Self {
         self.targets.push(AlertTarget::Email {
             recipient: recipient.to_string(),
+            smtp: None,
+        });
+        self
+    }
+
+    /// Add an email alert target delivered through the SMTP server in `smtp`.
+    pub fn email_via_smtp(mut self, recipient: &str, smtp: SmtpConfig) -> Self {
+        self.targets.push(AlertTarget::Email {
+            recipient: recipient.to_string(),
+            smtp: Some(smtp),
         });
         self
     }
@@ -122,6 +136,202 @@ impl AlertingConfig {
         self.custom_thresholds.insert(name, threshold);
         self
     }
+
+    /// Check the alert targets without contacting them.
+    ///
+    /// Fails with a configuration error for an email target without SMTP settings,
+    /// with invalid SMTP settings, or with an invalid recipient address.
+    pub fn validate(&self) -> Result<()> {
+        for target in &self.targets {
+            if let AlertTarget::Email { recipient, smtp } = target {
+                parse_mailbox(recipient).map_err(|e| {
+                    HammerworkError::Config(format!(
+                        "email alert target: invalid recipient address {e}"
+                    ))
+                })?;
+                let Some(smtp) = smtp else {
+                    return Err(HammerworkError::Config(format!(
+                        "email alert target '{recipient}' has no SMTP settings \
+                         (set `smtp`, or use AlertingConfig::email_via_smtp)"
+                    )));
+                };
+                smtp.validate().map_err(|e| {
+                    HammerworkError::Config(format!("email alert target '{recipient}': {e}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where a secret such as an SMTP password comes from.
+///
+/// Prefer [`Environment`](Self::Environment) so the secret stays out of configuration
+/// files. The value is read each time it is needed, so rotating the variable takes
+/// effect on the next alert.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SecretSource {
+    /// The secret itself. Only for development and tests.
+    Static(String),
+    /// The name of an environment variable holding the secret.
+    Environment(String),
+}
+
+impl SecretSource {
+    /// Resolve the secret.
+    pub fn resolve(&self) -> Result<String> {
+        match self {
+            SecretSource::Static(value) => Ok(value.clone()),
+            SecretSource::Environment(name) => {
+                std::env::var(name).map_err(|e| HammerworkError::Alerting {
+                    message: format!("cannot read SMTP password from ${name}: {e}"),
+                })
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for SecretSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretSource::Static(_) => f.write_str("Static(<redacted>)"),
+            SecretSource::Environment(name) => f.debug_tuple("Environment").field(name).finish(),
+        }
+    }
+}
+
+/// How the connection to the SMTP server is secured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpTls {
+    /// Connect in plain text and upgrade with STARTTLS. Sending fails if the server
+    /// does not offer STARTTLS; it never falls back to plain text. Default port 587.
+    #[default]
+    StartTls,
+    /// TLS from the start of the connection (SMTPS). Default port 465.
+    Implicit,
+    /// No encryption at all. Only for a relay on localhost or a trusted network.
+    /// Default port 25.
+    None,
+}
+
+fn default_smtp_timeout_secs() -> u64 {
+    30
+}
+
+/// SMTP server settings for an email alert target.
+///
+/// # Examples
+///
+/// ```rust
+/// use hammerwork::alerting::{AlertingConfig, SecretSource, SmtpConfig, SmtpTls};
+///
+/// let smtp = SmtpConfig::new("smtp.example.com", "Hammerwork <alerts@example.com>")
+///     .with_credentials("alerts@example.com", SecretSource::Environment("SMTP_PASSWORD".into()))
+///     .with_tls(SmtpTls::StartTls);
+///
+/// let config = AlertingConfig::new()
+///     .alert_on_queue_depth(10_000)
+///     .email_via_smtp("oncall@example.com", smtp);
+/// config.validate().unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmtpConfig {
+    /// SMTP server host name.
+    pub host: String,
+    /// Server port. Defaults to the usual port for the TLS mode (587, 465 or 25).
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Sender address, e.g. `alerts@example.com` or `Hammerwork <alerts@example.com>`.
+    pub from: String,
+    /// User name for SMTP authentication. Requires `password`.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Password for SMTP authentication. Requires `username`.
+    #[serde(default)]
+    pub password: Option<SecretSource>,
+    /// Connection security. Defaults to [`SmtpTls::StartTls`].
+    #[serde(default)]
+    pub tls: SmtpTls,
+    /// Timeout for each SMTP command, in seconds. Defaults to 30.
+    #[serde(default = "default_smtp_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl SmtpConfig {
+    /// Settings for `host`, sending as `from`, with STARTTLS and no authentication.
+    pub fn new(host: impl Into<String>, from: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            port: None,
+            from: from.into(),
+            username: None,
+            password: None,
+            tls: SmtpTls::default(),
+            timeout_secs: default_smtp_timeout_secs(),
+        }
+    }
+
+    /// Use a non-default port.
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    /// Authenticate as `username` with the password from `password`.
+    pub fn with_credentials(mut self, username: impl Into<String>, password: SecretSource) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password);
+        self
+    }
+
+    /// Choose how the connection is secured.
+    pub fn with_tls(mut self, tls: SmtpTls) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// Set the per-command timeout.
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Check the settings without connecting to the server.
+    pub fn validate(&self) -> Result<()> {
+        let invalid =
+            |message: String| HammerworkError::Config(format!("SMTP settings: {message}"));
+        if self.host.trim().is_empty() {
+            return Err(invalid("host is empty".to_string()));
+        }
+        parse_mailbox(&self.from).map_err(|e| invalid(format!("invalid from address: {e}")))?;
+        match (&self.username, &self.password) {
+            (Some(_), None) => Err(invalid("username is set without a password".to_string())),
+            (None, Some(_)) => Err(invalid("password is set without a username".to_string())),
+            _ => Ok(()),
+        }
+    }
+
+    /// The port that will be used.
+    pub fn effective_port(&self) -> u16 {
+        self.port.unwrap_or(match self.tls {
+            SmtpTls::StartTls => 587,
+            SmtpTls::Implicit => 465,
+            SmtpTls::None => 25,
+        })
+    }
+}
+
+fn parse_mailbox(address: &str) -> std::result::Result<lettre::message::Mailbox, String> {
+    address.parse().map_err(|e| format!("'{address}': {e}"))
+}
+
+/// Replace control characters (such as line breaks) so a value is safe in a header.
+fn single_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Alert target configuration
@@ -132,8 +342,15 @@ pub enum AlertTarget {
         url: String,
         headers: HashMap<String, String>,
     },
-    /// Email alert target
-    Email { recipient: String },
+    /// Email alert target, sent through the SMTP server in `smtp`.
+    ///
+    /// `smtp` is required; a target without it is rejected by
+    /// [`AlertingConfig::validate`].
+    Email {
+        recipient: String,
+        #[serde(default)]
+        smtp: Option<SmtpConfig>,
+    },
     /// Slack alert target
     Slack {
         webhook_url: String,
@@ -214,14 +431,28 @@ pub struct AlertManager {
 }
 
 impl AlertManager {
-    /// Create a new alert manager
+    /// Create a new alert manager.
+    ///
+    /// The configuration is not rejected here; an invalid configuration is logged at
+    /// error level, and alerts to an invalid target fail when they are sent. Prefer
+    /// [`try_new`](Self::try_new), which reports configuration errors immediately.
     pub fn new(config: AlertingConfig) -> Self {
+        if let Err(e) = config.validate() {
+            tracing::error!("Invalid alerting configuration: {e}");
+        }
         Self {
             config,
             last_alerts: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "alerting")]
             http_client: reqwest::Client::new(),
         }
+    }
+
+    /// Create a new alert manager, failing if the configuration is invalid
+    /// (see [`AlertingConfig::validate`]).
+    pub fn try_new(config: AlertingConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self::new(config))
     }
 
     /// Check statistics against thresholds and trigger alerts if needed
@@ -404,19 +635,33 @@ impl AlertManager {
         }
 
         // Send alert to all targets
+        let mut failures = Vec::new();
         for target in &self.config.targets {
             if let Err(e) = self.send_to_target(&alert, target).await {
                 tracing::warn!("Failed to send alert to target: {}", e);
+                failures.push(e.to_string());
             }
         }
 
-        // Update last alert time
-        {
+        // Start the cooldown only once some target was reached, so an alert that
+        // could not be delivered anywhere is tried again on the next check.
+        if failures.len() < self.config.targets.len() || self.config.targets.is_empty() {
             let mut last_alerts = self.last_alerts.write().await;
             last_alerts.insert(alert_key, alert.timestamp);
         }
 
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(HammerworkError::Alerting {
+                message: format!(
+                    "{} of {} alert target(s) failed: {}",
+                    failures.len(),
+                    self.config.targets.len(),
+                    failures.join("; ")
+                ),
+            })
+        }
     }
 
     /// Send alert to a specific target
@@ -425,7 +670,12 @@ impl AlertManager {
             AlertTarget::Webhook { url, headers } => {
                 self.send_webhook_alert(alert, url, headers).await
             }
-            AlertTarget::Email { recipient } => self.send_email_alert(alert, recipient).await,
+            AlertTarget::Email { recipient, smtp } => match smtp {
+                Some(smtp) => self.send_email_alert(alert, recipient, smtp).await,
+                None => Err(HammerworkError::Alerting {
+                    message: format!("email alert target '{recipient}' has no SMTP settings"),
+                }),
+            },
             AlertTarget::Slack {
                 webhook_url,
                 channel,
@@ -485,16 +735,78 @@ impl AlertManager {
         Ok(())
     }
 
-    /// Send email alert (placeholder - requires email service integration)
-    async fn send_email_alert(&self, alert: &Alert, _recipient: &str) -> Result<()> {
-        tracing::info!(
-            "Email alert: {} - {} ({})",
-            alert.alert_type,
-            alert.message,
-            alert.severity
-        );
-        // TODO: Implement email sending when email service is integrated
+    /// Send an email alert through the target's SMTP server.
+    async fn send_email_alert(
+        &self,
+        alert: &Alert,
+        recipient: &str,
+        smtp: &SmtpConfig,
+    ) -> Result<()> {
+        use lettre::{
+            AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+            message::header::ContentType, transport::smtp::authentication::Credentials,
+        };
+
+        let failed = |message: String| HammerworkError::Alerting {
+            message: format!("Failed to send email alert to {recipient}: {message}"),
+        };
+
+        let from = parse_mailbox(&smtp.from).map_err(failed)?;
+        let to = parse_mailbox(recipient).map_err(failed)?;
+        let message = Message::builder()
+            .from(from)
+            .to(to)
+            .subject(single_line(&format!(
+                "[Hammerwork {}] {} on queue {}",
+                alert.severity, alert.alert_type, alert.queue_name
+            )))
+            .header(ContentType::TEXT_PLAIN)
+            .body(Self::email_body(alert))
+            .map_err(|e| failed(e.to_string()))?;
+
+        let mut transport = match smtp.tls {
+            SmtpTls::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp.host)
+                .map_err(|e| failed(e.to_string()))?,
+            SmtpTls::Implicit => AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.host)
+                .map_err(|e| failed(e.to_string()))?,
+            SmtpTls::None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&smtp.host),
+        }
+        .port(smtp.effective_port())
+        .timeout(Some(Duration::from_secs(smtp.timeout_secs)));
+        if let (Some(username), Some(password)) = (&smtp.username, &smtp.password) {
+            let password = password.resolve().map_err(|e| failed(e.to_string()))?;
+            transport = transport.credentials(Credentials::new(username.clone(), password));
+        }
+
+        transport
+            .build()
+            .send(message)
+            .await
+            .map_err(|e| failed(e.to_string()))?;
         Ok(())
+    }
+
+    /// Plain-text body of an alert email.
+    fn email_body(alert: &Alert) -> String {
+        let mut body = format!(
+            "{}\n\nAlert: {}\nSeverity: {}\nQueue: {}\nCurrent value: {:.2}\nThreshold: {:.2}\nTime: {}\n",
+            alert.message,
+            alert.alert_type,
+            alert.severity,
+            alert.queue_name,
+            alert.current_value,
+            alert.threshold,
+            alert.timestamp.to_rfc3339()
+        );
+        if !alert.context.is_empty() {
+            let mut context: Vec<_> = alert.context.iter().collect();
+            context.sort();
+            body.push_str("\nContext:\n");
+            for (key, value) in context {
+                body.push_str(&format!("  {key}: {value}\n"));
+            }
+        }
+        body
     }
 
     /// Send Slack alert
@@ -620,7 +932,10 @@ mod tests {
             .alert_on_queue_depth(1000)
             .alert_on_worker_starvation(Duration::from_secs(300))
             .webhook("https://example.com/webhook")
-            .email("admin@example.com")
+            .email_via_smtp(
+                "admin@example.com",
+                SmtpConfig::new("smtp.example.com", "alerts@example.com"),
+            )
             .slack("https://hooks.slack.com/webhook", "#alerts")
             .with_cooldown(Duration::from_secs(600));
 
@@ -737,6 +1052,7 @@ mod tests {
 
         let email = AlertTarget::Email {
             recipient: "test@example.com".to_string(),
+            smtp: None,
         };
 
         let slack = AlertTarget::Slack {
@@ -750,7 +1066,7 @@ mod tests {
         }
 
         match email {
-            AlertTarget::Email { recipient } => assert_eq!(recipient, "test@example.com"),
+            AlertTarget::Email { recipient, .. } => assert_eq!(recipient, "test@example.com"),
             _ => panic!("Expected email target"),
         }
 
@@ -777,5 +1093,400 @@ mod tests {
 
         assert_eq!(config.custom_thresholds.get("memory_usage"), Some(&80.0));
         assert_eq!(config.custom_thresholds.get("cpu_usage"), Some(&90.0));
+    }
+
+    /// What a fake SMTP server saw during one session.
+    #[derive(Debug, Default, Clone)]
+    struct SmtpSession {
+        commands: Vec<String>,
+        data: String,
+    }
+
+    /// How the fake SMTP server behaves.
+    #[derive(Clone, Copy)]
+    struct FakeSmtp {
+        /// Advertise `AUTH PLAIN LOGIN`.
+        auth: bool,
+        /// Reply to `RCPT TO` with this code.
+        rcpt_reply: u16,
+    }
+
+    impl Default for FakeSmtp {
+        fn default() -> Self {
+            Self {
+                auth: false,
+                rcpt_reply: 250,
+            }
+        }
+    }
+
+    /// A local SMTP server speaking just enough of the protocol for lettre. Every
+    /// finished session is sent on the returned channel.
+    async fn fake_smtp_server(
+        behaviour: FakeSmtp,
+    ) -> (u16, tokio::sync::mpsc::UnboundedReceiver<SmtpSession>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = socket.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    let mut session = SmtpSession::default();
+                    let _ = write.write_all(b"220 fake.test ESMTP\r\n").await;
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let upper = line.to_ascii_uppercase();
+                        session.commands.push(line.clone());
+                        let reply: String = if upper.starts_with("EHLO") {
+                            if behaviour.auth {
+                                "250-fake.test\r\n250 AUTH PLAIN LOGIN\r\n".into()
+                            } else {
+                                "250 fake.test\r\n".into()
+                            }
+                        } else if upper.starts_with("AUTH") {
+                            "235 2.7.0 Authentication successful\r\n".into()
+                        } else if upper.starts_with("MAIL FROM") {
+                            "250 OK\r\n".into()
+                        } else if upper.starts_with("RCPT TO") {
+                            format!("{} recipient\r\n", behaviour.rcpt_reply)
+                        } else if upper == "DATA" {
+                            let _ = write.write_all(b"354 go ahead\r\n").await;
+                            while let Ok(Some(data_line)) = lines.next_line().await {
+                                if data_line == "." {
+                                    break;
+                                }
+                                session.data.push_str(&data_line);
+                                session.data.push('\n');
+                            }
+                            "250 queued\r\n".into()
+                        } else if upper == "QUIT" {
+                            let _ = write.write_all(b"221 bye\r\n").await;
+                            break;
+                        } else {
+                            "250 OK\r\n".into()
+                        };
+                        if write.write_all(reply.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = tx.send(session);
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    fn local_smtp(port: u16) -> SmtpConfig {
+        SmtpConfig::new("127.0.0.1", "Hammerwork <alerts@example.com>")
+            .with_port(port)
+            .with_tls(SmtpTls::None)
+            .with_timeout_secs(5)
+    }
+
+    async fn next_session(
+        sessions: &mut tokio::sync::mpsc::UnboundedReceiver<SmtpSession>,
+    ) -> SmtpSession {
+        tokio::time::timeout(Duration::from_secs(10), sessions.recv())
+            .await
+            .expect("no SMTP session")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_email_alert_is_sent_over_smtp() {
+        let (port, mut sessions) = fake_smtp_server(FakeSmtp::default()).await;
+        let config = AlertingConfig::new().email_via_smtp("oncall@example.com", local_smtp(port));
+        let manager = AlertManager::try_new(config).unwrap();
+
+        manager
+            .send_custom_alert(
+                "emails",
+                "backlog",
+                "Backlog is growing",
+                42.0,
+                30.0,
+                AlertSeverity::Critical,
+            )
+            .await
+            .unwrap();
+
+        let session = next_session(&mut sessions).await;
+        assert!(
+            session
+                .commands
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("MAIL FROM:<alerts@example.com>")),
+            "{:?}",
+            session.commands
+        );
+        assert!(
+            session
+                .commands
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("RCPT TO:<oncall@example.com>")),
+            "{:?}",
+            session.commands
+        );
+        assert!(!session.commands.iter().any(|c| c.starts_with("AUTH")));
+        assert!(
+            session
+                .data
+                .contains("Subject: [Hammerwork Critical] Custom: backlog on queue emails"),
+            "{}",
+            session.data
+        );
+        assert!(session.data.contains("Backlog is growing"));
+        assert!(session.data.contains("Threshold: 30.00"));
+    }
+
+    #[tokio::test]
+    async fn test_email_alert_authenticates_with_credentials() {
+        let (port, mut sessions) = fake_smtp_server(FakeSmtp {
+            auth: true,
+            ..Default::default()
+        })
+        .await;
+        let smtp =
+            local_smtp(port).with_credentials("alerts", SecretSource::Static("s3cret".to_string()));
+        let manager =
+            AlertManager::try_new(AlertingConfig::new().email_via_smtp("oncall@example.com", smtp))
+                .unwrap();
+        manager
+            .send_custom_alert("q", "x", "m", 1.0, 0.0, AlertSeverity::Info)
+            .await
+            .unwrap();
+
+        let session = next_session(&mut sessions).await;
+        use base64::Engine as _;
+        let expected = base64::engine::general_purpose::STANDARD.encode("\0alerts\0s3cret");
+        assert!(
+            session
+                .commands
+                .iter()
+                .any(|c| c == &format!("AUTH PLAIN {expected}")),
+            "{:?}",
+            session.commands
+        );
+    }
+
+    #[tokio::test]
+    async fn test_email_alert_failure_is_reported() {
+        // The server rejects the recipient.
+        let (port, _sessions) = fake_smtp_server(FakeSmtp {
+            rcpt_reply: 550,
+            ..Default::default()
+        })
+        .await;
+        let manager = AlertManager::try_new(
+            AlertingConfig::new().email_via_smtp("nobody@example.com", local_smtp(port)),
+        )
+        .unwrap();
+        let err = manager
+            .send_custom_alert("q", "x", "m", 1.0, 0.0, AlertSeverity::Warning)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nobody@example.com"), "{err}");
+
+        // A failed alert does not start the cooldown, so it is tried again.
+        assert!(manager.last_alerts.read().await.is_empty());
+
+        // Nothing listens on the port.
+        let unreachable = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let manager = AlertManager::try_new(
+            AlertingConfig::new().email_via_smtp("oncall@example.com", local_smtp(unreachable)),
+        )
+        .unwrap();
+        assert!(
+            manager
+                .send_custom_alert("q", "x", "m", 1.0, 0.0, AlertSeverity::Warning)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_starttls_is_required_when_configured() {
+        // The fake server does not offer STARTTLS; the alert must not go out in plain text.
+        let (port, mut sessions) = fake_smtp_server(FakeSmtp::default()).await;
+        let smtp = local_smtp(port).with_tls(SmtpTls::StartTls);
+        let manager =
+            AlertManager::try_new(AlertingConfig::new().email_via_smtp("oncall@example.com", smtp))
+                .unwrap();
+        assert!(
+            manager
+                .send_custom_alert("q", "x", "m", 1.0, 0.0, AlertSeverity::Warning)
+                .await
+                .is_err()
+        );
+        let session = next_session(&mut sessions).await;
+        assert!(!session.commands.iter().any(|c| c.starts_with("MAIL")));
+        assert!(session.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_missing_password_variable_is_reported() {
+        let smtp = local_smtp(1).with_credentials(
+            "alerts",
+            SecretSource::Environment("HAMMERWORK_TEST_SMTP_PASSWORD_THAT_IS_NOT_SET".into()),
+        );
+        let manager =
+            AlertManager::try_new(AlertingConfig::new().email_via_smtp("oncall@example.com", smtp))
+                .unwrap();
+        let err = manager
+            .send_custom_alert("q", "x", "m", 1.0, 0.0, AlertSeverity::Warning)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("HAMMERWORK_TEST_SMTP_PASSWORD_THAT_IS_NOT_SET"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_email_target_without_smtp_is_a_configuration_error() {
+        let config = AlertingConfig::new().email("oncall@example.com");
+        match AlertManager::try_new(config) {
+            Err(HammerworkError::Config(message)) => {
+                assert!(message.contains("no SMTP settings"), "{message}");
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+            Ok(_) => panic!("an email target without SMTP settings must be rejected"),
+        }
+
+        // Also when loaded from a configuration file.
+        let target: AlertTarget =
+            serde_json::from_str(r#"{"Email": {"recipient": "oncall@example.com"}}"#).unwrap();
+        let config = AlertingConfig {
+            targets: vec![target],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_smtp_settings_are_validated() {
+        let cases = [
+            (SmtpConfig::new("", "alerts@example.com"), "host is empty"),
+            (
+                SmtpConfig::new("smtp.example.com", "not an address"),
+                "invalid from",
+            ),
+            (
+                SmtpConfig {
+                    username: Some("alerts".into()),
+                    ..SmtpConfig::new("smtp.example.com", "alerts@example.com")
+                },
+                "without a password",
+            ),
+            (
+                SmtpConfig {
+                    password: Some(SecretSource::Environment("X".into())),
+                    ..SmtpConfig::new("smtp.example.com", "alerts@example.com")
+                },
+                "without a username",
+            ),
+        ];
+        for (smtp, expected) in cases {
+            let config = AlertingConfig::new().email_via_smtp("oncall@example.com", smtp);
+            let message = config.validate().unwrap_err().to_string();
+            assert!(message.contains(expected), "{message}");
+        }
+
+        let bad_recipient = AlertingConfig::new().email_via_smtp(
+            "not an address",
+            SmtpConfig::new("smtp.example.com", "alerts@example.com"),
+        );
+        assert!(bad_recipient.validate().is_err());
+    }
+
+    #[test]
+    fn test_smtp_defaults_and_secret_redaction() {
+        let smtp = SmtpConfig::new("smtp.example.com", "alerts@example.com");
+        assert_eq!(smtp.tls, SmtpTls::StartTls);
+        assert_eq!(smtp.effective_port(), 587);
+        assert_eq!(
+            smtp.clone().with_tls(SmtpTls::Implicit).effective_port(),
+            465
+        );
+        assert_eq!(smtp.clone().with_tls(SmtpTls::None).effective_port(), 25);
+        assert_eq!(smtp.with_port(2525).effective_port(), 2525);
+
+        let secret = SecretSource::Static("hunter2".to_string());
+        assert!(!format!("{secret:?}").contains("hunter2"));
+
+        // Deserializes from TOML with defaults filled in.
+        let smtp: SmtpConfig = toml::from_str(
+            r#"
+            host = "smtp.example.com"
+            from = "alerts@example.com"
+            username = "alerts"
+            password = { Environment = "SMTP_PASSWORD" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(smtp.tls, SmtpTls::StartTls);
+        assert_eq!(smtp.timeout_secs, 30);
+        assert_eq!(
+            smtp.password,
+            Some(SecretSource::Environment("SMTP_PASSWORD".to_string()))
+        );
+
+        // The target layout documented in docs/monitoring.md.
+        #[derive(Deserialize)]
+        struct Targets {
+            targets: Vec<AlertTarget>,
+        }
+        let parsed: Targets = toml::from_str(
+            r#"
+            [[targets]]
+            [targets.Email]
+            recipient = "admin@example.com"
+
+            [targets.Email.smtp]
+            host = "smtp.example.com"
+            from = "alerts@example.com"
+            tls = "implicit"
+            "#,
+        )
+        .unwrap();
+        match &parsed.targets[..] {
+            [AlertTarget::Email { recipient, smtp }] => {
+                assert_eq!(recipient, "admin@example.com");
+                assert_eq!(smtp.as_ref().unwrap().tls, SmtpTls::Implicit);
+            }
+            other => panic!("unexpected targets: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_webhook_target_is_reported() {
+        let unreachable = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let manager = AlertManager::try_new(
+            AlertingConfig::new().webhook(&format!("http://127.0.0.1:{unreachable}/alert")),
+        )
+        .unwrap();
+        let err = manager
+            .send_custom_alert("q", "x", "m", 1.0, 0.0, AlertSeverity::Warning)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("1 of 1 alert target(s) failed"),
+            "{err}"
+        );
     }
 }
