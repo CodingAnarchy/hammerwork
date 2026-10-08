@@ -494,9 +494,16 @@ where
     assert!(wait_for_jobs(&queue, &more, Duration::from_secs(10), completed).await);
     assert_eq!(concurrency.peak(), 1, "only min_workers remain");
 
+    // A new backlog scales the pool up again (reusing the retired workers' slots).
+    concurrency.reset_peak();
+    let again = enqueue_many(&queue, &queue_name, 24).await;
+    assert!(wait_for_jobs(&queue, &again, Duration::from_secs(30), completed).await);
+    assert_eq!(concurrency.peak(), 3, "scaled up to max_workers again");
+
     pool.shutdown().await.unwrap();
     delete_jobs(&queue, &ids).await;
     delete_jobs(&queue, &more).await;
+    delete_jobs(&queue, &again).await;
 }
 
 /// A worker leaves a paused queue alone and picks its jobs up once it is resumed.
