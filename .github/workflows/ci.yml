@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
       - uses: dtolnay/rust-toolchain@stable
@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
       - uses: dtolnay/rust-toolchain@stable
@@ -100,7 +100,7 @@ jobs:
       DATABASE_URL: postgres://postgres:password@localhost:5432/hammerwork_test
       RUST_LOG: info
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
       - uses: dtolnay/rust-toolchain@stable
@@ -139,7 +139,7 @@ jobs:
       MYSQL_DATABASE_URL: mysql://root:password@127.0.0.1:3306/hammerwork_test
       RUST_LOG: info
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
       - uses: dtolnay/rust-toolchain@stable
@@ -163,12 +163,14 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       # Cargo.lock is not committed (library crate), so resolve one for the audit.
       - run: cargo generate-lockfile
       # Fails the job on any unignored vulnerability. Ignores (with justification)
       # live in .cargo/audit.toml, which cargo-audit reads from the workspace root.
+      # v2.0.0 is the latest release and still declares node20 (GitHub runs it on
+      # Node 24); upstream main already targets node24 -- bump when it is released.
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
