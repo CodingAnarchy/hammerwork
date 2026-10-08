@@ -202,7 +202,13 @@ let error_job = Job::new("handle_invalid_data".to_string(), json!({
 
 ## Failure Policies
 
-Control how workflows handle failures:
+Control how workflows handle failures. A policy applies when a job fails terminally
+(its last attempt failed or timed out, or it was failed manually); failed attempts that
+will be retried do not trigger it. Dependency resolution and the policy run in the same
+transaction as the job's status change, and the workflow's `completed_jobs`,
+`failed_jobs` and `status` are updated with it. A workflow is `completed` when every
+job completed, and `failed` as soon as a job fails under `FailFast`, or once every job
+has finished with at least one failure under the other policies.
 
 ### FailFast (Default)
 
@@ -240,6 +246,16 @@ let workflow = JobGroup::new("manual_review_pipeline")
     .with_failure_policy(FailurePolicy::Manual);
 // If critical_job fails, workflow pauses for manual decision
 ```
+
+With `Manual`, the dependents of the failed job stay `waiting` and the workflow stays
+`running`. Re-run the failed job with `queue.retry_dead_job(job_id)`; when it completes,
+its dependents become runnable. To give up instead, call `cancel_workflow`.
+
+With `FailFast`, every job of the workflow that has not started yet is marked `Failed`
+(jobs already running finish normally). With `ContinueOnFailure`, the jobs that depend
+on the failed job, directly or transitively, are marked `Failed` with
+`dependency_status = failed`; independent jobs keep running. Jobs that use
+`Job::depends_on` outside a workflow behave like `ContinueOnFailure`.
 
 ## Workflow Management
 

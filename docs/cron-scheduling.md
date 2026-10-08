@@ -221,6 +221,14 @@ let one_time = Job::new("special_report".to_string(), payload)
 queue.enqueue_cron_job(one_time).await?;
 ```
 
+A recurring job is rescheduled after every run that ends, not only after a success.
+Failed attempts are retried as usual (up to the job's `max_attempts`); when a run
+completes, dies or times out on its last attempt, the job goes back to `Pending` at
+its next scheduled time with its attempts reset. After a failed run the job keeps its
+`error_message` and `failed_at` (or `timed_out_at`) until the next run, and the
+worker's fail/timeout hooks and events fire as for any other job. The next run is
+computed from the time the run ended.
+
 ## Monitoring Cron Jobs
 
 ### Cron Job Statistics

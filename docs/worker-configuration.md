@@ -10,7 +10,7 @@ use std::time::Duration;
 
 let worker = Worker::new(queue, "email_queue".to_string(), handler)
     .with_poll_interval(Duration::from_millis(500))  // Check for jobs every 500ms
-    .with_max_retries(3)                             // Retry failed jobs up to 3 times
+    .with_max_retries(3)                             // At most 3 attempts per job (job max_attempts still applies)
     .with_retry_delay(Duration::from_secs(30));      // Wait 30s between retries
 ```
 
@@ -278,12 +278,42 @@ let handler = Arc::new(|job: Job| {
 
 ### Retry Configuration
 
+A job's own `max_attempts` (`Job::with_max_attempts`, default 3) decides how often it
+runs. A failing run is retried while attempts remain; the last failure makes the job
+`Dead`. A run that exceeds its timeout counts as a failed attempt too: it is retried
+while attempts remain and the job only ends `TimedOut` on its last attempt.
+
+`Worker::with_max_retries(n)` can only lower that limit (`min(job.max_attempts, n)`);
+by default workers set no cap. Before this change the worker value replaced the job's
+`max_attempts`, which made `with_max_attempts(5)` jobs stop after 3 runs in a
+`Failed` state that nothing retried.
+
 ```rust
 let worker = Worker::new(queue, "retry_queue".to_string(), handler)
-    .with_max_retries(5)                        // Try up to 5 times
+    .with_max_retries(5)                        // Never more than 5 attempts per job
     .with_retry_delay(Duration::from_secs(30))  // Wait 30s between attempts
     .with_default_timeout(Duration::from_secs(300)); // 5 minute timeout per attempt
 ```
+
+The delay before a retry comes from the job's retry strategy
+(`Job::with_retry_strategy`, stored with the job since migration 018), then the
+worker's `with_default_retry_strategy`, then `with_retry_delay`. A
+`RetryStrategy::Custom` closure cannot be stored, so enqueueing a job that carries one
+is rejected; set it with `with_default_retry_strategy` instead.
+
+### Recording Outcomes and Zombie Workers
+
+A worker records each run with `DatabaseQueue::finish_job_run`. The outcome only
+applies while the job is still `Running` the same run (same `attempts` and
+`started_at`). If the stale job reaper reclaimed the job, an operator changed it, or
+another worker is running a newer attempt, the outcome is discarded with a warning, so
+a late worker never overwrites newer state. The same transaction also:
+
+- reschedules a recurring job for its next run after the run completed, died or timed
+  out (a failed run's error stays on the job until the next run);
+- makes dependents whose dependencies have all completed runnable;
+- applies the workflow's `FailurePolicy` and the batch's `PartialFailureMode` on a
+  terminal failure, and updates workflow and batch progress.
 
 ## Performance Tuning
 
