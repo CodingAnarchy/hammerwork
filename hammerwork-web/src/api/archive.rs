@@ -31,6 +31,7 @@
 //!     dry_run: false,
 //!     policy: Some(ArchivalPolicy::new()
 //!         .archive_completed_after(Duration::days(7))),
+//!     config: None,
 //! };
 //!
 //! // This would be sent to POST /api/archive/jobs
