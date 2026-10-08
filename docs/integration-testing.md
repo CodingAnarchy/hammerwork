@@ -49,7 +49,7 @@ make integration-mysql
 
 ### Directory Structure
 
-```
+```text
 hammerwork/
 ├── docker-compose.yml           # Database containers
 ├── Makefile                     # Convenient commands
@@ -334,9 +334,12 @@ docker system prune
 
 1. **Add to Shared Scenarios** (`integrations/shared/test_scenarios.rs`):
    ```rust
+   # struct TestScenarios<DB>(std::marker::PhantomData<DB>);
+   # type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
    impl<DB> TestScenarios<DB> {
        pub async fn test_new_feature(&self) -> Result<()> {
            // Your test implementation
+       Ok(())
        }
    }
    ```

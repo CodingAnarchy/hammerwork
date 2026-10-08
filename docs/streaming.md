@@ -6,6 +6,7 @@ cargo feature: `kafka`, `kinesis` or `google-pubsub`. Adding a stream for a back
 whose feature is disabled fails with a configuration error.
 
 ```rust
+# async fn example() -> hammerwork::Result<()> {
 use hammerwork::events::{EventFilter, EventManager, JobLifecycleEventType};
 use hammerwork::streaming::{StreamBackend, StreamConfig, StreamManager, StreamRetryPolicy};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -33,6 +34,8 @@ streams.add_stream(stream).await?;
 
 // ... on shutdown:
 streams.shutdown(Duration::from_secs(10)).await;
+# Ok(())
+# }
 ```
 
 ## Delivery

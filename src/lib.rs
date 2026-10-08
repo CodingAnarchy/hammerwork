@@ -382,3 +382,31 @@ pub type Result<T> = std::result::Result<T, HammerworkError>;
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/quick-start.md")]
+struct QuickStartDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/monitoring.md")]
+struct MonitoringDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/migrations.md")]
+struct MigrationsDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/webhooks.md")]
+struct WebhooksDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/integration-testing.md")]
+struct IntegrationTestingDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/testing.md")]
+struct TestingDoctests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../docs/streaming.md")]
+struct StreamingDoctests;

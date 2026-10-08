@@ -60,8 +60,8 @@ cargo hammerwork migration status --database-url postgresql://localhost/hammerwo
 
 Once migrations are complete, your application can connect directly to the database:
 
-```rust
-use hammerwork::{Job, JobQueue, Worker, WorkerPool};
+```rust,no_run
+use hammerwork::{Job, JobQueue, queue::DatabaseQueue};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -187,13 +187,13 @@ does not do it.
 When adding new features to Hammerwork:
 
 1. **Create Migration Files**: Add both PostgreSQL and MySQL versions
-   ```
+   ```text
    src/migrations/011_new_feature.postgres.sql
    src/migrations/011_new_feature.mysql.sql
    ```
 
 2. **Register in Framework**: Add to `register_builtin_migrations()` in `src/migrations/mod.rs`
-   ```rust
+   ```text
    // Migration 011: Add new feature
    self.register_migration(
        Migration {

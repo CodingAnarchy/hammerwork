@@ -602,13 +602,19 @@ For testing Worker behavior, use a real database connection with `JobQueue<DB>` 
 ### 1. Use Descriptive Queue Names
 
 ```rust
+# #[cfg(feature = "test")]
+# async fn example() -> hammerwork::Result<()> {
+# use hammerwork::{Job, queue::{DatabaseQueue, test::TestQueue}};
+# let data = serde_json::json!({});
 // Good: Descriptive queue names prevent test interference
 let queue = TestQueue::new();
-queue.enqueue(Job::new("user_registration_queue".to_string(), data)).await?;
-queue.enqueue(Job::new("email_notification_queue".to_string(), data)).await?;
+queue.enqueue(Job::new("user_registration_queue".to_string(), data.clone())).await?;
+queue.enqueue(Job::new("email_notification_queue".to_string(), data.clone())).await?;
 
 // Avoid: Generic names that might clash between tests
 queue.enqueue(Job::new("test".to_string(), data)).await?;
+# Ok(())
+# }
 ```
 
 ### 2. Test Time-Dependent Features with MockClock
