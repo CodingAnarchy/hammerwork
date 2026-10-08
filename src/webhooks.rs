@@ -777,11 +777,9 @@ impl WebhookManager {
                 let webhook = {
                     let webhooks = webhooks.read().await;
                     match webhooks.get(&webhook_id) {
-                        Some(webhook) if webhook.enabled => webhook.clone(),
-                        _ => {
-                            // Webhook disabled or removed, exit task
-                            break;
-                        }
+                        Some(webhook) => webhook.clone(),
+                        // Webhook removed, exit task
+                        None => break,
                     }
                 };
 
@@ -793,8 +791,14 @@ impl WebhookManager {
                 // Wait for events
                 match receiver.recv().await {
                     Ok(event) => {
-                        // Check if event matches webhook filter
-                        if webhook.filter.matches(&event) {
+                        // A disabled webhook drops events but keeps listening, so that
+                        // enabling it again resumes delivery. Check the current state:
+                        // it may have changed while waiting for the event.
+                        let webhook = match webhooks.read().await.get(&webhook_id) {
+                            Some(current) => current.clone(),
+                            None => break,
+                        };
+                        if webhook.enabled && webhook.filter.matches(&event) {
                             // Clone necessary data for delivery task
                             let webhook_clone = webhook.clone();
                             let event_clone = event.clone();
@@ -2536,5 +2540,296 @@ mod tests {
                 "job_id": event.job_id.to_string(),
             })
         );
+    }
+
+    /// A request received by [`recording_http_server`].
+    #[derive(Debug)]
+    struct Recorded {
+        request_line: String,
+        headers: HashMap<String, String>,
+        body: String,
+    }
+
+    /// A local HTTP server answering every request with `status` (after `delay`) and
+    /// recording the requests it receives.
+    async fn recording_http_server(
+        status: u16,
+        delay: Duration,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<Recorded>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head, body) = loop {
+                        if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buffer[..end]).to_string();
+                            let length: usize = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().to_string())
+                                })
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(0);
+                            if buffer.len() >= end + 4 + length {
+                                break (head, buffer[end + 4..end + 4 + length].to_vec());
+                            }
+                        }
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let mut lines = head.lines();
+                    let request_line = lines.next().unwrap_or_default().to_string();
+                    let headers = lines
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
+                        .collect();
+                    let _ = tx.send(Recorded {
+                        request_line,
+                        headers,
+                        body: String::from_utf8_lossy(&body).to_string(),
+                    });
+                    tokio::time::sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-length: 4\r\nconnection: close\r\n\r\nnope"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (url, rx)
+    }
+
+    async fn next_recorded(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Recorded>) -> Recorded {
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("no request received")
+            .unwrap()
+    }
+
+    fn no_retries() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        }
+    }
+
+    /// Add `webhook`, publish one event and return the request the endpoint received.
+    async fn deliver_one(
+        webhook: WebhookConfig,
+        url_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Recorded>,
+    ) -> Recorded {
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        manager.add_webhook(webhook).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.publish_event(completed_event()).await.unwrap();
+        let recorded = next_recorded(url_rx).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+        recorded
+    }
+
+    #[tokio::test]
+    async fn test_auth_methods_and_signature() {
+        let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
+        let cases = [
+            (
+                WebhookAuth::Bearer {
+                    token: "t0ken".to_string(),
+                },
+                "authorization",
+                "Bearer t0ken".to_string(),
+            ),
+            (
+                WebhookAuth::Basic {
+                    username: "user".to_string(),
+                    password: "pass".to_string(),
+                },
+                "authorization",
+                "Basic dXNlcjpwYXNz".to_string(),
+            ),
+            (
+                WebhookAuth::ApiKey {
+                    header_name: "X-Api-Key".to_string(),
+                    api_key: "k123".to_string(),
+                },
+                "x-api-key",
+                "k123".to_string(),
+            ),
+            (
+                WebhookAuth::Custom {
+                    headers: HashMap::from([("X-Custom".to_string(), "c".to_string())]),
+                },
+                "x-custom",
+                "c".to_string(),
+            ),
+        ];
+        for (auth, header, expected) in cases {
+            let webhook = WebhookConfig::new("auth".to_string(), url.clone())
+                .with_auth(auth)
+                .with_retry_policy(no_retries());
+            let recorded = deliver_one(webhook, &mut rx).await;
+            assert_eq!(
+                recorded.headers.get(header),
+                Some(&expected),
+                "{recorded:?}"
+            );
+        }
+
+        // Method, extra headers and the HMAC signature of the body.
+        let webhook = WebhookConfig::new("signed".to_string(), url.clone())
+            .with_method(HttpMethod::Put)
+            .with_header("X-Team".to_string(), "queues".to_string())
+            .with_secret("s3cret".to_string())
+            .with_retry_policy(no_retries());
+        let recorded = deliver_one(webhook, &mut rx).await;
+        assert!(
+            recorded.request_line.starts_with("PUT /hook"),
+            "{recorded:?}"
+        );
+        assert_eq!(
+            recorded.headers.get("x-team").map(String::as_str),
+            Some("queues")
+        );
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+        let body: serde_json::Value = serde_json::from_str(&recorded.body).unwrap();
+        mac.update(serde_json::to_string(&body).unwrap().as_bytes());
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert_eq!(
+            recorded.headers.get("x-hammerwork-signature"),
+            Some(&expected)
+        );
+
+        let webhook = WebhookConfig::new("patch".to_string(), url)
+            .with_method(HttpMethod::Patch)
+            .with_retry_policy(no_retries());
+        let recorded = deliver_one(webhook, &mut rx).await;
+        assert!(recorded.request_line.starts_with("PATCH /hook"));
+    }
+
+    #[tokio::test]
+    async fn test_non_retryable_status_and_timeout_are_failures() {
+        // 404 is not in retry_on_status_codes: one attempt only.
+        let (url, mut rx) = recording_http_server(404, Duration::ZERO).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        let webhook = WebhookConfig::new("404".to_string(), url).with_retry_policy(RetryPolicy {
+            max_attempts: 3,
+            initial_delay_secs: 0,
+            ..RetryPolicy::default()
+        });
+        let id = webhook.id;
+        manager.add_webhook(webhook).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.publish_event(completed_event()).await.unwrap();
+        next_recorded(&mut rx).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(rx.try_recv().is_err(), "a 404 is not retried");
+        let stats = manager.get_webhook_stats(id).await.unwrap();
+        assert_eq!((stats.total_attempts, stats.failed_deliveries), (1, 1));
+        assert!(stats.last_failure_at.is_some());
+        assert_eq!(manager.get_all_webhook_stats().await.len(), 1);
+        manager.shutdown(Duration::from_secs(5)).await;
+
+        // An endpoint slower than the webhook timeout fails the delivery.
+        let (url, mut rx) = recording_http_server(200, Duration::from_secs(5)).await;
+        let manager = WebhookManager::new_default(events.clone());
+        let webhook = WebhookConfig::new("slow".to_string(), url)
+            .with_timeout_secs(1)
+            .with_retry_policy(no_retries());
+        let id = webhook.id;
+        manager.add_webhook(webhook).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.publish_event(completed_event()).await.unwrap();
+        next_recorded(&mut rx).await;
+        let mut failed = false;
+        for _ in 0..100 {
+            if manager
+                .get_webhook_stats(id)
+                .await
+                .is_some_and(|s| s.failed_deliveries == 1)
+            {
+                failed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(failed, "the timed-out delivery is recorded as failed");
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// Disabling a webhook stops delivery, enabling it resumes, updating replaces it,
+    /// and unknown ids are errors.
+    #[tokio::test]
+    async fn test_enable_disable_update_webhook() {
+        let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        let webhook =
+            WebhookConfig::new("toggle".to_string(), url.clone()).with_retry_policy(no_retries());
+        let id = webhook.id;
+        manager.add_webhook(webhook.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        manager.disable_webhook(id).await.unwrap();
+        assert_eq!(manager.get_stats().await.active_webhooks, 0);
+        events.publish_event(completed_event()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(rx.try_recv().is_err(), "disabled webhooks send nothing");
+
+        manager.enable_webhook(id).await.unwrap();
+        let event = completed_event();
+        let event_id = event.event_id;
+        events.publish_event(event).await.unwrap();
+        let recorded = next_recorded(&mut rx).await;
+        assert!(
+            recorded.body.contains(&event_id.to_string()),
+            "{recorded:?}"
+        );
+
+        // Updating replaces the configuration (here: the request method).
+        manager
+            .update_webhook(webhook.with_method(HttpMethod::Put))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_webhook(id).await.unwrap().method,
+            HttpMethod::Put
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.publish_event(completed_event()).await.unwrap();
+        assert!(next_recorded(&mut rx).await.request_line.starts_with("PUT"));
+
+        let unknown = Uuid::new_v4();
+        for result in [
+            manager.enable_webhook(unknown).await,
+            manager.disable_webhook(unknown).await,
+        ] {
+            assert!(result.unwrap_err().to_string().contains("not found"));
+        }
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    #[test]
+    fn test_webhook_config_builders() {
+        let filter = EventFilter::new().with_queue_names(vec!["q".to_string()]);
+        let webhook = WebhookConfig::new("w".to_string(), "http://x".to_string())
+            .with_filter(filter)
+            .with_retry_policy(no_retries())
+            .enabled(false);
+        assert_eq!(webhook.filter.queue_names, vec!["q".to_string()]);
+        assert_eq!(webhook.retry_policy.max_attempts, 1);
+        assert!(!webhook.enabled);
     }
 }
