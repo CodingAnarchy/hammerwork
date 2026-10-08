@@ -58,12 +58,13 @@
 mod azure;
 pub mod engine;
 pub mod key_manager;
+mod kms;
 
 pub use engine::EncryptionEngine;
 pub use key_manager::{
     EncryptionKey, ExternalKmsConfig, KeyAuditRecord, KeyDerivationConfig, KeyManager,
-    KeyManagerConfig, KeyManagerStats, KeyOperation, KeyPurpose, KeyStatus, parse_algorithm,
-    parse_key_purpose, parse_key_source, parse_key_status,
+    KeyManagerBackend, KeyManagerConfig, KeyManagerStats, KeyOperation, KeyPurpose, KeyStatus,
+    parse_algorithm, parse_key_purpose, parse_key_source, parse_key_status,
 };
 
 use chrono::{DateTime, Utc};
@@ -928,11 +929,11 @@ impl EncryptionStats {
     }
 }
 
-/// Deterministic key generation utility for KMS fallback scenarios
+/// Deterministic key generation utility for tests
 ///
-/// This utility generates consistent keys for development, testing, and fallback scenarios
-/// when external KMS services are unavailable. It uses SHA-256 hashing to create
-/// deterministic keys based on the service type and configuration parameters.
+/// Derives a key from its inputs with SHA-256. Anyone who knows the inputs can derive the
+/// same key, so it is **not a secret** and must never encrypt real data. Hammerwork no
+/// longer uses it as a fallback when a KMS is unavailable (key loading fails instead).
 ///
 /// # Arguments
 ///
@@ -950,11 +951,11 @@ impl EncryptionStats {
 /// # {
 /// use hammerwork::encryption::generate_deterministic_key;
 ///
-/// // Generate a deterministic key for AWS KMS fallback
+/// // Derive a reproducible test key
 /// let key = generate_deterministic_key("aws-kms-data-key", &["my-key-id", "us-east-1"]);
 /// assert_eq!(key.len(), 32); // SHA-256 produces 32 bytes
 ///
-/// // Generate a deterministic key for Azure Key Vault fallback
+/// // Different inputs give a different key
 /// let key = generate_deterministic_key("azure-kv-master-key", &["vault-url", "key-name"]);
 /// assert_eq!(key.len(), 32);
 /// # }

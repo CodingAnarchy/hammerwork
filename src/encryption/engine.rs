@@ -7,14 +7,14 @@
 use super::key_manager::KeyManager;
 use super::{
     EncryptedPayload, EncryptionAlgorithm, EncryptionConfig, EncryptionError, EncryptionMetadata,
-    EncryptionStats, KeySource, RetentionPolicy,
+    EncryptionStats, KeySource, RetentionPolicy, kms,
 };
 use serde_json::Value;
 use sqlx::Database;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
 #[cfg(feature = "encryption")]
 use {
@@ -36,18 +36,23 @@ use {
 /// The engine is designed to be used from multiple threads safely. Internal
 /// state is protected with appropriate synchronization primitives.
 ///
+/// The `DB` parameter is the database of the optional [`KeyManager`]; the engine's bounds
+/// are currently only satisfied by MySQL (`sqlx::MySql`).
+///
 /// # Examples
 ///
 /// ```rust,no_run
-/// # #[cfg(feature = "encryption")]
+/// # #[cfg(all(feature = "encryption", feature = "mysql"))]
 /// # {
-/// use hammerwork::encryption::{EncryptionEngine, EncryptionConfig, EncryptionAlgorithm};
+/// use hammerwork::encryption::{EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource};
 /// use serde_json::json;
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM);
-///     let mut engine = EncryptionEngine::new(config)?;
+///     // HAMMERWORK_ENCRYPTION_KEY holds a base64-encoded 32-byte key
+///     let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+///         .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()));
+///     let mut engine = EncryptionEngine::<sqlx::MySql>::new(config).await?;
 ///
 ///     let payload = json!({
 ///         "user_id": "123",
@@ -107,20 +112,22 @@ where
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # #[cfg(feature = "encryption")]
+    /// # #[cfg(all(feature = "encryption", feature = "mysql"))]
     /// # {
     /// use hammerwork::encryption::{EncryptionEngine, EncryptionConfig, EncryptionAlgorithm, KeySource};
     ///
-    /// # fn example() -> Result<(), hammerwork::encryption::EncryptionError> {
-    /// // With environment variable key
+    /// # async fn example() -> Result<(), hammerwork::encryption::EncryptionError> {
+    /// // With environment variable key (base64-encoded 32-byte key)
     /// let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     ///     .with_key_source(KeySource::Environment("MY_ENCRYPTION_KEY".to_string()));
-    /// let engine = EncryptionEngine::new(config)?;
+    /// let engine = EncryptionEngine::<sqlx::MySql>::new(config).await?;
     ///
     /// // With static key (for testing only)
     /// let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
-    ///     .with_key_source(KeySource::Static("base64encodedkey".to_string()));
-    /// let engine = EncryptionEngine::new(config)?;
+    ///     .with_key_source(KeySource::Static(
+    ///         "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=".to_string(),
+    ///     ));
+    /// let engine = EncryptionEngine::<sqlx::MySql>::new(config).await?;
     /// # Ok(())
     /// # }
     /// # }
@@ -176,11 +183,11 @@ where
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # #[cfg(feature = "encryption")]
+    /// # #[cfg(all(feature = "encryption", feature = "mysql"))]
     /// # {
     /// use serde_json::json;
     ///
-    /// # async fn example(mut engine: hammerwork::encryption::EncryptionEngine) -> Result<(), Box<dyn std::error::Error>> {
+    /// # async fn example(mut engine: hammerwork::encryption::EncryptionEngine<sqlx::MySql>) -> Result<(), Box<dyn std::error::Error>> {
     /// let payload = json!({
     ///     "user_id": "123",
     ///     "email": "user@example.com",
@@ -354,9 +361,9 @@ where
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # #[cfg(feature = "encryption")]
+    /// # #[cfg(all(feature = "encryption", feature = "mysql"))]
     /// # {
-    /// # async fn example(mut engine: hammerwork::encryption::EncryptionEngine, encrypted_payload: hammerwork::encryption::EncryptedPayload) -> Result<(), Box<dyn std::error::Error>> {
+    /// # async fn example(mut engine: hammerwork::encryption::EncryptionEngine<sqlx::MySql>, encrypted_payload: hammerwork::encryption::EncryptedPayload) -> Result<(), Box<dyn std::error::Error>> {
     /// let decrypted_payload = engine.decrypt_payload(&encrypted_payload).await?;
     /// println!("Decrypted: {}", decrypted_payload);
     /// # Ok(())
@@ -449,11 +456,11 @@ where
     /// # Examples
     ///
     /// ```rust
-    /// # #[cfg(feature = "encryption")]
+    /// # #[cfg(all(feature = "encryption", feature = "mysql"))]
     /// # {
     /// use serde_json::json;
     ///
-    /// # fn example(engine: &hammerwork::encryption::EncryptionEngine) {
+    /// # fn example(engine: &hammerwork::encryption::EncryptionEngine<sqlx::MySql>) {
     /// let payload = json!({
     ///     "user_id": "123",
     ///     "email": "user@example.com",
@@ -516,9 +523,9 @@ where
     /// # Examples
     ///
     /// ```rust
-    /// # #[cfg(feature = "encryption")]
+    /// # #[cfg(all(feature = "encryption", feature = "mysql"))]
     /// # {
-    /// # fn example(engine: &hammerwork::encryption::EncryptionEngine) {
+    /// # fn example(engine: &hammerwork::encryption::EncryptionEngine<sqlx::MySql>) {
     /// let stats = engine.get_stats();
     /// println!("Jobs encrypted: {}", stats.jobs_encrypted);
     /// println!("Success rate: {:.2}%", stats.encryption_success_rate());
@@ -576,452 +583,6 @@ where
     }
 
     // Private helper methods
-
-    #[cfg(feature = "encryption")]
-    async fn load_from_aws_kms(
-        service_config: &str,
-        expected_size: usize,
-    ) -> Result<Vec<u8>, EncryptionError> {
-        // Parse AWS KMS configuration: aws://key-id?region=us-east-1
-        let config_parts: Vec<&str> = service_config
-            .strip_prefix("aws://")
-            .unwrap_or(service_config)
-            .split('?')
-            .collect();
-
-        let key_id = config_parts[0];
-        let region = if config_parts.len() > 1 {
-            config_parts[1]
-                .strip_prefix("region=")
-                .unwrap_or("us-east-1")
-        } else {
-            "us-east-1"
-        };
-
-        info!(
-            "Loading key from AWS KMS: key_id={}, region={}",
-            key_id, region
-        );
-
-        #[cfg(feature = "aws-kms")]
-        {
-            use aws_config::Region;
-            use aws_sdk_kms::Client;
-
-            // Load AWS configuration
-            let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new(region.to_string()))
-                .load()
-                .await;
-
-            let client = Client::new(&config);
-
-            // Generate a data key for this specific encryption key
-            let key_spec = match expected_size {
-                32 => aws_sdk_kms::types::DataKeySpec::Aes256,
-                16 => aws_sdk_kms::types::DataKeySpec::Aes128,
-                _ => {
-                    return Err(EncryptionError::KeyManagement(format!(
-                        "Unsupported key size for AWS KMS: {} bytes",
-                        expected_size
-                    )));
-                }
-            };
-
-            match client
-                .generate_data_key()
-                .key_id(key_id)
-                .key_spec(key_spec)
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    if let Some(plaintext) = response.plaintext {
-                        let key_material = plaintext.into_inner();
-                        if key_material.len() == expected_size {
-                            info!("Successfully loaded encryption key from AWS KMS");
-                            return Ok(key_material);
-                        } else {
-                            return Err(EncryptionError::KeyManagement(format!(
-                                "AWS KMS returned key with incorrect length: expected {}, got {}",
-                                expected_size,
-                                key_material.len()
-                            )));
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(EncryptionError::KeyManagement(format!(
-                        "Failed to load key from AWS KMS: {}",
-                        e
-                    )));
-                }
-            }
-        }
-
-        #[cfg(not(feature = "aws-kms"))]
-        {
-            warn!("AWS KMS feature not enabled, falling back to deterministic key generation");
-        }
-
-        // Fallback to deterministic key generation for development/testing
-        let key = super::generate_deterministic_key_with_size(
-            "aws-kms-data-key",
-            &[key_id, region],
-            expected_size,
-        );
-
-        Ok(key)
-    }
-
-    #[cfg(feature = "encryption")]
-    async fn load_from_vault(
-        service_config: &str,
-        expected_size: usize,
-    ) -> Result<Vec<u8>, EncryptionError> {
-        // Parse Vault configuration: vault://secret/encryption-key?addr=https://vault.example.com
-        let config_parts: Vec<&str> = service_config
-            .strip_prefix("vault://")
-            .unwrap_or(service_config)
-            .split('?')
-            .collect();
-
-        let secret_path = config_parts[0];
-        let vault_addr = if config_parts.len() > 1 {
-            config_parts[1]
-                .strip_prefix("addr=")
-                .unwrap_or("https://vault.example.com")
-                .to_string()
-        } else {
-            std::env::var("VAULT_ADDR").unwrap_or_else(|_| "https://vault.example.com".to_string())
-        };
-
-        info!(
-            "Loading key from HashiCorp Vault: path={}, addr={}",
-            secret_path, vault_addr
-        );
-
-        #[cfg(feature = "vault-kms")]
-        {
-            use vaultrs::{client::VaultClient, kv2};
-
-            // Try to get Vault token from environment
-            let token = std::env::var("VAULT_TOKEN").ok();
-
-            if let Some(vault_token) = token {
-                // Create Vault client
-                let client_result = VaultClient::new(
-                    vaultrs::client::VaultClientSettingsBuilder::default()
-                        .address(vault_addr.clone())
-                        .token(vault_token)
-                        .build()
-                        .unwrap(),
-                );
-
-                match client_result {
-                    Ok(client) => {
-                        // Try to read the secret from Vault
-                        // Parse the path to extract mount and secret path
-                        let path_parts: Vec<&str> = secret_path.split('/').collect();
-                        if path_parts.len() >= 2 {
-                            let mount = path_parts[0];
-                            let secret_key = path_parts[1..].join("/");
-
-                            match kv2::read::<serde_json::Value>(&client, mount, &secret_key).await
-                            {
-                                Ok(secret) => {
-                                    // Look for a key field in the secret
-                                    if let Some(key_data) = secret.get("key") {
-                                        if let Some(key_str) = key_data.as_str() {
-                                            // Try to decode as base64 first
-                                            if let Ok(decoded) = base64::Engine::decode(
-                                                &base64::engine::general_purpose::STANDARD,
-                                                key_str,
-                                            ) {
-                                                if decoded.len() == expected_size {
-                                                    info!(
-                                                        "Successfully loaded encryption key from HashiCorp Vault"
-                                                    );
-                                                    return Ok(decoded);
-                                                }
-                                                // If decoded but wrong size, pad or truncate
-                                                let mut key = vec![0u8; expected_size];
-                                                let copy_len =
-                                                    std::cmp::min(decoded.len(), expected_size);
-                                                key[..copy_len]
-                                                    .copy_from_slice(&decoded[..copy_len]);
-                                                if decoded.len() < expected_size {
-                                                    // Pad with hash of original key
-                                                    use sha2::{Digest, Sha256};
-                                                    let mut hasher = Sha256::new();
-                                                    hasher.update(&decoded);
-                                                    let hash = hasher.finalize();
-                                                    let hash_bytes = hash.as_slice();
-                                                    for i in decoded.len()..expected_size {
-                                                        key[i] = hash_bytes[i % hash_bytes.len()];
-                                                    }
-                                                }
-                                                info!(
-                                                    "Successfully loaded and resized encryption key from HashiCorp Vault"
-                                                );
-                                                return Ok(key);
-                                            }
-                                            // If not base64, use as string and hash to expected size
-                                            use sha2::{Digest, Sha256};
-                                            let mut hasher = Sha256::new();
-                                            hasher.update(key_str.as_bytes());
-                                            let hash = hasher.finalize();
-                                            let hash_bytes = hash.as_slice();
-                                            let mut key = vec![0u8; expected_size];
-                                            for (i, byte) in key.iter_mut().enumerate() {
-                                                *byte = hash_bytes[i % hash_bytes.len()];
-                                            }
-                                            info!(
-                                                "Successfully loaded and hashed encryption key from HashiCorp Vault"
-                                            );
-                                            return Ok(key);
-                                        }
-                                    }
-
-                                    // If no 'key' field, try to generate a key from the secret data
-                                    warn!(
-                                        "No 'key' field found in Vault secret, using deterministic generation from secret data"
-                                    );
-                                    use sha2::{Digest, Sha256};
-                                    let mut hasher = Sha256::new();
-                                    hasher.update(secret_path.as_bytes());
-                                    // Add some entropy from the secret if available
-                                    if let Some(first_value) =
-                                        secret.as_object().and_then(|obj| obj.values().next())
-                                    {
-                                        if let Some(value_str) = first_value.as_str() {
-                                            hasher.update(value_str.as_bytes());
-                                        }
-                                    }
-                                    let hash = hasher.finalize();
-                                    let hash_bytes = hash.as_slice();
-                                    let mut key = vec![0u8; expected_size];
-                                    for (i, byte) in key.iter_mut().enumerate() {
-                                        *byte = hash_bytes[i % hash_bytes.len()];
-                                    }
-                                    return Ok(key);
-                                }
-                                Err(e) => {
-                                    warn!("Failed to read secret from HashiCorp Vault: {}", e);
-                                }
-                            }
-                        } else {
-                            warn!("Invalid Vault secret path format: {}", secret_path);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to create Vault client: {}", e);
-                    }
-                }
-            } else {
-                warn!(
-                    "No VAULT_TOKEN environment variable found, falling back to deterministic key generation"
-                );
-            }
-        }
-
-        #[cfg(not(feature = "vault-kms"))]
-        {
-            warn!("Vault KMS feature not enabled, falling back to deterministic key generation");
-        }
-
-        // Fallback to deterministic key generation for development/testing
-        let key = super::generate_deterministic_key_with_size(
-            "vault-data-key",
-            &[secret_path, &vault_addr],
-            expected_size,
-        );
-
-        Ok(key)
-    }
-
-    #[cfg(feature = "encryption")]
-    async fn load_from_gcp_kms(
-        service_config: &str,
-        expected_size: usize,
-    ) -> Result<Vec<u8>, EncryptionError> {
-        // Parse GCP KMS configuration: gcp://projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY
-        let key_resource = service_config
-            .strip_prefix("gcp://")
-            .unwrap_or(service_config);
-
-        info!("Loading key from GCP KMS: resource={}", key_resource);
-
-        #[cfg(feature = "gcp-kms")]
-        {
-            use google_cloud_kms::client::{Client, ClientConfig};
-            use google_cloud_kms::grpc::kms::v1::GenerateRandomBytesRequest;
-
-            // Try to create GCP KMS client with automatic authentication
-            let config_result = ClientConfig::default().with_auth().await;
-
-            match config_result {
-                Ok(client_config) => {
-                    let client_result = Client::new(client_config).await;
-
-                    match client_result {
-                        Ok(client) => {
-                            // Parse the key resource path for project and location
-                            let path_parts: Vec<&str> = key_resource.split('/').collect();
-                            if path_parts.len() >= 4 {
-                                let project = path_parts[1];
-                                let location = path_parts[3];
-
-                                // Create a parent path for the project/location
-                                let parent = format!("projects/{}/locations/{}", project, location);
-
-                                // Generate random bytes instead of using generate_data_key
-                                // This is a simpler approach that works with the v0.6 API
-                                let req = GenerateRandomBytesRequest {
-                                    location: parent,
-                                    length_bytes: expected_size as i32,
-                                    protection_level: 1, // SOFTWARE (default protection level)
-                                };
-
-                                match client.generate_random_bytes(req, None).await {
-                                    Ok(response) => {
-                                        let plaintext = response.data;
-                                        if plaintext.len() == expected_size {
-                                            info!("Successfully generated random key from GCP KMS");
-                                            return Ok(plaintext);
-                                        } else {
-                                            return Err(EncryptionError::KeyManagement(format!(
-                                                "GCP KMS returned key with incorrect length: expected {}, got {}",
-                                                expected_size,
-                                                plaintext.len()
-                                            )));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to generate random bytes from GCP KMS: {}",
-                                            e
-                                        );
-                                        // Fall through to deterministic key generation
-                                    }
-                                }
-                            } else {
-                                warn!("Invalid GCP KMS resource path format: {}", key_resource);
-                                // Fall through to deterministic key generation
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to create GCP KMS client: {}", e);
-                            // Fall through to deterministic key generation
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to configure GCP KMS client: {}", e);
-                    // Fall through to deterministic key generation
-                }
-            }
-        }
-
-        #[cfg(not(feature = "gcp-kms"))]
-        {
-            warn!("GCP KMS feature not enabled, falling back to deterministic key generation");
-        }
-
-        // Fallback to deterministic key generation for development/testing
-        let key = super::generate_deterministic_key_with_size(
-            "gcp-kms-data-key",
-            &[key_resource],
-            expected_size,
-        );
-
-        Ok(key)
-    }
-
-    #[cfg(feature = "encryption")]
-    async fn load_from_azure_kv(
-        service_config: &str,
-        expected_size: usize,
-    ) -> Result<Vec<u8>, EncryptionError> {
-        // Parse Azure Key Vault configuration: azure://vault-name.vault.azure.net/keys/key-name
-        let vault_parts: Vec<&str> = service_config
-            .strip_prefix("azure://")
-            .unwrap_or(service_config)
-            .split('/')
-            .collect();
-
-        let vault_url = if !vault_parts.is_empty() {
-            format!("https://{}", vault_parts[0])
-        } else {
-            "https://vault.vault.azure.net".to_string()
-        };
-
-        let key_name = vault_parts.get(2).unwrap_or(&"encryption-key");
-
-        info!(
-            "Loading key from Azure Key Vault: vault={}, key={}",
-            vault_url, key_name
-        );
-
-        // Try to load the key from Azure Key Vault with real integration
-        #[cfg(feature = "azure-kv")]
-        {
-            match super::azure::fetch_key_material(&vault_url, key_name).await {
-                Ok(decoded_key) => {
-                    // Ensure the key is the expected size
-                    if decoded_key.len() >= expected_size {
-                        info!("Successfully loaded encryption key from Azure Key Vault");
-                        return Ok(decoded_key[..expected_size].to_vec());
-                    }
-
-                    // If key is shorter than expected, pad it using key derivation
-                    let mut final_key = vec![0u8; expected_size];
-                    final_key[..decoded_key.len()].copy_from_slice(&decoded_key);
-
-                    use hmac::{Hmac, Mac};
-                    use sha2::Sha256;
-                    type HmacSha256 = Hmac<Sha256>;
-
-                    let mut mac =
-                        <HmacSha256 as Mac>::new_from_slice(&decoded_key).map_err(|e| {
-                            EncryptionError::KeyManagement(format!("HMAC creation failed: {}", e))
-                        })?;
-                    mac.update(b"azure-kv-key-derivation");
-                    mac.update(vault_url.as_bytes());
-                    mac.update(key_name.as_bytes());
-                    let derived = mac.finalize().into_bytes();
-
-                    for (i, byte) in final_key.iter_mut().enumerate().skip(decoded_key.len()) {
-                        *byte = derived[i % derived.len()];
-                    }
-
-                    info!("Successfully loaded and padded encryption key from Azure Key Vault");
-                    return Ok(final_key);
-                }
-                Err(e) => {
-                    warn!("Failed to load key from Azure Key Vault: {}", e);
-                    // Fall through to deterministic key generation
-                }
-            }
-        }
-
-        #[cfg(not(feature = "azure-kv"))]
-        {
-            warn!(
-                "Azure Key Vault feature not enabled, falling back to deterministic key generation"
-            );
-        }
-
-        // Fallback to deterministic key generation for development/testing
-        let key = super::generate_deterministic_key_with_size(
-            "azure-kv-data-key",
-            &[&vault_url, key_name],
-            expected_size,
-        );
-
-        info!("Using deterministic key generation for Azure Key Vault (fallback)");
-        Ok(key)
-    }
 
     #[cfg(feature = "encryption")]
     async fn store_generated_key(
@@ -1172,21 +733,7 @@ where
                 Ok(key_bytes)
             }
             KeySource::External(service_config) => {
-                // Parse the service configuration to determine the external KMS type
-                if service_config.starts_with("aws://") {
-                    Self::load_from_aws_kms(service_config, expected_size).await
-                } else if service_config.starts_with("vault://") {
-                    Self::load_from_vault(service_config, expected_size).await
-                } else if service_config.starts_with("gcp://") {
-                    Self::load_from_gcp_kms(service_config, expected_size).await
-                } else if service_config.starts_with("azure://") {
-                    Self::load_from_azure_kv(service_config, expected_size).await
-                } else {
-                    Err(EncryptionError::KeyManagement(format!(
-                        "Unknown external key management service: {}",
-                        service_config
-                    )))
-                }
+                load_external_key(service_config, expected_size).await
             }
             KeySource::Generated(location) => {
                 // Generate a new random key
@@ -1389,6 +936,198 @@ where
             }
             _ => {} // Primitive values don't contain nested fields
         }
+    }
+}
+
+// External key loaders. They fail closed: an unavailable KMS, missing credentials or a
+// KMS source whose cargo feature is not enabled is an error, never a fallback key.
+
+/// Load a key from the external key management service named by `service_config`.
+async fn load_external_key(
+    service_config: &str,
+    expected_size: usize,
+) -> Result<Vec<u8>, EncryptionError> {
+    if service_config.starts_with("aws://") {
+        load_from_aws_kms(service_config, expected_size).await
+    } else if service_config.starts_with("vault://") {
+        load_from_vault(service_config, expected_size).await
+    } else if service_config.starts_with("gcp://") {
+        load_from_gcp_kms(service_config, expected_size).await
+    } else if service_config.starts_with("azure://") {
+        load_from_azure_kv(service_config, expected_size).await
+    } else {
+        Err(EncryptionError::KeyManagement(format!(
+            "Unknown external key management service: {}",
+            service_config
+        )))
+    }
+}
+
+/// Load a data key from AWS KMS (`aws://<key-id>?region=<region>&endpoint=<url>`).
+///
+/// Note: this asks KMS for a new data key (`GenerateDataKey`) on every load.
+async fn load_from_aws_kms(
+    service_config: &str,
+    expected_size: usize,
+) -> Result<Vec<u8>, EncryptionError> {
+    let (key_id, region, endpoint) = kms::aws_key_config(service_config)?;
+
+    info!(
+        "Loading key from AWS KMS: key_id={}, region={}",
+        key_id, region
+    );
+
+    #[cfg(not(feature = "aws-kms"))]
+    {
+        let _ = (endpoint, expected_size);
+        Err(kms::kms_feature_disabled("aws://", "aws-kms"))
+    }
+
+    #[cfg(feature = "aws-kms")]
+    {
+        let key = kms::aws_generate_data_key(key_id, region, endpoint, expected_size).await?;
+        info!("Successfully loaded encryption key from AWS KMS");
+        Ok(key)
+    }
+}
+
+/// Load a key from a HashiCorp Vault KV v2 secret (`vault://<mount>/<path>?addr=<url>`).
+///
+/// The secret's string `key` field is used: a base64 key is truncated or padded to
+/// `expected_size`, any other string is hashed with SHA-256.
+async fn load_from_vault(
+    service_config: &str,
+    expected_size: usize,
+) -> Result<Vec<u8>, EncryptionError> {
+    let (secret_path, params) = kms::parse_service_config(service_config, "vault://");
+    let vault_addr = kms::vault_address(&params)?;
+    let (mount, secret) = kms::vault_mount_and_path(secret_path)?;
+
+    info!(
+        "Loading key from HashiCorp Vault: path={}, addr={}",
+        secret_path, vault_addr
+    );
+
+    #[cfg(not(feature = "vault-kms"))]
+    {
+        let _ = (mount, secret, expected_size);
+        Err(kms::kms_feature_disabled("vault://", "vault-kms"))
+    }
+
+    #[cfg(feature = "vault-kms")]
+    {
+        let key_str = kms::vault_read_key_field(&vault_addr, mount, secret).await?;
+
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&key_str) {
+            if decoded.len() == expected_size {
+                info!("Successfully loaded encryption key from HashiCorp Vault");
+                return Ok(decoded);
+            }
+            // Wrong size: truncate, or pad with a hash of the decoded key
+            let mut key = vec![0u8; expected_size];
+            let copy_len = std::cmp::min(decoded.len(), expected_size);
+            key[..copy_len].copy_from_slice(&decoded[..copy_len]);
+            if decoded.len() < expected_size {
+                let hash = Sha256::digest(&decoded);
+                for (i, byte) in key.iter_mut().enumerate().skip(decoded.len()) {
+                    *byte = hash[i % hash.len()];
+                }
+            }
+            info!("Successfully loaded and resized encryption key from HashiCorp Vault");
+            return Ok(key);
+        }
+
+        // Not base64: hash the string to the expected size
+        let hash = Sha256::digest(key_str.as_bytes());
+        let key = (0..expected_size).map(|i| hash[i % hash.len()]).collect();
+        info!("Successfully loaded and hashed encryption key from HashiCorp Vault");
+        Ok(key)
+    }
+}
+
+/// Generate a key with GCP KMS
+/// (`gcp://projects/<project>/locations/<location>/keyRings/<ring>/cryptoKeys/<key>`).
+///
+/// Note: this asks KMS for random bytes (`GenerateRandomBytes`) on every load.
+async fn load_from_gcp_kms(
+    service_config: &str,
+    expected_size: usize,
+) -> Result<Vec<u8>, EncryptionError> {
+    let (key_resource, _) = kms::parse_service_config(service_config, "gcp://");
+    let location = kms::gcp_location(key_resource)?;
+
+    info!("Loading key from GCP KMS: resource={}", key_resource);
+
+    #[cfg(not(feature = "gcp-kms"))]
+    {
+        let _ = (location, expected_size);
+        Err(kms::kms_feature_disabled("gcp://", "gcp-kms"))
+    }
+
+    #[cfg(feature = "gcp-kms")]
+    {
+        let key = kms::gcp_generate_random_bytes(location, expected_size).await?;
+        info!("Successfully generated random key from GCP KMS");
+        Ok(key)
+    }
+}
+
+/// Load a key from Azure Key Vault (`azure://<vault-host>/keys/<key-name>`, key name
+/// defaults to `encryption-key`). Material shorter than `expected_size` is padded with
+/// HMAC-SHA256 output keyed by the material.
+async fn load_from_azure_kv(
+    service_config: &str,
+    expected_size: usize,
+) -> Result<Vec<u8>, EncryptionError> {
+    let (vault_url, key_name) = kms::azure_vault_and_key(service_config, "encryption-key")?;
+
+    info!(
+        "Loading key from Azure Key Vault: vault={}, key={}",
+        vault_url, key_name
+    );
+
+    #[cfg(not(feature = "azure-kv"))]
+    {
+        let _ = (vault_url, key_name, expected_size);
+        Err(kms::kms_feature_disabled("azure://", "azure-kv"))
+    }
+
+    #[cfg(feature = "azure-kv")]
+    {
+        let decoded_key = super::azure::fetch_key_material(&vault_url, &key_name)
+            .await
+            .map_err(|e| {
+                EncryptionError::KeyManagement(format!(
+                    "Failed to load key from Azure Key Vault: {}",
+                    e
+                ))
+            })?;
+
+        if decoded_key.len() >= expected_size {
+            info!("Successfully loaded encryption key from Azure Key Vault");
+            return Ok(decoded_key[..expected_size].to_vec());
+        }
+
+        // Key is shorter than expected: pad it using key derivation
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<Sha256>;
+
+        let mut final_key = vec![0u8; expected_size];
+        final_key[..decoded_key.len()].copy_from_slice(&decoded_key);
+
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&decoded_key)
+            .map_err(|e| EncryptionError::KeyManagement(format!("HMAC creation failed: {}", e)))?;
+        mac.update(b"azure-kv-key-derivation");
+        mac.update(vault_url.as_bytes());
+        mac.update(key_name.as_bytes());
+        let derived = mac.finalize().into_bytes();
+
+        for (i, byte) in final_key.iter_mut().enumerate().skip(decoded_key.len()) {
+            *byte = derived[i % derived.len()];
+        }
+
+        info!("Successfully loaded and padded encryption key from Azure Key Vault");
+        Ok(final_key)
     }
 }
 
@@ -1602,5 +1341,74 @@ mod tests {
         // 3. Set it on the engine
         // 4. Test that key rotation uses the key manager
         assert!(engine.key_manager.is_none());
+    }
+
+    // ---- Fail-closed external key loading (#16); no cloud credentials needed ----
+
+    #[tokio::test]
+    async fn test_external_key_invalid_config_fails() {
+        let cases = [
+            "aws://?region=us-east-1",
+            "vault://key-only?addr=http://127.0.0.1:1",
+            "gcp://not-a-resource",
+            "azure://",
+        ];
+        for source in cases {
+            let err = load_external_key(source, 32).await.unwrap_err();
+            assert!(
+                matches!(err, EncryptionError::InvalidConfiguration(_)),
+                "{source}: {err}"
+            );
+        }
+        let err = load_external_key("ftp://key", 32).await.unwrap_err();
+        assert!(matches!(err, EncryptionError::KeyManagement(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_external_key_without_feature_fails() {
+        #[allow(unused_mut)]
+        let mut cases: Vec<(&str, &str)> = Vec::new();
+        #[cfg(not(feature = "aws-kms"))]
+        cases.push(("aws://alias/key?region=us-east-1", "aws-kms"));
+        #[cfg(not(feature = "vault-kms"))]
+        cases.push(("vault://secret/key?addr=http://127.0.0.1:1", "vault-kms"));
+        #[cfg(not(feature = "gcp-kms"))]
+        cases.push((
+            "gcp://projects/p/locations/global/keyRings/r/cryptoKeys/k",
+            "gcp-kms",
+        ));
+        #[cfg(not(feature = "azure-kv"))]
+        cases.push(("azure://my-vault.vault.azure.net/keys/k", "azure-kv"));
+
+        for (source, feature) in cases {
+            let err = load_external_key(source, 32).await.unwrap_err();
+            assert!(
+                matches!(err, EncryptionError::InvalidConfiguration(_)),
+                "{source}: {err}"
+            );
+            assert!(err.to_string().contains(feature), "{source}: {err}");
+        }
+    }
+
+    #[cfg(feature = "aws-kms")]
+    #[tokio::test]
+    async fn test_aws_key_unreachable_endpoint_fails() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(120),
+            load_from_aws_kms(
+                "aws://alias/hammerwork-test?region=us-east-1&endpoint=http://127.0.0.1:1",
+                32,
+            ),
+        )
+        .await
+        .expect("AWS KMS loader did not finish");
+        assert!(matches!(result, Err(EncryptionError::KeyManagement(_))));
+    }
+
+    #[cfg(feature = "vault-kms")]
+    #[tokio::test]
+    async fn test_vault_key_unavailable_fails() {
+        let result = load_from_vault("vault://secret/hammerwork?addr=http://127.0.0.1:1", 32).await;
+        assert!(matches!(result, Err(EncryptionError::KeyManagement(_))));
     }
 }

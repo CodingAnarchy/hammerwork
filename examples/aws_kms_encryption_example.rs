@@ -5,7 +5,7 @@
 //! - Use AWS KMS for encryption key generation
 //! - Set up proper AWS credentials and regions
 //! - Handle AWS KMS errors gracefully
-//! - Fall back to deterministic keys for development
+//! - Fail closed (return an error) when the KMS is unavailable
 
 use hammerwork::{
     Job,
@@ -76,10 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             Err(e) => {
-                println!(
-                    "   ⚠️  AWS KMS not available (falling back to deterministic): {}",
-                    e
-                );
+                println!("   ⚠️  AWS KMS not available (key loading failed): {}", e);
                 println!("   This is normal in development without proper AWS credentials");
             }
         }
@@ -141,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
 
-    // Configure with AWS KMS (will fall back if not available)
+    // Configure with AWS KMS (fails if the KMS is not available)
     let aws_job = payment_job
         .with_encryption(
             EncryptionConfig::new(EncryptionAlgorithm::AES256GCM).with_key_source(

@@ -5,7 +5,7 @@
 //! - Use GCP KMS for encryption key generation
 //! - Set up proper Google Cloud credentials and projects
 //! - Handle GCP KMS errors gracefully
-//! - Fall back to deterministic keys for development
+//! - Fail closed (return an error) when the KMS is unavailable
 
 use hammerwork::{
     Job,
@@ -76,10 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             Err(e) => {
-                println!(
-                    "   ⚠️  GCP KMS not available (falling back to deterministic): {}",
-                    e
-                );
+                println!("   ⚠️  GCP KMS not available (key loading failed): {}", e);
                 println!("   This is normal in development without proper GCP credentials");
             }
         }
@@ -143,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
 
-    // Configure with GCP KMS (will fall back if not available)
+    // Configure with GCP KMS (fails if the KMS is not available)
     let gcp_job = payment_job
         .with_encryption(
             EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
