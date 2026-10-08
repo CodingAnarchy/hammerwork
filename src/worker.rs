@@ -2036,6 +2036,27 @@ where
 
         let processing_time_ms = (Utc::now() - start_time).num_milliseconds().max(0) as u64;
 
+        // Store the result before recording the completion, so that anyone who sees the
+        // job as Completed can also read its result.
+        if let Some(result_data) = job_result.data
+            && let crate::job::ResultStorage::Database = job.result_config.storage
+        {
+            let expires_at = job
+                .result_config
+                .ttl
+                .map(|ttl| crate::queue::saturating_add_to(Utc::now(), ttl));
+
+            if let Err(e) = self
+                .queue
+                .store_job_result(job_id, result_data, expires_at)
+                .await
+            {
+                error!("Failed to store result for job {}: {}", job_id, e);
+            } else {
+                debug!("Stored result for job {}", job_id);
+            }
+        }
+
         // Completing also reschedules a recurring job, and makes dependents whose
         // dependencies have all completed runnable, in the same transaction.
         if self
@@ -2061,25 +2082,6 @@ where
                     "Failed to update batch status for batch {}: {}",
                     batch_id, e
                 );
-            }
-        }
-
-        // Store job result if enabled and data is provided
-        if let Some(result_data) = job_result.data
-            && let crate::job::ResultStorage::Database = job.result_config.storage
-        {
-            let expires_at = job.result_config.ttl.map(|ttl| {
-                Utc::now() + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(24))
-            });
-
-            if let Err(e) = self
-                .queue
-                .store_job_result(job_id, result_data, expires_at)
-                .await
-            {
-                warn!("Failed to store job result for job {}: {}", job_id, e);
-            } else {
-                debug!("Stored result for job {}", job_id);
             }
         }
 
