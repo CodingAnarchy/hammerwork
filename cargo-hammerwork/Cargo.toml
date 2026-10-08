@@ -1,6 +1,6 @@
 [package]
 name = "cargo-hammerwork"
-description = "A comprehensive cargo subcommand for managing Hammerwork job queues with webhook management, event streaming, database operations, and advanced monitoring capabilities"
+description = "A comprehensive cargo subcommand for managing Hammerwork job queues with webhook management, database operations, and advanced monitoring capabilities"
 keywords = ["cargo", "cli", "hammerwork", "job-queue", "database"]
 categories = ["command-line-utilities", "development-tools::cargo-plugins"]
 version.workspace = true
@@ -33,6 +33,7 @@ indicatif = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
 cron = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.8"

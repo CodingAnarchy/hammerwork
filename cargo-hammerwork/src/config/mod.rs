@@ -91,6 +91,7 @@
 //! - `HAMMERWORK_DEFAULT_LIMIT` - Default limit for list operations
 //! - `HAMMERWORK_LOG_LEVEL` - Logging level (error, warn, info, debug, trace)
 //! - `HAMMERWORK_POOL_SIZE` - Database connection pool size
+//! - `HAMMERWORK_WEBHOOKS_FILE` - Path of the webhook registry (default `webhooks.json` beside `config.toml`)
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -238,6 +239,19 @@ impl Config {
 
         path.push("hammerwork");
         path.push("config.toml");
+        Ok(path)
+    }
+
+    /// Path of the JSON file holding webhooks managed by `cargo hammerwork webhook`.
+    ///
+    /// Defaults to `webhooks.json` beside `config.toml`; `HAMMERWORK_WEBHOOKS_FILE`
+    /// overrides it.
+    pub fn webhooks_file_path(&self) -> Result<PathBuf> {
+        if let Ok(path) = env::var("HAMMERWORK_WEBHOOKS_FILE") {
+            return Ok(PathBuf::from(path));
+        }
+        let mut path = Self::config_file_path()?;
+        path.set_file_name("webhooks.json");
         Ok(path)
     }
 

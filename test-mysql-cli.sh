@@ -37,10 +37,9 @@ $CLI queue list -d "$MYSQL_URL"
 $CLI queue stats -d "$MYSQL_URL" -n test_queue
 $CLI queue stats -d "$MYSQL_URL" -n email_queue
 
-# Test 4: Worker Operations (these are mostly placeholders)
+# Test 4: Worker lease status
 echo -e "\n📋 Test 4: Worker Operations"
-$CLI worker list -u "$MYSQL_URL"
-$CLI worker stats -u "$MYSQL_URL"
+$CLI worker status -u "$MYSQL_URL"
 
 # Test 5: Monitoring
 echo -e "\n📋 Test 5: Monitoring Operations"

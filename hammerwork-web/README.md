@@ -6,7 +6,6 @@ A modern, real-time web-based admin dashboard for monitoring and managing [Hamme
 
 - **Real-time Monitoring**: Live updates via WebSockets for queue statistics, job status, and system health
 - **Job Management**: View, retry, cancel, and inspect jobs with detailed payload and error information
-- **Spawn Operation Management**: Monitor job spawning, visualize parent-child relationships, and track spawn trees
 - **Job Archive Management**: Archive, restore, and purge jobs with configurable retention policies
 - **Queue Administration**: Monitor queue performance, clear queues, and manage queue priorities
 - **Archive Statistics**: Track storage savings, compression ratios, and archival operations
@@ -164,13 +163,17 @@ curl -u admin:password http://localhost:8080/api/stats/overview
 #### System
 - `GET /health` - Health check (no auth required)
 - `GET /api/stats/overview` - System overview statistics
-- `GET /api/stats/throughput?period=24h` - Throughput data
+- `GET /api/stats/detailed` - Per-queue statistics, hourly trends, error patterns and performance metrics
+- `GET /api/stats/trends` - Completed/failed jobs per hour from the database (last 24 hours, or a `time_range` of up to 31 days)
+- `GET /api/stats/health` - Health assessment
+
+Values the dashboard cannot measure are reported as `null` (for example memory usage on macOS, worker counts, CPU, and the metrics count), never as made-up numbers. "Failed" in trends and error patterns means jobs currently in `Failed`, `Dead` or `TimedOut`, counted at the hour they failed.
 
 #### Queues
 - `GET /api/queues` - List all queues with statistics
-- `POST /api/queues/{name}/clear` - Clear all jobs from queue
-- `POST /api/queues/{name}/pause` - Pause queue processing
-- `POST /api/queues/{name}/resume` - Resume queue processing
+- `GET /api/queues/{name}` - Queue details with hourly throughput and recent errors
+- `GET /api/queues/{name}/jobs` - Jobs in the queue (same filters as `/api/jobs`)
+- `POST /api/queues/{name}/actions` - `{"action": "pause" | "resume" | "clear_completed" | "clear_dead"}`; `clear_completed` deletes the queue's completed jobs, `clear_dead` its dead jobs older than 7 days
 
 #### Jobs
 - `GET /api/jobs?status=failed&limit=50` - List jobs with filters
@@ -185,16 +188,6 @@ curl -u admin:password http://localhost:8080/api/stats/overview
 - `POST /api/archive/jobs/{id}/restore` - Restore an archived job to pending status
 - `DELETE /api/archive/purge` - Permanently purge old archived jobs
 - `GET /api/archive/stats?queue=email` - Get archive statistics and metrics
-
-#### Spawn Operations
-- `GET /api/spawn/info` - List available spawn API endpoints
-- `GET /api/jobs/{id}/children?include_grandchildren=true` - List spawned child jobs
-- `GET /api/jobs/{id}/parent` - Get parent job information
-- `GET /api/jobs/{id}/spawn-tree?format=json&max_depth=5` - Get complete spawn hierarchy
-- `GET /api/spawn/operations?limit=50` - List spawn operations
-- `GET /api/spawn/operations/{id}` - Get spawn operation details
-- `POST /api/jobs/{id}/spawn` - Manually trigger spawn operation
-- `GET /api/spawn/stats?queue=data_processing` - Get spawn operation statistics
 
 ### WebSocket API
 

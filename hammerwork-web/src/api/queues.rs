@@ -99,6 +99,7 @@
 //! assert_eq!(detailed_stats.priority_breakdown.get("high"), Some(&5));
 //! ```
 
+use super::history::{FinishedKind, JobHistory};
 use super::{
     ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
     with_filters, with_pagination, with_sort,
@@ -168,7 +169,7 @@ pub fn routes<T>(
     queue: Arc<T>,
 ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
 where
-    T: DatabaseQueue + Send + Sync + 'static,
+    T: JobHistory + 'static,
 {
     let queue_filter = warp::any().map(move || queue.clone());
 
@@ -290,7 +291,7 @@ async fn get_queue_handler<T>(
     queue: Arc<T>,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
     match queue.get_all_queue_stats().await {
         Ok(all_stats) => {
@@ -304,7 +305,10 @@ where
                     get_status_breakdown(&queue, &queue_name).await,
                     "Failed to get status breakdown"
                 );
-                let hourly_throughput = get_hourly_throughput(&queue, &queue_name).await;
+                let hourly_throughput = try_api!(
+                    get_hourly_throughput(&*queue, &queue_name).await,
+                    "Failed to get hourly throughput"
+                );
                 let recent_errors = try_api!(
                     get_recent_errors(&queue, &queue_name).await,
                     "Failed to get recent errors"
@@ -326,8 +330,14 @@ where
                     avg_processing_time_ms: stats.statistics.avg_processing_time_ms,
                     throughput_per_minute: stats.statistics.throughput_per_minute,
                     error_rate: stats.statistics.error_rate,
-                    last_job_at: None,
-                    oldest_pending_job: None,
+                    last_job_at: try_api!(
+                        get_last_job_time(&queue, &stats.queue_name).await,
+                        "Failed to get last job time"
+                    ),
+                    oldest_pending_job: try_api!(
+                        get_oldest_pending_job(&queue, &stats.queue_name).await,
+                        "Failed to get oldest pending job"
+                    ),
                     is_paused: pause_info.is_some(),
                     paused_at: pause_info.as_ref().map(|p| p.paused_at),
                     paused_by: pause_info.as_ref().and_then(|p| p.paused_by.clone()),
@@ -363,15 +373,22 @@ async fn queue_action_handler<T>(
     action_request: QueueActionRequest,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
     match action_request.action.as_str() {
         "clear_dead" => {
             let older_than = chrono::Utc::now() - chrono::Duration::days(7); // Remove jobs older than 7 days
-            match queue.purge_dead_jobs(older_than).await {
+            match queue
+                .delete_jobs(Some(&queue_name), FinishedKind::Dead, Some(older_than))
+                .await
+            {
                 Ok(count) => {
                     let response = ApiResponse::success(serde_json::json!({
-                        "message": format!("Cleared {} dead jobs from queue '{}'", count, queue_name),
+                        "message": format!(
+                            "Cleared {} dead jobs older than 7 days from queue '{}'",
+                            count, queue_name
+                        ),
+                        "queue": queue_name,
                         "count": count
                     }));
                     Ok(json_reply(&response))
@@ -382,7 +399,10 @@ where
                 )),
             }
         }
-        "clear_completed" => match clear_completed_jobs(&queue, &queue_name).await {
+        "clear_completed" => match queue
+            .delete_jobs(Some(&queue_name), FinishedKind::Completed, None)
+            .await
+        {
             Ok(count) => {
                 let response = ApiResponse::success(serde_json::json!({
                     "message": format!("Cleared {} completed jobs from queue '{}'", count, queue_name),
@@ -431,27 +451,19 @@ where
     }
 }
 
-/// Handler for getting jobs in a specific queue
+/// Handler for getting jobs in a specific queue: the jobs listing scoped to the queue.
 async fn queue_jobs_handler<T>(
     queue_name: String,
     queue: Arc<T>,
     pagination: PaginationParams,
-    filters: FilterParams,
+    mut filters: FilterParams,
     sort: SortParams,
 ) -> Result<impl Reply, warp::Rejection>
 where
     T: DatabaseQueue + Send + Sync,
 {
-    // This would delegate to the jobs API with queue filter
-    // For now, return a simple response
-    let _ = (queue, pagination, filters, sort);
-
-    let response = ApiResponse::success(serde_json::json!({
-        "message": format!("Jobs for queue '{}' - implementation pending", queue_name),
-        "queue": queue_name
-    }));
-
-    Ok(json_reply(&response))
+    filters.queue = Some(queue_name);
+    super::jobs::list_jobs_handler(queue, pagination, filters, sort).await
 }
 
 /// Helper function to get the last job time for a queue
@@ -553,14 +565,26 @@ where
     Ok(counts.into_iter().collect())
 }
 
-/// Helper function to get hourly throughput data for a queue
-async fn get_hourly_throughput<T>(_queue: &Arc<T>, _queue_name: &str) -> Vec<HourlyThroughput>
+/// Completed/failed counts per hour over the last 24 hours (23 whole hours plus the
+/// current one) for a queue.
+async fn get_hourly_throughput<T>(
+    queue: &T,
+    queue_name: &str,
+) -> hammerwork::Result<Vec<HourlyThroughput>>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
-    // This would require tracking hourly statistics
-    // For now, return empty as it's not implemented in the DatabaseQueue trait
-    Vec::new()
+    let now = chrono::Utc::now();
+    let start = super::history::hour_floor(now) - chrono::Duration::hours(23);
+    let buckets = queue.hourly_activity(Some(queue_name), start, now).await?;
+    Ok(buckets
+        .into_iter()
+        .map(|b| HourlyThroughput {
+            hour: b.hour,
+            completed: b.completed,
+            failed: b.failed,
+        })
+        .collect())
 }
 
 /// Helper function to get recent errors for a queue
@@ -588,24 +612,6 @@ where
         .collect())
 }
 
-/// Helper function to clear completed jobs from a queue
-async fn clear_completed_jobs<T>(_queue: &Arc<T>, _queue_name: &str) -> Result<u64, String>
-where
-    T: DatabaseQueue + Send + Sync,
-{
-    // To implement this properly, we would need:
-    // 1. A method to query jobs by status (get_jobs_by_status)
-    // 2. Filter for completed jobs
-    // 3. Delete them using the existing delete_job method
-    //
-    // Since DatabaseQueue trait doesn't provide a way to query jobs by status,
-    // we cannot implement this functionality without extending the trait.
-    Err(
-        "Clear completed jobs requires additional DatabaseQueue methods not yet available"
-            .to_string(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,6 +634,47 @@ mod tests {
         let (status, body) = body_json(response).await;
         assert_eq!(status, 500);
         assert_eq!(body["success"], false);
+    }
+
+    #[tokio::test]
+    async fn test_clear_actions_report_database_failures_not_success() {
+        for action in ["clear_completed", "clear_dead"] {
+            let response = queue_action_handler(
+                "q".to_string(),
+                unreachable_queue(),
+                QueueActionRequest {
+                    action: action.to_string(),
+                    confirm: Some(true),
+                },
+            )
+            .await
+            .unwrap()
+            .into_response();
+            let (status, body) = body_json(response).await;
+            assert_eq!(status, 500, "{action}");
+            assert_eq!(body["success"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_queue_jobs_delegates_to_job_listing() {
+        let response = queue_jobs_handler(
+            "q".to_string(),
+            unreachable_queue(),
+            PaginationParams::default(),
+            serde_json::from_value(serde_json::json!({})).unwrap(),
+            SortParams {
+                sort_by: None,
+                sort_order: None,
+            },
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let (status, body) = body_json(response).await;
+        // The real listing ran (and failed on the dead database), not a stub message.
+        assert_eq!(status, 500);
+        assert!(body.get("data").is_none_or(|d| d.is_null()));
     }
 
     #[test]

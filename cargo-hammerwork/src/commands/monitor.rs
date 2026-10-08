@@ -39,17 +39,6 @@ pub enum MonitorCommand {
         #[arg(short = 'n', long, help = "Specific queue to analyze")]
         queue: Option<String>,
     },
-    #[command(about = "Tail job logs (placeholder)")]
-    Logs {
-        #[arg(short = 'u', long, help = "Database connection URL")]
-        database_url: Option<String>,
-        #[arg(short = 'l', long, help = "Number of recent log entries")]
-        lines: Option<u32>,
-        #[arg(short = 'n', long, help = "Filter by queue")]
-        queue: Option<String>,
-        #[arg(long, help = "Follow logs in real-time")]
-        follow: bool,
-    },
 }
 
 impl MonitorCommand {
@@ -67,14 +56,6 @@ impl MonitorCommand {
             MonitorCommand::Metrics { period, queue, .. } => {
                 show_metrics(pool, period.clone(), queue.clone()).await?;
             }
-            MonitorCommand::Logs {
-                lines,
-                queue,
-                follow,
-                ..
-            } => {
-                show_logs(pool, *lines, queue.clone(), *follow).await?;
-            }
         }
         Ok(())
     }
@@ -84,7 +65,6 @@ impl MonitorCommand {
             MonitorCommand::Dashboard { database_url, .. } => database_url,
             MonitorCommand::Health { database_url, .. } => database_url,
             MonitorCommand::Metrics { database_url, .. } => database_url,
-            MonitorCommand::Logs { database_url, .. } => database_url,
         };
 
         url_option
@@ -527,105 +507,22 @@ async fn show_metrics(
     Ok(())
 }
 
-async fn show_logs(
-    _pool: DatabasePool,
-    lines: Option<u32>,
-    queue: Option<String>,
-    follow: bool,
-) -> Result<()> {
-    let lines_count = lines.unwrap_or(50);
-
-    println!("📜 Job Logs (Placeholder)");
-    if let Some(q) = &queue {
-        println!("🎯 Queue: {}", q);
-    }
-    println!("📄 Lines: {}", lines_count);
-    if follow {
-        println!("👁️  Following logs...");
-    }
-    println!("═══════════════════════════");
-
-    // In a real implementation, this would:
-    // 1. Query job events/logs from a logs table
-    // 2. Show recent job state changes
-    // 3. Display error messages and stack traces
-    // 4. Support real-time tailing with --follow
-
-    // Mock log entries
-    let mock_logs = [
-        (
-            "2024-06-28 10:30:15",
-            "INFO",
-            "emails",
-            "Job 12345678 started processing",
-        ),
-        (
-            "2024-06-28 10:30:14",
-            "INFO",
-            "emails",
-            "Job 87654321 completed successfully",
-        ),
-        (
-            "2024-06-28 10:30:12",
-            "ERROR",
-            "reports",
-            "Job 11111111 failed: Connection timeout",
-        ),
-        (
-            "2024-06-28 10:30:10",
-            "INFO",
-            "notifications",
-            "Job 22222222 enqueued",
-        ),
-        (
-            "2024-06-28 10:30:08",
-            "WARN",
-            "emails",
-            "Job 33333333 retry attempt 2/3",
-        ),
-    ];
-
-    for (timestamp, level, log_queue, message) in mock_logs.iter().take(lines_count as usize) {
-        if let Some(filter_queue) = &queue
-            && log_queue != filter_queue
-        {
-            continue;
-        }
-
-        let level_icon = match *level {
-            "INFO" => "ℹ️",
-            "WARN" => "⚠️",
-            "ERROR" => "❌",
-            _ => "📝",
-        };
-
-        println!(
-            "{} {} [{}] {}: {}",
-            timestamp, level_icon, level, log_queue, message
-        );
-    }
-
-    if follow {
-        println!("\n👁️  Following logs (Ctrl+C to stop)...");
-        println!("💡 This is a placeholder. Real implementation would stream live logs.");
-
-        // Simulate following logs
-        tokio::select! {
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
-                println!("⏰ Demo timeout - stopping log follow");
-            }
-            _ = tokio::signal::ctrl_c() => {
-                println!("\n👋 Log following stopped");
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: MonitorCommand,
+    }
+
+    #[test]
+    fn test_simulated_logs_subcommand_was_removed() {
+        assert!(TestCli::try_parse_from(["t", "logs"]).is_err());
+        assert!(TestCli::try_parse_from(["t", "health"]).is_ok());
+    }
 
     #[tokio::test]
     async fn test_dashboard_rejects_zero_refresh_interval() {

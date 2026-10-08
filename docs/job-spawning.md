@@ -338,59 +338,10 @@ cargo hammerwork spawn lineage 550e8400-e29b-41d4-a716-446655440000 --descendant
 cargo hammerwork spawn lineage 550e8400-e29b-41d4-a716-446655440000 --ancestors
 ```
 
-## Web API Integration
+## Inspecting Spawn Trees
 
-### REST Endpoints
-
-```bash
-# Get spawn operations
-curl "http://localhost:8080/api/spawn/operations?limit=50"
-
-# Get spawn tree for job
-curl "http://localhost:8080/api/jobs/550e8400-e29b-41d4-a716-446655440000/spawn-tree?format=json"
-
-# Get spawn statistics
-curl "http://localhost:8080/api/spawn/stats?queue=data_processing"
-
-# List child jobs
-curl "http://localhost:8080/api/jobs/550e8400-e29b-41d4-a716-446655440000/children"
-```
-
-### JavaScript Client Example
-
-```javascript
-class SpawnManager {
-    constructor(baseUrl) {
-        this.baseUrl = baseUrl;
-    }
-    
-    async getSpawnTree(jobId, format = 'json', maxDepth = 10) {
-        const response = await fetch(
-            `${this.baseUrl}/api/jobs/${jobId}/spawn-tree?format=${format}&max_depth=${maxDepth}`
-        );
-        return response.json();
-    }
-    
-    async getSpawnStats(queue = null, hours = 24) {
-        const params = new URLSearchParams();
-        if (queue) params.append('queue', queue);
-        params.append('hours', hours);
-        
-        const response = await fetch(`${this.baseUrl}/api/spawn/stats?${params}`);
-        return response.json();
-    }
-    
-    async getSpawnOperations(limit = 50) {
-        const response = await fetch(`${this.baseUrl}/api/spawn/operations?limit=${limit}`);
-        return response.json();
-    }
-}
-
-// Usage
-const spawnManager = new SpawnManager('http://localhost:8080');
-const spawnTree = await spawnManager.getSpawnTree('550e8400-e29b-41d4-a716-446655440000');
-console.log('Spawn tree:', spawnTree);
-```
+Spawn trees are available from the CLI (`cargo hammerwork spawn tree|lineage|stats`, see
+above). The web dashboard has no spawn endpoints.
 
 ## Performance Considerations
 

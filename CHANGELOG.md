@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Real data in place of placeholders** (part of [#41](https://github.com/CodingAnarchy/hammerwork/issues/41)):
+  - CLI `worker status [--queue] [--jobs]`: running jobs per queue with their lease/heartbeat state (active, expired, none), using the database clock.
+  - CLI `webhook add/list/update/toggle/remove` now persist to `webhooks.json` beside `config.toml` (`HAMMERWORK_WEBHOOKS_FILE` overrides; mode 0600) instead of silently discarding the configuration, and `webhook test` sends a real request (configured method, headers, auth and HMAC signature) and fails when the endpoint is unreachable or returns an error status. Not-found and unconfirmed removals are now errors instead of exit 0.
+  - Web `GET /api/stats/trends`, `/api/stats/detailed` and `/api/queues/{name}`: hourly completed/failed counts, average processing time and error patterns (real `first_seen`, `last_seen` and `affected_queues`) are computed from `hammerwork_jobs` for PostgreSQL and MySQL; `time_range` is honoured and validated. Hours with no activity are zero-filled; `avg_processing_time_ms` is `null` when nothing completed.
+  - Web `GET /api/queues/{name}/jobs` returns the queue's jobs (it returned a stub message), `last_job_at` / `oldest_pending_job` are filled in on queue details, and `POST /api/queues/{name}/actions` `clear_completed` works (it always failed). The dashboard's "clear queue" button now calls it (it called a nonexistent endpoint).
+  - Web maintenance `cleanup` dry run reports the real number of dead jobs it would delete.
 - **🔐 Job payloads are encrypted at rest** ([#11](https://github.com/CodingAnarchy/hammerwork/issues/11)), PostgreSQL and MySQL. `Job::with_encryption` / `with_pii_fields` / `with_retention_policy` used to be stored on the `Job` and ignored, so "encrypted" payloads were written and processed in plaintext (see Security).
   - New `JobQueue::with_encryption(engine)` (and `encryption_engine()`). `enqueue`, `enqueue_batch`, `enqueue_workflow` and `enqueue_cron_job` encrypt every job that has an encryption config before anything is written and fill in the migration 011 columns (`is_encrypted`, `encryption_key_id`, `encryption_algorithm`, `encrypted_payload`, `encryption_nonce`, `encryption_tag`, `encryption_metadata`, `payload_hash`, `pii_fields`, `retention_policy`, `retention_delete_at`, `encrypted_at`). No new migration is needed.
   - The `payload` column never holds encrypted data in plaintext: it is `{"encrypted": true}` when the whole payload is encrypted, or the payload with each PII field's value replaced by `"[ENCRYPTED]"` (`encryption::job_payload`). PII field names are paths (`"customer.ssn"`).
@@ -44,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Migration `018_add_job_retry_strategy` adds `hammerwork_jobs.retry_strategy` (JSON) and an index on `(batch_id, status)`. **Required**: every job query reads the new column, so run `cargo hammerwork migration run` before upgrading.
 
 ### Changed
+- Web `POST /api/queues/{name}/actions` `clear_dead` now only deletes the named queue's dead jobs older than 7 days; it previously purged dead jobs from every queue while reporting it had cleared one. `/api/system/metrics` `custom_metrics_count` and `performance_metrics.{database_response_time_ms, active_workers, worker_utilization}` are now nullable, and `hourly_trends[].avg_processing_time_ms` is `null` (not a global average) for hours without completions. Dashboard `GET /api/stats/detailed` reports the real uptime.
 - **MSRV is now 1.91.1** (first raised to 1.88 for the Azure SDK 1.x, then to 1.91.1 because every AWS SDK release containing the fix for GHSA-8ffr-xgwf-xj56 in `aws-smithy-json` requires it). Was previously declared as 1.86, but dependencies already needed a newer compiler.
  The workspace uses resolver 3, so the committed `Cargo.lock` is resolved for 1.91.1, and CI builds every crate and target on 1.91.1.
 - `Cargo.lock` is committed for reproducible builds.
@@ -60,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - AWS KMS clients (`aws-kms` feature) now load config with `BehaviorVersion::latest()` instead of the deprecated `v2025_01_17`, matching the Kinesis client. This picks up the SDK's newer defaults, including HTTP(S) proxy settings from the environment.
 
 ### Removed
+- **CLI and dashboard placeholders that printed or returned made-up data** (part of [#41](https://github.com/CodingAnarchy/hammerwork/issues/41)):
+  - `cargo hammerwork worker start`, `worker list` and `worker stop`: there is no worker registry, so they could only print simulated output. Use `worker status` (new, below) and `job requeue-stale`.
+  - `cargo hammerwork monitor logs`: it printed simulated log lines; no log storage exists.
+  - `cargo hammerwork webhook stats`: delivery statistics only exist in the memory of the process running the `WebhookManager`.
+  - The whole `cargo hammerwork streaming` command: it never read or wrote configuration, and its `test`, `stats` and `health` subcommands printed success without contacting anything. Configure streams in code with `StreamManager`.
+  - The web dashboard's `GET /api/spawn/info` placeholder route, which advertised spawn endpoints that never existed (also removed from the web README and `docs/job-spawning.md`). Spawn trees remain available through `cargo hammerwork spawn`.
+  - Made-up dashboard values: mock `recent_operations` in `GET /api/archive/stats`, estimated `database_response_time_ms`, and `active_workers` / `worker_utilization` in `GET /api/stats/detailed` (running jobs are not workers). These are now measured or `null`.
 - Unused `ArchiveConfig` fields `archive_directory`, `max_file_size_bytes` and `include_payloads`. Existing TOML files containing them still load.
 
 ### Security

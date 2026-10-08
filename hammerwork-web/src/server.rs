@@ -52,7 +52,6 @@ use crate::{
 };
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 use hammerwork::JobQueue;
-use hammerwork::queue::DatabaseQueue;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{error, info};
@@ -164,7 +163,7 @@ impl WebDashboard {
     /// Serve the dashboard for an already connected job queue.
     async fn serve<Q>(self, queue: Q, database_type: &str) -> Result<()>
     where
-        Q: DatabaseQueue + Send + Sync + 'static,
+        Q: api::history::JobHistory + 'static,
     {
         let bind_addr: SocketAddr = self.config.bind_addr().parse()?;
         let queue = Arc::new(queue);
@@ -248,7 +247,7 @@ impl WebDashboard {
         system_state: Arc<RwLock<SystemState>>,
     ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
     where
-        Q: DatabaseQueue + Send + Sync + 'static,
+        Q: api::history::JobHistory + 'static,
     {
         // Health check endpoint (no auth required)
         let health = warp::path("health")
@@ -267,8 +266,7 @@ impl WebDashboard {
             .or(api::jobs::routes(queue.clone()))
             .or(api::stats::routes(queue.clone(), system_state.clone()))
             .or(api::system::routes(queue.clone(), system_state))
-            .or(api::archive::archive_routes(queue.clone()))
-            .or(api::spawn::spawn_routes(queue));
+            .or(api::archive::archive_routes(queue));
 
         let authenticated_api = warp::path("api")
             .and(auth_filter(auth_state))

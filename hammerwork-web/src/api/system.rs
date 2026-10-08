@@ -111,15 +111,16 @@
 //! let metrics_info = MetricsInfo {
 //!     prometheus_enabled: true,
 //!     metrics_endpoint: "/metrics".to_string(),
-//!     custom_metrics_count: 15,
+//!     custom_metrics_count: Some(15),
 //!     last_scrape: Some(Utc::now()),
 //! };
 //!
 //! assert!(metrics_info.prometheus_enabled);
 //! assert_eq!(metrics_info.metrics_endpoint, "/metrics");
-//! assert_eq!(metrics_info.custom_metrics_count, 15);
+//! assert_eq!(metrics_info.custom_metrics_count, Some(15));
 //! ```
 
+use super::history::{FinishedKind, JobHistory};
 use super::{ApiResponse, error_reply, json_reply};
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
@@ -215,7 +216,8 @@ pub struct ServerConfig {
 pub struct MetricsInfo {
     pub prometheus_enabled: bool,
     pub metrics_endpoint: String,
-    pub custom_metrics_count: u32,
+    /// `null`: the dashboard keeps no metrics registry, so there is nothing to count.
+    pub custom_metrics_count: Option<u32>,
     pub last_scrape: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -240,7 +242,7 @@ pub fn routes<T>(
     system_state: Arc<RwLock<SystemState>>,
 ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
 where
-    T: DatabaseQueue + Send + Sync + 'static,
+    T: JobHistory + 'static,
 {
     let queue_filter = warp::any().map(move || queue.clone());
     let state_filter = warp::any().map(move || system_state.clone());
@@ -305,7 +307,7 @@ where
     let runtime_info = RuntimeInfo {
         process_id: std::process::id(),
         memory_usage_bytes: get_memory_usage(),
-        cpu_usage_percent: None, // Would need process monitoring
+        cpu_usage_percent: None, // unavailable
         thread_count: None,      // Would need thread monitoring
         gc_collections: None,    // Not applicable for Rust
     };
@@ -382,23 +384,33 @@ async fn maintenance_handler<T>(
     request: MaintenanceRequest,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
     let dry_run = request.dry_run.unwrap_or(false);
 
     match request.operation.as_str() {
         "cleanup" => {
+            let older_than = chrono::Utc::now() - chrono::Duration::days(7); // Remove jobs older than 7 days
             if dry_run {
-                let response = ApiResponse::success(serde_json::json!({
-                    "operation": "cleanup",
-                    "dry_run": true,
-                    "message": "Dry run: Would clean up old completed and dead jobs",
-                    "estimated_deletions": 0
-                }));
-                Ok(json_reply(&response))
+                match queue
+                    .count_jobs(None, FinishedKind::Dead, Some(older_than))
+                    .await
+                {
+                    Ok(count) => {
+                        let response = ApiResponse::success(serde_json::json!({
+                            "operation": "cleanup",
+                            "dry_run": true,
+                            "message": format!("Dry run: would clean up {} dead jobs older than 7 days", count),
+                            "estimated_deletions": count
+                        }));
+                        Ok(json_reply(&response))
+                    }
+                    Err(e) => Ok(error_reply(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Cleanup dry run failed: {}", e),
+                    )),
+                }
             } else {
-                // Perform actual cleanup
-                let older_than = chrono::Utc::now() - chrono::Duration::days(7); // Remove jobs older than 7 days
                 match queue.purge_dead_jobs(older_than).await {
                     Ok(count) => {
                         let response = ApiResponse::success(serde_json::json!({
@@ -491,31 +503,19 @@ fn get_memory_usage() -> Option<u64> {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        // macOS memory usage would require system calls
-        // For now, return None
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // Windows memory usage would require Windows API
-        // For now, return None
-    }
-
+    // Other platforms: current resident memory has no portable std API (macOS and Windows
+    // need platform calls; `getrusage` only reports the peak), so report it as unavailable
+    // rather than invent a number.
     None
 }
 
-/// Get count of custom metrics (Prometheus metrics beyond the default ones)
-fn get_custom_metrics_count() -> u32 {
-    // TODO: Query the Prometheus registry to count user-defined metrics once
-    // hammerwork-web exposes metrics. Until then this is a placeholder.
-    0
+/// Count of custom metrics: unavailable, hammerwork-web serves no metrics registry.
+fn get_custom_metrics_count() -> Option<u32> {
+    None
 }
 
-/// Get the last time metrics were scraped
+/// Last metrics scrape: unavailable, hammerwork-web serves no metrics endpoint.
 async fn get_last_scrape_time() -> Option<chrono::DateTime<chrono::Utc>> {
-    // TODO: Track actual scrape times once hammerwork-web exposes metrics.
     None
 }
 
@@ -550,6 +550,28 @@ mod tests {
         let json = serde_json::to_string(&build_info).unwrap();
         assert!(json.contains("1.0.0"));
         assert!(json.contains("abc123"));
+    }
+
+    #[test]
+    fn test_unavailable_metrics_are_none_not_zero() {
+        assert_eq!(get_custom_metrics_count(), None);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_dry_run_reports_database_failure() {
+        let response = maintenance_handler(
+            crate::api::test_support::unreachable_queue(),
+            MaintenanceRequest {
+                operation: "cleanup".to_string(),
+                target: None,
+                dry_run: Some(true),
+            },
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let (status, _) = crate::api::test_support::body_json(response).await;
+        assert_eq!(status, 500);
     }
 
     #[test]

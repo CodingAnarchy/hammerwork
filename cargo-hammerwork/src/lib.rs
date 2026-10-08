@@ -3,7 +3,7 @@
 //! A comprehensive command-line interface for managing Hammerwork job queues.
 //!
 //! This crate provides the `cargo hammerwork` CLI tool for database migrations,
-//! job management, worker control, queue operations, and monitoring of Hammerwork
+//! job management, worker lease visibility, queue operations, and monitoring of Hammerwork
 //! job processing systems.
 //!
 //! ## Installation
@@ -76,15 +76,11 @@
 //! ### Worker Management
 //!
 //! ```bash
-//! # Start a worker (requires configuration file)
-//! cargo hammerwork worker start --database-url postgresql://localhost/mydb \
-//!   --queue default --handler ./my_handler
-//!
-//! # Show worker status
+//! # Running jobs and the worker leases (heartbeats) behind them, per queue
 //! cargo hammerwork worker status --database-url postgresql://localhost/mydb
 //!
-//! # Stop all workers gracefully
-//! cargo hammerwork worker stop --database-url postgresql://localhost/mydb --all
+//! # Also list every running job
+//! cargo hammerwork worker status --database-url postgresql://localhost/mydb --jobs
 //! ```
 //!
 //! ### Monitoring
@@ -150,8 +146,7 @@
 //! # 4. Check queue status
 //! cargo hammerwork queue list
 //!
-//! # 5. Process jobs (in another terminal)
-//! cargo hammerwork worker start --queue email
+//! # 5. Process jobs with a worker in your application (the CLI does not run workers)
 //!
 //! # 6. Monitor progress
 //! cargo hammerwork monitor dashboard
