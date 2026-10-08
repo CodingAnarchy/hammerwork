@@ -800,14 +800,16 @@ impl DatabaseQueue for TestQueue {
             job.completed_at = Some(now);
 
             // Handle cron jobs
-            if job.recurring && job.cron_schedule.is_some() {
+            let schedule = if job.recurring {
+                job.cron_schedule
+                    .as_deref()
+                    .and_then(|expr| expr.parse::<cron::Schedule>().ok())
+            } else {
+                None
+            };
+            {
                 // Calculate next run time
-                if let Ok(schedule) = job
-                    .cron_schedule
-                    .as_ref()
-                    .unwrap()
-                    .parse::<cron::Schedule>()
-                {
+                if let Some(schedule) = schedule {
                     let timezone = job
                         .timezone
                         .as_ref()
@@ -1609,7 +1611,7 @@ impl DatabaseQueue for TestQueue {
         }
 
         // Sort by completion time (most recent first)
-        matching_jobs.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+        matching_jobs.sort_by_key(|j| std::cmp::Reverse(j.completed_at));
 
         // Apply limit if specified
         if let Some(limit) = limit {
@@ -2341,7 +2343,7 @@ impl DatabaseQueue for TestQueue {
         let offset = offset.unwrap_or(0) as usize;
         let limit = limit.unwrap_or(100) as usize;
 
-        archived_jobs.sort_by(|a, b| b.archived_at.cmp(&a.archived_at));
+        archived_jobs.sort_by_key(|j| std::cmp::Reverse(j.archived_at));
 
         if offset < archived_jobs.len() {
             let end = std::cmp::min(offset + limit, archived_jobs.len());

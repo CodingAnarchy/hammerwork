@@ -116,12 +116,13 @@ pub enum EncryptionError {
 ///
 /// Each algorithm has different characteristics in terms of performance,
 /// security, and compatibility.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum EncryptionAlgorithm {
     /// AES-256 in Galois/Counter Mode (AES-256-GCM).
     ///
     /// Industry standard, widely supported, hardware acceleration available
     /// on most modern processors. Provides both confidentiality and authenticity.
+    #[default]
     AES256GCM,
 
     /// ChaCha20-Poly1305 stream cipher.
@@ -130,12 +131,6 @@ pub enum EncryptionAlgorithm {
     /// Resistant to timing attacks and performs well on devices without
     /// AES hardware acceleration.
     ChaCha20Poly1305,
-}
-
-impl Default for EncryptionAlgorithm {
-    fn default() -> Self {
-        Self::AES256GCM
-    }
 }
 
 /// Source for encryption keys.
@@ -453,7 +448,7 @@ impl Default for EncryptionConfig {
 /// Determines how long encrypted job data should be kept before
 /// automatic cleanup. Different retention policies can be applied
 /// based on data sensitivity and compliance requirements.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum RetentionPolicy {
     /// Keep data for a specific duration from job creation.
     DeleteAfter(Duration),
@@ -468,13 +463,8 @@ pub enum RetentionPolicy {
     DeleteImmediately,
 
     /// Use the default retention policy from the encryption configuration.
+    #[default]
     UseDefault,
-}
-
-impl Default for RetentionPolicy {
-    fn default() -> Self {
-        Self::UseDefault
-    }
 }
 
 impl RetentionPolicy {

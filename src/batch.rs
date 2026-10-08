@@ -23,10 +23,11 @@ use sqlx::MySql;
 pub type BatchId = Uuid;
 
 /// Strategies for handling partial failures within a batch.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum PartialFailureMode {
     /// Continue processing remaining jobs even if some fail.
     /// Failed jobs are tracked but don't stop batch processing.
+    #[default]
     ContinueOnError,
     /// Stop processing immediately when the first job fails.
     /// Remaining jobs in the batch are not processed.
@@ -34,12 +35,6 @@ pub enum PartialFailureMode {
     /// Process all jobs and collect all errors.
     /// Similar to ContinueOnError but provides detailed error reporting.
     CollectErrors,
-}
-
-impl Default for PartialFailureMode {
-    fn default() -> Self {
-        Self::ContinueOnError
-    }
 }
 
 /// Current status of a job batch.

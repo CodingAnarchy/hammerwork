@@ -66,9 +66,10 @@ pub type ArchivalPolicyId = String;
 /// // Test default value
 /// assert_eq!(ArchivalReason::default(), ArchivalReason::Automatic);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ArchivalReason {
     /// Job was archived due to automatic policy.
+    #[default]
     Automatic,
     /// Job was manually archived by an administrator.
     Manual,
@@ -76,12 +77,6 @@ pub enum ArchivalReason {
     Compliance,
     /// Job was archived due to database maintenance.
     Maintenance,
-}
-
-impl Default for ArchivalReason {
-    fn default() -> Self {
-        Self::Automatic
-    }
 }
 
 impl std::fmt::Display for ArchivalReason {

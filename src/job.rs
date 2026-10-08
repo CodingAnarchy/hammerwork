@@ -193,20 +193,15 @@ impl Decode<'_, MySql> for JobStatus {
 /// // Don't store results (default behavior)
 /// let no_storage = ResultStorage::None;
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ResultStorage {
     /// Store results in the database (persistent across restarts).
     Database,
     /// Store results in memory (faster access but lost on restart).
     Memory,
     /// Don't store job results (default behavior).
+    #[default]
     None,
-}
-
-impl Default for ResultStorage {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Configuration for job result storage and management.

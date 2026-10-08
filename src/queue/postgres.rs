@@ -52,18 +52,31 @@ pub(crate) struct JobRow {
     pub correlation_id: Option<String>,
     pub parent_span_id: Option<String>,
     pub span_context: Option<String>,
-    // Encryption fields
+    // Encryption fields. Only `is_encrypted` and `pii_fields` are mapped into `Job`
+    // unconditionally; the rest are decoded only with the `encryption` feature.
+    // TODO(#7): payload encryption is read-side only. No enqueue/update path writes
+    // these columns and nothing encrypts or decrypts payloads, so they are always NULL.
     pub is_encrypted: bool,
+    #[cfg(feature = "encryption")]
     pub encryption_key_id: Option<String>,
+    #[cfg(feature = "encryption")]
     pub encryption_algorithm: Option<String>,
+    #[cfg(feature = "encryption")]
     pub encrypted_payload: Option<Vec<u8>>,
+    #[cfg(feature = "encryption")]
     pub encryption_nonce: Option<Vec<u8>>,
+    #[cfg(feature = "encryption")]
     pub encryption_tag: Option<Vec<u8>>,
+    #[cfg(feature = "encryption")]
     pub encryption_metadata: Option<serde_json::Value>,
+    #[cfg(feature = "encryption")]
     pub payload_hash: Option<String>,
     pub pii_fields: Option<Vec<String>>,
+    #[cfg(feature = "encryption")]
     pub retention_policy: Option<String>,
+    #[cfg(feature = "encryption")]
     pub retention_delete_at: Option<DateTime<Utc>>,
+    #[cfg(feature = "encryption")]
     pub encrypted_at: Option<DateTime<Utc>>,
 }
 
@@ -227,12 +240,6 @@ impl JobRow {
         Ok(Some(config))
     }
 
-    /// Builds an EncryptionConfig from database fields - no-op when encryption is disabled.
-    #[cfg(not(feature = "encryption"))]
-    fn build_encryption_config(&self) -> Result<Option<()>> {
-        Ok(None)
-    }
-
     /// Parses the retention policy from the database string.
     #[cfg(feature = "encryption")]
     fn parse_retention_policy(&self) -> Result<Option<crate::encryption::RetentionPolicy>> {
@@ -276,12 +283,6 @@ impl JobRow {
                 }
             }
         }
-    }
-
-    /// Parses the retention policy - no-op when encryption is disabled.
-    #[cfg(not(feature = "encryption"))]
-    fn parse_retention_policy(&self) -> Result<Option<()>> {
-        Ok(None)
     }
 
     /// Builds an EncryptedPayload from database fields if the job is encrypted.
@@ -404,12 +405,6 @@ impl JobRow {
             tag: tag_b64,
             metadata,
         }))
-    }
-
-    /// Builds an EncryptedPayload - no-op when encryption is disabled.
-    #[cfg(not(feature = "encryption"))]
-    fn build_encrypted_payload(&self) -> Result<Option<()>> {
-        Ok(None)
     }
 }
 

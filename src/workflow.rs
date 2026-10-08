@@ -14,9 +14,10 @@ use uuid::Uuid;
 pub type WorkflowId = Uuid;
 
 /// Status of job dependency resolution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum DependencyStatus {
     /// Job has no dependencies
+    #[default]
     None,
     /// Job is waiting for dependencies to complete
     Waiting,
@@ -24,12 +25,6 @@ pub enum DependencyStatus {
     Satisfied,
     /// One or more dependencies failed
     Failed,
-}
-
-impl Default for DependencyStatus {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl DependencyStatus {
@@ -58,9 +53,10 @@ impl DependencyStatus {
 }
 
 /// Status of a workflow execution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum WorkflowStatus {
     /// Workflow is currently running
+    #[default]
     Running,
     /// Workflow completed successfully
     Completed,
@@ -68,12 +64,6 @@ pub enum WorkflowStatus {
     Failed,
     /// Workflow was cancelled
     Cancelled,
-}
-
-impl Default for WorkflowStatus {
-    fn default() -> Self {
-        Self::Running
-    }
 }
 
 impl WorkflowStatus {
@@ -102,20 +92,15 @@ impl WorkflowStatus {
 }
 
 /// Policy for handling failures in workflows.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FailurePolicy {
     /// Stop the entire workflow when any job fails
+    #[default]
     FailFast,
     /// Continue executing jobs that don't depend on failed jobs
     ContinueOnFailure,
     /// Require manual intervention to decide how to handle failures
     Manual,
-}
-
-impl Default for FailurePolicy {
-    fn default() -> Self {
-        Self::FailFast
-    }
 }
 
 impl FailurePolicy {

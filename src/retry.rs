@@ -165,14 +165,6 @@ impl<'de> Deserialize<'de> for JitterType {
         use serde::de::{self, MapAccess, Visitor};
         use std::fmt;
 
-        #[derive(Deserialize)]
-        #[serde(field_identifier, rename_all = "snake_case")]
-        enum Field {
-            Type,
-            DurationMs,
-            Factor,
-        }
-
         struct JitterTypeVisitor;
 
         impl<'de> Visitor<'de> for JitterTypeVisitor {
