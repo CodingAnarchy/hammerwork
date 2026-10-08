@@ -226,8 +226,23 @@ Failed attempts are retried as usual (up to the job's `max_attempts`); when a ru
 completes, dies or times out on its last attempt, the job goes back to `Pending` at
 its next scheduled time with its attempts reset. After a failed run the job keeps its
 `error_message` and `failed_at` (or `timed_out_at`) until the next run, and the
-worker's fail/timeout hooks and events fire as for any other job. The next run is
-computed from the time the run ended.
+worker's fail/timeout hooks and events fire as for any other job.
+
+The next run is computed from the run's scheduled slot (its `next_run_at`), not from
+the time the run ended, using the database clock:
+
+- If the next occurrence after the slot is still ahead, the job runs then. A run that
+  takes a while does not push the schedule back.
+- If it has already passed (the run overran into the next slot, or no worker ran the
+  job for a while), the missed occurrences are coalesced into **one** catch-up run,
+  scheduled at the latest missed occurrence and therefore due immediately. After it,
+  the job is back on its regular schedule. Slots are never skipped silently and never
+  pile up into a burst of runs.
+
+For example, a daily job (`0 0 0 * * *`) whose 2026-03-10 run ends at 00:05 runs
+next at 2026-03-11 00:00. If that run starts days late, on 2026-03-15 at 12:00, it is
+followed by one catch-up run due immediately (slot 2026-03-15 00:00) and then by the
+2026-03-16 00:00 run.
 
 ## Monitoring Cron Jobs
 

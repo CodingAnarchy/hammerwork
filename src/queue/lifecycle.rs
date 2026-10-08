@@ -217,6 +217,35 @@ impl Target {
             Self::Retry { .. } => None,
         }
     }
+
+    /// The target as written for a run outcome (`guard` is a [`Guard::Run`]), with
+    /// times on the database clock.
+    ///
+    /// A worker computes `retry_at` as "now + backoff" on its own clock; the dequeue
+    /// compares it with the database clock. Keeping the backoff and moving it onto the
+    /// database clock (`db_now`) means clock skew between the worker and the database
+    /// neither shortens nor lengthens the delay. Manual transitions keep the absolute
+    /// time the caller asked for.
+    pub fn on_db_clock(&self, guard: &Guard<'_>, db_now: DateTime<Utc>) -> Self {
+        match (self, guard) {
+            (
+                Self::Retry {
+                    retry_at,
+                    error,
+                    timed_out,
+                },
+                Guard::Run(_),
+            ) => {
+                let delay = *retry_at - Utc::now();
+                Self::Retry {
+                    retry_at: db_now.checked_add_signed(delay).unwrap_or(*retry_at),
+                    error: error.clone(),
+                    timed_out: *timed_out,
+                }
+            }
+            _ => self.clone(),
+        }
+    }
 }
 
 impl From<JobOutcome> for Target {
@@ -382,6 +411,186 @@ pub(crate) fn batch_failed_message(failed: JobId) -> String {
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) const UNFINISHED_STATUS_SQL: &str = "'Pending', 'Running', 'Retrying'";
 
+/// Error message recorded on the unfinished jobs of a cancelled workflow.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) const WORKFLOW_CANCELLED_MESSAGE: &str = "Workflow cancelled";
+
+/// How many missed occurrences [`next_cron_run`] steps through before it gives up
+/// finding the latest one and schedules the catch-up run at `now`.
+const CRON_CATCH_UP_SCAN_LIMIT: usize = 10_000;
+
+/// The next run of a recurring job whose run ended at `now` (by the database clock).
+///
+/// The next occurrence is computed from the run's scheduled slot (the earlier of
+/// `next_run_at` and `scheduled_at`), not from the time the run ended, so a run that
+/// ends late does not skip the following slot. Catch-up semantics:
+///
+/// - the next occurrence after the slot is still in the future: run then;
+/// - it has already passed (the run overran, or workers were down): the missed
+///   occurrences are coalesced into **one** run, scheduled at the latest missed
+///   occurrence, so it is due immediately. After that run, the job is back on its
+///   regular schedule. Missed occurrences never pile up into a burst of runs.
+///
+/// Returns `None` when the job has no valid cron schedule or no next occurrence.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn next_cron_run(job: &Job, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let schedule = job.get_cron_schedule()?.ok()?;
+    // `next_run_at` is the slot; a retried run has a later `scheduled_at`, and a run
+    // started early by hand an earlier one.
+    let slot = job
+        .next_run_at
+        .map_or(job.scheduled_at, |slot| slot.min(job.scheduled_at));
+    let next = schedule.next_execution(slot)?;
+    if next > now {
+        return Some(next);
+    }
+    let mut latest = next;
+    for _ in 0..CRON_CATCH_UP_SCAN_LIMIT {
+        match schedule.next_execution(latest) {
+            Some(occurrence) if occurrence <= now => latest = occurrence,
+            _ => return Some(latest),
+        }
+    }
+    // Too many missed occurrences to walk (e.g. a per-second schedule after a long
+    // outage): run the catch-up now.
+    Some(now)
+}
+
+/// The state of a dependency of a job being enqueued, as far as the new job is
+/// concerned. See [`settle_new_dependents`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) enum ParentState {
+    /// The dependency completed: it no longer blocks.
+    Completed,
+    /// The dependency failed terminally and its workflow's failure policy fails the
+    /// jobs that depend on it.
+    Failed,
+    /// Anything else: not finished, failed under the `Manual` policy, or unknown.
+    Unfinished,
+}
+
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+impl ParentState {
+    /// The state of a stored dependency with job status `status`, in a workflow with
+    /// failure policy `policy` (the `failure_policy` column, `None` outside workflows).
+    ///
+    /// Mirrors what happens when a dependency finishes while its dependents already
+    /// exist: completion releases them; a terminal failure fails them unless the
+    /// workflow's policy is `Manual`, which leaves them waiting for an operator.
+    pub fn from_db(status: &str, policy: Option<&str>) -> Self {
+        let manual = policy.is_some_and(|policy| {
+            crate::workflow::FailurePolicy::parse_from_db(policy)
+                .is_ok_and(|policy| policy == crate::workflow::FailurePolicy::Manual)
+        });
+        match job_status_from_db(status) {
+            Some(JobStatus::Completed) => Self::Completed,
+            Some(JobStatus::Failed | JobStatus::Dead | JobStatus::TimedOut) if !manual => {
+                Self::Failed
+            }
+            _ => Self::Unfinished,
+        }
+    }
+
+    /// The state of an archived dependency. Archived jobs keep no workflow, so a
+    /// terminally failed one fails its dependents.
+    pub fn from_archived(status: &str) -> Self {
+        Self::from_db(status, None)
+    }
+}
+
+/// The dependencies of `jobs` (about to be inserted) that are not themselves in `jobs`.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn external_dependencies(jobs: &[Job]) -> Vec<JobId> {
+    let new: std::collections::HashSet<JobId> = jobs.iter().map(|job| job.id).collect();
+    let mut parents: Vec<JobId> = jobs
+        .iter()
+        .filter(|job| job.dependency_status == crate::workflow::DependencyStatus::Waiting)
+        .flat_map(|job| job.depends_on.iter().copied())
+        .filter(|id| !new.contains(id))
+        .collect();
+    parents.sort_unstable();
+    parents.dedup();
+    parents
+}
+
+/// Settle the dependency state of jobs about to be inserted whose dependencies may
+/// already have finished.
+///
+/// Dependents are normally released (or failed) when a dependency finishes, which
+/// only reaches jobs that already exist. A job enqueued after its dependencies
+/// finished would otherwise wait forever. Given the (locked) states of the
+/// dependencies outside `jobs`:
+///
+/// - a waiting job whose dependencies all completed becomes `satisfied`;
+/// - a waiting job with a failed dependency is inserted as `Failed` (dependency status
+///   `failed`), and so are the jobs in `jobs` that (transitively) depend on it;
+/// - everything else keeps waiting.
+///
+/// Returns the ids of the jobs that were failed.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn settle_new_dependents(
+    jobs: &mut [Job],
+    parents: &std::collections::HashMap<JobId, ParentState>,
+    now: DateTime<Utc>,
+) -> Vec<JobId> {
+    use crate::workflow::DependencyStatus;
+
+    let index: std::collections::HashMap<JobId, usize> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, job)| (job.id, i))
+        .collect();
+    let mut failed = Vec::new();
+
+    // Failures propagate along dependency chains inside `jobs`, so repeat until nothing
+    // changes; each pass fails at least one more job or ends the loop.
+    loop {
+        let mut changed = false;
+        for i in 0..jobs.len() {
+            let job = &jobs[i];
+            if job.dependency_status != DependencyStatus::Waiting || job.depends_on.is_empty() {
+                continue;
+            }
+            let state_of = |parent: &JobId| match index.get(parent) {
+                Some(&j) => match jobs[j].status {
+                    JobStatus::Completed => ParentState::Completed,
+                    JobStatus::Failed | JobStatus::Dead | JobStatus::TimedOut => {
+                        ParentState::Failed
+                    }
+                    _ => ParentState::Unfinished,
+                },
+                None => parents
+                    .get(parent)
+                    .copied()
+                    .unwrap_or(ParentState::Unfinished),
+            };
+            if let Some(&failed_parent) = job
+                .depends_on
+                .iter()
+                .find(|parent| state_of(parent) == ParentState::Failed)
+            {
+                let job = &mut jobs[i];
+                job.status = JobStatus::Failed;
+                job.dependency_status = DependencyStatus::Failed;
+                job.failed_at = Some(now);
+                job.error_message = Some(dependency_failed_message(failed_parent));
+                failed.push(job.id);
+                changed = true;
+            } else if job
+                .depends_on
+                .iter()
+                .all(|parent| state_of(parent) == ParentState::Completed)
+            {
+                jobs[i].dependency_status = DependencyStatus::Satisfied;
+            }
+        }
+        if !changed {
+            return failed;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +687,142 @@ mod tests {
         assert!(guard.admits(&job_in(JobStatus::Running)));
         assert!(guard.admits(&job_in(JobStatus::Pending)));
         assert!(!guard.admits(&job_in(JobStatus::TimedOut)));
+    }
+
+    fn daily_job(slot: DateTime<Utc>) -> Job {
+        let mut job = job_in(JobStatus::Running);
+        job.cron_schedule = Some("0 0 0 * * *".to_string());
+        job.recurring = true;
+        job.scheduled_at = slot;
+        job.next_run_at = Some(slot);
+        job
+    }
+
+    fn at(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339).unwrap().into()
+    }
+
+    #[test]
+    fn next_cron_run_is_computed_from_the_slot() {
+        // On time: the next slot
+        let job = daily_job(at("2026-03-10T00:00:00Z"));
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-10T00:05:00Z")),
+            Some(at("2026-03-11T00:00:00Z"))
+        );
+        // Overran into the next slot: that slot still runs, immediately
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-11T00:30:00Z")),
+            Some(at("2026-03-11T00:00:00Z"))
+        );
+        // Days behind: one catch-up run at the latest missed slot, no pile-up
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-15T12:00:00Z")),
+            Some(at("2026-03-15T00:00:00Z"))
+        );
+        // A retried run keeps its slot
+        let mut job = daily_job(at("2026-03-10T00:00:00Z"));
+        job.scheduled_at = at("2026-03-10T00:03:00Z");
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-10T00:05:00Z")),
+            Some(at("2026-03-11T00:00:00Z"))
+        );
+        // A run started early by hand does not skip the upcoming slot
+        let mut job = daily_job(at("2026-03-11T00:00:00Z"));
+        job.scheduled_at = at("2026-03-10T12:00:00Z");
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-10T12:05:00Z")),
+            Some(at("2026-03-11T00:00:00Z"))
+        );
+        // Old rows without next_run_at use scheduled_at
+        let mut job = daily_job(at("2026-03-10T00:00:00Z"));
+        job.next_run_at = None;
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-10T00:05:00Z")),
+            Some(at("2026-03-11T00:00:00Z"))
+        );
+        // No schedule
+        let mut job = daily_job(at("2026-03-10T00:00:00Z"));
+        job.cron_schedule = None;
+        assert_eq!(next_cron_run(&job, at("2026-03-10T00:05:00Z")), None);
+    }
+
+    #[test]
+    fn next_cron_run_bounds_the_catch_up_scan() {
+        let mut job = daily_job(at("2026-03-10T00:00:00Z"));
+        job.cron_schedule = Some("* * * * * *".to_string());
+        let now = at("2026-03-20T00:00:00Z");
+        assert_eq!(next_cron_run(&job, now), Some(now));
+    }
+
+    #[test]
+    fn parent_state_follows_status_and_policy() {
+        assert_eq!(
+            ParentState::from_db("Completed", None),
+            ParentState::Completed
+        );
+        assert_eq!(ParentState::from_db("Dead", None), ParentState::Failed);
+        assert_eq!(
+            ParentState::from_db("TimedOut", Some("fail_fast")),
+            ParentState::Failed
+        );
+        assert_eq!(
+            ParentState::from_db("Failed", Some("manual")),
+            ParentState::Unfinished
+        );
+        assert_eq!(
+            ParentState::from_db("Running", None),
+            ParentState::Unfinished
+        );
+        assert_eq!(
+            ParentState::from_archived("\"Completed\""),
+            ParentState::Completed
+        );
+    }
+
+    #[test]
+    fn new_dependents_are_settled_from_their_dependencies() {
+        use crate::workflow::DependencyStatus;
+        use std::collections::HashMap;
+
+        let (done, failed, running) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        let parents = HashMap::from([
+            (done, ParentState::Completed),
+            (failed, ParentState::Failed),
+            (running, ParentState::Unfinished),
+        ]);
+        let new = |deps: Vec<JobId>| Job::new("q".to_string(), json!({})).depends_on_jobs(&deps);
+
+        let satisfied = new(vec![done]);
+        let waiting = new(vec![done, running]);
+        let doomed = new(vec![done, failed]);
+        // Depends on `doomed`, which is in the same insert
+        let downstream = new(vec![doomed.id]);
+        let mut jobs = vec![downstream, satisfied, waiting, doomed];
+        let now = Utc::now();
+        let mut external = vec![done, failed, running];
+        external.sort_unstable();
+        assert_eq!(external_dependencies(&jobs), external);
+
+        let failed_ids = settle_new_dependents(&mut jobs, &parents, now);
+
+        assert_eq!(jobs[1].dependency_status, DependencyStatus::Satisfied);
+        assert_eq!(jobs[1].status, JobStatus::Pending);
+        assert_eq!(jobs[2].dependency_status, DependencyStatus::Waiting);
+        for job in [&jobs[3], &jobs[0]] {
+            assert_eq!(job.status, JobStatus::Failed);
+            assert_eq!(job.dependency_status, DependencyStatus::Failed);
+            assert_eq!(job.failed_at, Some(now));
+        }
+        assert_eq!(
+            jobs[3].error_message.as_deref(),
+            Some(dependency_failed_message(failed).as_str())
+        );
+        assert_eq!(failed_ids.len(), 2);
     }
 
     #[test]

@@ -145,6 +145,41 @@ The migration system handles differences between PostgreSQL and MySQL:
 - Regular indexes (no partial index support)
 - Microsecond precision timestamps
 
+### Clocks and Time Zones
+
+Due times are checked against the **database clock**: the dequeue (`scheduled_at <=
+NOW()`), cron due checks, lease expiry and the stale-job reaper all compare with the
+database's current time, and the timestamps of a run (`started_at`, `completed_at`,
+`failed_at`, `timed_out_at`, heartbeats and leases) and the next cron run are taken
+from it. Clock skew between application servers therefore no longer shifts
+scheduling. A worker's retry backoff keeps its length on the database clock.
+Absolute times the application sets (`Job::scheduled_at`, `with_delay`, a `retry_at`
+passed to `retry_job`) are stored as given, so keep application and database clocks
+synchronized (NTP) if you rely on them to the second.
+
+On MySQL every time is written and compared as UTC (`UTC_TIMESTAMP(6)`, never the
+session-local `NOW()`), so the session `time_zone` does not matter. sqlx sets it to
+`+00:00` by default.
+
+### MySQL `TIMESTAMP` Range (Year 2038)
+
+The MySQL schema stores times in `TIMESTAMP(6)` columns, which hold
+1970-01-01 00:00:01 to **2038-01-19 03:14:07 UTC**. The MySQL backend rejects times
+outside that range with `HammerworkError::InvalidJobPayload` instead of a database
+error: enqueueing a job scheduled after it, `retry_job`, `reschedule_cron_job` and
+`store_job_result` with such a time. Times computed by the library are capped instead:
+a worker's retry backoff that would end after it retries at the latest storable time,
+a lease is capped, and a recurring job whose next occurrence falls after it is not
+rescheduled (it keeps its final status, with a warning). PostgreSQL (`TIMESTAMPTZ`) has
+no such limit.
+
+Converting the columns to `DATETIME(6)` would lift the limit, but MySQL performs that
+change by rebuilding each table (`ALTER TABLE ... MODIFY`, `ALGORITHM=COPY`), which
+blocks writes to `hammerwork_jobs` for the duration. Because migrations run
+automatically (`run_migrations`, `auto_migrate`), shipping it as a regular migration
+would turn an upgrade into an unplanned write outage on large queues, so Hammerwork
+does not do it.
+
 ## Migration Development
 
 ### Adding New Migrations

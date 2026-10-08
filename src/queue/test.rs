@@ -356,6 +356,10 @@ impl TestStorage {
 
     /// Get the next job to dequeue based on priority and scheduled time
     fn get_next_job(&self, queue_name: &str, weights: Option<&PriorityWeights>) -> Option<JobId> {
+        // Like the database backends, a paused queue hands out no jobs.
+        if self.paused_queues.contains_key(queue_name) {
+            return None;
+        }
         let queue_jobs = self.queues.get(queue_name)?;
         let pending_jobs = queue_jobs.get(&JobStatus::Pending)?;
 
@@ -2580,6 +2584,28 @@ mod tests {
             queue.get_job_count("test_queue", &JobStatus::Pending).await,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn test_paused_queue_is_not_dequeued() {
+        let queue = TestQueue::new();
+        let job_id = queue
+            .enqueue(Job::new("paused".to_string(), json!({})))
+            .await
+            .unwrap();
+
+        queue.pause_queue("paused", Some("test")).await.unwrap();
+        assert!(queue.dequeue("paused").await.unwrap().is_none());
+        assert!(
+            queue
+                .dequeue_with_priority_weights("paused", &PriorityWeights::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        queue.resume_queue("paused", None).await.unwrap();
+        assert_eq!(queue.dequeue("paused").await.unwrap().unwrap().id, job_id);
     }
 
     #[tokio::test]
