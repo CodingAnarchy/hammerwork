@@ -64,7 +64,10 @@
 //! assert!(archived_job.payload_compressed);
 //! ```
 
-use super::{ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams};
+use super::{
+    ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, error_reply,
+    internal_error, json_reply,
+};
 use hammerwork::{
     JobId, JobStatus,
     archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason, ArchivalStats, ArchivedJob},
@@ -72,6 +75,7 @@ use hammerwork::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use warp::http::StatusCode;
 use warp::{Filter, Reply};
 
 /// Request to archive jobs
@@ -351,7 +355,7 @@ where
             policy_used: policy,
             config_used: config,
         };
-        return Ok(warp::reply::json(&ApiResponse::success(response)));
+        return Ok(json_reply(&ApiResponse::success(response)));
     }
 
     match queue
@@ -371,12 +375,9 @@ where
                 policy_used: policy,
                 config_used: config,
             };
-            Ok(warp::reply::json(&ApiResponse::success(response)))
+            Ok(json_reply(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
-            "Failed to archive jobs: {}",
-            e
-        )))),
+        Err(e) => Ok(internal_error("Failed to archive jobs", &e)),
     }
 }
 
@@ -411,7 +412,7 @@ where
                     .await
                 {
                     Ok(all_jobs) => all_jobs.len() as u64,
-                    Err(_) => jobs.len() as u64, // Fallback to current page count
+                    Err(e) => return Ok(internal_error("Failed to count archived jobs", &e)),
                 }
             } else {
                 // If we got less than the limit, we have all records
@@ -424,12 +425,9 @@ where
                 pagination: pagination_meta,
             };
 
-            Ok(warp::reply::json(&ApiResponse::success(response)))
+            Ok(json_reply(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
-            "Failed to list archived jobs: {}",
-            e
-        )))),
+        Err(e) => Ok(internal_error("Failed to list archived jobs", &e)),
     }
 }
 
@@ -445,9 +443,10 @@ where
     let job_id = match uuid::Uuid::parse_str(&job_id_str) {
         Ok(id) => id,
         Err(_) => {
-            return Ok(warp::reply::json(&ApiResponse::<()>::error(
-                "Invalid job ID format".to_string(),
-            )));
+            return Ok(error_reply(
+                StatusCode::BAD_REQUEST,
+                "Invalid job ID format",
+            ));
         }
     };
 
@@ -458,12 +457,9 @@ where
                 restored_at: chrono::Utc::now(),
                 restored_by: request.restored_by,
             };
-            Ok(warp::reply::json(&ApiResponse::success(response)))
+            Ok(json_reply(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
-            "Failed to restore job: {}",
-            e
-        )))),
+        Err(e) => Ok(internal_error("Failed to restore job", &e)),
     }
 }
 
@@ -480,7 +476,7 @@ where
         // with a large limit to get an accurate count
         let count = match queue.list_archived_jobs(None, Some(10000), Some(0)).await {
             Ok(jobs) => jobs.len() as u64,
-            Err(_) => 0, // If we can't get the count, return 0 for safety
+            Err(e) => return Ok(internal_error("Failed to count archived jobs", &e)),
         };
 
         let response = PurgeResponse {
@@ -488,7 +484,7 @@ where
             dry_run: true,
             executed_at: chrono::Utc::now(),
         };
-        return Ok(warp::reply::json(&ApiResponse::success(response)));
+        return Ok(json_reply(&ApiResponse::success(response)));
     }
 
     match queue.purge_archived_jobs(request.older_than).await {
@@ -498,12 +494,9 @@ where
                 dry_run: false,
                 executed_at: chrono::Utc::now(),
             };
-            Ok(warp::reply::json(&ApiResponse::success(response)))
+            Ok(json_reply(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
-            "Failed to purge archived jobs: {}",
-            e
-        )))),
+        Err(e) => Ok(internal_error("Failed to purge archived jobs", &e)),
     }
 }
 
@@ -522,12 +515,23 @@ where
 
             if filters.queue.is_none() {
                 // Get queue list and collect stats for each
-                if let Ok(queue_stats) = queue.get_all_queue_stats().await {
-                    for queue_stat in queue_stats {
-                        if let Ok(queue_archival_stats) =
-                            queue.get_archival_stats(Some(&queue_stat.queue_name)).await
-                        {
+                let queue_stats = match queue.get_all_queue_stats().await {
+                    Ok(queue_stats) => queue_stats,
+                    Err(e) => return Ok(internal_error("Failed to get queue stats", &e)),
+                };
+                for queue_stat in queue_stats {
+                    match queue.get_archival_stats(Some(&queue_stat.queue_name)).await {
+                        Ok(queue_archival_stats) => {
                             by_queue.insert(queue_stat.queue_name, queue_archival_stats);
+                        }
+                        Err(e) => {
+                            return Ok(internal_error(
+                                &format!(
+                                    "Failed to get archive stats for queue '{}'",
+                                    queue_stat.queue_name
+                                ),
+                                &e,
+                            ));
                         }
                     }
                 }
@@ -558,18 +562,44 @@ where
                 by_queue,
                 recent_operations,
             };
-            Ok(warp::reply::json(&ApiResponse::success(response)))
+            Ok(json_reply(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(warp::reply::json(&ApiResponse::<()>::error(format!(
-            "Failed to get archive stats: {}",
-            e
-        )))),
+        Err(e) => Ok(internal_error("Failed to get archive stats", &e)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::test_support::{body_json, unreachable_queue};
+
+    #[tokio::test]
+    async fn test_dry_run_purge_returns_500_instead_of_zero_when_database_is_down() {
+        let request: PurgeRequest = serde_json::from_value(serde_json::json!({
+            "older_than": "2024-01-01T00:00:00Z",
+            "dry_run": true
+        }))
+        .unwrap();
+        let response = handle_purge_jobs(request, unreachable_queue())
+            .await
+            .unwrap()
+            .into_response();
+        let (status, body) = body_json(response).await;
+        assert_eq!(status, 500);
+        assert_eq!(body["success"], false);
+        assert!(body["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_archive_stats_returns_500_when_database_is_down() {
+        let filters: FilterParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        let response = handle_archive_stats(filters, unreachable_queue())
+            .await
+            .unwrap()
+            .into_response();
+        let (status, _) = body_json(response).await;
+        assert_eq!(status, 500);
+    }
     use chrono::Duration;
 
     #[test]

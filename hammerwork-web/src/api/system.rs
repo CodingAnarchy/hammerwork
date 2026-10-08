@@ -120,11 +120,12 @@
 //! assert_eq!(metrics_info.custom_metrics_count, 15);
 //! ```
 
-use super::ApiResponse;
+use super::{ApiResponse, error_reply, json_reply};
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use warp::http::StatusCode;
 use warp::{Filter, Reply};
 
 /// Shared system state for tracking runtime information
@@ -339,7 +340,7 @@ where
         started_at: state.started_at,
     };
 
-    Ok(warp::reply::json(&ApiResponse::success(system_info)))
+    Ok(json_reply(&ApiResponse::success(system_info)))
 }
 
 /// Handler for system configuration
@@ -356,7 +357,7 @@ async fn system_config_handler(
         static_assets_path: state.config.static_dir.to_string_lossy().to_string(),
     };
 
-    Ok(warp::reply::json(&ApiResponse::success(config)))
+    Ok(json_reply(&ApiResponse::success(config)))
 }
 
 /// Handler for metrics information
@@ -372,7 +373,7 @@ async fn metrics_info_handler(
         last_scrape: get_last_scrape_time().await,
     };
 
-    Ok(warp::reply::json(&ApiResponse::success(metrics_info)))
+    Ok(json_reply(&ApiResponse::success(metrics_info)))
 }
 
 /// Handler for maintenance operations
@@ -394,7 +395,7 @@ where
                     "message": "Dry run: Would clean up old completed and dead jobs",
                     "estimated_deletions": 0
                 }));
-                Ok(warp::reply::json(&response))
+                Ok(json_reply(&response))
             } else {
                 // Perform actual cleanup
                 let older_than = chrono::Utc::now() - chrono::Duration::days(7); // Remove jobs older than 7 days
@@ -406,40 +407,40 @@ where
                             "message": format!("Cleaned up {} dead jobs", count),
                             "deletions": count
                         }));
-                        Ok(warp::reply::json(&response))
+                        Ok(json_reply(&response))
                     }
-                    Err(e) => {
-                        let response = ApiResponse::<()>::error(format!("Cleanup failed: {}", e));
-                        Ok(warp::reply::json(&response))
-                    }
+                    Err(e) => Ok(error_reply(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Cleanup failed: {}", e),
+                    )),
                 }
             }
         }
         "vacuum" => {
             // Database vacuum operation (PostgreSQL specific)
-            let response =
-                ApiResponse::<()>::error("Vacuum operation not yet implemented".to_string());
-            Ok(warp::reply::json(&response))
+            Ok(error_reply(
+                StatusCode::NOT_IMPLEMENTED,
+                "Vacuum operation not yet implemented".to_string(),
+            ))
         }
         "reindex" => {
             // Database reindex operation
-            let response =
-                ApiResponse::<()>::error("Reindex operation not yet implemented".to_string());
-            Ok(warp::reply::json(&response))
+            Ok(error_reply(
+                StatusCode::NOT_IMPLEMENTED,
+                "Reindex operation not yet implemented".to_string(),
+            ))
         }
         "optimize" => {
             // General optimization operation
-            let response =
-                ApiResponse::<()>::error("Optimize operation not yet implemented".to_string());
-            Ok(warp::reply::json(&response))
+            Ok(error_reply(
+                StatusCode::NOT_IMPLEMENTED,
+                "Optimize operation not yet implemented".to_string(),
+            ))
         }
-        _ => {
-            let response = ApiResponse::<()>::error(format!(
-                "Unknown maintenance operation: {}",
-                request.operation
-            ));
-            Ok(warp::reply::json(&response))
-        }
+        _ => Ok(error_reply(
+            StatusCode::BAD_REQUEST,
+            format!("Unknown maintenance operation: {}", request.operation),
+        )),
     }
 }
 
@@ -456,7 +457,7 @@ async fn version_handler() -> Result<impl Reply, warp::Rejection> {
         "build_target": get_target_triple(),
     });
 
-    Ok(warp::reply::json(&ApiResponse::success(version_info)))
+    Ok(json_reply(&ApiResponse::success(version_info)))
 }
 
 /// Get Rust compiler version

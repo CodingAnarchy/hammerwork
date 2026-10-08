@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -234,11 +234,11 @@ impl SpawnCommand {
 
                 for row in rows {
                     use sqlx::Row;
-                    let parent_id: Uuid = row.get("parent_id");
-                    let queue_name: String = row.get("queue_name");
-                    let spawned_count: i64 = row.get("spawned_count");
-                    let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-                    let spawn_config: Option<Value> = row.try_get("spawn_config").ok().flatten();
+                    let parent_id: Uuid = row.try_get("parent_id")?;
+                    let queue_name: String = row.try_get("queue_name")?;
+                    let spawned_count: i64 = row.try_get("spawned_count")?;
+                    let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
+                    let spawn_config: Option<Value> = row.try_get("spawn_config")?;
 
                     let operation_id = spawn_config
                         .as_ref()
@@ -247,8 +247,7 @@ impl SpawnCommand {
                         .unwrap_or("none");
 
                     let workflow = row
-                        .try_get::<Option<String>, _>("workflow_name")
-                        .unwrap_or(None)
+                        .try_get::<Option<String>, _>("workflow_name")?
                         .unwrap_or_else(|| "none".to_string());
 
                     println!(
@@ -307,26 +306,27 @@ impl SpawnCommand {
 
                 for row in rows {
                     use sqlx::Row;
-                    let parent_id: String = row.get("parent_id");
-                    let queue_name: String = row.get("queue_name");
-                    let spawned_count: i64 = row.get("spawned_count");
-                    let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-                    let spawn_config_str: Option<String> =
-                        row.try_get("spawn_config").ok().flatten();
+                    let parent_id: String = row.try_get("parent_id")?;
+                    let queue_name: String = row.try_get("queue_name")?;
+                    let spawned_count: i64 = row.try_get("spawned_count")?;
+                    let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
+                    let spawn_config_str: Option<String> = row.try_get("spawn_config")?;
 
                     let operation_id = spawn_config_str
                         .as_ref()
-                        .and_then(|config_str| serde_json::from_str::<Value>(config_str).ok())
-                        .and_then(|config| {
-                            config
-                                .get("operation_id")
-                                .and_then(|id| id.as_str().map(|s| s.to_string()))
-                        })
+                        .map(
+                            |config_str| match serde_json::from_str::<Value>(config_str) {
+                                Ok(config) => config
+                                    .get("operation_id")
+                                    .and_then(|id| id.as_str().map(|s| s.to_string()))
+                                    .unwrap_or_else(|| "none".to_string()),
+                                Err(_) => "invalid-config".to_string(),
+                            },
+                        )
                         .unwrap_or_else(|| "none".to_string());
 
                     let workflow = row
-                        .try_get::<Option<String>, _>("workflow_name")
-                        .unwrap_or(None)
+                        .try_get::<Option<String>, _>("workflow_name")?
                         .unwrap_or_else(|| "none".to_string());
 
                     println!(
@@ -410,7 +410,7 @@ impl SpawnCommand {
                 let total_query = format!(
                     r#"
                     SELECT COUNT(*) as total_spawn_ops,
-                           AVG(spawned_count) as avg_children,
+                           CAST(AVG(spawned_count) AS DOUBLE PRECISION) as avg_children,
                            MAX(spawned_count) as max_children
                     FROM (
                         SELECT parent.id, COUNT(child.id) as spawned_count
@@ -425,11 +425,12 @@ impl SpawnCommand {
                     hours, queue_clause
                 );
 
-                if let Ok(row) = sqlx::query(&total_query).fetch_one(&pg_pool).await {
+                {
+                    let row = sqlx::query(&total_query).fetch_one(&pg_pool).await?;
                     use sqlx::Row;
-                    let total: i64 = row.get("total_spawn_ops");
-                    let avg: Option<f64> = row.try_get("avg_children").ok().flatten();
-                    let max: Option<i64> = row.try_get("max_children").ok().flatten();
+                    let total: i64 = row.try_get("total_spawn_ops")?;
+                    let avg: Option<f64> = row.try_get("avg_children")?;
+                    let max: Option<i64> = row.try_get("max_children")?;
 
                     println!("Total Spawn Operations: {}", total);
                     if let Some(avg) = avg {
@@ -446,7 +447,7 @@ impl SpawnCommand {
                         r#"
                         SELECT queue_name, 
                                COUNT(*) as spawn_count,
-                               AVG(spawned_count) as avg_children
+                               CAST(AVG(spawned_count) AS DOUBLE PRECISION) as avg_children
                         FROM (
                             SELECT parent.queue_name, COUNT(child.id) as spawned_count
                             FROM hammerwork_jobs parent
@@ -472,9 +473,9 @@ impl SpawnCommand {
 
                     for row in rows {
                         use sqlx::Row;
-                        let queue: String = row.get("queue_name");
-                        let count: i64 = row.get("spawn_count");
-                        let avg: Option<f64> = row.try_get("avg_children").ok().flatten();
+                        let queue: String = row.try_get("queue_name")?;
+                        let count: i64 = row.try_get("spawn_count")?;
+                        let avg: Option<f64> = row.try_get("avg_children")?;
 
                         println!(
                             "{:<20} {:<12} {:<15.1}",
@@ -490,7 +491,7 @@ impl SpawnCommand {
                 let total_query = format!(
                     r#"
                     SELECT COUNT(*) as total_spawn_ops,
-                           AVG(spawned_count) as avg_children,
+                           CAST(AVG(spawned_count) AS DOUBLE) as avg_children,
                            MAX(spawned_count) as max_children
                     FROM (
                         SELECT parent.id, COUNT(child.id) as spawned_count
@@ -505,11 +506,12 @@ impl SpawnCommand {
                     hours, queue_clause
                 );
 
-                if let Ok(row) = sqlx::query(&total_query).fetch_one(&mysql_pool).await {
+                {
+                    let row = sqlx::query(&total_query).fetch_one(&mysql_pool).await?;
                     use sqlx::Row;
-                    let total: i64 = row.get("total_spawn_ops");
-                    let avg: Option<f64> = row.try_get("avg_children").ok();
-                    let max: Option<i64> = row.try_get("max_children").ok();
+                    let total: i64 = row.try_get("total_spawn_ops")?;
+                    let avg: Option<f64> = row.try_get("avg_children")?;
+                    let max: Option<i64> = row.try_get("max_children")?;
 
                     println!("Total Spawn Operations: {}", total);
                     if let Some(avg) = avg {
@@ -526,7 +528,7 @@ impl SpawnCommand {
                         r#"
                         SELECT queue_name, 
                                COUNT(*) as spawn_count,
-                               AVG(spawned_count) as avg_children
+                               CAST(AVG(spawned_count) AS DOUBLE) as avg_children
                         FROM (
                             SELECT parent.queue_name, COUNT(child.id) as spawned_count
                             FROM hammerwork_jobs parent
@@ -552,9 +554,9 @@ impl SpawnCommand {
 
                     for row in rows {
                         use sqlx::Row;
-                        let queue: String = row.get("queue_name");
-                        let count: i64 = row.get("spawn_count");
-                        let avg: Option<f64> = row.try_get("avg_children").ok();
+                        let queue: String = row.try_get("queue_name")?;
+                        let count: i64 = row.try_get("spawn_count")?;
+                        let avg: Option<f64> = row.try_get("avg_children")?;
 
                         println!(
                             "{:<20} {:<12} {:<15.1}",
@@ -675,11 +677,11 @@ impl SpawnCommand {
 
                 for row in rows {
                     use sqlx::Row;
-                    let id: Uuid = row.get("id");
-                    let queue_name: String = row.get("queue_name");
-                    let status: String = row.get("status");
-                    let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-                    let spawn_config: Option<Value> = row.try_get("spawn_config").ok().flatten();
+                    let id: Uuid = row.try_get("id")?;
+                    let queue_name: String = row.try_get("queue_name")?;
+                    let status: String = row.try_get("status")?;
+                    let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
+                    let spawn_config: Option<Value> = row.try_get("spawn_config")?;
 
                     println!(
                         "📋 Job: {} | Queue: {} | Status: {} | Created: {}",
@@ -725,12 +727,11 @@ impl SpawnCommand {
 
                 for row in rows {
                     use sqlx::Row;
-                    let id: String = row.get("id");
-                    let queue_name: String = row.get("queue_name");
-                    let status: String = row.get("status");
-                    let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-                    let spawn_config_str: Option<String> =
-                        row.try_get("spawn_config").ok().flatten();
+                    let id: String = row.try_get("id")?;
+                    let queue_name: String = row.try_get("queue_name")?;
+                    let status: String = row.try_get("status")?;
+                    let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
+                    let spawn_config_str: Option<String> = row.try_get("spawn_config")?;
 
                     println!(
                         "📋 Job: {} | Queue: {} | Status: {} | Created: {}",
@@ -930,12 +931,12 @@ impl SpawnCommand {
 
                 // Get parents (jobs this one depends on)
                 for parent_id in &job.depends_on {
-                    if let Ok(parent_uuid) = Uuid::parse_str(parent_id) {
-                        if let Ok(Some(parent)) = self.get_spawn_node(pool, &parent_uuid).await {
-                            if !all_nodes.contains_key(&parent.id) {
-                                all_nodes.insert(parent.id.clone(), parent.clone());
-                                to_visit.push_back(parent.id.clone());
-                            }
+                    let parent_uuid = Uuid::parse_str(parent_id)
+                        .with_context(|| format!("invalid dependency id '{}'", parent_id))?;
+                    if let Some(parent) = self.get_spawn_node(pool, &parent_uuid).await? {
+                        if !all_nodes.contains_key(&parent.id) {
+                            all_nodes.insert(parent.id.clone(), parent.clone());
+                            to_visit.push_back(parent.id.clone());
                         }
                     }
                 }
@@ -959,14 +960,14 @@ impl SpawnCommand {
             // Find the spawn parent (first dependency that has spawn config)
             let mut parent_found = false;
             for parent_id in &current.depends_on {
-                if let Ok(parent_uuid) = Uuid::parse_str(parent_id) {
-                    if let Ok(Some(parent)) = self.get_spawn_node(pool, &parent_uuid).await {
-                        if parent.spawn_config.is_some() {
-                            ancestors.push(parent.clone());
-                            current = parent;
-                            parent_found = true;
-                            break;
-                        }
+                let parent_uuid = Uuid::parse_str(parent_id)
+                    .with_context(|| format!("invalid dependency id '{}'", parent_id))?;
+                if let Some(parent) = self.get_spawn_node(pool, &parent_uuid).await? {
+                    if parent.spawn_config.is_some() {
+                        ancestors.push(parent.clone());
+                        current = parent;
+                        parent_found = true;
+                        break;
                     }
                 }
             }
@@ -1013,64 +1014,61 @@ impl SpawnCommand {
     fn postgres_row_to_spawn_node(&self, row: &sqlx::postgres::PgRow) -> Result<SpawnNode> {
         use sqlx::Row;
 
-        let id: Uuid = row.get("id");
+        let id: Uuid = row.try_get("id")?;
         // depends_on is a UUID[] column in PostgreSQL
         let depends_on = row
-            .try_get::<Option<Vec<Uuid>>, _>("depends_on")
-            .ok()
-            .flatten()
+            .try_get::<Option<Vec<Uuid>>, _>("depends_on")?
             .unwrap_or_default()
             .iter()
             .map(Uuid::to_string)
             .collect();
-        let spawn_config: Option<Value> = row.try_get("spawn_config").ok().flatten();
-        let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+        let spawn_config: Option<Value> = row.try_get("spawn_config")?;
+        let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
 
-        let workflow_id: Option<String> = match row.try_get::<Option<Uuid>, _>("workflow_id") {
-            Ok(Some(uuid)) => Some(uuid.to_string()),
-            Ok(None) => None,
-            Err(_) => None,
-        };
+        let workflow_id: Option<String> = row
+            .try_get::<Option<Uuid>, _>("workflow_id")?
+            .map(|uuid| uuid.to_string());
 
         Ok(SpawnNode {
             id: id.to_string(),
-            queue_name: row.get("queue_name"),
-            status: row.get("status"),
+            queue_name: row.try_get("queue_name")?,
+            status: row.try_get("status")?,
             depends_on,
             spawn_config,
             created_at: created_at.to_string(),
             workflow_id,
-            workflow_name: row.try_get("workflow_name").ok(),
+            workflow_name: row.try_get("workflow_name")?,
         })
     }
 
     fn mysql_row_to_spawn_node(&self, row: &sqlx::mysql::MySqlRow) -> Result<SpawnNode> {
         use sqlx::Row;
 
-        let id: String = row.get("id");
-        let depends_on = self.parse_json_array(row.try_get("depends_on").ok())?;
+        let id: String = row.try_get("id")?;
+        let depends_on = self.parse_json_array(row.try_get("depends_on")?)?;
 
         // Handle spawn config which might be a JSON string in MySQL
         let spawn_config: Option<Value> = match row.try_get::<Option<String>, _>("spawn_config") {
-            Ok(Some(config_str)) => serde_json::from_str(&config_str).ok(),
+            Ok(Some(config_str)) => Some(
+                serde_json::from_str(&config_str)
+                    .context("corrupt spawn_config JSON in hammerwork_jobs")?,
+            ),
             Ok(None) => None,
-            Err(_) => {
-                // Try as direct JSON value
-                row.try_get("spawn_config").ok().flatten()
-            }
+            // Not a text column: decode it as a native JSON value instead.
+            Err(_) => row.try_get::<Option<Value>, _>("spawn_config")?,
         };
 
-        let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+        let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
 
         Ok(SpawnNode {
             id,
-            queue_name: row.get("queue_name"),
-            status: row.get("status"),
+            queue_name: row.try_get("queue_name")?,
+            status: row.try_get("status")?,
             depends_on,
             spawn_config,
             created_at: created_at.to_string(),
-            workflow_id: row.try_get("workflow_id").ok(),
-            workflow_name: row.try_get("workflow_name").ok(),
+            workflow_id: row.try_get("workflow_id")?,
+            workflow_name: row.try_get("workflow_name")?,
         })
     }
 

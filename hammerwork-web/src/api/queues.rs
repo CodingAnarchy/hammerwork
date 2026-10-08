@@ -103,9 +103,11 @@ use super::{
     ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
     with_filters, with_pagination, with_sort,
 };
+use super::{error_reply, json_reply};
 use hammerwork::{JobPriority, queue::DatabaseQueue};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use warp::http::StatusCode;
 use warp::{Filter, Reply};
 
 /// Queue information for API responses
@@ -226,10 +228,10 @@ where
 
             for stats in all_stats {
                 // Get pause information for this queue
-                let pause_info = queue
-                    .get_queue_pause_info(&stats.queue_name)
-                    .await
-                    .unwrap_or(None);
+                let pause_info = try_api!(
+                    queue.get_queue_pause_info(&stats.queue_name).await,
+                    "Failed to get queue pause info"
+                );
 
                 let queue_info = QueueInfo {
                     name: stats.queue_name.clone(),
@@ -241,8 +243,14 @@ where
                     avg_processing_time_ms: stats.statistics.avg_processing_time_ms,
                     throughput_per_minute: stats.statistics.throughput_per_minute,
                     error_rate: stats.statistics.error_rate,
-                    last_job_at: get_last_job_time(&queue, &stats.queue_name).await,
-                    oldest_pending_job: get_oldest_pending_job(&queue, &stats.queue_name).await,
+                    last_job_at: try_api!(
+                        get_last_job_time(&queue, &stats.queue_name).await,
+                        "Failed to get last job time"
+                    ),
+                    oldest_pending_job: try_api!(
+                        get_oldest_pending_job(&queue, &stats.queue_name).await,
+                        "Failed to get oldest pending job"
+                    ),
                     is_paused: pause_info.is_some(),
                     paused_at: pause_info.as_ref().map(|p| p.paused_at),
                     paused_by: pause_info.as_ref().and_then(|p| p.paused_by.clone()),
@@ -267,13 +275,12 @@ where
                 pagination: PaginationMeta::new(&pagination, total),
             };
 
-            Ok(warp::reply::json(&ApiResponse::success(response)))
+            Ok(json_reply(&ApiResponse::success(response)))
         }
-        Err(e) => {
-            let response =
-                ApiResponse::<()>::error(format!("Failed to get queue statistics: {}", e));
-            Ok(warp::reply::json(&response))
-        }
+        Err(e) => Ok(error_reply(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get queue statistics: {}", e),
+        )),
     }
 }
 
@@ -289,16 +296,25 @@ where
         Ok(all_stats) => {
             if let Some(stats) = all_stats.into_iter().find(|s| s.queue_name == queue_name) {
                 // Get additional details for this specific queue
-                let priority_breakdown = get_priority_breakdown(&queue, &queue_name).await;
-                let status_breakdown = get_status_breakdown(&queue, &queue_name).await;
+                let priority_breakdown = try_api!(
+                    get_priority_breakdown(&queue, &queue_name).await,
+                    "Failed to get priority breakdown"
+                );
+                let status_breakdown = try_api!(
+                    get_status_breakdown(&queue, &queue_name).await,
+                    "Failed to get status breakdown"
+                );
                 let hourly_throughput = get_hourly_throughput(&queue, &queue_name).await;
-                let recent_errors = get_recent_errors(&queue, &queue_name).await;
+                let recent_errors = try_api!(
+                    get_recent_errors(&queue, &queue_name).await,
+                    "Failed to get recent errors"
+                );
 
                 // Get pause information for this queue
-                let pause_info = queue
-                    .get_queue_pause_info(&queue_name)
-                    .await
-                    .unwrap_or(None);
+                let pause_info = try_api!(
+                    queue.get_queue_pause_info(&queue_name).await,
+                    "Failed to get queue pause info"
+                );
 
                 let queue_info = QueueInfo {
                     name: stats.queue_name.clone(),
@@ -325,18 +341,18 @@ where
                     recent_errors,
                 };
 
-                Ok(warp::reply::json(&ApiResponse::success(detailed_stats)))
+                Ok(json_reply(&ApiResponse::success(detailed_stats)))
             } else {
-                let response =
-                    ApiResponse::<()>::error(format!("Queue '{}' not found", queue_name));
-                Ok(warp::reply::json(&response))
+                Ok(error_reply(
+                    StatusCode::NOT_FOUND,
+                    format!("Queue '{}' not found", queue_name),
+                ))
             }
         }
-        Err(e) => {
-            let response =
-                ApiResponse::<()>::error(format!("Failed to get queue statistics: {}", e));
-            Ok(warp::reply::json(&response))
-        }
+        Err(e) => Ok(error_reply(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get queue statistics: {}", e),
+        )),
     }
 }
 
@@ -358,13 +374,12 @@ where
                         "message": format!("Cleared {} dead jobs from queue '{}'", count, queue_name),
                         "count": count
                     }));
-                    Ok(warp::reply::json(&response))
+                    Ok(json_reply(&response))
                 }
-                Err(e) => {
-                    let response =
-                        ApiResponse::<()>::error(format!("Failed to clear dead jobs: {}", e));
-                    Ok(warp::reply::json(&response))
-                }
+                Err(e) => Ok(error_reply(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to clear dead jobs: {}", e),
+                )),
             }
         }
         "clear_completed" => match clear_completed_jobs(&queue, &queue_name).await {
@@ -374,13 +389,12 @@ where
                     "queue": queue_name,
                     "cleared_count": count
                 }));
-                Ok(warp::reply::json(&response))
+                Ok(json_reply(&response))
             }
-            Err(e) => {
-                let response =
-                    ApiResponse::<()>::error(format!("Failed to clear completed jobs: {}", e));
-                Ok(warp::reply::json(&response))
-            }
+            Err(e) => Ok(error_reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to clear completed jobs: {}", e),
+            )),
         },
         "pause" => match queue.pause_queue(&queue_name, Some("web-ui")).await {
             Ok(()) => {
@@ -389,12 +403,12 @@ where
                     "queue": queue_name,
                     "action": "pause"
                 }));
-                Ok(warp::reply::json(&response))
+                Ok(json_reply(&response))
             }
-            Err(e) => {
-                let response = ApiResponse::<()>::error(format!("Failed to pause queue: {}", e));
-                Ok(warp::reply::json(&response))
-            }
+            Err(e) => Ok(error_reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to pause queue: {}", e),
+            )),
         },
         "resume" => match queue.resume_queue(&queue_name, Some("web-ui")).await {
             Ok(()) => {
@@ -403,18 +417,17 @@ where
                     "queue": queue_name,
                     "action": "resume"
                 }));
-                Ok(warp::reply::json(&response))
+                Ok(json_reply(&response))
             }
-            Err(e) => {
-                let response = ApiResponse::<()>::error(format!("Failed to resume queue: {}", e));
-                Ok(warp::reply::json(&response))
-            }
+            Err(e) => Ok(error_reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to resume queue: {}", e),
+            )),
         },
-        _ => {
-            let response =
-                ApiResponse::<()>::error(format!("Unknown action: {}", action_request.action));
-            Ok(warp::reply::json(&response))
-        }
+        _ => Ok(error_reply(
+            StatusCode::BAD_REQUEST,
+            format!("Unknown action: {}", action_request.action),
+        )),
     }
 }
 
@@ -438,14 +451,14 @@ where
         "queue": queue_name
     }));
 
-    Ok(warp::reply::json(&response))
+    Ok(json_reply(&response))
 }
 
 /// Helper function to get the last job time for a queue
 async fn get_last_job_time<T>(
     queue: &Arc<T>,
     queue_name: &str,
-) -> Option<chrono::DateTime<chrono::Utc>>
+) -> hammerwork::Result<Option<chrono::DateTime<chrono::Utc>>>
 where
     T: DatabaseQueue + Send + Sync,
 {
@@ -453,103 +466,91 @@ where
     let mut latest_time: Option<chrono::DateTime<chrono::Utc>> = None;
 
     // Check ready jobs
-    if let Ok(ready_jobs) = queue.get_ready_jobs(queue_name, 10).await {
-        for job in ready_jobs {
-            if let Some(time) = job.completed_at.or(job.started_at).or(Some(job.created_at)) {
-                latest_time = match latest_time {
-                    Some(current) if time > current => Some(time),
-                    None => Some(time),
-                    _ => latest_time,
-                };
-            }
+    let ready_jobs = queue.get_ready_jobs(queue_name, 10).await?;
+    for job in ready_jobs {
+        if let Some(time) = job.completed_at.or(job.started_at).or(Some(job.created_at)) {
+            latest_time = match latest_time {
+                Some(current) if time > current => Some(time),
+                None => Some(time),
+                _ => latest_time,
+            };
         }
     }
 
     // Check dead jobs
-    if let Ok(dead_jobs) = queue
+    let dead_jobs = queue
         .get_dead_jobs_by_queue(queue_name, Some(10), Some(0))
-        .await
-    {
-        for job in dead_jobs {
-            if let Some(time) = job
-                .failed_at
-                .or(job.completed_at)
-                .or(job.started_at)
-                .or(Some(job.created_at))
-            {
-                latest_time = match latest_time {
-                    Some(current) if time > current => Some(time),
-                    None => Some(time),
-                    _ => latest_time,
-                };
-            }
+        .await?;
+    for job in dead_jobs {
+        if let Some(time) = job
+            .failed_at
+            .or(job.completed_at)
+            .or(job.started_at)
+            .or(Some(job.created_at))
+        {
+            latest_time = match latest_time {
+                Some(current) if time > current => Some(time),
+                None => Some(time),
+                _ => latest_time,
+            };
         }
     }
 
-    latest_time
+    Ok(latest_time)
 }
 
 /// Helper function to get the oldest pending job time for a queue
 async fn get_oldest_pending_job<T>(
     queue: &Arc<T>,
     queue_name: &str,
-) -> Option<chrono::DateTime<chrono::Utc>>
+) -> hammerwork::Result<Option<chrono::DateTime<chrono::Utc>>>
 where
     T: DatabaseQueue + Send + Sync,
 {
     // Get ready jobs (these are pending jobs) and find the oldest
-    if let Ok(ready_jobs) = queue.get_ready_jobs(queue_name, 100).await {
-        ready_jobs
-            .iter()
-            .filter(|job| matches!(job.status, hammerwork::job::JobStatus::Pending))
-            .map(|job| job.created_at)
-            .min()
-    } else {
-        None
-    }
+    let ready_jobs = queue.get_ready_jobs(queue_name, 100).await?;
+    Ok(ready_jobs
+        .iter()
+        .filter(|job| matches!(job.status, hammerwork::job::JobStatus::Pending))
+        .map(|job| job.created_at)
+        .min())
 }
 
 /// Helper function to get priority breakdown for a queue
 async fn get_priority_breakdown<T>(
     queue: &Arc<T>,
     queue_name: &str,
-) -> std::collections::HashMap<String, u64>
+) -> hammerwork::Result<std::collections::HashMap<String, u64>>
 where
     T: DatabaseQueue + Send + Sync,
 {
     // Use the new get_priority_stats method
-    if let Ok(priority_stats) = queue.get_priority_stats(queue_name).await {
-        let mut breakdown = std::collections::HashMap::new();
-        for (priority, count) in priority_stats.job_counts {
-            let priority_name = match priority {
-                JobPriority::Background => "background",
-                JobPriority::Low => "low",
-                JobPriority::Normal => "normal",
-                JobPriority::High => "high",
-                JobPriority::Critical => "critical",
-            };
-            breakdown.insert(priority_name.to_string(), count);
-        }
-        breakdown
-    } else {
-        std::collections::HashMap::new()
+    let priority_stats = queue.get_priority_stats(queue_name).await?;
+    let mut breakdown = std::collections::HashMap::new();
+    for (priority, count) in priority_stats.job_counts {
+        let priority_name = match priority {
+            JobPriority::Background => "background",
+            JobPriority::Low => "low",
+            JobPriority::Normal => "normal",
+            JobPriority::High => "high",
+            JobPriority::Critical => "critical",
+        };
+        breakdown.insert(priority_name.to_string(), count);
     }
+    Ok(breakdown)
 }
 
 /// Helper function to get status breakdown for a queue
 async fn get_status_breakdown<T>(
     queue: &Arc<T>,
     queue_name: &str,
-) -> std::collections::HashMap<String, u64>
+) -> hammerwork::Result<std::collections::HashMap<String, u64>>
 where
     T: DatabaseQueue + Send + Sync,
 {
     // Use existing job counts method
-    if let Ok(counts) = queue.get_job_counts_by_status(queue_name).await {
-        counts.into_iter().collect()
-    } else {
-        std::collections::HashMap::new()
-    }
+    let counts = queue.get_job_counts_by_status(queue_name).await?;
+    Ok(counts.into_iter().collect())
 }
 
 /// Helper function to get hourly throughput data for a queue
@@ -563,29 +564,28 @@ where
 }
 
 /// Helper function to get recent errors for a queue
-async fn get_recent_errors<T>(queue: &Arc<T>, queue_name: &str) -> Vec<RecentError>
+async fn get_recent_errors<T>(
+    queue: &Arc<T>,
+    queue_name: &str,
+) -> hammerwork::Result<Vec<RecentError>>
 where
     T: DatabaseQueue + Send + Sync,
 {
     // Get dead jobs which contain failed jobs with error messages
-    if let Ok(dead_jobs) = queue
+    let dead_jobs = queue
         .get_dead_jobs_by_queue(queue_name, Some(20), Some(0))
-        .await
-    {
-        dead_jobs
-            .into_iter()
-            .filter_map(|job| {
-                job.error_message.map(|error_msg| RecentError {
-                    job_id: job.id.to_string(),
-                    error_message: error_msg,
-                    occurred_at: job.failed_at.unwrap_or(job.created_at),
-                    attempts: job.attempts,
-                })
+        .await?;
+    Ok(dead_jobs
+        .into_iter()
+        .filter_map(|job| {
+            job.error_message.map(|error_msg| RecentError {
+                job_id: job.id.to_string(),
+                error_message: error_msg,
+                occurred_at: job.failed_at.unwrap_or(job.created_at),
+                attempts: job.attempts,
             })
-            .collect()
-    } else {
-        Vec::new()
-    }
+        })
+        .collect())
 }
 
 /// Helper function to clear completed jobs from a queue
@@ -609,6 +609,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::test_support::{body_json, unreachable_queue};
+
+    #[tokio::test]
+    async fn test_list_queues_returns_500_when_database_is_down() {
+        let response = list_queues_handler(
+            unreachable_queue(),
+            PaginationParams::default(),
+            serde_json::from_value(serde_json::json!({})).unwrap(),
+            SortParams {
+                sort_by: None,
+                sort_order: None,
+            },
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let (status, body) = body_json(response).await;
+        assert_eq!(status, 500);
+        assert_eq!(body["success"], false);
+    }
 
     #[test]
     fn test_queue_action_request_deserialization() {

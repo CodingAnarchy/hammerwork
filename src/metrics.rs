@@ -265,16 +265,40 @@ impl PrometheusMetricsCollector {
         Ok(collector)
     }
 
-    /// Start the Prometheus HTTP exposition server
+    /// Start the Prometheus HTTP exposition server.
+    ///
+    /// The listening socket is bound before this method returns, so a failure to
+    /// bind the configured address (port in use, privileged port, bad interface)
+    /// is reported as `Err(HammerworkError::Metrics)` instead of the server task
+    /// dying silently. Does nothing when no exposition address is configured.
     pub async fn start_exposition_server(&mut self) -> Result<()> {
         if let Some(addr) = self.config.exposition_addr {
+            let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+                HammerworkError::Metrics {
+                    message: format!("Failed to bind metrics exposition server to {addr}: {e}"),
+                }
+            })?;
+
             let registry = self.registry.clone();
             let app = warp::path("metrics").map(move || {
                 let encoder = TextEncoder::new();
                 let metric_families = registry.gather();
                 let mut buffer = Vec::new();
-                encoder.encode(&metric_families, &mut buffer).unwrap();
-                let body = String::from_utf8(buffer).unwrap();
+                let body = match encoder
+                    .encode(&metric_families, &mut buffer)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| String::from_utf8(buffer).map_err(|e| e.to_string()))
+                {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::error!("Failed to encode metrics: {}", e);
+                        let mut reply = warp::reply::Response::new(
+                            format!("failed to encode metrics: {e}").into(),
+                        );
+                        *reply.status_mut() = warp::http::StatusCode::INTERNAL_SERVER_ERROR;
+                        return reply;
+                    }
+                };
                 let mut reply = warp::reply::Response::new(body.into());
                 reply.headers_mut().insert(
                     warp::http::header::CONTENT_TYPE,
@@ -285,9 +309,11 @@ impl PrometheusMetricsCollector {
 
             // Spawn the server future directly (not wrapped in an `async` block) to
             // avoid a rustc higher-ranked lifetime inference issue with warp 0.4.
-            let handle = tokio::spawn(warp::serve(app).run(addr));
+            let handle = tokio::spawn(warp::serve(app).incoming(listener).run());
 
-            self.server_handle = Some(handle);
+            if let Some(previous) = self.server_handle.replace(handle) {
+                previous.abort();
+            }
         }
 
         Ok(())
@@ -574,6 +600,39 @@ mod tests {
     use super::*;
     use crate::stats::{JobEvent, JobEventType};
     use std::time::Duration;
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_exposition_server_reports_bind_failure() {
+        // Occupy a port, then ask the collector to bind the very same address.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = blocker.local_addr().unwrap();
+
+        let mut collector =
+            PrometheusMetricsCollector::new(MetricsConfig::new().with_prometheus_exporter(addr))
+                .unwrap();
+        let err = collector.start_exposition_server().await.unwrap_err();
+        assert!(
+            matches!(err, HammerworkError::Metrics { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains(&addr.to_string()), "{err}");
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_exposition_server_serves_when_bind_succeeds() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let mut collector =
+            PrometheusMetricsCollector::new(MetricsConfig::new().with_prometheus_exporter(addr))
+                .unwrap();
+        collector.start_exposition_server().await.unwrap();
+        assert!(collector.server_handle.is_some());
+        assert!(tokio::net::TcpStream::connect(addr).await.is_ok());
+    }
 
     #[test]
     fn test_metrics_config_creation() {

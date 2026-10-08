@@ -268,7 +268,19 @@ impl DashboardConfig {
     pub fn from_file(path: &str) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Check settings that would otherwise make background tasks panic at runtime.
+    ///
+    /// Currently this requires a non-zero `websocket.ping_interval`
+    /// (`tokio::time::interval` panics on a zero period).
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.websocket.ping_interval.is_zero() {
+            anyhow::bail!("websocket.ping_interval must be greater than zero");
+        }
+        Ok(())
     }
 
     /// Save configuration to a TOML file
@@ -392,6 +404,25 @@ mod tests {
         assert_eq!(config.database_url, "mysql://localhost/test");
         assert!(config.enable_cors);
         assert_eq!(config.bind_addr(), "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_ping_interval() {
+        let mut config = DashboardConfig::new();
+        assert!(config.validate().is_ok());
+        config.websocket.ping_interval = Duration::ZERO;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ping_interval"), "{err}");
+    }
+
+    #[test]
+    fn test_from_file_rejects_zero_ping_interval() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        let mut config = DashboardConfig::new();
+        config.websocket.ping_interval = Duration::ZERO;
+        config.save_to_file(path.to_str().unwrap()).unwrap();
+        assert!(DashboardConfig::from_file(path.to_str().unwrap()).is_err());
     }
 
     #[test]

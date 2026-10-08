@@ -48,6 +48,17 @@
 //! assert!(meta.has_prev);
 //! ```
 
+/// Unwrap a `Result` inside a warp handler returning `Ok(reply)`; on error log it
+/// and return a `500` JSON error response instead of swallowing the failure.
+macro_rules! try_api {
+    ($expr:expr, $context:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(e) => return Ok($crate::api::internal_error($context, &e)),
+        }
+    };
+}
+
 pub mod archive;
 pub mod jobs;
 pub mod queues;
@@ -56,6 +67,7 @@ pub mod stats;
 pub mod system;
 
 use serde::{Deserialize, Serialize};
+use warp::Reply;
 
 /// Standard API response wrapper
 #[derive(Debug, Serialize)]
@@ -84,6 +96,33 @@ impl<T> ApiResponse<T> {
             timestamp: chrono::Utc::now(),
         }
     }
+}
+
+/// Serialize `body` as a `200 OK` JSON response.
+pub fn json_reply<T: Serialize>(body: &T) -> warp::reply::Response {
+    warp::reply::with_status(warp::reply::json(body), warp::http::StatusCode::OK).into_response()
+}
+
+/// Build a JSON [`ApiResponse`] error body with the given HTTP status.
+pub fn error_reply(
+    status: warp::http::StatusCode,
+    message: impl Into<String>,
+) -> warp::reply::Response {
+    let body = ApiResponse::<()>::error(message.into());
+    warp::reply::with_status(warp::reply::json(&body), status).into_response()
+}
+
+/// Log a failed backend operation and return it as a `500 Internal Server Error`
+/// JSON response (`"{context}: {err}"`).
+///
+/// Handlers use this instead of swallowing the error, so API callers can tell
+/// an outage apart from "no data".
+pub fn internal_error(context: &str, err: &dyn std::fmt::Display) -> warp::reply::Response {
+    tracing::error!(error = %err, "{}", context);
+    error_reply(
+        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{}: {}", context, err),
+    )
 }
 
 /// Pagination parameters
@@ -239,8 +278,38 @@ pub fn with_sort() -> impl warp::Filter<Extract = (SortParams,), Error = warp::R
     warp::query::<SortParams>()
 }
 
+/// Test helpers shared by the handler tests of the API submodules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use hammerwork::JobQueue;
+    use std::sync::Arc;
+
+    /// A queue whose database is unreachable, so every query fails quickly.
+    pub fn unreachable_queue() -> Arc<JobQueue<sqlx::Postgres>> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+            .expect("lazy pool");
+        Arc::new(JobQueue::new(pool))
+    }
+
+    /// Status code and JSON body of a handler reply.
+    pub async fn body_json(response: warp::reply::Response) -> (u16, serde_json::Value) {
+        use warp::Filter;
+        // `warp::test` needs a filter; hand the response out once via a shared slot.
+        let slot = Arc::new(std::sync::Mutex::new(Some(response)));
+        let filter = warp::any().map(move || slot.lock().unwrap().take().unwrap());
+        let reply = warp::test::request().reply(&filter).await;
+        (
+            reply.status().as_u16(),
+            serde_json::from_slice(reply.body()).unwrap(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::body_json;
     use super::*;
 
     #[test]
@@ -314,5 +383,29 @@ mod tests {
         let (field, direction) = params.get_order_by();
         assert_eq!(field, "name");
         assert_eq!(direction, "ASC");
+    }
+
+    #[tokio::test]
+    async fn test_internal_error_is_500_with_json_error_body() {
+        let (status, body) = body_json(internal_error("Failed to list jobs", &"db down")).await;
+        assert_eq!(status, 500);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["error"], "Failed to list jobs: db down");
+        assert!(body["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_error_reply_uses_given_status() {
+        let (status, body) =
+            body_json(error_reply(warp::http::StatusCode::BAD_REQUEST, "nope")).await;
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "nope");
+    }
+
+    #[tokio::test]
+    async fn test_json_reply_is_200() {
+        let (status, body) = body_json(json_reply(&ApiResponse::success(5))).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], 5);
     }
 }

@@ -97,6 +97,9 @@ impl MonitorCommand {
 }
 
 async fn run_dashboard(pool: DatabasePool, refresh_secs: u64, queue: Option<String>) -> Result<()> {
+    if refresh_secs == 0 {
+        anyhow::bail!("refresh interval must be at least 1 second");
+    }
     println!("📊 Hammerwork Dashboard");
     println!("Press Ctrl+C to exit\n");
 
@@ -255,13 +258,13 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
         DatabasePool::Postgres(ref pg_pool) => {
             match sqlx::query("SELECT 1").fetch_one(pg_pool).await {
                 Ok(_) => ("🟢", "Database", "Connected".to_string()),
-                Err(_) => ("🔴", "Database", "Connection Failed".to_string()),
+                Err(e) => ("🔴", "Database", format!("Connection Failed: {}", e)),
             }
         }
         DatabasePool::MySQL(ref mysql_pool) => {
             match sqlx::query("SELECT 1").fetch_one(mysql_pool).await {
                 Ok(_) => ("🟢", "Database", "Connected".to_string()),
-                Err(_) => ("🔴", "Database", "Connection Failed".to_string()),
+                Err(e) => ("🔴", "Database", format!("Connection Failed: {}", e)),
             }
         }
     };
@@ -276,7 +279,7 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
             )
             .fetch_one(pg_pool)
             .await?;
-            result.try_get::<i64, _>("count").unwrap_or(0)
+            result.try_get::<i64, _>("count")?
         }
         DatabasePool::MySQL(ref mysql_pool) => {
             let result = sqlx::query(
@@ -285,7 +288,7 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
             )
             .fetch_one(mysql_pool)
             .await?;
-            result.try_get::<i64, _>("count").unwrap_or(0)
+            result.try_get::<i64, _>("count")?
         }
     };
 
@@ -316,8 +319,8 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
             .await?;
 
             (
-                total_result.try_get::<i64, _>("count").unwrap_or(0),
-                failed_result.try_get::<i64, _>("count").unwrap_or(0),
+                total_result.try_get::<i64, _>("count")?,
+                failed_result.try_get::<i64, _>("count")?,
             )
         }
         DatabasePool::MySQL(ref mysql_pool) => {
@@ -336,8 +339,8 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
             .await?;
 
             (
-                total_result.try_get::<i64, _>("count").unwrap_or(0),
-                failed_result.try_get::<i64, _>("count").unwrap_or(0),
+                total_result.try_get::<i64, _>("count")?,
+                failed_result.try_get::<i64, _>("count")?,
             )
         }
     };
@@ -455,7 +458,7 @@ async fn show_metrics(
 
             // Average processing time for completed jobs
             let avg_time_result = sqlx::query(&format!(
-                "SELECT AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) as avg_duration
+                "SELECT CAST(AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) AS DOUBLE PRECISION) as avg_duration
                  FROM hammerwork_jobs 
                  WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '{}'{}",
                 pg_interval, queue_filter
@@ -463,9 +466,7 @@ async fn show_metrics(
             .fetch_one(&pg_pool)
             .await?;
 
-            if let Ok(Some(avg_duration)) =
-                avg_time_result.try_get::<Option<f64>, _>("avg_duration")
-            {
+            if let Some(avg_duration) = avg_time_result.try_get::<Option<f64>, _>("avg_duration")? {
                 println!("   Avg Processing Time: {:.1}s", avg_duration);
             }
         }
@@ -509,7 +510,7 @@ async fn show_metrics(
 
             // Average processing time for completed jobs
             let avg_time_result = sqlx::query(&format!(
-                "SELECT AVG(TIMESTAMPDIFF(SECOND, started_at, completed_at)) as avg_duration
+                "SELECT CAST(AVG(TIMESTAMPDIFF(SECOND, started_at, completed_at)) AS DOUBLE) as avg_duration
                  FROM hammerwork_jobs 
                  WHERE status = 'completed' AND completed_at > DATE_SUB(NOW(), INTERVAL {}){}",
                 mysql_interval, queue_filter
@@ -517,9 +518,7 @@ async fn show_metrics(
             .fetch_one(&mysql_pool)
             .await?;
 
-            if let Ok(Some(avg_duration)) =
-                avg_time_result.try_get::<Option<f64>, _>("avg_duration")
-            {
+            if let Some(avg_duration) = avg_time_result.try_get::<Option<f64>, _>("avg_duration")? {
                 println!("   Avg Processing Time: {:.1}s", avg_duration);
             }
         }
@@ -622,4 +621,21 @@ async fn show_logs(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_dashboard_rejects_zero_refresh_interval() {
+        // The check runs before the pool is touched, so a lazily connected pool is enough.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://u:p@127.0.0.1:1/none")
+            .unwrap();
+        let err = run_dashboard(DatabasePool::Postgres(pool), 0, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("at least 1 second"));
+    }
 }

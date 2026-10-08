@@ -82,9 +82,11 @@ use super::{
     ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
     with_filters, with_pagination, with_sort,
 };
+use super::{error_reply, json_reply};
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use warp::http::StatusCode;
 use warp::{Filter, Reply};
 
 /// Job information for API responses
@@ -233,8 +235,10 @@ where
     let queue_stats = match queue.get_all_queue_stats().await {
         Ok(stats) => stats,
         Err(e) => {
-            let response = ApiResponse::<()>::error(format!("Failed to get queue stats: {}", e));
-            return Ok(warp::reply::json(&response));
+            return Ok(error_reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get queue stats: {}", e),
+            ));
         }
     };
 
@@ -253,9 +257,10 @@ where
         if filters.status.is_none() || filters.status.as_ref().unwrap().to_lowercase() == "pending"
         {
             // Get ready jobs (pending jobs ready to be processed)
-            if let Ok(ready_jobs) = queue.get_ready_jobs(queue_name, 100).await {
-                queue_jobs.extend(ready_jobs);
-            }
+            queue_jobs.extend(try_api!(
+                queue.get_ready_jobs(queue_name, 100).await,
+                "Failed to get ready jobs"
+            ));
         }
 
         if filters.status.is_none()
@@ -263,21 +268,22 @@ where
             || filters.status.as_ref().unwrap().to_lowercase() == "dead"
         {
             // Get dead jobs
-            if let Ok(dead_jobs) = queue
-                .get_dead_jobs_by_queue(queue_name, Some(100), Some(0))
-                .await
-            {
-                queue_jobs.extend(dead_jobs);
-            }
+            queue_jobs.extend(try_api!(
+                queue
+                    .get_dead_jobs_by_queue(queue_name, Some(100), Some(0))
+                    .await,
+                "Failed to get dead jobs"
+            ));
         }
 
         if filters.status.is_none()
             || filters.status.as_ref().unwrap().to_lowercase() == "recurring"
         {
             // Get recurring jobs
-            if let Ok(recurring_jobs) = queue.get_recurring_jobs(queue_name).await {
-                queue_jobs.extend(recurring_jobs);
-            }
+            queue_jobs.extend(try_api!(
+                queue.get_recurring_jobs(queue_name).await,
+                "Failed to get recurring jobs"
+            ));
         }
 
         for job in queue_jobs {
@@ -373,7 +379,7 @@ where
         pagination: PaginationMeta::new(&pagination, total_count),
     };
 
-    Ok(warp::reply::json(&ApiResponse::success(response)))
+    Ok(json_reply(&ApiResponse::success(response)))
 }
 
 /// Handler for creating a new job
@@ -419,12 +425,12 @@ where
                 "message": "Job created successfully",
                 "job_id": job_id.to_string()
             }));
-            Ok(warp::reply::json(&response))
+            Ok(json_reply(&response))
         }
-        Err(e) => {
-            let response = ApiResponse::<()>::error(format!("Failed to create job: {}", e));
-            Ok(warp::reply::json(&response))
-        }
+        Err(e) => Ok(error_reply(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create job: {}", e),
+        )),
     }
 }
 
@@ -436,8 +442,10 @@ where
     let job_uuid = match uuid::Uuid::parse_str(&job_id) {
         Ok(uuid) => uuid,
         Err(_) => {
-            let response = ApiResponse::<()>::error("Invalid job ID format".to_string());
-            return Ok(warp::reply::json(&response));
+            return Ok(error_reply(
+                StatusCode::BAD_REQUEST,
+                "Invalid job ID format".to_string(),
+            ));
         }
     };
 
@@ -469,16 +477,16 @@ where
                 correlation_id: job.correlation_id.clone(),
             };
 
-            Ok(warp::reply::json(&ApiResponse::success(job_info)))
+            Ok(json_reply(&ApiResponse::success(job_info)))
         }
-        Ok(None) => {
-            let response = ApiResponse::<()>::error(format!("Job '{}' not found", job_id));
-            Ok(warp::reply::json(&response))
-        }
-        Err(e) => {
-            let response = ApiResponse::<()>::error(format!("Failed to get job: {}", e));
-            Ok(warp::reply::json(&response))
-        }
+        Ok(None) => Ok(error_reply(
+            StatusCode::NOT_FOUND,
+            format!("Job '{}' not found", job_id),
+        )),
+        Err(e) => Ok(error_reply(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get job: {}", e),
+        )),
     }
 }
 
@@ -494,8 +502,10 @@ where
     let job_uuid = match uuid::Uuid::parse_str(&job_id) {
         Ok(uuid) => uuid,
         Err(_) => {
-            let response = ApiResponse::<()>::error("Invalid job ID format".to_string());
-            return Ok(warp::reply::json(&response));
+            return Ok(error_reply(
+                StatusCode::BAD_REQUEST,
+                "Invalid job ID format".to_string(),
+            ));
         }
     };
 
@@ -505,30 +515,29 @@ where
                 let response = ApiResponse::success(serde_json::json!({
                     "message": format!("Job '{}' scheduled for retry", job_id)
                 }));
-                Ok(warp::reply::json(&response))
+                Ok(json_reply(&response))
             }
-            Err(e) => {
-                let response = ApiResponse::<()>::error(format!("Failed to retry job: {}", e));
-                Ok(warp::reply::json(&response))
-            }
+            Err(e) => Ok(error_reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to retry job: {}", e),
+            )),
         },
         "cancel" | "delete" => match queue.delete_job(job_uuid).await {
             Ok(()) => {
                 let response = ApiResponse::success(serde_json::json!({
                     "message": format!("Job '{}' deleted", job_id)
                 }));
-                Ok(warp::reply::json(&response))
+                Ok(json_reply(&response))
             }
-            Err(e) => {
-                let response = ApiResponse::<()>::error(format!("Failed to delete job: {}", e));
-                Ok(warp::reply::json(&response))
-            }
+            Err(e) => Ok(error_reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to delete job: {}", e),
+            )),
         },
-        _ => {
-            let response =
-                ApiResponse::<()>::error(format!("Unknown action: {}", action_request.action));
-            Ok(warp::reply::json(&response))
-        }
+        _ => Ok(error_reply(
+            StatusCode::BAD_REQUEST,
+            format!("Unknown action: {}", action_request.action),
+        )),
     }
 }
 
@@ -595,7 +604,7 @@ where
         "message": format!("Bulk {} completed: {} successful, {} failed", request.action, successful, failed)
     }));
 
-    Ok(warp::reply::json(&response))
+    Ok(json_reply(&response))
 }
 
 /// Handler for searching jobs
@@ -615,8 +624,10 @@ where
     let queue_stats = match queue.get_all_queue_stats().await {
         Ok(stats) => stats,
         Err(e) => {
-            let response = ApiResponse::<()>::error(format!("Failed to get queue stats: {}", e));
-            return Ok(warp::reply::json(&response));
+            return Ok(error_reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get queue stats: {}", e),
+            ));
         }
     };
 
@@ -631,26 +642,26 @@ where
         let mut queue_jobs = Vec::new();
 
         // Collect jobs from all sources for comprehensive search
-        if let Ok(ready_jobs) = queue.get_ready_jobs(queue_name, 200).await {
-            queue_jobs.extend(ready_jobs);
-        }
+        queue_jobs.extend(try_api!(
+            queue.get_ready_jobs(queue_name, 200).await,
+            "Failed to get ready jobs"
+        ));
 
-        if let Ok(dead_jobs) = queue
-            .get_dead_jobs_by_queue(queue_name, Some(200), Some(0))
-            .await
-        {
-            queue_jobs.extend(dead_jobs);
-        }
+        queue_jobs.extend(try_api!(
+            queue
+                .get_dead_jobs_by_queue(queue_name, Some(200), Some(0))
+                .await,
+            "Failed to get dead jobs"
+        ));
 
-        if let Ok(recurring_jobs) = queue.get_recurring_jobs(queue_name).await {
-            queue_jobs.extend(recurring_jobs);
-        }
+        queue_jobs.extend(try_api!(
+            queue.get_recurring_jobs(queue_name).await,
+            "Failed to get recurring jobs"
+        ));
 
         for job in queue_jobs {
             // Check if job matches search criteria
-            let payload_str = serde_json::to_string(&job.payload)
-                .unwrap_or_default()
-                .to_lowercase();
+            let payload_str = payload_search_text(&job.payload);
             let matches_search = job.id.to_string().contains(&search_term)
                 || job.queue_name.to_lowercase().contains(&search_term)
                 || payload_str.contains(&search_term)
@@ -736,22 +747,14 @@ where
         }
 
         // Also search recurring jobs
-        let recurring_jobs = match queue.get_recurring_jobs(queue_name).await {
-            Ok(jobs) => jobs,
-            Err(e) => {
-                eprintln!(
-                    "Failed to get recurring jobs for queue {}: {}",
-                    queue_name, e
-                );
-                continue;
-            }
-        };
+        let recurring_jobs = try_api!(
+            queue.get_recurring_jobs(queue_name).await,
+            "Failed to get recurring jobs"
+        );
 
         for job in recurring_jobs {
             // Check if job matches search criteria
-            let payload_str = serde_json::to_string(&job.payload)
-                .unwrap_or_default()
-                .to_lowercase();
+            let payload_str = payload_search_text(&job.payload);
             let matches_search = job.id.to_string().contains(&search_term)
                 || job.queue_name.to_lowercase().contains(&search_term)
                 || payload_str.contains(&search_term)
@@ -855,12 +858,71 @@ where
         pagination: PaginationMeta::new(&pagination, total_count),
     };
 
-    Ok(warp::reply::json(&ApiResponse::success(response)))
+    Ok(json_reply(&ApiResponse::success(response)))
+}
+
+/// Lowercased text of a job payload used for substring search.
+///
+/// `serde_json::Value` always serializes, so this does not lose data; it is
+/// kept infallible so a (theoretical) failure cannot make a job unsearchable
+/// silently: such a payload falls back to `Value`'s `Display` output.
+fn payload_search_text(payload: &serde_json::Value) -> String {
+    match serde_json::to_string(payload) {
+        Ok(text) => text.to_lowercase(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize job payload for search");
+            payload.to_string().to_lowercase()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::test_support::{body_json, unreachable_queue};
+
+    #[tokio::test]
+    async fn test_list_jobs_returns_500_when_database_is_down() {
+        let response = list_jobs_handler(
+            unreachable_queue(),
+            PaginationParams::default(),
+            serde_json::from_value(serde_json::json!({})).unwrap(),
+            SortParams {
+                sort_by: None,
+                sort_order: None,
+            },
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let (status, body) = body_json(response).await;
+        assert_eq!(status, 500);
+        assert_eq!(body["success"], false);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("Failed to get queue stats")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_job_id_is_400() {
+        let response = get_job_handler("not-a-uuid".to_string(), unreachable_queue())
+            .await
+            .unwrap()
+            .into_response();
+        let (status, _) = body_json(response).await;
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn test_payload_search_text_lowercases_json() {
+        let payload = serde_json::json!({"To": "User@Example.com"});
+        let text = payload_search_text(&payload);
+        assert!(text.contains("user@example.com"));
+        assert!(text.contains("\"to\""));
+    }
 
     #[test]
     fn test_create_job_request_deserialization() {

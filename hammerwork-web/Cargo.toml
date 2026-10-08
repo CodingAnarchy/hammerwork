@@ -63,3 +63,4 @@ auth = ["bcrypt"]
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
+warp = { workspace = true, features = ["test"] }

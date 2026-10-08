@@ -330,7 +330,8 @@ impl AlertManager {
 
         if let Some(threshold) = self.config.worker_starvation_threshold {
             let time_since_last_job = Utc::now() - last_job_time;
-            let threshold_duration = chrono::Duration::from_std(threshold).unwrap();
+            let threshold_duration =
+                chrono::Duration::from_std(threshold).unwrap_or(chrono::Duration::MAX);
 
             if time_since_last_job > threshold_duration {
                 let alert = Alert {
@@ -668,6 +669,17 @@ mod tests {
         let config = AlertingConfig::new();
         let manager = AlertManager::new(config);
         assert!(manager.config.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_worker_starvation_huge_threshold_does_not_panic() {
+        let config = AlertingConfig::new().alert_on_worker_starvation(Duration::MAX);
+        let manager = AlertManager::new(config);
+        // A threshold beyond chrono's range means "never starved"; it must not panic.
+        manager
+            .check_worker_starvation("q", Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

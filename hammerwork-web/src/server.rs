@@ -116,6 +116,7 @@ impl WebDashboard {
     ///
     /// Returns an error if the configuration is invalid or if initialization fails.
     pub async fn new(config: DashboardConfig) -> Result<Self> {
+        config.validate()?;
         let auth_state = AuthState::new(config.auth.clone());
         let websocket_state = Arc::new(RwLock::new(WebSocketState::new(config.websocket.clone())));
 

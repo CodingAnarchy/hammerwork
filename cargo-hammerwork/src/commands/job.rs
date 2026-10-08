@@ -479,22 +479,21 @@ fn print_job_details_postgres(row: &sqlx::postgres::PgRow) -> Result<()> {
         scheduled_at.format("%Y-%m-%d %H:%M:%S UTC")
     );
 
-    if let Ok(Some(started)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")
-    {
+    if let Some(started) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")? {
         println!("Started: {}", started.format("%Y-%m-%d %H:%M:%S UTC"));
     }
 
-    if let Ok(Some(completed)) =
-        row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
+    if let Some(completed) =
+        row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")?
     {
         println!("Completed: {}", completed.format("%Y-%m-%d %H:%M:%S UTC"));
     }
 
-    if let Ok(Some(failed)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at") {
+    if let Some(failed) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at")? {
         println!("Failed: {}", failed.format("%Y-%m-%d %H:%M:%S UTC"));
     }
 
-    if let Ok(Some(error)) = row.try_get::<Option<String>, _>("error_message") {
+    if let Some(error) = row.try_get::<Option<String>, _>("error_message")? {
         println!("Error: {}", error);
     }
 
@@ -526,22 +525,21 @@ fn print_job_details_mysql(row: &sqlx::mysql::MySqlRow) -> Result<()> {
         scheduled_at.format("%Y-%m-%d %H:%M:%S UTC")
     );
 
-    if let Ok(Some(started)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")
-    {
+    if let Some(started) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")? {
         println!("Started: {}", started.format("%Y-%m-%d %H:%M:%S UTC"));
     }
 
-    if let Ok(Some(completed)) =
-        row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
+    if let Some(completed) =
+        row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")?
     {
         println!("Completed: {}", completed.format("%Y-%m-%d %H:%M:%S UTC"));
     }
 
-    if let Ok(Some(failed)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at") {
+    if let Some(failed) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at")? {
         println!("Failed: {}", failed.format("%Y-%m-%d %H:%M:%S UTC"));
     }
 
-    if let Ok(Some(error)) = row.try_get::<Option<String>, _>("error_message") {
+    if let Some(error) = row.try_get::<Option<String>, _>("error_message")? {
         println!("Error: {}", error);
     }
 
@@ -572,7 +570,8 @@ async fn enqueue_job(
     job.priority = job_priority;
 
     if let Some(max_att) = max_attempts {
-        job.max_attempts = max_att as i32;
+        job.max_attempts = i32::try_from(max_att)
+            .map_err(|_| anyhow::anyhow!("--max-attempts {} is too large", max_att))?;
     }
 
     if let Some(timeout_secs) = timeout {
@@ -580,8 +579,7 @@ async fn enqueue_job(
     }
 
     if let Some(delay_secs) = delay {
-        let scheduled_at = chrono::Utc::now() + chrono::Duration::seconds(delay_secs as i64);
-        job.scheduled_at = scheduled_at;
+        job.scheduled_at = delayed_schedule(chrono::Utc::now(), delay_secs)?;
     }
 
     match job_queue {
@@ -596,6 +594,18 @@ async fn enqueue_job(
     }
 
     Ok(())
+}
+
+/// `now + delay_secs`, rejecting delays that overflow instead of wrapping or panicking.
+fn delayed_schedule(
+    now: chrono::DateTime<chrono::Utc>,
+    delay_secs: u64,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    i64::try_from(delay_secs)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+        .and_then(|delay| now.checked_add_signed(delay))
+        .ok_or_else(|| anyhow::anyhow!("--delay {} seconds is out of range", delay_secs))
 }
 
 async fn requeue_stale_jobs(pool: DatabasePool, older_than_secs: u64) -> Result<()> {
@@ -839,6 +849,22 @@ async fn purge_jobs(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn test_delayed_schedule_adds_delay() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            delayed_schedule(now, 90).unwrap(),
+            now + chrono::Duration::seconds(90)
+        );
+    }
+
+    #[test]
+    fn test_delayed_schedule_rejects_overflow() {
+        let now = chrono::Utc::now();
+        assert!(delayed_schedule(now, u64::MAX).is_err());
+        assert!(delayed_schedule(now, i64::MAX as u64).is_err());
+    }
 
     #[derive(Parser)]
     struct TestCli {
