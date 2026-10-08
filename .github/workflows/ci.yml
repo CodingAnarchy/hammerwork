@@ -226,6 +226,85 @@ jobs:
         if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
         run: cargo test --workspace --all-features --no-fail-fast -- --include-ignored mysql
 
+  # Line coverage across the whole workspace, from the PostgreSQL and MySQL test runs
+  # merged. Fails if coverage drops below COVERAGE_FLOOR; raise the floor as tests are
+  # added, never lower it to make a PR pass.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hammerwork_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+        ports:
+          - 5432:5432
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: hammerwork_test
+          MYSQL_ROOT_PASSWORD: password
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+        ports:
+          - 3306:3306
+    env:
+      PG_URL: postgres://postgres:password@localhost:5432/hammerwork_test
+      MY_URL: mysql://root:password@127.0.0.1:3306/hammerwork_test
+      COVERAGE_FLOOR: "70"
+      COVERAGE_IGNORE: "(/tests/|/examples/|/integrations/)"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Run migrations
+        run: |
+          cargo run -p cargo-hammerwork -- migration run --database-url "$PG_URL"
+          cargo run -p cargo-hammerwork -- migration run --database-url "$MY_URL"
+      - name: Tests with coverage (PostgreSQL)
+        env:
+          DATABASE_URL: ${{ env.PG_URL }}
+          MYSQL_DATABASE_URL: ${{ env.MY_URL }}
+        run: cargo llvm-cov --no-report --workspace --all-features --no-fail-fast -- --include-ignored --skip mysql
+      - name: Tests with coverage (MySQL)
+        env:
+          DATABASE_URL: ${{ env.MY_URL }}
+          MYSQL_DATABASE_URL: ${{ env.MY_URL }}
+        run: cargo llvm-cov --no-report --workspace --all-features --no-fail-fast -- --include-ignored mysql
+      - name: Coverage report
+        run: |
+          cargo llvm-cov report --workspace --summary-only --ignore-filename-regex "$COVERAGE_IGNORE" | tee coverage-summary.txt
+          cargo llvm-cov report --workspace --lcov --output-path lcov.info --ignore-filename-regex "$COVERAGE_IGNORE"
+          cargo llvm-cov report --workspace --summary-only --ignore-filename-regex "$COVERAGE_IGNORE" --fail-under-lines "$COVERAGE_FLOOR"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: coverage
+          path: |
+            coverage-summary.txt
+            lcov.info
+
   audit:
     name: security audit
     runs-on: ubuntu-latest
