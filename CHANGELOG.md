@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Weighted dequeue on PostgreSQL returned jobs with default values for result storage, dependencies, workflow and trace fields, so job results were not stored. The job is now built from the full row.
 - MySQL dequeues and the PostgreSQL weighted dequeue ignored `dependency_status` and could run a job before its dependencies completed.
 - MySQL dequeues now use `FOR UPDATE SKIP LOCKED` (MySQL 8.0+), so concurrent workers skip rows being claimed instead of blocking on them.
+- MySQL job claims run at READ COMMITTED and retry when InnoDB aborts them as deadlock victims (error 1213), which concurrent workers otherwise hit intermittently.
 - **Archiving ([#14](https://github.com/CodingAnarchy/hammerwork/issues/14))**, PostgreSQL and MySQL:
   - `archive_jobs` now moves jobs: the archive insert and the delete from `hammerwork_jobs` run in one transaction, and candidates are selected with `FOR UPDATE SKIP LOCKED` so concurrent archivers do not collide. Previously the row stayed in `hammerwork_jobs` with its old status.
   - `get_job` falls back to the archive table and returns archived jobs with `JobStatus::Archived` (previously it returned the stale pre-archive row)
