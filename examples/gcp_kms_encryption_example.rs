@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_compression_enabled(true);
 
         match EncryptionEngine::new(gcp_kms_config).await {
-            Ok(mut engine) => {
+            Ok(engine) => {
                 println!("   ✅ GCP KMS encryption engine created successfully");
 
                 // Test encryption with GCP KMS

@@ -1987,19 +1987,27 @@ where
         })
         .await;
 
+        // The job's own max_attempts decides whether a failed run is retried.
+        let attempts_left = job.attempts < self.attempt_limit(&job);
+
+        // Only the handler sees an encrypted job's plaintext payload; hooks, events and
+        // the recorded outcome use the stored (redacted) job. A payload that cannot be
+        // decrypted (no engine, missing key, tampered data) fails this run.
+        let handler_job = match self.queue.decrypt_job(job.clone()).await {
+            Ok(handler_job) => handler_job,
+            Err(e) => return self.handle_failure(&job, e, attempts_left).await,
+        };
+
         // Determine timeout duration (job-specific or default)
         let timeout_duration = job.timeout.or(self.default_timeout);
 
         // Ok(handler result), or Err(timeout) when the handler ran out of time.
         let handler_result = match timeout_duration {
-            Some(timeout) => tokio::time::timeout(timeout, self.execute_handler(job.clone()))
+            Some(timeout) => tokio::time::timeout(timeout, self.execute_handler(handler_job))
                 .await
                 .map_err(|_| timeout),
-            None => Ok(self.execute_handler(job.clone()).await),
+            None => Ok(self.execute_handler(handler_job).await),
         };
-
-        // The job's own max_attempts decides whether a failed run is retried.
-        let attempts_left = job.attempts < self.attempt_limit(&job);
 
         match handler_result {
             Ok(Ok(job_result)) => self.handle_success(&job, job_result, start_time).await,

@@ -74,6 +74,20 @@ pub enum HammerworkError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// A job payload could not be encrypted or decrypted, or a job needs encryption the
+    /// queue cannot provide.
+    #[error("Encryption error: {message}")]
+    Encryption { message: String },
+}
+
+#[cfg(feature = "encryption")]
+impl From<crate::encryption::EncryptionError> for HammerworkError {
+    fn from(err: crate::encryption::EncryptionError) -> Self {
+        HammerworkError::Encryption {
+            message: err.to_string(),
+        }
+    }
 }
 
 // Add From implementations for toml errors

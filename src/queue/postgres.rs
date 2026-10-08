@@ -58,10 +58,9 @@ pub(crate) struct JobRow {
     pub parent_span_id: Option<String>,
     pub span_context: Option<String>,
     pub retry_strategy: Option<serde_json::Value>,
-    // Encryption fields. Only `is_encrypted` and `pii_fields` are mapped into `Job`
-    // unconditionally; the rest are decoded only with the `encryption` feature.
-    // TODO(#7): payload encryption is read-side only. No enqueue/update path writes
-    // these columns and nothing encrypts or decrypts payloads, so they are always NULL.
+    // Encryption fields (written by `insert_jobs`, see `JobQueue::with_encryption`).
+    // Only `is_encrypted` and `pii_fields` are mapped into `Job` unconditionally; the
+    // rest are decoded only with the `encryption` feature.
     pub is_encrypted: bool,
     #[cfg(feature = "encryption")]
     pub encryption_key_id: Option<String>,
@@ -90,7 +89,50 @@ pub(crate) struct JobRow {
 const JOB_SELECT_FIELDS: &str = "id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context, retry_strategy, is_encrypted, encryption_key_id, encryption_algorithm, encrypted_payload, encryption_nonce, encryption_tag, encryption_metadata, payload_hash, pii_fields, retention_policy, retention_delete_at, encrypted_at";
 
 /// Columns of hammerwork_jobs_archive needed to rebuild a [`Job`].
-const ARCHIVED_JOB_FIELDS: &str = "id, queue_name, payload, payload_compressed, status, priority, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, result, result_ttl, retry_strategy, timeout_seconds, cron_schedule, next_run_at, recurring, timezone, batch_id, depends_on, dependency_status, result_config, trace_id, correlation_id, parent_span_id, span_context";
+const ARCHIVED_JOB_FIELDS: &str = "id, queue_name, payload, payload_compressed, status, priority, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, result, result_ttl, retry_strategy, timeout_seconds, cron_schedule, next_run_at, recurring, timezone, batch_id, depends_on, dependency_status, result_config, trace_id, correlation_id, parent_span_id, span_context, is_encrypted, pii_fields";
+
+/// Encryption columns of hammerwork_jobs and hammerwork_jobs_archive (migration 011).
+/// Archiving and restoring copy them between the tables in SQL, so encrypted payloads
+/// move without being decrypted, with or without the `encryption` feature.
+const ENCRYPTION_COLUMNS: [&str; 12] = [
+    "is_encrypted",
+    "encryption_key_id",
+    "encryption_algorithm",
+    "encrypted_payload",
+    "encryption_nonce",
+    "encryption_tag",
+    "encryption_metadata",
+    "payload_hash",
+    "pii_fields",
+    "retention_policy",
+    "retention_delete_at",
+    "encrypted_at",
+];
+
+/// Copies the encryption columns of the jobs `ids` from table `from` to table `to`.
+async fn copy_encryption_columns(
+    conn: &mut sqlx::PgConnection,
+    from: &str,
+    to: &str,
+    ids: &[uuid::Uuid],
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let assignments = ENCRYPTION_COLUMNS
+        .iter()
+        .map(|column| format!("{column} = src.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query(&format!(
+        "UPDATE {to} dst SET {assignments} FROM {from} src \
+         WHERE dst.id = src.id AND src.id = ANY($1)"
+    ))
+    .bind(ids)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
 
 /// Rebuilds a job from a hammerwork_jobs_archive row selected with [`ARCHIVED_JOB_FIELDS`].
 ///
@@ -153,10 +195,13 @@ fn archived_job_from_row(row: &sqlx::postgres::PgRow) -> Result<Job> {
         span_context: row.try_get("span_context")?,
         #[cfg(feature = "encryption")]
         encryption_config: None,
-        pii_fields: Vec::new(),
+        pii_fields: row
+            .try_get::<Option<Vec<String>>, _>("pii_fields")?
+            .unwrap_or_default(),
         #[cfg(feature = "encryption")]
         retention_policy: None,
-        is_encrypted: false,
+        // The ciphertext stays in the archive row; restore the job to decrypt it
+        is_encrypted: row.try_get("is_encrypted")?,
         #[cfg(feature = "encryption")]
         encrypted_payload: None,
     })
@@ -575,7 +620,8 @@ impl DeadJobRow {
 impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     type Database = Postgres;
 
-    async fn enqueue(&self, job: Job) -> Result<JobId> {
+    async fn enqueue(&self, mut job: Job) -> Result<JobId> {
+        self.seal_jobs(std::slice::from_mut(&mut job)).await?;
         let mut conn = self.pool.acquire().await?;
         insert_jobs(&mut conn, std::slice::from_ref(&job)).await?;
         Ok(job.id)
@@ -794,6 +840,19 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         // Validate the batch first
         batch.validate()?;
 
+        // Encrypt payloads before anything is written, so a job that cannot be encrypted
+        // fails the whole batch.
+        let mut jobs: Vec<Job> = batch
+            .jobs
+            .iter()
+            .cloned()
+            .map(|mut job| {
+                job.batch_id = Some(batch.id);
+                job
+            })
+            .collect();
+        self.seal_jobs(&mut jobs).await?;
+
         let mut tx = self.pool.begin().await?;
 
         // Insert batch metadata
@@ -818,16 +877,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .await?;
 
         // Insert the jobs with the same columns as `enqueue` (result config,
-        // dependencies, workflow, tracing and retry strategy included).
-        let jobs: Vec<Job> = batch
-            .jobs
-            .iter()
-            .cloned()
-            .map(|mut job| {
-                job.batch_id = Some(batch.id);
-                job
-            })
-            .collect();
+        // dependencies, workflow, tracing, retry strategy and encryption included).
         insert_jobs(&mut tx, &jobs).await?;
 
         tx.commit().await?;
@@ -1550,6 +1600,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         // Validate workflow before enqueuing
         workflow.validate()?;
 
+        let mut jobs = workflow.jobs.clone();
+        self.seal_jobs(&mut jobs).await?;
+
         let mut tx = self.pool.begin().await?;
 
         // Insert workflow metadata
@@ -1575,7 +1628,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .await?;
 
         // Insert all jobs in the workflow
-        for job in &workflow.jobs {
+        for job in &jobs {
             self.insert_job_in_transaction(&mut tx, job).await?;
         }
 
@@ -1802,6 +1855,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let jobs_to_archive = query.fetch_all(&mut *tx).await?;
 
         let archived_at = Utc::now();
+        let mut archived_ids = Vec::with_capacity(jobs_to_archive.len());
+        let mut encrypted_ids = Vec::new();
         for job_row in jobs_to_archive {
             let job = job_row.into_job()?;
             let (final_payload, is_compressed, original_size) =
@@ -1871,13 +1926,27 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .execute(&mut *tx)
             .await?;
 
-            sqlx::query("DELETE FROM hammerwork_jobs WHERE id = $1")
-                .bind(job.id)
-                .execute(&mut *tx)
-                .await?;
-
+            archived_ids.push(job.id);
+            if job.is_encrypted || !job.pii_fields.is_empty() {
+                encrypted_ids.push(job.id);
+            }
             jobs_archived += 1;
             bytes_archived += final_payload.len() as u64;
+        }
+
+        // Move encrypted payloads as they are, without decrypting them
+        copy_encryption_columns(
+            &mut tx,
+            "hammerwork_jobs",
+            "hammerwork_jobs_archive",
+            &encrypted_ids,
+        )
+        .await?;
+        if !archived_ids.is_empty() {
+            sqlx::query("DELETE FROM hammerwork_jobs WHERE id = ANY($1)")
+                .bind(&archived_ids)
+                .execute(&mut *tx)
+                .await?;
         }
 
         tx.commit().await?;
@@ -1926,8 +1995,20 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .execute(&mut *tx)
             .await?;
 
-        // Insert back into main table
-        self.enqueue_with_tx(&mut tx, job.clone()).await?;
+        // Insert back into main table. An encrypted payload is copied back as it is,
+        // without decrypting it.
+        let mut row = job.clone();
+        row.is_encrypted = false;
+        self.enqueue_with_tx(&mut tx, row).await?;
+        if job.is_encrypted || !job.pii_fields.is_empty() {
+            copy_encryption_columns(
+                &mut tx,
+                "hammerwork_jobs_archive",
+                "hammerwork_jobs",
+                &[job_id],
+            )
+            .await?;
+        }
 
         // Remove from archive table
         sqlx::query("DELETE FROM hammerwork_jobs_archive WHERE id = $1")
@@ -2185,6 +2266,43 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
         Ok(recovery)
     }
+
+    async fn purge_expired_encrypted_jobs(&self) -> Result<super::EncryptedJobPurge> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let jobs = sqlx::query(&format!(
+            "DELETE FROM hammerwork_jobs WHERE is_encrypted = true \
+             AND retention_delete_at IS NOT NULL AND retention_delete_at <= $1 \
+             AND status IN ({})",
+            super::FINISHED_STATUS_SQL
+        ))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let archived_jobs = sqlx::query(
+            "DELETE FROM hammerwork_jobs_archive WHERE is_encrypted = true \
+             AND retention_delete_at IS NOT NULL AND retention_delete_at <= $1",
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+
+        let purge = super::EncryptedJobPurge {
+            jobs,
+            archived_jobs,
+        };
+        if purge.total() > 0 {
+            tracing::info!(
+                jobs = purge.jobs,
+                archived_jobs = purge.archived_jobs,
+                "Deleted encrypted jobs whose retention period ended"
+            );
+        }
+        Ok(purge)
+    }
 }
 
 impl crate::queue::JobQueue<Postgres> {
@@ -2296,9 +2414,9 @@ impl crate::queue::JobQueue<Postgres> {
 }
 
 /// Columns written by [`insert_jobs`], in bind order.
-const INSERT_JOB_COLUMNS: &str = "id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes, retry_strategy, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context";
+const INSERT_JOB_COLUMNS: &str = "id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes, retry_strategy, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context, is_encrypted, encryption_key_id, encryption_algorithm, encrypted_payload, encryption_nonce, encryption_tag, encryption_metadata, payload_hash, pii_fields, retention_policy, retention_delete_at, encrypted_at";
 
-/// Rows per multi-row INSERT; 33 binds per row stays far below PostgreSQL's 65535.
+/// Rows per multi-row INSERT; 45 binds per row stays below PostgreSQL's 65535.
 const INSERT_CHUNK_ROWS: usize = 1000;
 
 fn result_storage_str(storage: &crate::job::ResultStorage) -> &'static str {
@@ -2317,15 +2435,21 @@ async fn insert_jobs(conn: &mut sqlx::PgConnection, jobs: &[Job]) -> Result<()> 
         .iter()
         .map(super::retry_strategy_json)
         .collect::<Result<Vec<_>>>()?;
+    let encryption = jobs
+        .iter()
+        .map(super::EncryptionColumns::for_job)
+        .collect::<Result<Vec<_>>>()?;
 
-    for (chunk, strategies) in jobs
+    for ((chunk, strategies), encryption) in jobs
         .chunks(INSERT_CHUNK_ROWS)
         .zip(strategies.chunks(INSERT_CHUNK_ROWS))
+        .zip(encryption.chunks(INSERT_CHUNK_ROWS))
     {
         let mut builder = sqlx::QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO hammerwork_jobs ({INSERT_JOB_COLUMNS}) "
         ));
-        builder.push_values(chunk.iter().zip(strategies), |mut row, (job, strategy)| {
+        let rows = chunk.iter().zip(strategies).zip(encryption);
+        builder.push_values(rows, |mut row, ((job, strategy), encryption)| {
             row.push_bind(job.id)
                 .push_bind(job.queue_name.clone())
                 .push_bind(job.payload.clone())
@@ -2358,7 +2482,19 @@ async fn insert_jobs(conn: &mut sqlx::PgConnection, jobs: &[Job]) -> Result<()> 
                 .push_bind(job.trace_id.clone())
                 .push_bind(job.correlation_id.clone())
                 .push_bind(job.parent_span_id.clone())
-                .push_bind(job.span_context.clone());
+                .push_bind(job.span_context.clone())
+                .push_bind(encryption.is_encrypted)
+                .push_bind(encryption.key_id.clone())
+                .push_bind(encryption.algorithm)
+                .push_bind(encryption.ciphertext.clone())
+                .push_bind(encryption.nonce.clone())
+                .push_bind(encryption.tag.clone())
+                .push_bind(encryption.metadata.clone())
+                .push_bind(encryption.payload_hash.clone())
+                .push_bind(super::pii_fields_column(job))
+                .push_bind(encryption.retention_policy)
+                .push_bind(encryption.retention_delete_at)
+                .push_bind(encryption.encrypted_at);
         });
         builder.build().execute(&mut *conn).await?;
     }

@@ -7,6 +7,7 @@ Hammerwork provides enterprise-grade encryption capabilities for protecting sens
 - [Overview](#overview)
 - [Encryption Algorithms](#encryption-algorithms)
 - [Configuration](#configuration)
+- [Encrypting Jobs at Rest](#encrypting-jobs-at-rest)
 - [PII Field Protection](#pii-field-protection)
 - [Key Management](#key-management)
 - [Retention Policies](#retention-policies)
@@ -20,12 +21,14 @@ Hammerwork provides enterprise-grade encryption capabilities for protecting sens
 
 The Hammerwork encryption system provides:
 
-- **Field-Level Encryption**: Encrypt only PII fields, leaving metadata accessible
-- **Multiple Algorithms**: AES-256-GCM and ChaCha20-Poly1305 support
-- **Transparent Processing**: Jobs are automatically encrypted/decrypted
-- **Key Management**: Enterprise key lifecycle with rotation and audit trails
-- **Retention Policies**: Automatic deletion for compliance requirements
-- **Zero Overhead**: Optional compilation - only enabled when needed
+- **Encryption at rest**: a queue with an `EncryptionEngine` encrypts the payload of every job that has an `EncryptionConfig` before it is written, on PostgreSQL and MySQL. The plaintext never reaches the database.
+- **Field-Level Encryption**: encrypt only the PII fields of a payload, leaving the rest readable
+- **Multiple Algorithms**: AES-256-GCM and ChaCha20-Poly1305
+- **Decryption only for the handler**: workers decrypt the payload just before calling the handler; everything else (dashboards, CLI, `get_job`) sees the redacted payload
+- **Fail closed**: missing engines or keys are errors, never a silent fallback to plaintext
+- **Key Management**: static, environment, KMS (AWS, GCP), Vault and Azure Key Vault keys, decrypt-only keys for rotated key ids, and the `KeyManager` for stored keys with audit trails
+- **Retention Policies**: finished encrypted jobs are deleted after their retention period by `purge_expired_encrypted_jobs`
+- **Zero Overhead**: optional compilation - only enabled with the `encryption` feature
 
 ## Encryption Algorithms
 
@@ -192,54 +195,93 @@ Previously, these cases logged an error and used a key derived from the source s
 
 A stored KMS-wrapped key that the configured KMS key cannot decrypt is also an error; Hammerwork never replaces it with a new key.
 
-## PII Field Protection
+## Encrypting Jobs at Rest
 
-### Automatic PII Detection
-
-Hammerwork can automatically detect common PII patterns:
+Give the queue an engine with `JobQueue::with_encryption`, and mark the jobs to encrypt with `Job::with_encryption`:
 
 ```rust
-use hammerwork::{Job, encryption::EncryptionConfig};
+use hammerwork::{Job, JobQueue, queue::DatabaseQueue};
+use hammerwork::encryption::{EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource};
 use serde_json::json;
+use std::sync::Arc;
 
-let job = Job::new("payment_processing".to_string(), json!({
-    "user_id": "user123",
-    "credit_card": "4111-1111-1111-1111",  // Automatically detected as PII
-    "ssn": "123-45-6789",                  // Automatically detected as PII
-    "email": "user@example.com",           // Automatically detected as PII
-    "amount": 99.99,
-    "timestamp": "2024-01-01T00:00:00Z"
-}))
-.with_encryption(EncryptionConfig::new(EncryptionAlgorithm::AES256GCM))
-.with_auto_pii_detection(true);
+let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+    .with_key_id("payments-2026")
+    .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()));
+let engine = EncryptionEngine::new(config.clone()).await?;
+// aws:// and gcp:// key sources: EncryptionEngine::new_with_pool(config, &pool)
+let queue = Arc::new(JobQueue::new(pool).with_encryption(engine));
+
+let job = Job::new("payments".to_string(), json!({"card": "4111-1111-1111-1111", "amount": 10}))
+    .with_encryption(config);
+queue.enqueue(job).await?;
 ```
 
-### Manual PII Field Specification
+How it works:
 
-For precise control, specify PII fields explicitly:
+- **Enqueue.** `enqueue`, `enqueue_batch`, `enqueue_workflow` and `enqueue_cron_job` encrypt every job that has an encryption config before anything is written (a batch with one job that cannot be encrypted writes nothing). The ciphertext, nonce, tag, key id, algorithm, metadata, keyed integrity hash, PII field list and retention columns of migration 011 are filled in; `is_encrypted` is set.
+- **What `payload` holds.** Never the plaintext of encrypted data. With no PII fields the whole payload is encrypted and `payload` is the placeholder `{"encrypted": true}`. With PII fields (see below) `payload` is the original payload with each listed field's value replaced by `"[ENCRYPTED]"`.
+- **The engine decides.** The queue's engine sets the algorithm, key and compression. A job whose config names another algorithm, or a `key_id` other than the engine's, is rejected. Jobs without an encryption config are stored unchanged, also on a queue with an engine.
+- **Fail closed.** Enqueueing a job that has an encryption config on a queue without an engine fails with `HammerworkError::Encryption`.
+- **Dequeue and reads.** `dequeue`, `get_job`, `get_batch_jobs` and the other reads return jobs as stored: `is_encrypted` is `true`, `payload` is redacted and `encrypted_payload` holds the ciphertext. The web dashboard and `cargo hammerwork job show` therefore show the redacted payload (`job show` also prints the key id, algorithm and retention). They never need a key.
+- **Workers.** A worker decrypts the job (`JobQueue::decrypt_job`) just before it calls the handler; only the handler sees the plaintext. Event hooks, webhooks and the recorded outcome keep using the redacted job. If the payload cannot be decrypted (the worker's queue has no engine, the engine does not have the job's key, or the data was tampered with) the run fails with `Cannot decrypt the payload of job ...` and goes through the normal retry / dead path; the handler is not called.
+- **Reading the plaintext yourself.** `queue.decrypt_job(job).await?` returns the job with its plaintext payload.
+- **Without the `encryption` feature** a build cannot encrypt or decrypt. It still reads `is_encrypted`, so its workers fail encrypted jobs instead of running them with the redacted payload, and archiving and restoring still carry the ciphertext.
+
+The payload hash stored with the ciphertext is an HMAC-SHA256 keyed by the data key (`hmac-sha256:<hex>`), not a plain SHA-256, so a low-entropy value (an SSN, a card number) cannot be recovered from it by brute force. Payloads encrypted by earlier versions with a plain SHA-256 still decrypt.
+
+### Key Rotation for Job Payloads
+
+Each encrypted job records the id of the key it was encrypted with. To switch to a new key, give the engine a new `key_id` and keep the previous key for decryption:
+
+```rust
+let engine = EncryptionEngine::new(
+    EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+        .with_key_id("payments-2027")
+        .with_key_source(KeySource::Environment("HAMMERWORK_KEY_2027".to_string())),
+)
+.await?
+.with_decryption_key(
+    "payments-2026",
+    &KeySource::Environment("HAMMERWORK_KEY_2026".to_string()),
+)
+.await?;
+```
+
+New jobs are encrypted with `payments-2027`; jobs written with `payments-2026` still decrypt. For `aws://` and `gcp://` sources, `EncryptionEngine::rotate_kms_key` adds a new key version under the same key id and keeps earlier versions for decryption (see above).
+
+## PII Field Protection
+
+To encrypt only some fields, list them with `with_pii_fields`:
 
 ```rust
 let job = Job::new("user_data_processing".to_string(), json!({
     "user_id": "user123",
     "credit_card": "4111-1111-1111-1111",
-    "billing_address": "123 Main St",
-    "phone": "+1-555-123-4567",
+    "billing": {"address": "123 Main St", "country": "US"},
     "preferences": {"newsletter": true}
 }))
 .with_encryption(EncryptionConfig::new(EncryptionAlgorithm::AES256GCM))
-.with_pii_fields(vec!["credit_card", "billing_address", "phone"]);
+.with_pii_fields(vec!["credit_card", "billing.address"]);
 ```
 
-### PII Detection Patterns
+is stored with `payload`
 
-Hammerwork recognizes these PII patterns automatically:
+```json
+{"user_id": "user123", "credit_card": "[ENCRYPTED]", "billing": {"address": "[ENCRYPTED]", "country": "US"}, "preferences": {"newsletter": true}}
+```
 
-- **Credit Cards**: Visa, MasterCard, Amex, Discover patterns
-- **Social Security Numbers**: XXX-XX-XXXX, XXXXXXXXX formats
-- **Email Addresses**: RFC 5322 compliant email patterns
-- **Phone Numbers**: US and international phone number patterns
-- **IP Addresses**: IPv4 and IPv6 addresses
-- **API Keys**: Common API key patterns (AWS, GitHub, etc.)
+and the values of the two fields encrypted in `encrypted_payload`. The handler receives the original payload.
+
+- Field names are paths into the JSON object: `"ssn"` is a top-level field and `"billing.address"` the `address` field of the `billing` object. A top-level key that itself contains a dot is matched literally first. Arrays are not traversed; list the array's parent field to encrypt it whole.
+- A field's whole value is encrypted, whatever its type (string, number, object, array).
+- Listed fields that are missing from a payload are skipped. Only the listed fields are protected: anything else in the payload is stored in plaintext. When in doubt, encrypt the whole payload (no PII fields).
+- PII field encryption needs a JSON object payload.
+- `with_pii_fields` on its own (without `with_encryption`) only records the field names in the `pii_fields` column; nothing is encrypted.
+
+### Finding PII Fields
+
+`EncryptionEngine::identify_pii_fields(&payload)` suggests field names that look like PII (`ssn`, `email`, `credit_card`, `phone`, `address`, `password`, `date_of_birth`, ...). It matches field names only, not values; review its output before passing it to `with_pii_fields`.
 
 ## Key Management
 
@@ -339,6 +381,29 @@ let policy = RetentionPolicy::DeleteImmediately;
 let policy = RetentionPolicy::UseDefault;
 ```
 
+### Enforcing Retention
+
+When a job is encrypted, its retention policy (`Job::with_retention_policy`, or `UseDefault`, which uses the engine's `default_retention`) is stored in `retention_policy` and the deletion time in `retention_delete_at`. Nothing is deleted automatically; run the purge periodically:
+
+```rust
+let purge = queue.purge_expired_encrypted_jobs().await?;
+println!("deleted {} jobs and {} archived jobs", purge.jobs, purge.archived_jobs);
+```
+
+or from the CLI (e.g. from cron):
+
+```bash
+cargo hammerwork maintenance purge-encrypted --dry-run
+cargo hammerwork maintenance purge-encrypted --confirm
+```
+
+The purge deletes the whole job row (ciphertext, redacted payload and result) of encrypted jobs whose `retention_delete_at` has passed and that are finished (`Completed`, `Failed`, `Dead` or `TimedOut`), and encrypted jobs in `hammerwork_jobs_archive` past their retention time. It needs no key.
+
+- Pending, running and retrying jobs are never deleted, even after their retention time; they are deleted by the first purge after they finish.
+- `DeleteImmediately` jobs are deleted by the first purge after they finish.
+- `KeepIndefinitely`, and `UseDefault` without a `default_retention`, are never purged.
+- A deleted `Dead` job can no longer be retried. Dependents of a deleted job that were still waiting on it stay waiting.
+
 ### Compliance Examples
 
 ```rust
@@ -365,21 +430,24 @@ let pci_job = Job::new("payment_processing".to_string(), payment_data)
 
 ### Jobs Table Extensions
 
-The `hammerwork_jobs` table includes encryption fields:
+Migration `011_add_encryption` adds these columns to `hammerwork_jobs` and `hammerwork_jobs_archive`:
 
-```sql
--- PostgreSQL schema additions
-ALTER TABLE hammerwork_jobs ADD COLUMN is_encrypted BOOLEAN DEFAULT FALSE;
-ALTER TABLE hammerwork_jobs ADD COLUMN encrypted_payload BYTEA;
-ALTER TABLE hammerwork_jobs ADD COLUMN pii_fields TEXT[];
-ALTER TABLE hammerwork_jobs ADD COLUMN retention_policy JSONB;
+| Column | PostgreSQL | MySQL | Contents |
+|---|---|---|---|
+| `is_encrypted` | `BOOLEAN` | `BOOLEAN` | Whether `encrypted_payload` holds the job's encrypted data |
+| `encryption_key_id` | `VARCHAR` | `VARCHAR(255)` | Id of the key the payload was encrypted with |
+| `encryption_algorithm` | `VARCHAR` | `VARCHAR(50)` | `AES256GCM` or `ChaCha20Poly1305` |
+| `encrypted_payload` | `BYTEA` | `LONGBLOB` | Ciphertext (the whole payload, or the PII fields' values) |
+| `encryption_nonce` | `BYTEA` | `BLOB` | 96-bit nonce |
+| `encryption_tag` | `BYTEA` | `BLOB` | 128-bit authentication tag |
+| `encryption_metadata` | `JSONB` | `JSON` | Algorithm, key id, compression, encrypted field names, retention |
+| `payload_hash` | `VARCHAR` | `VARCHAR(255)` | Keyed integrity hash of the plaintext (`hmac-sha256:<hex>`) |
+| `pii_fields` | `TEXT[]` | `JSON` | Field names listed with `with_pii_fields` |
+| `retention_policy` | `VARCHAR` | `VARCHAR(50)` | `DeleteAfter`, `DeleteAt`, `KeepIndefinitely`, `DeleteImmediately` or `UseDefault` |
+| `retention_delete_at` | `TIMESTAMPTZ` | `TIMESTAMP(6)` | When the job may be purged |
+| `encrypted_at` | `TIMESTAMPTZ` | `TIMESTAMP(6)` | When the payload was encrypted |
 
--- MySQL schema additions  
-ALTER TABLE hammerwork_jobs ADD COLUMN is_encrypted BOOLEAN DEFAULT FALSE;
-ALTER TABLE hammerwork_jobs ADD COLUMN encrypted_payload LONGBLOB;
-ALTER TABLE hammerwork_jobs ADD COLUMN pii_fields JSON;
-ALTER TABLE hammerwork_jobs ADD COLUMN retention_policy JSON;
-```
+A CHECK constraint requires `encrypted_payload`, `encryption_nonce`, `encryption_tag` and `encryption_key_id` whenever `is_encrypted` is true. Archiving and restoring copy these columns between the two tables as they are; the payload is never decrypted on the way.
 
 ### Encryption Keys Table
 
@@ -421,21 +489,23 @@ CREATE INDEX idx_encryption_keys_next_rotation ON hammerwork_encryption_keys(nex
 ### Complete Encryption Workflow
 
 ```rust
-use hammerwork::{Job, JobQueue, Worker, WorkerPool};
-use hammerwork::encryption::{EncryptionConfig, EncryptionAlgorithm, KeySource, RetentionPolicy};
+use hammerwork::{Job, JobQueue, Worker, WorkerPool, queue::DatabaseQueue, worker::JobHandler};
+use hammerwork::encryption::{
+    EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource, RetentionPolicy,
+};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup
     let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
-    let queue = Arc::new(JobQueue::new(pool));
 
     // Configure encryption
     let encryption_config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
         .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()))
         .with_compression_enabled(true);
+    let engine = EncryptionEngine::new(encryption_config.clone()).await?;
+    let queue = Arc::new(JobQueue::new(pool).with_encryption(engine));
 
     // Create encrypted job
     let job = Job::new("sensitive_data_processing".to_string(), json!({
@@ -443,28 +513,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "credit_card": "4111-1111-1111-1111",
         "ssn": "123-45-6789",
         "transaction_amount": 299.99,
-        "timestamp": "2024-01-01T00:00:00Z"
     }))
     .with_encryption(encryption_config)
     .with_pii_fields(vec!["credit_card", "ssn"])
-    .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(30 * 24 * 60 * 60))); // 30 days
+    .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(30 * 24 * 60 * 60)));
 
-    // Enqueue - automatic encryption occurs
+    // Encrypted before it is written
     queue.enqueue(job).await?;
 
-    // Worker processes decrypted data transparently
-    let handler = Arc::new(|job: Job| {
+    // The worker decrypts the payload just before calling the handler
+    let handler: JobHandler = Arc::new(|job: Job| {
         Box::pin(async move {
-            // Job payload is automatically decrypted
             println!("Processing transaction: {}", job.payload["transaction_amount"]);
-            
-            // PII fields are accessible in plain text
-            let credit_card = job.payload["credit_card"].as_str().unwrap();
-            let ssn = job.payload["ssn"].as_str().unwrap();
-            
-            // Process the sensitive data
-            // ...
-            
+            let _credit_card = job.payload["credit_card"].as_str().unwrap_or_default();
             Ok(())
         })
     });
@@ -472,7 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = Worker::new(queue.clone(), "sensitive_data_processing".to_string(), handler);
     let mut worker_pool = WorkerPool::new();
     worker_pool.add_worker(worker);
-    
+
     worker_pool.start().await
 }
 ```
@@ -540,8 +601,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 1. **Environment Variables**: Store keys in environment variables, not code
 2. **Secure Transmission**: Use TLS for all database connections
-3. **Memory Protection**: Keys are zeroed from memory when possible
-4. **Error Handling**: Avoid leaking sensitive information in logs
+3. **Memory Protection**: Keys are held in process memory while the engine exists; they are not printed by `Debug`
+4. **Error Handling**: Encryption errors never include payload data
 
 ## Performance
 
@@ -556,18 +617,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 1. **Selective Encryption**: Only encrypt PII fields, not entire payloads
 2. **Compression**: Enable compression for large payloads
-3. **Key Caching**: Keys cached in memory for 1 hour
-4. **Batch Operations**: Process multiple jobs with same key efficiently
-
-### Benchmarks
-
-```
-Encryption Performance (1KB payload, 2 PII fields):
-- AES-256-GCM:     ~0.05ms per operation
-- ChaCha20-Poly1305: ~0.08ms per operation
-- Key retrieval:   ~0.01ms (cached), ~2ms (database)
-- Total overhead:  ~5-10% for typical workloads
-```
+3. **Key Loading**: The engine loads its keys once, when it is created
+4. **Batch Operations**: `enqueue_batch` encrypts all jobs before a single transaction
 
 ## Compliance
 
@@ -615,35 +666,32 @@ let job = Job::new("financial_reporting".to_string(), financial_data)
 
 ### Enabling Encryption on Existing Jobs
 
-1. **Run Migration**: Apply migration 011_add_encryption
-2. **Configure Keys**: Set up encryption keys
-3. **Update Code**: Add encryption to new jobs
-4. **Gradual Rollout**: Encrypt new jobs while processing existing ones
+1. **Run Migrations**: `cargo hammerwork migration run` (migration 011 adds the columns)
+2. **Configure Keys**: create an `EncryptionEngine` and pass it to `JobQueue::with_encryption` on every queue that enqueues encrypted jobs **and on every queue used by workers that process them**. Workers without an engine fail encrypted jobs.
+3. **Update Code**: add `with_encryption` (and optionally `with_pii_fields`) to the jobs to protect
+4. **Schedule the retention purge**: `cargo hammerwork maintenance purge-encrypted --confirm`
 
 ### Migrating Existing Data
 
+Jobs enqueued before encryption was enabled stay in plaintext; nothing re-encrypts them. To protect pending ones, re-enqueue them with an encryption config on a queue with an engine and delete the originals:
+
 ```rust
-// Example migration script
-async fn migrate_existing_jobs() -> Result<(), Box<dyn std::error::Error>> {
-    let queue = JobQueue::new(pool);
-    
-    // Get unencrypted jobs with PII
-    let jobs = queue.list_jobs(Some("payment_processing"), None, None).await?;
-    
-    for job in jobs {
-        if !job.is_encrypted && contains_pii(&job.payload) {
-            // Re-enqueue with encryption
-            let encrypted_job = Job::new(job.queue_name, job.payload)
-                .with_encryption(encryption_config.clone())
-                .with_pii_fields(detect_pii_fields(&job.payload));
-            
-            queue.enqueue(encrypted_job).await?;
-            queue.delete_job(job.id).await?;
+async fn encrypt_pending(
+    queue: &JobQueue<sqlx::Postgres>,
+    job_ids: &[uuid::Uuid],
+    config: &EncryptionConfig,
+) -> hammerwork::Result<()> {
+    for id in job_ids {
+        if let Some(job) = queue.get_job(*id).await? {
+            if job.status == JobStatus::Pending && !job.is_encrypted {
+                let encrypted = Job::new(job.queue_name.clone(), job.payload.clone())
+                    .with_encryption(config.clone())
+                    .with_pii_fields(vec!["credit_card", "ssn"]);
+                queue.enqueue(encrypted).await?;
+                queue.delete_job(job.id).await?;
+            }
         }
     }
-    
     Ok(())
 }
 ```
-
-For more examples and detailed API documentation, see the [API documentation](https://docs.rs/hammerwork) and the `examples/encryption_example.rs` file.

@@ -58,10 +58,12 @@
 mod azure;
 pub mod engine;
 mod envelope;
+pub mod job_payload;
 pub mod key_manager;
 mod kms;
 
 pub use engine::EncryptionEngine;
+pub use job_payload::{REDACTED_FIELD_VALUE, encrypted_payload_placeholder};
 pub use key_manager::{
     EncryptionKey, ExternalKmsConfig, KeyAuditRecord, KeyDerivationConfig, KeyManager,
     KeyManagerBackend, KeyManagerConfig, KeyManagerStats, KeyOperation, KeyPurpose, KeyStatus,
