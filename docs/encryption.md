@@ -116,6 +116,8 @@ let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::External("aws://alias/hammerwork-key?region=us-east-1".to_string()));
 ```
 
+Add `&endpoint=<url>` to use a different KMS endpoint (for example LocalStack). Requires the `aws-kms` feature.
+
 ##### Google Cloud KMS
 
 ```rust
@@ -138,13 +140,36 @@ let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
 ```
 
 **Environment Variables:**
-- `VAULT_ADDR`: Vault server address (default: https://vault.example.com)
+- `VAULT_ADDR`: Vault server address, used when the source has no `addr=` parameter (required: there is no default)
 - `VAULT_TOKEN`: Authentication token for Vault access
 
 **Vault Requirements:**
 - KV v2 secrets engine enabled
 - Secret stored with `key` field containing base64-encoded key material
 - Proper authentication and access policies configured
+- The `vault-kms` feature
+
+##### Azure Key Vault
+
+```rust
+let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+    .with_key_source(KeySource::External("azure://my-vault.vault.azure.net/keys/encryption-key".to_string()));
+```
+
+Credentials come from the environment (`AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`, workload identity, managed identity, or the Azure CLI). Requires the `azure-kv` feature.
+
+#### Key loading fails closed
+
+Loading a key from an external source never falls back to another key. `EncryptionEngine::new` and `KeyManager::new` return an error when:
+
+- the KMS or vault is unreachable, or rejects the credentials
+- the key, secret or `key` field does not exist
+- the source is malformed (for example a Vault path without a mount, or a GCP resource that is not `projects/.../locations/...`)
+- the cargo feature for the source (`aws-kms`, `gcp-kms`, `vault-kms`, `azure-kv`) is not enabled
+
+Previously, these cases logged an error and used a key derived from the source string (key ID, region, Vault path, vault URL). Anyone who knew the configuration could derive that key. For development without a KMS, use `KeySource::Static` with a base64-encoded key, or `KeySource::Generated`.
+
+**Note:** `aws://` sources call `GenerateDataKey` and `gcp://` sources call `GenerateRandomBytes`, so they produce a different key every time they are loaded. Data encrypted with such a key cannot be decrypted after a restart. Use a Vault or Azure Key Vault source, or an environment variable, for keys that must be stable.
 
 ## PII Field Protection
 
@@ -231,12 +256,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 let new_version = key_manager.rotate_key("payment-encryption").await?;
 println!("Rotated to version {}", new_version);
 
+// Older versions stay available to decrypt data encrypted before the rotation
+// (up to `max_key_versions` versions are kept)
+let previous = key_manager.get_key_version("payment-encryption", new_version - 1).await?;
+
 // Automatic rotation (configured intervals)
 let rotated_keys = key_manager.perform_automatic_rotation().await?;
 for key_id in rotated_keys {
     println!("Auto-rotated key: {}", key_id);
 }
 ```
+
+### Key Storage and Master Keys
+
+`KeyManager` stores every key version in `hammerwork_encryption_keys` (PostgreSQL and MySQL). Key material is encrypted with AES-256-GCM under a master key before it is written; plaintext key material and the configured master key are never stored. The `key_source` column holds only a label (`Generated`, `Environment`, ...).
+
+The master key is loaded from `master_key_source` when the `KeyManager` is created, and loading fails closed (see above). `generate_master_key()` creates a key-encryption key, stores it encrypted with the configured master key, and uses it for keys generated or rotated afterwards. Keys encrypted with earlier master keys remain readable, and a new `KeyManager` loads the active key-encryption key from the database. A `KeyManager` configured with a different master key fails to start instead of silently using the wrong key.
 
 ### Key Audit Trails
 

@@ -30,6 +30,9 @@
 //!     error_rate: 0.008,
 //!     last_job_at: Some(Utc::now()),
 //!     oldest_pending_job: Some(Utc::now()),
+//!     is_paused: false,
+//!     paused_at: None,
+//!     paused_by: None,
 //! };
 //!
 //! assert_eq!(queue_info.name, "email_queue");
@@ -75,6 +78,9 @@
 //!     error_rate: 0.01,
 //!     last_job_at: None,
 //!     oldest_pending_job: None,
+//!     is_paused: false,
+//!     paused_at: None,
+//!     paused_by: None,
 //! };
 //!
 //! let mut priority_breakdown = HashMap::new();

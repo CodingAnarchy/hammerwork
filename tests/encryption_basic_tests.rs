@@ -203,9 +203,9 @@ mod parsing_tests {
     fn test_invalid_key_source_parsing() {
         let invalid_sources = vec![
             "InvalidType(test)",
-            "Environment", // Missing parentheses
-            "Static(",     // Missing closing parenthesis
-            "",            // Empty string
+            "Unknown", // Not a stored label
+            "Static(", // Missing closing parenthesis
+            "",        // Empty string
         ];
 
         for invalid_source in invalid_sources {
@@ -216,6 +216,23 @@ mod parsing_tests {
                 invalid_source
             );
         }
+    }
+
+    #[test]
+    fn test_stored_key_source_labels_parse() {
+        // The key_source column stores only a label (never key material)
+        assert_eq!(
+            parse_key_source("Environment").unwrap(),
+            KeySource::Environment(String::new())
+        );
+        assert_eq!(
+            parse_key_source("Generated").unwrap(),
+            KeySource::Generated(String::new())
+        );
+        assert_eq!(
+            parse_key_source("Derived").unwrap(),
+            KeySource::Generated(String::new())
+        );
     }
 
     #[test]
@@ -383,32 +400,19 @@ mod aws_kms_integration_tests {
     use hammerwork::encryption::EncryptionEngine;
 
     #[tokio::test]
-    async fn test_aws_kms_configuration_fallback() {
-        // Test that AWS KMS configuration falls back gracefully when not available
+    async fn test_aws_kms_unavailable_fails_closed() {
+        // Without reachable AWS credentials, engine creation must fail instead of
+        // falling back to a key derived from the (public) configuration (#16).
         let config = hammerwork::encryption::EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
             .with_key_source(KeySource::External(
                 "aws://alias/test-key?region=us-east-1".to_string(),
             ));
 
-        // This should not panic and should fall back to deterministic key generation
         let result = EncryptionEngine::new(config).await;
-
-        // In CI/CD environments without AWS credentials, this might fail but shouldn't panic
-        // In development, it should fall back to deterministic keys
-        if let Ok(mut engine) = result {
-            // Test that we can still encrypt/decrypt with the fallback
-            let payload = serde_json::json!({"test": "data"});
-            let encrypted = engine
-                .encrypt_payload(&payload, &Vec::<String>::new())
-                .await;
-
-            // Should work with fallback implementation
-            if let Ok(encrypted) = encrypted {
-                let decrypted = engine.decrypt_payload(&encrypted).await;
-                assert!(decrypted.is_ok());
-                assert_eq!(decrypted.unwrap(), payload);
-            }
-        }
+        assert!(
+            result.is_err(),
+            "AWS KMS source without credentials must not produce a key"
+        );
     }
 
     #[tokio::test]
@@ -601,32 +605,19 @@ mod gcp_kms_integration_tests {
     use hammerwork::encryption::EncryptionEngine;
 
     #[tokio::test]
-    async fn test_gcp_kms_configuration_fallback() {
-        // Test that GCP KMS configuration falls back gracefully when not available
+    async fn test_gcp_kms_unavailable_fails_closed() {
+        // Without reachable GCP credentials, engine creation must fail instead of
+        // falling back to a key derived from the (public) configuration (#16).
         let config = hammerwork::encryption::EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
             .with_key_source(KeySource::External(
                 "gcp://projects/test-project/locations/us-central1/keyRings/test-ring/cryptoKeys/test-key".to_string()
             ));
 
-        // This should not panic and should fall back to deterministic key generation
         let result = EncryptionEngine::new(config).await;
-
-        // In CI/CD environments without GCP credentials, this might fail but shouldn't panic
-        // In development, it should fall back to deterministic keys
-        if let Ok(mut engine) = result {
-            // Test that we can still encrypt/decrypt with the fallback
-            let payload = serde_json::json!({"test": "data"});
-            let encrypted = engine
-                .encrypt_payload(&payload, &Vec::<String>::new())
-                .await;
-
-            // Should work with fallback implementation
-            if let Ok(encrypted) = encrypted {
-                let decrypted = engine.decrypt_payload(&encrypted).await;
-                assert!(decrypted.is_ok());
-                assert_eq!(decrypted.unwrap(), payload);
-            }
-        }
+        assert!(
+            result.is_err(),
+            "GCP KMS source without credentials must not produce a key"
+        );
     }
 
     #[tokio::test]
@@ -851,32 +842,19 @@ mod vault_kms_integration_tests {
     use hammerwork::encryption::EncryptionEngine;
 
     #[tokio::test]
-    async fn test_vault_kms_configuration_fallback() {
-        // Test that Vault KMS configuration falls back gracefully when not available
+    async fn test_vault_kms_unavailable_fails_closed() {
+        // Without reachable Vault credentials, engine creation must fail instead of
+        // falling back to a key derived from the (public) configuration (#16).
         let config = hammerwork::encryption::EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
             .with_key_source(KeySource::External(
                 "vault://secret/hammerwork/test-key".to_string(),
             ));
 
-        // This should not panic and should fall back to deterministic key generation
         let result = EncryptionEngine::new(config).await;
-
-        // In CI/CD environments without Vault credentials, this might fail but shouldn't panic
-        // In development, it should fall back to deterministic keys
-        if let Ok(mut engine) = result {
-            // Test that we can still encrypt/decrypt with the fallback
-            let payload = serde_json::json!({"test": "data"});
-            let encrypted = engine
-                .encrypt_payload(&payload, &Vec::<String>::new())
-                .await;
-
-            // Should work with fallback implementation
-            if let Ok(encrypted) = encrypted {
-                let decrypted = engine.decrypt_payload(&encrypted).await;
-                assert!(decrypted.is_ok());
-                assert_eq!(decrypted.unwrap(), payload);
-            }
-        }
+        assert!(
+            result.is_err(),
+            "Vault KMS source without credentials must not produce a key"
+        );
     }
 
     #[tokio::test]
@@ -927,8 +905,8 @@ mod vault_kms_integration_tests {
 
         let result = EncryptionEngine::new(config).await;
 
-        // Should fallback to deterministic key generation when no token is available
-        assert!(result.is_ok(), "Should fallback when no VAULT_TOKEN is set");
+        // Without a token (or address) there is no key; no deterministic fallback (#16)
+        assert!(result.is_err(), "Must fail when no VAULT_TOKEN is set");
 
         // Restore original token if it existed
         if let Some(token) = original_token {

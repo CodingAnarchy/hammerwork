@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unused `ArchiveConfig` fields `archive_directory`, `max_file_size_bytes` and `include_payloads`. Existing TOML files containing them still load.
 
 ### Security
+- **External key loading fails closed ([#16](https://github.com/CodingAnarchy/hammerwork/issues/16))**. With the `encryption` feature, the AWS KMS, GCP KMS, HashiCorp Vault and Azure Key Vault loaders in `KeyManager` (master key) and `EncryptionEngine` (data key) used to log a failure and continue with a key derived from the public source string (key ID, region, Vault path or address, vault URL). The same happened when the source's cargo feature was not enabled. They now return an error, and `KeyManager::new` / `EncryptionEngine::new` fail:
+  - KMS or vault unreachable, credentials missing or rejected, secret or `key` field missing: `EncryptionError::KeyManagement`
+  - malformed source (Vault path without a mount, GCP resource not `projects/<p>/locations/<l>/...`, `azure://` without a vault host) or the source's feature (`aws-kms`, `gcp-kms`, `vault-kms`, `azure-kv`) not enabled: `EncryptionError::InvalidConfiguration`
+  - Vault no longer defaults to `https://vault.example.com`; set `addr=` or `VAULT_ADDR`. A Vault secret without a string `key` field is an error instead of a key hashed from the path.
+  - There is no opt-in fallback. For development without a KMS use `KeySource::Static` (base64 key) or `KeySource::Generated` (random, in memory).
+- `KeyManager` never writes plaintext key material or the configured master key to the database: keys are encrypted with AES-256-GCM under the master key, and `key_source` stores only a label. Previously `KeySource::Static(key)` would have been stored with the key in `key_source` ([#9](https://github.com/CodingAnarchy/hammerwork/issues/9)).
 - **`cargo audit` is clean and the CI `security audit` job is now blocking** (#7). Dependency upgrades that clear the open advisories:
   - `azure-kv`: moved from `azure_security_keyvault` / `azure_identity` / `azure_core` 0.20 to the 1.x Azure SDK (`azure_security_keyvault_keys`, `azure_identity`, `azure_core`). Fixes RUSTSEC-2026-0275 (legacy `azure_core` logged the `authorization` header) and drops `http-types` (RUSTSEC-2026-0174), `rand` 0.7 (RUSTSEC-2026-0097), `instant` and `paste` (unmaintained).
   - `metrics` / `hammerwork-web`: `warp` 0.3 → 0.4 (hyper 1.x, h2 0.4).
@@ -45,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - RUSTSEC-2023-0071 (`rsa` Marvin attack, no fixed release) is ignored in `.cargo/audit.toml`: it comes only from `sqlx-mysql`, which uses RSA public-key *encryption* of the password during `caching_sha2_password` auth; the vulnerable private-key decryption path is never used.
 
 ### Changed (breaking, feature-gated)
+- `encryption`: `KeyManager`'s methods now require `DB: KeyManagerBackend` (implemented for `sqlx::Postgres` and `sqlx::MySql`) instead of the previous generic sqlx bounds. Code using `KeyManager<Postgres>` or `KeyManager<MySql>` is unaffected.
+- `encryption`: external key sources fail instead of falling back to a derived key (see Security). Deployments that ran on the fallback key without noticing will fail to start; data encrypted under a fallback key can only be read by recreating that key.
 - `azure-kv`: the Azure SDK 1.x has no `DefaultAzureCredential`. Hammerwork now picks a credential from the environment: `ClientSecretCredential` when `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` are set, `WorkloadIdentityCredential` when `AZURE_FEDERATED_TOKEN_FILE` is set, otherwise managed identity followed by the Azure CLI / Azure Developer CLI. The optional dependency (and implicit feature) `azure_security_keyvault` is renamed `azure_security_keyvault_keys`; enable `azure-kv` rather than the dependency name.
 - `tracing`: `shutdown_tracing()` now flushes and shuts down the provider installed by `init_tracing()` (OpenTelemetry 0.33 removed the global shutdown hook). Code that uses the `opentelemetry` crates directly alongside Hammerwork must move to 0.33.
 
@@ -64,6 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Cloning a `RetryStrategy::Custom` (e.g. through `Worker::clone` for autoscaling) no longer panics (H6)
   - Webhook delivery no longer panics when truncating a response body in the middle of a multi-byte UTF-8 character (H7)
   - The autoscaler no longer panics on a zero `evaluation_window`
+- **`KeyManager` persistence works on PostgreSQL and MySQL ([#9](https://github.com/CodingAnarchy/hammerwork/issues/9))**. Key storage had never worked: the generic storage methods were stubs returning "Database-specific implementation required", so `generate_key`, `get_key`, `rotate_key` and `generate_master_key` (with auditing) always failed.
+  - Storage is implemented through a sealed `KeyManagerBackend` trait for `sqlx::Postgres` and `sqlx::MySql`; the `KeyManager` methods are now generic over it (`is_key_due_for_rotation`, `get_keys_due_for_rotation`, `query_database_statistics` and the rotation-schedule methods were previously separate per-backend inherent methods with the same signatures).
+  - `rotate_key` inserts the new version and retires the old one in one transaction; old versions stay readable with the new `KeyManager::get_key_version` and are pruned to `max_key_versions` (0 keeps all). Generating an existing key ID is an error instead of an overwrite.
+  - `perform_automatic_rotation` rotates keys whose `next_rotation_at` has passed (it was a no-op) and reports keys it failed to rotate. `start_rotation_service` rejects a non-positive interval instead of panicking.
+  - `refresh_stats` (also run by `KeyManager::new`) reads key counts and ages from the database; it was a no-op. The statistics queries no longer fail to decode `AVG` results.
+  - `generate_master_key` stores the new key-encryption key (encrypted with the configured master key) and retires the previous one; keys it encrypted can still be decrypted, and new `KeyManager` instances load it. A `KeyManager` whose configured master key cannot decrypt the stored key-encryption key fails to start.
+  - `key_source` is stored as a label that satisfies the schema CHECK constraint (`Generated`, ...) instead of `Generated(rotation)`. `parse_key_source` accepts these bare labels (and `Derived`) as well as the parenthesised form.
+  - PostgreSQL `rotation_interval` is bound and read as an `INTERVAL` (it was bound as text and failed).
+  - Key usage counters only count the active version.
+- **Migration 016** (`016_versioned_encryption_keys`, PostgreSQL and MySQL): `hammerwork_encryption_keys` is unique on `(key_id, key_version)` instead of `key_id`, so rotated versions are kept, and the audit log accepts the `Update` operation.
+- Doctests: fixed the encryption engine, key manager, `lib.rs` configuration and `hammerwork-web` queue/archive examples to match the current API. They all compile (and `ignore`d examples pass under `--include-ignored`).
 - **Archiving ([#14](https://github.com/CodingAnarchy/hammerwork/issues/14))**, PostgreSQL and MySQL:
   - `archive_jobs` now moves jobs: the archive insert and the delete from `hammerwork_jobs` run in one transaction, and candidates are selected with `FOR UPDATE SKIP LOCKED` so concurrent archivers do not collide. Previously the row stayed in `hammerwork_jobs` with its old status.
   - `get_job` falls back to the archive table and returns archived jobs with `JobStatus::Archived` (previously it returned the stale pre-archive row)

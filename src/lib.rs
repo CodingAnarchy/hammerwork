@@ -174,7 +174,7 @@
 //!
 //! Hammerwork supports comprehensive configuration through TOML files and environment variables:
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use hammerwork::config::HammerworkConfig;
 //!
 //! // Load from TOML file

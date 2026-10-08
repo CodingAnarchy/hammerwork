@@ -420,5 +420,20 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("015_add_job_leases.postgres.sql").to_string(),
             include_str!("015_add_job_leases.mysql.sql").to_string(),
         );
+
+        // Migration 016: Unique encryption keys per (key_id, key_version)
+        self.register_migration(
+            Migration {
+                id: "016_versioned_encryption_keys".to_string(),
+                description: "Keep every encryption key version and allow 'Update' audit records"
+                    .to_string(),
+                version: 16,
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("016_versioned_encryption_keys.postgres.sql").to_string(),
+            include_str!("016_versioned_encryption_keys.mysql.sql").to_string(),
+        );
     }
 }
