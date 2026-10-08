@@ -1489,4 +1489,294 @@ mod tests {
             "{err}"
         );
     }
+
+    /// An HTTP request received by [`fake_http_server`].
+    #[derive(Debug)]
+    struct HttpRequest {
+        headers: String,
+        body: serde_json::Value,
+    }
+
+    /// A local HTTP server that answers every request with `status` and records it.
+    async fn fake_http_server(
+        status: u16,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<HttpRequest>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (headers, body) = loop {
+                        if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&buffer[..end]).to_lowercase();
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            if buffer.len() >= end + 4 + length {
+                                break (headers, buffer[end + 4..end + 4 + length].to_vec());
+                            }
+                        }
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = tx.send(HttpRequest {
+                        headers,
+                        body: serde_json::from_slice(&body).unwrap_or_default(),
+                    });
+                });
+            }
+        });
+        (url, rx)
+    }
+
+    async fn next_request(
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<HttpRequest>,
+    ) -> HttpRequest {
+        tokio::time::timeout(Duration::from_secs(10), requests.recv())
+            .await
+            .expect("no HTTP request")
+            .unwrap()
+    }
+
+    fn stats(error_rate: f64, avg_processing_time_ms: f64) -> JobStatistics {
+        JobStatistics {
+            total_processed: 10,
+            completed: 5,
+            failed: 5,
+            error_rate,
+            avg_processing_time_ms,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_webhook_alert_sends_headers_and_alert_fields() {
+        let (url, mut requests) = fake_http_server(200).await;
+        let headers = HashMap::from([("X-Team".to_string(), "queues".to_string())]);
+        let manager = AlertManager::new(
+            AlertingConfig::new()
+                .alert_on_high_error_rate(0.1)
+                .webhook_with_headers(&url, headers),
+        );
+        manager
+            .check_thresholds("emails", &stats(0.5, 0.0))
+            .await
+            .unwrap();
+        let request = next_request(&mut requests).await;
+        assert!(
+            request.headers.contains("x-team: queues"),
+            "{}",
+            request.headers
+        );
+        assert_eq!(request.body["alert_type"], "HighErrorRate");
+        assert_eq!(
+            request.body["severity"], "Critical",
+            "more than twice the threshold"
+        );
+        assert_eq!(request.body["queue_name"], "emails");
+        assert_eq!(request.body["context"]["failed"], "5");
+    }
+
+    #[tokio::test]
+    async fn test_error_status_is_an_error_and_does_not_start_cooldown() {
+        let (url, mut requests) = fake_http_server(500).await;
+        let manager =
+            AlertManager::new(AlertingConfig::new().alert_on_queue_depth(1).webhook(&url));
+        let err = manager.check_queue_depth("q", 5).await.unwrap_err();
+        assert!(err.to_string().contains("500"), "{err}");
+        next_request(&mut requests).await;
+        // Not delivered anywhere, so the next check tries again.
+        assert!(manager.check_queue_depth("q", 5).await.is_err());
+        next_request(&mut requests).await;
+    }
+
+    #[tokio::test]
+    async fn test_unreachable_webhook_is_an_error() {
+        let manager = AlertManager::new(
+            AlertingConfig::new()
+                .alert_on_queue_depth(1)
+                .webhook("http://127.0.0.1:1/hook"),
+        );
+        let err = manager.check_queue_depth("q", 5).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to send webhook alert"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slack_alert_payload() {
+        let (url, mut requests) = fake_http_server(200).await;
+        let manager = AlertManager::new(
+            AlertingConfig::new()
+                .alert_on_slow_processing(Duration::from_millis(100))
+                .slack(&url, "#alerts"),
+        );
+        // 150ms average: over the threshold, but not twice it.
+        manager
+            .check_thresholds("reports", &stats(0.0, 150.0))
+            .await
+            .unwrap();
+        let request = next_request(&mut requests).await;
+        assert_eq!(request.body["channel"], "#alerts");
+        let attachment = &request.body["attachments"][0];
+        assert_eq!(attachment["color"], "#ffaa00", "warning");
+        assert_eq!(attachment["title"], "Hammerwork Alert: SlowProcessing");
+        assert_eq!(attachment["fields"][0]["value"], "reports");
+        assert_eq!(attachment["fields"][1]["value"], "150.00");
+        assert_eq!(attachment["fields"][2]["value"], "100.00");
+
+        // Slack error statuses and unreachable endpoints are errors.
+        let (url, _requests) = fake_http_server(404).await;
+        let manager = AlertManager::new(AlertingConfig::new().slack(&url, "#a"));
+        let err = manager
+            .send_custom_alert("q", "disk", "full", 1.0, 0.5, AlertSeverity::Info)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Slack alert failed with status"),
+            "{err}"
+        );
+        let manager = AlertManager::new(AlertingConfig::new().slack("http://127.0.0.1:1", "#a"));
+        let err = manager
+            .send_custom_alert("q", "disk", "full", 1.0, 0.5, AlertSeverity::Critical)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to send Slack alert"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_threshold_severities_and_cooldown() {
+        let (url, mut requests) = fake_http_server(200).await;
+        let manager = AlertManager::new(
+            AlertingConfig::new()
+                .alert_on_high_error_rate(0.4)
+                .alert_on_slow_processing(Duration::from_millis(100))
+                .alert_on_queue_depth(10)
+                .webhook(&url),
+        );
+        // Error rate 0.5: over 0.4 but not 0.8 -> warning. Processing 250ms: over
+        // twice 100ms -> critical.
+        manager
+            .check_thresholds("q", &stats(0.5, 250.0))
+            .await
+            .unwrap();
+        let mut seen = HashMap::new();
+        for _ in 0..2 {
+            let request = next_request(&mut requests).await;
+            seen.insert(
+                request.body["alert_type"].as_str().unwrap().to_string(),
+                request.body["severity"].as_str().unwrap().to_string(),
+            );
+        }
+        assert_eq!(seen["HighErrorRate"], "Warning");
+        assert_eq!(seen["SlowProcessing"], "Critical");
+
+        manager.check_queue_depth("q", 25).await.unwrap();
+        let request = next_request(&mut requests).await;
+        assert_eq!(request.body["severity"], "Critical");
+        // Under the threshold: nothing. Within the cooldown: nothing.
+        manager.check_queue_depth("q", 5).await.unwrap();
+        manager.check_queue_depth("q", 25).await.unwrap();
+        manager
+            .check_thresholds("q", &stats(0.5, 250.0))
+            .await
+            .unwrap();
+        // Another queue has its own cooldown.
+        manager.check_queue_depth("other", 15).await.unwrap();
+        let request = next_request(&mut requests).await;
+        assert_eq!(request.body["queue_name"], "other");
+        assert_eq!(request.body["severity"], "Warning");
+        assert!(requests.try_recv().is_err(), "nothing else was sent");
+    }
+
+    #[tokio::test]
+    async fn test_worker_starvation_alert() {
+        let (url, mut requests) = fake_http_server(200).await;
+        let manager = AlertManager::new(
+            AlertingConfig::new()
+                .alert_on_worker_starvation(Duration::from_secs(60))
+                .webhook(&url),
+        );
+        manager
+            .check_worker_starvation("q", Utc::now() - chrono::Duration::seconds(10))
+            .await
+            .unwrap();
+        manager
+            .check_worker_starvation("q", Utc::now() - chrono::Duration::minutes(5))
+            .await
+            .unwrap();
+        let request = next_request(&mut requests).await;
+        assert_eq!(request.body["alert_type"], "WorkerStarvation");
+        assert_eq!(request.body["current_value"], 5.0);
+        assert_eq!(request.body["threshold"], 1.0);
+        assert!(requests.try_recv().is_err(), "10 seconds is not starvation");
+    }
+
+    #[tokio::test]
+    async fn test_disabled_alerting_sends_nothing() {
+        let (url, mut requests) = fake_http_server(200).await;
+        let mut manager = AlertManager::new(
+            AlertingConfig::new()
+                .alert_on_high_error_rate(0.1)
+                .alert_on_queue_depth(1)
+                .alert_on_worker_starvation(Duration::from_secs(1))
+                .webhook(&url)
+                .enabled(false),
+        );
+        manager
+            .check_thresholds("q", &stats(1.0, 0.0))
+            .await
+            .unwrap();
+        manager.check_queue_depth("q", 100).await.unwrap();
+        manager
+            .check_worker_starvation("q", Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        manager
+            .send_custom_alert("q", "x", "m", 1.0, 0.0, AlertSeverity::Info)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(requests.try_recv().is_err());
+
+        // Re-enabled through update_config.
+        let config = manager.config().clone().enabled(true);
+        manager.update_config(config);
+        assert!(manager.config().enabled);
+        manager.check_queue_depth("q", 100).await.unwrap();
+        assert_eq!(
+            next_request(&mut requests).await.body["alert_type"],
+            "QueueDepthExceeded"
+        );
+    }
+
+    #[test]
+    fn test_alert_type_display() {
+        assert_eq!(AlertType::HighErrorRate.to_string(), "High Error Rate");
+        assert_eq!(
+            AlertType::QueueDepthExceeded.to_string(),
+            "Queue Depth Exceeded"
+        );
+        assert_eq!(AlertType::WorkerStarvation.to_string(), "Worker Starvation");
+        assert_eq!(AlertType::SlowProcessing.to_string(), "Slow Processing");
+        assert_eq!(AlertType::Custom("disk".into()).to_string(), "Custom: disk");
+    }
 }
