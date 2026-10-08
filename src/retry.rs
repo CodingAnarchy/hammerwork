@@ -51,6 +51,7 @@
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Types of jitter that can be applied to retry delays.
@@ -119,15 +120,20 @@ impl JitterType {
 
                 // Randomly add or subtract jitter
                 if rng.gen_bool(0.5) {
-                    delay + jitter
+                    delay.saturating_add(jitter)
                 } else {
                     delay.saturating_sub(jitter)
                 }
             }
             JitterType::Multiplicative(factor) => {
+                // A NaN, infinite, zero or negative factor means "no jitter"; factors
+                // above 1.0 are clamped so the lower bound never goes negative.
+                if !factor.is_finite() || *factor <= 0.0 {
+                    return delay;
+                }
+                let factor = factor.min(1.0);
                 let jitter_factor = rng.gen_range((1.0 - factor)..=(1.0 + factor));
-                let jittered_millis = (delay.as_millis() as f64 * jitter_factor) as u64;
-                Duration::from_millis(jittered_millis)
+                saturating_mul_f64(delay, jitter_factor)
             }
         }
     }
@@ -417,8 +423,10 @@ pub enum RetryStrategy {
     /// use hammerwork::retry::RetryStrategy;
     /// use std::time::Duration;
     ///
+    /// use std::sync::Arc;
+    ///
     /// // Custom strategy: short delays for first few attempts, then longer
-    /// let strategy = RetryStrategy::Custom(Box::new(|attempt| {
+    /// let strategy = RetryStrategy::Custom(Arc::new(|attempt| {
     ///     if attempt <= 3 {
     ///         Duration::from_secs(5)  // Quick retries for transient issues
     ///     } else if attempt <= 6 {
@@ -432,7 +440,11 @@ pub enum RetryStrategy {
     /// assert_eq!(strategy.calculate_delay(4), Duration::from_secs(60));
     /// assert_eq!(strategy.calculate_delay(7), Duration::from_secs(300));
     /// ```
-    Custom(Box<dyn Fn(u32) -> Duration + Send + Sync>),
+    ///
+    /// The function is reference-counted so that cloning a strategy (for example when a
+    /// [`Worker`](crate::Worker) is cloned for autoscaling) is cheap and never fails.
+    /// Prefer the [`RetryStrategy::custom`] constructor, which wraps the closure for you.
+    Custom(CustomRetryFn),
 }
 
 impl RetryStrategy {
@@ -465,6 +477,9 @@ impl RetryStrategy {
     /// assert_eq!(strategy.calculate_delay(4), Duration::from_secs(8));
     /// ```
     pub fn calculate_delay(&self, attempt: u32) -> Duration {
+        // All arithmetic below saturates instead of panicking: huge attempt numbers,
+        // huge bases and invalid multipliers (NaN, negative) all produce a bounded
+        // delay, clamped to `max_delay` when one is configured.
         let base_delay = match self {
             RetryStrategy::Fixed(delay) => *delay,
 
@@ -473,12 +488,8 @@ impl RetryStrategy {
                 increment,
                 max_delay,
             } => {
-                let delay = *base + increment.mul_f64(attempt as f64);
-                if let Some(max) = max_delay {
-                    delay.min(*max)
-                } else {
-                    delay
-                }
+                let step = increment.checked_mul(attempt).unwrap_or(Duration::MAX);
+                cap_delay(base.saturating_add(step), *max_delay)
             }
 
             RetryStrategy::Exponential {
@@ -487,17 +498,15 @@ impl RetryStrategy {
                 max_delay,
                 jitter,
             } => {
-                let delay_multiplier = multiplier.powi((attempt.saturating_sub(1)) as i32);
-                let delay = base.mul_f64(delay_multiplier);
-
-                let capped_delay = if let Some(max) = max_delay {
-                    delay.min(*max)
-                } else {
-                    delay
-                };
+                let exponent = attempt.saturating_sub(1).min(i32::MAX as u32) as i32;
+                let delay_multiplier = sanitize_multiplier(*multiplier).powi(exponent);
+                let capped_delay =
+                    cap_delay(saturating_mul_f64(*base, delay_multiplier), *max_delay);
 
                 if let Some(jitter_type) = jitter {
-                    return jitter_type.apply(capped_delay);
+                    return jitter_type
+                        .apply(capped_delay)
+                        .max(Duration::from_millis(1));
                 }
 
                 capped_delay
@@ -505,13 +514,7 @@ impl RetryStrategy {
 
             RetryStrategy::Fibonacci { base, max_delay } => {
                 let fib_number = fibonacci(attempt);
-                let delay = base.mul_f64(fib_number as f64);
-
-                if let Some(max) = max_delay {
-                    delay.min(*max)
-                } else {
-                    delay
-                }
+                cap_delay(saturating_mul_f64(*base, fib_number as f64), *max_delay)
             }
 
             RetryStrategy::Custom(func) => func(attempt),
@@ -519,6 +522,46 @@ impl RetryStrategy {
 
         // Ensure delay is never zero (minimum 1ms)
         base_delay.max(Duration::from_millis(1))
+    }
+
+    /// Check that the strategy's parameters are sensible.
+    ///
+    /// [`calculate_delay`](Self::calculate_delay) never panics, even for invalid
+    /// parameters (a NaN or negative multiplier is treated as `1.0`), but such values
+    /// are almost certainly configuration mistakes. Call this when loading a strategy
+    /// from configuration to surface them early.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::retry::RetryStrategy;
+    /// use std::time::Duration;
+    ///
+    /// assert!(RetryStrategy::exponential(Duration::from_secs(1), 2.0, None).validate().is_ok());
+    /// assert!(RetryStrategy::exponential(Duration::from_secs(1), f64::NAN, None).validate().is_err());
+    /// ```
+    pub fn validate(&self) -> crate::Result<()> {
+        let invalid = |message: String| crate::HammerworkError::Worker { message };
+        match self {
+            RetryStrategy::Exponential {
+                multiplier, jitter, ..
+            } => {
+                if !multiplier.is_finite() || *multiplier <= 0.0 {
+                    return Err(invalid(format!(
+                        "exponential retry multiplier must be finite and > 0, got {multiplier}"
+                    )));
+                }
+                if let Some(JitterType::Multiplicative(factor)) = jitter {
+                    if !factor.is_finite() || !(0.0..=1.0).contains(factor) {
+                        return Err(invalid(format!(
+                            "multiplicative jitter factor must be within 0.0..=1.0, got {factor}"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Create a fixed delay retry strategy.
@@ -678,7 +721,38 @@ impl RetryStrategy {
     where
         F: Fn(u32) -> Duration + Send + Sync + 'static,
     {
-        RetryStrategy::Custom(Box::new(func))
+        RetryStrategy::Custom(Arc::new(func))
+    }
+}
+
+/// The function type stored by [`RetryStrategy::Custom`].
+pub type CustomRetryFn = Arc<dyn Fn(u32) -> Duration + Send + Sync>;
+
+/// Replace a NaN or negative exponential multiplier with `1.0` (constant delay).
+fn sanitize_multiplier(multiplier: f64) -> f64 {
+    if multiplier.is_nan() || multiplier < 0.0 {
+        1.0
+    } else {
+        multiplier
+    }
+}
+
+/// Multiply a duration by a float without panicking.
+///
+/// Non-positive and NaN factors yield zero; results too large for a `Duration`
+/// (including an infinite factor) saturate to `Duration::MAX`.
+fn saturating_mul_f64(delay: Duration, factor: f64) -> Duration {
+    if factor.is_nan() || factor <= 0.0 {
+        return Duration::ZERO;
+    }
+    Duration::try_from_secs_f64(delay.as_secs_f64() * factor).unwrap_or(Duration::MAX)
+}
+
+/// Clamp a delay to an optional maximum.
+fn cap_delay(delay: Duration, max_delay: Option<Duration>) -> Duration {
+    match max_delay {
+        Some(max) => delay.min(max),
+        None => delay,
     }
 }
 
@@ -793,9 +867,7 @@ impl Clone for RetryStrategy {
                 base: *base,
                 max_delay: *max_delay,
             },
-            RetryStrategy::Custom(_) => {
-                panic!("Cannot clone custom retry strategy functions")
-            }
+            RetryStrategy::Custom(func) => RetryStrategy::Custom(Arc::clone(func)),
         }
     }
 }
@@ -840,7 +912,8 @@ impl PartialEq for RetryStrategy {
                     max_delay: b_max,
                 },
             ) => a_base == b_base && a_max == b_max,
-            (RetryStrategy::Custom(_), RetryStrategy::Custom(_)) => false, // Custom functions can't be compared
+            // Closures can't be compared; two strategies sharing the same function are equal.
+            (RetryStrategy::Custom(a), RetryStrategy::Custom(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -1128,7 +1201,7 @@ mod tests {
 
     #[test]
     fn test_custom_retry_strategy() {
-        let strategy = RetryStrategy::Custom(Box::new(|attempt| match attempt {
+        let strategy = RetryStrategy::Custom(Arc::new(|attempt| match attempt {
             1..=3 => Duration::from_secs(5),
             4..=6 => Duration::from_secs(30),
             _ => Duration::from_secs(300),
@@ -1212,7 +1285,7 @@ mod tests {
     #[test]
     fn test_minimum_delay_enforcement() {
         // Test that zero delays are converted to 1ms minimum
-        let strategy = RetryStrategy::Custom(Box::new(|_| Duration::from_millis(0)));
+        let strategy = RetryStrategy::Custom(Arc::new(|_| Duration::from_millis(0)));
         assert_eq!(strategy.calculate_delay(1), Duration::from_millis(1));
     }
 
@@ -1248,5 +1321,122 @@ mod tests {
                 assert_eq!(strategy.calculate_delay(3), deserialized.calculate_delay(3));
             }
         }
+    }
+
+    #[test]
+    fn test_exponential_huge_attempt_saturates_instead_of_panicking() {
+        let uncapped = RetryStrategy::exponential(Duration::from_secs(1), 2.0, None);
+        assert_eq!(uncapped.calculate_delay(65), Duration::MAX);
+        assert_eq!(uncapped.calculate_delay(u32::MAX), Duration::MAX);
+
+        let capped =
+            RetryStrategy::exponential(Duration::from_secs(1), 2.0, Some(Duration::from_secs(600)));
+        assert_eq!(capped.calculate_delay(1_000), Duration::from_secs(600));
+        assert_eq!(capped.calculate_delay(u32::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_exponential_invalid_multipliers_do_not_panic() {
+        for multiplier in [f64::NAN, -2.0, -0.5] {
+            let strategy = RetryStrategy::exponential(Duration::from_secs(3), multiplier, None);
+            // Invalid multipliers are treated as 1.0 (constant delay).
+            assert_eq!(strategy.calculate_delay(1), Duration::from_secs(3));
+            assert_eq!(strategy.calculate_delay(50), Duration::from_secs(3));
+            assert!(strategy.validate().is_err());
+        }
+
+        let infinite = RetryStrategy::exponential(
+            Duration::from_secs(1),
+            f64::INFINITY,
+            Some(Duration::from_secs(60)),
+        );
+        assert_eq!(infinite.calculate_delay(2), Duration::from_secs(60));
+        assert!(infinite.validate().is_err());
+
+        let zero = RetryStrategy::exponential(Duration::from_secs(1), 0.0, None);
+        assert_eq!(zero.calculate_delay(5), Duration::from_millis(1));
+
+        assert!(
+            RetryStrategy::exponential(Duration::from_secs(1), 2.0, None)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_jitter_with_invalid_factors_does_not_panic() {
+        let base = Duration::from_secs(10);
+        for factor in [f64::NAN, -1.0, f64::INFINITY, 0.0] {
+            assert_eq!(JitterType::Multiplicative(factor).apply(base), base);
+        }
+        // Factors above 1.0 are clamped to 1.0: the result stays within [0, 2 * base].
+        for _ in 0..50 {
+            let jittered = JitterType::Multiplicative(5.0).apply(base);
+            assert!(jittered <= base * 2);
+        }
+        // Additive jitter on a huge delay saturates instead of overflowing.
+        for _ in 0..50 {
+            let jittered = JitterType::Additive(Duration::from_secs(5)).apply(Duration::MAX);
+            assert!(jittered >= Duration::MAX - Duration::from_secs(5));
+        }
+        let strategy = RetryStrategy::exponential_with_jitter(
+            Duration::from_secs(1),
+            2.0,
+            None,
+            JitterType::Multiplicative(0.1),
+        );
+        assert!(strategy.calculate_delay(u32::MAX) > Duration::from_secs(1));
+        assert!(
+            RetryStrategy::exponential_with_jitter(
+                Duration::from_secs(1),
+                2.0,
+                None,
+                JitterType::Multiplicative(2.0),
+            )
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_fibonacci_huge_attempt_saturates() {
+        let uncapped = RetryStrategy::fibonacci(Duration::from_secs(2), None);
+        assert_eq!(uncapped.calculate_delay(200), Duration::MAX);
+        let capped =
+            RetryStrategy::fibonacci(Duration::from_secs(2), Some(Duration::from_secs(300)));
+        assert_eq!(
+            capped.calculate_delay(u32::MAX - 1),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn test_linear_overflow_saturates() {
+        let strategy = RetryStrategy::linear(Duration::MAX, Duration::from_secs(1), None);
+        assert_eq!(strategy.calculate_delay(10), Duration::MAX);
+        let strategy = RetryStrategy::linear(
+            Duration::from_secs(1),
+            Duration::from_secs(u64::MAX / 2),
+            Some(Duration::from_secs(120)),
+        );
+        assert_eq!(strategy.calculate_delay(u32::MAX), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_custom_strategy_clone_is_total_and_shares_function() {
+        let strategy = RetryStrategy::custom(|attempt| Duration::from_secs(attempt as u64 * 7));
+        let cloned = strategy.clone();
+        assert_eq!(cloned.calculate_delay(3), Duration::from_secs(21));
+        assert_eq!(strategy, cloned);
+        assert_ne!(strategy, RetryStrategy::custom(|_| Duration::from_secs(1)));
+        assert!(strategy.validate().is_ok());
+
+        // Cloning through Option, as Worker::clone does, must not panic either.
+        let as_option = Some(strategy);
+        let cloned_option = as_option.clone();
+        assert_eq!(
+            cloned_option.unwrap().calculate_delay(1),
+            Duration::from_secs(7)
+        );
     }
 }
