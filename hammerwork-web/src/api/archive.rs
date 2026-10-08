@@ -282,32 +282,32 @@ pub fn archive_routes<Q>(
 where
     Q: DatabaseQueue + Send + Sync + 'static,
 {
-    let archive_jobs = warp::path!("api" / "archive" / "jobs")
+    let archive_jobs = warp::path!("archive" / "jobs")
         .and(warp::post())
         .and(warp::body::json())
         .and(with_queue(queue.clone()))
         .and_then(handle_archive_jobs);
 
-    let list_archived = warp::path!("api" / "archive" / "jobs")
+    let list_archived = warp::path!("archive" / "jobs")
         .and(warp::get())
         .and(super::with_pagination())
         .and(with_archive_filters())
         .and(with_queue(queue.clone()))
         .and_then(handle_list_archived_jobs);
 
-    let restore_job = warp::path!("api" / "archive" / "jobs" / String / "restore")
+    let restore_job = warp::path!("archive" / "jobs" / String / "restore")
         .and(warp::post())
         .and(warp::body::json())
         .and(with_queue(queue.clone()))
         .and_then(handle_restore_job);
 
-    let purge_jobs = warp::path!("api" / "archive" / "purge")
+    let purge_jobs = warp::path!("archive" / "purge")
         .and(warp::delete())
         .and(warp::body::json())
         .and(with_queue(queue.clone()))
         .and_then(handle_purge_jobs);
 
-    let archive_stats = warp::path!("api" / "archive" / "stats")
+    let archive_stats = warp::path!("archive" / "stats")
         .and(warp::get())
         .and(warp::query::<FilterParams>())
         .and(with_queue(queue.clone()))
@@ -381,6 +381,56 @@ where
     }
 }
 
+/// Everything archived in `queue_name` (all queues for `None`), read in pages.
+async fn all_archived_jobs<Q>(queue: &Q, queue_name: Option<&str>) -> hammerwork::Result<Vec<ArchivedJob>>
+where
+    Q: DatabaseQueue + Send + Sync,
+{
+    const PAGE: u32 = 1000;
+    let mut all = Vec::new();
+    loop {
+        let page = queue
+            .list_archived_jobs(queue_name, Some(PAGE), Some(all.len() as u32))
+            .await?;
+        let count = page.len() as u32;
+        all.extend(page);
+        if count < PAGE {
+            return Ok(all);
+        }
+    }
+}
+
+/// Whether the filters beyond the queue name narrow the listing.
+fn has_extra_filters(filters: &ArchiveFilterParams) -> bool {
+    filters.reason.is_some()
+        || filters.archived_after.is_some()
+        || filters.archived_before.is_some()
+        || filters.archived_by.is_some()
+        || filters.compressed.is_some()
+        || filters.original_status.is_some()
+}
+
+/// Whether `job` passes every filter (the queue filter is applied by the query).
+fn archived_job_matches(job: &ArchivedJob, filters: &ArchiveFilterParams) -> bool {
+    filters
+        .reason
+        .as_deref()
+        .is_none_or(|reason| format!("{:?}", job.archival_reason).eq_ignore_ascii_case(reason))
+        && filters.archived_after.is_none_or(|t| job.archived_at >= t)
+        && filters.archived_before.is_none_or(|t| job.archived_at <= t)
+        && filters
+            .archived_by
+            .as_deref()
+            .is_none_or(|by| job.archived_by.as_deref() == Some(by))
+        && filters
+            .compressed
+            .is_none_or(|compressed| job.payload_compressed == compressed)
+        && filters
+            .original_status
+            .as_deref()
+            .is_none_or(|status| job.status.as_str().eq_ignore_ascii_case(status))
+}
+
 /// Handle list archived jobs request
 async fn handle_list_archived_jobs<Q>(
     pagination: PaginationParams,
@@ -390,45 +440,52 @@ async fn handle_list_archived_jobs<Q>(
 where
     Q: DatabaseQueue + Send + Sync + 'static,
 {
-    match queue
-        .list_archived_jobs(
-            filters.queue.as_deref(),
-            Some(pagination.get_limit()),
-            Some(pagination.get_offset()),
-        )
-        .await
-    {
-        Ok(archived_jobs) => {
-            // Convert to API format
-            let jobs: Vec<ArchivedJobInfo> = archived_jobs.into_iter().map(Into::into).collect();
+    let limit = pagination.get_limit();
+    let offset = pagination.get_offset();
 
-            // Get a better estimate of total count by running a query with a large limit
-            // This is not perfect but gives a more accurate total than just the current page
-            let total = if jobs.len() as u64 == pagination.limit.unwrap_or(0) as u64 {
-                // If we got exactly the limit, there might be more records
-                // Run another query to get a better count estimate
-                match queue
-                    .list_archived_jobs(filters.queue.as_deref(), Some(10000), Some(0))
-                    .await
-                {
-                    Ok(all_jobs) => all_jobs.len() as u64,
-                    Err(e) => return Ok(internal_error("Failed to count archived jobs", &e)),
-                }
-            } else {
-                // If we got less than the limit, we have all records
-                pagination.offset.unwrap_or(0) as u64 + jobs.len() as u64
-            };
+    let (page, total) = if has_extra_filters(&filters) {
+        // The database only filters by queue: read everything and filter here.
+        let all = match all_archived_jobs(queue.as_ref(), filters.queue.as_deref()).await {
+            Ok(all) => all,
+            Err(e) => return Ok(internal_error("Failed to list archived jobs", &e)),
+        };
+        let matching: Vec<ArchivedJob> = all
+            .into_iter()
+            .filter(|job| archived_job_matches(job, &filters))
+            .collect();
+        let total = matching.len() as u64;
+        let page: Vec<ArchivedJob> = matching
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        (page, total)
+    } else {
+        let page = match queue
+            .list_archived_jobs(filters.queue.as_deref(), Some(limit), Some(offset))
+            .await
+        {
+            Ok(page) => page,
+            Err(e) => return Ok(internal_error("Failed to list archived jobs", &e)),
+        };
+        let total = if page.len() as u32 == limit {
+            // A full page: there may be more, so count them all.
+            match all_archived_jobs(queue.as_ref(), filters.queue.as_deref()).await {
+                Ok(all) => all.len() as u64,
+                Err(e) => return Ok(internal_error("Failed to count archived jobs", &e)),
+            }
+        } else {
+            // A short page is the end of the list.
+            u64::from(offset) + page.len() as u64
+        };
+        (page, total)
+    };
 
-            let pagination_meta = PaginationMeta::new(&pagination, total);
-            let response = PaginatedResponse {
-                items: jobs,
-                pagination: pagination_meta,
-            };
-
-            Ok(json_reply(&ApiResponse::success(response)))
-        }
-        Err(e) => Ok(internal_error("Failed to list archived jobs", &e)),
-    }
+    let response = PaginatedResponse {
+        items: page.into_iter().map(ArchivedJobInfo::from).collect(),
+        pagination: PaginationMeta::new(&pagination, total),
+    };
+    Ok(json_reply(&ApiResponse::success(response)))
 }
 
 /// Handle restore job request
@@ -459,7 +516,7 @@ where
             };
             Ok(json_reply(&ApiResponse::success(response)))
         }
-        Err(e) => Ok(internal_error("Failed to restore job", &e)),
+        Err(e) => Ok(super::queue_error_reply("Failed to restore job", &e)),
     }
 }
 
@@ -472,10 +529,12 @@ where
     Q: DatabaseQueue + Send + Sync + 'static,
 {
     if request.dry_run {
-        // For dry run, estimate how many jobs would be purged by using list_archived_jobs
-        // with a large limit to get an accurate count
-        let count = match queue.list_archived_jobs(None, Some(10000), Some(0)).await {
-            Ok(jobs) => jobs.len() as u64,
+        // Count the archived jobs the real purge would delete: those archived before the cutoff
+        let count = match all_archived_jobs(queue.as_ref(), None).await {
+            Ok(jobs) => jobs
+                .iter()
+                .filter(|job| job.archived_at < request.older_than)
+                .count() as u64,
             Err(e) => return Ok(internal_error("Failed to count archived jobs", &e)),
         };
 

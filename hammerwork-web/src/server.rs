@@ -57,6 +57,34 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 use warp::{Filter, Reply};
 
+/// All routes of the dashboard: the health check, the authenticated JSON API under `/api`,
+/// the WebSocket endpoint at `/ws`, and the static single-page app for everything else.
+///
+/// Requests under `/api` and `/ws` never fall through to the single-page app, so a failed
+/// authentication or an unknown API path is answered as such (401, 404) instead of with the
+/// HTML page. Rejections are turned into replies by [`handle_auth_rejection`].
+pub fn app_routes<Q>(
+    queue: Arc<Q>,
+    auth_state: AuthState,
+    system_state: Arc<RwLock<SystemState>>,
+    websocket_state: Arc<RwLock<WebSocketState>>,
+    static_dir: std::path::PathBuf,
+) -> impl Filter<Extract = (impl Reply,), Error = std::convert::Infallible> + Clone
+where
+    Q: api::history::JobHistory + 'static,
+{
+    let api_routes =
+        WebDashboard::create_api_routes_static(queue, auth_state.clone(), system_state);
+    let websocket_routes =
+        WebDashboard::create_websocket_routes_static(websocket_state, auth_state);
+    let static_routes = WebDashboard::create_static_routes_static(static_dir);
+
+    api_routes
+        .or(websocket_routes)
+        .or(static_routes)
+        .recover(handle_auth_rejection)
+}
+
 /// Main web dashboard server.
 ///
 /// The `WebDashboard` provides a complete web interface for monitoring and managing
@@ -175,27 +203,14 @@ impl WebDashboard {
             self.config.pool_size,
         )));
 
-        // Create API routes
-        let api_routes = Self::create_api_routes_static(
-            queue.clone(),
+        // API, WebSocket and static file routes
+        let routes = app_routes(
+            queue,
             self.auth_state.clone(),
-            system_state.clone(),
-        );
-
-        // Create WebSocket routes
-        let websocket_routes = Self::create_websocket_routes_static(
+            system_state,
             self.websocket_state.clone(),
-            self.auth_state.clone(),
+            self.config.static_dir.clone(),
         );
-
-        // Create static file routes
-        let static_routes = Self::create_static_routes_static(self.config.static_dir.clone())?;
-
-        // Combine all routes
-        let routes = api_routes
-            .or(websocket_routes)
-            .or(static_routes)
-            .recover(handle_auth_rejection);
 
         info!("Starting web server on {}", bind_addr);
 
@@ -289,8 +304,8 @@ impl WebDashboard {
             .map(
                 |_: (), ws: warp::ws::Ws, websocket_state: Arc<RwLock<WebSocketState>>| {
                     ws.on_upgrade(move |socket| async move {
-                        let mut state = websocket_state.write().await;
-                        if let Err(e) = state.handle_connection(socket).await {
+                        if let Err(e) = WebSocketState::serve_connection(websocket_state, socket).await
+                        {
                             error!("WebSocket error: {}", e);
                         }
                     })
@@ -301,18 +316,36 @@ impl WebDashboard {
     /// Create static file serving routes
     fn create_static_routes_static(
         static_dir: std::path::PathBuf,
-    ) -> Result<impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone> {
+    ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone {
         // Serve static files
         let static_files = warp::path("static").and(warp::fs::dir(static_dir.clone()));
 
         // Serve index.html at root
         let index = warp::path::end().and(warp::fs::file(static_dir.join("index.html")));
 
-        // Catch-all for SPA routing - serve index.html
-        let spa_routes = warp::any().and(warp::fs::file(static_dir.join("index.html")));
+        // Catch-all for SPA routing - serve index.html, but never for API or WebSocket paths
+        let spa_routes = not_api_path().and(warp::fs::file(static_dir.join("index.html")));
 
-        Ok(index.or(static_files).or(spa_routes))
+        index.or(static_files).or(spa_routes)
     }
+}
+
+/// Passes requests outside `/api` and `/ws`; rejects those, so they are not answered with the
+/// single-page app.
+fn not_api_path() -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
+    warp::path::full()
+        .and_then(|path: warp::path::FullPath| async move {
+            let path = path.as_str();
+            let reserved = ["/api", "/ws"]
+                .iter()
+                .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")));
+            if reserved {
+                Err(warp::reject::not_found())
+            } else {
+                Ok(())
+            }
+        })
+        .untuple_one()
 }
 
 /// The database backend a dashboard connects to, chosen from the database URL scheme.

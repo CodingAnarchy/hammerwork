@@ -274,9 +274,9 @@ class HammerworkDashboard {
         document.getElementById('totalJobs').textContent = this.formatNumber(data.total_jobs || 0);
         document.getElementById('pendingJobs').textContent = this.formatNumber(data.pending_jobs || 0);
         document.getElementById('runningJobs').textContent = this.formatNumber(data.running_jobs || 0);
-        document.getElementById('errorRate').textContent = this.formatPercentage(data.error_rate || 0);
-        document.getElementById('throughput').textContent = this.formatNumber(data.throughput || 0);
-        document.getElementById('avgProcessing').textContent = this.formatDuration(data.avg_processing_time || 0);
+        document.getElementById('errorRate').textContent = this.formatPercentage(data.overall_error_rate || 0);
+        document.getElementById('throughput').textContent = this.formatNumber(data.overall_throughput || 0);
+        document.getElementById('avgProcessing').textContent = this.formatDuration(data.avg_processing_time_ms || 0);
 
         // Update queue status chart
         if (this.charts.queueStatus) {
@@ -294,8 +294,8 @@ class HammerworkDashboard {
         try {
             const response = await this.apiCall('/api/queues');
             if (response.success) {
-                this.updateQueuesTable(response.data.queues || []);
-                this.updateQueueFilter(response.data.queues || []);
+                this.updateQueuesTable(response.data.items || []);
+                this.updateQueueFilter(response.data.items || []);
             }
         } catch (error) {
             console.error('Failed to load queues:', error);
@@ -362,7 +362,7 @@ class HammerworkDashboard {
             
             const response = await this.apiCall(url);
             if (response.success) {
-                this.updateJobsTable(response.data.jobs || []);
+                this.updateJobsTable(response.data.items || []);
             }
         } catch (error) {
             console.error('Failed to load jobs:', error);
@@ -381,13 +381,13 @@ class HammerworkDashboard {
             <tr>
                 <td class="font-mono truncate" title="${job.id}">${job.id.substring(0, 8)}</td>
                 <td class="truncate">${this.escapeHtml(job.queue_name)}</td>
-                <td><span class="status-badge status-${job.status}">${job.status}</span></td>
-                <td><span class="priority-badge priority-${job.priority}">${job.priority}</span></td>
+                <td><span class="status-badge status-${String(job.status).toLowerCase()}">${job.status}</span></td>
+                <td><span class="priority-badge priority-${String(job.priority).toLowerCase()}">${job.priority}</span></td>
                 <td>${job.attempts || 0}</td>
                 <td title="${job.created_at}">${this.formatRelativeTime(job.created_at)}</td>
                 <td>
                     <button class="btn btn-sm btn-secondary view-job-btn" data-job-id="${job.id}">View</button>
-                    ${job.status === 'failed' ? `<button class="btn btn-sm btn-primary retry-job-btn" data-job-id="${job.id}">Retry</button>` : ''}
+                    ${this.isRetryable(job.status) ? `<button class="btn btn-sm btn-primary retry-job-btn" data-job-id="${job.id}">Retry</button>` : ''}
                     <button class="btn btn-sm btn-danger delete-job-btn" data-job-id="${job.id}">Delete</button>
                 </td>
             </tr>
@@ -396,14 +396,15 @@ class HammerworkDashboard {
 
     async updateThroughputChart(period) {
         try {
-            const response = await this.apiCall(`/api/stats/throughput?period=${period}`);
+            const hours = { '1h': 1, '24h': 24, '7d': 168 }[period] || 24;
+            const response = await this.apiCall(`/api/stats/trends?hours=${hours}`);
             if (response.success && this.charts.throughput) {
-                const data = response.data.datapoints || [];
+                const data = response.data || [];
                 
                 this.charts.throughput.data.labels = data.map(point => 
-                    new Date(point.timestamp).toLocaleTimeString()
+                    new Date(point.hour).toLocaleTimeString()
                 );
-                this.charts.throughput.data.datasets[0].data = data.map(point => point.value);
+                this.charts.throughput.data.datasets[0].data = data.map(point => point.completed + point.failed);
                 this.charts.throughput.update();
             }
         } catch (error) {
@@ -581,11 +582,11 @@ class HammerworkDashboard {
             </div>
             <div class="form-group">
                 <label>Status</label>
-                <div><span class="status-badge status-${job.status}">${job.status}</span></div>
+                <div><span class="status-badge status-${String(job.status).toLowerCase()}">${job.status}</span></div>
             </div>
             <div class="form-group">
                 <label>Priority</label>
-                <div><span class="priority-badge priority-${job.priority}">${job.priority}</span></div>
+                <div><span class="priority-badge priority-${String(job.priority).toLowerCase()}">${job.priority}</span></div>
             </div>
             <div class="form-group">
                 <label>Payload</label>
@@ -606,7 +607,12 @@ class HammerworkDashboard {
         // Update modal action buttons
         document.getElementById('retryJobBtn').dataset.jobId = job.id;
         document.getElementById('deleteJobBtn').dataset.jobId = job.id;
-        document.getElementById('retryJobBtn').style.display = job.status === 'failed' ? 'inline-flex' : 'none';
+        document.getElementById('retryJobBtn').style.display = this.isRetryable(job.status) ? 'inline-flex' : 'none';
+    }
+
+    // Statuses a job can be retried from
+    isRetryable(status) {
+        return ['failed', 'dead', 'timedout'].includes(String(status).toLowerCase());
     }
 
     hideModal(modal) {
@@ -657,7 +663,7 @@ class HammerworkDashboard {
 
     async retryJob(jobId) {
         try {
-            const response = await this.apiCall(`/api/jobs/${jobId}/retry`, 'POST');
+            const response = await this.apiCall(`/api/jobs/${jobId}/actions`, 'POST', { action: 'retry' });
             if (response.success) {
                 this.showSuccess('Job queued for retry');
                 this.loadJobs();
@@ -677,7 +683,7 @@ class HammerworkDashboard {
         }
         
         try {
-            const response = await this.apiCall(`/api/jobs/${jobId}`, 'DELETE');
+            const response = await this.apiCall(`/api/jobs/${jobId}/actions`, 'POST', { action: 'delete' });
             if (response.success) {
                 this.showSuccess('Job deleted successfully');
                 this.loadJobs();
@@ -761,6 +767,12 @@ class HammerworkDashboard {
 
     // Utility functions
     async apiCall(url, method = 'GET', data = null) {
+        // Accept fetch-style options as well: apiCall(url, { method, body })
+        if (method && typeof method === 'object') {
+            const init = method;
+            method = init.method || 'GET';
+            data = init.body ? JSON.parse(init.body) : null;
+        }
         const options = {
             method,
             headers: {
