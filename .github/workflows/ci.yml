@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # Native build dependencies for `--all-features`:
+  #   - rdkafka-sys (feature `kafka`) builds a vendored librdkafka with its configure/make
+  #     scripts and links zlib through libz-sys -> build-essential, zlib1g-dev, pkg-config
+  #   - openssl-sys (pulled in via the Azure / GCP / Vault clients) -> libssl-dev, pkg-config
+  #   - aws-lc-sys (AWS SDK TLS) -> cmake
+  # No crate in the graph uses prost-build/tonic-build, so protoc is not needed.
+  APT_PACKAGES: build-essential cmake pkg-config libssl-dev zlib1g-dev
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build tests
+        run: cargo test --workspace --all-features --lib --bins --no-run
+      - name: Run unit tests (no databases)
+        run: cargo test --workspace --all-features --lib --bins --no-fail-fast
+
+  # Database jobs: every test file under tests/ contains both a PostgreSQL and a MySQL module,
+  # and both compile under --all-features. PostgreSQL tests read DATABASE_URL, MySQL tests read
+  # MYSQL_DATABASE_URL, and `#[sqlx::test]` reads DATABASE_URL for either backend. Each job
+  # therefore runs one backend, split by test name: every MySQL test has "mysql" in its path
+  # (`mysql_tests::...`, `test_..._mysql`), so the postgres job runs everything with
+  # `--skip mysql` and the mysql job runs only tests matching `mysql`, with both URLs pointing
+  # at MySQL.
+  postgres:
+    name: PostgreSQL 16 integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hammerwork_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgres://postgres:password@localhost:5432/hammerwork_test
+      RUST_LOG: info
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Run migrations
+        id: migrate
+        run: cargo run -p cargo-hammerwork -- migration run --database-url "$DATABASE_URL"
+      - name: Run postgres-integration scenarios
+        run: timeout 600 cargo run -p postgres-integration
+      - name: Run tests (PostgreSQL, including ignored)
+        if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
+        run: cargo test --workspace --all-features --no-fail-fast -- --include-ignored --skip mysql
+
+  mysql:
+    name: MySQL 8 integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: hammerwork_test
+          MYSQL_ROOT_PASSWORD: password
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+        ports:
+          - 3306:3306
+    env:
+      # root is required: #[sqlx::test] creates and drops a database per test.
+      DATABASE_URL: mysql://root:password@127.0.0.1:3306/hammerwork_test
+      MYSQL_DATABASE_URL: mysql://root:password@127.0.0.1:3306/hammerwork_test
+      RUST_LOG: info
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Run migrations
+        id: migrate
+        run: cargo run -p cargo-hammerwork -- migration run --database-url "$MYSQL_DATABASE_URL"
+      - name: Run mysql-integration scenarios
+        run: timeout 600 cargo run -p mysql-integration
+      - name: Run tests (MySQL, including ignored)
+        if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
+        run: cargo test --workspace --all-features --no-fail-fast -- --include-ignored mysql
+
+  audit:
+    name: security audit (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Cargo.lock is not committed (library crate), so resolve one for the audit.
+      - run: cargo generate-lockfile
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

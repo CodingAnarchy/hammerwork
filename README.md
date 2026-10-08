@@ -1,5 +1,7 @@
 # Hammerwork
 
+[![CI](https://github.com/CodingAnarchy/hammerwork/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/CodingAnarchy/hammerwork/actions/workflows/ci.yml)
+
 A high-performance, database-driven job queue for Rust with comprehensive features for production workloads.
 
 ## Features
