@@ -125,11 +125,11 @@ async fn list_queues(pool: DatabasePool) -> Result<()> {
         SELECT 
             j.queue_name,
             COUNT(j.id) as total_jobs,
-            COUNT(CASE WHEN j.status = 'pending' THEN 1 END) as pending,
-            COUNT(CASE WHEN j.status = 'running' THEN 1 END) as running,
-            COUNT(CASE WHEN j.status = 'completed' THEN 1 END) as completed,
-            COUNT(CASE WHEN j.status = 'failed' THEN 1 END) as failed,
-            COUNT(CASE WHEN j.status = 'dead' THEN 1 END) as dead,
+            COUNT(CASE WHEN j.status = 'Pending' THEN 1 END) as pending,
+            COUNT(CASE WHEN j.status = 'Running' THEN 1 END) as running,
+            COUNT(CASE WHEN j.status = 'Completed' THEN 1 END) as completed,
+            COUNT(CASE WHEN j.status = 'Failed' THEN 1 END) as failed,
+            COUNT(CASE WHEN j.status = 'Dead' THEN 1 END) as dead,
             CASE WHEN p.queue_name IS NOT NULL THEN true ELSE false END as is_paused
         FROM hammerwork_jobs j
         LEFT JOIN hammerwork_queue_pause p ON j.queue_name = p.queue_name
@@ -375,7 +375,7 @@ async fn clear_queue(
     }
 
     let condition = if pending_only {
-        " AND status = 'pending'"
+        " AND status = 'Pending'"
     } else {
         ""
     };
@@ -530,7 +530,7 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
 
             // Long-running jobs (running > 1 hour)
             let long_running_query = format!(
-                "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} status = 'running' AND started_at < NOW() - INTERVAL '1 hour'",
+                "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} status = 'Running' AND started_at < NOW() - INTERVAL '1 hour'",
                 queue_filter,
                 if queue_filter.is_empty() {
                     "WHERE"
@@ -601,7 +601,7 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
             let recent_failures: i64 = failed_row.try_get("count")?;
 
             let long_running_query = format!(
-                "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} status = 'running' AND started_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)",
+                "SELECT COUNT(*) as count FROM hammerwork_jobs{} {} status = 'Running' AND started_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)",
                 queue_filter,
                 if queue_filter.is_empty() {
                     "WHERE"

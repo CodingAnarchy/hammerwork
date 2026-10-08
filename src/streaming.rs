@@ -137,6 +137,7 @@
 use crate::{
     HammerworkError,
     events::{EventFilter, EventManager, EventSubscription, JobLifecycleEvent},
+    task_tracker::TaskTracker,
 };
 
 #[cfg(feature = "kafka")]
@@ -740,6 +741,10 @@ pub struct StreamManager {
     stats: Arc<RwLock<HashMap<Uuid, StreamStats>>>,
     /// Configuration
     config: StreamManagerConfig,
+    /// Long-lived per-stream event listener tasks
+    listeners: TaskTracker,
+    /// In-flight batch processing tasks
+    batches: TaskTracker,
 }
 
 /// Configuration for the stream manager.
@@ -968,7 +973,45 @@ impl StreamManager {
             ))),
             stats: Arc::new(RwLock::new(HashMap::new())),
             config,
+            listeners: TaskTracker::new("stream listener"),
+            batches: TaskTracker::new("stream batch"),
         }
+    }
+
+    /// Stop the manager and wait for in-flight batches.
+    ///
+    /// Stops every stream's event listener, then waits up to `grace` for batches that
+    /// are already being processed. Batches still running after `grace` are aborted.
+    /// Finally every backend processor is shut down. Returns the number of batches
+    /// aborted.
+    ///
+    /// Events still buffered in a listener (not yet flushed) are dropped.
+    pub async fn shutdown(&self, grace: Duration) -> usize {
+        self.listeners.close();
+        self.listeners.abort_all().await;
+        let aborted = self.batches.drain(grace).await;
+
+        let processors: Vec<_> = {
+            let mut processors = self.processors.write().await;
+            processors.drain().collect()
+        };
+        for (stream_id, processor) in processors {
+            if let Err(e) = processor.shutdown().await {
+                tracing::error!("Failed to shut down processor for stream {stream_id}: {e}");
+            }
+        }
+
+        if self.config.log_operations {
+            tracing::info!("Stream manager shut down ({aborted} batches aborted)");
+        }
+        aborted
+    }
+
+    /// Number of background stream tasks (listeners or batches) that have panicked.
+    ///
+    /// Panics are also logged at error level when they happen.
+    pub fn task_panics(&self) -> u64 {
+        self.listeners.panic_count() + self.batches.panic_count()
     }
 
     /// Create a new stream manager with default configuration.
@@ -1296,7 +1339,9 @@ impl StreamManager {
         let processing_semaphore = self.processing_semaphore.clone();
         let config = self.config.clone();
 
-        tokio::spawn(async move {
+        let batches = self.batches.clone();
+
+        self.listeners.spawn("listener", async move {
             let mut event_buffer: Vec<JobLifecycleEvent> = Vec::new();
             let mut last_flush = std::time::Instant::now();
 
@@ -1342,8 +1387,8 @@ impl StreamManager {
                     let config_clone = config.clone();
                     let semaphore_clone = processing_semaphore.clone();
 
-                    // Spawn processing task
-                    tokio::spawn(async move {
+                    // Spawn a tracked processing task
+                    batches.spawn("batch", async move {
                         // Acquire processing permit inside the task
                         let Ok(_permit) = semaphore_clone.acquire().await else {
                             tracing::error!("stream processing semaphore closed");
@@ -3905,5 +3950,85 @@ mod tests {
         );
         assert_feature_error(manager.add_stream(stream).await, "google-pubsub");
         assert!(manager.list_streams().await.is_empty());
+    }
+
+    fn completed_event() -> JobLifecycleEvent {
+        JobLifecycleEvent {
+            event_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            queue_name: "shutdown_queue".to_string(),
+            event_type: JobLifecycleEventType::Completed,
+            priority: JobPriority::Normal,
+            timestamp: Utc::now(),
+            processing_time_ms: Some(1),
+            error: None,
+            payload: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drains_batches_and_stops_processors() {
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        let stream = StreamConfig {
+            buffer_config: BufferConfig {
+                batch_size: 1,
+                ..Default::default()
+            },
+            enabled: true,
+            ..Default::default()
+        };
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(InMemoryProcessor))
+            .await
+            .unwrap();
+
+        // Let the listener task start and subscribe before the event is published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.publish_event(completed_event()).await.unwrap();
+        for _ in 0..100 {
+            let processed = manager
+                .get_stream_stats(stream_id)
+                .await
+                .is_some_and(|s| s.total_events > 0);
+            if processed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(manager.shutdown(Duration::from_secs(5)).await, 0);
+        assert_eq!(manager.listeners.len(), 0);
+        assert!(manager.processors.read().await.is_empty());
+        let stats = manager.get_stream_stats(stream_id).await.unwrap();
+        assert_eq!(stats.total_events, 1);
+        assert_eq!(manager.task_panics(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_aborts_batches_after_grace_period() {
+        let manager = StreamManager::new_default(Arc::new(EventManager::new_default()));
+        manager.batches.spawn("batch", async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        assert_eq!(manager.shutdown(Duration::from_millis(50)).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_panicking_background_task_is_observed() {
+        let manager = StreamManager::new_default(Arc::new(EventManager::new_default()));
+        manager.batches.spawn("batch", async {
+            panic!("expected test panic in a batch task");
+        });
+        manager.listeners.spawn("listener", async {
+            panic!("expected test panic in a listener task");
+        });
+
+        // Let the listener task start and subscribe before the event is published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(manager.task_panics(), 2);
     }
 }

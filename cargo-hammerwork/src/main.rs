@@ -231,3 +231,54 @@ async fn execute_command(command: &Commands, config: &mut Config) -> Result<()> 
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// clap's own consistency check: panics on duplicate short/long flags (including
+    /// clashes with the global `--verbose`/`--quiet`), which otherwise only show up
+    /// at runtime in debug builds when the offending subcommand is parsed.
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn short_q_is_quiet_and_queue_uses_capital_q() {
+        let cli = Cli::try_parse_from(["cargo-hammerwork", "-q", "config", "show"]).unwrap();
+        assert!(cli.quiet);
+
+        for args in [
+            &["spawn", "stats", "-Q", "emails"][..],
+            &["spawn", "pending", "-Q", "emails"][..],
+            &["archive", "list", "-Q", "emails"][..],
+            &["job", "purge", "-Q", "emails", "--completed"][..],
+        ] {
+            let mut argv = vec!["cargo-hammerwork"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?} should parse: {e}"));
+        }
+
+        // Long flags are unchanged and still combine with the global quiet flag.
+        let cli = Cli::try_parse_from(["cargo-hammerwork", "spawn", "stats", "--queue", "e", "-q"])
+            .unwrap();
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn global_flags_parse_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "cargo-hammerwork",
+            "spawn",
+            "stats",
+            "--queue",
+            "emails",
+            "-v",
+        ])
+        .unwrap();
+        assert!(cli.verbose);
+        assert!(!cli.quiet);
+    }
+}

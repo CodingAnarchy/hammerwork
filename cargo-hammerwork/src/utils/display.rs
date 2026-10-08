@@ -145,7 +145,7 @@ impl JobTable {
         created_at: &str,
         scheduled_at: &str,
     ) {
-        let status_colored = match status {
+        let status_colored = match status.to_lowercase().as_str() {
             "pending" => format!("🟡 {}", status),
             "running" => format!("🔵 {}", status),
             "completed" => format!("🟢 {}", status),
@@ -217,7 +217,7 @@ impl StatsTable {
     }
 
     pub fn add_stats_row(&mut self, status: &str, priority: &str, count: i64) {
-        let status_icon = match status {
+        let status_icon = match status.to_lowercase().as_str() {
             "pending" => "🟡",
             "running" => "🔵",
             "completed" => "🟢",

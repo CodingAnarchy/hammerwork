@@ -12,7 +12,7 @@ pub enum ArchiveCommand {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
         #[arg(
-            short = 'q',
+            short = 'Q',
             long,
             help = "Queue name to archive (all queues if not specified)"
         )]
@@ -73,7 +73,7 @@ pub enum ArchiveCommand {
     List {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'q', long, help = "Filter by queue name")]
+        #[arg(short = 'Q', long, help = "Filter by queue name")]
         queue_name: Option<String>,
         #[arg(
             short = 'l',
@@ -96,7 +96,7 @@ pub enum ArchiveCommand {
     Stats {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'q', long, help = "Filter by queue name")]
+        #[arg(short = 'Q', long, help = "Filter by queue name")]
         queue_name: Option<String>,
         #[arg(long, help = "Output format (table, json)")]
         format: Option<String>,
@@ -116,7 +116,7 @@ pub enum ArchiveCommand {
     SetPolicy {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'q', long, help = "Queue name")]
+        #[arg(short = 'Q', long, help = "Queue name")]
         queue_name: String,
         #[arg(long, help = "Days to keep completed jobs before archiving")]
         completed_after_days: Option<u32>,
@@ -137,7 +137,7 @@ pub enum ArchiveCommand {
     GetPolicy {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'q', long, help = "Queue name")]
+        #[arg(short = 'Q', long, help = "Queue name")]
         queue_name: String,
         #[arg(long, help = "Output format (table, json)")]
         format: Option<String>,
@@ -146,7 +146,7 @@ pub enum ArchiveCommand {
     RemovePolicy {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'q', long, help = "Queue name")]
+        #[arg(short = 'Q', long, help = "Queue name")]
         queue_name: String,
         #[arg(long, help = "Confirm the removal")]
         confirm: bool,

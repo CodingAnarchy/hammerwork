@@ -1,6 +1,7 @@
 pub mod database;
 pub mod db_helpers;
 pub mod display;
+pub mod job_ops;
 pub mod validation;
 
 pub use database::*;

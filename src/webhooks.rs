@@ -95,6 +95,7 @@
 //! ```
 
 use crate::events::{EventFilter, EventManager, EventSubscription, JobLifecycleEvent};
+use crate::task_tracker::TaskTracker;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -430,6 +431,10 @@ pub struct WebhookManager {
     stats: Arc<RwLock<HashMap<Uuid, WebhookStats>>>,
     /// Configuration
     config: WebhookManagerConfig,
+    /// Long-lived per-webhook event listener tasks
+    listeners: TaskTracker,
+    /// In-flight delivery tasks (including their retries)
+    deliveries: TaskTracker,
 }
 
 /// Configuration for the webhook manager
@@ -528,7 +533,35 @@ impl WebhookManager {
             delivery_semaphore: Arc::new(Semaphore::new(permits)),
             stats: Arc::new(RwLock::new(HashMap::new())),
             config,
+            listeners: TaskTracker::new("webhook listener"),
+            deliveries: TaskTracker::new("webhook delivery"),
         })
+    }
+
+    /// Stop the manager and wait for in-flight deliveries.
+    ///
+    /// Stops every webhook's event listener (no new events are picked up), then waits
+    /// up to `grace` for deliveries that are already running, including their retries.
+    /// Deliveries still running after `grace` are aborted. Returns the number aborted.
+    ///
+    /// After shutdown the manager no longer starts delivery tasks; webhooks added
+    /// later are registered but never delivered.
+    pub async fn shutdown(&self, grace: Duration) -> usize {
+        self.listeners.close();
+        self.listeners.abort_all().await;
+        let aborted = self.deliveries.drain(grace).await;
+
+        if self.config.log_deliveries {
+            tracing::info!("Webhook manager shut down ({aborted} deliveries aborted)");
+        }
+        aborted
+    }
+
+    /// Number of background webhook tasks (listeners or deliveries) that have panicked.
+    ///
+    /// Panics are also logged at error level when they happen.
+    pub fn task_panics(&self) -> u64 {
+        self.listeners.panic_count() + self.deliveries.panic_count()
     }
 
     /// Create a new webhook manager with default configuration
@@ -714,7 +747,9 @@ impl WebhookManager {
         let delivery_semaphore = self.delivery_semaphore.clone();
         let config = self.config.clone();
 
-        tokio::spawn(async move {
+        let deliveries = self.deliveries.clone();
+
+        self.listeners.spawn("listener", async move {
             loop {
                 // Get webhook configuration
                 let webhook = {
@@ -753,8 +788,8 @@ impl WebhookManager {
                             let config_clone = config.clone();
                             let semaphore_clone = delivery_semaphore.clone();
 
-                            // Spawn delivery task
-                            tokio::spawn(async move {
+                            // Spawn a tracked delivery task
+                            deliveries.spawn("delivery", async move {
                                 // Acquire delivery permit inside the task
                                 let Ok(_permit) = semaphore_clone.acquire().await else {
                                     tracing::error!("webhook delivery semaphore closed");
@@ -1781,5 +1816,137 @@ mod tests {
             assert!(truncated.len() <= max + "... [truncated]".len());
         }
         assert_eq!(truncate_response_body(body.clone(), body.len()), body);
+    }
+
+    fn completed_event() -> JobLifecycleEvent {
+        JobLifecycleEvent {
+            event_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            queue_name: "shutdown_queue".to_string(),
+            event_type: crate::events::JobLifecycleEventType::Completed,
+            priority: crate::priority::JobPriority::Normal,
+            timestamp: Utc::now(),
+            processing_time_ms: Some(1),
+            error: None,
+            payload: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Minimal HTTP server that answers every request with `200 OK` after `delay`.
+    /// Returns its URL and a counter of requests received.
+    async fn slow_http_server(delay: Duration) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let received = Arc::new(AtomicUsize::new(0));
+        let counter = received.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = socket.read(&mut buf).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (url, received)
+    }
+
+    async fn wait_for(received: &std::sync::atomic::AtomicUsize, count: usize) {
+        for _ in 0..200 {
+            if received.load(std::sync::atomic::Ordering::SeqCst) >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("server did not receive {count} request(s)");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_waits_for_in_flight_delivery() {
+        let (url, received) = slow_http_server(Duration::from_millis(300)).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        let webhook = WebhookConfig::new("slow".to_string(), url);
+        let webhook_id = webhook.id;
+        manager.add_webhook(webhook).await.unwrap();
+
+        // Let the listener task start and subscribe before the event is published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.publish_event(completed_event()).await.unwrap();
+        wait_for(&received, 1).await;
+
+        // The delivery is mid-flight: shutdown must wait for it, not abandon it.
+        assert_eq!(manager.shutdown(Duration::from_secs(10)).await, 0);
+        let stats = manager.get_webhook_stats(webhook_id).await.unwrap();
+        assert_eq!(stats.successful_deliveries, 1);
+        assert_eq!(manager.task_panics(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_aborts_deliveries_after_grace_period() {
+        let (url, received) = slow_http_server(Duration::from_secs(30)).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        manager
+            .add_webhook(WebhookConfig::new("stuck".to_string(), url))
+            .await
+            .unwrap();
+
+        // Let the listener task start and subscribe before the event is published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.publish_event(completed_event()).await.unwrap();
+        wait_for(&received, 1).await;
+
+        let started = std::time::Instant::now();
+        assert_eq!(manager.shutdown(Duration::from_millis(100)).await, 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_no_deliveries_after_shutdown() {
+        let (url, received) = slow_http_server(Duration::ZERO).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        manager
+            .add_webhook(WebhookConfig::new("late".to_string(), url))
+            .await
+            .unwrap();
+
+        manager.shutdown(Duration::from_secs(1)).await;
+        events.publish_event(completed_event()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_panicking_background_task_is_observed() {
+        let manager = WebhookManager::new_default(Arc::new(EventManager::new_default()));
+        assert_eq!(manager.task_panics(), 0);
+
+        manager.deliveries.spawn("delivery", async {
+            panic!("expected test panic in a delivery task");
+        });
+        manager.listeners.spawn("listener", async {
+            panic!("expected test panic in a listener task");
+        });
+
+        // Let the listener task start and subscribe before the event is published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(manager.task_panics(), 2);
     }
 }

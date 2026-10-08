@@ -70,16 +70,16 @@ mod postgres_tests {
         let pool = PgPool::connect(&database_url).await?;
 
         // Test retry query syntax
-        let query = "UPDATE hammerwork_jobs SET status = 'pending', attempts = 0, scheduled_at = NOW() WHERE status IN ('failed', 'dead')";
-        let result = sqlx::query(query).execute(&pool).await?;
+        let query = "SELECT id FROM hammerwork_jobs WHERE status IN ('Failed', 'Dead', 'TimedOut')";
+        let result = sqlx::query(query).fetch_all(&pool).await?;
         // Should execute without error
-        let _rows_affected = result.rows_affected();
+        let _rows_affected = result.len();
 
         // Test cancel query syntax
-        let query = "DELETE FROM hammerwork_jobs WHERE status = 'pending'";
-        let result = sqlx::query(query).execute(&pool).await?;
+        let query = "SELECT id FROM hammerwork_jobs WHERE status = 'Pending'";
+        let result = sqlx::query(query).fetch_all(&pool).await?;
         // Should execute without error
-        let _rows_affected = result.rows_affected();
+        let _rows_affected = result.len();
 
         // Test job detail query
         let test_uuid = uuid::Uuid::new_v4();
@@ -119,7 +119,7 @@ mod postgres_tests {
         let count: i64 = result.try_get("count")?;
         assert!(count >= 0);
 
-        let query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'failed' AND failed_at > NOW() - INTERVAL '1 hour'";
+        let query = "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Failed' AND failed_at > NOW() - INTERVAL '1 hour'";
         let result = sqlx::query(query).fetch_one(&pool).await?;
         let count: i64 = result.try_get("count")?;
         assert!(count >= 0);
