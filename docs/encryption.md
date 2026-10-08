@@ -114,16 +114,37 @@ Hammerwork supports multiple external Key Management Services for enterprise key
 ```rust
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::External("aws://alias/hammerwork-key?region=us-east-1".to_string()));
+let engine = EncryptionEngine::new_with_pool(config, &pool).await?;
 ```
 
-Add `&endpoint=<url>` to use a different KMS endpoint (for example LocalStack). Requires the `aws-kms` feature.
+Add `&endpoint=<url>` to use a different KMS endpoint (for example LocalStack). Requires the `aws-kms` feature. The application needs `kms:GenerateDataKey` and `kms:Decrypt` on the key.
 
 ##### Google Cloud KMS
 
 ```rust
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::External("gcp://projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY".to_string()));
+let engine = EncryptionEngine::new_with_pool(config, &pool).await?;
 ```
+
+Requires the `gcp-kms` feature. The application needs `cloudkms.locations.generateRandomBytes` on the location and `cloudkms.cryptoKeyVersions.useToEncrypt` / `useToDecrypt` on the key (`roles/cloudkms.cryptoKeyEncrypterDecrypter` plus a role that allows generating random bytes).
+
+##### Envelope encryption for AWS and GCP KMS
+
+A KMS does not hand out the same key twice, so `aws://` and `gcp://` sources use envelope encryption with a key stored in the database:
+
+1. On first use, Hammerwork generates a data key with the KMS (AWS `GenerateDataKey`; GCP `GenerateRandomBytes` followed by `Encrypt`) and stores **only the KMS-encrypted key** in `hammerwork_kms_data_keys` (migration `017_add_kms_data_keys`), with the KMS key id, version and creation time. The plaintext key is never written to the database.
+2. Every later load, in any process, reads the stored blob and calls KMS `Decrypt`, so restarts and other workers get the same key.
+3. Processes that start at the same time converge on one key: version 1 is unique per key, the first insert wins, and the others read back and decrypt the stored key.
+
+Stored keys are scoped by name (`key-manager/master` for the `KeyManager` master key, `engine/<key-id>` for an `EncryptionEngine` data key), provider and KMS key id. The KMS ciphertext is bound to that name (AWS encryption context `hammerwork:key-name`, GCP additional authenticated data), so a blob cannot be reused for another purpose. Pointing a source at a different KMS key creates a new, separate key.
+
+- `KeyManager::new` handles `aws://` / `gcp://` master key sources this way automatically.
+- `EncryptionEngine` needs the database: create it with `EncryptionEngine::new_with_pool(config, &pool)`. `EncryptionEngine::new` returns `EncryptionError::InvalidConfiguration` for these sources instead of generating a key that would be lost on restart.
+
+**Rotation.** `KeyManager::rotate_kms_master_key()` and `EncryptionEngine::rotate_kms_key(&pool)` generate a new data key with the KMS, store it as the new active version and retire the previous one. Retired versions are kept and stay decryptable: the key manager decrypts keys wrapped by an older master key version (including key-encryption keys from `generate_master_key`), and the engine falls back to older versions when decrypting payloads. Other running instances keep the version they loaded until they are recreated. Rotating the KMS key itself inside AWS or GCP (automatic key rotation) needs no action: the KMS still decrypts blobs encrypted under earlier key versions.
+
+**Upgrading.** Before this change, each process asked the KMS for a fresh key on every start, so anything encrypted by an earlier process was already unrecoverable. After running migration 017, the first start generates and stores a key; from then on it is stable. Data encrypted by the old per-process keys cannot be recovered.
 
 ##### HashiCorp Vault KMS
 
@@ -169,7 +190,7 @@ Loading a key from an external source never falls back to another key. `Encrypti
 
 Previously, these cases logged an error and used a key derived from the source string (key ID, region, Vault path, vault URL). Anyone who knew the configuration could derive that key. For development without a KMS, use `KeySource::Static` with a base64-encoded key, or `KeySource::Generated`.
 
-**Note:** `aws://` sources call `GenerateDataKey` and `gcp://` sources call `GenerateRandomBytes`, so they produce a different key every time they are loaded. Data encrypted with such a key cannot be decrypted after a restart. Use a Vault or Azure Key Vault source, or an environment variable, for keys that must be stable.
+A stored KMS-wrapped key that the configured KMS key cannot decrypt is also an error; Hammerwork never replaces it with a new key.
 
 ## PII Field Protection
 

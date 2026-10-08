@@ -435,5 +435,20 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("016_versioned_encryption_keys.postgres.sql").to_string(),
             include_str!("016_versioned_encryption_keys.mysql.sql").to_string(),
         );
+
+        // Migration 017: KMS-wrapped data keys for aws:// and gcp:// key sources
+        self.register_migration(
+            Migration {
+                id: "017_add_kms_data_keys".to_string(),
+                description: "Persist KMS-wrapped data keys so AWS/GCP KMS keys survive restarts"
+                    .to_string(),
+                version: 17,
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("017_add_kms_data_keys.postgres.sql").to_string(),
+            include_str!("017_add_kms_data_keys.mysql.sql").to_string(),
+        );
     }
 }

@@ -16,6 +16,10 @@
 //!   closed: if the environment variable, KMS or vault is unavailable, or the KMS cargo
 //!   feature for an `aws://`, `gcp://`, `vault://` or `azure://` source is not enabled,
 //!   [`KeyManager::new`] returns an error. There is no fallback key.
+//! - `aws://` and `gcp://` master keys use envelope encryption: on first use the KMS
+//!   generates a data key and only its KMS-encrypted form is stored (in
+//!   `hammerwork_kms_data_keys`); later loads decrypt it with the KMS, so every process and
+//!   restart uses the same master key. Rotate it with [`KeyManager::rotate_kms_master_key`].
 //! - Key creation, access and rotation are recorded in `hammerwork_key_audit_log` when
 //!   auditing is enabled
 //!
@@ -133,6 +137,7 @@
 //! # }
 //! ```
 
+use super::envelope::{self, DbStore, KmsKeyWrapper};
 use super::{EncryptionAlgorithm, EncryptionError, KeySource, kms};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use base64::Engine;
@@ -377,6 +382,39 @@ type KeyCacheEntry = (Vec<u8>, DateTime<Utc>); // (decrypted_material, cached_at
 type KeyCache = Arc<Mutex<HashMap<String, KeyCacheEntry>>>;
 type RootKey = (Uuid, Vec<u8>); // (derived ID, key material)
 
+/// Name under which [`KeyManager`] stores its KMS-wrapped master key in
+/// `hammerwork_kms_data_keys` (for `aws://` and `gcp://` master key sources).
+const KMS_MASTER_KEY_NAME: &str = "key-manager/master";
+
+/// A data key stored in `hammerwork_kms_data_keys`, encrypted by an AWS or GCP KMS key.
+///
+/// Used by `aws://` and `gcp://` key sources (envelope encryption): only the KMS-encrypted
+/// key is stored, and it is decrypted with the KMS on load.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct KmsWrappedKey {
+    /// Row ID
+    pub id: Uuid,
+    /// What the key is for, e.g. `key-manager/master` or `engine/<key-id>`
+    pub key_name: String,
+    /// `aws` or `gcp`
+    pub kms_provider: String,
+    /// KMS key that wraps this key (AWS key id/ARN/alias, GCP CryptoKey resource name)
+    pub kms_key_id: String,
+    /// Version, starting at 1 and incremented on rotation
+    pub version: u32,
+    /// Plaintext key length in bytes
+    pub key_size: u32,
+    /// The KMS-encrypted key
+    pub wrapped_key: Vec<u8>,
+    /// Whether this is the active version (older versions are retired)
+    pub active: bool,
+    /// When this version was created
+    pub created_at: DateTime<Utc>,
+    /// When this version was retired
+    pub retired_at: Option<DateTime<Utc>>,
+}
+
 /// Generates, stores, rotates and audits encryption keys.
 ///
 /// Keys are stored in `hammerwork_encryption_keys`, encrypted with a master key; plaintext
@@ -394,6 +432,10 @@ pub struct KeyManager<DB: Database> {
     /// Key that wraps newly generated keys (the active KEK, or the root key)
     master_key: Arc<Mutex<Option<Vec<u8>>>>,
     master_key_id: Arc<Mutex<Option<Uuid>>>,
+    /// KMS that wraps the master key, for `aws://` and `gcp://` master key sources
+    kms: Option<Arc<dyn KmsKeyWrapper>>,
+    /// Earlier versions of a KMS-wrapped master key, by derived ID
+    retired_root_keys: Arc<Mutex<HashMap<Uuid, Vec<u8>>>>,
     key_cache: KeyCache,
     stats: Arc<Mutex<KeyManagerStats>>,
 }
@@ -406,6 +448,8 @@ impl<DB: Database> Clone for KeyManager<DB> {
             root_key: self.root_key.clone(),
             master_key: self.master_key.clone(),
             master_key_id: self.master_key_id.clone(),
+            kms: self.kms.clone(),
+            retired_root_keys: self.retired_root_keys.clone(),
             key_cache: self.key_cache.clone(),
             stats: self.stats.clone(),
         }
@@ -741,6 +785,31 @@ pub trait KeyManagerBackend: Database + sealed::Sealed {
     /// `rotations_performed` are left at zero.
     #[doc(hidden)]
     async fn statistics(pool: &Pool<Self>) -> Result<KeyManagerStats, EncryptionError>;
+
+    /// Insert a KMS-wrapped key unless its `(key_name, kms_provider, kms_key_id, version)`
+    /// already exists.
+    #[doc(hidden)]
+    async fn insert_kms_wrapped_key_if_absent(
+        pool: &Pool<Self>,
+        key: &KmsWrappedKey,
+    ) -> Result<(), EncryptionError>;
+
+    /// Retire the active KMS-wrapped keys in `key`'s scope and insert `key`, in one
+    /// transaction. Fails if the version already exists.
+    #[doc(hidden)]
+    async fn insert_rotated_kms_wrapped_key(
+        pool: &Pool<Self>,
+        key: &KmsWrappedKey,
+    ) -> Result<(), EncryptionError>;
+
+    /// Every version of a KMS-wrapped key, newest first.
+    #[doc(hidden)]
+    async fn load_kms_wrapped_keys(
+        pool: &Pool<Self>,
+        key_name: &str,
+        kms_provider: &str,
+        kms_key_id: &str,
+    ) -> Result<Vec<KmsWrappedKey>, EncryptionError>;
 }
 
 mod sealed {
@@ -823,12 +892,28 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
     /// # }
     /// ```
     pub async fn new(config: KeyManagerConfig, pool: Pool<DB>) -> Result<Self, EncryptionError> {
+        let kms = match envelope::parse_kms_source(&config.master_key_source)? {
+            Some(source) => Some(source.connect().await?),
+            None => None,
+        };
+        Self::with_kms(config, pool, kms).await
+    }
+
+    /// Create a key manager whose master key is wrapped by `kms` (when set) instead of
+    /// being loaded from `config.master_key_source`.
+    async fn with_kms(
+        config: KeyManagerConfig,
+        pool: Pool<DB>,
+        kms: Option<Arc<dyn KmsKeyWrapper>>,
+    ) -> Result<Self, EncryptionError> {
         let manager = Self {
             config,
             pool,
             root_key: Arc::new(Mutex::new(None)),
             master_key: Arc::new(Mutex::new(None)),
             master_key_id: Arc::new(Mutex::new(None)),
+            kms,
+            retired_root_keys: Arc::new(Mutex::new(HashMap::new())),
             key_cache: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(Mutex::new(KeyManagerStats::default())),
         };
@@ -1408,6 +1493,59 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         Ok(master_key_id)
     }
 
+    /// Rotate a KMS-wrapped master key (`aws://` and `gcp://` master key sources).
+    ///
+    /// Generates a new data key with the KMS, stores its KMS-encrypted form as the new
+    /// active version in `hammerwork_kms_data_keys` and retires the previous version.
+    /// Earlier versions stay stored, so keys they encrypted can still be decrypted. If no
+    /// key-encryption key was created with [`KeyManager::generate_master_key`], keys
+    /// generated or rotated from now on are encrypted with the new version; otherwise call
+    /// `generate_master_key` to create a key-encryption key under it.
+    ///
+    /// Other running `KeyManager` instances keep using the version they loaded until they
+    /// are recreated; keys they encrypt stay readable because no version is deleted.
+    ///
+    /// Returns the new version number. Fails with
+    /// [`EncryptionError::InvalidConfiguration`] for other master key sources.
+    pub async fn rotate_kms_master_key(&mut self) -> Result<u32, EncryptionError> {
+        let kms = self.kms.clone().ok_or_else(|| {
+            EncryptionError::InvalidConfiguration(
+                "rotate_kms_master_key needs an aws:// or gcp:// master key source".to_string(),
+            )
+        })?;
+        let (old_id, old_key) = self.root_key()?;
+        let rotated =
+            envelope::rotate(&DbStore(&self.pool), kms.as_ref(), KMS_MASTER_KEY_NAME, 32).await?;
+        let new_id = derive_master_key_id(&rotated.key);
+
+        self.retired_root_keys
+            .lock()
+            .map_err(|_| lock_error("retired root keys"))?
+            .insert(old_id, old_key);
+        *self.root_key.lock().map_err(|_| lock_error("root key"))? =
+            Some((new_id, rotated.key.clone()));
+        if self.get_master_key_id().await == Some(old_id) {
+            // No key-encryption key: the root key wraps new keys directly
+            *self
+                .master_key
+                .lock()
+                .map_err(|_| lock_error("master key"))? = Some(rotated.key);
+            self.set_master_key_id(new_id).await?;
+        }
+
+        if self.config.audit_enabled {
+            self.record_audit_event(KMS_MASTER_KEY_NAME, KeyOperation::Rotate, true, None)
+                .await?;
+        }
+        self.update_stats(|stats| stats.rotations_performed += 1);
+
+        info!(
+            "Rotated KMS-wrapped master key to version {}",
+            rotated.version
+        );
+        Ok(rotated.version)
+    }
+
     /// Check if the active version of a key is due for rotation
     pub async fn is_key_due_for_rotation(&self, key_id: &str) -> Result<bool, EncryptionError> {
         DB::is_key_due_for_rotation(&self.pool, key_id).await
@@ -1475,7 +1613,19 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
 
     /// Load the configured master key and, if one exists, the active key-encryption key.
     async fn load_master_key(&self) -> Result<(), EncryptionError> {
-        let root_key = load_master_key_material(&self.config.master_key_source).await?;
+        let root_key = match &self.kms {
+            Some(kms) => {
+                envelope::load_or_create(
+                    &DbStore(&self.pool),
+                    kms.as_ref(),
+                    KMS_MASTER_KEY_NAME,
+                    32,
+                )
+                .await?
+                .key
+            }
+            None => load_master_key_material(&self.config.master_key_source).await?,
+        };
         if root_key.len() != 32 {
             return Err(EncryptionError::KeyManagement(format!(
                 "Master key must be 32 bytes, got {}",
@@ -1488,14 +1638,13 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
 
         let (master_key_id, master_key) = match DB::load_active_master_key(&self.pool).await? {
             Some(kek) => {
-                let material = unwrap_key_material(&root_key, &kek.encrypted_key_material)
-                    .map_err(|_| {
-                        EncryptionError::KeyManagement(format!(
-                            "The configured master key cannot decrypt the active key-encryption \
-                             key {}; check master_key_source",
-                            kek.key_id
-                        ))
-                    })?;
+                let material = self.unwrap_kek(&kek).await.map_err(|e| {
+                    EncryptionError::KeyManagement(format!(
+                        "The configured master key cannot decrypt the active key-encryption \
+                         key {}; check master_key_source ({})",
+                        kek.key_id, e
+                    ))
+                })?;
                 (kek.id, material)
             }
             None => (root_key_id, root_key),
@@ -1542,11 +1691,9 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         let wrapping_key = match key.master_key_id {
             None => current_key,
             Some(id) if id == current_id => current_key,
-            Some(id) => {
-                let (root_id, root_key) = self.root_key()?;
-                if id == root_id {
-                    root_key
-                } else {
+            Some(id) => match self.root_key_by_id(id).await? {
+                Some(root_key) => root_key,
+                None => {
                     let kek = DB::load_latest_key(&self.pool, &id.to_string())
                         .await?
                         .filter(|kek| kek.purpose == KeyPurpose::KEK)
@@ -1556,11 +1703,57 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
                                 id, key.key_id
                             ))
                         })?;
-                    unwrap_key_material(&root_key, &kek.encrypted_key_material)?
+                    self.unwrap_kek(&kek).await?
                 }
-            }
+            },
         };
         unwrap_key_material(&wrapping_key, &key.encrypted_key_material)
+    }
+
+    /// Decrypt a key-encryption key with the root key that encrypted it.
+    async fn unwrap_kek(&self, kek: &EncryptionKey) -> Result<Vec<u8>, EncryptionError> {
+        let (root_id, root_key) = self.root_key()?;
+        let wrapping_key = match kek.master_key_id {
+            Some(id) if id != root_id => self.root_key_by_id(id).await?.unwrap_or(root_key),
+            _ => root_key,
+        };
+        unwrap_key_material(&wrapping_key, &kek.encrypted_key_material)
+    }
+
+    /// The configured master key (root key) with derived ID `id`: the current one or, for
+    /// a KMS-wrapped master key, an earlier (rotated) version.
+    async fn root_key_by_id(&self, id: Uuid) -> Result<Option<Vec<u8>>, EncryptionError> {
+        let (root_id, root_key) = self.root_key()?;
+        if id == root_id {
+            return Ok(Some(root_key));
+        }
+        let Some(kms) = &self.kms else {
+            return Ok(None);
+        };
+        if let Some(key) = self
+            .retired_root_keys
+            .lock()
+            .map_err(|_| lock_error("retired root keys"))?
+            .get(&id)
+        {
+            return Ok(Some(key.clone()));
+        }
+
+        // Not seen yet (rotated by another process, or before this one started): decrypt
+        // every stored version with the KMS and remember them.
+        let versions =
+            envelope::load_all(&DbStore(&self.pool), kms.as_ref(), KMS_MASTER_KEY_NAME, 32).await?;
+        let mut retired = self
+            .retired_root_keys
+            .lock()
+            .map_err(|_| lock_error("retired root keys"))?;
+        for version in versions {
+            let version_id = derive_master_key_id(&version.key);
+            if version_id != root_id {
+                retired.insert(version_id, version.key);
+            }
+        }
+        Ok(retired.get(&id).cloned())
     }
 
     fn cache_key(&self, key_id: &str, key_material: Vec<u8>) {
@@ -1786,12 +1979,16 @@ async fn load_master_key_material(source: &KeySource) -> Result<Vec<u8>, Encrypt
             Ok(random_key_material(&EncryptionAlgorithm::AES256GCM))
         }
         KeySource::External(service_config) => {
-            if service_config.starts_with("aws://") {
-                load_master_key_from_aws(service_config).await
+            if service_config.starts_with("aws://") || service_config.starts_with("gcp://") {
+                // KMS sources use envelope encryption and are loaded by KeyManager with
+                // its database (see `envelope`); there is no stateless way to load them.
+                Err(EncryptionError::KeyManagement(format!(
+                    "{} master keys are stored KMS-wrapped in the database and are loaded \
+                     by KeyManager::new",
+                    &service_config[..service_config.find("://").unwrap_or(0) + 3]
+                )))
             } else if service_config.starts_with("vault://") {
                 load_master_key_from_vault(service_config).await
-            } else if service_config.starts_with("gcp://") {
-                load_master_key_from_gcp(service_config).await
             } else if service_config.starts_with("azure://") {
                 load_master_key_from_azure(service_config).await
             } else {
@@ -1801,35 +1998,6 @@ async fn load_master_key_material(source: &KeySource) -> Result<Vec<u8>, Encrypt
                 )))
             }
         }
-    }
-}
-
-/// Load the master key from AWS KMS.
-///
-/// Format: `aws://<key-id-or-arn>?region=<region>&endpoint=<url>`. `region` defaults to
-/// `us-east-1`; `endpoint` overrides the KMS endpoint (for example LocalStack).
-///
-/// Note: this asks KMS for a new data key (`GenerateDataKey`) on every load, so the
-/// master key differs between process starts.
-async fn load_master_key_from_aws(service_config: &str) -> Result<Vec<u8>, EncryptionError> {
-    let (key_id, region, endpoint) = kms::aws_key_config(service_config)?;
-
-    info!(
-        "Loading master key from AWS KMS: key_id={}, region={}",
-        key_id, region
-    );
-
-    #[cfg(not(feature = "aws-kms"))]
-    {
-        let _ = endpoint;
-        Err(kms::kms_feature_disabled("aws://", "aws-kms"))
-    }
-
-    #[cfg(feature = "aws-kms")]
-    {
-        let key_material = kms::aws_generate_data_key(key_id, region, endpoint, 32).await?;
-        info!("Successfully loaded master key from AWS KMS");
-        Ok(key_material)
     }
 }
 
@@ -1870,32 +2038,6 @@ async fn load_master_key_from_vault(service_config: &str) -> Result<Vec<u8>, Enc
         let hash = Sha256::digest(key_str.as_bytes());
         info!("Successfully loaded and hashed master key from HashiCorp Vault");
         Ok(hash.to_vec())
-    }
-}
-
-/// Load the master key from GCP KMS.
-///
-/// Format: `gcp://projects/<project>/locations/<location>/keyRings/<ring>/cryptoKeys/<key>`.
-///
-/// Note: this asks KMS for 32 random bytes (`GenerateRandomBytes`) on every load, so the
-/// master key differs between process starts.
-async fn load_master_key_from_gcp(service_config: &str) -> Result<Vec<u8>, EncryptionError> {
-    let (key_resource, _) = kms::parse_service_config(service_config, "gcp://");
-    let location = kms::gcp_location(key_resource)?;
-
-    info!("Loading master key from GCP KMS: resource={}", key_resource);
-
-    #[cfg(not(feature = "gcp-kms"))]
-    {
-        let _ = location;
-        Err(kms::kms_feature_disabled("gcp://", "gcp-kms"))
-    }
-
-    #[cfg(feature = "gcp-kms")]
-    {
-        let key_material = kms::gcp_generate_random_bytes(location, 32).await?;
-        info!("Successfully generated master key from GCP KMS");
-        Ok(key_material)
     }
 }
 
@@ -1974,6 +2116,16 @@ macro_rules! pg_select_key {
 }
 
 #[cfg(feature = "postgres")]
+macro_rules! pg_insert_kms_key {
+    () => {
+        r#"INSERT INTO hammerwork_kms_data_keys (
+               id, key_name, kms_provider, kms_key_id, key_version, key_size, wrapped_key,
+               status, created_at, retired_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#
+    };
+}
+
+#[cfg(feature = "postgres")]
 mod postgres_backend {
     use super::*;
     use sqlx::postgres::{PgRow, Postgres};
@@ -2044,6 +2196,36 @@ mod postgres_backend {
         .execute(executor)
         .await
         .map_err(db_error("Failed to store key"))?;
+        Ok(())
+    }
+
+    async fn insert_kms_wrapped_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        key: &KmsWrappedKey,
+        if_absent: bool,
+    ) -> Result<(), EncryptionError> {
+        let sql = if if_absent {
+            concat!(
+                pg_insert_kms_key!(),
+                " ON CONFLICT (key_name, kms_provider, kms_key_id, key_version) DO NOTHING"
+            )
+        } else {
+            pg_insert_kms_key!()
+        };
+        sqlx::query(sql)
+            .bind(key.id)
+            .bind(&key.key_name)
+            .bind(&key.kms_provider)
+            .bind(&key.kms_key_id)
+            .bind(to_i32(key.version, "key version")?)
+            .bind(to_i32(key.key_size, "key size")?)
+            .bind(&key.wrapped_key)
+            .bind(if key.active { "Active" } else { "Retired" })
+            .bind(key.created_at)
+            .bind(key.retired_at)
+            .execute(executor)
+            .await
+            .map_err(db_error("Failed to store KMS data key"))?;
         Ok(())
     }
 
@@ -2343,6 +2525,80 @@ mod postgres_backend {
                 .collect()
         }
 
+        async fn insert_kms_wrapped_key_if_absent(
+            pool: &Pool<Self>,
+            key: &KmsWrappedKey,
+        ) -> Result<(), EncryptionError> {
+            insert_kms_wrapped_key(pool, key, true).await
+        }
+
+        async fn insert_rotated_kms_wrapped_key(
+            pool: &Pool<Self>,
+            key: &KmsWrappedKey,
+        ) -> Result<(), EncryptionError> {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(db_error("Failed to start transaction"))?;
+            sqlx::query(
+                r#"
+                UPDATE hammerwork_kms_data_keys
+                SET status = 'Retired', retired_at = NOW()
+                WHERE key_name = $1 AND kms_provider = $2 AND kms_key_id = $3
+                  AND status = 'Active'
+                "#,
+            )
+            .bind(&key.key_name)
+            .bind(&key.kms_provider)
+            .bind(&key.kms_key_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error("Failed to retire KMS data key"))?;
+            insert_kms_wrapped_key(&mut *tx, key, false).await?;
+            tx.commit()
+                .await
+                .map_err(db_error("Failed to commit KMS data key rotation"))
+        }
+
+        async fn load_kms_wrapped_keys(
+            pool: &Pool<Self>,
+            key_name: &str,
+            kms_provider: &str,
+            kms_key_id: &str,
+        ) -> Result<Vec<KmsWrappedKey>, EncryptionError> {
+            let rows = sqlx::query(
+                r#"
+                SELECT id, key_name, kms_provider, kms_key_id, key_version, key_size,
+                       wrapped_key, status, created_at, retired_at
+                FROM hammerwork_kms_data_keys
+                WHERE key_name = $1 AND kms_provider = $2 AND kms_key_id = $3
+                ORDER BY key_version DESC
+                "#,
+            )
+            .bind(key_name)
+            .bind(kms_provider)
+            .bind(kms_key_id)
+            .fetch_all(pool)
+            .await
+            .map_err(db_error("Failed to load KMS data keys"))?;
+            rows.iter()
+                .map(|row| {
+                    Ok(KmsWrappedKey {
+                        id: column(row, "id")?,
+                        key_name: column(row, "key_name")?,
+                        kms_provider: column(row, "kms_provider")?,
+                        kms_key_id: column(row, "kms_key_id")?,
+                        version: to_u32(column(row, "key_version")?, "key version")?,
+                        key_size: to_u32(column(row, "key_size")?, "key size")?,
+                        wrapped_key: column(row, "wrapped_key")?,
+                        active: column::<_, String>(row, "status")? == "Active",
+                        created_at: column(row, "created_at")?,
+                        retired_at: column(row, "retired_at")?,
+                    })
+                })
+                .collect()
+        }
+
         async fn statistics(pool: &Pool<Self>) -> Result<KeyManagerStats, EncryptionError> {
             let row = sqlx::query(
                 r#"
@@ -2386,6 +2642,16 @@ macro_rules! mysql_select_key {
                   retired_at, status, rotation_interval_seconds, next_rotation_at,
                   key_strength, master_key_id, last_used_at, usage_count
            FROM hammerwork_encryption_keys "#
+    };
+}
+
+#[cfg(feature = "mysql")]
+macro_rules! mysql_insert_kms_key {
+    () => {
+        r#"INSERT INTO hammerwork_kms_data_keys (
+               id, key_name, kms_provider, kms_key_id, key_version, key_size, wrapped_key,
+               status, created_at, retired_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#
     };
 }
 
@@ -2464,6 +2730,34 @@ mod mysql_backend {
         .execute(executor)
         .await
         .map_err(db_error("Failed to store key"))?;
+        Ok(())
+    }
+
+    async fn insert_kms_wrapped_key<'e, E: sqlx::MySqlExecutor<'e>>(
+        executor: E,
+        key: &KmsWrappedKey,
+        if_absent: bool,
+    ) -> Result<(), EncryptionError> {
+        let sql = if if_absent {
+            // A no-op update instead of INSERT IGNORE, which would also hide other errors
+            concat!(mysql_insert_kms_key!(), " ON DUPLICATE KEY UPDATE id = id")
+        } else {
+            mysql_insert_kms_key!()
+        };
+        sqlx::query(sql)
+            .bind(key.id.to_string())
+            .bind(&key.key_name)
+            .bind(&key.kms_provider)
+            .bind(&key.kms_key_id)
+            .bind(to_i32(key.version, "key version")?)
+            .bind(to_i32(key.key_size, "key size")?)
+            .bind(&key.wrapped_key)
+            .bind(if key.active { "Active" } else { "Retired" })
+            .bind(key.created_at)
+            .bind(key.retired_at)
+            .execute(executor)
+            .await
+            .map_err(db_error("Failed to store KMS data key"))?;
         Ok(())
     }
 
@@ -2768,6 +3062,80 @@ mod mysql_backend {
             .map_err(db_error("Failed to get scheduled rotations"))?;
             rows.iter()
                 .map(|row| Ok((column(row, "key_id")?, column(row, "next_rotation_at")?)))
+                .collect()
+        }
+
+        async fn insert_kms_wrapped_key_if_absent(
+            pool: &Pool<Self>,
+            key: &KmsWrappedKey,
+        ) -> Result<(), EncryptionError> {
+            insert_kms_wrapped_key(pool, key, true).await
+        }
+
+        async fn insert_rotated_kms_wrapped_key(
+            pool: &Pool<Self>,
+            key: &KmsWrappedKey,
+        ) -> Result<(), EncryptionError> {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(db_error("Failed to start transaction"))?;
+            sqlx::query(
+                r#"
+                UPDATE hammerwork_kms_data_keys
+                SET status = 'Retired', retired_at = NOW(6)
+                WHERE key_name = ? AND kms_provider = ? AND kms_key_id = ?
+                  AND status = 'Active'
+                "#,
+            )
+            .bind(&key.key_name)
+            .bind(&key.kms_provider)
+            .bind(&key.kms_key_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error("Failed to retire KMS data key"))?;
+            insert_kms_wrapped_key(&mut *tx, key, false).await?;
+            tx.commit()
+                .await
+                .map_err(db_error("Failed to commit KMS data key rotation"))
+        }
+
+        async fn load_kms_wrapped_keys(
+            pool: &Pool<Self>,
+            key_name: &str,
+            kms_provider: &str,
+            kms_key_id: &str,
+        ) -> Result<Vec<KmsWrappedKey>, EncryptionError> {
+            let rows = sqlx::query(
+                r#"
+                SELECT id, key_name, kms_provider, kms_key_id, key_version, key_size,
+                       wrapped_key, status, created_at, retired_at
+                FROM hammerwork_kms_data_keys
+                WHERE key_name = ? AND kms_provider = ? AND kms_key_id = ?
+                ORDER BY key_version DESC
+                "#,
+            )
+            .bind(key_name)
+            .bind(kms_provider)
+            .bind(kms_key_id)
+            .fetch_all(pool)
+            .await
+            .map_err(db_error("Failed to load KMS data keys"))?;
+            rows.iter()
+                .map(|row| {
+                    Ok(KmsWrappedKey {
+                        id: parse_uuid(&column::<_, String>(row, "id")?, "KMS data key id")?,
+                        key_name: column(row, "key_name")?,
+                        kms_provider: column(row, "kms_provider")?,
+                        kms_key_id: column(row, "kms_key_id")?,
+                        version: to_u32(column(row, "key_version")?, "key version")?,
+                        key_size: to_u32(column(row, "key_size")?, "key size")?,
+                        wrapped_key: column(row, "wrapped_key")?,
+                        active: column::<_, String>(row, "status")? == "Active",
+                        created_at: column(row, "created_at")?,
+                        retired_at: column(row, "retired_at")?,
+                    })
+                })
                 .collect()
         }
 
@@ -3619,44 +3987,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_aws_master_key_invalid_config_fails() {
-        let err = load_master_key_from_aws("aws://?region=us-east-1")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, EncryptionError::InvalidConfiguration(_)),
-            "{err}"
-        );
-    }
-
-    #[cfg(not(feature = "aws-kms"))]
-    #[tokio::test]
-    async fn test_aws_master_key_without_feature_fails() {
-        let err = load_master_key_from_aws("aws://alias/key?region=us-east-1")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, EncryptionError::InvalidConfiguration(_)),
-            "{err}"
-        );
-        assert!(err.to_string().contains("aws-kms"), "{err}");
-    }
-
-    #[cfg(feature = "aws-kms")]
-    #[tokio::test]
-    async fn test_aws_master_key_unreachable_endpoint_fails() {
-        // Port 1 on localhost refuses connections; without credentials the SDK fails
-        // even earlier. Either way the loader must return an error, not a key.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            load_master_key_from_aws(
-                "aws://alias/hammerwork-test?region=us-east-1&endpoint=http://127.0.0.1:1",
-            ),
-        )
-        .await
-        .expect("AWS KMS loader did not finish");
-        let err = result.unwrap_err();
-        assert!(matches!(err, EncryptionError::KeyManagement(_)), "{err}");
+    async fn test_kms_master_key_source_is_not_loaded_statelessly() {
+        // aws:// and gcp:// master keys are only loaded by KeyManager (envelope encryption)
+        for source in [
+            "aws://alias/key?region=us-east-1",
+            "gcp://projects/p/locations/global/keyRings/r/cryptoKeys/k",
+        ] {
+            let err = load_master_key_material(&KeySource::External(source.to_string()))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, EncryptionError::KeyManagement(_)), "{err}");
+        }
     }
 
     #[tokio::test]
@@ -3696,29 +4037,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gcp_master_key_invalid_resource_fails() {
-        let err = load_master_key_from_gcp("gcp://my-key").await.unwrap_err();
-        assert!(
-            matches!(err, EncryptionError::InvalidConfiguration(_)),
-            "{err}"
-        );
-    }
-
-    #[cfg(not(feature = "gcp-kms"))]
-    #[tokio::test]
-    async fn test_gcp_master_key_without_feature_fails() {
-        let err =
-            load_master_key_from_gcp("gcp://projects/p/locations/global/keyRings/r/cryptoKeys/k")
-                .await
-                .unwrap_err();
-        assert!(
-            matches!(err, EncryptionError::InvalidConfiguration(_)),
-            "{err}"
-        );
-        assert!(err.to_string().contains("gcp-kms"), "{err}");
-    }
-
-    #[tokio::test]
     async fn test_azure_master_key_invalid_config_fails() {
         let err = load_master_key_from_azure("azure://").await.unwrap_err();
         assert!(
@@ -3751,6 +4069,7 @@ mod tests {
         for source in [
             KeySource::External("vault://key-only?addr=http://127.0.0.1:1".to_string()),
             KeySource::External("gcp://not-a-resource".to_string()),
+            KeySource::External("aws://?region=us-east-1".to_string()),
             KeySource::External("azure://".to_string()),
             KeySource::External("unknown://key".to_string()),
             KeySource::Environment("HAMMERWORK_TEST_UNSET_MASTER_KEY_VAR".to_string()),
@@ -4346,5 +4665,159 @@ mod tests {
 
             Ok(result)
         }
+    }
+
+    // ---- KMS-wrapped master keys (#26), with a local mock KMS ----
+
+    use crate::encryption::envelope::test_support::MockKms;
+
+    /// A new client for the same mock KMS key, as another process would have.
+    fn same_kms(kms: &MockKms) -> Arc<dyn KmsKeyWrapper> {
+        Arc::new(MockKms::new(kms.kms_key_id(), [0x5a; 32]))
+    }
+
+    /// The KMS-wrapped master key survives restarts, and keys encrypted under every
+    /// rotated version (directly, or through a key-encryption key) stay readable.
+    async fn kms_master_key_roundtrip<DB: KeyManagerBackend>(pool: Pool<DB>) {
+        let kms = MockKms::unique();
+
+        // rotate_kms_master_key needs a KMS source
+        let mut static_manager = KeyManager::new(test_config(), pool.clone()).await.unwrap();
+        assert!(matches!(
+            static_manager.rotate_kms_master_key().await,
+            Err(EncryptionError::InvalidConfiguration(_))
+        ));
+
+        let mut first = KeyManager::with_kms(test_config(), pool.clone(), Some(same_kms(&kms)))
+            .await
+            .unwrap();
+        let root_v1 = first.get_master_key_id().await.unwrap();
+        first
+            .generate_key("kms-a", EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        let a = first.get_key("kms-a").await.unwrap();
+
+        // Restart: the same master key comes back from the stored KMS-wrapped blob
+        let mut second = KeyManager::with_kms(test_config(), pool.clone(), Some(same_kms(&kms)))
+            .await
+            .unwrap();
+        assert_eq!(second.get_master_key_id().await, Some(root_v1));
+        assert_eq!(second.get_key("kms-a").await.unwrap(), a);
+        let stored = DB::load_kms_wrapped_keys(&pool, KMS_MASTER_KEY_NAME, "aws", kms.kms_key_id())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].wrapped_key.windows(32).any(|w| w == a.as_slice()));
+
+        // Rotate the KMS-wrapped master key: new keys use version 2
+        assert_eq!(second.rotate_kms_master_key().await.unwrap(), 2);
+        let root_v2 = second.get_master_key_id().await.unwrap();
+        assert_ne!(root_v1, root_v2);
+        second
+            .generate_key("kms-b", EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        let b = second.get_key("kms-b").await.unwrap();
+
+        // A fresh instance loads version 2 and still decrypts keys wrapped by version 1
+        let mut third = KeyManager::with_kms(test_config(), pool.clone(), Some(same_kms(&kms)))
+            .await
+            .unwrap();
+        assert_eq!(third.get_master_key_id().await, Some(root_v2));
+        assert_eq!(third.get_key("kms-a").await.unwrap(), a);
+        assert_eq!(third.get_key("kms-b").await.unwrap(), b);
+
+        // A key-encryption key under version 2, then another rotation
+        third.generate_master_key().await.unwrap();
+        third
+            .generate_key("kms-c", EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        let c = third.get_key("kms-c").await.unwrap();
+        assert_eq!(third.rotate_kms_master_key().await.unwrap(), 3);
+
+        // The active key-encryption key is wrapped by retired version 2
+        let mut fourth = KeyManager::with_kms(test_config(), pool.clone(), Some(same_kms(&kms)))
+            .await
+            .unwrap();
+        assert_eq!(fourth.get_key("kms-a").await.unwrap(), a);
+        assert_eq!(fourth.get_key("kms-b").await.unwrap(), b);
+        assert_eq!(fourth.get_key("kms-c").await.unwrap(), c);
+
+        let stored = DB::load_kms_wrapped_keys(&pool, KMS_MASTER_KEY_NAME, "aws", kms.kms_key_id())
+            .await
+            .unwrap();
+        let versions: Vec<_> = stored.iter().map(|k| (k.version, k.active)).collect();
+        assert_eq!(versions, vec![(3, true), (2, false), (1, false)]);
+        assert!(stored[1].retired_at.is_some());
+
+        // A different KMS key cannot be used to read the stored master key
+        let wrong: Arc<dyn KmsKeyWrapper> = Arc::new(MockKms::new(kms.kms_key_id(), [0x11; 32]));
+        assert!(
+            KeyManager::with_kms(test_config(), pool.clone(), Some(wrong))
+                .await
+                .is_err()
+        );
+    }
+
+    /// Key managers starting at the same time converge on one stored master key.
+    async fn kms_concurrent_first_load<DB: KeyManagerBackend>(pool: Pool<DB>) {
+        let kms = MockKms::unique();
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = pool.clone();
+                let kms = same_kms(&kms);
+                tokio::spawn(async move {
+                    KeyManager::with_kms(test_config(), pool, Some(kms))
+                        .await
+                        .unwrap()
+                        .get_master_key_id()
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut ids = Vec::new();
+        for task in tasks {
+            ids.push(task.await.unwrap());
+        }
+        assert!(ids.windows(2).all(|w| w[0] == w[1]), "{ids:?}");
+        let stored = DB::load_kms_wrapped_keys(&pool, KMS_MASTER_KEY_NAME, "aws", kms.kms_key_id())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+    }
+
+    #[cfg(all(feature = "encryption", feature = "postgres"))]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_kms_master_key_roundtrip_postgres() {
+        let (_guard, pool) = postgres_test_pool().await;
+        kms_master_key_roundtrip(pool).await;
+    }
+
+    #[cfg(all(feature = "encryption", feature = "mysql"))]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_kms_master_key_roundtrip_mysql() {
+        let (_guard, pool) = mysql_test_pool().await;
+        kms_master_key_roundtrip(pool).await;
+    }
+
+    #[cfg(all(feature = "encryption", feature = "postgres"))]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_kms_concurrent_first_load_postgres() {
+        let (_guard, pool) = postgres_test_pool().await;
+        kms_concurrent_first_load(pool).await;
+    }
+
+    #[cfg(all(feature = "encryption", feature = "mysql"))]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_kms_concurrent_first_load_mysql() {
+        let (_guard, pool) = mysql_test_pool().await;
+        kms_concurrent_first_load(pool).await;
     }
 }

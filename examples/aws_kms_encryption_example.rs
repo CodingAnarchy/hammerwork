@@ -76,8 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             Err(e) => {
-                println!("   ⚠️  AWS KMS not available (key loading failed): {}", e);
-                println!("   This is normal in development without proper AWS credentials");
+                println!("   ⚠️  AWS KMS engine not created: {}", e);
+                println!(
+                    "   aws:// keys are generated once by the KMS and stored KMS-encrypted in \
+                     the database, so production code creates the engine with \
+                     EncryptionEngine::new_with_pool(config, &pool)"
+                );
             }
         }
     } else {
