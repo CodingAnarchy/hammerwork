@@ -136,7 +136,7 @@ where
                 ],
                 "status": "placeholder_implementation"
             }));
-            warp::reply::json(&response)
+            super::json_reply(&response)
         })
 }
 

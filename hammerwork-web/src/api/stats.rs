@@ -109,11 +109,12 @@
 //! assert_eq!(metrics.worker_utilization, 0.75);
 //! ```
 
-use super::ApiResponse;
+use super::{ApiResponse, error_reply, json_reply};
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use warp::http::StatusCode;
 use warp::{Filter, Reply};
 
 /// System overview statistics
@@ -343,12 +344,12 @@ where
                 last_updated: chrono::Utc::now(),
             };
 
-            Ok(warp::reply::json(&ApiResponse::success(overview)))
+            Ok(json_reply(&ApiResponse::success(overview)))
         }
-        Err(e) => {
-            let response = ApiResponse::<()>::error(format!("Failed to get statistics: {}", e));
-            Ok(warp::reply::json(&response))
-        }
+        Err(e) => Ok(error_reply(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get statistics: {}", e),
+        )),
     }
 }
 
@@ -370,12 +371,16 @@ where
             let mut queue_stats: Vec<QueueStats> = Vec::new();
             for stats in all_stats.iter() {
                 // Calculate oldest pending age seconds
-                let oldest_pending_age_seconds =
-                    calculate_oldest_pending_age(&queue, &stats.queue_name).await;
+                let oldest_pending_age_seconds = try_api!(
+                    calculate_oldest_pending_age(&queue, &stats.queue_name).await,
+                    "Failed to get oldest pending job age"
+                );
 
                 // Get priority distribution from priority stats
-                let priority_distribution =
-                    get_priority_distribution(&queue, &stats.queue_name).await;
+                let priority_distribution = try_api!(
+                    get_priority_distribution(&queue, &stats.queue_name).await,
+                    "Failed to get priority distribution"
+                );
 
                 queue_stats.push(QueueStats {
                     name: stats.queue_name.clone(),
@@ -393,8 +398,14 @@ where
             }
 
             // Generate realistic data based on actual statistics
-            let hourly_trends = generate_hourly_trends(&queue, &all_stats).await;
-            let error_patterns = generate_error_patterns(&queue, &all_stats).await;
+            let hourly_trends = try_api!(
+                generate_hourly_trends(&queue, &all_stats).await,
+                "Failed to compute hourly trends"
+            );
+            let error_patterns = try_api!(
+                generate_error_patterns(&queue, &all_stats).await,
+                "Failed to compute error patterns"
+            );
             let performance_metrics = calculate_performance_metrics(&all_stats);
 
             // Generate overview from the stats
@@ -408,13 +419,12 @@ where
                 performance_metrics,
             };
 
-            Ok(warp::reply::json(&ApiResponse::success(detailed)))
+            Ok(json_reply(&ApiResponse::success(detailed)))
         }
-        Err(e) => {
-            let response =
-                ApiResponse::<()>::error(format!("Failed to get detailed statistics: {}", e));
-            Ok(warp::reply::json(&response))
-        }
+        Err(e) => Ok(error_reply(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get detailed statistics: {}", e),
+        )),
     }
 }
 
@@ -438,7 +448,7 @@ where
         })
         .collect();
 
-    Ok(warp::reply::json(&ApiResponse::success(trends)))
+    Ok(json_reply(&ApiResponse::success(trends)))
 }
 
 /// Handler for system health check
@@ -449,7 +459,7 @@ where
     match queue.get_all_queue_stats().await {
         Ok(all_stats) => {
             let health = assess_system_health(&all_stats);
-            Ok(warp::reply::json(&ApiResponse::success(health)))
+            Ok(json_reply(&ApiResponse::success(health)))
         }
         Err(e) => {
             let health = SystemHealth {
@@ -468,7 +478,7 @@ where
                     timestamp: chrono::Utc::now(),
                 }],
             };
-            Ok(warp::reply::json(&ApiResponse::success(health)))
+            Ok(json_reply(&ApiResponse::success(health)))
         }
     }
 }
@@ -598,55 +608,62 @@ fn generate_overview_from_stats(stats: &[hammerwork::stats::QueueStats]) -> Syst
 }
 
 /// Calculate the oldest pending job age in seconds for a queue
-async fn calculate_oldest_pending_age<T>(queue: &Arc<T>, queue_name: &str) -> Option<u64>
+async fn calculate_oldest_pending_age<T>(
+    queue: &Arc<T>,
+    queue_name: &str,
+) -> hammerwork::Result<Option<u64>>
 where
     T: DatabaseQueue + Send + Sync,
 {
     // Get ready jobs (pending jobs) and find the oldest
-    match queue.get_ready_jobs(queue_name, 100).await {
-        Ok(jobs) => {
-            let now = chrono::Utc::now();
-            jobs.iter()
-                .filter(|job| matches!(job.status, hammerwork::job::JobStatus::Pending))
-                .map(|job| {
-                    let age = now - job.created_at;
-                    age.num_seconds() as u64
-                })
-                .max()
-        }
-        Err(_) => None,
-    }
+    let jobs = queue.get_ready_jobs(queue_name, 100).await?;
+    let now = chrono::Utc::now();
+    Ok(jobs
+        .iter()
+        .filter(|job| matches!(job.status, hammerwork::job::JobStatus::Pending))
+        .map(|job| age_seconds(now, job.created_at))
+        .max())
+}
+
+/// Age in whole seconds between `created_at` and `now`, clamped to zero when
+/// `created_at` is in the future (clock skew) instead of wrapping to ~1.8e19.
+fn age_seconds(
+    now: chrono::DateTime<chrono::Utc>,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    u64::try_from((now - created_at).num_seconds()).unwrap_or(0)
 }
 
 /// Get priority distribution from priority stats for a queue
-async fn get_priority_distribution<T>(queue: &Arc<T>, queue_name: &str) -> HashMap<String, f32>
+async fn get_priority_distribution<T>(
+    queue: &Arc<T>,
+    queue_name: &str,
+) -> hammerwork::Result<HashMap<String, f32>>
 where
     T: DatabaseQueue + Send + Sync,
 {
-    match queue.get_priority_stats(queue_name).await {
-        Ok(priority_stats) => priority_stats
-            .priority_distribution
-            .into_iter()
-            .map(|(priority, percentage)| {
-                let priority_name = match priority {
-                    hammerwork::priority::JobPriority::Background => "background",
-                    hammerwork::priority::JobPriority::Low => "low",
-                    hammerwork::priority::JobPriority::Normal => "normal",
-                    hammerwork::priority::JobPriority::High => "high",
-                    hammerwork::priority::JobPriority::Critical => "critical",
-                };
-                (priority_name.to_string(), percentage)
-            })
-            .collect(),
-        Err(_) => HashMap::new(),
-    }
+    let priority_stats = queue.get_priority_stats(queue_name).await?;
+    Ok(priority_stats
+        .priority_distribution
+        .into_iter()
+        .map(|(priority, percentage)| {
+            let priority_name = match priority {
+                hammerwork::priority::JobPriority::Background => "background",
+                hammerwork::priority::JobPriority::Low => "low",
+                hammerwork::priority::JobPriority::Normal => "normal",
+                hammerwork::priority::JobPriority::High => "high",
+                hammerwork::priority::JobPriority::Critical => "critical",
+            };
+            (priority_name.to_string(), percentage)
+        })
+        .collect())
 }
 
 /// Generate hourly trends from queue statistics
 async fn generate_hourly_trends<T>(
     queue: &Arc<T>,
     all_stats: &[hammerwork::stats::QueueStats],
-) -> Vec<HourlyTrend>
+) -> hammerwork::Result<Vec<HourlyTrend>>
 where
     T: DatabaseQueue + Send + Sync,
 {
@@ -658,42 +675,39 @@ where
         let hour_start = now - chrono::Duration::hours(23 - i);
         let hour_end = hour_start + chrono::Duration::hours(1);
 
-        let mut hour_completed = 0u64;
-        let mut hour_failed = 0u64;
         let mut hour_processing_times = Vec::new();
 
         // Get completed jobs for this specific hour across all queues
-        if let Ok(completed_jobs) = queue
+        let completed_jobs = queue
             .get_jobs_completed_in_range(None, hour_start, hour_end, Some(1000))
-            .await
-        {
-            hour_completed = completed_jobs.len() as u64;
+            .await?;
+        let hour_completed = completed_jobs.len() as u64;
 
-            // Collect processing times for completed jobs
-            for job in completed_jobs {
-                if let (Some(started_at), Some(completed_at)) = (job.started_at, job.completed_at) {
-                    let processing_time = (completed_at - started_at).num_milliseconds() as f64;
-                    hour_processing_times.push(processing_time);
-                }
+        // Collect processing times for completed jobs
+        for job in completed_jobs {
+            if let (Some(started_at), Some(completed_at)) = (job.started_at, job.completed_at) {
+                let processing_time = (completed_at - started_at).num_milliseconds() as f64;
+                hour_processing_times.push(processing_time);
             }
         }
 
         // Get failed jobs for this hour using error frequencies
         // Since we don't have a direct method for failed jobs in time range,
         // we'll estimate based on error frequencies for this hour
-        if let Ok(error_frequencies) = queue.get_error_frequencies(None, hour_start).await {
+        let error_frequencies = queue.get_error_frequencies(None, hour_start).await?;
+        let hour_failed = {
             // This gives us errors since hour_start, so we need to estimate for just this hour
             let total_errors_since_start = error_frequencies.values().sum::<u64>();
 
             // For recent hours, use a more accurate estimate
             if i < 3 {
                 // For the last 3 hours, assume more recent distribution
-                hour_failed = total_errors_since_start / ((i + 1) as u64).max(1);
+                total_errors_since_start / ((i + 1) as u64).max(1)
             } else {
                 // For older hours, use a smaller fraction
-                hour_failed = total_errors_since_start / 24; // Rough hourly average
+                total_errors_since_start / 24 // Rough hourly average
             }
-        }
+        };
 
         // Calculate throughput (jobs per second for this hour)
         let hour_throughput = (hour_completed + hour_failed) as f64 / 3600.0;
@@ -730,14 +744,14 @@ where
         });
     }
 
-    trends
+    Ok(trends)
 }
 
 /// Generate error patterns from queue statistics
 async fn generate_error_patterns<T>(
     queue: &Arc<T>,
     all_stats: &[hammerwork::stats::QueueStats],
-) -> Vec<ErrorPattern>
+) -> hammerwork::Result<Vec<ErrorPattern>>
 where
     T: DatabaseQueue + Send + Sync,
 {
@@ -745,20 +759,18 @@ where
     let total_errors = all_stats.iter().map(|s| s.dead_count).sum::<u64>();
 
     if total_errors == 0 {
-        return error_patterns;
+        return Ok(error_patterns);
     }
 
     // Collect error messages from dead jobs across all queues
     let mut error_messages = Vec::new();
     for stats in all_stats {
-        if let Ok(dead_jobs) = queue
+        let dead_jobs = queue
             .get_dead_jobs_by_queue(&stats.queue_name, Some(20), Some(0))
-            .await
-        {
-            for job in dead_jobs {
-                if let Some(error_msg) = job.error_message {
-                    error_messages.push((error_msg, job.failed_at.unwrap_or(job.created_at)));
-                }
+            .await?;
+        for job in dead_jobs {
+            if let Some(error_msg) = job.error_message {
+                error_messages.push((error_msg, job.failed_at.unwrap_or(job.created_at)));
             }
         }
     }
@@ -780,7 +792,9 @@ where
     // Convert to error patterns
     for (error_type, count) in error_counts {
         let percentage = (count as f64 / total_errors as f64) * 100.0;
-        let (sample_message, first_seen) = error_first_seen.get(&error_type).unwrap();
+        let Some((sample_message, first_seen)) = error_first_seen.get(&error_type) else {
+            continue;
+        };
 
         error_patterns.push(ErrorPattern {
             error_type: error_type.clone(),
@@ -796,7 +810,7 @@ where
     // Sort by count descending
     error_patterns.sort_by_key(|p| std::cmp::Reverse(p.count));
 
-    error_patterns
+    Ok(error_patterns)
 }
 
 /// Calculate performance metrics from queue statistics
@@ -885,6 +899,26 @@ fn extract_error_type(error_msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::test_support::{body_json, unreachable_queue};
+
+    #[tokio::test]
+    async fn test_detailed_stats_returns_500_when_database_is_down() {
+        let query: StatsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        let response = detailed_stats_handler(unreachable_queue(), query)
+            .await
+            .unwrap()
+            .into_response();
+        let (status, body) = body_json(response).await;
+        assert_eq!(status, 500);
+        assert_eq!(body["success"], false);
+    }
+
+    #[test]
+    fn test_age_seconds_clamps_future_timestamps_to_zero() {
+        let now = chrono::Utc::now();
+        assert_eq!(age_seconds(now, now + chrono::Duration::seconds(30)), 0);
+        assert_eq!(age_seconds(now, now - chrono::Duration::seconds(30)), 30);
+    }
 
     #[test]
     fn test_stats_query_deserialization() {

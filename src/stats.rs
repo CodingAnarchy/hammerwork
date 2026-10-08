@@ -166,6 +166,18 @@ impl Default for StatsConfig {
     }
 }
 
+/// `now - age`, saturating at the earliest representable time.
+///
+/// `chrono::Duration::from_std(..).unwrap()` and `DateTime - Duration` both panic
+/// for huge ages (e.g. a caller passing `Duration::MAX` as "everything"); here an
+/// age that does not fit simply means "since the beginning of time".
+fn cutoff_before(now: DateTime<Utc>, age: Duration) -> DateTime<Utc> {
+    chrono::Duration::from_std(age)
+        .ok()
+        .and_then(|age| now.checked_sub_signed(age))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
 impl InMemoryStatsCollector {
     pub fn new(config: StatsConfig) -> Self {
         Self {
@@ -178,9 +190,26 @@ impl InMemoryStatsCollector {
         Self::new(StatsConfig::default())
     }
 
+    /// Lock the event buffer for reading, recovering from a poisoned lock.
+    ///
+    /// The buffer is only ever appended to, drained or filtered, so a panic in
+    /// another thread cannot leave it in a state that is unsafe to keep using.
+    fn read_events(&self) -> std::sync::RwLockReadGuard<'_, Vec<JobEvent>> {
+        self.events
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Lock the event buffer for writing, recovering from a poisoned lock.
+    fn write_events(&self) -> std::sync::RwLockWriteGuard<'_, Vec<JobEvent>> {
+        self.events
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn filter_events_by_window(&self, window: Duration) -> Vec<JobEvent> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(window).unwrap();
-        let events = self.events.read().unwrap();
+        let cutoff = cutoff_before(Utc::now(), window);
+        let events = self.read_events();
         events
             .iter()
             .filter(|event| event.timestamp >= cutoff)
@@ -228,8 +257,8 @@ impl InMemoryStatsCollector {
             } else {
                 let sum: u64 = processing_times.iter().sum();
                 let avg = sum as f64 / processing_times.len() as f64;
-                let min = *processing_times.iter().min().unwrap();
-                let max = *processing_times.iter().max().unwrap();
+                let min = processing_times.iter().copied().min().unwrap_or(0);
+                let max = processing_times.iter().copied().max().unwrap_or(0);
                 (avg, min, max)
             };
 
@@ -308,8 +337,11 @@ impl InMemoryStatsCollector {
 
     /// Clean up events older than max_event_age_secs
     pub fn cleanup_old_events(&self) -> usize {
-        let cutoff = Utc::now() - chrono::Duration::seconds(self.config.max_event_age_secs as i64);
-        let mut events = self.events.write().unwrap();
+        let cutoff = cutoff_before(
+            Utc::now(),
+            Duration::from_secs(self.config.max_event_age_secs),
+        );
+        let mut events = self.write_events();
         let original_len = events.len();
         events.retain(|event| event.timestamp >= cutoff);
 
@@ -327,7 +359,7 @@ impl InMemoryStatsCollector {
 #[async_trait::async_trait]
 impl StatisticsCollector for InMemoryStatsCollector {
     async fn record_event(&self, event: JobEvent) -> crate::Result<()> {
-        let mut events = self.events.write().unwrap();
+        let mut events = self.write_events();
         events.push(event);
 
         // Periodic cleanup to prevent memory growth
@@ -390,8 +422,8 @@ impl StatisticsCollector for InMemoryStatsCollector {
     }
 
     async fn cleanup_old_statistics(&self, older_than: Duration) -> crate::Result<u64> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(older_than).unwrap();
-        let mut events = self.events.write().unwrap();
+        let cutoff = cutoff_before(Utc::now(), older_than);
+        let mut events = self.write_events();
         let original_len = events.len();
         events.retain(|event| event.timestamp >= cutoff);
         Ok((original_len - events.len()) as u64)
@@ -402,6 +434,73 @@ impl StatisticsCollector for InMemoryStatsCollector {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn test_cutoff_before_saturates_on_huge_age() {
+        let now = Utc::now();
+        assert_eq!(cutoff_before(now, Duration::MAX), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(
+            cutoff_before(now, Duration::from_secs(60)),
+            now - chrono::Duration::seconds(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_huge_window_does_not_panic() {
+        let collector = InMemoryStatsCollector::new_default();
+        collector
+            .record_event(create_test_job_event(
+                "q",
+                JobEventType::Completed,
+                Some(JobPriority::Normal),
+                Some(5),
+                None,
+            ))
+            .await
+            .unwrap();
+        let stats = collector
+            .get_system_statistics(Duration::MAX)
+            .await
+            .unwrap();
+        assert_eq!(stats.total_processed, 1);
+        assert_eq!(
+            collector
+                .cleanup_old_statistics(Duration::MAX)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poisoned_lock_is_recovered() {
+        let collector = std::sync::Arc::new(InMemoryStatsCollector::new_default());
+        let poisoner = collector.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.events.write().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(collector.events.is_poisoned());
+
+        // None of these may panic on the poisoned lock.
+        collector
+            .record_event(create_test_job_event(
+                "q",
+                JobEventType::Completed,
+                Some(JobPriority::Normal),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let stats = collector
+            .get_system_statistics(Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(stats.total_processed, 1);
+        assert_eq!(collector.cleanup_old_events(), 0);
+    }
 
     // Helper function for creating test JobEvents
     fn create_test_job_event(

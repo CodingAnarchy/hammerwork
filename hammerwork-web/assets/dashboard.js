@@ -795,7 +795,13 @@ class HammerworkDashboard {
             }
             
             if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                // API errors carry a JSON body: { success: false, error: "..." }
+                let detail = response.statusText;
+                try {
+                    const body = await response.json();
+                    if (body && body.error) detail = body.error;
+                } catch (_) { /* non-JSON error body */ }
+                throw new Error(`HTTP ${response.status}: ${detail}`);
             }
             
             return await response.json();

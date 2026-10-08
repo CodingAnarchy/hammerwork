@@ -280,8 +280,10 @@ impl Default for RetryPolicy {
 impl RetryPolicy {
     /// Calculate delay for a specific retry attempt
     pub fn calculate_delay(&self, attempt: u32) -> Duration {
-        let delay_secs =
-            (self.initial_delay_secs as f64) * self.backoff_multiplier.powi(attempt as i32);
+        let delay_secs = (self.initial_delay_secs as f64)
+            * self
+                .backoff_multiplier
+                .powi(attempt.min(i32::MAX as u32) as i32);
         let delay_secs = delay_secs.min(self.max_delay_secs as f64);
         Duration::from_secs(delay_secs as u64)
     }
@@ -469,23 +471,64 @@ impl From<&crate::config::WebhookGlobalSettings> for WebhookManagerConfig {
     }
 }
 
+/// Clamp a configured delivery concurrency into the range `Semaphore` accepts.
+///
+/// `0` permits would deadlock every delivery task, and more than
+/// `Semaphore::MAX_PERMITS` panics inside tokio.
+fn clamp_delivery_permits(configured: usize) -> usize {
+    let permits = configured.clamp(1, Semaphore::MAX_PERMITS);
+    if permits != configured {
+        tracing::warn!(
+            configured,
+            effective = permits,
+            "max_concurrent_deliveries is out of range, clamping"
+        );
+    }
+    permits
+}
+
 impl WebhookManager {
-    /// Create a new webhook manager
+    /// Create a new webhook manager.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the HTTP client cannot be built (for example when
+    /// `config.user_agent` is not a valid header value). Use
+    /// [`WebhookManager::try_new`] to handle that error instead.
     pub fn new(event_manager: Arc<EventManager>, config: WebhookManagerConfig) -> Self {
+        match Self::try_new(event_manager, config) {
+            Ok(manager) => manager,
+            Err(e) => panic!("Failed to create webhook manager: {e}"),
+        }
+    }
+
+    /// Create a new webhook manager, returning an error instead of panicking when
+    /// the HTTP client cannot be built (invalid `user_agent`, TLS backend failure).
+    ///
+    /// `max_concurrent_deliveries` is clamped to `1..=Semaphore::MAX_PERMITS`: `0`
+    /// would make every delivery wait forever and a huge value would panic.
+    pub fn try_new(
+        event_manager: Arc<EventManager>,
+        config: WebhookManagerConfig,
+    ) -> crate::Result<Self> {
         let http_client = Client::builder()
             .user_agent(&config.user_agent)
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|e| crate::error::HammerworkError::Webhook {
+                message: format!("Failed to create webhook HTTP client: {e}"),
+            })?;
 
-        Self {
+        let permits = clamp_delivery_permits(config.max_concurrent_deliveries);
+
+        Ok(Self {
             http_client,
             webhooks: Arc::new(RwLock::new(HashMap::new())),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             event_manager,
-            delivery_semaphore: Arc::new(Semaphore::new(config.max_concurrent_deliveries)),
+            delivery_semaphore: Arc::new(Semaphore::new(permits)),
             stats: Arc::new(RwLock::new(HashMap::new())),
             config,
-        }
+        })
     }
 
     /// Create a new webhook manager with default configuration
@@ -499,7 +542,7 @@ impl WebhookManager {
         event_manager: Arc<EventManager>,
         config: &crate::config::WebhookConfigs,
     ) -> crate::Result<Self> {
-        let manager = Self::new(event_manager, (&config.global_settings).into());
+        let manager = Self::try_new(event_manager, (&config.global_settings).into())?;
         for webhook in &config.webhooks {
             manager.add_webhook(webhook.clone()).await?;
         }
@@ -713,7 +756,10 @@ impl WebhookManager {
                             // Spawn delivery task
                             tokio::spawn(async move {
                                 // Acquire delivery permit inside the task
-                                let _permit = semaphore_clone.acquire().await.unwrap();
+                                let Ok(_permit) = semaphore_clone.acquire().await else {
+                                    tracing::error!("webhook delivery semaphore closed");
+                                    return;
+                                };
                                 Self::deliver_webhook_event(
                                     webhook_clone,
                                     event_clone,
@@ -860,7 +906,8 @@ impl WebhookManager {
         // Make request
         match timeout(timeout_duration, request.send()).await {
             Ok(Ok(response)) => {
-                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let duration_ms =
+                    u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let status_code = response.status().as_u16();
                 let success = response.status().is_success();
 
@@ -888,7 +935,8 @@ impl WebhookManager {
                 }
             }
             Ok(Err(err)) => {
-                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let duration_ms =
+                    u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
                 WebhookDelivery {
                     delivery_id,
                     webhook_id: webhook.id,
@@ -904,7 +952,8 @@ impl WebhookManager {
             }
             Err(_) => {
                 // Timeout
-                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let duration_ms =
+                    u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
                 WebhookDelivery {
                     delivery_id,
                     webhook_id: webhook.id,
@@ -1342,6 +1391,46 @@ mod tests {
 
         assert_eq!(stats.success_rate, 0.5);
         assert_eq!(stats.total_attempts, 2);
+    }
+
+    #[test]
+    fn test_clamp_delivery_permits() {
+        assert_eq!(clamp_delivery_permits(0), 1);
+        assert_eq!(clamp_delivery_permits(7), 7);
+        assert_eq!(clamp_delivery_permits(usize::MAX), Semaphore::MAX_PERMITS);
+    }
+
+    #[tokio::test]
+    async fn test_try_new_with_extreme_concurrency_does_not_panic() {
+        for value in [0, usize::MAX] {
+            let config = WebhookManagerConfig {
+                max_concurrent_deliveries: value,
+                ..Default::default()
+            };
+            let manager =
+                WebhookManager::try_new(Arc::new(EventManager::new_default()), config).unwrap();
+            let permits = manager.delivery_semaphore.available_permits();
+            assert!((1..=Semaphore::MAX_PERMITS).contains(&permits));
+        }
+    }
+
+    #[test]
+    fn test_try_new_rejects_invalid_user_agent() {
+        let config = WebhookManagerConfig {
+            user_agent: "bad\nagent".to_string(),
+            ..Default::default()
+        };
+        let result = WebhookManager::try_new(Arc::new(EventManager::new_default()), config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_retry_policy_huge_attempt_does_not_panic() {
+        let policy = RetryPolicy::default();
+        assert_eq!(
+            policy.calculate_delay(u32::MAX),
+            Duration::from_secs(policy.max_delay_secs)
+        );
     }
 
     #[tokio::test]

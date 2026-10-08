@@ -728,60 +728,57 @@ impl WorkflowCommand {
     fn postgres_row_to_job_node(&self, row: &sqlx::postgres::PgRow) -> Result<JobNode> {
         use sqlx::Row;
 
-        let id: Uuid = row.get("id");
+        let id: Uuid = row.try_get("id")?;
         // depends_on and dependents are UUID[] columns in PostgreSQL
-        let uuid_array = |column: &str| -> Vec<String> {
-            row.try_get::<Option<Vec<Uuid>>, _>(column)
-                .ok()
-                .flatten()
+        let uuid_array = |column: &str| -> Result<Vec<String>> {
+            Ok(row
+                .try_get::<Option<Vec<Uuid>>, _>(column)?
                 .unwrap_or_default()
                 .iter()
                 .map(Uuid::to_string)
-                .collect()
+                .collect())
         };
-        let depends_on = uuid_array("depends_on");
-        let dependents = uuid_array("dependents");
+        let depends_on = uuid_array("depends_on")?;
+        let dependents = uuid_array("dependents")?;
 
-        let workflow_id: Option<String> = match row.try_get::<Option<Uuid>, _>("workflow_id") {
-            Ok(Some(uuid)) => Some(uuid.to_string()),
-            Ok(None) => None,
-            Err(_) => None,
-        };
+        let workflow_id: Option<String> = row
+            .try_get::<Option<Uuid>, _>("workflow_id")?
+            .map(|uuid| uuid.to_string());
 
         Ok(JobNode {
             id: id.to_string(),
-            queue_name: row.get("queue_name"),
-            status: row.get("status"),
+            queue_name: row.try_get("queue_name")?,
+            status: row.try_get("status")?,
             dependency_status: row
-                .try_get("dependency_status")
-                .unwrap_or_else(|_| "none".to_string()),
+                .try_get::<Option<String>, _>("dependency_status")?
+                .unwrap_or_else(|| "none".to_string()),
             depends_on,
             dependents,
             workflow_id,
-            workflow_name: row.try_get("workflow_name").ok(),
+            workflow_name: row.try_get("workflow_name")?,
         })
     }
 
     fn mysql_row_to_job_node(&self, row: &sqlx::mysql::MySqlRow) -> Result<JobNode> {
         use sqlx::Row;
 
-        let id: String = row.get("id");
-        let depends_on = self.parse_json_array(row.try_get("depends_on").ok())?;
-        let dependents = self.parse_json_array(row.try_get("dependents").ok())?;
+        let id: String = row.try_get("id")?;
+        let depends_on = self.parse_json_array(row.try_get("depends_on")?)?;
+        let dependents = self.parse_json_array(row.try_get("dependents")?)?;
 
-        let workflow_id: Option<String> = row.try_get("workflow_id").ok();
+        let workflow_id: Option<String> = row.try_get("workflow_id")?;
 
         Ok(JobNode {
             id,
-            queue_name: row.get("queue_name"),
-            status: row.get("status"),
+            queue_name: row.try_get("queue_name")?,
+            status: row.try_get("status")?,
             dependency_status: row
-                .try_get("dependency_status")
-                .unwrap_or_else(|_| "none".to_string()),
+                .try_get::<Option<String>, _>("dependency_status")?
+                .unwrap_or_else(|| "none".to_string()),
             depends_on,
             dependents,
             workflow_id,
-            workflow_name: row.try_get("workflow_name").ok(),
+            workflow_name: row.try_get("workflow_name")?,
         })
     }
 

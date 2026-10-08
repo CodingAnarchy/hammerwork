@@ -343,26 +343,102 @@ async fn check_job_exists(pool: &DatabasePool, id: &str) -> Result<bool> {
     }
 }
 
+/// Fields of a backed-up job, validated and converted for insertion.
+#[derive(Debug)]
+struct BackupJobFields<'a> {
+    id: &'a str,
+    queue_name: &'a str,
+    payload: &'a Value,
+    status: &'a str,
+    priority: &'a str,
+    attempts: i32,
+    max_attempts: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+    scheduled_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Read an optional string field; a present but non-string value is an error.
+fn backup_str<'a>(job: &'a Value, field: &str, default: &'a str) -> Result<&'a str> {
+    match job.get(field) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::String(s)) => Ok(s),
+        Some(other) => Err(anyhow::anyhow!(
+            "backup field '{}' must be a string, got {}",
+            field,
+            other
+        )),
+    }
+}
+
+/// Read an optional i32 field; a present but non-integer or out-of-range value is an error.
+fn backup_i32(job: &Value, field: &str, default: i32) -> Result<i32> {
+    match job.get(field) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "backup field '{}' must be a 32-bit integer, got {}",
+                    field,
+                    value
+                )
+            }),
+    }
+}
+
+/// Read an optional RFC 3339 timestamp. A missing field falls back to now;
+/// a present but unparseable one is an error rather than silently becoming now.
+fn backup_timestamp(job: &Value, field: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    match job.get(field) {
+        None | Some(Value::Null) => Ok(chrono::Utc::now()),
+        Some(Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                anyhow::anyhow!("backup field '{}' is not RFC 3339 ({}): {}", field, s, e)
+            }),
+        Some(other) => Err(anyhow::anyhow!(
+            "backup field '{}' must be a timestamp string, got {}",
+            field,
+            other
+        )),
+    }
+}
+
+fn parse_backup_job(job: &Value) -> Result<BackupJobFields<'_>> {
+    let id = backup_str(job, "id", "")?;
+    if id.is_empty() {
+        anyhow::bail!("backup job is missing required field 'id'");
+    }
+    let queue_name = backup_str(job, "queue_name", "")?;
+    if queue_name.is_empty() {
+        anyhow::bail!("backup job {} is missing required field 'queue_name'", id);
+    }
+    Ok(BackupJobFields {
+        id,
+        queue_name,
+        payload: &job["payload"],
+        status: backup_str(job, "status", "Pending")?,
+        priority: backup_str(job, "priority", "normal")?,
+        attempts: backup_i32(job, "attempts", 0)?,
+        max_attempts: backup_i32(job, "max_attempts", 3)?,
+        created_at: backup_timestamp(job, "created_at")?,
+        scheduled_at: backup_timestamp(job, "scheduled_at")?,
+    })
+}
+
 async fn insert_job_from_backup(pool: &DatabasePool, job: &Value) -> Result<()> {
-    let id = job["id"].as_str().unwrap_or("");
-    let queue_name = job["queue_name"].as_str().unwrap_or("");
-    let payload = &job["payload"];
-    let status = job["status"].as_str().unwrap_or("Pending");
-    let priority = job["priority"].as_str().unwrap_or("normal");
-    let attempts = job["attempts"].as_i64().unwrap_or(0) as i32;
-    let max_attempts = job["max_attempts"].as_i64().unwrap_or(3) as i32;
-
-    let created_at = job["created_at"]
-        .as_str()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(chrono::Utc::now);
-
-    let scheduled_at = job["scheduled_at"]
-        .as_str()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(chrono::Utc::now);
+    let BackupJobFields {
+        id,
+        queue_name,
+        payload,
+        status,
+        priority,
+        attempts,
+        max_attempts,
+        created_at,
+        scheduled_at,
+    } = parse_backup_job(job)?;
 
     match pool {
         DatabasePool::Postgres(pg_pool) => {
@@ -474,4 +550,44 @@ async fn list_backups(path: Option<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_backup_job_defaults_and_values() {
+        let job = serde_json::json!({
+            "id": "abc", "queue_name": "q", "payload": {"a": 1},
+            "attempts": 2, "created_at": "2024-01-02T03:04:05Z"
+        });
+        let parsed = parse_backup_job(&job).unwrap();
+        assert_eq!(parsed.attempts, 2);
+        assert_eq!(parsed.max_attempts, 3);
+        assert_eq!(parsed.status, "Pending");
+        assert_eq!(parsed.created_at.to_rfc3339(), "2024-01-02T03:04:05+00:00");
+    }
+
+    #[test]
+    fn test_parse_backup_job_rejects_bad_timestamp() {
+        let job = serde_json::json!({"id": "abc", "queue_name": "q", "created_at": "yesterday"});
+        let err = parse_backup_job(&job).unwrap_err().to_string();
+        assert!(err.contains("created_at"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_backup_job_rejects_out_of_range_attempts() {
+        let job = serde_json::json!({"id": "abc", "queue_name": "q", "attempts": 3_000_000_000i64});
+        let err = parse_backup_job(&job).unwrap_err().to_string();
+        assert!(err.contains("attempts"), "{err}");
+        let job = serde_json::json!({"id": "abc", "queue_name": "q", "max_attempts": "many"});
+        assert!(parse_backup_job(&job).is_err());
+    }
+
+    #[test]
+    fn test_parse_backup_job_requires_id_and_queue() {
+        assert!(parse_backup_job(&serde_json::json!({"queue_name": "q"})).is_err());
+        assert!(parse_backup_job(&serde_json::json!({"id": "abc"})).is_err());
+    }
 }

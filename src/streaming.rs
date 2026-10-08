@@ -892,6 +892,44 @@ pub trait StreamProcessor {
     async fn shutdown(&self) -> crate::Result<()>;
 }
 
+/// Clamp a configured processor concurrency into the range `Semaphore` accepts.
+///
+/// `0` permits would make every processing task wait forever and more than
+/// `Semaphore::MAX_PERMITS` panics inside tokio.
+fn clamp_processor_permits(configured: usize) -> usize {
+    let permits = configured.clamp(1, Semaphore::MAX_PERMITS);
+    if permits != configured {
+        tracing::warn!(
+            configured,
+            effective = permits,
+            "max_concurrent_processors is out of range, clamping"
+        );
+    }
+    permits
+}
+
+/// First four characters of a credential for display, cut on a character
+/// boundary (byte slicing would panic inside a multibyte character).
+#[cfg_attr(not(feature = "kinesis"), allow(dead_code))]
+fn mask_prefix(value: &str) -> String {
+    value.chars().take(4).collect()
+}
+
+/// Read `health.check.timeout.ms`, defaulting to 5000 when unset but failing on
+/// a value that is set and not a number (instead of silently using the default).
+#[cfg_attr(not(feature = "kafka"), allow(dead_code))]
+fn parse_health_check_timeout_ms(config: &HashMap<String, String>) -> crate::Result<u64> {
+    match config.get("health.check.timeout.ms") {
+        None => Ok(5000),
+        Some(value) => value.trim().parse::<u64>().map_err(|e| {
+            crate::error::HammerworkError::Config(format!(
+                "invalid health.check.timeout.ms '{}': {}",
+                value, e
+            ))
+        }),
+    }
+}
+
 impl StreamManager {
     /// Create a new stream manager.
     ///
@@ -925,7 +963,9 @@ impl StreamManager {
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             event_manager,
             processors: Arc::new(RwLock::new(HashMap::new())),
-            processing_semaphore: Arc::new(Semaphore::new(config.max_concurrent_processors)),
+            processing_semaphore: Arc::new(Semaphore::new(clamp_processor_permits(
+                config.max_concurrent_processors,
+            ))),
             stats: Arc::new(RwLock::new(HashMap::new())),
             config,
         }
@@ -1305,7 +1345,10 @@ impl StreamManager {
                     // Spawn processing task
                     tokio::spawn(async move {
                         // Acquire processing permit inside the task
-                        let _permit = semaphore_clone.acquire().await.unwrap();
+                        let Ok(_permit) = semaphore_clone.acquire().await else {
+                            tracing::error!("stream processing semaphore closed");
+                            return;
+                        };
                         Self::process_event_batch(
                             stream_id,
                             stream_clone,
@@ -1744,11 +1787,7 @@ impl StreamProcessor for KafkaProcessor {
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
-        let health_check_timeout_ms = self
-            .config
-            .get("health.check.timeout.ms")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5000);
+        let health_check_timeout_ms = parse_health_check_timeout_ms(&self.config)?;
 
         // Get cluster metadata to verify connectivity
         let timeout = tokio::time::Duration::from_millis(health_check_timeout_ms);
@@ -2021,7 +2060,9 @@ impl StreamProcessor for KinesisProcessor {
                         success: true,
                         error_message: None,
                         attempted_at: Utc::now(),
-                        duration_ms: Some(delivery_start.elapsed().as_millis() as u64),
+                        duration_ms: Some(
+                            u64::try_from(delivery_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        ),
                         attempt_number: 1,
                         partition: Some(partition_key),
                     }
@@ -2037,7 +2078,9 @@ impl StreamProcessor for KinesisProcessor {
                         success: false,
                         error_message: Some(error_msg),
                         attempted_at: Utc::now(),
-                        duration_ms: Some(delivery_start.elapsed().as_millis() as u64),
+                        duration_ms: Some(
+                            u64::try_from(delivery_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        ),
                         attempt_number: 1,
                         partition: Some(partition_key),
                     }
@@ -2125,10 +2168,7 @@ impl StreamProcessor for KinesisProcessor {
         if let Some(ref access_key_id) = self.access_key_id {
             stats.insert(
                 "access_key_id".to_string(),
-                serde_json::Value::String(format!(
-                    "{}***",
-                    &access_key_id[..4.min(access_key_id.len())]
-                )),
+                serde_json::Value::String(format!("{}***", mask_prefix(access_key_id))),
             );
         }
         stats.insert(
@@ -2315,7 +2355,9 @@ impl StreamProcessor for PubSubProcessor {
                         success: true,
                         error_message: None,
                         attempted_at: Utc::now(),
-                        duration_ms: Some(delivery_start.elapsed().as_millis() as u64),
+                        duration_ms: Some(
+                            u64::try_from(delivery_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        ),
                         attempt_number: 1,
                         partition: event.partition_key,
                     }
@@ -2330,7 +2372,9 @@ impl StreamProcessor for PubSubProcessor {
                         success: false,
                         error_message: Some(error_msg),
                         attempted_at: Utc::now(),
-                        duration_ms: Some(delivery_start.elapsed().as_millis() as u64),
+                        duration_ms: Some(
+                            u64::try_from(delivery_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        ),
                         attempt_number: 1,
                         partition: event.partition_key,
                     }
@@ -2542,6 +2586,46 @@ impl StreamProcessor for InMemoryProcessor {
 mod tests {
     use super::*;
     use crate::{events::JobLifecycleEventType, priority::JobPriority};
+
+    #[test]
+    fn test_clamp_processor_permits() {
+        assert_eq!(clamp_processor_permits(0), 1);
+        assert_eq!(clamp_processor_permits(9), 9);
+        assert_eq!(clamp_processor_permits(usize::MAX), Semaphore::MAX_PERMITS);
+    }
+
+    #[test]
+    fn test_stream_manager_new_survives_extreme_concurrency() {
+        for value in [0, usize::MAX] {
+            let manager = StreamManager::new(
+                Arc::new(EventManager::new_default()),
+                StreamManagerConfig {
+                    max_concurrent_processors: value,
+                    ..Default::default()
+                },
+            );
+            let permits = manager.processing_semaphore.available_permits();
+            assert!((1..=Semaphore::MAX_PERMITS).contains(&permits));
+        }
+    }
+
+    #[test]
+    fn test_mask_prefix_is_char_boundary_safe() {
+        assert_eq!(mask_prefix("AKIAIOSFODNN7"), "AKIA");
+        assert_eq!(mask_prefix("ab"), "ab");
+        // Four-byte prefix would split the second character.
+        assert_eq!(mask_prefix("日本語キー"), "日本語キ");
+    }
+
+    #[test]
+    fn test_parse_health_check_timeout_ms() {
+        let mut config = HashMap::new();
+        assert_eq!(parse_health_check_timeout_ms(&config).unwrap(), 5000);
+        config.insert("health.check.timeout.ms".to_string(), "250".to_string());
+        assert_eq!(parse_health_check_timeout_ms(&config).unwrap(), 250);
+        config.insert("health.check.timeout.ms".to_string(), "abc".to_string());
+        assert!(parse_health_check_timeout_ms(&config).is_err());
+    }
 
     #[tokio::test]
     async fn test_stream_manager_from_config() {
