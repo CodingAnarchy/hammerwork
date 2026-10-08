@@ -43,14 +43,16 @@ jobs:
   # Builds every crate and target with the declared `rust-version` against the committed
   # Cargo.lock, which the MSRV-aware resolver (resolver = "3") keeps compatible with it.
   msrv:
-    name: MSRV (1.88)
+    name: MSRV (1.91.1)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ env.APT_PACKAGES }}
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91.1
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv

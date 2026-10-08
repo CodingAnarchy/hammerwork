@@ -16,7 +16,7 @@ repository = "https://github.com/CodingAnarchy/hammerwork"
 authors = ["CodingAnarchy <noreply@codinganarchy.com>"]
 homepage = "https://github.com/CodingAnarchy/hammerwork"
 documentation = "https://docs.rs/hammerwork"
-rust-version = "1.88"
+rust-version = "1.91.1"
 
 [workspace.dependencies]
 hammerwork = { version = "1.15.5", path = "." }
