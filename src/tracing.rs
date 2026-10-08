@@ -535,9 +535,24 @@ pub async fn init_tracing(config: TracingConfig) -> Result<()> {
 #[cfg(feature = "tracing")]
 pub async fn shutdown_tracing() {
     let provider = TRACER_PROVIDER.lock().ok().and_then(|mut slot| slot.take());
-    if let Some(provider) = provider
-        && let Err(e) = provider.shutdown()
-    {
+    let Some(provider) = provider else {
+        return;
+    };
+    // `shutdown` blocks until the batch exporter has flushed, and the OTLP exporter
+    // needs the Tokio runtime to make progress meanwhile: never block a runtime
+    // worker thread on it.
+    let result = if tokio::runtime::Handle::try_current().is_ok() {
+        match tokio::task::spawn_blocking(move || provider.shutdown()).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!("Tracer provider shutdown task failed: {}", e);
+                return;
+            }
+        }
+    } else {
+        provider.shutdown()
+    };
+    if let Err(e) = result {
         tracing::warn!("Failed to shut down tracer provider: {}", e);
     }
 }
@@ -881,5 +896,174 @@ mod tests {
 
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
+    }
+
+    /// Collects exported spans in memory.
+    #[cfg(feature = "tracing")]
+    #[derive(Debug, Clone, Default)]
+    struct MemoryExporter(
+        std::sync::Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
+    );
+
+    #[cfg(feature = "tracing")]
+    impl opentelemetry_sdk::trace::SpanExporter for MemoryExporter {
+        fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            self.0.lock().unwrap().extend(batch);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// Run `f` with a subscriber that exports OpenTelemetry spans to memory; returns
+    /// the finished spans.
+    #[cfg(feature = "tracing")]
+    fn with_otel<R>(f: impl FnOnce() -> R) -> (R, Vec<opentelemetry_sdk::trace::SpanData>) {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = MemoryExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber =
+            tracing_subscriber::registry().with(OpenTelemetryLayer::new(provider.tracer("test")));
+        let result = tracing::subscriber::with_default(subscriber, f);
+        provider.force_flush().unwrap();
+        let spans = exporter.0.lock().unwrap().clone();
+        (result, spans)
+    }
+
+    #[cfg(feature = "tracing")]
+    fn attribute(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    }
+
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn test_job_span_exports_job_attributes() {
+        use crate::{Job, JobPriority};
+        use serde_json::json;
+
+        let mut job = Job::new("span_queue".to_string(), json!({}))
+            .with_trace_id("trace-abc")
+            .with_correlation_id("order-1")
+            .with_parent_span_id("parent-2")
+            .with_priority(JobPriority::High)
+            .as_recurring();
+        job.span_context = Some("trace_id=abc".to_string());
+        job.cron_schedule = Some("0 0 * * * *".to_string());
+        let job_id = job.id.to_string();
+
+        let ((), spans) = with_otel(|| {
+            let span = create_job_span(&job, "job.run");
+            let _entered = span.enter();
+        });
+        assert_eq!(spans.len(), 1);
+        let span = &spans[0];
+        assert_eq!(span.name, "job.run", "otel.name is the operation name");
+        assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Consumer);
+        assert_eq!(attribute(span, "job.id"), Some(job_id));
+        assert_eq!(
+            attribute(span, "job.queue_name").as_deref(),
+            Some("span_queue")
+        );
+        assert_eq!(attribute(span, "job.priority").as_deref(), Some("High"));
+        assert_eq!(attribute(span, "trace.id").as_deref(), Some("trace-abc"));
+        assert_eq!(
+            attribute(span, "correlation.id").as_deref(),
+            Some("order-1")
+        );
+        assert_eq!(
+            attribute(span, "parent.span.id").as_deref(),
+            Some("parent-2")
+        );
+        assert_eq!(
+            attribute(span, "job.cron_schedule").as_deref(),
+            Some("0 0 * * * *")
+        );
+        assert_eq!(attribute(span, "job.recurring").as_deref(), Some("true"));
+        assert_eq!(
+            attribute(span, "job.scheduled_at"),
+            Some(job.scheduled_at.to_rfc3339())
+        );
+    }
+
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn test_job_span_without_trace_fields() {
+        use crate::Job;
+        use serde_json::json;
+
+        let job = Job::new("plain".to_string(), json!({}));
+        let ((), spans) = with_otel(|| {
+            let span = create_job_span(&job, "job.plain");
+            let _entered = span.enter();
+        });
+        let span = &spans[0];
+        for key in [
+            "trace.id",
+            "correlation.id",
+            "parent.span.id",
+            "job.cron_schedule",
+            "job.recurring",
+        ] {
+            assert_eq!(attribute(span, key), None, "{key} is only set when known");
+        }
+        assert_eq!(attribute(span, "job.trace_id").as_deref(), Some(""));
+    }
+
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn test_set_job_trace_context_from_active_span() {
+        use crate::Job;
+        use serde_json::json;
+
+        let (job, spans) = with_otel(|| {
+            let mut job = Job::new("ctx".to_string(), json!({}));
+            let span = tracing::info_span!("enqueue");
+            set_job_trace_context(&mut job, &span);
+            job
+        });
+        let exported = &spans[0];
+        let trace_id = exported.span_context.trace_id().to_string();
+        let span_id = exported.span_context.span_id().to_string();
+        assert_eq!(job.trace_id.as_deref(), Some(trace_id.as_str()));
+        assert_eq!(job.parent_span_id.as_deref(), Some(span_id.as_str()));
+        let context = job.span_context.expect("span context recorded");
+        assert!(context.starts_with(&format!("trace_id={trace_id};span_id={span_id};")));
+
+        // A child job span continues the stored context.
+        let child = Job::new("ctx".to_string(), json!({})).with_trace_id(trace_id.clone());
+        assert_eq!(child.trace_id.as_deref(), Some(trace_id.as_str()));
+    }
+
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn test_set_job_trace_context_without_otel_leaves_job_unchanged() {
+        use crate::Job;
+        use serde_json::json;
+
+        // No OpenTelemetry layer: the span has no valid context.
+        let mut job = Job::new("ctx".to_string(), json!({}));
+        set_job_trace_context(&mut job, &tracing::Span::none());
+        assert!(job.trace_id.is_none());
+        assert!(job.parent_span_id.is_none());
+        assert!(job.span_context.is_none());
+    }
+
+    #[test]
+    fn test_ids_convert_and_default() {
+        let trace = TraceId::from(String::from("t-1"));
+        assert_eq!(trace.clone().into_string(), "t-1");
+        assert!(TraceId::default().as_str().starts_with("trace-"));
+        let corr = CorrelationId::from(String::from("c-1"));
+        assert_eq!(corr.clone().into_string(), "c-1");
+        assert!(CorrelationId::default().as_str().starts_with("corr-"));
     }
 }
