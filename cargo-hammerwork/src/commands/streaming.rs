@@ -8,6 +8,8 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::utils::display::create_table;
 
+// Parsed once per CLI invocation, so the size of the inline `Add` variant is irrelevant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Subcommand)]
 pub enum StreamingCommand {
     #[command(about = "List all configured streams")]
@@ -274,6 +276,8 @@ async fn list_streams(config: &Config, detailed: bool) -> Result<()> {
     Ok(())
 }
 
+// Mirrors the flags of the corresponding clap subcommand one-to-one.
+#[allow(clippy::too_many_arguments)]
 async fn add_stream(
     config: &Config,
     name: String,
@@ -409,6 +413,8 @@ async fn toggle_stream(config: &Config, stream_id: String, enable: bool) -> Resu
     Ok(())
 }
 
+// Mirrors the flags of the corresponding clap subcommand one-to-one.
+#[allow(clippy::too_many_arguments)]
 async fn update_stream(
     config: &Config,
     stream_id: String,
@@ -549,6 +555,8 @@ struct BufferConfigEntry {
     batch_size: usize,
 }
 
+// Mirrors the flags of the corresponding clap subcommand one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn create_stream_config(
     name: String,
     backend: String,

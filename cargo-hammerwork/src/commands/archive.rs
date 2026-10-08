@@ -287,6 +287,8 @@ impl ArchiveCommand {
 }
 
 // Helper functions for archive operations
+// Mirrors the flags of the corresponding clap subcommand one-to-one.
+#[allow(clippy::too_many_arguments)]
 async fn archive_jobs(
     pool: DatabasePool,
     queue_name: Option<&str>,
@@ -572,6 +574,8 @@ async fn purge_archived_jobs(
 }
 
 // Policy management functions (these would need to be implemented with a separate config storage)
+// Mirrors the flags of the corresponding clap subcommand one-to-one.
+#[allow(clippy::too_many_arguments)]
 async fn set_archival_policy(
     _pool: DatabasePool,
     queue_name: &str,

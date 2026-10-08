@@ -258,6 +258,8 @@ async fn list_webhooks(config: &Config, detailed: bool) -> Result<()> {
     Ok(())
 }
 
+// Mirrors the flags of the corresponding clap subcommand one-to-one.
+#[allow(clippy::too_many_arguments)]
 async fn add_webhook(
     config: &Config,
     name: String,
@@ -391,6 +393,8 @@ async fn toggle_webhook(config: &Config, webhook_id: String, enable: bool) -> Re
     Ok(())
 }
 
+// Mirrors the flags of the corresponding clap subcommand one-to-one.
+#[allow(clippy::too_many_arguments)]
 async fn update_webhook(
     config: &Config,
     webhook_id: String,
@@ -455,6 +459,8 @@ async fn update_webhook(
 
 // Helper functions for webhook configuration
 
+// Mirrors the flags of the corresponding clap subcommand one-to-one.
+#[allow(clippy::too_many_arguments)]
 fn create_webhook_config(
     name: String,
     url: String,
