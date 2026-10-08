@@ -523,10 +523,122 @@ impl JobGroup {
     }
 }
 
+/// Job counts of a workflow, tallied from its jobs' statuses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) struct WorkflowProgress {
+    pub completed: usize,
+    pub failed: usize,
+}
+
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+impl WorkflowProgress {
+    /// Tallies `(job_status, count)` rows: `Completed` counts as completed; `Failed`,
+    /// `Dead` and `TimedOut` as failed; everything else as unfinished.
+    pub fn from_status_counts<I>(counts: I) -> Self
+    where
+        I: IntoIterator<Item = (String, i64)>,
+    {
+        let mut progress = Self::default();
+        for (status, count) in counts {
+            let count = usize::try_from(count).unwrap_or(0);
+            match status.trim_matches('"') {
+                "Completed" => progress.completed += count,
+                "Failed" | "Dead" | "TimedOut" => progress.failed += count,
+                _ => {}
+            }
+        }
+        progress
+    }
+
+    /// The workflow status these counts imply.
+    ///
+    /// - A cancelled workflow stays cancelled.
+    /// - Every job completed: `Completed`.
+    /// - Any job failed and the policy is `FailFast`, or every job finished with at
+    ///   least one failure: `Failed`.
+    /// - Otherwise `Running`. With `Manual`, the dependents of a failed job keep waiting
+    ///   for an operator to retry it, so the workflow stays `Running`.
+    pub fn status(
+        &self,
+        total_jobs: usize,
+        policy: &FailurePolicy,
+        current: &WorkflowStatus,
+    ) -> WorkflowStatus {
+        if *current == WorkflowStatus::Cancelled {
+            WorkflowStatus::Cancelled
+        } else if total_jobs > 0 && self.completed >= total_jobs {
+            WorkflowStatus::Completed
+        } else if self.failed > 0
+            && (*policy == FailurePolicy::FailFast || self.completed + self.failed >= total_jobs)
+        {
+            WorkflowStatus::Failed
+        } else {
+            WorkflowStatus::Running
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn workflow_counts(rows: &[(&str, i64)]) -> Vec<(String, i64)> {
+        rows.iter().map(|(s, n)| (s.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn test_workflow_progress_status() {
+        let running = WorkflowStatus::Running;
+        let p = WorkflowProgress::from_status_counts(workflow_counts(&[
+            ("Completed", 1),
+            ("Pending", 2),
+        ]));
+        assert_eq!(
+            p,
+            WorkflowProgress {
+                completed: 1,
+                failed: 0
+            }
+        );
+        assert_eq!(p.status(3, &FailurePolicy::FailFast, &running), running);
+
+        let done = WorkflowProgress::from_status_counts(workflow_counts(&[("Completed", 3)]));
+        assert_eq!(
+            done.status(3, &FailurePolicy::FailFast, &running),
+            WorkflowStatus::Completed
+        );
+
+        // One failure with others still waiting
+        let p =
+            WorkflowProgress::from_status_counts(workflow_counts(&[("Dead", 1), ("Pending", 2)]));
+        assert_eq!(
+            p.status(3, &FailurePolicy::FailFast, &running),
+            WorkflowStatus::Failed
+        );
+        assert_eq!(
+            p.status(3, &FailurePolicy::ContinueOnFailure, &running),
+            running
+        );
+        assert_eq!(p.status(3, &FailurePolicy::Manual, &running), running);
+
+        // Every job finished with a failure
+        let p = WorkflowProgress::from_status_counts(workflow_counts(&[
+            ("Completed", 2),
+            ("TimedOut", 1),
+        ]));
+        assert_eq!(
+            p.status(3, &FailurePolicy::ContinueOnFailure, &running),
+            WorkflowStatus::Failed
+        );
+
+        // Cancelled is sticky
+        assert_eq!(
+            done.status(3, &FailurePolicy::FailFast, &WorkflowStatus::Cancelled),
+            WorkflowStatus::Cancelled
+        );
+    }
 
     #[test]
     fn test_dependency_status_conversion() {

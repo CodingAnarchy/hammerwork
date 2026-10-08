@@ -291,6 +291,27 @@ impl TestStorage {
         }
     }
 
+    /// Check that a manual `transition` may start from the job's current status (see
+    /// [`JobTransition::allowed_from`](crate::queue::JobTransition::allowed_from)).
+    fn check_transition(
+        &self,
+        job_id: JobId,
+        transition: crate::queue::JobTransition,
+    ) -> Result<()> {
+        let status = self
+            .jobs
+            .get(&job_id)
+            .map(|job| job.status)
+            .ok_or_else(|| HammerworkError::JobNotFound {
+                id: job_id.to_string(),
+            })?;
+        if transition.is_allowed_from(status) {
+            Ok(())
+        } else {
+            Err(transition.rejected(job_id, status))
+        }
+    }
+
     /// Update a job's status
     fn update_job_status(&mut self, job_id: JobId, new_status: JobStatus) -> Result<()> {
         // Get old status first
@@ -795,6 +816,7 @@ impl DatabaseQueue for TestQueue {
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
         let mut storage = self.storage.write().await;
+        storage.check_transition(job_id, crate::queue::JobTransition::Complete)?;
 
         storage.update_job_status(job_id, JobStatus::Completed)?;
 
@@ -858,6 +880,7 @@ impl DatabaseQueue for TestQueue {
 
     async fn fail_job(&self, job_id: JobId, error_message: &str) -> Result<()> {
         let mut storage = self.storage.write().await;
+        storage.check_transition(job_id, crate::queue::JobTransition::Fail)?;
 
         // First increment attempts
         if let Some(job) = storage.jobs.get_mut(&job_id) {
@@ -928,6 +951,7 @@ impl DatabaseQueue for TestQueue {
 
     async fn retry_job(&self, job_id: JobId, retry_at: DateTime<Utc>) -> Result<()> {
         let mut storage = self.storage.write().await;
+        storage.check_transition(job_id, crate::queue::JobTransition::Retry)?;
 
         storage.update_job_status(job_id, JobStatus::Pending)?;
 
@@ -1135,6 +1159,7 @@ impl DatabaseQueue for TestQueue {
     // Dead job management
     async fn mark_job_dead(&self, job_id: JobId, error_message: &str) -> Result<()> {
         let mut storage = self.storage.write().await;
+        storage.check_transition(job_id, crate::queue::JobTransition::MarkDead)?;
 
         storage.update_job_status(job_id, JobStatus::Dead)?;
 
@@ -1149,6 +1174,7 @@ impl DatabaseQueue for TestQueue {
 
     async fn mark_job_timed_out(&self, job_id: JobId, error_message: &str) -> Result<()> {
         let mut storage = self.storage.write().await;
+        storage.check_transition(job_id, crate::queue::JobTransition::MarkTimedOut)?;
 
         storage.update_job_status(job_id, JobStatus::TimedOut)?;
 

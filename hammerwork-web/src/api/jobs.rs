@@ -500,7 +500,7 @@ where
     };
 
     match action_request.action.as_str() {
-        "retry" => match queue.retry_job(job_uuid, chrono::Utc::now()).await {
+        "retry" => match retry_job_action(queue.as_ref(), job_uuid).await {
             Ok(()) => {
                 let response = ApiResponse::success(serde_json::json!({
                     "message": format!("Job '{}' scheduled for retry", job_id)
@@ -532,6 +532,21 @@ where
     }
 }
 
+/// Re-run a job now: `Dead` jobs go through `retry_dead_job` (which also resets their
+/// attempts); other retryable statuses through `retry_job`. Statuses that cannot be
+/// retried (e.g. `Completed`) return an `InvalidJobTransition` error.
+async fn retry_job_action<T>(queue: &T, job_id: uuid::Uuid) -> hammerwork::Result<()>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    match queue.get_job(job_id).await? {
+        Some(job) if job.status == hammerwork::JobStatus::Dead => {
+            queue.retry_dead_job(job_id).await
+        }
+        _ => queue.retry_job(job_id, chrono::Utc::now()).await,
+    }
+}
+
 /// Handler for bulk job actions
 async fn bulk_job_action_handler<T>(
     queue: Arc<T>,
@@ -555,7 +570,7 @@ where
         };
 
         let result = match request.action.as_str() {
-            "retry" => queue.retry_job(job_uuid, chrono::Utc::now()).await,
+            "retry" => retry_job_action(queue.as_ref(), job_uuid).await,
             "delete" => queue.delete_job(job_uuid).await,
             _ => {
                 failed += 1;

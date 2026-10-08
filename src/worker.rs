@@ -11,7 +11,7 @@ use crate::{
     error::HammerworkError,
     job::Job,
     priority::PriorityWeights,
-    queue::{DatabaseQueue, JobQueue},
+    queue::{DatabaseQueue, JobOutcome, JobQueue, RecordedOutcome},
     rate_limit::{RateLimit, RateLimiter, ThrottleConfig},
     retry::RetryStrategy,
     stats::{JobEvent, JobEventType, StatisticsCollector},
@@ -117,6 +117,15 @@ fn retry_at_from_delay(now: DateTime<Utc>, retry_delay: Duration) -> DateTime<Ut
         .unwrap_or(chrono::Duration::MAX);
     now.checked_add_signed(delay)
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
+/// How many attempts a job gets: its own `max_attempts`, lowered by the worker's cap
+/// (`Worker::with_max_retries`) when one is set.
+fn effective_attempt_limit(job_max_attempts: i32, worker_cap: Option<i32>) -> i32 {
+    match worker_cap {
+        Some(cap) => job_max_attempts.min(cap),
+        None => job_max_attempts,
+    }
 }
 
 /// Exponential backoff after `consecutive_errors` failed loop iterations.
@@ -671,7 +680,7 @@ pub struct Worker<DB: Database> {
     /// How often to poll for new jobs
     poll_interval: Duration,
     /// Maximum number of retry attempts for failed jobs
-    max_retries: i32,
+    max_retries: Option<i32>,
     /// Delay between retry attempts
     retry_delay: Duration,
     /// Default retry strategy for failed jobs (overrides retry_delay if specified)
@@ -803,7 +812,7 @@ where
             queue_name,
             handler: JobHandlerType::Legacy(handler),
             poll_interval: Duration::from_secs(1),
-            max_retries: 3,
+            max_retries: None,
             retry_delay: Duration::from_secs(30),
             default_retry_strategy: None,
             default_timeout: None,
@@ -876,7 +885,7 @@ where
             queue_name,
             handler: JobHandlerType::WithResult(handler),
             poll_interval: Duration::from_secs(1),
-            max_retries: 3,
+            max_retries: None,
             retry_delay: Duration::from_secs(30),
             default_retry_strategy: None,
             default_timeout: None,
@@ -973,15 +982,21 @@ where
         self
     }
 
-    /// Sets the maximum number of retry attempts for failed jobs.
+    /// Caps the number of attempts this worker gives any job.
     ///
-    /// When a job handler returns an error, the job will be retried up to
-    /// this many times before being marked as dead. This overrides the
-    /// job's own max_attempts setting.
+    /// A job's own [`max_attempts`](crate::Job::with_max_attempts) is the source of
+    /// truth: a failing (or timing-out) job runs up to `max_attempts` times and then
+    /// becomes `Dead` (or `TimedOut`). This setting only lowers that limit: the
+    /// effective limit is `min(job.max_attempts, max_retries)`. By default there is no
+    /// cap.
+    ///
+    /// Previously this value replaced the job's `max_attempts` (default 3), so jobs
+    /// with `with_max_attempts(5)` stopped after 3 runs in a non-retried `Failed`
+    /// state, and `with_max_attempts(1)` still ran 3 times.
     ///
     /// # Arguments
     ///
-    /// * `max_retries` - Maximum retry attempts
+    /// * `max_retries` - Maximum number of attempts per job on this worker
     ///
     /// # Examples
     ///
@@ -1000,7 +1015,7 @@ where
     /// # }
     /// ```
     pub fn with_max_retries(mut self, max_retries: i32) -> Self {
-        self.max_retries = max_retries;
+        self.max_retries = Some(max_retries);
         self
     }
 
@@ -1830,9 +1845,77 @@ where
         }
     }
 
+    /// The number of attempts `job` gets on this worker: its own `max_attempts`,
+    /// lowered by [`with_max_retries`](Self::with_max_retries) when that is set.
+    fn attempt_limit(&self, job: &Job) -> i32 {
+        effective_attempt_limit(job.max_attempts, self.max_retries)
+    }
+
+    /// When a failed or timed-out run of `job` should be retried.
+    ///
+    /// Uses, in order: the job's own retry strategy, the worker's default strategy,
+    /// and the fixed retry delay.
+    fn retry_at_for(&self, job: &Job) -> DateTime<Utc> {
+        let next_attempt = u32::try_from(job.attempts.saturating_add(1)).unwrap_or(u32::MAX);
+        let retry_delay = if let Some(ref job_strategy) = job.retry_strategy {
+            job_strategy.calculate_delay(next_attempt)
+        } else if let Some(ref default_strategy) = self.default_retry_strategy {
+            default_strategy.calculate_delay(next_attempt)
+        } else {
+            self.retry_delay
+        };
+        retry_at_from_delay(Utc::now(), retry_delay)
+    }
+
+    /// Record the outcome of this run of `job`.
+    ///
+    /// Returns `None` when the job is no longer `Running` this run: it was reclaimed by
+    /// the stale-job reaper, changed by an operator, or is being run again by another
+    /// worker. The outcome is then discarded so this (late) worker cannot overwrite the
+    /// job's newer state, and the caller skips its hooks and events.
+    async fn record_outcome(
+        &self,
+        job: &Job,
+        outcome: JobOutcome,
+    ) -> Result<Option<RecordedOutcome>> {
+        match self.queue.finish_job_run(job, outcome).await? {
+            Some(recorded) => {
+                if let Some(next_run_at) = recorded.next_run_at {
+                    info!(
+                        "Rescheduled recurring job {} for its next run at {}",
+                        job.id, next_run_at
+                    );
+                }
+                if !recorded.unblocked.is_empty() {
+                    debug!(
+                        "Job {} completed; {} dependent job(s) are now runnable",
+                        job.id,
+                        recorded.unblocked.len()
+                    );
+                }
+                if !recorded.cancelled.is_empty() {
+                    warn!(
+                        "Job {} failed; {} dependent, workflow or batch job(s) were failed with it",
+                        job.id,
+                        recorded.cancelled.len()
+                    );
+                }
+                Ok(Some(recorded))
+            }
+            None => {
+                warn!(
+                    "Job {} is no longer running attempt {} (it was reclaimed as stale, \
+                     changed by an operator or is running again elsewhere); discarding the \
+                     outcome of this run",
+                    job.id, job.attempts
+                );
+                Ok(None)
+            }
+        }
+    }
+
     async fn process_job(&self, job: Job) -> Result<()> {
         let job_id = job.id;
-        let queue_name = job.queue_name.clone();
         let batch_id = job.batch_id;
         let start_time = Utc::now();
 
@@ -1854,7 +1937,7 @@ where
         // Record job started event
         self.record_event(JobEvent {
             job_id,
-            queue_name: queue_name.clone(),
+            queue_name: job.queue_name.clone(),
             event_type: JobEventType::Started,
             priority: job.priority,
             processing_time_ms: None,
@@ -1866,314 +1949,348 @@ where
         // Determine timeout duration (job-specific or default)
         let timeout_duration = job.timeout.or(self.default_timeout);
 
-        let handler_result = if let Some(timeout) = timeout_duration {
-            // Run with timeout
-            match tokio::time::timeout(timeout, self.execute_handler(job.clone())).await {
-                Ok(result) => result,
-                Err(_) => {
-                    // Timeout occurred
-                    warn!("Job {} timed out after {:?}", job_id, timeout);
-
-                    // Mark job as timed out in database
-                    self.queue
-                        .mark_job_timed_out(job_id, &format!("Job timed out after {:?}", timeout))
-                        .await?;
-
-                    // Record span timeout status
-                    #[cfg(feature = "tracing")]
-                    {
-                        let span = tracing::Span::current();
-                        span.record("error", true);
-                        span.record("error.type", "timeout");
-                        span.record(
-                            "error.message",
-                            format!("Job timed out after {:?}", timeout),
-                        );
-                    }
-
-                    // Fire job timeout event hook
-                    self.event_hooks.fire_job_timeout(job.clone(), timeout);
-
-                    // Record timeout event
-                    self.record_event(JobEvent {
-                        job_id,
-                        queue_name: queue_name.clone(),
-                        event_type: JobEventType::TimedOut,
-                        priority: job.priority,
-                        processing_time_ms: Some(timeout.as_millis() as u64),
-                        error_message: Some(format!("Job timed out after {:?}", timeout)),
-                        timestamp: Utc::now(),
-                    })
-                    .await;
-
-                    return Ok(());
-                }
-            }
-        } else {
-            // Run without timeout
-            self.execute_handler(job.clone()).await
+        // Ok(handler result), or Err(timeout) when the handler ran out of time.
+        let handler_result = match timeout_duration {
+            Some(timeout) => tokio::time::timeout(timeout, self.execute_handler(job.clone()))
+                .await
+                .map_err(|_| timeout),
+            None => Ok(self.execute_handler(job.clone()).await),
         };
 
+        // The job's own max_attempts decides whether a failed run is retried.
+        let attempts_left = job.attempts < self.attempt_limit(&job);
+
         match handler_result {
-            Ok(job_result) => {
-                debug!("Job {} completed successfully", job_id);
+            Ok(Ok(job_result)) => self.handle_success(&job, job_result, start_time).await,
+            Ok(Err(e)) => self.handle_failure(&job, e, attempts_left).await,
+            Err(timeout) => self.handle_timeout(&job, timeout, attempts_left).await,
+        }
+    }
 
-                let processing_time_ms = (Utc::now() - start_time).num_milliseconds() as u64;
+    async fn handle_success(
+        &self,
+        job: &Job,
+        job_result: JobResult,
+        start_time: DateTime<Utc>,
+    ) -> Result<()> {
+        let job_id = job.id;
+        debug!("Job {} completed successfully", job_id);
 
-                // Update batch statistics for successful completion
-                if self.batch_processing_enabled && batch_id.is_some() {
-                    self.update_batch_stats(|stats| {
-                        stats.jobs_completed += 1;
-                        stats.total_processing_time_ms += processing_time_ms;
-                        stats.update_average_processing_time();
-                    });
+        let processing_time_ms = (Utc::now() - start_time).num_milliseconds().max(0) as u64;
 
-                    // Check if batch is complete and update batch status
-                    if let Some(batch_id) = batch_id {
-                        if let Err(e) = self.check_and_update_batch_status(batch_id).await {
-                            warn!(
-                                "Failed to update batch status for batch {}: {}",
-                                batch_id, e
-                            );
-                        }
-                    }
-                }
+        // Completing also reschedules a recurring job, and makes dependents whose
+        // dependencies have all completed runnable, in the same transaction.
+        if self
+            .record_outcome(job, JobOutcome::Completed)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
 
-                // Handle cron job rescheduling
-                if job.is_recurring() {
-                    if let Some(next_run_time) = job.calculate_next_run() {
-                        info!(
-                            "Rescheduling recurring job {} for next run at {}",
-                            job_id, next_run_time
-                        );
-                        self.queue
-                            .reschedule_cron_job(job_id, next_run_time)
-                            .await?;
-                    } else {
-                        warn!(
-                            "Could not calculate next run time for recurring job {}",
-                            job_id
-                        );
-                        self.queue.complete_job(job_id).await?;
-                    }
-                } else {
-                    self.queue.complete_job(job_id).await?;
-                }
+        // Update batch statistics for successful completion
+        if self.batch_processing_enabled {
+            if let Some(batch_id) = job.batch_id {
+                self.update_batch_stats(|stats| {
+                    stats.jobs_completed += 1;
+                    stats.total_processing_time_ms += processing_time_ms;
+                    stats.update_average_processing_time();
+                });
 
-                // Store job result if enabled and data is provided
-                if let Some(result_data) = job_result.data {
-                    if let crate::job::ResultStorage::Database = job.result_config.storage {
-                        let expires_at = job.result_config.ttl.map(|ttl| {
-                            Utc::now()
-                                + chrono::Duration::from_std(ttl)
-                                    .unwrap_or(chrono::Duration::hours(24))
-                        });
-
-                        if let Err(e) = self
-                            .queue
-                            .store_job_result(job_id, result_data, expires_at)
-                            .await
-                        {
-                            warn!("Failed to store job result for job {}: {}", job_id, e);
-                        } else {
-                            debug!("Stored result for job {}", job_id);
-                        }
-                    }
-                }
-
-                // Handle job spawning if spawn manager is configured
-                if let Some(spawn_manager) = &self.spawn_manager {
-                    // Check if spawn config is present in job payload
-                    if let Some(spawn_config_value) = job.payload.get("_spawn_config") {
-                        if let Ok(spawn_config) = serde_json::from_value::<crate::spawn::SpawnConfig>(
-                            spawn_config_value.clone(),
-                        ) {
-                            match spawn_manager
-                                .execute_spawn(job.clone(), spawn_config, self.queue.clone())
-                                .await
-                            {
-                                Ok(Some(spawn_result)) => {
-                                    info!(
-                                        "Job {} spawned {} child jobs: {:?}",
-                                        job_id,
-                                        spawn_result.spawned_jobs.len(),
-                                        spawn_result.spawned_jobs
-                                    );
-
-                                    // Call spawn completion hook if present
-                                    if let Some(ref hook) = self.event_hooks.on_job_complete {
-                                        let hook_event = JobHookEvent {
-                                            job: job.clone(),
-                                            timestamp: Utc::now(),
-                                            duration: Some(Duration::from_millis(
-                                                processing_time_ms,
-                                            )),
-                                            error: None,
-                                        };
-                                        hook(hook_event);
-                                    }
-                                }
-                                Ok(None) => {
-                                    debug!(
-                                        "No spawn handler registered for job type: {}",
-                                        job.queue_name
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!("Failed to spawn child jobs for job {}: {}", job_id, e);
-                                }
-                            }
-                        } else {
-                            debug!("Invalid spawn config in job payload for job {}", job_id);
-                        }
-                    }
-                }
-
-                // Record span success status
-                #[cfg(feature = "tracing")]
-                {
-                    let span = tracing::Span::current();
-                    span.record("success", true);
-                    span.record("processing_time_ms", processing_time_ms);
-                }
-
-                // Fire job completion event hook
-                let processing_duration = Duration::from_millis(processing_time_ms);
-                self.event_hooks
-                    .fire_job_complete(job.clone(), processing_duration);
-
-                // Record job completed event
-                self.record_event(JobEvent {
-                    job_id,
-                    queue_name,
-                    event_type: JobEventType::Completed,
-                    priority: job.priority,
-                    processing_time_ms: Some(processing_time_ms),
-                    error_message: None,
-                    timestamp: Utc::now(),
-                })
-                .await;
-            }
-            Err(e) => {
-                error!("Job {} failed: {}", job_id, e);
-                let error_message = e.to_string();
-
-                // Record span error status
-                #[cfg(feature = "tracing")]
-                {
-                    let span = tracing::Span::current();
-                    span.record("error", true);
-                    span.record("error.type", "job_failure");
-                    span.record("error.message", &error_message);
-                    span.record("job.will_retry", job.attempts < self.max_retries);
-                }
-
-                // Update batch statistics for failed job
-                if self.batch_processing_enabled && batch_id.is_some() {
-                    self.update_batch_stats(|stats| {
-                        stats.jobs_failed += 1;
-                    });
-
-                    // Check batch failure handling mode
-                    if let Some(batch_id) = batch_id {
-                        if let Err(e) = self
-                            .handle_batch_job_failure(batch_id, job_id, &error_message)
-                            .await
-                        {
-                            warn!(
-                                "Failed to handle batch job failure for batch {}: {}",
-                                batch_id, e
-                            );
-                        }
-                    }
-                }
-
-                if job.attempts >= self.max_retries {
-                    warn!("Job {} exceeded max retries, marking as failed", job_id);
-
-                    // Check if we should mark as dead or just failed
-                    if job.has_exhausted_retries() {
-                        self.queue.mark_job_dead(job_id, &error_message).await?;
-
-                        // Fire job failure event hook
-                        self.event_hooks
-                            .fire_job_fail(job.clone(), error_message.clone());
-
-                        // Record job dead event
-                        self.record_event(JobEvent {
-                            job_id,
-                            queue_name,
-                            event_type: JobEventType::Dead,
-                            priority: job.priority,
-                            processing_time_ms: None,
-                            error_message: Some(error_message),
-                            timestamp: Utc::now(),
-                        })
-                        .await;
-                    } else {
-                        self.queue.fail_job(job_id, &error_message).await?;
-
-                        // Fire job failure event hook
-                        self.event_hooks
-                            .fire_job_fail(job.clone(), error_message.clone());
-
-                        // Record job failed event
-                        self.record_event(JobEvent {
-                            job_id,
-                            queue_name,
-                            event_type: JobEventType::Failed,
-                            priority: job.priority,
-                            processing_time_ms: None,
-                            error_message: Some(error_message),
-                            timestamp: Utc::now(),
-                        })
-                        .await;
-                    }
-                } else {
-                    // Calculate retry delay using retry strategy priority:
-                    // 1. Job-specific retry strategy (if configured)
-                    // 2. Worker default retry strategy (if configured)
-                    // 3. Fixed retry delay (legacy fallback)
-                    let retry_delay = if let Some(ref job_strategy) = job.retry_strategy {
-                        job_strategy.calculate_delay((job.attempts + 1) as u32)
-                    } else if let Some(ref default_strategy) = self.default_retry_strategy {
-                        default_strategy.calculate_delay((job.attempts + 1) as u32)
-                    } else {
-                        self.retry_delay
-                    };
-
-                    let retry_at = retry_at_from_delay(Utc::now(), retry_delay);
-                    info!(
-                        "Retrying job {} at {} (attempt {} of {})",
-                        job_id,
-                        retry_at,
-                        job.attempts + 1,
-                        self.max_retries
+                if let Err(e) = self.check_and_update_batch_status(batch_id).await {
+                    warn!(
+                        "Failed to update batch status for batch {}: {}",
+                        batch_id, e
                     );
-                    self.queue.retry_job(job_id, retry_at).await?;
-
-                    // Fire job retry event hook
-                    self.event_hooks
-                        .fire_job_retry(job.clone(), error_message.clone());
-
-                    // Record job retry event
-                    self.record_event(JobEvent {
-                        job_id,
-                        queue_name,
-                        event_type: JobEventType::Retried,
-                        priority: job.priority,
-                        processing_time_ms: None,
-                        error_message: Some(error_message),
-                        timestamp: Utc::now(),
-                    })
-                    .await;
                 }
             }
+        }
+
+        // Store job result if enabled and data is provided
+        if let Some(result_data) = job_result.data {
+            if let crate::job::ResultStorage::Database = job.result_config.storage {
+                let expires_at = job.result_config.ttl.map(|ttl| {
+                    Utc::now()
+                        + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(24))
+                });
+
+                if let Err(e) = self
+                    .queue
+                    .store_job_result(job_id, result_data, expires_at)
+                    .await
+                {
+                    warn!("Failed to store job result for job {}: {}", job_id, e);
+                } else {
+                    debug!("Stored result for job {}", job_id);
+                }
+            }
+        }
+
+        // Handle job spawning if spawn manager is configured
+        if let Some(spawn_manager) = &self.spawn_manager {
+            // Check if spawn config is present in job payload
+            if let Some(spawn_config_value) = job.payload.get("_spawn_config") {
+                if let Ok(spawn_config) =
+                    serde_json::from_value::<crate::spawn::SpawnConfig>(spawn_config_value.clone())
+                {
+                    match spawn_manager
+                        .execute_spawn(job.clone(), spawn_config, self.queue.clone())
+                        .await
+                    {
+                        Ok(Some(spawn_result)) => {
+                            info!(
+                                "Job {} spawned {} child jobs: {:?}",
+                                job_id,
+                                spawn_result.spawned_jobs.len(),
+                                spawn_result.spawned_jobs
+                            );
+
+                            // Call spawn completion hook if present
+                            if let Some(ref hook) = self.event_hooks.on_job_complete {
+                                let hook_event = JobHookEvent {
+                                    job: job.clone(),
+                                    timestamp: Utc::now(),
+                                    duration: Some(Duration::from_millis(processing_time_ms)),
+                                    error: None,
+                                };
+                                hook(hook_event);
+                            }
+                        }
+                        Ok(None) => {
+                            debug!(
+                                "No spawn handler registered for job type: {}",
+                                job.queue_name
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to spawn child jobs for job {}: {}", job_id, e);
+                        }
+                    }
+                } else {
+                    debug!("Invalid spawn config in job payload for job {}", job_id);
+                }
+            }
+        }
+
+        // Record span success status
+        #[cfg(feature = "tracing")]
+        {
+            let span = tracing::Span::current();
+            span.record("success", true);
+            span.record("processing_time_ms", processing_time_ms);
+        }
+
+        // Fire job completion event hook
+        let processing_duration = Duration::from_millis(processing_time_ms);
+        self.event_hooks
+            .fire_job_complete(job.clone(), processing_duration);
+
+        // Record job completed event
+        self.record_event(JobEvent {
+            job_id,
+            queue_name: job.queue_name.clone(),
+            event_type: JobEventType::Completed,
+            priority: job.priority,
+            processing_time_ms: Some(processing_time_ms),
+            error_message: None,
+            timestamp: Utc::now(),
+        })
+        .await;
+
+        Ok(())
+    }
+
+    async fn handle_failure(
+        &self,
+        job: &Job,
+        error: HammerworkError,
+        attempts_left: bool,
+    ) -> Result<()> {
+        let job_id = job.id;
+        error!("Job {} failed: {}", job_id, error);
+        let error_message = error.to_string();
+
+        // Record span error status
+        #[cfg(feature = "tracing")]
+        {
+            let span = tracing::Span::current();
+            span.record("error", true);
+            span.record("error.type", "job_failure");
+            span.record("error.message", &error_message);
+            span.record("job.will_retry", attempts_left);
+        }
+
+        let outcome = if attempts_left {
+            JobOutcome::Retry {
+                retry_at: self.retry_at_for(job),
+                error: error_message.clone(),
+                timed_out: false,
+            }
+        } else {
+            warn!(
+                "Job {} failed on its last attempt ({} of {}), marking it dead",
+                job_id,
+                job.attempts,
+                self.attempt_limit(job)
+            );
+            JobOutcome::Dead {
+                error: error_message.clone(),
+            }
+        };
+        let Some(recorded) = self.record_outcome(job, outcome).await? else {
+            return Ok(());
+        };
+
+        self.after_failed_run(job, &error_message, attempts_left)
+            .await;
+
+        if attempts_left {
+            info!(
+                "Retrying job {} (attempt {} of {})",
+                job_id,
+                job.attempts + 1,
+                self.attempt_limit(job)
+            );
+            self.event_hooks
+                .fire_job_retry(job.clone(), error_message.clone());
+            self.record_event(JobEvent {
+                job_id,
+                queue_name: job.queue_name.clone(),
+                event_type: JobEventType::Retried,
+                priority: job.priority,
+                processing_time_ms: None,
+                error_message: Some(error_message),
+                timestamp: Utc::now(),
+            })
+            .await;
+        } else {
+            debug!("Job {} run ended with status {:?}", job_id, recorded.status);
+            self.event_hooks
+                .fire_job_fail(job.clone(), error_message.clone());
+            self.record_event(JobEvent {
+                job_id,
+                queue_name: job.queue_name.clone(),
+                event_type: JobEventType::Dead,
+                priority: job.priority,
+                processing_time_ms: None,
+                error_message: Some(error_message),
+                timestamp: Utc::now(),
+            })
+            .await;
         }
 
         Ok(())
     }
 
+    /// A timed-out run is retried like a failure while the job has attempts left, and
+    /// only ends the job as `TimedOut` on its last attempt.
+    async fn handle_timeout(
+        &self,
+        job: &Job,
+        timeout: Duration,
+        attempts_left: bool,
+    ) -> Result<()> {
+        let job_id = job.id;
+        let error_message = format!("Job timed out after {:?}", timeout);
+        warn!("Job {} timed out after {:?}", job_id, timeout);
+
+        let outcome = if attempts_left {
+            JobOutcome::Retry {
+                retry_at: self.retry_at_for(job),
+                error: error_message.clone(),
+                timed_out: true,
+            }
+        } else {
+            JobOutcome::TimedOut {
+                error: error_message.clone(),
+            }
+        };
+        if self.record_outcome(job, outcome).await?.is_none() {
+            return Ok(());
+        }
+
+        // Record span timeout status
+        #[cfg(feature = "tracing")]
+        {
+            let span = tracing::Span::current();
+            span.record("error", true);
+            span.record("error.type", "timeout");
+            span.record("error.message", &error_message);
+            span.record("job.will_retry", attempts_left);
+        }
+
+        self.after_failed_run(job, &error_message, attempts_left)
+            .await;
+
+        // Fire job timeout event hook
+        self.event_hooks.fire_job_timeout(job.clone(), timeout);
+
+        // Record timeout event
+        self.record_event(JobEvent {
+            job_id,
+            queue_name: job.queue_name.clone(),
+            event_type: JobEventType::TimedOut,
+            priority: job.priority,
+            processing_time_ms: Some(timeout.as_millis() as u64),
+            error_message: Some(error_message.clone()),
+            timestamp: Utc::now(),
+        })
+        .await;
+
+        if attempts_left {
+            info!(
+                "Retrying timed-out job {} (attempt {} of {})",
+                job_id,
+                job.attempts + 1,
+                self.attempt_limit(job)
+            );
+            self.event_hooks
+                .fire_job_retry(job.clone(), error_message.clone());
+            self.record_event(JobEvent {
+                job_id,
+                queue_name: job.queue_name.clone(),
+                event_type: JobEventType::Retried,
+                priority: job.priority,
+                processing_time_ms: None,
+                error_message: Some(error_message),
+                timestamp: Utc::now(),
+            })
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Batch statistics after a failed (or timed-out) run.
+    async fn after_failed_run(&self, job: &Job, error_message: &str, attempts_left: bool) {
+        if !self.batch_processing_enabled {
+            return;
+        }
+        let Some(batch_id) = job.batch_id else {
+            return;
+        };
+        self.update_batch_stats(|stats| {
+            stats.jobs_failed += 1;
+        });
+        if attempts_left {
+            return;
+        }
+        if let Err(e) = self
+            .handle_batch_job_failure(batch_id, job.id, error_message)
+            .await
+        {
+            warn!(
+                "Failed to handle batch job failure for batch {}: {}",
+                batch_id, e
+            );
+        }
+        if let Err(e) = self.check_and_update_batch_status(batch_id).await {
+            warn!(
+                "Failed to update batch status for batch {}: {}",
+                batch_id, e
+            );
+        }
+    }
     /// Create the handler future for `job`, unifying both handler types.
     fn start_handler(&self, job: Job) -> HandlerFuture {
         match &self.handler {
@@ -2358,8 +2475,8 @@ where
             job_id, batch_id, error_message, batch_result.pending_jobs, batch_result.total_jobs
         );
 
-        // Note: Actual failure mode handling (FailFast, ContinueOnError, etc.)
-        // is implemented in the queue layer during job processing
+        // PartialFailureMode (e.g. FailFast failing the remaining jobs) was already
+        // applied by DatabaseQueue::finish_job_run, in the transaction that ended the job.
 
         Ok(())
     }

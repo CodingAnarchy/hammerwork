@@ -74,7 +74,7 @@ async fn assert_batch_progress_is_live<Q: DatabaseQueue>(queue: &Q) {
         (2, 1, 0)
     );
 
-    // FailFast: one failure fails the batch
+    // FailFast: one failure fails the batch and the jobs it has not run yet
     queue.fail_job(jobs[1].id, "boom").await.unwrap();
     let status = queue.get_batch_status(batch_id).await.unwrap();
     assert_eq!(
@@ -83,13 +83,25 @@ async fn assert_batch_progress_is_live<Q: DatabaseQueue>(queue: &Q) {
             status.completed_jobs,
             status.failed_jobs
         ),
-        (1, 1, 1)
+        (0, 1, 2)
     );
     assert_eq!(status.status, BatchStatus::Failed);
     assert_eq!(
         status.job_errors.get(&jobs[1].id).map(String::as_str),
         Some("boom")
     );
+    assert!(
+        status
+            .job_errors
+            .get(&jobs[2].id)
+            .is_some_and(|e| e.contains("Batch failed")),
+        "{:?}",
+        status.job_errors
+    );
+    // The batch row is updated as well
+    assert!(status.completed_at.is_some());
+    let job = queue.get_job(jobs[2].id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
 
     queue.delete_batch(batch_id).await.unwrap();
 }

@@ -450,5 +450,20 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("017_add_kms_data_keys.postgres.sql").to_string(),
             include_str!("017_add_kms_data_keys.mysql.sql").to_string(),
         );
+
+        // Migration 018: Persist per-job retry strategies; index batch progress checks
+        self.register_migration(
+            Migration {
+                id: "018_add_job_retry_strategy".to_string(),
+                description: "Store each job's retry strategy and index jobs by batch and status"
+                    .to_string(),
+                version: 18,
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("018_add_job_retry_strategy.postgres.sql").to_string(),
+            include_str!("018_add_job_retry_strategy.mysql.sql").to_string(),
+        );
     }
 }
