@@ -21,16 +21,16 @@ Add Hammerwork to your `Cargo.toml`:
 ```toml
 [dependencies]
 # PostgreSQL support with default features (metrics, alerting)
-hammerwork = { version = "1.5", features = ["postgres"] }
+hammerwork = { version = "1.15", features = ["postgres"] }
 
 # MySQL support
-hammerwork = { version = "1.5", features = ["mysql"] }
+hammerwork = { version = "1.15", features = ["mysql"] }
 
 # With distributed tracing
-hammerwork = { version = "1.5", features = ["postgres", "tracing"] }
+hammerwork = { version = "1.15", features = ["postgres", "tracing"] }
 
 # Minimal installation without default features
-hammerwork = { version = "1.5", features = ["postgres"], default-features = false }
+hammerwork = { version = "1.15", features = ["postgres"], default-features = false }
 
 # Additional dependencies for examples
 serde_json = "1.0"

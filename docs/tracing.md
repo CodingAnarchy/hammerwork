@@ -20,7 +20,7 @@ Add the `tracing` feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hammerwork = { version = "1.4", features = ["postgres", "tracing"] }
+hammerwork = { version = "1.15", features = ["postgres", "tracing"] }
 ```
 
 ### Initialize Tracing

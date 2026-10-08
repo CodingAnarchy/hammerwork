@@ -377,3 +377,8 @@ pub use tracing::{
 ///
 /// This is used throughout the crate for consistent error handling.
 pub type Result<T> = std::result::Result<T, HammerworkError>;
+
+// Compile-check the Rust examples in the README.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
