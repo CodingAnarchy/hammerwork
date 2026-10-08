@@ -151,6 +151,7 @@ use rdkafka::{
 use google_cloud_pubsub::{
     client::{Client, ClientConfig as PubSubClientConfig},
     publisher::Publisher,
+    topic::Topic,
 };
 
 #[cfg(feature = "google-pubsub")]
@@ -166,9 +167,17 @@ use aws_sdk_kinesis::{Client as KinesisClient, config::Region};
 use aws_config::BehaviorVersion;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::{RwLock, Semaphore, broadcast};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{RwLock, Semaphore, broadcast, watch};
 use uuid::Uuid;
+
+/// Processors by stream id. Processors are reference-counted so a batch can send
+/// through one without holding the map lock across network I/O.
+type ProcessorMap = Arc<RwLock<HashMap<Uuid, Arc<dyn StreamProcessor + Send + Sync>>>>;
 
 /// Module for serializing UUID as string for TOML compatibility
 mod uuid_string {
@@ -507,7 +516,8 @@ pub enum SerializationFormat {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamRetryPolicy {
-    /// Maximum number of retry attempts
+    /// Maximum number of delivery attempts per event, including the first one.
+    /// `0` is treated as `1` (a single attempt, no retries).
     pub max_attempts: u32,
     /// Initial delay between retries (in seconds)
     pub initial_delay_secs: u64,
@@ -528,6 +538,32 @@ impl Default for StreamRetryPolicy {
             backoff_multiplier: 2.0,
             use_jitter: true,
         }
+    }
+}
+
+impl StreamRetryPolicy {
+    /// Delay before retry number `retry` (1 for the first retry).
+    ///
+    /// The delay is `initial_delay_secs * backoff_multiplier^(retry - 1)`, capped at
+    /// `max_delay_secs`. With `use_jitter` the delay is drawn uniformly from
+    /// `[delay / 2, delay]` so that streams failing together do not retry in lockstep.
+    pub fn delay_for_retry(&self, retry: u32) -> Duration {
+        let exponent = i32::try_from(retry.saturating_sub(1)).unwrap_or(i32::MAX);
+        let multiplier = if self.backoff_multiplier.is_finite() && self.backoff_multiplier > 0.0 {
+            self.backoff_multiplier
+        } else {
+            1.0
+        };
+        let max = self.max_delay_secs as f64;
+        let mut delay = (self.initial_delay_secs as f64 * multiplier.powi(exponent)).min(max);
+        if !delay.is_finite() || delay < 0.0 {
+            delay = max;
+        }
+        if self.use_jitter && delay > 0.0 {
+            use rand::Rng;
+            delay = rand::thread_rng().gen_range(delay / 2.0..=delay);
+        }
+        Duration::try_from_secs_f64(delay).unwrap_or(Duration::from_secs(self.max_delay_secs))
     }
 }
 
@@ -669,6 +705,9 @@ pub struct StreamStats {
     pub last_success_at: Option<DateTime<Utc>>,
     /// Last failure timestamp
     pub last_failure_at: Option<DateTime<Utc>>,
+    /// Error from the most recent failed delivery (after retries were exhausted)
+    #[serde(default)]
+    pub last_error: Option<String>,
     /// Statistics calculation timestamp
     pub calculated_at: DateTime<Utc>,
 }
@@ -733,8 +772,8 @@ pub struct StreamManager {
     subscriptions: Arc<RwLock<HashMap<Uuid, EventSubscription>>>,
     /// Event manager for subscribing to events
     event_manager: Arc<EventManager>,
-    /// Stream processors by backend type
-    processors: Arc<RwLock<HashMap<Uuid, Box<dyn StreamProcessor + Send + Sync>>>>,
+    /// Stream processors by stream id
+    processors: ProcessorMap,
     /// Rate limiting semaphore for concurrent processing
     processing_semaphore: Arc<Semaphore>,
     /// Stream statistics
@@ -745,6 +784,8 @@ pub struct StreamManager {
     listeners: TaskTracker,
     /// In-flight batch processing tasks
     batches: TaskTracker,
+    /// Set to `true` by [`shutdown`](Self::shutdown); batches stop retrying when it flips.
+    shutdown_signal: watch::Sender<bool>,
 }
 
 /// Configuration for the stream manager.
@@ -922,7 +963,10 @@ fn mask_prefix(value: &str) -> String {
 
 /// Read `health.check.timeout.ms`, defaulting to 5000 when unset but failing on
 /// a value that is set and not a number (instead of silently using the default).
-#[cfg_attr(not(feature = "kafka"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "kafka", feature = "google-pubsub")),
+    allow(dead_code)
+)]
 fn parse_health_check_timeout_ms(config: &HashMap<String, String>) -> crate::Result<u64> {
     match config.get("health.check.timeout.ms") {
         None => Ok(5000),
@@ -933,6 +977,19 @@ fn parse_health_check_timeout_ms(config: &HashMap<String, String>) -> crate::Res
             ))
         }),
     }
+}
+
+/// Final result of delivering one batch, after retries.
+#[derive(Debug, Default)]
+struct BatchOutcome {
+    /// Events the backend acknowledged.
+    delivered: u64,
+    /// Events that could not be prepared or were not delivered after all attempts.
+    failed: u64,
+    /// Sum of the delivery times of the delivered events, in milliseconds.
+    delivery_time_ms_total: f64,
+    /// The most recent error seen while delivering the batch.
+    last_error: Option<String>,
 }
 
 impl StreamManager {
@@ -975,18 +1032,22 @@ impl StreamManager {
             config,
             listeners: TaskTracker::new("stream listener"),
             batches: TaskTracker::new("stream batch"),
+            shutdown_signal: watch::Sender::new(false),
         }
     }
 
     /// Stop the manager and wait for in-flight batches.
     ///
     /// Stops every stream's event listener, then waits up to `grace` for batches that
-    /// are already being processed. Batches still running after `grace` are aborted.
-    /// Finally every backend processor is shut down. Returns the number of batches
-    /// aborted.
+    /// are already being processed. A send that is in progress is allowed to finish,
+    /// but no batch starts another retry after shutdown begins: events still awaiting
+    /// a retry are counted as failed deliveries (with `last_error` saying why).
+    /// Batches still running after `grace` are aborted. Finally every backend
+    /// processor is shut down. Returns the number of batches aborted.
     ///
     /// Events still buffered in a listener (not yet flushed) are dropped.
     pub async fn shutdown(&self, grace: Duration) -> usize {
+        self.shutdown_signal.send_replace(true);
         self.listeners.close();
         self.listeners.abort_all().await;
         let aborted = self.batches.drain(grace).await;
@@ -1121,7 +1182,7 @@ impl StreamManager {
 
         {
             let mut processors = self.processors.write().await;
-            processors.insert(stream_id, processor);
+            processors.insert(stream_id, Arc::from(processor));
         }
 
         {
@@ -1144,6 +1205,7 @@ impl StreamManager {
                     buffered_events: 0,
                     last_success_at: None,
                     last_failure_at: None,
+                    last_error: None,
                     calculated_at: Utc::now(),
                 },
             );
@@ -1172,7 +1234,7 @@ impl StreamManager {
         if backend_compiled {
             self.add_stream(stream).await
         } else {
-            self.add_stream_with_processor(stream, Box::new(InMemoryProcessor))
+            self.add_stream_with_processor(stream, Box::new(InMemoryProcessor::default()))
                 .await
         }
     }
@@ -1180,11 +1242,9 @@ impl StreamManager {
     /// Remove a stream configuration
     pub async fn remove_stream(&self, stream_id: Uuid) -> crate::Result<()> {
         // Shutdown processor
-        {
-            let mut processors = self.processors.write().await;
-            if let Some(processor) = processors.remove(&stream_id) {
-                processor.shutdown().await?;
-            }
+        let processor = self.processors.write().await.remove(&stream_id);
+        if let Some(processor) = processor {
+            processor.shutdown().await?;
         }
 
         // Remove subscription
@@ -1338,6 +1398,7 @@ impl StreamManager {
         let stats = self.stats.clone();
         let processing_semaphore = self.processing_semaphore.clone();
         let config = self.config.clone();
+        let shutdown_signal = self.shutdown_signal.clone();
 
         let batches = self.batches.clone();
 
@@ -1390,6 +1451,7 @@ impl StreamManager {
                     let stats_clone = stats.clone();
                     let config_clone = config.clone();
                     let semaphore_clone = processing_semaphore.clone();
+                    let shutdown = shutdown_signal.subscribe();
 
                     // Spawn a tracked processing task
                     batches.spawn("batch", async move {
@@ -1405,6 +1467,7 @@ impl StreamManager {
                             processors_clone,
                             stats_clone,
                             config_clone,
+                            shutdown,
                         )
                         .await;
                     });
@@ -1439,53 +1502,191 @@ impl StreamManager {
         });
     }
 
-    /// Process a batch of events for a stream
+    /// Deliver a batch of events through the stream's processor.
+    ///
+    /// Events are serialized, sent with [`StreamProcessor::send_batch`], and every
+    /// event whose delivery failed (or that has no delivery result) is retried
+    /// according to the stream's [`StreamRetryPolicy`]. Statistics are updated from
+    /// the final per-event outcome.
     async fn process_event_batch(
         stream_id: Uuid,
         stream: StreamConfig,
         events: Vec<JobLifecycleEvent>,
-        processors: Arc<RwLock<HashMap<Uuid, Box<dyn StreamProcessor + Send + Sync>>>>,
+        processors: ProcessorMap,
         stats: Arc<RwLock<HashMap<Uuid, StreamStats>>>,
         config: StreamManagerConfig,
+        mut shutdown: watch::Receiver<bool>,
     ) {
-        // Check if processor exists
-        {
-            let processors = processors.read().await;
-            if !processors.contains_key(&stream_id) {
-                return;
-            }
-        }
+        // The stream may have been removed while the batch waited for a permit.
+        let Some(processor) = processors.read().await.get(&stream_id).cloned() else {
+            return;
+        };
+
+        let mut outcome = BatchOutcome::default();
 
         // Convert events to streamed events
-        let mut streamed_events = Vec::new();
+        let mut streamed_events = Vec::with_capacity(events.len());
         for event in events {
             match Self::prepare_streamed_event(event, &stream) {
                 Ok(streamed_event) => streamed_events.push(streamed_event),
                 Err(e) => {
+                    let message = format!("failed to prepare event for streaming: {e}");
                     if config.log_operations {
-                        tracing::error!("Failed to prepare streamed event: {}", e);
+                        tracing::error!("Stream {}: {}", stream.name, message);
                     }
+                    outcome.failed += 1;
+                    outcome.last_error = Some(message);
                 }
             }
         }
 
-        if streamed_events.is_empty() {
-            return;
+        if !streamed_events.is_empty() {
+            if config.log_operations {
+                tracing::debug!(
+                    "Processing batch of {} events for stream {}",
+                    streamed_events.len(),
+                    stream.name
+                );
+            }
+            Self::deliver_with_retries(
+                &stream,
+                processor.as_ref(),
+                streamed_events,
+                &mut shutdown,
+                &config,
+                &mut outcome,
+            )
+            .await;
         }
 
-        // Note: This is a simplified version. In a real implementation,
-        // we'd properly handle the processor trait object and implement retry logic
+        Self::record_batch_outcome(stream_id, &outcome, &stats).await;
+    }
 
-        if config.log_operations {
-            tracing::debug!(
-                "Processing batch of {} events for stream {}",
-                streamed_events.len(),
-                stream.name
-            );
+    /// Send `pending` through `processor`, retrying failed events per the stream's
+    /// retry policy until they are delivered, the attempts run out, or the manager
+    /// shuts down. Results are accumulated into `outcome`.
+    async fn deliver_with_retries(
+        stream: &StreamConfig,
+        processor: &(dyn StreamProcessor + Send + Sync),
+        mut pending: Vec<StreamedEvent>,
+        shutdown: &mut watch::Receiver<bool>,
+        config: &StreamManagerConfig,
+        outcome: &mut BatchOutcome,
+    ) {
+        let policy = &stream.retry_policy;
+        let max_attempts = policy.max_attempts.max(1);
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            let last_attempt = attempt >= max_attempts;
+            let event_ids: Vec<Uuid> = pending.iter().map(|e| e.event.event_id).collect();
+            // Keep a copy for the next retry; the final attempt can hand the events over.
+            let batch = if last_attempt {
+                std::mem::take(&mut pending)
+            } else {
+                pending.clone()
+            };
+
+            let started = std::time::Instant::now();
+            let result = processor.send_batch(batch).await;
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            let failed_ids: HashSet<Uuid> = match result {
+                Ok(deliveries) => {
+                    let by_event: HashMap<Uuid, StreamDelivery> = deliveries
+                        .into_iter()
+                        .map(|delivery| (delivery.event_id, delivery))
+                        .collect();
+                    let mut failed = HashSet::new();
+                    for event_id in &event_ids {
+                        match by_event.get(event_id) {
+                            Some(delivery) if delivery.success => {
+                                outcome.delivered += 1;
+                                outcome.delivery_time_ms_total +=
+                                    delivery.duration_ms.unwrap_or(elapsed_ms) as f64;
+                            }
+                            Some(delivery) => {
+                                outcome.last_error = Some(
+                                    delivery
+                                        .error_message
+                                        .clone()
+                                        .unwrap_or_else(|| "delivery failed".to_string()),
+                                );
+                                failed.insert(*event_id);
+                            }
+                            None => {
+                                outcome.last_error =
+                                    Some("processor returned no delivery result".to_string());
+                                failed.insert(*event_id);
+                            }
+                        }
+                    }
+                    failed
+                }
+                Err(e) => {
+                    outcome.last_error = Some(e.to_string());
+                    event_ids.iter().copied().collect()
+                }
+            };
+
+            if failed_ids.is_empty() {
+                return;
+            }
+            if last_attempt {
+                outcome.failed += failed_ids.len() as u64;
+                if config.log_operations {
+                    tracing::error!(
+                        "Stream {}: {} event(s) failed after {} attempt(s): {}",
+                        stream.name,
+                        failed_ids.len(),
+                        attempt,
+                        outcome.last_error.as_deref().unwrap_or("unknown error")
+                    );
+                }
+                return;
+            }
+
+            pending.retain(|e| failed_ids.contains(&e.event.event_id));
+            let delay = policy.delay_for_retry(attempt);
+            if config.log_operations {
+                tracing::warn!(
+                    "Stream {}: {} event(s) failed (attempt {}/{}), retrying in {:?}: {}",
+                    stream.name,
+                    pending.len(),
+                    attempt,
+                    max_attempts,
+                    delay,
+                    outcome.last_error.as_deref().unwrap_or("unknown error")
+                );
+            }
+
+            // Stop retrying once shutdown starts, including during the backoff sleep.
+            let shutting_down = *shutdown.borrow()
+                || tokio::select! {
+                    _ = tokio::time::sleep(delay) => false,
+                    _ = shutdown.wait_for(|stopping| *stopping) => true,
+                };
+            if shutting_down {
+                outcome.failed += pending.len() as u64;
+                let reason = format!(
+                    "stream manager shut down before retry {} of {}; last error: {}",
+                    attempt + 1,
+                    max_attempts,
+                    outcome.last_error.as_deref().unwrap_or("unknown error")
+                );
+                if config.log_operations {
+                    tracing::warn!(
+                        "Stream {}: giving up on {} event(s): {}",
+                        stream.name,
+                        pending.len(),
+                        reason
+                    );
+                }
+                outcome.last_error = Some(reason);
+                return;
+            }
         }
-
-        // For now, simulate successful processing
-        Self::update_stream_stats(stream_id, true, streamed_events.len(), stats).await;
     }
 
     /// Prepare a job lifecycle event for streaming
@@ -1690,31 +1891,38 @@ impl StreamManager {
         }
     }
 
-    /// Update stream statistics
-    async fn update_stream_stats(
+    /// Fold the final outcome of one batch into the stream's statistics.
+    async fn record_batch_outcome(
         stream_id: Uuid,
-        success: bool,
-        event_count: usize,
-        stats: Arc<RwLock<HashMap<Uuid, StreamStats>>>,
+        outcome: &BatchOutcome,
+        stats: &RwLock<HashMap<Uuid, StreamStats>>,
     ) {
         let mut stats_map = stats.write().await;
-        if let Some(stream_stats) = stats_map.get_mut(&stream_id) {
-            stream_stats.total_events += event_count as u64;
+        let Some(stream_stats) = stats_map.get_mut(&stream_id) else {
+            return;
+        };
+        let now = Utc::now();
+        stream_stats.total_events += outcome.delivered + outcome.failed;
 
-            if success {
-                stream_stats.successful_deliveries += event_count as u64;
-                stream_stats.last_success_at = Some(Utc::now());
-            } else {
-                stream_stats.failed_deliveries += event_count as u64;
-                stream_stats.last_failure_at = Some(Utc::now());
-            }
-
-            // Update success rate
-            stream_stats.success_rate =
-                stream_stats.successful_deliveries as f64 / stream_stats.total_events as f64;
-
-            stream_stats.calculated_at = Utc::now();
+        if outcome.delivered > 0 {
+            let previous = stream_stats.successful_deliveries as f64;
+            stream_stats.successful_deliveries += outcome.delivered;
+            stream_stats.avg_delivery_time_ms = (stream_stats.avg_delivery_time_ms * previous
+                + outcome.delivery_time_ms_total)
+                / stream_stats.successful_deliveries as f64;
+            stream_stats.last_success_at = Some(now);
         }
+        if outcome.failed > 0 {
+            stream_stats.failed_deliveries += outcome.failed;
+            stream_stats.last_failure_at = Some(now);
+            stream_stats.last_error = outcome.last_error.clone();
+        }
+
+        let finished = stream_stats.successful_deliveries + stream_stats.failed_deliveries;
+        if finished > 0 {
+            stream_stats.success_rate = stream_stats.successful_deliveries as f64 / finished as f64;
+        }
+        stream_stats.calculated_at = now;
     }
 }
 
@@ -2079,11 +2287,8 @@ impl StreamProcessor for KinesisProcessor {
             let delivery_start = std::time::Instant::now();
             let delivery_id = Uuid::new_v4();
 
-            // Serialize the event to JSON
-            let payload =
-                serde_json::to_vec(&event.event).map_err(|e| HammerworkError::Streaming {
-                    message: format!("Failed to serialize event: {}", e),
-                })?;
+            // Send the bytes produced by the stream's configured serialization format.
+            let payload = event.serialized_data.clone();
 
             // Create Kinesis record
             let partition_key = event.partition_key.clone().unwrap_or_else(|| {
@@ -2301,6 +2506,7 @@ pub struct PubSubProcessor {
     topic_name: String,
     service_account_key: Option<String>,
     config: HashMap<String, String>,
+    topic: Topic,
     publisher: Publisher,
 }
 
@@ -2339,6 +2545,27 @@ impl PubSubProcessor {
                 })?
         };
 
+        Self::with_client_config(
+            project_id,
+            topic_name,
+            service_account_key,
+            config,
+            client_config,
+        )
+        .await
+    }
+
+    /// Build the processor from a ready Pub/Sub client configuration.
+    async fn with_client_config(
+        project_id: String,
+        topic_name: String,
+        service_account_key: Option<String>,
+        config: HashMap<String, String>,
+        client_config: PubSubClientConfig,
+    ) -> crate::Result<Self> {
+        // Validate the health check timeout up front rather than on the first check.
+        parse_health_check_timeout_ms(&config)?;
+
         let client = Client::new(client_config)
             .await
             .map_err(|e| HammerworkError::Streaming {
@@ -2353,6 +2580,7 @@ impl PubSubProcessor {
             topic_name,
             service_account_key,
             config,
+            topic,
             publisher,
         })
     }
@@ -2369,11 +2597,8 @@ impl StreamProcessor for PubSubProcessor {
             let delivery_start = std::time::Instant::now();
             let delivery_id = Uuid::new_v4();
 
-            // Serialize the event to JSON
-            let payload =
-                serde_json::to_vec(&event.event).map_err(|e| HammerworkError::Streaming {
-                    message: format!("Failed to serialize event: {}", e),
-                })?;
+            // Send the bytes produced by the stream's configured serialization format.
+            let payload = event.serialized_data.clone();
 
             // Create message attributes
             let mut attributes = std::collections::HashMap::new();
@@ -2451,11 +2676,61 @@ impl StreamProcessor for PubSubProcessor {
         Ok(deliveries)
     }
 
+    /// Checks that the topic exists by fetching it from Pub/Sub.
+    ///
+    /// Returns `Ok(true)` when the topic exists, `Ok(false)` when it does not or
+    /// Pub/Sub cannot be reached within `health.check.timeout.ms` (default 5000), and
+    /// an error when Pub/Sub rejects the request (for example missing permissions or
+    /// invalid credentials), since retrying will not fix that.
     async fn health_check(&self) -> crate::Result<bool> {
-        // For now, just return true as the publisher will handle connection errors
-        // A more sophisticated health check could try to publish a test message
-        tracing::debug!("Pub/Sub health check for topic '{}'.", self.topic_name);
-        Ok(true)
+        use google_cloud_gax::grpc::Code;
+        use google_cloud_gax::retry::RetrySetting;
+
+        let timeout = Duration::from_millis(parse_health_check_timeout_ms(&self.config)?);
+        // A single attempt: the timeout above bounds the whole check.
+        let no_retry = RetrySetting {
+            take: 0,
+            codes: Vec::new(),
+            ..Default::default()
+        };
+
+        match tokio::time::timeout(timeout, self.topic.exists(Some(no_retry))).await {
+            Ok(Ok(true)) => {
+                tracing::debug!(
+                    "Pub/Sub health check passed for topic '{}'",
+                    self.topic_name
+                );
+                Ok(true)
+            }
+            Ok(Ok(false)) => {
+                tracing::warn!("Pub/Sub topic '{}' does not exist", self.topic_name);
+                Ok(false)
+            }
+            Ok(Err(status)) => match status.code() {
+                Code::Unavailable | Code::DeadlineExceeded | Code::Unknown | Code::Aborted => {
+                    tracing::error!(
+                        "Pub/Sub health check for topic '{}' failed: {}",
+                        self.topic_name,
+                        status
+                    );
+                    Ok(false)
+                }
+                _ => Err(HammerworkError::Streaming {
+                    message: format!(
+                        "Pub/Sub health check for topic '{}' was rejected: {}",
+                        self.topic_name, status
+                    ),
+                }),
+            },
+            Err(_) => {
+                tracing::error!(
+                    "Pub/Sub health check for topic '{}' timed out after {:?}",
+                    self.topic_name,
+                    timeout
+                );
+                Ok(false)
+            }
+        }
     }
 
     async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
@@ -2601,29 +2876,114 @@ impl StreamConfig {
     }
 }
 
-/// Broker-less processor for tests that need a working stream without any
-/// backend feature enabled. Acknowledges every event.
+/// Decides whether the `call`-th (0-based) `send_batch` call fails as a whole.
 #[cfg(test)]
-struct InMemoryProcessor;
+type BatchFailurePlan = Arc<dyn Fn(usize) -> bool + Send + Sync>;
+
+/// Decides whether one event fails within the `call`-th (0-based) `send_batch` call.
+#[cfg(test)]
+type EventFailurePlan = Arc<dyn Fn(usize, &StreamedEvent) -> bool + Send + Sync>;
+
+/// Broker-less processor for tests that need a working stream without any
+/// backend feature enabled.
+///
+/// By default it acknowledges every event. It records every event it acknowledged
+/// and how often each event was attempted, and can be scripted to fail whole
+/// batches or single events. Clones share the recorded state, so a test can keep a
+/// clone while the manager owns the processor.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct InMemoryProcessor {
+    /// Events acknowledged, in delivery order.
+    delivered: Arc<std::sync::Mutex<Vec<StreamedEvent>>>,
+    /// Number of attempts per event id.
+    attempts: Arc<std::sync::Mutex<HashMap<Uuid, usize>>>,
+    /// Number of `send_batch` calls so far.
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Makes a whole `send_batch` call return an error.
+    fail_batch: Option<BatchFailurePlan>,
+    /// Makes single events come back with an unsuccessful delivery.
+    fail_event: Option<EventFailurePlan>,
+}
+
+#[cfg(test)]
+impl InMemoryProcessor {
+    fn failing_batches(mut self, plan: impl Fn(usize) -> bool + Send + Sync + 'static) -> Self {
+        self.fail_batch = Some(Arc::new(plan));
+        self
+    }
+
+    fn failing_events(
+        mut self,
+        plan: impl Fn(usize, &StreamedEvent) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.fail_event = Some(Arc::new(plan));
+        self
+    }
+
+    fn delivered_ids(&self) -> Vec<Uuid> {
+        self.delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.event.event_id)
+            .collect()
+    }
+
+    fn attempts_for(&self, event_id: Uuid) -> usize {
+        self.attempts
+            .lock()
+            .unwrap()
+            .get(&event_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 #[cfg(test)]
 #[async_trait::async_trait]
 impl StreamProcessor for InMemoryProcessor {
     async fn send_batch(&self, events: Vec<StreamedEvent>) -> crate::Result<Vec<StreamDelivery>> {
-        Ok(events
-            .into_iter()
-            .map(|event| StreamDelivery {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut attempts = self.attempts.lock().unwrap();
+            for event in &events {
+                *attempts.entry(event.event.event_id).or_default() += 1;
+            }
+        }
+        if self.fail_batch.as_ref().is_some_and(|fail| fail(call)) {
+            return Err(HammerworkError::Streaming {
+                message: format!("in-memory backend rejected batch {call}"),
+            });
+        }
+
+        let mut deliveries = Vec::with_capacity(events.len());
+        for event in events {
+            let failed = self
+                .fail_event
+                .as_ref()
+                .is_some_and(|fail| fail(call, &event));
+            deliveries.push(StreamDelivery {
                 delivery_id: Uuid::new_v4(),
                 stream_id: Uuid::nil(),
                 event_id: event.event.event_id,
-                success: true,
-                error_message: None,
+                success: !failed,
+                error_message: failed
+                    .then(|| format!("in-memory backend rejected event in call {call}")),
                 attempted_at: Utc::now(),
                 duration_ms: Some(0),
                 attempt_number: 1,
-                partition: event.partition_key,
-            })
-            .collect())
+                partition: event.partition_key.clone(),
+            });
+            if !failed {
+                self.delivered.lock().unwrap().push(event);
+            }
+        }
+        Ok(deliveries)
     }
 
     async fn health_check(&self) -> crate::Result<bool> {
@@ -3299,6 +3659,7 @@ mod tests {
             buffered_events: 25,
             last_success_at: Some(Utc::now() - chrono::Duration::minutes(2)),
             last_failure_at: Some(Utc::now() - chrono::Duration::minutes(10)),
+            last_error: None,
             calculated_at: Utc::now(),
         };
 
@@ -3993,7 +4354,7 @@ mod tests {
         };
         let stream_id = stream.id;
         manager
-            .add_stream_with_processor(stream, Box::new(InMemoryProcessor))
+            .add_stream_with_processor(stream, Box::new(InMemoryProcessor::default()))
             .await
             .unwrap();
 
@@ -4021,6 +4382,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_listener_streams_every_event_in_a_burst() {
+        let processor = InMemoryProcessor::default();
         let events = Arc::new(EventManager::new_default());
         let manager = StreamManager::new_default(events.clone());
         let stream = StreamConfig {
@@ -4034,7 +4396,7 @@ mod tests {
         };
         let stream_id = stream.id;
         manager
-            .add_stream_with_processor(stream, Box::new(InMemoryProcessor))
+            .add_stream_with_processor(stream, Box::new(processor.clone()))
             .await
             .unwrap();
 
@@ -4058,6 +4420,14 @@ mod tests {
         }
         manager.shutdown(Duration::from_secs(5)).await;
         assert_eq!(total, 100);
+
+        let mut delivered = processor.delivered_ids();
+        delivered.sort();
+        delivered.dedup();
+        assert_eq!(delivered.len(), 100);
+        let stats = manager.get_stream_stats(stream_id).await.unwrap();
+        assert_eq!(stats.successful_deliveries, 100);
+        assert_eq!(stats.failed_deliveries, 0);
     }
 
     #[tokio::test]
@@ -4083,5 +4453,409 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         manager.shutdown(Duration::from_secs(5)).await;
         assert_eq!(manager.task_panics(), 2);
+    }
+
+    /// A stream that flushes after `batch_size` events and retries per `retry_policy`.
+    fn test_stream(batch_size: usize, retry_policy: StreamRetryPolicy) -> StreamConfig {
+        StreamConfig {
+            buffer_config: BufferConfig {
+                batch_size,
+                max_buffer_time_secs: 1,
+                ..Default::default()
+            },
+            retry_policy,
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// Retries immediately, without jitter.
+    fn immediate_retries(max_attempts: u32) -> StreamRetryPolicy {
+        StreamRetryPolicy {
+            max_attempts,
+            initial_delay_secs: 0,
+            max_delay_secs: 0,
+            backoff_multiplier: 1.0,
+            use_jitter: false,
+        }
+    }
+
+    /// Add `stream` with `processor`, publish `count` events and wait until the
+    /// stream's stats account for all of them. Returns the published event ids.
+    async fn stream_events(
+        stream: StreamConfig,
+        processor: &InMemoryProcessor,
+        count: usize,
+    ) -> (StreamManager, Uuid, Vec<Uuid>) {
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(processor.clone()))
+            .await
+            .unwrap();
+
+        // Let the listener task start and subscribe before the events are published.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut ids = Vec::new();
+        for _ in 0..count {
+            let event = completed_event();
+            ids.push(event.event_id);
+            events.publish_event(event).await.unwrap();
+        }
+        wait_for_total_events(&manager, stream_id, count as u64).await;
+        (manager, stream_id, ids)
+    }
+
+    async fn wait_for_total_events(manager: &StreamManager, stream_id: Uuid, count: u64) {
+        for _ in 0..200 {
+            let total = manager
+                .get_stream_stats(stream_id)
+                .await
+                .map_or(0, |s| s.total_events);
+            if total >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("stream did not finish {count} events in time");
+    }
+
+    #[tokio::test]
+    async fn test_events_reach_the_processor() {
+        let processor = InMemoryProcessor::default();
+        let (manager, stream_id, ids) =
+            stream_events(test_stream(3, immediate_retries(3)), &processor, 3).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+
+        let mut delivered = processor.delivered_ids();
+        delivered.sort();
+        let mut expected = ids;
+        expected.sort();
+        assert_eq!(delivered, expected);
+
+        let stats = manager.get_stream_stats(stream_id).await.unwrap();
+        assert_eq!(stats.total_events, 3);
+        assert_eq!(stats.successful_deliveries, 3);
+        assert_eq!(stats.failed_deliveries, 0);
+        assert_eq!(stats.success_rate, 1.0);
+        assert!(stats.last_success_at.is_some());
+        assert!(stats.last_failure_at.is_none());
+        assert!(stats.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_processor_errors_are_retried_then_reported_as_failures() {
+        let processor = InMemoryProcessor::default().failing_batches(|_| true);
+        let (manager, stream_id, ids) =
+            stream_events(test_stream(1, immediate_retries(3)), &processor, 1).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+
+        // One initial attempt plus two retries, then the event is given up on.
+        assert_eq!(processor.attempts_for(ids[0]), 3);
+        assert!(processor.delivered_ids().is_empty());
+
+        let stats = manager.get_stream_stats(stream_id).await.unwrap();
+        assert_eq!(stats.total_events, 1);
+        assert_eq!(stats.successful_deliveries, 0);
+        assert_eq!(stats.failed_deliveries, 1);
+        assert_eq!(stats.success_rate, 0.0);
+        assert!(stats.last_failure_at.is_some());
+        assert!(stats.last_success_at.is_none());
+        let last_error = stats.last_error.unwrap();
+        assert!(
+            last_error.contains("in-memory backend rejected batch 2"),
+            "{last_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transient_error_is_retried_until_delivered() {
+        let processor = InMemoryProcessor::default().failing_batches(|call| call == 0);
+        let (manager, stream_id, ids) =
+            stream_events(test_stream(1, immediate_retries(3)), &processor, 1).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(processor.attempts_for(ids[0]), 2);
+        assert_eq!(processor.delivered_ids(), ids);
+        let stats = manager.get_stream_stats(stream_id).await.unwrap();
+        assert_eq!(stats.successful_deliveries, 1);
+        assert_eq!(stats.failed_deliveries, 0);
+    }
+
+    #[tokio::test]
+    async fn test_partial_batch_failure_retries_only_failed_events() {
+        let failing: Arc<std::sync::Mutex<HashSet<Uuid>>> = Arc::default();
+        let processor = InMemoryProcessor::default().failing_events({
+            let failing = failing.clone();
+            move |_, event| failing.lock().unwrap().contains(&event.event.event_id)
+        });
+
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        let stream = test_stream(4, immediate_retries(2));
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(processor.clone()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let published: Vec<JobLifecycleEvent> = (0..4).map(|_| completed_event()).collect();
+        // The second and fourth events are rejected on every attempt.
+        failing
+            .lock()
+            .unwrap()
+            .extend([published[1].event_id, published[3].event_id]);
+        for event in &published {
+            events.publish_event(event.clone()).await.unwrap();
+        }
+        wait_for_total_events(&manager, stream_id, 4).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+
+        for (i, event) in published.iter().enumerate() {
+            let expected_attempts = if i % 2 == 1 { 2 } else { 1 };
+            assert_eq!(
+                processor.attempts_for(event.event_id),
+                expected_attempts,
+                "event {i}"
+            );
+        }
+        let mut delivered = processor.delivered_ids();
+        delivered.sort();
+        let mut expected = vec![published[0].event_id, published[2].event_id];
+        expected.sort();
+        assert_eq!(delivered, expected);
+
+        let stats = manager.get_stream_stats(stream_id).await.unwrap();
+        assert_eq!(stats.total_events, 4);
+        assert_eq!(stats.successful_deliveries, 2);
+        assert_eq!(stats.failed_deliveries, 2);
+        assert_eq!(stats.success_rate, 0.5);
+        assert!(
+            stats
+                .last_error
+                .unwrap()
+                .contains("in-memory backend rejected event")
+        );
+    }
+
+    /// A processor that acknowledges only some of the events it was given.
+    struct ForgetfulProcessor;
+
+    #[async_trait::async_trait]
+    impl StreamProcessor for ForgetfulProcessor {
+        async fn send_batch(
+            &self,
+            _events: Vec<StreamedEvent>,
+        ) -> crate::Result<Vec<StreamDelivery>> {
+            Ok(Vec::new())
+        }
+
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+
+        async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
+            Ok(HashMap::new())
+        }
+
+        async fn shutdown(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_delivery_result_counts_as_failure() {
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        let stream = test_stream(1, immediate_retries(1));
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(ForgetfulProcessor))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.publish_event(completed_event()).await.unwrap();
+        wait_for_total_events(&manager, stream_id, 1).await;
+        manager.shutdown(Duration::from_secs(5)).await;
+
+        let stats = manager.get_stream_stats(stream_id).await.unwrap();
+        assert_eq!(stats.successful_deliveries, 0);
+        assert_eq!(stats.failed_deliveries, 1);
+        assert!(stats.last_error.unwrap().contains("no delivery result"));
+    }
+
+    #[tokio::test]
+    async fn test_retries_stop_on_shutdown() {
+        let processor = InMemoryProcessor::default().failing_batches(|_| true);
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        let stream = test_stream(
+            1,
+            StreamRetryPolicy {
+                max_attempts: 5,
+                initial_delay_secs: 60,
+                max_delay_secs: 60,
+                backoff_multiplier: 1.0,
+                use_jitter: false,
+            },
+        );
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(processor.clone()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        events.publish_event(completed_event()).await.unwrap();
+
+        // Wait for the first attempt; the batch is now sleeping before its retry.
+        for _ in 0..200 {
+            if processor.calls() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(processor.calls(), 1);
+
+        let started = std::time::Instant::now();
+        // The batch must finish on its own (not be aborted) well within the grace period.
+        assert_eq!(manager.shutdown(Duration::from_secs(30)).await, 0);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(processor.calls(), 1);
+
+        let stats = manager.get_stream_stats(stream_id).await.unwrap();
+        assert_eq!(stats.total_events, 1);
+        assert_eq!(stats.failed_deliveries, 1);
+        let last_error = stats.last_error.unwrap();
+        assert!(last_error.contains("shut down"), "{last_error}");
+        assert!(last_error.contains("rejected batch 0"), "{last_error}");
+    }
+
+    #[test]
+    fn test_retry_delay_backoff() {
+        let policy = StreamRetryPolicy {
+            max_attempts: 10,
+            initial_delay_secs: 1,
+            max_delay_secs: 10,
+            backoff_multiplier: 2.0,
+            use_jitter: false,
+        };
+        assert_eq!(policy.delay_for_retry(1), Duration::from_secs(1));
+        assert_eq!(policy.delay_for_retry(2), Duration::from_secs(2));
+        assert_eq!(policy.delay_for_retry(3), Duration::from_secs(4));
+        assert_eq!(policy.delay_for_retry(5), Duration::from_secs(10));
+        assert_eq!(policy.delay_for_retry(u32::MAX), Duration::from_secs(10));
+
+        let jittered = StreamRetryPolicy {
+            use_jitter: true,
+            ..policy.clone()
+        };
+        for _ in 0..100 {
+            let delay = jittered.delay_for_retry(3);
+            assert!(delay >= Duration::from_secs(2) && delay <= Duration::from_secs(4));
+        }
+
+        let odd = StreamRetryPolicy {
+            backoff_multiplier: f64::NAN,
+            ..policy
+        };
+        assert_eq!(odd.delay_for_retry(4), Duration::from_secs(1));
+    }
+
+    /// A fake Pub/Sub endpoint that answers every gRPC call with `grpc_status`
+    /// (and an empty message when the status is OK), or never answers when
+    /// `grpc_status` is `None`.
+    #[cfg(feature = "google-pubsub")]
+    async fn fake_pubsub_server(grpc_status: Option<u32>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let Ok(mut connection) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok((_request, mut respond))) = connection.accept().await {
+                        let Some(code) = grpc_status else {
+                            // Hold the request open without answering.
+                            std::mem::forget(respond);
+                            continue;
+                        };
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .body(())
+                            .unwrap();
+                        let Ok(mut stream) = respond.send_response(response, false) else {
+                            continue;
+                        };
+                        if code == 0 {
+                            // An empty, uncompressed message: a default `Topic`.
+                            let _ = stream.send_data(bytes::Bytes::from_static(&[0; 5]), false);
+                        }
+                        let mut trailers = http::HeaderMap::new();
+                        trailers.insert("grpc-status", code.to_string().parse().unwrap());
+                        trailers.insert("grpc-message", "fake".parse().unwrap());
+                        let _ = stream.send_trailers(trailers);
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[cfg(feature = "google-pubsub")]
+    async fn pubsub_processor_for(addr: String) -> PubSubProcessor {
+        let mut config = HashMap::new();
+        config.insert("health.check.timeout.ms".to_string(), "500".to_string());
+        let client_config = PubSubClientConfig {
+            project_id: Some("test-project".to_string()),
+            environment: google_cloud_gax::conn::Environment::Emulator(addr),
+            ..Default::default()
+        };
+        PubSubProcessor::with_client_config(
+            "test-project".to_string(),
+            "test-topic".to_string(),
+            None,
+            config,
+            client_config,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "google-pubsub")]
+    #[tokio::test]
+    async fn test_pubsub_health_check_reports_topic_state() {
+        // Topic exists.
+        let processor = pubsub_processor_for(fake_pubsub_server(Some(0)).await).await;
+        assert!(processor.health_check().await.unwrap());
+
+        // NOT_FOUND: the topic does not exist.
+        let processor = pubsub_processor_for(fake_pubsub_server(Some(5)).await).await;
+        assert!(!processor.health_check().await.unwrap());
+
+        // UNAVAILABLE: Pub/Sub cannot be reached.
+        let processor = pubsub_processor_for(fake_pubsub_server(Some(14)).await).await;
+        assert!(!processor.health_check().await.unwrap());
+
+        // No answer at all: the health check times out instead of hanging.
+        let processor = pubsub_processor_for(fake_pubsub_server(None).await).await;
+        let started = std::time::Instant::now();
+        assert!(!processor.health_check().await.unwrap());
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // PERMISSION_DENIED: a configuration problem, reported as an error.
+        let processor = pubsub_processor_for(fake_pubsub_server(Some(7)).await).await;
+        match processor.health_check().await {
+            Err(HammerworkError::Streaming { message }) => {
+                assert!(message.contains("rejected"), "{message}");
+            }
+            other => panic!("expected a streaming error, got {other:?}"),
+        }
     }
 }
