@@ -104,20 +104,44 @@ EXECUTE stmt;
 DEALLOCATE PREPARE stmt;
 
 -- Indexes for main table archival queries (MySQL doesn't support IF NOT EXISTS for indexes)
--- Use DROP IF EXISTS followed by CREATE to ensure idempotency
-DROP INDEX IF EXISTS idx_hammerwork_jobs_archival_candidates ON hammerwork_jobs;
-CREATE INDEX idx_hammerwork_jobs_archival_candidates
-    ON hammerwork_jobs (status, completed_at, failed_at, created_at);
+-- Create each index only if it is missing to keep the migration idempotent
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND index_name = 'idx_hammerwork_jobs_archival_candidates') = 0,
+    'CREATE INDEX idx_hammerwork_jobs_archival_candidates ON hammerwork_jobs (status, completed_at, failed_at, created_at)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Index for finding jobs eligible for archival based on age and status
-DROP INDEX IF EXISTS idx_hammerwork_jobs_archival_completed ON hammerwork_jobs;
-CREATE INDEX idx_hammerwork_jobs_archival_completed
-    ON hammerwork_jobs (completed_at, status);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND index_name = 'idx_hammerwork_jobs_archival_completed') = 0,
+    'CREATE INDEX idx_hammerwork_jobs_archival_completed ON hammerwork_jobs (completed_at, status)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-DROP INDEX IF EXISTS idx_hammerwork_jobs_archival_failed ON hammerwork_jobs;
-CREATE INDEX idx_hammerwork_jobs_archival_failed
-    ON hammerwork_jobs (failed_at, status);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND index_name = 'idx_hammerwork_jobs_archival_failed') = 0,
+    'CREATE INDEX idx_hammerwork_jobs_archival_failed ON hammerwork_jobs (failed_at, status)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
-DROP INDEX IF EXISTS idx_hammerwork_jobs_archival_dead ON hammerwork_jobs;
-CREATE INDEX idx_hammerwork_jobs_archival_dead
-    ON hammerwork_jobs (failed_at, status);
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND index_name = 'idx_hammerwork_jobs_archival_dead') = 0,
+    'CREATE INDEX idx_hammerwork_jobs_archival_dead ON hammerwork_jobs (failed_at, status)',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;

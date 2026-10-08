@@ -4,7 +4,7 @@ use super::{Migration, MigrationRecord, MigrationRunner};
 use crate::Result;
 use chrono::Utc;
 use sqlparser::{dialect::MySqlDialect, parser::Parser};
-use sqlx::{MySqlPool, Row};
+use sqlx::{Executor, MySqlPool, Row};
 use tracing::{debug, info, warn};
 
 /// Parse SQL text into individual statements using sqlparser-rs for MySQL
@@ -74,7 +74,9 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
                 migration.id
             );
 
-            sqlx::query(&full_statement).execute(&mut *tx).await?;
+            // Use the text protocol: dynamic DDL (PREPARE/EXECUTE/DEALLOCATE) is not
+            // supported through MySQL's prepared statement protocol.
+            tx.execute(full_statement.as_str()).await?;
         }
 
         tx.commit().await?;

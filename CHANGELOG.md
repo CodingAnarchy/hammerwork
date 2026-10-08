@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **🔧 MySQL 8 migrations**
+  - Migration statements now run over the text protocol, so the `PREPARE`/`EXECUTE` blocks in migration 010 no longer fail with error 1295
+  - Replaced MariaDB-only `DROP INDEX IF EXISTS` (010) and `ADD COLUMN IF NOT EXISTS` (011) syntax with MySQL 8 compatible statements
+
 ## [1.15.5] - 2025-08-29
 
 ### Fixed
