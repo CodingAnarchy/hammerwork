@@ -593,77 +593,72 @@ impl DeadJobRow {
     }
 }
 
-#[async_trait]
-impl DatabaseQueue for crate::queue::JobQueue<MySql> {
-    type Database = MySql;
+/// Number of attempts for a job claim that keeps hitting InnoDB deadlocks.
+const CLAIM_DEADLOCK_ATTEMPTS: u32 = 5;
 
-    async fn enqueue(&self, job: Job) -> Result<JobId> {
-        sqlx::query(
-            r#"
-            INSERT INTO hammerwork_jobs 
-            (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#
-        )
-        .bind(job.id.to_string())
-        .bind(&job.queue_name)
-        .bind(&job.payload)
-        .bind(job.status)
-        .bind(job.priority.as_i32())
-        .bind(job.attempts)
-        .bind(job.max_attempts)
-        .bind(job.timeout.map(|t| t.as_secs() as i32))
-        .bind(job.created_at)
-        .bind(job.scheduled_at)
-        .bind(job.started_at)
-        .bind(job.completed_at)
-        .bind(job.failed_at)
-        .bind(job.timed_out_at)
-        .bind(&job.error_message)
-        .bind(&job.cron_schedule)
-        .bind(job.next_run_at)
-        .bind(job.recurring)
-        .bind(&job.timezone)
-        .bind(None::<String>) // batch_id is None for individual jobs
-        .bind(match job.result_config.storage {
-            crate::job::ResultStorage::Database => "database",
-            crate::job::ResultStorage::Memory => "memory",
-            crate::job::ResultStorage::None => "none",
-        })
-        .bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
-        .bind(job.result_config.max_size_bytes.map(|s| s as i64))
-        .bind(serde_json::to_value(&job.depends_on)?)
-        .bind(serde_json::to_value(&job.dependents)?)
-        .bind(job.dependency_status.as_str())
-        .bind(job.workflow_id.map(|id| id.to_string()))
-        .bind(&job.workflow_name)
-        .bind(&job.trace_id)
-        .bind(&job.correlation_id)
-        .bind(&job.parent_span_id)
-        .bind(&job.span_context)
-        .execute(&self.pool)
-        .await?;
+/// Whether an error is an InnoDB deadlock (SQLSTATE 40001, error 1213), which is safe to retry.
+fn is_deadlock(error: &crate::HammerworkError) -> bool {
+    matches!(
+        error,
+        crate::HammerworkError::Database(sqlx::Error::Database(db_error))
+            if db_error.code().as_deref() == Some("40001")
+    )
+}
 
-        Ok(job.id)
+/// Runs a job claim, retrying with a short backoff when InnoDB aborts it as a deadlock
+/// victim. Concurrent `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` claims can still
+/// deadlock on secondary index locks; the aborted transaction has been rolled back, so
+/// retrying is safe.
+async fn retry_on_deadlock<F, Fut, T>(mut claim: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        match claim().await {
+            Err(error) if attempt < CLAIM_DEADLOCK_ATTEMPTS && is_deadlock(&error) => {
+                tokio::time::sleep(Duration::from_millis(5 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+impl crate::queue::JobQueue<MySql> {
+    /// Starts the transaction used to claim jobs.
+    ///
+    /// It runs at READ COMMITTED: under the default REPEATABLE READ, the claim's locking
+    /// read takes next-key (gap) locks that make concurrent workers deadlock far more often.
+    async fn begin_claim_transaction(
+        conn: &mut sqlx::pool::PoolConnection<MySql>,
+    ) -> Result<sqlx::Transaction<'_, MySql>> {
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut **conn)
+            .await?;
+        Ok(sqlx::Connection::begin(&mut **conn).await?)
     }
 
-    async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
+    async fn dequeue_attempt(&self, queue_name: &str) -> Result<Option<Job>> {
         use crate::job::JobStatus;
 
-        // MySQL doesn't support FOR UPDATE SKIP LOCKED in the same way
-        // This is a simplified version - in production you might want advisory locks
-        let mut tx = self.pool.begin().await?;
+        // Lock and claim in one transaction. SKIP LOCKED (MySQL 8.0+) lets concurrent
+        // workers move past rows another worker is claiming instead of blocking on them.
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = Self::begin_claim_transaction(&mut conn).await?;
 
         let row = sqlx::query_as::<_, JobRow>(&format!(
             r#"
             SELECT {}
-            FROM hammerwork_jobs 
-            WHERE queue_name = ? 
-            AND status = ? 
-            AND scheduled_at <= ?
-            ORDER BY priority DESC, scheduled_at ASC 
+            FROM hammerwork_jobs
+            WHERE queue_name = ?
+              AND status = ?
+              AND scheduled_at <= ?
+              AND (dependency_status = 'none' OR dependency_status = 'satisfied')
+            ORDER BY priority DESC, scheduled_at ASC
             LIMIT 1
-            FOR UPDATE
+            FOR UPDATE SKIP LOCKED
             "#,
             JOB_SELECT_FIELDS
         ))
@@ -699,7 +694,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         }
     }
 
-    async fn dequeue_with_priority_weights(
+    async fn dequeue_with_priority_weights_attempt(
         &self,
         queue_name: &str,
         weights: &crate::priority::PriorityWeights,
@@ -712,19 +707,21 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             return self.dequeue(queue_name).await;
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = Self::begin_claim_transaction(&mut conn).await?;
 
         // Get available jobs by priority
         let available_jobs = sqlx::query_as::<_, JobRow>(&format!(
             r#"
             SELECT {}
-            FROM hammerwork_jobs 
-            WHERE queue_name = ? 
-            AND status = ? 
-            AND scheduled_at <= ?
-            ORDER BY priority DESC, scheduled_at ASC 
+            FROM hammerwork_jobs
+            WHERE queue_name = ?
+              AND status = ?
+              AND scheduled_at <= ?
+              AND (dependency_status = 'none' OR dependency_status = 'satisfied')
+            ORDER BY priority DESC, scheduled_at ASC
             LIMIT 20
-            FOR UPDATE
+            FOR UPDATE SKIP LOCKED
             "#,
             JOB_SELECT_FIELDS
         ))
@@ -802,6 +799,73 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         tx.rollback().await?;
         Ok(None)
+    }
+}
+
+#[async_trait]
+impl DatabaseQueue for crate::queue::JobQueue<MySql> {
+    type Database = MySql;
+
+    async fn enqueue(&self, job: Job) -> Result<JobId> {
+        sqlx::query(
+            r#"
+            INSERT INTO hammerwork_jobs 
+            (id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#
+        )
+        .bind(job.id.to_string())
+        .bind(&job.queue_name)
+        .bind(&job.payload)
+        .bind(job.status)
+        .bind(job.priority.as_i32())
+        .bind(job.attempts)
+        .bind(job.max_attempts)
+        .bind(job.timeout.map(|t| t.as_secs() as i32))
+        .bind(job.created_at)
+        .bind(job.scheduled_at)
+        .bind(job.started_at)
+        .bind(job.completed_at)
+        .bind(job.failed_at)
+        .bind(job.timed_out_at)
+        .bind(&job.error_message)
+        .bind(&job.cron_schedule)
+        .bind(job.next_run_at)
+        .bind(job.recurring)
+        .bind(&job.timezone)
+        .bind(None::<String>) // batch_id is None for individual jobs
+        .bind(match job.result_config.storage {
+            crate::job::ResultStorage::Database => "database",
+            crate::job::ResultStorage::Memory => "memory",
+            crate::job::ResultStorage::None => "none",
+        })
+        .bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
+        .bind(job.result_config.max_size_bytes.map(|s| s as i64))
+        .bind(serde_json::to_value(&job.depends_on)?)
+        .bind(serde_json::to_value(&job.dependents)?)
+        .bind(job.dependency_status.as_str())
+        .bind(job.workflow_id.map(|id| id.to_string()))
+        .bind(&job.workflow_name)
+        .bind(&job.trace_id)
+        .bind(&job.correlation_id)
+        .bind(&job.parent_span_id)
+        .bind(&job.span_context)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(job.id)
+    }
+
+    async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
+        retry_on_deadlock(|| self.dequeue_attempt(queue_name)).await
+    }
+
+    async fn dequeue_with_priority_weights(
+        &self,
+        queue_name: &str,
+        weights: &crate::priority::PriorityWeights,
+    ) -> Result<Option<Job>> {
+        retry_on_deadlock(|| self.dequeue_with_priority_weights_attempt(queue_name, weights)).await
     }
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {

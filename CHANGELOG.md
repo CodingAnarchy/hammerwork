@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing`: `shutdown_tracing()` now flushes and shuts down the provider installed by `init_tracing()` (OpenTelemetry 0.33 removed the global shutdown hook). Code that uses the `opentelemetry` crates directly alongside Hammerwork must move to 0.33.
 
 ### Fixed
+- **🚨 Duplicate job execution with weighted priority dequeue (PostgreSQL)**: `dequeue_with_priority_weights` ran its `FOR UPDATE SKIP LOCKED` candidate query outside a transaction, so the row locks were released before the claiming `UPDATE`, and that `UPDATE` didn't check the job's status. Concurrent workers could claim and run the same job more than once. In a 16-worker test, 76 of 200 jobs ran more than once. Workers configured with non-strict `PriorityWeights` (including those built through `Worker::with_config`) used this path. The lock and claim now happen in one transaction, and the claim requires `status = 'Pending'`.
+- Weighted dequeue on PostgreSQL returned jobs with default values for result storage, dependencies, workflow and trace fields, so job results were not stored. The job is now built from the full row.
+- MySQL dequeues and the PostgreSQL weighted dequeue ignored `dependency_status` and could run a job before its dependencies completed.
+- MySQL dequeues now use `FOR UPDATE SKIP LOCKED` (MySQL 8.0+), so concurrent workers skip rows being claimed instead of blocking on them.
+- MySQL job claims run at READ COMMITTED and retry when InnoDB aborts them as deadlock victims (error 1213), which concurrent workers otherwise hit intermittently.
 - **Archiving ([#14](https://github.com/CodingAnarchy/hammerwork/issues/14))**, PostgreSQL and MySQL:
   - `archive_jobs` now moves jobs: the archive insert and the delete from `hammerwork_jobs` run in one transaction, and candidates are selected with `FOR UPDATE SKIP LOCKED` so concurrent archivers do not collide. Previously the row stayed in `hammerwork_jobs` with its old status.
   - `get_job` falls back to the archive table and returns archived jobs with `JobStatus::Archived` (previously it returned the stale pre-archive row)

@@ -778,39 +778,46 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             return self.dequeue(queue_name).await;
         }
 
-        // Get available jobs by priority
-        let query = format!(
+        // Lock up to 20 runnable candidates and claim one of them in the same
+        // transaction, so the row locks taken by `FOR UPDATE SKIP LOCKED` are held
+        // until the claim commits. Without the transaction, the locks are released as
+        // soon as the SELECT finishes and two workers can claim the same job.
+        let mut tx = self.pool.begin().await?;
+
+        let candidates = sqlx::query(
             r#"
-            SELECT {}
-            FROM hammerwork_jobs 
-            WHERE queue_name = $1 
-            AND status = $2 
-            AND scheduled_at <= $3
-            ORDER BY priority DESC, scheduled_at ASC 
+            SELECT id, priority
+            FROM hammerwork_jobs
+            WHERE queue_name = $1
+              AND status = $2
+              AND scheduled_at <= $3
+              AND (dependency_status = 'none' OR dependency_status = 'satisfied')
+            ORDER BY priority DESC, scheduled_at ASC
             LIMIT 20
             FOR UPDATE SKIP LOCKED
             "#,
-            JOB_SELECT_FIELDS
-        );
-        let available_jobs = sqlx::query(&query)
-            .bind(queue_name)
-            .bind(JobStatus::Pending)
-            .bind(Utc::now())
-            .fetch_all(&self.pool)
-            .await?;
+        )
+        .bind(queue_name)
+        .bind(JobStatus::Pending)
+        .bind(Utc::now())
+        .fetch_all(&mut *tx)
+        .await?;
 
-        if available_jobs.is_empty() {
+        if candidates.is_empty() {
+            tx.rollback().await?;
             return Ok(None);
         }
 
-        // Group jobs by priority and apply weighted selection
-        let mut priority_jobs: std::collections::HashMap<JobPriority, Vec<_>> =
+        // Group candidate ids by priority, keeping the oldest-first order from the query
+        let mut priority_jobs: std::collections::HashMap<JobPriority, Vec<uuid::Uuid>> =
             std::collections::HashMap::new();
-
-        for row in available_jobs {
-            let priority_val: i32 = row.get("priority");
+        for row in &candidates {
+            let priority_val: i32 = row.try_get("priority")?;
             let priority = JobPriority::from_i32(priority_val).unwrap_or(JobPriority::Normal);
-            priority_jobs.entry(priority).or_default().push(row);
+            priority_jobs
+                .entry(priority)
+                .or_default()
+                .push(row.try_get("id")?);
         }
 
         // Calculate weighted selection
@@ -823,6 +830,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         }
 
         if weighted_choices.is_empty() {
+            tx.rollback().await?;
             return Ok(None);
         }
 
@@ -840,115 +848,29 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         };
         let selected_priority = weighted_choices[selection_index];
 
-        // Select the oldest job from the selected priority
-        if let Some(jobs) = priority_jobs.get(selected_priority) {
-            if let Some(selected_row) = jobs.first() {
-                let job_id: uuid::Uuid = selected_row.get("id");
+        let Some(&job_id) = priority_jobs
+            .get(selected_priority)
+            .and_then(|ids| ids.first())
+        else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
 
-                // Update the selected job
-                let query = format!(
-                    "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 WHERE id = $3 RETURNING {}",
-                    JOB_SELECT_FIELDS
-                );
-                let updated_row = sqlx::query(&query)
-                    .bind(JobStatus::Running)
-                    .bind(Utc::now())
-                    .bind(job_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
+        let claimed = sqlx::query_as::<_, JobRow>(&format!(
+            "UPDATE hammerwork_jobs SET status = $1, started_at = $2, attempts = attempts + 1 \
+             WHERE id = $3 AND status = $4 RETURNING {}",
+            JOB_SELECT_FIELDS
+        ))
+        .bind(JobStatus::Running)
+        .bind(Utc::now())
+        .bind(job_id)
+        .bind(JobStatus::Pending)
+        .fetch_optional(&mut *tx)
+        .await?;
 
-                if let Some(row) = updated_row {
-                    let id: uuid::Uuid = row.get("id");
-                    let queue_name: String = row.get("queue_name");
-                    let payload: serde_json::Value = row.get("payload");
-                    let status: String = row.get("status");
-                    let priority: i32 = row.get("priority");
-                    let attempts: i32 = row.get("attempts");
-                    let max_attempts: i32 = row.get("max_attempts");
-                    let timeout_seconds: Option<i32> = row.get("timeout_seconds");
-                    let created_at: DateTime<Utc> = row.get("created_at");
-                    let scheduled_at: DateTime<Utc> = row.get("scheduled_at");
-                    let started_at: Option<DateTime<Utc>> = row.get("started_at");
-                    let completed_at: Option<DateTime<Utc>> = row.get("completed_at");
-                    let failed_at: Option<DateTime<Utc>> = row.get("failed_at");
-                    let timed_out_at: Option<DateTime<Utc>> = row.get("timed_out_at");
-                    let error_message: Option<String> = row.get("error_message");
-                    let cron_schedule: Option<String> = row.get("cron_schedule");
-                    let next_run_at: Option<DateTime<Utc>> = row.get("next_run_at");
-                    let recurring: bool = row.get("recurring");
-                    let timezone: Option<String> = row.get("timezone");
-                    let batch_id: Option<uuid::Uuid> = row.get("batch_id");
-                    let result_data: Option<serde_json::Value> = row.get("result_data");
-                    let result_stored_at: Option<DateTime<Utc>> = row.get("result_stored_at");
-                    let result_expires_at: Option<DateTime<Utc>> = row.get("result_expires_at");
+        tx.commit().await?;
 
-                    return Ok(Some(Job {
-                        id,
-                        queue_name,
-                        payload,
-                        status: {
-                            // Handle both quoted (old format) and unquoted (new format) status values
-                            let cleaned_str = status.trim_matches('"');
-                            match cleaned_str {
-                                "Pending" => JobStatus::Pending,
-                                "Running" => JobStatus::Running,
-                                "Completed" => JobStatus::Completed,
-                                "Failed" => JobStatus::Failed,
-                                "Dead" => JobStatus::Dead,
-                                "TimedOut" => JobStatus::TimedOut,
-                                "Retrying" => JobStatus::Retrying,
-                                "Archived" => JobStatus::Archived,
-                                _ => {
-                                    return Err(crate::error::HammerworkError::Processing(
-                                        format!("Unknown job status: {}", cleaned_str),
-                                    ));
-                                }
-                            }
-                        },
-                        priority: JobPriority::from_i32(priority).unwrap_or(JobPriority::Normal),
-                        attempts,
-                        max_attempts,
-                        created_at,
-                        scheduled_at,
-                        started_at,
-                        completed_at,
-                        failed_at,
-                        timed_out_at,
-                        timeout: timeout_seconds.map(|s| std::time::Duration::from_secs(s as u64)),
-                        error_message,
-                        cron_schedule,
-                        next_run_at,
-                        recurring,
-                        timezone,
-                        batch_id,
-                        result_config: crate::job::ResultConfig::default(),
-                        result_data,
-                        result_stored_at,
-                        result_expires_at,
-                        retry_strategy: None,
-                        depends_on: Vec::new(),
-                        dependents: Vec::new(),
-                        dependency_status: crate::workflow::DependencyStatus::None,
-                        workflow_id: None,
-                        workflow_name: None,
-                        trace_id: None,
-                        correlation_id: None,
-                        parent_span_id: None,
-                        span_context: None,
-                        #[cfg(feature = "encryption")]
-                        encryption_config: None,
-                        pii_fields: Vec::new(),
-                        #[cfg(feature = "encryption")]
-                        retention_policy: None,
-                        is_encrypted: false,
-                        #[cfg(feature = "encryption")]
-                        encrypted_payload: None,
-                    }));
-                }
-            }
-        }
-
-        Ok(None)
+        claimed.map(JobRow::into_job).transpose()
     }
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
