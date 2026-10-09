@@ -70,7 +70,7 @@ pub struct MetricsConfig {
     pub exposition_addr: Option<SocketAddr>,
     /// Custom metric labels to include
     pub custom_labels: HashMap<String, String>,
-    /// Whether to collect detailed timing histograms
+    /// Whether to record job durations in `hammerwork_job_duration_seconds`
     pub collect_histograms: bool,
     /// Custom gauge metric names to track
     pub custom_gauges: Vec<String>,
@@ -156,8 +156,32 @@ pub struct PrometheusMetricsCollector {
 #[cfg(feature = "metrics")]
 impl PrometheusMetricsCollector {
     /// Create a new Prometheus metrics collector
+    ///
+    /// `custom_labels` are added to every metric as constant labels. Fails with
+    /// [`HammerworkError::Metrics`] when a label or custom metric name is not a valid
+    /// Prometheus name, or a custom metric name is used twice.
     pub fn new(config: MetricsConfig) -> Result<Self> {
-        let registry = Registry::new();
+        if let Some(name) = config.custom_labels.keys().find(|name| {
+            let mut chars = name.chars();
+            !chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                || name.starts_with("__")
+        }) {
+            return Err(HammerworkError::Metrics {
+                message: format!("Invalid custom metric label name: {name:?}"),
+            });
+        }
+        let registry = if config.custom_labels.is_empty() {
+            Registry::new()
+        } else {
+            Registry::new_custom(None, Some(config.custom_labels.clone())).map_err(|e| {
+                HammerworkError::Metrics {
+                    message: format!("Invalid custom metric labels: {}", e),
+                }
+            })?
+        };
 
         // Register core job metrics
         let jobs_total = prometheus::CounterVec::new(
@@ -330,7 +354,9 @@ impl PrometheusMetricsCollector {
                     .with_label_values(&[queue.as_str(), "completed", priority.as_str()])
                     .inc();
 
-                if let Some(duration_ms) = event.processing_time_ms {
+                if let Some(duration_ms) = event.processing_time_ms
+                    && self.config.collect_histograms
+                {
                     let duration_secs = duration_ms as f64 / 1000.0;
                     self.jobs_duration
                         .with_label_values(&[queue.as_str(), priority.as_str()])
@@ -432,7 +458,13 @@ impl PrometheusMetricsCollector {
     }
 
     /// Register custom metrics based on configuration
+    ///
+    /// Called from `new`, before the collector is shared, so the maps are filled
+    /// directly (this must not block on a runtime: `new` is synchronous).
     fn register_custom_metrics(&mut self) -> Result<()> {
+        let mut gauges = HashMap::new();
+        let mut histograms = HashMap::new();
+
         // Register custom gauges
         for gauge_name in &self.config.custom_gauges {
             let gauge = prometheus::GaugeVec::new(
@@ -455,13 +487,7 @@ impl PrometheusMetricsCollector {
                     ),
                 })?;
 
-            tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async {
-                    let mut gauges = self.custom_gauges.write().await;
-                    gauges.insert(gauge_name.clone(), gauge);
-                });
-            });
+            gauges.insert(gauge_name.clone(), gauge);
         }
 
         // Register custom histograms
@@ -489,15 +515,11 @@ impl PrometheusMetricsCollector {
                     ),
                 })?;
 
-            tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async {
-                    let mut histograms = self.custom_histograms.write().await;
-                    histograms.insert(histogram_name.clone(), histogram);
-                });
-            });
+            histograms.insert(histogram_name.clone(), histogram);
         }
 
+        self.custom_gauges = Arc::new(RwLock::new(gauges));
+        self.custom_histograms = Arc::new(RwLock::new(histograms));
         Ok(())
     }
 
@@ -768,5 +790,297 @@ mod tests {
                 .custom_histograms
                 .contains(&"response_size".to_string())
         );
+    }
+
+    #[test]
+    fn test_metrics_config_serde_roundtrip() {
+        let config = MetricsConfig::new()
+            .with_prometheus_exporter("127.0.0.1:9464".parse().unwrap())
+            .with_update_interval(Duration::from_secs(42));
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["exposition_addr"], "127.0.0.1:9464");
+        assert_eq!(json["update_interval"], 42);
+        let back: MetricsConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.exposition_addr, config.exposition_addr);
+        assert_eq!(back.update_interval, Duration::from_secs(42));
+
+        // No address: omitted when serializing, `None` when missing.
+        let json = serde_json::to_value(MetricsConfig::new()).unwrap();
+        assert!(json.get("exposition_addr").is_none());
+        let back: MetricsConfig = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.exposition_addr.is_none());
+
+        let mut bad = json;
+        bad["exposition_addr"] = "not an address".into();
+        assert!(serde_json::from_value::<MetricsConfig>(bad).is_err());
+    }
+
+    #[cfg(feature = "metrics")]
+    fn event(event_type: JobEventType, error: Option<&str>, ms: Option<u64>) -> JobEvent {
+        JobEvent {
+            job_id: uuid::Uuid::new_v4(),
+            queue_name: "q".to_string(),
+            event_type,
+            priority: crate::priority::JobPriority::High,
+            processing_time_ms: ms,
+            error_message: error.map(str::to_string),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// The value of the sample line starting with `prefix` and containing `labels`.
+    #[cfg(feature = "metrics")]
+    fn sample(text: &str, prefix: &str, labels: &[&str]) -> Option<f64> {
+        text.lines()
+            .filter(|line| !line.starts_with('#'))
+            .find(|line| {
+                line.starts_with(prefix) && labels.iter().all(|label| line.contains(label))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_record_job_event_counts_every_outcome() {
+        let collector = PrometheusMetricsCollector::new(MetricsConfig::new()).unwrap();
+        for e in [
+            event(JobEventType::Started, None, None),
+            event(JobEventType::Completed, None, Some(250)),
+            event(JobEventType::Failed, Some("request timeout"), None),
+            event(JobEventType::Failed, Some("connection reset"), None),
+            event(JobEventType::Failed, Some("bad input"), None),
+            event(JobEventType::Failed, None, None),
+            event(JobEventType::TimedOut, Some("timed out"), None),
+            event(JobEventType::Dead, Some("gave up"), None),
+            event(JobEventType::Retried, Some("again"), None),
+        ] {
+            collector.record_job_event(&e).await.unwrap();
+        }
+        let text = collector.get_metrics_text().unwrap();
+        let total = |status: &str| {
+            sample(
+                &text,
+                "hammerwork_jobs_total",
+                &[&format!("status=\"{status}\""), "priority=\"high\""],
+            )
+        };
+        assert_eq!(total("started"), Some(1.0));
+        assert_eq!(total("completed"), Some(1.0));
+        assert_eq!(total("failed"), Some(4.0));
+        assert_eq!(total("timed_out"), Some(1.0));
+        assert_eq!(total("dead"), Some(1.0));
+        assert_eq!(total("retried"), Some(1.0));
+
+        let failed = |error_type: &str| {
+            sample(
+                &text,
+                "hammerwork_jobs_failed_total",
+                &[&format!("error_type=\"{error_type}\"")],
+            )
+        };
+        // A timed-out job and a failure mentioning a timeout are both "timeout".
+        assert_eq!(failed("timeout"), Some(2.0));
+        assert_eq!(failed("connection"), Some(1.0));
+        assert_eq!(failed("other"), Some(1.0));
+        assert_eq!(failed("unknown"), Some(1.0));
+        assert_eq!(failed("exhausted"), Some(1.0));
+
+        assert_eq!(
+            sample(
+                &text,
+                "hammerwork_job_duration_seconds_sum",
+                &["queue=\"q\""]
+            ),
+            Some(0.25)
+        );
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_collect_histograms_false_skips_durations() {
+        let collector = PrometheusMetricsCollector::new(MetricsConfig {
+            collect_histograms: false,
+            ..MetricsConfig::new()
+        })
+        .unwrap();
+        collector
+            .record_job_event(&event(JobEventType::Completed, None, Some(250)))
+            .await
+            .unwrap();
+        let text = collector.get_metrics_text().unwrap();
+        assert_eq!(
+            sample(&text, "hammerwork_jobs_total", &["status=\"completed\""]),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(&text, "hammerwork_job_duration_seconds_count", &[]),
+            None
+        );
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_gauges_and_custom_metrics_are_exported() {
+        let collector = PrometheusMetricsCollector::new(
+            MetricsConfig::new()
+                .with_custom_gauges(vec!["backlog_bytes"])
+                .with_histograms(vec!["payload_size"]),
+        )
+        .unwrap();
+        collector.update_queue_depth("q", 42).await.unwrap();
+        collector
+            .update_worker_utilization("q", "worker-1", 0.75)
+            .await
+            .unwrap();
+        collector
+            .update_custom_gauge("backlog_bytes", "q", 1024.0)
+            .await
+            .unwrap();
+        collector
+            .observe_custom_histogram("payload_size", "q", 3.0)
+            .await
+            .unwrap();
+        // Unknown custom metrics are ignored.
+        collector
+            .update_custom_gauge("missing", "q", 1.0)
+            .await
+            .unwrap();
+        collector
+            .observe_custom_histogram("missing", "q", 1.0)
+            .await
+            .unwrap();
+
+        let text = collector.get_metrics_text().unwrap();
+        assert_eq!(
+            sample(&text, "hammerwork_queue_depth", &["queue=\"q\""]),
+            Some(42.0)
+        );
+        assert_eq!(
+            sample(
+                &text,
+                "hammerwork_worker_utilization",
+                &["worker_id=\"worker-1\""]
+            ),
+            Some(0.75)
+        );
+        assert_eq!(sample(&text, "hammerwork_backlog_bytes", &[]), Some(1024.0));
+        assert_eq!(sample(&text, "hammerwork_payload_size_sum", &[]), Some(3.0));
+        assert!(!text.contains("hammerwork_missing"));
+    }
+
+    /// `new` is synchronous: registering custom metrics must not need (or block) a
+    /// Tokio runtime. It used `block_in_place`, which panics outside a multi-threaded
+    /// runtime.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_custom_metrics_without_a_runtime() {
+        let collector = PrometheusMetricsCollector::new(
+            MetricsConfig::new()
+                .with_custom_gauges(vec!["g"])
+                .with_histograms(vec!["h"]),
+        )
+        .unwrap();
+        assert!(collector.get_metrics_text().is_ok());
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_custom_metrics_on_a_current_thread_runtime() {
+        let collector =
+            PrometheusMetricsCollector::new(MetricsConfig::new().with_custom_gauges(vec!["g"]))
+                .unwrap();
+        collector.update_custom_gauge("g", "q", 2.0).await.unwrap();
+        let text = collector.get_metrics_text().unwrap();
+        assert_eq!(sample(&text, "hammerwork_g", &["queue=\"q\""]), Some(2.0));
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_custom_labels_apply_to_every_metric() {
+        let labels = HashMap::from([("service".to_string(), "billing".to_string())]);
+        let collector = PrometheusMetricsCollector::new(
+            MetricsConfig::new()
+                .with_labels(labels)
+                .with_custom_gauges(vec!["g"]),
+        )
+        .unwrap();
+        collector.update_queue_depth("q", 1).await.unwrap();
+        collector.update_custom_gauge("g", "q", 1.0).await.unwrap();
+        collector
+            .record_job_event(&event(JobEventType::Completed, None, None))
+            .await
+            .unwrap();
+        let text = collector.get_metrics_text().unwrap();
+        let samples: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert!(samples.len() >= 3);
+        for line in samples {
+            assert!(line.contains("service=\"billing\""), "{line}");
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_invalid_names_are_rejected() {
+        for config in [
+            MetricsConfig::new().with_custom_gauges(vec!["bad-name"]),
+            MetricsConfig::new().with_histograms(vec!["bad name"]),
+            MetricsConfig::new().with_custom_gauges(vec!["dup", "dup"]),
+            MetricsConfig::new()
+                .with_labels(HashMap::from([("bad-label".to_string(), "x".to_string())])),
+        ] {
+            let err = PrometheusMetricsCollector::new(config.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{config:?} should be rejected"));
+            assert!(matches!(err, HammerworkError::Metrics { .. }), "{err}");
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_exposition_server_serves_metrics_over_http() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let mut collector =
+            PrometheusMetricsCollector::new(MetricsConfig::new().with_prometheus_exporter(addr))
+                .unwrap();
+        collector.start_exposition_server().await.unwrap();
+        collector.update_queue_depth("served", 7).await.unwrap();
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.to_lowercase().contains("content-type: text/plain"));
+        assert!(response.contains("hammerwork_queue_depth{queue=\"served\"} 7"));
+
+        // Dropping the collector stops the server.
+        drop(collector);
+        let stopped = async {
+            loop {
+                if tokio::net::TcpStream::connect(addr).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), stopped)
+            .await
+            .expect("the server stops with the collector");
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn test_exposition_server_without_address_is_a_noop() {
+        let mut collector = PrometheusMetricsCollector::new(MetricsConfig::new()).unwrap();
+        collector.start_exposition_server().await.unwrap();
+        assert!(collector.server_handle.is_none());
     }
 }
