@@ -428,8 +428,11 @@ cargo hammerwork workflow list --limit 20
 # Show workflow details, optionally with the dependency graph
 cargo hammerwork workflow show <workflow_id> --dependencies
 
-# Create an empty workflow record
-cargo hammerwork workflow create --name nightly_etl --failure-policy continue_on_failure
+# Create a workflow and enqueue its jobs in one transaction. jobs.json is a JSON array of
+# {"queue", "payload", "priority"?, "depends_on"?} objects; depends_on lists the indexes of
+# earlier jobs, e.g. [{"queue": "etl", "payload": {"step": "extract"}},
+#                     {"queue": "etl", "payload": {"step": "load"}, "depends_on": [0]}]
+cargo hammerwork workflow create --name nightly_etl --jobs-file jobs.json --failure-policy continue_on_failure
 
 # Show a job's dependencies (--tree for the full tree, --dependents for jobs that wait on it)
 cargo hammerwork workflow dependencies <job_id> --tree

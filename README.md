@@ -474,13 +474,13 @@ Hammerwork provides a migration system for progressive schema updates:
 
 ```bash
 # Build the migration tool
-cargo build --bin cargo-hammerwork --features postgres
+cargo install --path cargo-hammerwork
 
 # Run migrations
-cargo hammerwork migrate --database-url postgresql://localhost/hammerwork
+cargo hammerwork migration run --database-url postgresql://localhost/hammerwork
 
 # Check migration status
-cargo hammerwork status --database-url postgresql://localhost/hammerwork
+cargo hammerwork migration status --database-url postgresql://localhost/hammerwork
 
 # Start the web dashboard after migrations
 hammerwork-web --database-url postgresql://localhost/hammerwork --no-auth
