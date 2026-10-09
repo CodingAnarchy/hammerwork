@@ -34,7 +34,8 @@
 //!         .with_bind_address("0.0.0.0", 9090)
 //!         .with_database_url("postgresql://localhost/hammerwork")
 //!         .with_auth("admin", "$2b$12$hash...")
-//!         .with_cors(true);
+//!         .with_cors(true)
+//!         .with_allowed_origin("https://ops.example.com");
 //!
 //!     let dashboard = WebDashboard::new(config).await?;
 //!     dashboard.start().await?;
@@ -48,6 +49,7 @@ use crate::{
     api::system::SystemState,
     auth::{AuthState, auth_filter, handle_auth_rejection},
     config::DashboardConfig,
+    security::{AllowedOrigins, same_origin, same_origin_writes},
     websocket::WebSocketState,
 };
 #[cfg(any(feature = "postgres", feature = "mysql"))]
@@ -63,20 +65,29 @@ use warp::{Filter, Reply};
 /// Requests under `/api` and `/ws` never fall through to the single-page app, so a failed
 /// authentication or an unknown API path is answered as such (401, 404) instead of with the
 /// HTML page. Rejections are turned into replies by [`handle_auth_rejection`].
+///
+/// State-changing API requests and WebSocket handshakes that a browser sends from a page on
+/// another origin than the dashboard's own or one of `allowed_origins` are refused with 403
+/// (see [`crate::security`]).
 pub fn app_routes<Q>(
     queue: Arc<Q>,
     auth_state: AuthState,
     system_state: Arc<RwLock<SystemState>>,
     websocket_state: Arc<RwLock<WebSocketState>>,
     static_dir: std::path::PathBuf,
+    allowed_origins: AllowedOrigins,
 ) -> impl Filter<Extract = (impl Reply,), Error = std::convert::Infallible> + Clone
 where
     Q: api::history::JobHistory + 'static,
 {
-    let api_routes =
-        WebDashboard::create_api_routes_static(queue, auth_state.clone(), system_state);
+    let api_routes = WebDashboard::create_api_routes_static(
+        queue,
+        auth_state.clone(),
+        system_state,
+        allowed_origins.clone(),
+    );
     let websocket_routes =
-        WebDashboard::create_websocket_routes_static(websocket_state, auth_state);
+        WebDashboard::create_websocket_routes_static(websocket_state, auth_state, allowed_origins);
     let static_routes = WebDashboard::create_static_routes_static(static_dir);
 
     api_routes
@@ -115,6 +126,7 @@ pub struct WebDashboard {
     config: DashboardConfig,
     auth_state: AuthState,
     websocket_state: Arc<RwLock<WebSocketState>>,
+    allowed_origins: AllowedOrigins,
 }
 
 impl WebDashboard {
@@ -144,6 +156,7 @@ impl WebDashboard {
     /// Returns an error if the configuration is invalid or if initialization fails.
     pub async fn new(config: DashboardConfig) -> Result<Self> {
         config.validate()?;
+        let allowed_origins = AllowedOrigins::new(&config.allowed_origins)?;
         let auth_state = AuthState::new(config.auth.clone());
         let websocket_state = Arc::new(RwLock::new(WebSocketState::new(config.websocket.clone())));
 
@@ -151,6 +164,7 @@ impl WebDashboard {
             config,
             auth_state,
             websocket_state,
+            allowed_origins,
         })
     }
 
@@ -210,6 +224,7 @@ impl WebDashboard {
             system_state,
             self.websocket_state.clone(),
             self.config.static_dir.clone(),
+            self.allowed_origins.clone(),
         );
 
         info!("Starting web server on {}", bind_addr);
@@ -241,10 +256,11 @@ impl WebDashboard {
         WebSocketState::start_broadcast_listener(websocket_state_broadcast).await?;
 
         // Start the server. With CORS disabled no CORS filter is installed at all, so
-        // browsers apply their default same-origin policy.
+        // browsers apply their default same-origin policy. With it enabled, only the
+        // configured origins are granted access (validated in `new`).
         if self.config.enable_cors {
             let cors = warp::cors()
-                .allow_any_origin()
+                .allow_origins(self.allowed_origins.as_slice().iter().map(String::as_str))
                 .allow_headers(vec!["content-type", "authorization"])
                 .allow_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"]);
             warp::serve(routes.with(cors)).run(bind_addr).await;
@@ -260,6 +276,7 @@ impl WebDashboard {
         queue: Arc<Q>,
         auth_state: AuthState,
         system_state: Arc<RwLock<SystemState>>,
+        allowed_origins: AllowedOrigins,
     ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
     where
         Q: api::history::JobHistory + 'static,
@@ -284,6 +301,7 @@ impl WebDashboard {
             .or(api::archive::archive_routes(queue));
 
         let authenticated_api = warp::path("api")
+            .and(same_origin_writes(allowed_origins))
             .and(auth_filter(auth_state))
             .untuple_one()
             .and(api_routes);
@@ -291,25 +309,33 @@ impl WebDashboard {
         health.or(authenticated_api)
     }
 
-    /// Create WebSocket routes with authentication
+    /// Create WebSocket routes with authentication, an origin check (browsers on other
+    /// origins are refused, against cross-site WebSocket hijacking) and the configured
+    /// message size limit.
     fn create_websocket_routes_static(
         websocket_state: Arc<RwLock<WebSocketState>>,
         auth_state: AuthState,
+        allowed_origins: AllowedOrigins,
     ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone {
         warp::path("ws")
             .and(warp::path::end())
+            .and(same_origin(allowed_origins))
             .and(auth_filter(auth_state))
             .and(warp::ws())
             .and(warp::any().map(move || websocket_state.clone()))
-            .map(
-                |_: (), ws: warp::ws::Ws, websocket_state: Arc<RwLock<WebSocketState>>| {
-                    ws.on_upgrade(move |socket| async move {
+            .and_then(
+                |_: (), ws: warp::ws::Ws, websocket_state: Arc<RwLock<WebSocketState>>| async move {
+                    let max_message_size = websocket_state.read().await.config().max_message_size;
+                    let ws = ws
+                        .max_message_size(max_message_size)
+                        .max_frame_size(max_message_size);
+                    Ok::<_, warp::Rejection>(ws.on_upgrade(move |socket| async move {
                         if let Err(e) =
                             WebSocketState::serve_connection(websocket_state, socket).await
                         {
                             error!("WebSocket error: {}", e);
                         }
-                    })
+                    }))
                 },
             )
     }
@@ -393,7 +419,8 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_creation() {
         let temp_dir = tempdir().unwrap();
-        let config = DashboardConfig::new().with_static_dir(temp_dir.path().to_path_buf());
+        let mut config = DashboardConfig::new().with_static_dir(temp_dir.path().to_path_buf());
+        config.auth.enabled = cfg!(feature = "auth");
 
         let dashboard = WebDashboard::new(config).await;
         assert!(dashboard.is_ok());
@@ -425,5 +452,213 @@ mod tests {
     fn test_cors_configuration() {
         let config = DashboardConfig::new().with_cors(true);
         assert!(config.enable_cors);
+    }
+
+    #[tokio::test]
+    async fn new_rejects_cors_without_origins() {
+        let mut config = DashboardConfig::new().with_cors(true);
+        config.auth.enabled = false;
+        let err = WebDashboard::new(config)
+            .await
+            .err()
+            .expect("CORS without origins is refused");
+        assert!(err.to_string().contains("allowed_origins"), "{err}");
+    }
+
+    type Router = warp::filters::BoxedFilter<(Box<dyn Reply>,)>;
+
+    /// The full route tree over an unreachable database, without authentication.
+    fn routes(websocket: crate::config::WebSocketConfig) -> (Router, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "SPA").unwrap();
+        let config = DashboardConfig {
+            websocket: websocket.clone(),
+            ..DashboardConfig::new()
+        };
+        let system_state = Arc::new(RwLock::new(SystemState::new(
+            config.clone(),
+            "PostgreSQL".into(),
+            1,
+        )));
+        let auth = AuthState::new(crate::config::AuthConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let routes = app_routes(
+            crate::api::test_support::unreachable_queue(),
+            auth,
+            system_state,
+            Arc::new(RwLock::new(WebSocketState::new(websocket))),
+            dir.path().to_path_buf(),
+            AllowedOrigins::new(["https://ops.example.com"]).unwrap(),
+        )
+        .map(|reply| Box::new(reply) as Box<dyn Reply>)
+        .boxed();
+        (routes, dir)
+    }
+
+    fn post_job() -> warp::test::RequestBuilder {
+        let body = r#"{"queue_name": "q", "payload": {}}"#;
+        warp::test::request()
+            .method("POST")
+            .path("/api/jobs")
+            .header("host", "127.0.0.1:8080")
+            .header("content-length", body.len().to_string())
+            .body(body)
+    }
+
+    /// H8: state-changing requests from other origins, and bodies a cross-site form or
+    /// no-cors fetch could send, never reach a handler.
+    #[tokio::test]
+    async fn cross_site_writes_are_refused() {
+        let (routes, _dir) = routes(Default::default());
+        let status = |request: warp::test::RequestBuilder| {
+            let routes = routes.clone();
+            async move { request.reply(&routes).await.status().as_u16() }
+        };
+
+        // A type-less body (a no-cors fetch with a Blob) or a form post: 415.
+        assert_eq!(status(post_job()).await, 415);
+        assert_eq!(
+            status(post_job().header("content-type", "text/plain")).await,
+            415
+        );
+        // A cross-site page: 403, whatever the content type.
+        for site in ["cross-site", "same-site"] {
+            let request = post_job()
+                .header("content-type", "application/json")
+                .header("origin", "http://127.0.0.1:9999")
+                .header("sec-fetch-site", site);
+            assert_eq!(status(request).await, 403, "{site}");
+        }
+        let request = post_job()
+            .header("content-type", "application/json")
+            .header("origin", "http://evil.example");
+        assert_eq!(status(request).await, 403);
+        let bulk = warp::test::request()
+            .method("POST")
+            .path("/api/jobs/bulk")
+            .header("origin", "null")
+            .json(&serde_json::json!({"job_ids": [], "action": "delete"}));
+        assert_eq!(status(bulk).await, 403);
+        let purge = warp::test::request()
+            .method("DELETE")
+            .path("/api/archive/purge")
+            .header("sec-fetch-site", "cross-site")
+            .json(&serde_json::json!({"older_than": "2020-01-01T00:00:00Z", "dry_run": false}));
+        assert_eq!(status(purge).await, 403);
+
+        // The dashboard's own page, an allowed origin and non-browser clients get through
+        // (to the unreachable database: 500).
+        let own = post_job()
+            .header("content-type", "application/json")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("sec-fetch-site", "same-origin");
+        assert_eq!(status(own).await, 500);
+        let allowed = post_job()
+            .header("content-type", "application/json; charset=utf-8")
+            .header("origin", "https://ops.example.com")
+            .header("sec-fetch-site", "cross-site");
+        assert_eq!(status(allowed).await, 500);
+        let curl = post_job().header("content-type", "application/json");
+        assert_eq!(status(curl).await, 500);
+
+        // Reads are not affected.
+        let read = warp::test::request()
+            .path("/api/jobs")
+            .header("origin", "http://evil.example")
+            .header("sec-fetch-site", "cross-site");
+        assert_eq!(status(read).await, 500);
+    }
+
+    /// M11: request bodies are bounded.
+    #[tokio::test]
+    async fn oversized_bodies_are_refused() {
+        let (routes, _dir) = routes(Default::default());
+        let payload = "x".repeat(crate::security::MAX_JSON_BODY_BYTES as usize);
+        let response = warp::test::request()
+            .method("POST")
+            .path("/api/jobs")
+            .json(&serde_json::json!({"queue_name": "q", "payload": payload}))
+            .reply(&routes)
+            .await;
+        assert_eq!(response.status(), 413);
+
+        let ids: Vec<String> = (0..=crate::api::jobs::MAX_BULK_JOB_IDS)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        let response = warp::test::request()
+            .method("POST")
+            .path("/api/jobs/bulk")
+            .json(&serde_json::json!({"job_ids": ids, "action": "delete"}))
+            .reply(&routes)
+            .await;
+        assert_eq!(response.status(), 400);
+        let body = String::from_utf8_lossy(response.body()).to_string();
+        assert!(body.contains("Too many job IDs"), "{body}");
+    }
+
+    /// M12: the WebSocket handshake checks the origin.
+    #[tokio::test]
+    async fn websocket_handshakes_from_other_origins_are_refused() {
+        let (routes, _dir) = routes(Default::default());
+        // (The test client sends the request to a local address of its own choosing, so the
+        // origin of "our" page is declared with Sec-Fetch-Site.)
+        for (origin, site) in [
+            ("http://evil.example", Some("cross-site")),
+            ("http://evil.example", None),
+            ("null", None),
+        ] {
+            let mut hijack = warp::test::ws().path("/ws").header("origin", origin);
+            if let Some(site) = site {
+                hijack = hijack.header("sec-fetch-site", site);
+            }
+            assert!(
+                hijack.handshake(routes.clone()).await.is_err(),
+                "cross-site WebSocket hijacking from {origin} is refused"
+            );
+        }
+        let own = warp::test::ws()
+            .path("/ws")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("sec-fetch-site", "same-origin")
+            .handshake(routes.clone())
+            .await;
+        assert!(own.is_ok());
+        let allowed = warp::test::ws()
+            .path("/ws")
+            .header("origin", "https://ops.example.com")
+            .handshake(routes)
+            .await;
+        assert!(allowed.is_ok());
+    }
+
+    /// M12: messages above `max_message_size` end the connection instead of being buffered.
+    #[tokio::test]
+    async fn websocket_messages_are_size_limited() {
+        let (routes, _dir) = routes(crate::config::WebSocketConfig {
+            max_message_size: 1024,
+            ..Default::default()
+        });
+        let mut client = warp::test::ws()
+            .path("/ws")
+            .handshake(routes.clone())
+            .await
+            .expect("handshake");
+        client.send_text(r#"{"type": "Ping"}"#).await;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv())
+            .await
+            .expect("a reply")
+            .expect("open socket");
+        assert!(reply.to_str().unwrap().contains("Pong"));
+
+        client.send_text("x".repeat(4096)).await;
+        let end = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv())
+            .await
+            .expect("the server reacts");
+        assert!(
+            end.is_err() || end.as_ref().is_ok_and(|message| message.is_close()),
+            "the oversized message closed the connection: {end:?}"
+        );
     }
 }

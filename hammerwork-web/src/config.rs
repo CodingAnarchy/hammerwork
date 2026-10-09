@@ -113,8 +113,18 @@ pub struct DashboardConfig {
     /// WebSocket configuration
     pub websocket: WebSocketConfig,
 
-    /// Enable CORS for cross-origin requests
+    /// Enable CORS for cross-origin requests from [`allowed_origins`](Self::allowed_origins).
+    ///
+    /// CORS is only ever granted to the listed origins, never to any origin, so enabling it
+    /// requires at least one entry there.
     pub enable_cors: bool,
+
+    /// Origins other than the dashboard's own (`scheme://host[:port]`) that may send
+    /// state-changing requests and WebSocket connections, and, with
+    /// [`enable_cors`](Self::enable_cors), read API responses. Browsers on any other origin
+    /// are refused (see [`crate::security`]).
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 
     /// Request timeout duration
     pub request_timeout: Duration,
@@ -131,6 +141,7 @@ impl Default for DashboardConfig {
             auth: AuthConfig::default(),
             websocket: WebSocketConfig::default(),
             enable_cors: false,
+            allowed_origins: Vec::new(),
             request_timeout: Duration::from_secs(30),
         }
     }
@@ -241,8 +252,8 @@ impl DashboardConfig {
 
     /// Enable or disable CORS support.
     ///
-    /// When enabled, the server will accept cross-origin requests from any domain.
-    /// This is useful for development or when the dashboard is accessed from different domains.
+    /// When enabled, browsers on the origins in [`allowed_origins`](Self::allowed_origins)
+    /// may call the API; [`validate`](Self::validate) requires at least one of them.
     ///
     /// # Examples
     ///
@@ -250,9 +261,11 @@ impl DashboardConfig {
     /// use hammerwork_web::config::DashboardConfig;
     ///
     /// let config = DashboardConfig::new()
-    ///     .with_cors(true);
+    ///     .with_cors(true)
+    ///     .with_allowed_origin("https://ops.example.com");
     ///
     /// assert!(config.enable_cors);
+    /// assert_eq!(config.allowed_origins, ["https://ops.example.com"]);
     ///
     /// let config = DashboardConfig::new()
     ///     .with_cors(false);
@@ -264,6 +277,13 @@ impl DashboardConfig {
         self
     }
 
+    /// Allow requests from another origin (`scheme://host[:port]`); see
+    /// [`allowed_origins`](Self::allowed_origins).
+    pub fn with_allowed_origin(mut self, origin: &str) -> Self {
+        self.allowed_origins.push(origin.to_string());
+        self
+    }
+
     /// Load configuration from a TOML file
     pub fn from_file(path: &str) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -272,13 +292,36 @@ impl DashboardConfig {
         Ok(config)
     }
 
-    /// Check settings that would otherwise make background tasks panic at runtime.
+    /// Check settings that would make the server unsafe or make it fail at runtime:
     ///
-    /// Currently this requires a non-zero `websocket.ping_interval`
-    /// (`tokio::time::interval` panics on a zero period).
+    /// - authentication enabled in a build without the `auth` feature, which cannot verify
+    ///   bcrypt password hashes;
+    /// - an entry of `allowed_origins` that is not an origin, or `enable_cors` without any;
+    /// - a zero `websocket.ping_interval` (`tokio::time::interval` panics on a zero period),
+    ///   `websocket.message_buffer_size` or `websocket.max_message_size`.
     pub fn validate(&self) -> crate::Result<()> {
+        if self.auth.enabled && !cfg!(feature = "auth") {
+            anyhow::bail!(
+                "Authentication is enabled, but hammerwork-web was built without the `auth` \
+                 feature and cannot verify bcrypt password hashes. Rebuild with \
+                 `--features auth` (a default feature), or disable authentication"
+            );
+        }
+        crate::security::AllowedOrigins::new(&self.allowed_origins)?;
+        if self.enable_cors && self.allowed_origins.is_empty() {
+            anyhow::bail!(
+                "enable_cors requires at least one entry in allowed_origins: CORS is never \
+                 granted to every origin"
+            );
+        }
         if self.websocket.ping_interval.is_zero() {
             anyhow::bail!("websocket.ping_interval must be greater than zero");
+        }
+        if self.websocket.message_buffer_size == 0 {
+            anyhow::bail!("websocket.message_buffer_size must be greater than zero");
+        }
+        if self.websocket.max_message_size == 0 {
+            anyhow::bail!("websocket.max_message_size must be greater than zero");
         }
         Ok(())
     }
@@ -334,16 +377,18 @@ pub struct AuthConfig {
     /// Username for basic authentication
     pub username: String,
 
-    /// Bcrypt hash of the password
+    /// Bcrypt hash of the password. It is only ever verified with bcrypt (the `auth`
+    /// feature), never compared to the password as text.
     pub password_hash: String,
 
-    /// Session timeout duration
+    /// Upper bound on how long a successful credential check is remembered (at most
+    /// [`crate::auth::VERIFIED_CREDENTIALS_TTL`]); zero re-verifies every request.
     pub session_timeout: Duration,
 
-    /// Maximum number of failed login attempts
+    /// Failed attempts from one client address before it is locked out
     pub max_failed_attempts: u32,
 
-    /// Lockout duration after max failed attempts
+    /// How long a locked-out client is refused. A failure older than this no longer counts.
     pub lockout_duration: Duration,
 }
 
@@ -369,10 +414,11 @@ pub struct WebSocketConfig {
     /// Maximum number of concurrent WebSocket connections
     pub max_connections: usize,
 
-    /// Buffer size for WebSocket messages
+    /// Outgoing messages queued per connection; further messages for a client that does
+    /// not keep up are dropped
     pub message_buffer_size: usize,
 
-    /// Maximum message size in bytes
+    /// Maximum size in bytes of a message (and of a frame) received from a client
     pub max_message_size: usize,
 }
 
@@ -392,6 +438,13 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// The defaults, with authentication only where this build can verify passwords.
+    fn defaults() -> DashboardConfig {
+        let mut config = DashboardConfig::new();
+        config.auth.enabled = cfg!(feature = "auth");
+        config
+    }
+
     #[test]
     fn test_config_creation() {
         let config = DashboardConfig::new()
@@ -408,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_zero_ping_interval() {
-        let mut config = DashboardConfig::new();
+        let mut config = defaults();
         assert!(config.validate().is_ok());
         config.websocket.ping_interval = Duration::ZERO;
         let err = config.validate().unwrap_err().to_string();
@@ -419,7 +472,7 @@ mod tests {
     fn test_from_file_rejects_zero_ping_interval() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.toml");
-        let mut config = DashboardConfig::new();
+        let mut config = defaults();
         config.websocket.ping_interval = Duration::ZERO;
         config.save_to_file(path.to_str().unwrap()).unwrap();
         assert!(DashboardConfig::from_file(path.to_str().unwrap()).is_err());
@@ -430,7 +483,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
 
-        let config = DashboardConfig::new()
+        let config = defaults()
             .with_bind_address("192.168.1.100", 8888)
             .with_database_url("postgresql://test/db");
 
@@ -453,6 +506,68 @@ mod tests {
         assert_eq!(auth.max_failed_attempts, 5);
         assert_eq!(auth.lockout_duration.as_secs(), 15 * 60); // 15 minutes
         assert_eq!(auth.session_timeout.as_secs(), 8 * 60 * 60); // 8 hours
+    }
+
+    #[test]
+    fn test_validate_rejects_unusable_websocket_limits() {
+        let mut config = defaults();
+        config.websocket.message_buffer_size = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("message_buffer_size"), "{err}");
+        let mut config = defaults();
+        config.websocket.max_message_size = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_message_size"), "{err}");
+    }
+
+    #[test]
+    fn cors_is_only_granted_to_listed_origins() {
+        // M16: CORS used to allow any origin.
+        let err = defaults()
+            .with_cors(true)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_origins"), "{err}");
+        let config = defaults()
+            .with_cors(true)
+            .with_allowed_origin("https://ops.example.com");
+        assert!(config.validate().is_ok());
+        let err = defaults()
+            .with_allowed_origin("*")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid origin"), "{err}");
+    }
+
+    #[test]
+    fn config_files_without_allowed_origins_still_load() {
+        let text = toml::to_string(&DashboardConfig::new()).unwrap();
+        let text: String = text
+            .lines()
+            .filter(|line| !line.starts_with("allowed_origins"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config: DashboardConfig = toml::from_str(&text).unwrap();
+        assert!(config.allowed_origins.is_empty());
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn auth_builds_accept_authentication() {
+        assert!(DashboardConfig::new().validate().is_ok());
+    }
+
+    #[cfg(not(feature = "auth"))]
+    #[test]
+    fn builds_without_bcrypt_refuse_to_enable_authentication() {
+        // H5: without bcrypt the stored hash must never be compared as a plaintext password.
+        let err = DashboardConfig::new().validate().unwrap_err().to_string();
+        assert!(err.contains("`auth`"), "{err}");
+        let mut config = DashboardConfig::new();
+        config.auth.enabled = false;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

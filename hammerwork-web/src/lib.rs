@@ -54,7 +54,8 @@
 //!     .with_bind_address("0.0.0.0", 9090)
 //!     .with_database_url("postgresql://localhost/hammerwork")
 //!     .with_auth("admin", "bcrypt_hash_here")
-//!     .with_cors(true);
+//!     .with_cors(true)
+//!     .with_allowed_origin("https://ops.example.com");
 //!
 //! assert_eq!(config.bind_addr(), "0.0.0.0:9090");
 //! assert_eq!(config.database_url, "postgresql://localhost/hammerwork");
@@ -103,6 +104,7 @@ compile_error!(
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod security;
 pub mod server;
 pub mod websocket;
 
@@ -150,6 +152,10 @@ mod tests {
         let config = DashboardConfig {
             database_url: "invalid://url".to_string(),
             static_dir: temp_dir.path().to_path_buf(),
+            auth: crate::AuthConfig {
+                enabled: cfg!(feature = "auth"),
+                ..Default::default()
+            },
             ..Default::default()
         };
 

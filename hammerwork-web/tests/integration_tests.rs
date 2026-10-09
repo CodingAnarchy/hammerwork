@@ -61,6 +61,7 @@ mod tests {
                 ..Default::default()
             },
             enable_cors: true,
+            allowed_origins: vec!["https://ops.example.com".to_string()],
             request_timeout: Duration::from_secs(30),
             ..Default::default()
         };
@@ -158,7 +159,8 @@ mod tests {
         let original_config = DashboardConfig::new()
             .with_bind_address("192.168.1.100", 9090)
             .with_database_url("postgresql://test/database")
-            .with_cors(true);
+            .with_cors(true)
+            .with_allowed_origin("https://ops.example.com");
 
         // Save configuration
         original_config

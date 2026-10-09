@@ -40,6 +40,7 @@ fn help_and_version() {
         "--port",
         "--static-dir",
         "--cors",
+        "--allowed-origin",
         "--auth",
         "--username",
         "--password",
@@ -87,6 +88,14 @@ fn startup_errors_exit_with_status_1_and_a_message() {
     ]));
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("Unsupported database URL"), "{out}");
+
+    // CORS is never granted to every origin.
+    let (code, out) = run(bin().args(["--no-auth", "--cors"]));
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("allowed_origins"), "{out}");
+    let (code, out) = run(bin().args(["--no-auth", "--allowed-origin", "*"]));
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("invalid origin"), "{out}");
 }
 
 /// A running dashboard process, stopped with SIGINT (so it exits normally and flushes
@@ -226,17 +235,19 @@ async fn serve_and_query(database_url: &str, database_name: &str) {
     let status = server.stop();
     assert!(status.success(), "clean shutdown on SIGINT: {status}");
 
-    // --- protected dashboard, configured through a password file
-    let hash = {
-        #[cfg(feature = "auth")]
-        {
-            bcrypt::hash("open-sesame", 4).unwrap()
-        }
-        #[cfg(not(feature = "auth"))]
-        {
-            "open-sesame".to_string()
-        }
-    };
+    // --- protected dashboard, configured through a password file (needs bcrypt)
+    #[cfg(feature = "auth")]
+    serve_protected(database_url, static_dir, &dir, &client).await;
+}
+
+#[cfg(feature = "auth")]
+async fn serve_protected(
+    database_url: &str,
+    static_dir: &str,
+    dir: &tempfile::TempDir,
+    client: &reqwest::Client,
+) {
+    let hash = bcrypt::hash("open-sesame", 4).unwrap();
     let hash_file = dir.path().join("hash.txt");
     std::fs::write(&hash_file, format!("{hash}\n")).unwrap();
     let mut server = Server::start(
@@ -246,6 +257,8 @@ async fn serve_and_query(database_url: &str, database_name: &str) {
             "--static-dir",
             static_dir,
             "--cors",
+            "--allowed-origin",
+            "http://example.com",
             "--auth",
             "--username",
             "ops",
@@ -293,6 +306,26 @@ async fn serve_and_query(database_url: &str, database_name: &str) {
             .headers()
             .contains_key("access-control-allow-origin")
     );
+    // ...but only for the allowed origin.
+    let other = client
+        .request(reqwest::Method::OPTIONS, server.url("/api/queues"))
+        .header("origin", "http://evil.example")
+        .header("access-control-request-method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert!(!other.headers().contains_key("access-control-allow-origin"));
+    // A cross-origin write from a browser page is refused before authentication.
+    let forged = client
+        .post(server.url("/api/jobs"))
+        .basic_auth("ops", Some("open-sesame"))
+        .header("origin", "http://evil.example")
+        .header("sec-fetch-site", "cross-site")
+        .json(&serde_json::json!({"queue_name": "q", "payload": {}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), 403);
     assert!(server.stop().success());
 }
 

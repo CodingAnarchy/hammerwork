@@ -9,6 +9,7 @@ use hammerwork_web::api::history::JobHistory;
 use hammerwork_web::api::system::SystemState;
 use hammerwork_web::auth::AuthState;
 use hammerwork_web::config::{AuthConfig, DashboardConfig};
+use hammerwork_web::security::AllowedOrigins;
 use hammerwork_web::server::app_routes;
 use hammerwork_web::websocket::WebSocketState;
 use serde_json::{Value, json};
@@ -61,6 +62,7 @@ impl<Q: JobHistory + 'static> App<Q> {
                 system_state.clone(),
                 websocket_state.clone(),
                 dir.clone(),
+                AllowedOrigins::new(["https://ops.example.com"]).unwrap(),
             )
             .map(|reply| Box::new(reply) as Box<dyn warp::Reply>)
             .boxed()
@@ -1102,8 +1104,8 @@ async fn archive_endpoints<Q: JobHistory + 'static>(app: &App<Q>) {
         )
         .await
         .0,
-        400,
-        "a body is required"
+        415,
+        "a JSON body is required"
     );
 
     // --- purge: the dry run counts only what the real purge would delete
@@ -1158,17 +1160,9 @@ async fn archive_endpoints<Q: JobHistory + 'static>(app: &App<Q>) {
     app.queue.delete_job(first).await.unwrap();
 }
 
+#[cfg(feature = "auth")]
 async fn authentication<Q: JobHistory + 'static>(queue: Arc<Q>, database_type: &str) {
-    let hash = {
-        #[cfg(feature = "auth")]
-        {
-            bcrypt::hash("s3cret", 4).unwrap()
-        }
-        #[cfg(not(feature = "auth"))]
-        {
-            "s3cret".to_string()
-        }
-    };
+    let hash = bcrypt::hash("s3cret", 4).unwrap();
     let app = App::new(
         queue,
         AuthConfig {
@@ -1372,6 +1366,149 @@ async fn dashboard_script_calls_only_existing_endpoints<Q: JobHistory + 'static>
     app.queue.delete_job(job.parse().unwrap()).await.unwrap();
 }
 
+/// Issue #64 regressions: cross-site writes (H8), body limits and paging the archive in the
+/// database (M11), and clamped pagination (M13).
+async fn request_hardening<Q: JobHistory + 'static>(app: &App<Q>) {
+    let q = unique("hardening");
+    let reply = |request: warp::test::RequestBuilder| {
+        let routes = (app.routes)();
+        async move {
+            let response = request.reply(&routes).await;
+            let text = String::from_utf8_lossy(response.body()).to_string();
+            (response.status().as_u16(), text)
+        }
+    };
+    let body = json!({"queue_name": q, "payload": {"n": 1}}).to_string();
+    let post = |content_type: Option<&str>| {
+        let mut request = warp::test::request()
+            .method("POST")
+            .path("/api/jobs")
+            .header("content-length", body.len().to_string())
+            .body(body.clone());
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        request
+    };
+
+    // --- H8: a body without the JSON content type, or from another site, is refused.
+    let (status, text) = reply(post(None)).await;
+    assert_eq!(status, 415, "{text}");
+    let (status, text) = reply(post(Some("text/plain"))).await;
+    assert_eq!(status, 415, "{text}");
+    let (status, text) = reply(
+        post(Some("application/json"))
+            .header("origin", "http://evil.example")
+            .header("sec-fetch-site", "cross-site"),
+    )
+    .await;
+    assert_eq!(status, 403, "{text}");
+    assert!(text.contains("Cross-origin request refused"), "{text}");
+    let (_, listing) = app.get(&format!("/api/jobs?queue={q}")).await;
+    assert!(job_ids(&listing).is_empty(), "nothing was enqueued");
+    // The dashboard's own page and an allowed origin can write.
+    let (status, text) = reply(
+        post(Some("application/json"))
+            .header("origin", "http://127.0.0.1:8080")
+            .header("sec-fetch-site", "same-origin"),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let (status, text) = reply(
+        post(Some("application/json; charset=utf-8"))
+            .header("origin", "https://ops.example.com")
+            .header("sec-fetch-site", "cross-site"),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+
+    // --- M11: bounded bodies and bulk requests.
+    let (status, _) = reply(
+        warp::test::request()
+            .method("POST")
+            .path("/api/jobs")
+            .json(&json!({"queue_name": q, "payload": "x".repeat(2 * 1024 * 1024)})),
+    )
+    .await;
+    assert_eq!(status, 413);
+    let ids: Vec<String> = (0..=hammerwork_web::api::jobs::MAX_BULK_JOB_IDS)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect();
+    let (status, body) = app
+        .post(
+            "/api/jobs/bulk",
+            json!({"job_ids": ids, "action": "delete"}),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+
+    // --- M11 / M13: the archive is filtered, counted and paged in the database.
+    let archive = unique("archive_pages");
+    let mut archived = Vec::new();
+    for (n, by) in ["ann", "ann", "ann", "ben"].iter().enumerate() {
+        archived.push(archive_one(app.queue.as_ref(), &archive, json!({ "n": n }), by).await);
+    }
+    let (status, page) = app
+        .get(&format!("/api/archive/jobs?queue={archive}&limit=2&page=2"))
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(job_ids(&page).len(), 2);
+    assert_eq!(page["data"]["pagination"]["total"], 4);
+    let (_, filtered) = app
+        .get(&format!(
+            "/api/archive/jobs?queue={archive}&archived_by=ann&limit=2&page=2"
+        ))
+        .await;
+    assert_eq!(job_ids(&filtered).len(), 1, "{filtered}");
+    assert_eq!(filtered["data"]["pagination"]["total"], 3);
+    assert_eq!(filtered["data"]["pagination"]["total_pages"], 2);
+    // Pages cover every job exactly once, newest first.
+    let mut seen = Vec::new();
+    for page in 1..=4 {
+        let (_, listing) = app
+            .get(&format!(
+                "/api/archive/jobs?queue={archive}&limit=1&page={page}"
+            ))
+            .await;
+        seen.extend(job_ids(&listing));
+    }
+    seen.sort();
+    let mut expected: Vec<String> = archived.iter().map(|id| id.to_string()).collect();
+    expected.sort();
+    assert_eq!(seen, expected);
+    // M13: an oversized limit is clamped before the offset is computed.
+    let (status, clamped) = app
+        .get(&format!(
+            "/api/archive/jobs?queue={archive}&limit=5000&page=2"
+        ))
+        .await;
+    assert_eq!(status, 200, "{clamped}");
+    assert_eq!(clamped["data"]["pagination"]["limit"], 1000);
+    assert_eq!(clamped["data"]["pagination"]["offset"], 1000);
+    assert!(job_ids(&clamped).is_empty());
+    let (status, overflow) = app
+        .get(&format!(
+            "/api/archive/jobs?queue={archive}&limit=4294967295&page=4294967295"
+        ))
+        .await;
+    assert_eq!(status, 200, "no overflow: {overflow}");
+    assert!(job_ids(&overflow).is_empty());
+    assert_eq!(overflow["data"]["pagination"]["total"], 4);
+    // The purge dry run counts in the database too.
+    let (status, dry) = app
+        .delete(
+            "/api/archive/purge",
+            json!({"older_than": chrono::Utc::now() + chrono::Duration::days(1), "dry_run": true}),
+        )
+        .await;
+    assert_eq!(status, 200, "{dry}");
+    assert!(dry["data"]["jobs_purged"].as_u64().unwrap() >= 4);
+    for id in archived {
+        app.queue.restore_archived_job(id).await.unwrap();
+        app.queue.delete_job(id).await.unwrap();
+    }
+}
+
 async fn run_all<Q: JobHistory + 'static>(queue: Arc<Q>, database_type: &str) {
     let app = App::new(
         queue.clone(),
@@ -1387,9 +1524,13 @@ async fn run_all<Q: JobHistory + 'static>(queue: Arc<Q>, database_type: &str) {
     stats_endpoints(&app).await;
     system_endpoints(&app, database_type).await;
     archive_endpoints(&app).await;
+    request_hardening(&app).await;
     websocket_through_the_router(&app).await;
     dashboard_script_calls_only_existing_endpoints(&app).await;
+    #[cfg(feature = "auth")]
     authentication(queue, database_type).await;
+    #[cfg(not(feature = "auth"))]
+    let _ = queue;
 }
 
 #[cfg(feature = "postgres")]

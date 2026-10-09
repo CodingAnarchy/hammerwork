@@ -81,9 +81,14 @@ impl Subscription {
     }
 
     fn subscribe(&mut self, event_types: Vec<String>) {
-        // The first explicit choice replaces the default of "everything".
+        // The first explicit choice replaces the default of "everything". Only known event
+        // types are kept, so a client cannot grow the set without bound.
         self.all = false;
-        self.types.extend(event_types);
+        self.types.extend(
+            event_types
+                .into_iter()
+                .filter(|event_type| EVENT_TYPES.contains(&event_type.as_str())),
+        );
     }
 
     fn unsubscribe(&mut self, event_types: &[String]) {
@@ -97,11 +102,14 @@ impl Subscription {
     }
 }
 
-/// WebSocket connection state manager
+/// WebSocket connection state manager.
+///
+/// Each connection has an outgoing queue of `message_buffer_size` messages; messages for a
+/// client whose queue is full are dropped rather than buffered without bound.
 #[derive(Debug)]
 pub struct WebSocketState {
     config: WebSocketConfig,
-    connections: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
+    connections: HashMap<Uuid, mpsc::Sender<Message>>,
     subscriptions: HashMap<Uuid, Subscription>,
     broadcast_sender: mpsc::UnboundedSender<BroadcastMessage>,
     broadcast_receiver: Option<mpsc::UnboundedReceiver<BroadcastMessage>>,
@@ -120,6 +128,28 @@ impl WebSocketState {
         }
     }
 
+    /// The configuration the state was created with.
+    pub fn config(&self) -> &WebSocketConfig {
+        &self.config
+    }
+
+    /// Queue `message` for one connection. A full queue drops the message: the client is not
+    /// reading, and buffering for it would grow without bound. Returns whether the message
+    /// was queued.
+    fn enqueue(connection_id: Uuid, sender: &mpsc::Sender<Message>, message: Message) -> bool {
+        match sender.try_send(message) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!(
+                    "WebSocket client {} is not keeping up; dropped a message",
+                    connection_id
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
     /// Serve one WebSocket connection until it closes.
     ///
     /// The shared `state` is only locked for the short moments that register the connection,
@@ -132,7 +162,10 @@ impl WebSocketState {
     ) -> crate::Result<()> {
         let connection_id = Uuid::new_v4();
         let (mut ws_sender, mut ws_receiver) = websocket.split();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = {
+            let guard = state.read().await;
+            mpsc::channel::<Message>(guard.config.message_buffer_size.max(1))
+        };
 
         {
             let mut guard = state.write().await;
@@ -222,7 +255,7 @@ impl WebSocketState {
             // Send pong response
             if let Some(sender) = self.connections.get(&connection_id) {
                 let pong_msg = Message::pong(message.as_bytes().to_vec());
-                let _ = sender.send(pong_msg);
+                Self::enqueue(connection_id, sender, pong_msg);
             }
         } else if message.is_pong() {
             // Pong received - connection is alive
@@ -267,7 +300,7 @@ impl WebSocketState {
                 // Answer the client that asked, not everyone.
                 if let Some(sender) = self.connections.get(&connection_id) {
                     let pong = Message::text(serde_json::to_string(&ServerMessage::Pong)?);
-                    let _ = sender.send(pong);
+                    Self::enqueue(connection_id, sender, pong);
                 }
             }
         }
@@ -282,8 +315,8 @@ impl WebSocketState {
 
         // A closed channel belongs to a connection that is shutting down; its handler
         // removes it, so a failed send is not an error here.
-        for sender in self.connections.values() {
-            let _ = sender.send(ws_message.clone());
+        for (&connection_id, sender) in &self.connections {
+            Self::enqueue(connection_id, sender, ws_message.clone());
         }
 
         Ok(())
@@ -304,7 +337,7 @@ impl WebSocketState {
                 .get(connection_id)
                 .is_none_or(|subscription| subscription.wants(event_type));
             if wanted {
-                let _ = sender.send(ws_message.clone());
+                Self::enqueue(*connection_id, sender, ws_message.clone());
             }
         }
 
@@ -379,8 +412,10 @@ impl WebSocketState {
         let mut disconnected = Vec::new();
 
         for (&connection_id, sender) in &self.connections {
-            if sender.send(ping_message.clone()).is_err() {
+            if sender.is_closed() {
                 disconnected.push(connection_id);
+            } else {
+                Self::enqueue(connection_id, sender, ping_message.clone());
             }
         }
 
@@ -1126,6 +1161,48 @@ mod tests {
         assert!(sub.wants("archive_events") && !sub.wants("queue_updates"));
         sub.subscribe(vec!["queue_updates".to_string()]);
         assert!(sub.wants("queue_updates") && sub.wants("archive_events"));
+    }
+
+    /// M12: subscribing keeps only known event types, so a client cannot grow the set.
+    #[test]
+    fn subscriptions_ignore_unknown_event_types() {
+        let mut sub = Subscription::everything();
+        sub.subscribe((0..10_000).map(|n| format!("junk-{n}")).collect());
+        sub.subscribe(vec!["job_updates".to_string(), "job_updates".to_string()]);
+        assert_eq!(sub.types.len(), 1);
+        assert!(sub.wants("job_updates"));
+        assert!(!sub.wants("junk-1"));
+    }
+
+    /// M12: each connection's outgoing queue holds `message_buffer_size` messages; a client
+    /// that does not read loses messages instead of growing server memory.
+    #[tokio::test]
+    async fn outgoing_messages_are_bounded_per_connection() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let id = Uuid::new_v4();
+        assert!(WebSocketState::enqueue(id, &sender, Message::text("1")));
+        assert!(WebSocketState::enqueue(id, &sender, Message::text("2")));
+        assert!(
+            !WebSocketState::enqueue(id, &sender, Message::text("3")),
+            "a full queue drops the message"
+        );
+        assert_eq!(receiver.recv().await.unwrap().to_str().unwrap(), "1");
+        assert!(WebSocketState::enqueue(id, &sender, Message::text("4")));
+        drop(receiver);
+        assert!(!WebSocketState::enqueue(id, &sender, Message::text("5")));
+
+        // Connections get a queue of the configured size.
+        let state = Arc::new(RwLock::new(WebSocketState::new(WebSocketConfig {
+            message_buffer_size: 3,
+            ..WebSocketConfig::default()
+        })));
+        let route = ws_route(state.clone());
+        let _client = connect(&route).await;
+        wait_for_connections(&state, 1).await;
+        let guard = state.read().await;
+        let queue = guard.connections.values().next().unwrap();
+        assert_eq!(queue.max_capacity(), 3);
+        assert_eq!(guard.config().message_buffer_size, 3);
     }
 
     #[test]

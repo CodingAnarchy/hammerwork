@@ -163,19 +163,29 @@ impl Default for PaginationParams {
     }
 }
 
+/// The page size when a request does not give one.
+pub const DEFAULT_PAGE_SIZE: u32 = 50;
+
+/// The largest page size a request may ask for; larger limits are clamped to it.
+pub const MAX_PAGE_SIZE: u32 = 1000;
+
 impl PaginationParams {
+    /// The offset of the first item: `offset` if given, else `(page - 1) * limit` computed
+    /// with the clamped [`get_limit`](Self::get_limit), saturating instead of overflowing.
     pub fn get_offset(&self) -> u32 {
         if let Some(offset) = self.offset {
             offset
         } else {
             let page = self.page.unwrap_or(1);
-            let limit = self.limit.unwrap_or(50);
-            (page.saturating_sub(1)) * limit
+            page.saturating_sub(1).saturating_mul(self.get_limit())
         }
     }
 
+    /// The page size: `limit`, clamped to `1..=`[`MAX_PAGE_SIZE`].
     pub fn get_limit(&self) -> u32 {
-        self.limit.unwrap_or(50).min(1000) // Cap at 1000 items
+        self.limit
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE)
     }
 }
 
@@ -196,7 +206,7 @@ impl PaginationMeta {
         let limit = params.get_limit();
         let offset = params.get_offset();
         let page = params.page.unwrap_or(1);
-        let total_pages = ((total as f64) / (limit as f64)).ceil() as u32;
+        let total_pages = u32::try_from(total.div_ceil(u64::from(limit))).unwrap_or(u32::MAX);
 
         Self {
             page,
@@ -364,6 +374,46 @@ mod tests {
         };
         assert_eq!(params.get_limit(), 20);
         assert_eq!(params.get_offset(), 40); // (3-1) * 20
+    }
+
+    #[test]
+    fn the_offset_uses_the_clamped_limit_and_never_overflows() {
+        // M13: limit=5000&page=2 serves at most 1000 rows, so page 2 starts at row 1000.
+        let params = PaginationParams {
+            page: Some(2),
+            limit: Some(5000),
+            offset: None,
+        };
+        assert_eq!(params.get_limit(), MAX_PAGE_SIZE);
+        assert_eq!(params.get_offset(), MAX_PAGE_SIZE);
+
+        let huge = PaginationParams {
+            page: Some(u32::MAX),
+            limit: Some(u32::MAX),
+            offset: None,
+        };
+        assert_eq!(
+            huge.get_offset(),
+            u32::MAX,
+            "saturates instead of overflowing"
+        );
+
+        let zero = PaginationParams {
+            page: Some(0),
+            limit: Some(0),
+            offset: None,
+        };
+        assert_eq!(zero.get_limit(), 1, "a zero limit is clamped to one");
+        assert_eq!(zero.get_offset(), 0);
+        let meta = PaginationMeta::new(&zero, 3);
+        assert_eq!(meta.total_pages, 3);
+
+        let explicit = PaginationParams {
+            page: Some(7),
+            limit: Some(10),
+            offset: Some(5),
+        };
+        assert_eq!(explicit.get_offset(), 5, "an explicit offset wins");
     }
 
     #[test]
