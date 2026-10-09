@@ -18,23 +18,23 @@ use crate::utils::sql::{
 pub enum QueueCommand {
     #[command(about = "List all queues")]
     List {
-        #[arg(short, long, help = "Database connection URL")]
+        #[arg(short = 'u', short_alias = 'd', long, help = "Database connection URL")]
         database_url: Option<String>,
     },
     #[command(about = "Show queue statistics")]
     Stats {
-        #[arg(short, long, help = "Database connection URL")]
+        #[arg(short = 'u', short_alias = 'd', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Specific queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Specific queue name")]
         queue: Option<String>,
         #[arg(long, help = "Show detailed breakdown by priority")]
         detailed: bool,
     },
     #[command(about = "Clear all jobs from a queue")]
     Clear {
-        #[arg(short, long, help = "Database connection URL")]
+        #[arg(short = 'u', short_alias = 'd', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name")]
         queue: String,
         #[arg(long, help = "Only clear pending jobs")]
         pending_only: bool,
@@ -43,28 +43,28 @@ pub enum QueueCommand {
     },
     #[command(about = "Pause a queue (prevent job processing)")]
     Pause {
-        #[arg(short, long, help = "Database connection URL")]
+        #[arg(short = 'u', short_alias = 'd', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name")]
         queue: String,
     },
     #[command(about = "Resume a paused queue")]
     Resume {
-        #[arg(short, long, help = "Database connection URL")]
+        #[arg(short = 'u', short_alias = 'd', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name")]
         queue: String,
     },
     #[command(about = "List all paused queues")]
     Paused {
-        #[arg(short, long, help = "Database connection URL")]
+        #[arg(short = 'u', short_alias = 'd', long, help = "Database connection URL")]
         database_url: Option<String>,
     },
     #[command(about = "Get queue health status")]
     Health {
-        #[arg(short, long, help = "Database connection URL")]
+        #[arg(short = 'u', short_alias = 'd', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Specific queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Specific queue name")]
         queue: Option<String>,
     },
 }
@@ -72,7 +72,7 @@ pub enum QueueCommand {
 impl QueueCommand {
     pub async fn execute(&self, config: &Config) -> Result<()> {
         let db_url = self.get_database_url(config)?;
-        let pool = DatabasePool::connect(&db_url, config.get_connection_pool_size()).await?;
+        let pool = DatabasePool::connect_with_config(&db_url, config).await?;
 
         match self {
             QueueCommand::List { .. } => {

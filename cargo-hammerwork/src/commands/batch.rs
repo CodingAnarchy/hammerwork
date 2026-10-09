@@ -23,11 +23,20 @@ pub enum BatchCommand {
         database_url: Option<String>,
         #[arg(short = 'f', long, help = "Input file path (JSON lines format)")]
         file: Option<String>,
-        #[arg(short = 'n', long, help = "Default queue name")]
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Queue for jobs whose line has no \"queue\" of its own (required)"
+        )]
         queue: String,
         #[arg(short = 'r', long, help = "Default priority")]
         priority: Option<String>,
-        #[arg(long, help = "Print progress every N jobs (default 100)")]
+        #[arg(
+            long,
+            alias = "progress-every",
+            help = "Print a progress line every N jobs (default 100); does not change how jobs are inserted"
+        )]
         batch_size: Option<u32>,
         #[arg(long, help = "Continue on errors")]
         continue_on_error: bool,
@@ -36,13 +45,13 @@ pub enum BatchCommand {
     Retry {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name filter")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name filter")]
         queue: Option<String>,
         #[arg(short = 't', long, help = "Status filter (failed, dead)")]
         status: Option<String>,
         #[arg(long, help = "Hours since last failure")]
         failed_since_hours: Option<u32>,
-        #[arg(long, help = "Maximum attempts filter")]
+        #[arg(long, help = "Only retry jobs that have used up all their attempts")]
         max_attempts_reached: bool,
         #[arg(long, help = "Confirm the batch retry operation")]
         confirm: bool,
@@ -53,7 +62,7 @@ pub enum BatchCommand {
     Cancel {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name filter")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name filter")]
         queue: Option<String>,
         #[arg(short = 't', long, help = "Status filter (pending, running)")]
         status: Option<String>,
@@ -70,7 +79,7 @@ pub enum BatchCommand {
         database_url: Option<String>,
         #[arg(short = 'o', long, help = "Output file path")]
         output: String,
-        #[arg(short = 'n', long, help = "Queue name filter")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name filter")]
         queue: Option<String>,
         #[arg(short = 't', long, help = "Status filter")]
         status: Option<String>,
@@ -86,7 +95,7 @@ pub enum BatchCommand {
 impl BatchCommand {
     pub async fn execute(&self, config: &Config) -> Result<()> {
         let db_url = self.get_database_url(config)?;
-        let pool = DatabasePool::connect(&db_url, config.get_connection_pool_size()).await?;
+        let pool = DatabasePool::connect_with_config(&db_url, config).await?;
 
         match self {
             BatchCommand::Enqueue {

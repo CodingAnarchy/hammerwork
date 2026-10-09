@@ -20,6 +20,7 @@ fn unique_queue(prefix: &str) -> String {
 fn retry_all_in(url: &str, queue: &str) -> JobCommand {
     JobCommand::Retry {
         database_url: Some(url.to_string()),
+        id: None,
         job_id: None,
         queue: Some(queue.to_string()),
         all: false,
@@ -29,6 +30,7 @@ fn retry_all_in(url: &str, queue: &str) -> JobCommand {
 fn retry_one_cmd(url: &str, id: JobId) -> JobCommand {
     JobCommand::Retry {
         database_url: Some(url.to_string()),
+        id: None,
         job_id: Some(id.to_string()),
         queue: None,
         all: false,
@@ -38,6 +40,7 @@ fn retry_one_cmd(url: &str, id: JobId) -> JobCommand {
 fn cancel_queue(url: &str, queue: &str) -> JobCommand {
     JobCommand::Cancel {
         database_url: Some(url.to_string()),
+        id: None,
         job_id: None,
         queue: Some(queue.to_string()),
         all_pending: false,

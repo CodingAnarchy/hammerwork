@@ -80,7 +80,7 @@ pub enum MaintenanceCommand {
 impl MaintenanceCommand {
     pub async fn execute(&self, config: &Config) -> Result<()> {
         let db_url = self.get_database_url(config)?;
-        let pool = DatabasePool::connect(&db_url, config.get_connection_pool_size()).await?;
+        let pool = DatabasePool::connect_with_config(&db_url, config).await?;
 
         match self {
             MaintenanceCommand::Vacuum {

@@ -20,7 +20,12 @@ pub enum BackupCommand {
         database_url: Option<String>,
         #[arg(short = 'o', long, help = "Output file path")]
         output: String,
-        #[arg(short = 'n', long, help = "Include only specific queue")]
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Include only specific queue"
+        )]
         queue: Option<String>,
         #[arg(long, help = "Include completed jobs")]
         include_completed: bool,

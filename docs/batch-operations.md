@@ -367,7 +367,7 @@ loop {
 
 ```bash
 # Enqueue jobs from a JSON-lines file
-cargo hammerwork batch enqueue --file jobs.jsonl --queue emails --batch-size 500 --continue-on-error
+cargo hammerwork batch enqueue --file jobs.jsonl --queue emails --progress-every 500 --continue-on-error
 
 # Retry failed or dead jobs matching criteria (preview first with --dry-run)
 cargo hammerwork batch retry --queue emails --status failed --failed-since-hours 24 --dry-run

@@ -191,7 +191,12 @@ pub enum SpawnCommand {
         limit: Option<u32>,
         #[arg(long, help = "Show only recent spawn operations")]
         recent: bool,
-        #[arg(long, help = "Show spawn operations for specific queue")]
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Show spawn operations for specific queue"
+        )]
         queue: Option<String>,
     },
     #[command(about = "Show spawn tree hierarchy for a job")]
@@ -211,7 +216,7 @@ pub enum SpawnCommand {
     Stats {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'Q', long, help = "Filter by queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Filter by queue name")]
         queue: Option<String>,
         #[arg(long, help = "Time period in hours (default: 24)")]
         hours: Option<u32>,
@@ -235,7 +240,7 @@ pub enum SpawnCommand {
     Pending {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'Q', long, help = "Filter by queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Filter by queue name")]
         queue: Option<String>,
         #[arg(long, help = "Show spawn configuration details")]
         show_config: bool,
@@ -246,7 +251,7 @@ pub enum SpawnCommand {
         database_url: Option<String>,
         #[arg(long, help = "Refresh interval in seconds (default: 5)")]
         interval: Option<u32>,
-        #[arg(short = 'Q', long, help = "Filter by queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Filter by queue name")]
         queue: Option<String>,
     },
 }
@@ -254,7 +259,7 @@ pub enum SpawnCommand {
 impl SpawnCommand {
     pub async fn execute(&self, config: Config) -> Result<()> {
         let db_url = self.get_database_url(&config)?;
-        let pool = DatabasePool::connect(&db_url, config.get_connection_pool_size()).await?;
+        let pool = DatabasePool::connect_with_config(&db_url, &config).await?;
 
         match self {
             SpawnCommand::List {

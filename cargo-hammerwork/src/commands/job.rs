@@ -26,7 +26,7 @@ pub enum JobCommand {
     List {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name to filter by")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name to filter by")]
         queue: Option<String>,
         #[arg(short = 't', long, help = "Job status to filter by")]
         status: Option<String>,
@@ -52,7 +52,7 @@ pub enum JobCommand {
     Enqueue {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name")]
         queue: String,
         #[arg(short = 'j', long, help = "Job payload as JSON")]
         payload: String,
@@ -65,13 +65,32 @@ pub enum JobCommand {
         #[arg(long, help = "Timeout in seconds")]
         timeout: Option<u32>,
     },
-    #[command(about = "Retry failed jobs")]
+    #[command(
+        about = "Retry failed, dead and timed-out jobs",
+        long_about = "Retry jobs that are Failed, Dead or TimedOut.\n\n\
+            Pass a job ID (positionally or with --job-id) to retry one job, or use \
+            --queue and/or --all to retry many. Jobs in any other status are left alone."
+    )]
     Retry {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(long, help = "Specific job ID to retry")]
+        #[arg(
+            value_name = "JOB_ID",
+            conflicts_with = "job_id",
+            help = "Specific job ID to retry (failed, dead or timed-out jobs)"
+        )]
+        id: Option<String>,
+        #[arg(
+            long,
+            help = "Specific job ID to retry (same as the positional JOB_ID)"
+        )]
         job_id: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name to retry all failed jobs")]
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Queue name to retry all failed jobs"
+        )]
         queue: Option<String>,
         #[arg(long, help = "Retry all failed jobs")]
         all: bool,
@@ -80,9 +99,23 @@ pub enum JobCommand {
     Cancel {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(long, help = "Specific job ID to cancel")]
+        #[arg(
+            value_name = "JOB_ID",
+            conflicts_with = "job_id",
+            help = "Specific job ID to cancel"
+        )]
+        id: Option<String>,
+        #[arg(
+            long,
+            help = "Specific job ID to cancel (same as the positional JOB_ID)"
+        )]
         job_id: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name to cancel pending jobs")]
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Queue name to cancel pending jobs"
+        )]
         queue: Option<String>,
         #[arg(long, help = "Cancel all pending jobs")]
         all_pending: bool,
@@ -91,7 +124,7 @@ pub enum JobCommand {
     Purge {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'Q', long, help = "Queue name to filter by")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name to filter by")]
         queue: Option<String>,
         #[arg(long, help = "Only purge completed jobs")]
         completed: bool,
@@ -129,7 +162,7 @@ pub enum JobCommand {
 impl JobCommand {
     pub async fn execute(&self, config: &Config) -> Result<()> {
         let db_url = self.get_database_url(config)?;
-        let pool = DatabasePool::connect(&db_url, config.get_connection_pool_size()).await?;
+        let pool = DatabasePool::connect_with_config(&db_url, config).await?;
 
         match self {
             JobCommand::List {
@@ -178,17 +211,24 @@ impl JobCommand {
                 .await?;
             }
             JobCommand::Retry {
-                job_id, queue, all, ..
+                id,
+                job_id,
+                queue,
+                all,
+                ..
             } => {
-                retry_jobs(pool, job_id.clone(), queue.clone(), *all).await?;
+                let target = id.clone().or_else(|| job_id.clone());
+                retry_jobs(pool, target, queue.clone(), *all).await?;
             }
             JobCommand::Cancel {
+                id,
                 job_id,
                 queue,
                 all_pending,
                 ..
             } => {
-                cancel_jobs(pool, job_id.clone(), queue.clone(), *all_pending).await?;
+                let target = id.clone().or_else(|| job_id.clone());
+                cancel_jobs(pool, target, queue.clone(), *all_pending).await?;
             }
             JobCommand::Purge {
                 queue,

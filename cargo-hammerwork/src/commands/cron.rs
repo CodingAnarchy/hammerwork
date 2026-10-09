@@ -19,7 +19,7 @@ pub enum CronCommand {
     List {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name filter")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name filter")]
         queue: Option<String>,
         #[arg(long, help = "Show only active cron jobs")]
         active_only: bool,
@@ -30,7 +30,7 @@ pub enum CronCommand {
     Create {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name")]
         queue: String,
         #[arg(short = 'j', long, help = "Job payload as JSON")]
         payload: String,
@@ -63,7 +63,7 @@ pub enum CronCommand {
     Next {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Queue name filter")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name filter")]
         queue: Option<String>,
         #[arg(
             short = 'c',
@@ -102,7 +102,7 @@ pub enum CronCommand {
 impl CronCommand {
     pub async fn execute(&self, config: &Config) -> Result<()> {
         let db_url = self.get_database_url(config)?;
-        let pool = DatabasePool::connect(&db_url, config.get_connection_pool_size()).await?;
+        let pool = DatabasePool::connect_with_config(&db_url, config).await?;
 
         match self {
             CronCommand::List {

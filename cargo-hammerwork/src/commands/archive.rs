@@ -13,8 +13,10 @@ pub enum ArchiveCommand {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
         #[arg(
-            short = 'Q',
-            long,
+            short = 'n',
+            short_alias = 'Q',
+            long = "queue",
+            alias = "queue-name",
             help = "Queue name to archive (all queues if not specified)"
         )]
         queue_name: Option<String>,
@@ -54,9 +56,15 @@ pub enum ArchiveCommand {
             num_args = 0..=1,
             default_missing_value = "true",
             action = clap::ArgAction::Set,
-            help = "Whether to compress archived payloads (--compress false to disable)"
+            help = "Whether to compress archived payloads (on by default; --no-compress or --compress false to disable)"
         )]
         compress: bool,
+        #[arg(
+            long,
+            conflicts_with = "compress",
+            help = "Do not compress archived payloads"
+        )]
+        no_compress: bool,
         #[arg(long, default_value = "6", help = "Compression level (0-9)")]
         compression_level: u32,
         #[arg(long, help = "Dry run - show what would be archived without archiving")]
@@ -77,7 +85,13 @@ pub enum ArchiveCommand {
     List {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'Q', long, help = "Filter by queue name")]
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long = "queue",
+            alias = "queue-name",
+            help = "Filter by queue name"
+        )]
         queue_name: Option<String>,
         #[arg(
             short = 'l',
@@ -100,7 +114,13 @@ pub enum ArchiveCommand {
     Stats {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'Q', long, help = "Filter by queue name")]
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long = "queue",
+            alias = "queue-name",
+            help = "Filter by queue name"
+        )]
         queue_name: Option<String>,
         #[arg(long, help = "Output format (table, json)")]
         format: Option<String>,
@@ -121,7 +141,7 @@ pub enum ArchiveCommand {
 impl ArchiveCommand {
     pub async fn execute(&self, config: &Config) -> Result<()> {
         let db_url = self.get_database_url(config)?;
-        let pool = DatabasePool::connect(&db_url, config.get_connection_pool_size()).await?;
+        let pool = DatabasePool::connect_with_config(&db_url, config).await?;
 
         match self {
             ArchiveCommand::Run {
@@ -132,6 +152,7 @@ impl ArchiveCommand {
                 timed_out_after_days,
                 batch_size,
                 compress,
+                no_compress,
                 compression_level,
                 dry_run,
                 reason,
@@ -146,7 +167,7 @@ impl ArchiveCommand {
                     *dead_after_days,
                     *timed_out_after_days,
                     *batch_size,
-                    *compress,
+                    *compress && !*no_compress,
                     *compression_level,
                     *dry_run,
                     reason.as_deref(),
@@ -564,6 +585,7 @@ mod tests {
                 timed_out_after_days,
                 batch_size,
                 compress,
+                no_compress,
                 compression_level,
                 dry_run,
                 reason,
@@ -581,7 +603,7 @@ mod tests {
                     (7, 30, 30, 30)
                 );
                 assert_eq!((batch_size, compression_level), (1000, 6));
-                assert!(compress, "compression is on by default");
+                assert!(compress && !no_compress, "compression is on by default");
                 assert!(!dry_run);
                 assert!(reason.is_none() && archived_by.is_none());
             }
