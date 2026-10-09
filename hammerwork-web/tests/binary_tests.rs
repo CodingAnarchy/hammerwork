@@ -70,8 +70,21 @@ fn startup_errors_exit_with_status_1_and_a_message() {
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("no password provided"), "{out}");
 
+    // Without a password, authentication fails closed unless --no-auth opts out.
+    let (code, out) = run(&mut bin());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("--no-auth"), "{out}");
+
     let port = free_port().to_string();
-    let (code, out) = run(bin().args(["-d", "sqlite://x.db", "-p", &port, "--static-dir", "."]));
+    let (code, out) = run(bin().args([
+        "--no-auth",
+        "-d",
+        "sqlite://x.db",
+        "-p",
+        &port,
+        "--static-dir",
+        ".",
+    ]));
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("Unsupported database URL"), "{out}");
 }
@@ -148,7 +161,7 @@ async fn serve_and_query(database_url: &str, database_name: &str) {
 
     // --- open dashboard
     let mut server = Server::start(
-        &["-d", database_url, "--static-dir", static_dir],
+        &["--no-auth", "-d", database_url, "--static-dir", static_dir],
         free_port(),
     );
     server.wait_until_ready().await;

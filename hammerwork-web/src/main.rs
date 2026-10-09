@@ -82,6 +82,13 @@ fn cli() -> Command {
                 .value_name("FILE")
                 .help("File containing password hash (requires --auth)"),
         )
+        .arg(
+            Arg::new("no-auth")
+                .long("no-auth")
+                .help("Run without authentication: anyone who can reach the dashboard can manage jobs")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("auth"),
+        )
 }
 
 /// The configuration the server runs with, and notes for the operator.
@@ -173,14 +180,22 @@ fn resolve_config(matches: &ArgMatches, env_database_url: Option<&str>) -> Resul
         );
     }
 
-    // The built-in default enables authentication but cannot know a password: with none
-    // configured nobody could log in, so run without it (and say so) instead.
-    if config.auth.enabled && config.auth.password_hash.is_empty() {
+    if matches.get_flag("no-auth") {
         config.auth.enabled = false;
+    }
+
+    // The built-in default enables authentication but cannot know a password. Fail closed:
+    // running open must be an explicit choice.
+    if config.auth.enabled && config.auth.password_hash.is_empty() {
+        return Err(anyhow!(
+            "Authentication is enabled but no password is configured. Use --auth with \
+             --password or --password-file, set auth.password_hash in the config file, or pass \
+             --no-auth to run the dashboard without authentication"
+        ));
+    }
+    if !config.auth.enabled {
         warnings.push(
-            "Authentication is disabled because no password is configured. Use --auth with \
-             --password or --password-file to protect the dashboard."
-                .into(),
+            "Authentication is disabled: anyone who can reach the dashboard can manage jobs".into(),
         );
     }
 
@@ -315,7 +330,7 @@ mod tests {
 
     #[test]
     fn defaults_come_from_the_dashboard_config() {
-        let resolved = resolve(&[], None).unwrap();
+        let resolved = resolve(&["--no-auth"], None).unwrap();
         let defaults = DashboardConfig::new();
         assert_eq!(resolved.config.bind_address, defaults.bind_address);
         assert_eq!(resolved.config.port, defaults.port);
@@ -328,6 +343,7 @@ mod tests {
     fn explicit_arguments_override_the_defaults() {
         let resolved = resolve(
             &[
+                "--no-auth",
                 "-d",
                 "mysql://root@db/app",
                 "-b",
@@ -351,20 +367,24 @@ mod tests {
     #[test]
     fn invalid_ports_are_rejected() {
         for port in ["abc", "70000", "-1"] {
-            assert!(resolve(&["-p", port], None).is_err(), "{port}");
+            assert!(resolve(&["--no-auth", "-p", port], None).is_err(), "{port}");
         }
     }
 
     #[test]
     fn the_environment_supplies_the_database_url_unless_a_flag_or_file_does() {
-        let from_env = resolve(&[], Some("postgres://env/db")).unwrap();
+        let from_env = resolve(&["--no-auth"], Some("postgres://env/db")).unwrap();
         assert_eq!(from_env.config.database_url, "postgres://env/db");
 
-        let flag_wins = resolve(&["-d", "mysql://flag/db"], Some("postgres://env/db")).unwrap();
+        let flag_wins = resolve(
+            &["--no-auth", "-d", "mysql://flag/db"],
+            Some("postgres://env/db"),
+        )
+        .unwrap();
         assert_eq!(flag_wins.config.database_url, "mysql://flag/db");
 
         // An empty variable is as good as unset.
-        let empty = resolve(&[], Some("")).unwrap();
+        let empty = resolve(&["--no-auth"], Some("")).unwrap();
         assert_eq!(
             empty.config.database_url,
             DashboardConfig::new().database_url
@@ -429,15 +449,21 @@ mod tests {
     }
 
     #[test]
-    fn authentication_needs_a_password_and_is_off_without_one() {
-        // By default there is no password: the dashboard runs open, with a warning.
-        let open = resolve(&[], None).unwrap();
+    fn authentication_needs_a_password_or_an_explicit_opt_out() {
+        // By default there is no password: refuse to start rather than run open.
+        let err = resolve(&[], None).unwrap_err();
+        assert!(err.to_string().contains("--no-auth"), "{err}");
+
+        // --no-auth runs open, with a warning.
+        let open = resolve(&["--no-auth"], None).unwrap();
         assert!(!open.config.auth.enabled);
         assert!(
             open.warnings
                 .iter()
-                .any(|w| w.contains("no password is configured"))
+                .any(|w| w.contains("Authentication is disabled"))
         );
+        let err = resolve(&["--no-auth", "--auth"], None).unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"), "{err}");
 
         // --auth without any password is an error.
         let err = resolve(&["--auth"], None).unwrap_err();
@@ -478,7 +504,7 @@ mod tests {
         assert!(err.to_string().contains("must not be empty"), "{err}");
 
         // Credentials without --auth are ignored, and the user is told.
-        let ignored = resolve(&["--username", "x", "--password", "y"], None).unwrap();
+        let ignored = resolve(&["--no-auth", "--username", "x", "--password", "y"], None).unwrap();
         assert!(!ignored.config.auth.enabled);
         assert!(
             ignored
