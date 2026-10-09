@@ -1,224 +1,365 @@
 # Cron Scheduling
 
-Hammerwork provides comprehensive cron-based job scheduling with timezone awareness for recurring jobs.
+Hammerwork supports cron-based recurring jobs with timezone awareness. A recurring job is a
+single row in the jobs table that is moved back to `Pending` at its next scheduled time after
+each run.
 
 ## Basic Cron Jobs
 
 ### Creating Cron Jobs
 
-```rust
+Build a `CronSchedule`, then attach it to a job with `Job::with_cron`. `with_cron` computes
+the first `next_run_at`, sets `scheduled_at` to it and marks the job as recurring.
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::{Job, cron::CronSchedule};
-use chrono_tz::US::Eastern;
 use serde_json::json;
 
-// Daily backup at 2 AM Eastern
+// Daily backup at 2 AM UTC (seconds, minutes, hours, day, month, weekday)
+let schedule = CronSchedule::new("0 0 2 * * *")?;
 let backup_job = Job::new("backup".to_string(), json!({"type": "daily_backup"}))
-    .with_cron("0 0 2 * * *")?  // seconds, minutes, hours, day, month, weekday
-    .with_timezone(Eastern)
-    .as_recurring();
+    .with_cron(schedule)?;
 
+assert!(backup_job.is_recurring());
 queue.enqueue_cron_job(backup_job).await?;
+# Ok(())
+# }
+```
+
+`Job::with_cron_schedule(queue_name, payload, schedule)` is the equivalent constructor: it
+builds a recurring job directly from a schedule in one step.
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, cron::CronSchedule};
+use serde_json::json;
+
+let job = Job::with_cron_schedule(
+    "backup".to_string(),
+    json!({"type": "daily_backup"}),
+    CronSchedule::new("0 0 2 * * *")?,
+)?;
+assert!(job.has_cron_schedule());
+# Ok(())
+# }
 ```
 
 ### Cron Expression Format
 
-Hammerwork uses 6-field cron expressions:
+Hammerwork uses 6-field cron expressions (the syntax of the `cron` crate). The seconds
+field comes first:
 
+```text
+sec  min  hour  day-of-month  month  day-of-week
+ 0    0    2         *          *         *
 ```
-┌─────────────── seconds (0-59)
-│ ┌───────────── minutes (0-59)
-│ │ ┌─────────── hours (0-23)
-│ │ │ ┌───────── day of month (1-31)
-│ │ │ │ ┌─────── month (1-12)
-│ │ │ │ │ ┌───── day of week (0-6, Sunday=0)
-│ │ │ │ │ │
-* * * * * *
+
+Seconds are 0-59, minutes 0-59, hours 0-23, day of month 1-31 and month 1-12. Day of
+week accepts names (`Mon`, `Sat`) and ranges (`Mon-Fri`); the `cron` crate numbers days
+1-7 starting at Sunday, so prefer names to avoid mistakes.
+
+Use `CronSchedule::validate` to check an expression without building a schedule:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::cron::CronSchedule;
+
+assert!(CronSchedule::validate("0 0 2 * * *").is_ok());
+assert!(CronSchedule::validate("invalid cron").is_err());
+# Ok(())
+# }
 ```
 
 ## Common Cron Patterns
 
 ### Built-in Presets
 
-```rust
-use hammerwork::cron::CronSchedule;
+`CronSchedule` has constructors for common schedules; they return a `Result`. The
+`cron::presets` module has infallible versions of the same schedules.
 
-// Predefined common schedules
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, cron::{CronSchedule, presets}};
+use serde_json::json;
+
 let hourly = Job::new("cleanup".to_string(), json!({"type": "temp_files"}))
-    .with_cron_schedule(CronSchedule::every_hour())
-    .as_recurring();
+    .with_cron(CronSchedule::every_hour()?)?;
 
 let daily = Job::new("reports".to_string(), json!({"type": "daily"}))
-    .with_cron_schedule(CronSchedule::daily_at_midnight())
-    .as_recurring();
+    .with_cron(CronSchedule::every_day_at_midnight()?)?;
 
 let weekdays = Job::new("business".to_string(), json!({"type": "weekday"}))
-    .with_cron_schedule(CronSchedule::weekdays_at_9am())
-    .as_recurring();
+    .with_cron(CronSchedule::every_weekday_at_9am()?)?;
 
 let weekly = Job::new("weekly_report".to_string(), json!({"type": "weekly"}))
-    .with_cron_schedule(CronSchedule::mondays_at_noon())
-    .as_recurring();
+    .with_cron(CronSchedule::every_monday_at_noon()?)?;
+
+// The presets module returns a CronSchedule directly
+let heartbeat = Job::new("heartbeat".to_string(), json!({}))
+    .with_cron(presets::every_minute())?;
+# Ok(())
+# }
 ```
 
 ### Custom Expressions
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, cron::CronSchedule};
+use serde_json::json;
+
 // Every 30 minutes
 let frequent = Job::new("sync".to_string(), json!({"action": "sync"}))
-    .with_cron("0 */30 * * * *")?
-    .as_recurring();
+    .with_cron(CronSchedule::new("0 */30 * * * *")?)?;
 
-// Business hours only (9 AM to 5 PM, weekdays)
+// Every hour from 9 to 17, Monday to Friday
 let business_hours = Job::new("business_sync".to_string(), json!({"type": "sync"}))
-    .with_cron("0 0 9-17 * * 1-5")?  // Every hour from 9-17, Mon-Fri
-    .as_recurring();
+    .with_cron(CronSchedule::new("0 0 9-17 * * Mon-Fri")?)?;
 
 // First day of every month at 9 AM
 let monthly = Job::new("billing".to_string(), json!({"cycle": "monthly"}))
-    .with_cron("0 0 9 1 * *")?
-    .as_recurring();
+    .with_cron(CronSchedule::new("0 0 9 1 * *")?)?;
 
 // Every 15 minutes during business hours
-let frequent_business = Job::new("monitoring".to_string(), json!({"type": "health_check"}))
-    .with_cron("0 */15 9-17 * * 1-5")?
-    .as_recurring();
+let health = Job::new("monitoring".to_string(), json!({"type": "health_check"}))
+    .with_cron(CronSchedule::new("0 */15 9-17 * * Mon-Fri")?)?;
+# Ok(())
+# }
 ```
 
 ## Timezone Support
 
 ### Setting Timezones
 
-```rust
-use chrono_tz::{US, Europe, Asia};
+Pass an IANA timezone name to `CronSchedule::with_timezone`. The job records the schedule's
+timezone, and `next_run_at` is computed in that timezone. Use this rather than
+`Job::with_timezone`, which only sets the stored timezone string and does not recompute
+`next_run_at`.
 
-// US timezones
-let eastern_job = Job::new("east_coast".to_string(), payload)
-    .with_cron("0 0 9 * * *")?  // 9 AM Eastern
-    .with_timezone(US::Eastern)
-    .as_recurring();
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, cron::CronSchedule};
 
-let pacific_job = Job::new("west_coast".to_string(), payload)
-    .with_cron("0 0 9 * * *")?  // 9 AM Pacific
-    .with_timezone(US::Pacific)
-    .as_recurring();
+let eastern_job = Job::new("east_coast".to_string(), payload.clone())
+    .with_cron(CronSchedule::with_timezone("0 0 9 * * *", "America/New_York")?)?;
+assert_eq!(eastern_job.timezone.as_deref(), Some("America/New_York"));
 
-// International timezones
-let london_job = Job::new("london_office".to_string(), payload)
-    .with_cron("0 0 9 * * 1-5")?  // 9 AM London, weekdays
-    .with_timezone(Europe::London)
-    .as_recurring();
+let london_job = Job::new("london_office".to_string(), payload.clone())
+    .with_cron(CronSchedule::with_timezone("0 0 9 * * Mon-Fri", "Europe/London")?)?;
 
-let tokyo_job = Job::new("tokyo_office".to_string(), payload)
-    .with_cron("0 0 9 * * 1-5")?  // 9 AM Tokyo, weekdays
-    .with_timezone(Asia::Tokyo)
-    .as_recurring();
+let tokyo_job = Job::new("tokyo_office".to_string(), payload.clone())
+    .with_cron(CronSchedule::with_timezone("0 0 9 * * Mon-Fri", "Asia/Tokyo")?)?;
+# Ok(())
+# }
 ```
 
-### Timezone Considerations
+An unknown timezone name is rejected with `CronError::InvalidTimezone`.
 
-```rust
-// Jobs are scheduled in the specified timezone
-// Automatically handles daylight saving time transitions
-let dst_aware = Job::new("dst_test".to_string(), payload)
-    .with_cron("0 0 2 * * *")?  // 2 AM - handles DST transitions
-    .with_timezone(US::Eastern)
-    .as_recurring();
+### Daylight Saving Time
+
+Occurrences are computed in the schedule's timezone, so "9 AM" stays 9 AM local time across
+daylight saving transitions while the UTC instant shifts.
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use chrono::{TimeZone, Utc};
+use hammerwork::cron::CronSchedule;
+
+let schedule = CronSchedule::with_timezone("0 0 9 * * *", "America/New_York")?;
+
+// Winter (EST, UTC-5): 9 AM local is 14:00 UTC
+let winter = schedule.next_execution(Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap());
+assert_eq!(winter, Some(Utc.with_ymd_and_hms(2026, 1, 15, 14, 0, 0).unwrap()));
+
+// Summer (EDT, UTC-4): 9 AM local is 13:00 UTC
+let summer = schedule.next_execution(Utc.with_ymd_and_hms(2026, 7, 15, 0, 0, 0).unwrap());
+assert_eq!(summer, Some(Utc.with_ymd_and_hms(2026, 7, 15, 13, 0, 0).unwrap()));
+# Ok(())
+# }
 ```
 
 ## Advanced Scheduling
 
-### Complex Patterns
+### Inspecting a Schedule
 
-```rust
-// Multiple specific times
-let multi_daily = Job::new("multi_sync".to_string(), payload)
-    .with_cron("0 0 8,12,16,20 * * *")?  // 8 AM, 12 PM, 4 PM, 8 PM
-    .as_recurring();
+`CronSchedule::next_execution` returns the next occurrence after a given instant,
+`next_execution_from_now` does the same from the current time, and `matches` tests whether
+an instant is an occurrence.
 
-// Specific days of month
-let payroll = Job::new("payroll".to_string(), payload)
-    .with_cron("0 0 9 15,30 * *")?  // 15th and 30th of each month at 9 AM
-    .as_recurring();
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use chrono::{TimeZone, Utc};
+use hammerwork::cron::CronSchedule;
 
-// Quarterly reports (first day of quarter)
-let quarterly = Job::new("quarterly_report".to_string(), payload)
-    .with_cron("0 0 9 1 1,4,7,10 *")?  // Jan 1, Apr 1, Jul 1, Oct 1 at 9 AM
-    .as_recurring();
-
-// Weekend maintenance
-let weekend_only = Job::new("maintenance".to_string(), payload)
-    .with_cron("0 0 2 * * 0,6")?  // 2 AM on Saturday and Sunday
-    .as_recurring();
+let schedule = CronSchedule::new("0 0 8,12,16,20 * * *")?; // 8 AM, 12 PM, 4 PM, 8 PM
+let after = Utc.with_ymd_and_hms(2026, 3, 10, 9, 0, 0).unwrap();
+assert_eq!(
+    schedule.next_execution(after),
+    Some(Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap())
+);
+assert!(schedule.matches(Utc.with_ymd_and_hms(2026, 3, 10, 16, 0, 0).unwrap()));
+let _next = schedule.next_execution_from_now();
+# Ok(())
+# }
 ```
 
-### Range Expressions
+### Complex Patterns
 
-```rust
-// Every weekday at various times
-let business_checks = Job::new("business_hours".to_string(), payload)
-    .with_cron("0 0 9-17/2 * * 1-5")?  // Every 2 hours from 9-17, weekdays
-    .as_recurring();
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, cron::CronSchedule};
 
-// Every 5 minutes during peak hours
-let peak_monitoring = Job::new("peak_monitoring".to_string(), payload)
-    .with_cron("0 */5 8-10,14-16 * * 1-5")?  // Every 5 min, 8-10 AM & 2-4 PM
-    .as_recurring();
+// The 15th and 30th of each month at 9 AM
+let payroll = Job::new("payroll".to_string(), payload.clone())
+    .with_cron(CronSchedule::new("0 0 9 15,30 * *")?)?;
+
+// First day of each quarter at 9 AM
+let quarterly = Job::new("quarterly_report".to_string(), payload.clone())
+    .with_cron(CronSchedule::new("0 0 9 1 1,4,7,10 *")?)?;
+
+// 2 AM on Saturday and Sunday
+let weekend_only = Job::new("maintenance".to_string(), payload.clone())
+    .with_cron(CronSchedule::new("0 0 2 * * Sat,Sun")?)?;
+
+// Every 2 hours from 9 to 17 on weekdays
+let business_checks = Job::new("business_hours".to_string(), payload.clone())
+    .with_cron(CronSchedule::new("0 0 9-17/2 * * Mon-Fri")?)?;
+
+// Every 5 minutes at 8-10 AM and 2-4 PM on weekdays
+let peak = Job::new("peak_monitoring".to_string(), payload.clone())
+    .with_cron(CronSchedule::new("0 */5 8-10,14-16 * * Mon-Fri")?)?;
+# Ok(())
+# }
 ```
 
 ## Cron Job Management
 
 ### Retrieving Due Jobs
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::queue::DatabaseQueue;
 
-// Get all jobs ready to run
+// Pending recurring jobs whose next_run_at has passed (or is unset)
 let due_jobs = queue.get_due_cron_jobs(None).await?;
 
-// Get jobs for specific queue
-let queue_jobs = queue.get_due_cron_jobs(Some("backup")).await?;
+// Only for one queue
+let backup_due = queue.get_due_cron_jobs(Some("backup")).await?;
 
-// Process due jobs
 for job in due_jobs {
-    println!("Job {} is ready to run", job.id);
-    queue.enqueue(job).await?;
+    println!("Job {} is due (next run {:?})", job.id, job.next_run_at);
 }
+# Ok(())
+# }
 ```
+
+Workers pick up due recurring jobs through their normal polling, so there is no need to
+re-enqueue what `get_due_cron_jobs` returns; it is useful for inspection and monitoring.
 
 ### Managing Recurring Jobs
 
-```rust
-// List all recurring jobs for a queue
-let recurring_jobs = queue.get_recurring_jobs("backup").await?;
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::queue::DatabaseQueue;
 
-for job in recurring_jobs {
+let recurring_jobs = queue.get_recurring_jobs("backup").await?;
+for job in &recurring_jobs {
     println!("Recurring job: {} - Next run: {:?}", job.id, job.next_run_at);
 }
 
-// Disable a recurring job temporarily
-queue.disable_recurring_job(&job_id).await?;
+// Stop future executions
+queue.disable_recurring_job(job_id).await?;
 
-// Re-enable a recurring job
-queue.enable_recurring_job(&job_id).await?;
+// Resume
+queue.enable_recurring_job(job_id).await?;
 
-// Manually reschedule a job
-queue.reschedule_cron_job(&job_id).await?;
+// Move a job back to Pending at an explicit time
+let next = chrono::Utc::now() + chrono::Duration::hours(1);
+queue.reschedule_cron_job(job_id, next).await?;
+# Ok(())
+# }
 ```
 
 ### Job Lifecycle
 
-```rust
-// When a recurring job completes, it's automatically rescheduled
-// The next_run_at is calculated based on the cron expression
+To run a cron-timed job only once, do not give it a schedule: compute the time from the
+schedule and use `Job::with_scheduled_at`.
 
-// For one-time execution of a recurring pattern
-let one_time = Job::new("special_report".to_string(), payload)
-    .with_cron("0 0 9 1 * *")?  // First of month at 9 AM
-    .with_timezone(US::Eastern)
-    // Note: NOT marked as recurring - runs once
-    ;
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, cron::CronSchedule};
+use serde_json::json;
 
-queue.enqueue_cron_job(one_time).await?;
+let schedule = CronSchedule::with_timezone("0 0 9 1 * *", "America/New_York")?;
+if let Some(first_run) = schedule.next_execution_from_now() {
+    let one_time = Job::new("special_report".to_string(), json!({}))
+        .with_scheduled_at(first_run);
+    assert!(!one_time.is_recurring());
+    queue.enqueue(one_time).await?;
+}
+# Ok(())
+# }
 ```
 
 A recurring job is rescheduled after every run that ends, not only after a success.
@@ -246,142 +387,179 @@ followed by one catch-up run due immediately (slot 2026-03-15 00:00) and then by
 
 ## Monitoring Cron Jobs
 
-### Cron Job Statistics
+### Queue Statistics and Overdue Jobs
 
-```rust
-// Monitor cron job execution
-let stats = stats_collector.get_queue_stats("backup").await?;
-println!("Backup jobs completed: {}", stats.completed_count);
-println!("Average backup time: {:?}", stats.avg_processing_time);
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::queue::DatabaseQueue;
 
-// Check for missed executions
-let recurring_jobs = queue.get_recurring_jobs("backup").await?;
-for job in recurring_jobs {
+let stats = queue.get_queue_stats("backup").await?;
+println!("Pending: {}, running: {}", stats.pending_count, stats.running_count);
+println!("Completed: {}", stats.completed_count);
+
+// A recurring job whose next_run_at is in the past has not been picked up yet
+for job in queue.get_recurring_jobs("backup").await? {
     if let Some(next_run) = job.next_run_at {
         if next_run < chrono::Utc::now() {
-            eprintln!("Job {} appears to have missed its scheduled time", job.id);
+            eprintln!("Job {} is overdue (was due {})", job.id, next_run);
         }
     }
 }
+# Ok(())
+# }
 ```
 
 ### Alerting on Cron Issues
 
-```rust
-// Alert when cron jobs fail
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Worker, alerting::AlertingConfig};
+use std::time::Duration;
+
 let alerting_config = AlertingConfig::new()
-    .alert_on_high_error_rate(0.1)  // Alert if 10% of cron jobs fail
-    .alert_on_worker_starvation(Duration::from_hours(2))  // Alert if no jobs run for 2 hours
+    .alert_on_high_error_rate(0.1)
+    .alert_on_worker_starvation(Duration::from_secs(2 * 60 * 60))
     .webhook("https://alerts.example.com/cron-failure");
 
-let cron_worker = Worker::new(queue, "backup".to_string(), backup_handler)
+let cron_worker = Worker::new(queue, "backup".to_string(), handler)
     .with_alerting_config(alerting_config);
+# Ok(())
+# }
 ```
 
 ## Best Practices
 
-### Cron Expression Guidelines
-
-```rust
-// Be explicit about seconds to avoid confusion
-let explicit = Job::new("task".to_string(), payload)
-    .with_cron("0 30 14 * * *")?  // 2:30 PM daily (explicit 0 seconds)
-    .as_recurring();
-
-// Use meaningful names for recurring jobs
-let descriptive = Job::new("daily_user_analytics".to_string(), payload)
-    .with_cron("0 0 1 * * *")?  // 1 AM daily
-    .as_recurring();
-
-// Consider timezone for your users
-let user_timezone = Job::new("user_notification".to_string(), payload)
-    .with_cron("0 0 9 * * *")?  // 9 AM in user's timezone
-    .with_timezone(chrono_tz::America::New_York)
-    .as_recurring();
-```
-
 ### Error Handling
 
-```rust
-// Handle cron parsing errors gracefully
-match Job::new("backup".to_string(), payload).with_cron("invalid cron") {
-    Ok(job) => queue.enqueue_cron_job(job).await?,
-    Err(e) => {
-        eprintln!("Invalid cron expression: {}", e);
-        // Use fallback schedule or notify admin
+An invalid expression or timezone surfaces as a `CronError` when the schedule is built:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, cron::{CronError, CronSchedule}};
+
+match CronSchedule::new("invalid cron") {
+    Ok(schedule) => {
+        let job = Job::new("backup".to_string(), payload.clone()).with_cron(schedule)?;
+        queue.enqueue_cron_job(job).await?;
     }
+    Err(CronError::InvalidExpression(e)) => eprintln!("Invalid cron expression: {}", e),
+    Err(e) => eprintln!("Bad schedule: {}", e),
 }
 
-// Validate cron expressions before storing
-fn validate_cron_expression(expr: &str) -> Result<(), cron::error::Error> {
-    expr.parse::<cron::Schedule>()?;
-    Ok(())
-}
+assert!(matches!(
+    CronSchedule::with_timezone("0 0 9 * * *", "Not/AZone"),
+    Err(CronError::InvalidTimezone(_))
+));
+# Ok(())
+# }
 ```
 
 ### Performance Considerations
 
-```rust
-// For high-frequency jobs, consider rate limiting
-let frequent_job = Job::new("frequent_task".to_string(), payload)
-    .with_cron("0 * * * * *")?  // Every minute
-    .as_recurring();
+Be explicit about the seconds field (`0 * * * * *` is every minute, `* * * * * *` is every
+second). For high-frequency schedules, cap the worker's execution rate:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, Worker, cron::CronSchedule, rate_limit::RateLimit};
+
+let frequent_job = Job::new("frequent_task".to_string(), payload.clone())
+    .with_cron(CronSchedule::new("0 * * * * *")?)?; // every minute
 
 let worker = Worker::new(queue, "frequent_queue".to_string(), handler)
-    .with_rate_limit(RateLimit::per_minute(10));  // Limit execution rate
+    .with_rate_limit(RateLimit::per_minute(10));
+# Ok(())
+# }
 ```
 
 ## Example: Complete Backup System
 
-```rust
-use hammerwork::{Job, Worker, queue::DatabaseQueue};
-use chrono_tz::US::Eastern;
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
+# #[allow(unused_imports)] use std::result::Result;
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::{sync::Arc, time::Duration};
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, payload: serde_json::Value, stats_collector: Arc<InMemoryStatsCollector>, job_id: JobId, job: Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, JobQueue, Worker, WorkerPool, cron::CronSchedule, queue::DatabaseQueue};
+use hammerwork::worker::JobHandler;
 use serde_json::json;
+use std::{sync::Arc, time::Duration};
 
-async fn setup_backup_system(queue: Arc<JobQueue<sqlx::Postgres>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn setup_backup_system(
+    queue: Arc<JobQueue<sqlx::Postgres>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let eastern = |expr: &str| CronSchedule::with_timezone(expr, "America/New_York");
+
     // Daily database backup at 2 AM Eastern
-    let db_backup = Job::new("backup".to_string(), json!({"type": "database", "retention_days": 30}))
-        .with_cron("0 0 2 * * *")?
-        .with_timezone(Eastern)
-        .as_recurring();
+    let db_backup = Job::new(
+        "backup".to_string(),
+        json!({"type": "database", "retention_days": 30}),
+    )
+    .with_cron(eastern("0 0 2 * * *")?)?;
 
     // Weekly file backup on Sundays at 3 AM Eastern
-    let file_backup = Job::new("backup".to_string(), json!({"type": "files", "retention_weeks": 12}))
-        .with_cron("0 0 3 * * 0")?
-        .with_timezone(Eastern)
-        .as_recurring();
+    let file_backup = Job::new(
+        "backup".to_string(),
+        json!({"type": "files", "retention_weeks": 12}),
+    )
+    .with_cron(eastern("0 0 3 * * Sun")?)?;
 
-    // Monthly archive on first day of month at 1 AM Eastern
-    let monthly_archive = Job::new("backup".to_string(), json!({"type": "archive", "retention_months": 12}))
-        .with_cron("0 0 1 1 * *")?
-        .with_timezone(Eastern)
-        .as_recurring();
+    // Monthly archive on the first day of the month at 1 AM Eastern
+    let monthly_archive = Job::new(
+        "backup".to_string(),
+        json!({"type": "archive", "retention_months": 12}),
+    )
+    .with_cron(eastern("0 0 1 1 * *")?)?;
 
-    // Enqueue all backup jobs
     queue.enqueue_cron_job(db_backup).await?;
     queue.enqueue_cron_job(file_backup).await?;
     queue.enqueue_cron_job(monthly_archive).await?;
 
-    // Set up worker to process backups
-    let backup_handler = Arc::new(|job: Job| {
+    let backup_handler: JobHandler = Arc::new(|job: Job| {
         Box::pin(async move {
             match job.payload.get("type").and_then(|v| v.as_str()) {
-                Some("database") => perform_database_backup(&job).await,
-                Some("files") => perform_file_backup(&job).await,
-                Some("archive") => perform_monthly_archive(&job).await,
-                _ => Err("Unknown backup type".into()),
+                Some("database") => Ok(()), // dump the database
+                Some("files") => Ok(()),    // sync files
+                Some("archive") => Ok(()),  // build the monthly archive
+                _ => Err(hammerwork::HammerworkError::Worker {
+                    message: "Unknown backup type".to_string(),
+                }),
             }
         })
     });
 
     let backup_worker = Worker::new(queue, "backup".to_string(), backup_handler)
-        .with_default_timeout(Duration::from_hours(4))  // 4 hour timeout for backups
+        .with_default_timeout(Duration::from_secs(4 * 60 * 60))
         .with_max_retries(2)
-        .with_retry_delay(Duration::from_minutes(30));
+        .with_retry_delay(Duration::from_secs(30 * 60));
 
-    // Start worker (in practice, you'd add this to a WorkerPool)
-    backup_worker.start().await?;
+    let mut pool = WorkerPool::new();
+    pool.add_worker(backup_worker);
+    pool.start().await?;
 
     Ok(())
 }
+# Ok(())
+# }
 ```

@@ -421,4 +421,7 @@ mod doc_examples {
 
     #[doc = include_str!("../docs/priority-system.md")]
     struct PrioritySystemDoctests;
+
+    #[doc = include_str!("../docs/cron-scheduling.md")]
+    struct CronSchedulingDoctests;
 }
