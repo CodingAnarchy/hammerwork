@@ -272,4 +272,208 @@ mod tests {
         assert!(cli.verbose);
         assert!(!cli.quiet);
     }
+
+    /// Value of `id` on the innermost subcommand matched by `args`.
+    fn leaf_value(args: &[&str], id: &str) -> Option<String> {
+        let mut argv = vec!["cargo-hammerwork"];
+        argv.extend_from_slice(args);
+        let matches = Cli::command()
+            .try_get_matches_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?} should parse: {e}"));
+        let mut m = &matches;
+        while let Some((_, sub)) = m.subcommand() {
+            m = sub;
+        }
+        m.get_one::<String>(id).cloned()
+    }
+
+    #[test]
+    fn database_url_accepts_u_long_and_the_old_queue_d() {
+        for sub in ["list", "paused"] {
+            for flag in ["-u", "--database-url", "-d"] {
+                assert_eq!(
+                    leaf_value(&["queue", sub, flag, "postgres://x/y"], "database_url").as_deref(),
+                    Some("postgres://x/y"),
+                    "queue {sub} {flag}"
+                );
+            }
+        }
+        for flag in ["-u", "-d"] {
+            for sub in ["stats", "health"] {
+                assert!(leaf_value(&["queue", sub, flag, "u"], "database_url").is_some());
+            }
+            assert!(
+                leaf_value(&["queue", "pause", flag, "u", "-n", "q"], "database_url").is_some()
+            );
+        }
+        // -d stays hidden from help
+        let help = Cli::command()
+            .find_subcommand_mut("queue")
+            .unwrap()
+            .find_subcommand_mut("list")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("-u, --database-url"), "{help}");
+        assert!(!help.contains(" -d,") && !help.contains("-d "), "{help}");
+    }
+
+    #[test]
+    fn queue_flag_is_n_with_q_and_long_aliases() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["queue", "stats"], "queue"),
+            (&["queue", "pause"], "queue"),
+            (&["job", "list"], "queue"),
+            (&["job", "purge", "--completed"], "queue"),
+            (&["job", "retry"], "queue"),
+            (&["batch", "retry"], "queue"),
+            (&["batch", "export", "-o", "f"], "queue"),
+            (&["spawn", "list"], "queue"),
+            (&["spawn", "stats"], "queue"),
+            (&["spawn", "pending"], "queue"),
+            (&["spawn", "monitor"], "queue"),
+            (&["archive", "run"], "queue_name"),
+            (&["archive", "list"], "queue_name"),
+            (&["archive", "stats"], "queue_name"),
+            (&["monitor", "dashboard"], "queue"),
+            (&["monitor", "metrics"], "queue"),
+            (&["worker", "status"], "queue"),
+            (&["backup", "create", "-o", "f"], "queue"),
+            (&["cron", "list"], "queue"),
+        ];
+        for (base, id) in cases {
+            for flag in ["-n", "-Q", "--queue"] {
+                let mut args = base.to_vec();
+                args.extend(["--database-url", "u", flag, "emails"]);
+                // some of these subcommands have no database_url; retry without it
+                let mut argv = vec!["cargo-hammerwork"];
+                argv.extend_from_slice(&args);
+                let args = if Cli::try_parse_from(&argv).is_ok() {
+                    args
+                } else {
+                    let mut a = base.to_vec();
+                    a.extend([flag, "emails"]);
+                    a
+                };
+                assert_eq!(leaf_value(&args, id).as_deref(), Some("emails"), "{args:?}");
+            }
+        }
+        // archive keeps its old --queue-name spelling
+        assert_eq!(
+            leaf_value(&["archive", "run", "--queue-name", "q"], "queue_name").as_deref(),
+            Some("q")
+        );
+        assert_eq!(
+            leaf_value(&["archive", "list", "--queue-name", "q"], "queue_name").as_deref(),
+            Some("q")
+        );
+    }
+
+    #[test]
+    fn job_retry_and_cancel_take_the_id_positionally_or_via_flag() {
+        for cmd in ["retry", "cancel"] {
+            assert_eq!(
+                leaf_value(&["job", cmd, "abc"], "id").as_deref(),
+                Some("abc")
+            );
+            assert_eq!(
+                leaf_value(&["job", cmd, "--job-id", "abc"], "job_id").as_deref(),
+                Some("abc")
+            );
+            assert_eq!(leaf_value(&["job", cmd, "--job-id", "abc"], "id"), None);
+            // both at once is a usage error
+            assert!(
+                Cli::try_parse_from(["cargo-hammerwork", "job", cmd, "abc", "--job-id", "def"])
+                    .is_err()
+            );
+        }
+        // positional id combines with the other flags
+        assert!(
+            Cli::try_parse_from(["cargo-hammerwork", "job", "retry", "abc", "-u", "u"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn job_retry_help_mentions_timed_out_jobs() {
+        let help = Cli::command()
+            .find_subcommand_mut("job")
+            .unwrap()
+            .find_subcommand_mut("retry")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.to_lowercase().contains("timed-out") || help.contains("TimedOut"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn batch_flags_and_help_are_accurate() {
+        let mut batch = Cli::command();
+        let enqueue = batch
+            .find_subcommand_mut("batch")
+            .unwrap()
+            .find_subcommand_mut("enqueue")
+            .unwrap();
+        let help = enqueue.render_long_help().to_string();
+        assert!(!help.contains("Default queue name"), "{help}");
+        assert!(help.contains("required"), "{help}");
+        for args in [
+            &["batch", "enqueue", "-n", "q", "--batch-size", "7"][..],
+            &["batch", "enqueue", "-n", "q", "--progress-every", "7"][..],
+        ] {
+            let mut argv = vec!["cargo-hammerwork"];
+            argv.extend_from_slice(args);
+            let matches = Cli::command().try_get_matches_from(&argv).unwrap();
+            let (_, b) = matches.subcommand().unwrap();
+            let (_, e) = b.subcommand().unwrap();
+            assert_eq!(e.get_one::<u32>("batch_size"), Some(&7));
+        }
+        assert!(
+            Cli::try_parse_from(["cargo-hammerwork", "batch", "enqueue"]).is_err(),
+            "queue stays required"
+        );
+        let retry_help = Cli::command()
+            .find_subcommand_mut("batch")
+            .unwrap()
+            .find_subcommand_mut("retry")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            !retry_help.contains("Maximum attempts filter"),
+            "{retry_help}"
+        );
+    }
+
+    #[test]
+    fn archive_compress_can_be_disabled_three_ways() {
+        let compress = |args: &[&str]| -> (bool, bool) {
+            let mut argv = vec!["cargo-hammerwork", "archive", "run"];
+            argv.extend_from_slice(args);
+            let matches = Cli::command().try_get_matches_from(&argv).unwrap();
+            let (_, a) = matches.subcommand().unwrap();
+            let (_, r) = a.subcommand().unwrap();
+            (
+                r.get_flag("no_compress"),
+                *r.get_one::<bool>("compress").unwrap(),
+            )
+        };
+        assert_eq!(compress(&[]), (false, true));
+        assert_eq!(compress(&["--compress"]), (false, true));
+        assert_eq!(compress(&["--compress", "true"]), (false, true));
+        assert_eq!(compress(&["--compress", "false"]), (false, false));
+        assert_eq!(compress(&["--no-compress"]), (true, true));
+        assert!(
+            Cli::try_parse_from([
+                "cargo-hammerwork",
+                "archive",
+                "run",
+                "--compress",
+                "--no-compress"
+            ])
+            .is_err()
+        );
+    }
 }

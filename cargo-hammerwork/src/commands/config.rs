@@ -97,6 +97,14 @@ async fn show_config(config: &Config) -> Result<()> {
     let pool_size = config.get_connection_pool_size().to_string();
     table.add_row(vec!["connection_pool_size", &pool_size, "Config File"]);
 
+    // Connect timeout
+    let connect_timeout = config.get_connect_timeout_secs().to_string();
+    table.add_row(vec![
+        "connect_timeout_secs",
+        &connect_timeout,
+        "Config File",
+    ]);
+
     println!("{}", table);
 
     println!("\n💡 Configuration priority: Environment Variables > Config File > Defaults");
@@ -145,9 +153,21 @@ async fn set_config_value(config: &mut Config, key: &str, value: &str, path: &Pa
             config.connection_pool_size = Some(size);
             info!("✅ Set connection_pool_size to: {}", size);
         }
+        "connect_timeout_secs" => {
+            let secs: u64 = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("connect_timeout_secs must be a positive integer"))?;
+            if secs == 0 || secs > 600 {
+                return Err(anyhow::anyhow!(
+                    "connect_timeout_secs must be between 1 and 600"
+                ));
+            }
+            config.connect_timeout_secs = Some(secs);
+            info!("✅ Set connect_timeout_secs to: {}", secs);
+        }
         _ => {
             return Err(anyhow::anyhow!(
-                "Unknown configuration key: {}. Valid keys: database_url, default_queue, default_limit, log_level, connection_pool_size",
+                "Unknown configuration key: {}. Valid keys: database_url, default_queue, default_limit, log_level, connection_pool_size, connect_timeout_secs",
                 key
             ));
         }
@@ -167,9 +187,10 @@ async fn get_config_value(config: &Config, key: &str) -> Result<()> {
         "default_limit" => config.get_default_limit().to_string(),
         "log_level" => config.get_log_level().to_string(),
         "connection_pool_size" => config.get_connection_pool_size().to_string(),
+        "connect_timeout_secs" => config.get_connect_timeout_secs().to_string(),
         _ => {
             return Err(anyhow::anyhow!(
-                "Unknown configuration key: {}. Valid keys: database_url, default_queue, default_limit, log_level, connection_pool_size",
+                "Unknown configuration key: {}. Valid keys: database_url, default_queue, default_limit, log_level, connection_pool_size, connect_timeout_secs",
                 key
             ));
         }
@@ -342,6 +363,7 @@ mod tests {
             "default_limit",
             "log_level",
             "connection_pool_size",
+            "connect_timeout_secs",
         ] {
             run(&["get", key], &mut config, &path).await.unwrap();
         }

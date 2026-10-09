@@ -204,6 +204,7 @@ fn test_workflow_command_database_url_priority() {
         default_limit: None,
         log_level: None,
         connection_pool_size: None,
+        connect_timeout_secs: None,
     };
 
     let config_without_url = Config {
@@ -212,6 +213,7 @@ fn test_workflow_command_database_url_priority() {
         default_limit: None,
         log_level: None,
         connection_pool_size: None,
+        connect_timeout_secs: None,
     };
 
     // Test command with URL overrides config

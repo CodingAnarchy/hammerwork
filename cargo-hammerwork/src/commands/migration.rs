@@ -35,7 +35,7 @@ impl MigrationCommand {
                     .ok_or_else(|| anyhow::anyhow!("Database URL is required"))?;
 
                 info!("Running migrations for: {}", redact_url(db_url));
-                let pool = DatabasePool::connect(db_url, config.get_connection_pool_size()).await?;
+                let pool = DatabasePool::connect_with_config(db_url, config).await?;
                 pool.migrate(*drop).await?;
                 info!("Migrations completed successfully");
             }

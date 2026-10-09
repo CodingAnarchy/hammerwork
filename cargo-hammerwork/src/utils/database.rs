@@ -69,8 +69,40 @@ use hammerwork::{
         MigrationManager, mysql::MySqlMigrationRunner, postgres::PostgresMigrationRunner,
     },
 };
+use sqlx::Connection;
 use sqlx::{MySqlPool, PgPool};
+use std::time::Duration;
 use tracing::info;
+
+/// Default time to wait for a database connection before giving up.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Await one connection attempt, closing the connection and mapping a timeout to a
+/// readable error.
+async fn probe<C, F>(attempt: F, timeout: Duration) -> Result<()>
+where
+    C: sqlx::Connection,
+    F: std::future::Future<Output = std::result::Result<C, sqlx::Error>>,
+{
+    match tokio::time::timeout(timeout, attempt).await {
+        Ok(Ok(conn)) => {
+            let _ = conn.close().await;
+            Ok(())
+        }
+        Ok(Err(e)) => Err(connect_error(e, timeout)),
+        Err(_) => Err(connect_error(sqlx::Error::PoolTimedOut, timeout)),
+    }
+}
+
+fn connect_error(err: sqlx::Error, timeout: Duration) -> anyhow::Error {
+    match err {
+        sqlx::Error::PoolTimedOut => anyhow::anyhow!(
+            "Timed out after {}s connecting to the database; check the URL and that the server is reachable",
+            timeout.as_secs_f32().max(0.0)
+        ),
+        other => anyhow::Error::new(other),
+    }
+}
 
 /// Database connection pool abstraction.
 ///
@@ -137,23 +169,65 @@ impl DatabasePool {
     /// # }
     /// ```
     pub async fn connect(database_url: &str, pool_size: u32) -> Result<Self> {
+        Self::connect_with_timeout(
+            database_url,
+            pool_size,
+            Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    /// Like [`connect`](Self::connect), but fails with an error if no connection
+    /// can be established within `connect_timeout`, instead of hanging on an
+    /// unreachable host.
+    pub async fn connect_with_timeout(
+        database_url: &str,
+        pool_size: u32,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
         if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
+            // sqlx's pool retries refused connections until its acquire timeout, so
+            // probe with a single connection first: a refused port or bad
+            // credentials fail immediately, and an unroutable host hits the timeout.
+            probe(sqlx::PgConnection::connect(database_url), connect_timeout).await?;
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(pool_size)
+                .acquire_timeout(connect_timeout)
                 .connect(database_url)
-                .await?;
+                .await
+                .map_err(|e| connect_error(e, connect_timeout))?;
             Ok(DatabasePool::Postgres(pool))
         } else if database_url.starts_with("mysql://") {
+            probe(
+                sqlx::MySqlConnection::connect(database_url),
+                connect_timeout,
+            )
+            .await?;
             let pool = sqlx::mysql::MySqlPoolOptions::new()
                 .max_connections(pool_size)
+                .acquire_timeout(connect_timeout)
                 .connect(database_url)
-                .await?;
+                .await
+                .map_err(|e| connect_error(e, connect_timeout))?;
             Ok(DatabasePool::MySQL(pool))
         } else {
             Err(anyhow::anyhow!(
                 "Unsupported database URL format. Use postgres:// or mysql://"
             ))
         }
+    }
+
+    /// Connect using the pool size and connect timeout from the CLI configuration.
+    pub async fn connect_with_config(
+        database_url: &str,
+        config: &crate::config::Config,
+    ) -> Result<Self> {
+        Self::connect_with_timeout(
+            database_url,
+            config.get_connection_pool_size(),
+            Duration::from_secs(config.get_connect_timeout_secs()),
+        )
+        .await
     }
 
     /// Create a job queue from this database pool.
@@ -284,4 +358,82 @@ impl DatabasePool {
 pub enum JobQueueWrapper {
     Postgres(JobQueue<sqlx::Postgres>),
     MySQL(JobQueue<sqlx::MySql>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn refused_connection_fails_fast() {
+        let start = Instant::now();
+        let result = DatabasePool::connect("postgres://u:p@127.0.0.1:1/x", 1).await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn mysql_refused_connection_fails_fast() {
+        let start = Instant::now();
+        let result = DatabasePool::connect("mysql://u:p@127.0.0.1:1/x", 1).await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// 10.255.255.1 is normally a black hole (SYNs are dropped, not refused), which
+    /// is what used to hang. Whatever the network does, the connect must give up
+    /// within the configured timeout.
+    #[tokio::test]
+    async fn unroutable_address_respects_the_timeout() {
+        let start = Instant::now();
+        let result = DatabasePool::connect_with_timeout(
+            "postgres://u:p@10.255.255.1:5432/x",
+            1,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_config_uses_the_configured_timeout() {
+        let config = crate::config::Config {
+            connect_timeout_secs: Some(1),
+            ..crate::config::Config::default()
+        };
+        let start = Instant::now();
+        let result =
+            DatabasePool::connect_with_config("postgres://u:p@10.255.255.1:5432/x", &config).await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn timeout_error_message_says_what_happened() {
+        let err = connect_error(sqlx::Error::PoolTimedOut, Duration::from_secs(10));
+        assert!(err.to_string().contains("Timed out after 10"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unsupported_scheme_is_rejected() {
+        assert!(DatabasePool::connect("sqlite://x", 1).await.is_err());
+    }
 }

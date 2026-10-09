@@ -22,7 +22,12 @@ pub enum MonitorCommand {
             help = "Refresh interval in seconds"
         )]
         refresh: u64,
-        #[arg(short = 'n', long, help = "Specific queue to monitor")]
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Specific queue to monitor"
+        )]
         queue: Option<String>,
     },
     #[command(about = "Check system health")]
@@ -38,7 +43,12 @@ pub enum MonitorCommand {
         database_url: Option<String>,
         #[arg(short = 't', long, help = "Time period (1h, 24h, 7d)")]
         period: Option<String>,
-        #[arg(short = 'n', long, help = "Specific queue to analyze")]
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Specific queue to analyze"
+        )]
         queue: Option<String>,
     },
 }
@@ -46,7 +56,7 @@ pub enum MonitorCommand {
 impl MonitorCommand {
     pub async fn execute(&self, config: &Config) -> Result<()> {
         let db_url = self.get_database_url(config)?;
-        let pool = DatabasePool::connect(&db_url, config.get_connection_pool_size()).await?;
+        let pool = DatabasePool::connect_with_config(&db_url, config).await?;
 
         match self {
             MonitorCommand::Dashboard { refresh, queue, .. } => {

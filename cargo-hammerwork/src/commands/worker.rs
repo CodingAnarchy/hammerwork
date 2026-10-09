@@ -29,7 +29,7 @@ pub enum WorkerCommand {
     Status {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', long, help = "Only show this queue")]
+        #[arg(short = 'n', short_alias = 'Q', long, help = "Only show this queue")]
         queue: Option<String>,
         #[arg(long, help = "Also list every running job")]
         jobs: bool,
@@ -48,7 +48,7 @@ impl WorkerCommand {
                     .as_deref()
                     .or(config.get_database_url())
                     .ok_or_else(|| anyhow::anyhow!("Database URL is required"))?;
-                let pool = DatabasePool::connect(db_url, config.get_connection_pool_size()).await?;
+                let pool = DatabasePool::connect_with_config(db_url, config).await?;
                 let (now, running) = fetch_running_jobs(&pool, queue.as_deref()).await?;
                 print!("{}", render_status(&running, now, *jobs));
                 Ok(())

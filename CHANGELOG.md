@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Migration `018_add_job_retry_strategy` adds `hammerwork_jobs.retry_strategy` (JSON) and an index on `(batch_id, status)`. **Required**: every job query reads the new column, so run `cargo hammerwork migration run` before upgrading.
 
 ### Changed
+- **CLI flag consistency** ([#61](https://github.com/CodingAnarchy/hammerwork/issues/61)); old spellings keep working as aliases:
+  - `queue` commands take `-u/--database-url` like every other group (`-d` remains as a hidden alias).
+  - The queue filter is `-n/--queue` everywhere (`job purge`, `spawn list/stats/pending/monitor`, `archive run/list/stats`); `-Q` and `archive --queue-name` still work.
+  - `job retry` and `job cancel` accept the job id positionally (`job retry <JOB_ID>`); `--job-id` still works, and passing both is an error.
+  - `archive run --no-compress` disables compression (`--compress false` is still accepted); `batch enqueue --progress-every` is an alias of `--batch-size`.
+  - Help text fixes: `job retry` also retries timed-out jobs, `batch enqueue --queue` is required, `--batch-size` only controls progress output, `batch retry --max-attempts-reached` is a flag.
 - **Migrations run exactly as written.** Both runners used to re-serialize each migration through `sqlparser` (PostgreSQL also patched the output to restore `EXECUTE FUNCTION f()`), and fell back to naive splitting with an `ERROR` log when the parser couldn't handle a statement such as a `DO $$` block. They now share a small splitter that only finds top-level `;` terminators, skipping string literals, quoted identifiers, comments and PostgreSQL dollar-quoted bodies, and executes the original text. The `sqlparser` dependency is removed. The resulting schema is identical on both backends.
 - Web `POST /api/queues/{name}/actions` `clear_dead` now only deletes the named queue's dead jobs older than 7 days; it previously purged dead jobs from every queue while reporting it had cleared one. `/api/system/metrics` `custom_metrics_count` and `performance_metrics.{database_response_time_ms, active_workers, worker_utilization}` are now nullable, and `hourly_trends[].avg_processing_time_ms` is `null` (not a global average) for hours without completions. Dashboard `GET /api/stats/detailed` reports the real uptime.
 - **Breaking (`alerting`):** `AlertTarget::Email` has a new `smtp` field, so code that constructs or exhaustively matches the variant must add it (`smtp: None` / `..`). Configuration files without it still parse, but `from_file` then rejects the target. `AlertingConfig::email(recipient)` is deprecated because the target it creates cannot send; use `email_via_smtp`.
@@ -118,6 +124,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing`: `shutdown_tracing()` now flushes and shuts down the provider installed by `init_tracing()` (OpenTelemetry 0.33 removed the global shutdown hook). Code that uses the `opentelemetry` crates directly alongside Hammerwork must move to 0.33.
 
 ### Fixed
+- The CLI no longer hangs when the database is unreachable: connecting gives up after 10 seconds with a clear error. Configure with `connect_timeout_secs` in `config.toml`, `cargo hammerwork config set connect_timeout_secs N`, or `HAMMERWORK_CONNECT_TIMEOUT`.
 - **CLI and web bugs found by testing every command and endpoint against both databases** ([#44](https://github.com/CodingAnarchy/hammerwork/issues/44)):
   - CLI `backup restore` bound text into UUID/INT columns on PostgreSQL (it never worked there), dropped timestamps and the error message, and counted skipped duplicates as restored; `--skip-existing` compared a UUID with text. CSV backups now quote fields instead of replacing commas.
   - CLI `cron` was mostly stubs: `create` wrote text ids/priorities that PostgreSQL rejected and accepted five-field schedules the scheduler cannot run; `list`/`next` printed "coming soon"; `update` did nothing. They are now real (library scheduling, real next-run times, `update` recomputes the next run). `cron create --description` (never stored) was removed.

@@ -132,6 +132,10 @@ pub struct Config {
 
     /// Database connection pool size
     pub connection_pool_size: Option<u32>,
+
+    /// Seconds to wait for a database connection before failing (default 10)
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
 }
 
 impl Default for Config {
@@ -142,6 +146,7 @@ impl Default for Config {
             default_limit: Some(50),
             log_level: Some("info".to_string()),
             connection_pool_size: Some(5),
+            connect_timeout_secs: None,
         }
     }
 }
@@ -208,6 +213,9 @@ impl Config {
         }
         if let Some(size) = get("HAMMERWORK_POOL_SIZE").and_then(|v| v.parse().ok()) {
             self.connection_pool_size = Some(size);
+        }
+        if let Some(secs) = get("HAMMERWORK_CONNECT_TIMEOUT").and_then(|v| v.parse().ok()) {
+            self.connect_timeout_secs = Some(secs);
         }
     }
 
@@ -291,6 +299,13 @@ impl Config {
     pub fn get_connection_pool_size(&self) -> u32 {
         self.connection_pool_size.unwrap_or(5)
     }
+
+    /// Seconds to wait when connecting to the database (default 10, never 0).
+    pub fn get_connect_timeout_secs(&self) -> u64 {
+        self.connect_timeout_secs
+            .unwrap_or(crate::utils::database::DEFAULT_CONNECT_TIMEOUT_SECS)
+            .max(1)
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +319,22 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn connect_timeout_defaults_to_ten_seconds_and_can_be_overridden() {
+        let mut config = Config::default();
+        assert_eq!(config.get_connect_timeout_secs(), 10);
+        config.apply_env(&env_of(&[("HAMMERWORK_CONNECT_TIMEOUT", "3")]));
+        assert_eq!(config.get_connect_timeout_secs(), 3);
+        config.apply_env(&env_of(&[("HAMMERWORK_CONNECT_TIMEOUT", "soon")]));
+        assert_eq!(config.get_connect_timeout_secs(), 3);
+        config.connect_timeout_secs = Some(0);
+        assert_eq!(
+            config.get_connect_timeout_secs(),
+            1,
+            "0 would never connect"
+        );
     }
 
     #[test]
@@ -322,6 +353,7 @@ mod tests {
             default_limit: None,
             log_level: None,
             connection_pool_size: None,
+            connect_timeout_secs: None,
         };
         assert_eq!(bare.get_default_limit(), 50);
         assert_eq!(bare.get_log_level(), "info");
@@ -410,6 +442,7 @@ mod tests {
             default_limit: Some(11),
             log_level: Some("warn".into()),
             connection_pool_size: Some(3),
+            connect_timeout_secs: Some(7),
         };
         config.save_to(&path).unwrap();
         let loaded = Config::load_from_path(&path).unwrap();
