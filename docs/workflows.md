@@ -1,28 +1,31 @@
 # Job Dependencies & Workflows
 
-Hammerwork provides a comprehensive workflow system that allows you to create complex data processing pipelines with job dependencies, sequential chains, and parallel processing with synchronization barriers.
+Hammerwork's workflow system lets you build data processing pipelines from jobs that depend on one another: sequential chains, parallel fan-out with a synchronization point, and configurable behavior when a job fails.
 
 ## Overview
 
 The workflow system enables you to:
-- Create job dependencies where jobs wait for other jobs to complete
-- Build sequential processing pipelines (job1 → job2 → job3)
-- Execute jobs in parallel with synchronization points
-- Handle failure scenarios with configurable policies
-- Visualize complex dependency graphs
-- Prevent circular dependencies with validation
+- Make jobs wait for other jobs to complete
+- Build sequential pipelines (job1 → job2 → job3)
+- Run jobs in parallel and wait for all of them
+- Choose how a workflow reacts to a failed job
+- Validate a workflow for missing dependencies and cycles before enqueuing it
+- Inspect and cancel workflows from code or the CLI
 
 ## Core Concepts
 
 ### Job Dependencies
 
-Jobs can depend on other jobs using the `depends_on` field:
+A job can depend on other jobs with `Job::depends_on` (one at a time) or `Job::depends_on_jobs` (a slice). Both mark the job as waiting for its dependencies.
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::{Job, queue::DatabaseQueue};
 use serde_json::json;
 
-// Create jobs with dependencies
 let job1 = Job::new("data_processing".to_string(), json!({
     "input_file": "raw_data.csv"
 }));
@@ -37,19 +40,23 @@ let job3 = Job::new("data_export".to_string(), json!({
 }))
 .depends_on(&job2.id);  // job3 waits for job2
 
-// Enqueue jobs - they'll execute in dependency order
+assert!(job3.has_dependencies());
+
+// Enqueue the jobs - they execute in dependency order
 queue.enqueue(job1).await?;
 queue.enqueue(job2).await?;
 queue.enqueue(job3).await?;
+# Ok(())
+# }
 ```
 
 ### Dependency Status
 
-Jobs track their dependency state:
-- `None` - Job has no dependencies and can run immediately
-- `Waiting` - Job is waiting for dependencies to complete
-- `Satisfied` - All dependencies have completed successfully
-- `Failed` - One or more dependencies failed
+Jobs track their dependency state in `Job::dependency_status` (a `DependencyStatus`):
+- `None` - the job has no dependencies and can run immediately
+- `Waiting` - the job is waiting for dependencies to complete
+- `Satisfied` - all dependencies have completed successfully
+- `Failed` - one or more dependencies failed
 
 A job may be enqueued after its dependencies have finished. Its dependency state is
 then settled when it is enqueued: `Satisfied` if every dependency completed (also when
@@ -61,14 +68,21 @@ inserted, so a dependency that finishes at the same moment cannot leave it waiti
 
 ## JobGroup and Workflow Creation
 
+A `JobGroup` collects jobs under a workflow ID and a name, with a failure policy.
+`JobGroup::add_job` and `add_parallel_jobs` add jobs without dependencies. `JobGroup::then`
+adds a job that depends on **every job already in the group**, replacing any `depends_on`
+the job had. Enqueue the group with `DatabaseQueue::enqueue_workflow`.
+
 ### Sequential Workflows
 
-Create linear processing pipelines:
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{FailurePolicy, Job, JobGroup, queue::DatabaseQueue};
+use serde_json::json;
 
-```rust
-use hammerwork::{Job, JobGroup, FailurePolicy};
-
-// Create a sequential data processing pipeline
 let extract_job = Job::new("extract".to_string(), json!({
     "source": "database_table",
     "query": "SELECT * FROM customers WHERE created_at > ?"
@@ -83,23 +97,28 @@ let load_job = Job::new("load".to_string(), json!({
     "table": "dim_customers"
 }));
 
-// Create workflow - each job depends on the previous one
 let workflow = JobGroup::new("etl_pipeline")
     .add_job(extract_job)
     .then(transform_job)  // transform depends on extract
-    .then(load_job)       // load depends on transform
+    .then(load_job)       // load depends on extract and transform
     .with_failure_policy(FailurePolicy::FailFast);
 
-// Enqueue the entire workflow
-queue.enqueue_workflow(workflow).await?;
+workflow.validate()?;
+let workflow_id = queue.enqueue_workflow(workflow).await?;
+# Ok(())
+# }
 ```
 
 ### Parallel Workflows
 
-Execute multiple jobs concurrently:
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{FailurePolicy, Job, JobGroup, queue::DatabaseQueue};
+use serde_json::json;
 
-```rust
-// Create parallel processing jobs
 let region_jobs = vec![
     Job::new("process_region".to_string(), json!({"region": "us-east"})),
     Job::new("process_region".to_string(), json!({"region": "us-west"})),
@@ -107,106 +126,106 @@ let region_jobs = vec![
     Job::new("process_region".to_string(), json!({"region": "ap-south"})),
 ];
 
-// Create a job that waits for all parallel jobs
 let summary_job = Job::new("create_summary".to_string(), json!({
     "output_file": "global_summary.json",
     "include_all_regions": true
 }));
 
-// Create workflow with parallel execution and synchronization
 let workflow = JobGroup::new("parallel_processing")
     .add_parallel_jobs(region_jobs)  // These run concurrently
-    .then(summary_job)               // This waits for all parallel jobs
+    .then(summary_job)               // This waits for all of them
     .with_failure_policy(FailurePolicy::ContinueOnFailure);
 
 queue.enqueue_workflow(workflow).await?;
+# Ok(())
+# }
 ```
 
 ### Fan-out and Fan-in Patterns
 
-Create complex patterns with branching and merging:
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, JobGroup, queue::DatabaseQueue};
+use serde_json::json;
 
-```rust
 // Initial job that generates work
 let split_job = Job::new("split_data".to_string(), json!({
     "input_file": "large_dataset.csv",
     "chunk_size": 10000
 }));
 
-// Multiple processing jobs (fan-out)
-let mut processing_jobs = Vec::new();
-for i in 0..10 {
-    let job = Job::new("process_chunk".to_string(), json!({
-        "chunk_id": i,
-        "algorithm": "ml_classification"
-    }))
-    .depends_on(&split_job.id);
+// Multiple processing jobs (fan-out), each depending on the split job
+let processing_jobs: Vec<Job> = (0..10)
+    .map(|i| {
+        Job::new("process_chunk".to_string(), json!({
+            "chunk_id": i,
+            "algorithm": "ml_classification"
+        }))
+        .depends_on(&split_job.id)
+    })
+    .collect();
 
-    processing_jobs.push(job);
-}
-
-// Aggregation job (fan-in)
+// Aggregation job (fan-in) depending on every processing job
+let processing_ids: Vec<_> = processing_jobs.iter().map(|job| job.id).collect();
 let aggregate_job = Job::new("aggregate_results".to_string(), json!({
     "output_format": "final_results.json"
-}));
+}))
+.depends_on_jobs(&processing_ids);
 
-// Add dependencies from all processing jobs to aggregation
-for job in &processing_jobs {
-    aggregate_job.depends_on(&job.id);
-}
-
-// Create and enqueue workflow
 let workflow = JobGroup::new("fan_out_fan_in")
     .add_job(split_job)
     .add_parallel_jobs(processing_jobs)
-    .then(aggregate_job);
+    .add_job(aggregate_job);
 
+workflow.validate()?;
 queue.enqueue_workflow(workflow).await?;
+# Ok(())
+# }
 ```
+
+`add_job` keeps the dependencies you set on the job, which is what you want here; using
+`then` for the last job would also work but would make it depend on the split job too.
 
 ## Advanced Dependency Patterns
 
 ### Multiple Dependencies
 
-Jobs can depend on multiple other jobs:
+A job can depend on several jobs and only runs once all of them have completed:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::Job;
+use serde_json::json;
+
 let data_job = Job::new("fetch_data".to_string(), json!({"source": "api"}));
 let config_job = Job::new("load_config".to_string(), json!({"env": "prod"}));
 let auth_job = Job::new("authenticate".to_string(), json!({"service": "external"}));
 
-// Job that depends on all three completing
 let process_job = Job::new("process_with_deps".to_string(), json!({
     "operation": "complex_processing"
 }))
 .depends_on(&data_job.id)
 .depends_on(&config_job.id)
 .depends_on(&auth_job.id);
+
+assert_eq!(process_job.depends_on.len(), 3);
+
+// Equivalent, in one call
+let process_job = Job::new("process_with_deps".to_string(), json!({}))
+    .depends_on_jobs(&[data_job.id, config_job.id, auth_job.id]);
+# Ok(())
+# }
 ```
 
-### Conditional Dependencies
-
-Create workflows with conditional paths:
-
-```rust
-let validation_job = Job::new("validate_input".to_string(), json!({
-    "input_file": "data.csv",
-    "validation_rules": "strict"
-}));
-
-// Different paths based on validation result
-let success_job = Job::new("process_valid_data".to_string(), json!({
-    "algorithm": "standard_processing"
-}))
-.depends_on(&validation_job.id)
-.with_condition("validation_status == 'valid'");
-
-let error_job = Job::new("handle_invalid_data".to_string(), json!({
-    "action": "quarantine_and_notify"
-}))
-.depends_on(&validation_job.id)
-.with_condition("validation_status == 'invalid'");
-```
+There is no conditional dependency (running a job only if a dependency produced a particular
+result). To branch, have the dependency's handler enqueue the follow-up job it wants, for
+example with [dynamic job spawning](job-spawning.md).
 
 ## Failure Policies
 
@@ -222,37 +241,61 @@ has finished with at least one failure under the other policies.
 
 Stop the entire workflow when any job fails:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{FailurePolicy, JobGroup};
+
 let workflow = JobGroup::new("critical_pipeline")
-    .add_job(job1)
-    .then(job2)
-    .then(job3)
+    .add_job(job("step1"))
+    .then(job("step2"))
+    .then(job("step3"))
     .with_failure_policy(FailurePolicy::FailFast);
-// If job1 fails, job2 and job3 will not execute
+// If step1 fails, step2 and step3 will not execute
+# Ok(())
+# }
 ```
 
 ### ContinueOnFailure
 
 Continue executing jobs that don't depend on failed jobs:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{FailurePolicy, JobGroup};
+
 let workflow = JobGroup::new("resilient_pipeline")
-    .add_parallel_jobs(vec![job_a, job_b, job_c])
-    .then(final_job)
+    .add_parallel_jobs(vec![job("a"), job("b"), job("c")])
+    .then(job("final"))
     .with_failure_policy(FailurePolicy::ContinueOnFailure);
-// If job_a fails, job_b and job_c continue, but final_job won't execute
+// If job a fails, b and c continue, but final won't execute
+# Ok(())
+# }
 ```
 
 ### Manual
 
 Require manual intervention for failure handling:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{FailurePolicy, JobGroup};
+
 let workflow = JobGroup::new("manual_review_pipeline")
-    .add_job(critical_job)
-    .then(dependent_job)
+    .add_job(job("critical"))
+    .then(job("dependent"))
     .with_failure_policy(FailurePolicy::Manual);
-// If critical_job fails, workflow pauses for manual decision
+// If critical fails, its dependents wait for a manual decision
+# Ok(())
+# }
 ```
 
 With `Manual`, the dependents of the failed job stay `waiting` and the workflow stays
@@ -269,32 +312,43 @@ on the failed job, directly or transitively, are marked `Failed` with
 
 ### Creating and Managing Workflows
 
-```rust
-use hammerwork::{JobGroup, WorkflowStatus};
+`JobGroup::with_metadata` attaches arbitrary JSON to the workflow. `get_workflow_status` returns the stored workflow, including its jobs and counters, or `None` if there is no such workflow.
 
-// Create workflow with metadata
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{FailurePolicy, JobGroup, WorkflowStatus, queue::DatabaseQueue};
+use serde_json::json;
+
 let workflow = JobGroup::new("daily_report_generation")
-    .with_description("Generate daily sales and analytics reports")
-    .with_timeout(Duration::from_hours(2))
-    .with_priority(JobPriority::High)
-    .add_job(extract_sales_data)
-    .then(generate_report)
-    .then(send_report_email);
+    .with_metadata(json!({"description": "Generate daily sales and analytics reports"}))
+    .add_job(job("extract_sales_data"))
+    .then(job("generate_report"))
+    .then(job("send_report_email"))
+    .with_failure_policy(FailurePolicy::FailFast);
 
-// Enqueue workflow
 let workflow_id = queue.enqueue_workflow(workflow).await?;
 
 // Check workflow status
-let status = queue.get_workflow_status(workflow_id).await?;
-match status {
-    WorkflowStatus::Running => println!("Workflow is executing"),
-    WorkflowStatus::Completed => println!("Workflow completed successfully"),
-    WorkflowStatus::Failed => println!("Workflow failed"),
-    WorkflowStatus::Cancelled => println!("Workflow was cancelled"),
+if let Some(workflow) = queue.get_workflow_status(workflow_id).await? {
+    match workflow.status {
+        WorkflowStatus::Running => println!("Workflow is executing"),
+        WorkflowStatus::Completed => println!("Workflow completed successfully"),
+        WorkflowStatus::Failed => println!("Workflow failed"),
+        WorkflowStatus::Cancelled => println!("Workflow was cancelled"),
+    }
 }
+
+// List the jobs of a workflow
+let jobs = queue.get_workflow_jobs(workflow_id).await?;
+println!("{} jobs in the workflow", jobs.len());
 
 // Cancel a running workflow
 queue.cancel_workflow(workflow_id).await?;
+# Ok(())
+# }
 ```
 
 `cancel_workflow` marks every unfinished job of the workflow (`Pending`, `Retrying`
@@ -304,25 +358,36 @@ the end, but its outcome is discarded. `finish_job_run` only records outcomes fo
 that are still `Running` the same run, so the job stays `Failed`, and the worker's
 heartbeats stop extending its lease. Side effects the handler performed are not undone.
 
-### Workflow Statistics
+### Workflow Progress
 
-Monitor workflow execution:
+The `JobGroup` returned by `get_workflow_status` carries the counters:
 
-```rust
-let stats = queue.get_workflow_stats(workflow_id).await?;
-println!("Total jobs: {}", stats.total_jobs);
-println!("Completed: {}", stats.completed_jobs);
-println!("Failed: {}", stats.failed_jobs);
-println!("Pending: {}", stats.pending_jobs);
-println!("Running: {}", stats.running_jobs);
-println!("Completion: {:.1}%", stats.completion_percentage());
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::queue::DatabaseQueue;
+
+if let Some(workflow) = queue.get_workflow_status(workflow_id).await? {
+    println!("Total jobs: {}", workflow.total_jobs);
+    println!("Completed: {}", workflow.completed_jobs);
+    println!("Failed: {}", workflow.failed_jobs);
+    if workflow.total_jobs > 0 {
+        let pct = workflow.completed_jobs as f64 / workflow.total_jobs as f64 * 100.0;
+        println!("Completion: {:.1}%", pct);
+    }
+}
+# Ok(())
+# }
 ```
 
 ## Database Implementation
 
 ### Dependency Storage
 
-Dependencies are stored as JSON arrays in the database:
+Dependencies are stored in the `depends_on` column of `hammerwork_jobs`, next to
+`dependency_status`:
 
 ```sql
 -- PostgreSQL example
@@ -354,101 +419,84 @@ dependents of a failed job walks the dependency graph one job at a time.
 
 ## CLI Workflow Commands
 
-The `cargo-hammerwork` CLI provides comprehensive workflow management:
+The `cargo-hammerwork` CLI inspects and manages workflows:
 
 ```bash
-# List all workflows
-cargo hammerwork workflow list
+# List workflows (optionally --running, --completed or --failed)
+cargo hammerwork workflow list --limit 20
 
-# Show workflow details
-cargo hammerwork workflow show <workflow_id>
+# Show workflow details, optionally with the dependency graph
+cargo hammerwork workflow show <workflow_id> --dependencies
 
-# Create a new workflow from JSON/YAML
-cargo hammerwork workflow create --file workflow.json
+# Create an empty workflow record
+cargo hammerwork workflow create --name nightly_etl --failure-policy continue_on_failure
 
-# Show job dependencies
-cargo hammerwork workflow dependencies <job_id>
+# Show a job's dependencies (--tree for the full tree, --dependents for jobs that wait on it)
+cargo hammerwork workflow dependencies <job_id> --tree
 
-# Visualize workflow as dependency graph
+# Visualize a workflow as a dependency graph
 cargo hammerwork workflow graph <workflow_id> --format dot
 cargo hammerwork workflow graph <workflow_id> --format mermaid
 cargo hammerwork workflow graph <workflow_id> --format json
 
 # Cancel a workflow
 cargo hammerwork workflow cancel <workflow_id>
-
-# Retry failed workflows
-cargo hammerwork workflow retry <workflow_id>
 ```
 
-### Workflow Configuration File
-
-Define workflows in JSON or YAML:
-
-```json
-{
-  "name": "data_pipeline",
-  "description": "Daily data processing pipeline",
-  "failure_policy": "continue_on_failure",
-  "jobs": [
-    {
-      "name": "extract",
-      "queue": "etl_queue",
-      "payload": {"source": "production_db"},
-      "depends_on": []
-    },
-    {
-      "name": "transform",
-      "queue": "etl_queue",
-      "payload": {"rules": "business_logic.json"},
-      "depends_on": ["extract"]
-    },
-    {
-      "name": "load",
-      "queue": "etl_queue",
-      "payload": {"destination": "data_warehouse"},
-      "depends_on": ["transform"]
-    }
-  ]
-}
-```
+Workflows with jobs are built from code with `JobGroup` and `enqueue_workflow`; the CLI
+does not load workflow definition files.
 
 ## Validation and Error Handling
 
 ### Circular Dependency Detection
 
-The system prevents circular dependencies:
+`JobGroup::validate` rejects missing dependencies and cycles. The `Job::depends_on`
+builder cannot easily produce a cycle, but the `depends_on` field is public, so a cycle can be
+introduced by editing it directly:
 
-```rust
-let job_a = Job::new("queue".to_string(), json!({}));
-let job_b = Job::new("queue".to_string(), json!({})).depends_on(&job_a.id);
-let job_c = Job::new("queue".to_string(), json!({})).depends_on(&job_b.id);
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::JobGroup;
 
-// This would be detected and rejected
-job_a.depends_on(&job_c.id); // Creates A -> B -> C -> A cycle
+let mut job_a = job("a");
+let job_b = job("b").depends_on(&job_a.id);
+let job_c = job("c").depends_on(&job_b.id);
+
+// A -> C -> B -> A would be a cycle: make A depend on C
+job_a.depends_on = vec![job_c.id];
 
 let workflow = JobGroup::new("test")
     .add_job(job_a)
     .add_job(job_b)
     .add_job(job_c);
 
-// Validation will fail with circular dependency error
-match workflow.validate() {
-    Ok(_) => println!("Workflow is valid"),
-    Err(e) => eprintln!("Validation error: {}", e),
-}
+assert!(workflow.validate().is_err());
+# Ok(())
+# }
 ```
 
 ### Dependency Validation
 
-Ensure all dependencies exist:
+All dependencies must be part of the workflow:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::JobGroup;
+
+let outsider = job("not-in-the-workflow");
 let workflow = JobGroup::new("test_workflow")
-    .add_job(job1)
-    .add_job(job2.depends_on(&non_existent_id)); // This will fail validation
+    .add_job(job("job1"))
+    .add_job(job("job2").depends_on(&outsider.id));
 
-workflow.validate()?; // Returns error for missing dependency
+assert!(workflow.validate().is_err()); // missing dependency
+# Ok(())
+# }
 ```
 
 ## Integration with Other Features
@@ -457,157 +505,133 @@ workflow.validate()?; // Returns error for missing dependency
 
 Dependencies are checked before priority ordering:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, JobPriority};
+use serde_json::json;
+
+let low_priority_job = Job::new("queue".to_string(), json!({})).as_low_priority();
 let high_priority_job = Job::new("queue".to_string(), json!({}))
     .with_priority(JobPriority::High)
     .depends_on(&low_priority_job.id);
 
 // high_priority_job won't run until low_priority_job completes,
 // regardless of priority levels
+# Ok(())
+# }
 ```
 
-### Cron Jobs with Dependencies
+### Workflow Jobs and Tracing
 
-Create recurring workflows:
+Jobs in a workflow can carry trace and correlation IDs like any other job. `JobGroup` has no tracing helpers, so set them on each job:
 
-```rust
-let daily_extract = Job::new("extract".to_string(), json!({}))
-    .with_cron_schedule("0 2 * * *"); // 2 AM daily
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{JobGroup, tracing::{CorrelationId, TraceId}};
 
-let daily_report = Job::new("report".to_string(), json!({}))
-    .depends_on(&daily_extract.id)
-    .with_cron_schedule("0 8 * * *"); // 8 AM daily
-
-// Both jobs will be created daily, with report waiting for extract
-```
-
-### Batch Operations with Workflows
-
-Create workflows that include batch jobs:
-
-```rust
-let batch_job = Job::new_batch("process_batch".to_string(),
-    vec![payload1, payload2, payload3]);
-
-let summary_job = Job::new("summarize".to_string(), json!({}))
-    .depends_on(&batch_job.id);
-
-let workflow = JobGroup::new("batch_workflow")
-    .add_job(batch_job)
-    .then(summary_job);
-```
-
-### Distributed Tracing in Workflows
-
-Trace entire workflows:
-
-```rust
 let trace_id = TraceId::new();
-let correlation_id = CorrelationId::from_business_id("daily-report-001");
+let correlation_id = CorrelationId::from_string("daily-report-001");
+
+let traced = |name: &str| {
+    job(name)
+        .with_trace_id(trace_id.to_string())
+        .with_correlation_id(correlation_id.to_string())
+};
 
 let workflow = JobGroup::new("traced_workflow")
-    .with_trace_id(trace_id.to_string())
-    .with_correlation_id(correlation_id.to_string())
-    .add_job(job1.with_trace_id(trace_id.to_string()))
-    .then(job2.with_trace_id(trace_id.to_string()))
-    .then(job3.with_trace_id(trace_id.to_string()));
+    .add_job(traced("job1"))
+    .then(traced("job2"))
+    .then(traced("job3"));
+# Ok(())
+# }
 ```
 
 ## Best Practices
 
 ### 1. Keep Dependencies Simple
 
-```rust
-// Good: Linear dependency chain
-job1 -> job2 -> job3
+Prefer linear chains and simple fan-out/fan-in over dense dependency webs:
 
-// Avoid: Complex dependency webs
-job1 -> job2 -> job4
-  |  -> job3 -> job5
-           |  -> job6
+```text
+Good:   job1 -> job2 -> job3
+
+Avoid:  job1 -> job2 -> job4
+          \-> job3 -> job5
+                  \-> job6
 ```
 
 ### 2. Use Meaningful Names
 
-```rust
-// Good: Descriptive workflow and job names
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::JobGroup;
+
+// Good: descriptive workflow and job names
 let workflow = JobGroup::new("customer_onboarding_pipeline")
-    .add_job(validate_customer_data)
-    .then(create_customer_account)
-    .then(send_welcome_email);
-
-// Avoid: Generic names
-let workflow = JobGroup::new("workflow1")
-    .add_job(job1)
-    .then(job2);
+    .add_job(job("validate_customer_data"))
+    .then(job("create_customer_account"))
+    .then(job("send_welcome_email"));
+# Ok(())
+# }
 ```
 
-### 3. Handle Failures Gracefully
+### 3. Handle Failures Deliberately
 
-```rust
-// Consider what happens when jobs fail
+Retries are configured per job (and per worker), and the failure policy decides what happens once a job has exhausted them:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(dead_code)] fn job(name: &str) -> hammerwork::Job { hammerwork::Job::new(name.to_string(), serde_json::json!({})) }
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, workflow_id: hammerwork::WorkflowId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{FailurePolicy, JobGroup};
+
 let workflow = JobGroup::new("data_processing")
-    .add_job(critical_job)
-    .then(optional_job)
-    .with_failure_policy(FailurePolicy::ContinueOnFailure)
-    .with_retry_policy(RetryPolicy::ExponentialBackoff {
-        initial_delay: Duration::from_secs(30),
-        max_delay: Duration::from_secs(300),
-        multiplier: 2.0,
-    });
+    .add_job(job("critical_job").with_max_attempts(5))
+    .then(job("optional_job"))
+    .with_failure_policy(FailurePolicy::ContinueOnFailure);
+# Ok(())
+# }
 ```
 
-### 4. Monitor Workflow Health
+### 4. Use Appropriate Granularity
 
-```rust
-// Set up monitoring for long-running workflows
-let workflow = JobGroup::new("daily_batch_processing")
-    .with_timeout(Duration::from_hours(4))
-    .with_health_check_interval(Duration::from_minutes(15))
-    .add_job(extract_job)
-    .then(transform_job)
-    .then(load_job);
-```
-
-### 5. Use Appropriate Granularity
-
-```rust
-// Good: Logical job boundaries
-extract_customer_data -> transform_customer_data -> load_customer_data
-
-// Avoid: Too fine-grained
-read_file -> parse_header -> validate_row1 -> validate_row2 -> ...
+```text
+Good:   extract_customer_data -> transform_customer_data -> load_customer_data
+Avoid:  read_file -> parse_header -> validate_row1 -> validate_row2 -> ...
 ```
 
 ## Performance Considerations
 
 - Dependencies are checked during job dequeue operations
 - Use indexes on `dependency_status` and `depends_on` fields
-- Consider batch processing for workflows with many small jobs
-- Monitor dependency graph complexity in large workflows
 - Use parallel execution where possible to reduce total workflow time
+- Keep the dependency graph of a single workflow reasonably small
 
 ## Troubleshooting
 
-### Common Issues
-
-1. **Jobs Not Starting**: Check dependency status and ensure parent jobs completed
-2. **Circular Dependencies**: Use workflow validation to detect cycles
-3. **Orphaned Jobs**: Clean up jobs whose dependencies were deleted
-4. **Performance Issues**: Monitor dependency query performance with complex graphs
+1. **Jobs not starting**: check `dependency_status` and make sure the jobs they depend on completed.
+2. **Circular or missing dependencies**: call `JobGroup::validate` before `enqueue_workflow`.
+3. **Stuck workflow under `Manual`**: retry the failed job with `retry_dead_job`, or cancel the workflow.
 
 ### Debugging Workflows
 
 ```bash
-# Check job dependencies
-cargo hammerwork job show JOB_ID --include-dependencies
+# Check a job's dependencies and dependents
+cargo hammerwork workflow dependencies JOB_ID --tree --dependents
 
-# Visualize workflow graph
+# Visualize the workflow graph
 cargo hammerwork workflow graph WORKFLOW_ID --format mermaid
 
-# Monitor workflow progress
-cargo hammerwork workflow status WORKFLOW_ID --watch
-
-# Check for stuck jobs
-cargo hammerwork job list --status waiting --dependency-status waiting
+# Inspect the workflow and its state
+cargo hammerwork workflow show WORKFLOW_ID --dependencies
 ```
