@@ -1,6 +1,6 @@
 # Batch Operations
 
-Hammerwork provides comprehensive batch operations for high-performance bulk job processing. This feature enables efficient enqueueing and processing of large numbers of jobs with minimal overhead.
+Hammerwork supports batch operations for bulk job processing: a `JobBatch` is inserted in a single transaction, tracked as a unit, and configured with a failure handling mode.
 
 ## Table of Contents
 
@@ -10,27 +10,32 @@ Hammerwork provides comprehensive batch operations for high-performance bulk job
 - [Failure Handling Modes](#failure-handling-modes)
 - [Worker Batch Processing](#worker-batch-processing)
 - [Monitoring Batch Progress](#monitoring-batch-progress)
+- [CLI Batch Commands](#cli-batch-commands)
 - [Best Practices](#best-practices)
 
 ## Overview
 
-Batch operations provide significant performance improvements when processing large numbers of jobs:
+Batch operations provide:
 
-- **Bulk insertion**: Jobs are inserted in optimized bulk operations
-- **Atomic operations**: Entire batches succeed or fail together
-- **Progress tracking**: Monitor batch completion and success rates
-- **Flexible failure handling**: Configure how batches handle individual job failures
-- **Worker optimization**: Enhanced worker processing for batch jobs
+- **Bulk insertion**: all jobs of a batch are inserted in one transaction instead of one round trip each
+- **Atomic enqueue**: a batch is stored completely or not at all
+- **Progress tracking**: `get_batch_status` reports pending, completed and failed counts
+- **Flexible failure handling**: choose what happens when a job of the batch fails
+- **Worker statistics**: workers can keep per-batch processing statistics
+
+A batch holds up to 10,000 jobs, all on the **same queue**.
 
 ## Creating Job Batches
 
 ### Basic Batch Creation
 
-```rust
-use hammerwork::{batch::{JobBatch, PartialFailureMode}, Job};
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{batch::{JobBatch, PartialFailureMode}, Job, queue::DatabaseQueue};
 use serde_json::json;
 
-// Create individual jobs
 let jobs = vec![
     Job::new("email_queue".to_string(), json!({
         "to": "user1@example.com",
@@ -46,78 +51,133 @@ let jobs = vec![
     })),
 ];
 
-// Create a batch
 let batch = JobBatch::new("welcome_emails")
     .with_jobs(jobs)
     .with_batch_size(100)
     .with_partial_failure_handling(PartialFailureMode::ContinueOnError);
 
-// Enqueue the batch
+assert_eq!(batch.job_count(), 3);
+
 let batch_id = queue.enqueue_batch(batch).await?;
+# Ok(())
+# }
 ```
 
 ### Building Batches Incrementally
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{batch::{JobBatch, PartialFailureMode}, Job};
+use serde_json::json;
+
+let files = vec![("a.csv", 10u64), ("b.csv", 20)];
+
 let mut batch = JobBatch::new("data_processing");
 
-// Add jobs one at a time
-for file in files {
+for (path, size) in files {
     let job = Job::new("process_queue".to_string(), json!({
-        "file": file.path,
-        "size": file.size
+        "file": path,
+        "size": size
     }));
     batch = batch.add_job(job);
 }
 
-// Configure batch settings
 batch = batch
-    .with_batch_size(50)
     .with_partial_failure_handling(PartialFailureMode::CollectErrors)
     .with_metadata("department", "data_science")
     .with_metadata("priority", "high");
+# Ok(())
+# }
 ```
 
 ## Batch Configuration
 
 ### Batch Size
 
-Control how jobs are chunked for processing:
+`with_batch_size` records a chunk size on the batch. `enqueue_batch` itself inserts every job of the batch in one transaction; the chunk size is used by `JobBatch::into_chunks`, which splits a batch into several smaller batches (named `<name>_chunk_<n>`, default chunk size 1000) that you can then enqueue one by one:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{batch::JobBatch, queue::DatabaseQueue};
+
 let batch = JobBatch::new("large_batch")
     .with_jobs(jobs)
-    .with_batch_size(100); // Process in chunks of 100
+    .with_batch_size(100);
+
+for chunk in batch.into_chunks() {
+    queue.enqueue_batch(chunk).await?;
+}
+# Ok(())
+# }
 ```
 
 ### Metadata
 
-Attach metadata to batches for tracking and filtering:
+Attach string metadata to batches for tracking:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::batch::JobBatch;
+
 let batch = JobBatch::new("campaign_emails")
     .with_jobs(jobs)
     .with_metadata("campaign_id", "summer_2024")
     .with_metadata("department", "marketing")
     .with_metadata("priority", "high");
+
+assert_eq!(batch.metadata.get("campaign_id").map(String::as_str), Some("summer_2024"));
+# Ok(())
+# }
 ```
 
 ### Job Priorities
 
-Jobs within batches maintain their individual priorities:
+Jobs within batches keep their individual priorities:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{batch::JobBatch, Job, JobPriority};
+use serde_json::json;
+
 let jobs = vec![
-    Job::new("queue".to_string(), json!({"critical": true}))
-        .as_critical(),
-    Job::new("queue".to_string(), json!({"important": true}))
-        .as_high_priority(),
-    Job::new("queue".to_string(), json!({"regular": true}))
-        .as_normal_priority(),
+    Job::new("queue".to_string(), json!({"critical": true})).as_critical(),
+    Job::new("queue".to_string(), json!({"important": true})).as_high_priority(),
+    Job::new("queue".to_string(), json!({"regular": true})).with_priority(JobPriority::Normal),
 ];
 
-let batch = JobBatch::new("mixed_priority_batch")
-    .with_jobs(jobs);
+let batch = JobBatch::new("mixed_priority_batch").with_jobs(jobs);
+# Ok(())
+# }
+```
+
+### Validation
+
+`JobBatch::validate` (called by `enqueue_batch`) rejects empty batches, batches over 10,000 jobs and batches whose jobs are not all on the same queue:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{batch::JobBatch, Job};
+use serde_json::json;
+
+assert!(JobBatch::new("empty").validate().is_err());
+
+let mixed = JobBatch::new("mixed").with_jobs(vec![
+    Job::new("queue1".to_string(), json!({})),
+    Job::new("queue2".to_string(), json!({})),
+]);
+assert!(mixed.validate().is_err());
+# Ok(())
+# }
 ```
 
 ## Failure Handling Modes
@@ -136,10 +196,17 @@ Batches support three failure handling modes:
 
 Continue processing even if some jobs fail:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::batch::{JobBatch, PartialFailureMode};
+
 let batch = JobBatch::new("resilient_batch")
     .with_jobs(jobs)
     .with_partial_failure_handling(PartialFailureMode::ContinueOnError);
+# Ok(())
+# }
 ```
 
 ### FailFast
@@ -150,30 +217,57 @@ not started yet are marked `Failed` ("Batch failed: job ... failed") in the same
 transaction, so no worker picks them up. Jobs already running finish normally. Retried
 attempts do not trigger it.
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::batch::{JobBatch, PartialFailureMode};
+
 let batch = JobBatch::new("critical_batch")
     .with_jobs(jobs)
     .with_partial_failure_handling(PartialFailureMode::FailFast);
+# Ok(())
+# }
 ```
 
 ### CollectErrors
 
-Collect all errors for analysis while continuing:
+Keep processing and collect the error of every failed job. The errors are available from
+`BatchResult::job_errors` (keyed by job ID) when you query the batch status:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{batch::{JobBatch, PartialFailureMode}, queue::DatabaseQueue};
+
 let batch = JobBatch::new("analytics_batch")
     .with_jobs(jobs)
     .with_partial_failure_handling(PartialFailureMode::CollectErrors);
+
+let batch_id = queue.enqueue_batch(batch).await?;
+
+// Later, once jobs have run
+let result = queue.get_batch_status(batch_id).await?;
+for (job_id, error) in &result.job_errors {
+    eprintln!("Job {} failed: {}", job_id, error);
+}
+# Ok(())
+# }
 ```
 
 ## Worker Batch Processing
 
-Workers can be configured to optimize batch job processing:
-
 ### Enable Batch Processing
 
-```rust
-use hammerwork::{Worker, worker::JobHandler};
+Enabling batch processing on a worker makes it keep statistics for jobs that belong to a batch:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, Worker, worker::JobHandler};
+use std::{sync::Arc, time::Duration};
 
 let handler: JobHandler = Arc::new(|job: Job| {
     Box::pin(async move {
@@ -183,163 +277,243 @@ let handler: JobHandler = Arc::new(|job: Job| {
 });
 
 let worker = Worker::new(queue, "batch_queue".to_string(), handler)
-    .with_batch_processing_enabled(true)  // Enable batch optimizations
+    .with_batch_processing_enabled(true)
     .with_poll_interval(Duration::from_millis(100));
+# Ok(())
+# }
 ```
 
 ### Access Batch Statistics
 
-```rust
-// Get current batch processing statistics
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let stats = worker.get_batch_stats();
 println!("Batch jobs processed: {}", stats.jobs_processed);
 println!("Batch success rate: {:.1}%", stats.success_rate() * 100.0);
 println!("Average processing time: {:.1}ms", stats.average_processing_time_ms);
+# Ok(())
+# }
 ```
 
 ## Monitoring Batch Progress
 
 ### Check Batch Status
 
-```rust
-// Get current batch status
+`get_batch_status` returns a `BatchResult`:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::queue::DatabaseQueue;
+
 let batch_result = queue.get_batch_status(batch_id).await?;
 
+println!("Status: {:?}", batch_result.status);
 println!("Total jobs: {}", batch_result.total_jobs);
 println!("Pending: {}", batch_result.pending_jobs);
 println!("Completed: {}", batch_result.completed_jobs);
 println!("Failed: {}", batch_result.failed_jobs);
 println!("Success rate: {:.1}%", batch_result.success_rate() * 100.0);
+# Ok(())
+# }
 ```
 
 ### List Batch Jobs
 
-```rust
-// Get all jobs in a batch
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::queue::DatabaseQueue;
+
 let batch_jobs = queue.get_batch_jobs(batch_id).await?;
 
 for job in batch_jobs {
-    println!("Job {}: Status={:?}, Priority={:?}", 
-             job.id, job.status, job.priority);
+    println!("Job {}: Status={:?}, Priority={:?}", job.id, job.status, job.priority);
 }
+# Ok(())
+# }
 ```
 
 ### Monitor Completion
 
-```rust
-// Wait for batch completion
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::queue::DatabaseQueue;
+use std::time::Duration;
+
 loop {
     let batch_result = queue.get_batch_status(batch_id).await?;
-    
+
     if batch_result.pending_jobs == 0 {
-        println!("Batch completed!");
-        println!("Success rate: {:.1}%", batch_result.success_rate() * 100.0);
+        println!("Batch finished with {:.1}% success", batch_result.success_rate() * 100.0);
         break;
     }
-    
+
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
+# Ok(())
+# }
+```
+
+## CLI Batch Commands
+
+`cargo hammerwork batch` works on jobs in bulk (it does not create `JobBatch` records):
+
+```bash
+# Enqueue jobs from a JSON-lines file
+cargo hammerwork batch enqueue --file jobs.jsonl --queue emails --batch-size 500 --continue-on-error
+
+# Retry failed or dead jobs matching criteria (preview first with --dry-run)
+cargo hammerwork batch retry --queue emails --status failed --failed-since-hours 24 --dry-run
+cargo hammerwork batch retry --queue emails --status failed --failed-since-hours 24 --confirm
+
+# Cancel pending jobs older than a day
+cargo hammerwork batch cancel --queue emails --status pending --older-than-hours 24 --confirm
+
+# Export jobs to a file (csv, json or jsonl)
+cargo hammerwork batch export --output jobs.csv --queue emails --format csv
 ```
 
 ## Best Practices
 
 ### 1. Choose Appropriate Batch Sizes
 
-```rust
-// Small batches for quick processing
-let small_batch = JobBatch::new("quick_tasks")
-    .with_batch_size(10);
+Smaller chunks give faster feedback and shorter transactions; larger ones mean fewer round trips. Chunk with `into_chunks`:
 
-// Large batches for bulk operations
-let large_batch = JobBatch::new("bulk_import")
-    .with_batch_size(1000);
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::batch::JobBatch;
+
+let small = JobBatch::new("quick_tasks").with_jobs(jobs.clone()).with_batch_size(10);
+let large = JobBatch::new("bulk_import").with_jobs(jobs).with_batch_size(1000);
+# Ok(())
+# }
 ```
 
 ### 2. Use Metadata for Tracking
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::batch::JobBatch;
+
 let batch = JobBatch::new("user_notifications")
-    .with_metadata("run_id", Uuid::new_v4().to_string())
+    .with_metadata("run_id", uuid::Uuid::new_v4().to_string())
     .with_metadata("triggered_by", "automated_system")
-    .with_metadata("timestamp", Utc::now().to_rfc3339());
+    .with_metadata("timestamp", chrono::Utc::now().to_rfc3339());
+# Ok(())
+# }
 ```
 
 ### 3. Handle Large Batches
 
-For very large batches, consider chunking at the application level:
+A batch is limited to 10,000 jobs. For more, split at the application level:
 
-```rust
-// Process 10,000 jobs in multiple batches
-let all_jobs = generate_jobs(10_000);
-let chunks = all_jobs.chunks(1000);
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{batch::JobBatch, queue::DatabaseQueue, Job};
+use serde_json::json;
 
-for (i, chunk) in chunks.enumerate() {
-    let batch = JobBatch::new(&format!("large_batch_part_{}", i))
+let all_jobs: Vec<Job> = (0..25_000)
+    .map(|i| Job::new("bulk".to_string(), json!({"n": i})))
+    .collect();
+
+for (i, chunk) in all_jobs.chunks(5000).enumerate() {
+    let batch = JobBatch::new(format!("large_batch_part_{}", i))
         .with_jobs(chunk.to_vec())
         .with_metadata("parent_batch", "large_batch")
         .with_metadata("part", i.to_string());
-    
+
     queue.enqueue_batch(batch).await?;
 }
+# Ok(())
+# }
 ```
 
 ### 4. Monitor Batch Performance
 
-```rust
-use hammerwork::StatisticsCollector;
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::stats::{InMemoryStatsCollector, StatisticsCollector};
+use std::{sync::Arc, time::Duration};
 
-// Track batch processing metrics
-let stats = stats_collector.get_queue_statistics("batch_queue", Duration::from_hours(1)).await?;
+let stats_collector = Arc::new(InMemoryStatsCollector::new_default());
+// ... pass it to workers with `with_stats_collector` ...
 
-println!("Batches processed: {}", stats.total_processed);
-println!("Average batch size: {:.1}", stats.average_batch_size);
-println!("Batch error rate: {:.1}%", stats.error_rate * 100.0);
+let stats = stats_collector
+    .get_queue_statistics("batch_queue", Duration::from_secs(3600))
+    .await?;
+
+println!("Jobs processed: {}", stats.total_processed);
+println!("Error rate: {:.1}%", stats.error_rate * 100.0);
+# Ok(())
+# }
 ```
 
-### 5. Clean Up Completed Batches
+### 5. Clean Up Finished Batches
 
-```rust
-// Delete batch data after processing
+`delete_batch` removes the batch row and **all of its jobs**:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::queue::DatabaseQueue;
+
 let batch_result = queue.get_batch_status(batch_id).await?;
 if batch_result.pending_jobs == 0 {
     queue.delete_batch(batch_id).await?;
 }
+# Ok(())
+# }
 ```
 
 ## Example: Complete Batch Processing Workflow
 
-```rust
+```rust,no_run
 use hammerwork::{
     batch::{JobBatch, PartialFailureMode},
-    Job, JobQueue, Worker, WorkerPool,
     queue::DatabaseQueue,
+    worker::JobHandler,
+    Job, JobQueue, Worker, WorkerPool,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup
+    // Setup (run the migrations first, e.g. with `cargo hammerwork migration run`)
     let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
     let queue = Arc::new(JobQueue::new(pool));
-    queue.create_tables().await?;
 
     // Create a batch of data processing jobs
-    let mut jobs = Vec::new();
-    for i in 0..100 {
-        jobs.push(Job::new(
-            "data_processing".to_string(),
-            json!({
-                "file_id": format!("file_{}", i),
-                "operation": "transform"
-            })
-        ));
-    }
+    let jobs: Vec<Job> = (0..100)
+        .map(|i| {
+            Job::new(
+                "data_processing".to_string(),
+                json!({
+                    "file_id": format!("file_{}", i),
+                    "operation": "transform"
+                }),
+            )
+        })
+        .collect();
 
-    // Configure and enqueue batch
     let batch = JobBatch::new("daily_data_processing")
         .with_jobs(jobs)
-        .with_batch_size(25)
         .with_partial_failure_handling(PartialFailureMode::ContinueOnError)
         .with_metadata("date", "2024-01-15")
         .with_metadata("source", "automated_pipeline");
@@ -347,10 +521,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch_id = queue.enqueue_batch(batch).await?;
     println!("Enqueued batch: {}", batch_id);
 
-    // Create worker with batch processing enabled
-    let handler = Arc::new(|job: Job| {
+    // Worker with batch processing enabled
+    let handler: JobHandler = Arc::new(|_job: Job| {
         Box::pin(async move {
-            // Simulate processing
             tokio::time::sleep(Duration::from_millis(100)).await;
             Ok(())
         })
@@ -359,32 +532,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = Worker::new(queue.clone(), "data_processing".to_string(), handler)
         .with_batch_processing_enabled(true);
 
-    // Start processing
-    let mut pool = WorkerPool::new();
-    pool.add_worker(worker);
-    
+    let mut worker_pool = WorkerPool::new();
+    worker_pool.add_worker(worker);
+
     tokio::spawn(async move {
-        pool.start().await.unwrap();
+        if let Err(e) = worker_pool.start().await {
+            eprintln!("Worker pool stopped: {}", e);
+        }
     });
 
     // Monitor progress
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        
+
         let status = queue.get_batch_status(batch_id).await?;
-        println!("Progress: {}/{} jobs completed", 
-                 status.completed_jobs, status.total_jobs);
-        
+        println!(
+            "Progress: {}/{} jobs completed",
+            status.completed_jobs, status.total_jobs
+        );
+
         if status.pending_jobs == 0 {
-            println!("Batch completed with {:.1}% success rate", 
-                     status.success_rate() * 100.0);
+            println!(
+                "Batch finished with {:.1}% success rate",
+                status.success_rate() * 100.0
+            );
             break;
         }
     }
 
-    // Cleanup
+    // Cleanup (removes the batch and its jobs)
     queue.delete_batch(batch_id).await?;
-    
+
     Ok(())
 }
 ```
@@ -393,69 +571,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Database-Specific Optimizations
 
-**PostgreSQL**: Uses `UNNEST` for optimal bulk insertions
-```sql
-INSERT INTO hammerwork_jobs (...) 
-SELECT * FROM UNNEST($1::uuid[], $2::text[], ...)
-```
-
-**MySQL**: Uses multi-row `VALUES` with automatic chunking
-```sql
-INSERT INTO hammerwork_jobs (...) 
-VALUES (?, ?, ...), (?, ?, ...), ...
-```
-
-### Memory Usage
-
-Batches are processed in configurable chunks to manage memory:
-
-```rust
-// Limit memory usage with smaller batch sizes
-let batch = JobBatch::new("memory_conscious")
-    .with_jobs(large_job_list)
-    .with_batch_size(50); // Process 50 at a time
-```
+**PostgreSQL** inserts a batch's jobs inside one transaction using bulk statements, and **MySQL** uses multi-row `INSERT ... VALUES` statements. Either way a batch costs a handful of statements instead of one per job.
 
 ### Network Overhead
 
-Batch operations significantly reduce network round trips:
+- Individual enqueue: 1000 jobs = 1000 round trips
+- Batch enqueue: 1000 jobs = a few statements in one transaction
 
-- Individual enqueue: 1000 jobs = 1000 network calls
-- Batch enqueue: 1000 jobs = 1-10 network calls (depending on chunk size)
+### Memory Usage
+
+The whole batch is held in memory while it is built and inserted. Keep batches moderate (a few thousand jobs) and use `into_chunks` or application-level chunking for more.
 
 ## Troubleshooting
 
 ### Batch Validation Errors
 
-```rust
-// Error: Batch cannot be empty
-let empty_batch = JobBatch::new("empty");
-// This will error when enqueuing
-
-// Error: Jobs must have same queue name
-let mixed_jobs = vec![
-    Job::new("queue1".to_string(), json!({})),
-    Job::new("queue2".to_string(), json!({})),
-];
-// This will error during validation
-```
-
-### Large Batch Handling
-
-```rust
-// Error: Batch too large (>10,000 jobs)
-// Solution: Split into multiple batches
-let batches = large_jobs
-    .chunks(5000)
-    .map(|chunk| JobBatch::new("large").with_jobs(chunk.to_vec()));
-```
+`enqueue_batch` returns `HammerworkError::Queue` when validation fails: an empty batch, more than 10,000 jobs, or jobs with different queue names. Call `batch.validate()` yourself to check ahead of time.
 
 ### Performance Issues
 
 If batch processing is slow:
 
-1. Check batch size configuration
+1. Check the size of the batches you enqueue
 2. Monitor database performance
-3. Ensure workers have batch processing enabled
+3. Make sure workers poll the right queue and have enough capacity
 4. Review job handler efficiency
-5. Consider parallel worker pools
+5. Consider more workers in a `WorkerPool`
