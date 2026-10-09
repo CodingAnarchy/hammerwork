@@ -3319,7 +3319,7 @@ impl std::fmt::Display for KeySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KeySource::Environment(env_var) => write!(f, "Environment({})", env_var),
-            KeySource::Static(key) => write!(f, "Static({})", key),
+            KeySource::Static(_) => write!(f, "Static(<redacted>)"),
             KeySource::Generated(gen_type) => write!(f, "Generated({})", gen_type),
             KeySource::External(ext_id) => write!(f, "External({})", ext_id),
         }
@@ -4819,5 +4819,301 @@ mod tests {
     async fn test_kms_concurrent_first_load_mysql() {
         let (_guard, pool) = mysql_test_pool().await;
         kms_concurrent_first_load(pool).await;
+    }
+
+    #[test]
+    fn test_purpose_and_status_parse_display_roundtrip() {
+        for purpose in [KeyPurpose::Encryption, KeyPurpose::MAC, KeyPurpose::KEK] {
+            assert_eq!(parse_key_purpose(&purpose.to_string()).unwrap(), purpose);
+        }
+        for status in [
+            KeyStatus::Active,
+            KeyStatus::Retired,
+            KeyStatus::Revoked,
+            KeyStatus::Expired,
+        ] {
+            assert_eq!(parse_key_status(&status.to_string()).unwrap(), status);
+        }
+        assert!(
+            parse_key_purpose("Signing")
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown key purpose: Signing")
+        );
+        assert!(
+            parse_key_status("Lost")
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown key status: Lost")
+        );
+        let operations = [
+            (KeyOperation::Create, "Create"),
+            (KeyOperation::Access, "Access"),
+            (KeyOperation::Rotate, "Rotate"),
+            (KeyOperation::Retire, "Retire"),
+            (KeyOperation::Revoke, "Revoke"),
+            (KeyOperation::Delete, "Delete"),
+            (KeyOperation::Update, "Update"),
+        ];
+        for (operation, name) in operations {
+            assert_eq!(operation.to_string(), name);
+        }
+        assert_eq!(
+            EncryptionAlgorithm::ChaCha20Poly1305.to_string(),
+            "ChaCha20Poly1305"
+        );
+    }
+
+    /// Neither `Display` nor `Debug` may print a static key (they used to).
+    #[test]
+    fn test_key_source_formatting_never_shows_static_keys() {
+        let secret = "c2VjcmV0LWtleS1tYXRlcmlhbC0xMjM0NTY3ODkwMTI=";
+        let source = KeySource::Static(secret.to_string());
+        assert_eq!(source.to_string(), "Static(<redacted>)");
+        assert_eq!(format!("{source:?}"), "Static(<redacted>)");
+        let config = KeyManagerConfig::default().with_master_key_source(source);
+        assert!(!format!("{config:?}").contains(secret));
+        let config = crate::encryption::EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+            .with_key_source(KeySource::Static(secret.to_string()));
+        assert!(!format!("{config:?}").contains(secret));
+
+        assert_eq!(
+            KeySource::Environment("VAR".into()).to_string(),
+            "Environment(VAR)"
+        );
+        assert_eq!(
+            format!("{:?}", KeySource::External("aws://k".into())),
+            "External(\"aws://k\")"
+        );
+        assert_eq!(
+            KeySource::Generated("file:///k".into()).to_string(),
+            "Generated(file:///k)"
+        );
+        assert_eq!(
+            format!("{:?}", KeySource::Generated("g".into())),
+            "Generated(\"g\")"
+        );
+    }
+
+    fn stored_key(key_id: &str, status: KeyStatus) -> EncryptionKey {
+        EncryptionKey {
+            id: Uuid::new_v4(),
+            key_id: key_id.to_string(),
+            version: 1,
+            algorithm: EncryptionAlgorithm::AES256GCM,
+            encrypted_key_material: vec![],
+            derivation_salt: None,
+            source: KeySource::Generated("test".to_string()),
+            purpose: KeyPurpose::Encryption,
+            created_at: Utc::now(),
+            created_by: None,
+            expires_at: None,
+            rotated_at: None,
+            retired_at: None,
+            status,
+            rotation_interval: None,
+            next_rotation_at: None,
+            key_strength: 256,
+            master_key_id: None,
+            last_used_at: None,
+            usage_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_check_key_usable() {
+        assert!(check_key_usable(&stored_key("k", KeyStatus::Active)).is_ok());
+        assert!(check_key_usable(&stored_key("k", KeyStatus::Retired)).is_ok());
+        let err = check_key_usable(&stored_key("k", KeyStatus::Revoked)).unwrap_err();
+        assert!(err.to_string().contains("Key k has been revoked"), "{err}");
+        let err = check_key_usable(&stored_key("k", KeyStatus::Expired)).unwrap_err();
+        assert!(err.to_string().contains("Key k has expired"), "{err}");
+        let mut past = stored_key("k", KeyStatus::Active);
+        past.expires_at = Some(Utc::now() - Duration::seconds(1));
+        assert!(check_key_usable(&past).is_err(), "expires_at has passed");
+        past.expires_at = Some(Utc::now() + Duration::hours(1));
+        assert!(check_key_usable(&past).is_ok());
+    }
+
+    #[test]
+    fn test_with_external_kms_is_recorded() {
+        let config = KeyManagerConfig::default().with_external_kms(ExternalKmsConfig {
+            service_type: "AWS".to_string(),
+            endpoint: "https://kms.example".to_string(),
+            auth_config: HashMap::new(),
+            region: Some("eu-west-1".to_string()),
+            namespace: None,
+        });
+        assert_eq!(
+            config.external_kms_config.unwrap().region.as_deref(),
+            Some("eu-west-1")
+        );
+    }
+
+    /// Revoked and expired keys cannot be used, key-encryption keys cannot be rotated
+    /// as data keys, and rotation schedules can be changed and queried.
+    async fn key_states_and_schedules<DB: KeyManagerBackend>(pool: Pool<DB>) {
+        let mut manager = KeyManager::new(test_config(), pool).await.unwrap();
+        let suffix = Uuid::new_v4().simple().to_string();
+
+        let revoked = format!("revoked-{suffix}");
+        manager
+            .store_key(&stored_key(&revoked, KeyStatus::Revoked))
+            .await
+            .unwrap();
+        let err = manager.get_key(&revoked).await.unwrap_err();
+        assert!(err.to_string().contains("has been revoked"), "{err}");
+
+        let expired = format!("expired-{suffix}");
+        let mut key = stored_key(&expired, KeyStatus::Active);
+        key.expires_at = Some(Utc::now() - Duration::minutes(1));
+        manager.store_key(&key).await.unwrap();
+        let err = manager.get_key(&expired).await.unwrap_err();
+        assert!(err.to_string().contains("has expired"), "{err}");
+
+        let kek = format!("kek-{suffix}");
+        let mut key = stored_key(&kek, KeyStatus::Active);
+        key.purpose = KeyPurpose::KEK;
+        manager.store_key(&key).await.unwrap();
+        let err = manager.rotate_key(&kek).await.unwrap_err();
+        assert!(err.to_string().contains("is a key-encryption key"), "{err}");
+
+        let scheduled = format!("scheduled-{suffix}");
+        manager
+            .generate_key(&scheduled, EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        manager
+            .update_key_rotation_schedule(&scheduled, Some(Duration::days(7)))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .load_key(&scheduled)
+                .await
+                .unwrap()
+                .rotation_interval,
+            Some(Duration::days(7))
+        );
+        let next = manager
+            .get_key_rotation_schedule(&scheduled)
+            .await
+            .unwrap()
+            .expect("next rotation");
+        assert!(next > Utc::now() + Duration::days(6));
+        assert!(!manager.is_key_due_for_rotation(&scheduled).await.unwrap());
+        assert!(
+            !manager
+                .get_keys_due_for_rotation()
+                .await
+                .unwrap()
+                .contains(&scheduled)
+        );
+
+        manager
+            .schedule_key_rotation(&scheduled, Utc::now() - Duration::minutes(1))
+            .await
+            .unwrap();
+        assert!(manager.is_key_due_for_rotation(&scheduled).await.unwrap());
+        assert!(
+            manager
+                .get_keys_due_for_rotation()
+                .await
+                .unwrap()
+                .contains(&scheduled)
+        );
+
+        // Clearing the interval clears the schedule.
+        manager
+            .update_key_rotation_schedule(&scheduled, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_key_rotation_schedule(&scheduled).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            manager
+                .load_key(&scheduled)
+                .await
+                .unwrap()
+                .rotation_interval,
+            None
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_key_states_and_schedules_postgres() {
+        let (_db_guard, pool) = postgres_test_pool().await;
+        key_states_and_schedules(pool).await;
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_key_states_and_schedules_mysql() {
+        let (_db_guard, pool) = mysql_test_pool().await;
+        key_states_and_schedules(pool).await;
+    }
+
+    /// The rotation service refuses a disabled or zero-interval configuration, and
+    /// otherwise rotates keys as they fall due.
+    async fn rotation_service_rotates_due_keys<DB: KeyManagerBackend>(pool: Pool<DB>) {
+        let disabled = KeyManager::new(test_config(), pool.clone()).await.unwrap();
+        assert!(matches!(
+            disabled.start_rotation_service(Duration::seconds(1)).await,
+            Err(EncryptionError::InvalidConfiguration(_))
+        ));
+
+        let mut manager = KeyManager::new(test_config().with_auto_rotation_enabled(true), pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.start_rotation_service(Duration::zero()).await,
+            Err(EncryptionError::InvalidConfiguration(_))
+        ));
+
+        let key_id = format!("service-{}", Uuid::new_v4().simple());
+        manager
+            .generate_key(&key_id, EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        let service = manager
+            .start_rotation_service(Duration::milliseconds(50))
+            .await
+            .unwrap();
+        let task = tokio::spawn(service);
+        manager
+            .schedule_key_rotation(&key_id, Utc::now() - Duration::minutes(1))
+            .await
+            .unwrap();
+        let mut rotated = false;
+        for _ in 0..100 {
+            if manager.load_key(&key_id).await.unwrap().version >= 2 {
+                rotated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        task.abort();
+        assert!(rotated, "the service rotates a key once it is due");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_rotation_service_rotates_due_keys_postgres() {
+        let (_db_guard, pool) = postgres_test_pool().await;
+        rotation_service_rotates_due_keys(pool).await;
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_rotation_service_rotates_due_keys_mysql() {
+        let (_db_guard, pool) = mysql_test_pool().await;
+        rotation_service_rotates_due_keys(pool).await;
     }
 }

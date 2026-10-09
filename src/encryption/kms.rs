@@ -94,11 +94,6 @@ pub(crate) async fn vault_read_key_field(
     mount: &str,
     path: &str,
 ) -> Result<String, EncryptionError> {
-    use vaultrs::{
-        client::{VaultClient, VaultClientSettingsBuilder},
-        kv2,
-    };
-
     let token = std::env::var("VAULT_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -107,7 +102,29 @@ pub(crate) async fn vault_read_key_field(
                 "VAULT_TOKEN is not set; cannot read the key from HashiCorp Vault".to_string(),
             )
         })?;
+    vault_read_key_field_with_token(vault_addr, &token, mount, path).await
+}
 
+/// Read the string `key` field of a KV v2 secret, authenticating with `token`.
+#[cfg(feature = "vault-kms")]
+pub(crate) async fn vault_read_key_field_with_token(
+    vault_addr: &str,
+    token: &str,
+    mount: &str,
+    path: &str,
+) -> Result<String, EncryptionError> {
+    use vaultrs::{
+        client::{VaultClient, VaultClientSettingsBuilder},
+        kv2,
+    };
+
+    // `VaultClientSettingsBuilder::address` panics on an invalid URL.
+    url::Url::parse(vault_addr).map_err(|e| {
+        EncryptionError::InvalidConfiguration(format!(
+            "Invalid Vault address {:?}: {}",
+            vault_addr, e
+        ))
+    })?;
     let settings = VaultClientSettingsBuilder::default()
         .address(vault_addr)
         .token(token)
@@ -243,5 +260,159 @@ mod tests {
             "default"
         );
         assert!(azure_vault_and_key("azure://", "default").is_err());
+    }
+
+    /// A fake Vault server: answers KV v2 reads of `secret/<name>` from `secrets`
+    /// (404 for anything else) and records the tokens it was sent.
+    #[cfg(feature = "vault-kms")]
+    async fn fake_vault(
+        secrets: HashMap<&'static str, serde_json::Value>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let tokens = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&tokens);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let secrets = secrets.clone();
+                let seen = std::sync::Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&buffer).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                    if let Some(token) = request.lines().find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("x-vault-token:")
+                            .map(|t| t.trim().to_string())
+                    }) {
+                        seen.lock().unwrap().push(token);
+                    }
+                    let found = path
+                        .split('?')
+                        .next()
+                        .unwrap_or("")
+                        .strip_prefix("/v1/secret/data/")
+                        .and_then(|name| secrets.get(name));
+                    let (status, body) = match found {
+                        Some(data) => (
+                            "200 OK",
+                            serde_json::json!({
+                                "request_id": "r",
+                                "lease_id": "",
+                                "renewable": false,
+                                "lease_duration": 0,
+                                "data": {
+                                    "data": data,
+                                    "metadata": {
+                                        "created_time": "2026-01-01T00:00:00Z",
+                                        "custom_metadata": null,
+                                        "deletion_time": "",
+                                        "destroyed": false,
+                                        "version": 1
+                                    }
+                                },
+                                "wrap_info": null,
+                                "warnings": null,
+                                "auth": null
+                            })
+                            .to_string(),
+                        ),
+                        None => ("404 Not Found", r#"{"errors":[]}"#.to_string()),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (addr, tokens)
+    }
+
+    #[cfg(feature = "vault-kms")]
+    #[tokio::test]
+    async fn test_vault_read_key_field_with_token() {
+        let (addr, tokens) = fake_vault(HashMap::from([
+            ("hammerwork", serde_json::json!({ "key": "c2VjcmV0" })),
+            ("no-key", serde_json::json!({ "other": "x" })),
+            ("number-key", serde_json::json!({ "key": 42 })),
+        ]))
+        .await;
+
+        let key = vault_read_key_field_with_token(&addr, "s.token", "secret", "hammerwork")
+            .await
+            .unwrap();
+        assert_eq!(key, "c2VjcmV0");
+        assert_eq!(tokens.lock().unwrap().as_slice(), ["s.token"]);
+
+        for (path, expected) in [
+            ("no-key", "has no string `key` field"),
+            ("number-key", "has no string `key` field"),
+            ("missing", "Failed to read secret secret/missing"),
+        ] {
+            let err = vault_read_key_field_with_token(&addr, "s.token", "secret", path)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, EncryptionError::KeyManagement(_)), "{err}");
+            assert!(err.to_string().contains(expected), "{path}: {err}");
+        }
+
+        let err = vault_read_key_field_with_token("not a url", "t", "secret", "x")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Vault"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_service_config_edge_cases() {
+        // Without the scheme prefix the whole string is the resource.
+        let (resource, params) = parse_service_config("alias/key?flag&x=", "aws://");
+        assert_eq!(resource, "alias/key");
+        assert_eq!(params.get("flag"), Some(&""));
+        assert_eq!(params.get("x"), Some(&""));
+        let (resource, params) = parse_service_config("aws://k?&&region=r", "aws://");
+        assert_eq!(resource, "k");
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn test_aws_key_config_region_and_endpoint() {
+        assert_eq!(
+            aws_key_config("aws://k?region=eu-west-1&endpoint=http://localhost:4566").unwrap(),
+            ("k", "eu-west-1", Some("http://localhost:4566"))
+        );
+        // Empty values fall back to the defaults.
+        assert_eq!(
+            aws_key_config("aws://k?region=&endpoint=").unwrap(),
+            ("k", "us-east-1", None)
+        );
+    }
+
+    #[test]
+    fn test_vault_address_requires_an_address() {
+        let empty: HashMap<&str, &str> = [("addr", "")].into_iter().collect();
+        // An empty `addr` is not an address (VAULT_ADDR is used only when `addr` is
+        // absent).
+        assert!(matches!(
+            vault_address(&empty),
+            Err(EncryptionError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn test_kms_feature_disabled_message() {
+        let err = kms_feature_disabled("aws://", "aws-kms");
+        assert!(matches!(err, EncryptionError::InvalidConfiguration(_)));
+        assert!(err.to_string().contains("`aws-kms` cargo feature"), "{err}");
     }
 }
