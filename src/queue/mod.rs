@@ -361,10 +361,31 @@ pub trait DatabaseQueue: Send + Sync {
     /// have been satisfied (completed successfully).
     async fn get_ready_jobs(&self, queue_name: &str, limit: u32) -> Result<Vec<Job>>;
 
-    /// Mark job dependencies as failed when a job fails.
+    /// Apply the failure of `failed_job_id` to the jobs that can no longer run because
+    /// of it, according to its workflow's
+    /// [`FailurePolicy`](crate::workflow::FailurePolicy), and return the jobs that were
+    /// failed:
     ///
-    /// This propagates failure through the dependency graph according to the
-    /// workflow's failure policy.
+    /// - `FailFast`: the workflow's other `Pending` and `Retrying` jobs, and every job
+    ///   that (transitively) depends on the failed one, become `Failed`; the workflow
+    ///   becomes `Failed`. Jobs already `Running` finish their run.
+    /// - `ContinueOnFailure`: only the `Pending` jobs that (transitively) depend on the
+    ///   failed one become `Failed` (their dependency status `failed`); independent
+    ///   branches keep running. The workflow stays `Running` until all its jobs have
+    ///   finished, and then becomes `Failed`.
+    /// - `Manual`: nothing changes. The dependents keep waiting until an operator
+    ///   re-runs the failed job ([`retry_job`](Self::retry_job), after which its
+    ///   completion releases them) or cancels the workflow
+    ///   ([`cancel_workflow`](Self::cancel_workflow)). The workflow stays `Running`.
+    ///
+    /// A job outside any workflow is treated like `ContinueOnFailure`. The workflow's
+    /// counters and status are updated in the same transaction.
+    ///
+    /// Terminal transitions ([`fail_job`](Self::fail_job),
+    /// [`finish_job_run`](Self::finish_job_run) and, on the database backends,
+    /// [`mark_job_dead`](Self::mark_job_dead) and
+    /// [`mark_job_timed_out`](Self::mark_job_timed_out)) already apply the policy, so
+    /// calling this afterwards changes nothing and returns an empty list.
     async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>>;
 
     /// Get all jobs in a workflow.

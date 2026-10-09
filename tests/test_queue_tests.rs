@@ -186,17 +186,20 @@ async fn test_job_retry_mechanism() {
     let job = Job::new("retry_queue".to_string(), json!({"retry": "test"})).with_max_attempts(3);
     let job_id = queue.enqueue(job).await.unwrap();
 
-    // First attempt - dequeue and fail
-    let _dequeued = queue.dequeue("retry_queue").await.unwrap().unwrap();
-    queue.fail_job(job_id, "First failure").await.unwrap();
+    // Each dequeue counts as an attempt. Like a worker, retry a failed run while the
+    // job has attempts left and mark it dead once they are used up.
 
-    let job = queue.get_job(job_id).await.unwrap().unwrap();
-    assert_eq!(job.status, JobStatus::Retrying);
-    assert_eq!(job.attempts, 1);
+    // First attempt - dequeue and fail
+    let dequeued = queue.dequeue("retry_queue").await.unwrap().unwrap();
+    assert_eq!(dequeued.attempts, 1);
+    assert!(dequeued.attempts < dequeued.max_attempts);
 
     // Schedule retry
     let retry_at = clock.now() + Duration::minutes(5);
     queue.retry_job(job_id, retry_at).await.unwrap();
+    let job = queue.get_job(job_id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Pending);
+    assert_eq!(job.attempts, 1);
 
     // Job should not be available immediately
     assert!(queue.dequeue("retry_queue").await.unwrap().is_none());
@@ -207,19 +210,18 @@ async fn test_job_retry_mechanism() {
     // Second attempt - fail again
     let dequeued = queue.dequeue("retry_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.id, job_id);
-    queue.fail_job(job_id, "Second failure").await.unwrap();
-
-    let job = queue.get_job(job_id).await.unwrap().unwrap();
-    assert_eq!(job.attempts, 2);
-
-    // Third attempt - fail again (should mark as dead)
+    assert_eq!(dequeued.attempts, 2);
     queue.retry_job(job_id, clock.now()).await.unwrap();
-    queue.dequeue("retry_queue").await.unwrap();
-    queue.fail_job(job_id, "Third failure").await.unwrap();
+
+    // Third attempt - the last one: mark as dead
+    let dequeued = queue.dequeue("retry_queue").await.unwrap().unwrap();
+    assert_eq!(dequeued.attempts, dequeued.max_attempts);
+    queue.mark_job_dead(job_id, "Third failure").await.unwrap();
 
     let job = queue.get_job(job_id).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Dead);
     assert_eq!(job.attempts, 3);
+    assert_eq!(job.error_message.as_deref(), Some("Third failure"));
     assert!(job.failed_at.is_some());
 }
 
@@ -256,10 +258,7 @@ async fn test_batch_operations() {
     for i in 0..4 {
         if let Some(job) = queue.dequeue("batch_queue").await.unwrap() {
             if i == 2 {
-                // Fail the third job
-                queue.fail_job(job.id, "Planned failure").await.unwrap();
-                // Exhaust retries
-                queue.fail_job(job.id, "Planned failure").await.unwrap();
+                // Fail the third job (a terminal failure)
                 queue.fail_job(job.id, "Planned failure").await.unwrap();
             } else {
                 queue.complete_job(job.id).await.unwrap();
@@ -301,13 +300,14 @@ async fn test_batch_fail_fast() {
     // Fail second job
     if let Some(job) = queue.dequeue("failfast_queue").await.unwrap() {
         queue.fail_job(job.id, "Failure").await.unwrap();
-        queue.fail_job(job.id, "Failure").await.unwrap();
-        queue.fail_job(job.id, "Failure").await.unwrap();
     }
 
-    // Check batch status - should be failed even though third job is pending
+    // The batch fails fast: its third job is failed without running.
     let status = queue.get_batch_status(batch_id).await.unwrap();
     assert_eq!(status.status, BatchStatus::Failed);
+    assert_eq!(status.completed_jobs, 1);
+    assert_eq!(status.failed_jobs, 2);
+    assert!(queue.dequeue("failfast_queue").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -393,18 +393,16 @@ async fn test_workflow_failure_policies() {
 
     let workflow_id = queue.enqueue_workflow(workflow).await.unwrap();
 
-    // Fail the first job
+    // Fail the first job (a terminal failure)
     let dequeued = queue.dequeue("failfast_wf").await.unwrap().unwrap();
-    queue.fail_job(dequeued.id, "Test failure").await.unwrap();
-    queue.fail_job(dequeued.id, "Test failure").await.unwrap();
     queue.fail_job(dequeued.id, "Test failure").await.unwrap();
 
     // Other jobs should have been failed due to fail-fast policy
     let failed_job_id = dequeued.id;
 
-    // Check that the failed job is dead
+    // Check that the failed job is failed
     let failed_job_status = queue.get_job(failed_job_id).await.unwrap().unwrap();
-    assert_eq!(failed_job_status.status, JobStatus::Dead);
+    assert_eq!(failed_job_status.status, JobStatus::Failed);
 
     // Check that all other jobs are failed
     for job in [&job1, &job2, &job3] {
@@ -682,10 +680,8 @@ async fn test_queue_statistics() {
             if i < 3 {
                 queue.complete_job(job.id).await.unwrap();
             } else {
-                // Fail the last 2
-                queue.fail_job(job.id, "Test failure").await.unwrap();
-                queue.fail_job(job.id, "Test failure").await.unwrap();
-                queue.fail_job(job.id, "Test failure").await.unwrap();
+                // The last 2 run out of attempts and die, as a worker records it
+                queue.mark_job_dead(job.id, "Test failure").await.unwrap();
             }
         }
     }

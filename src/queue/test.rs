@@ -41,10 +41,12 @@ use crate::{
     batch::{BatchId, BatchResult, BatchStatus, JobBatch},
     job::{Job, JobId, JobStatus},
     priority::{JobPriority, PriorityWeights},
-    queue::{DatabaseQueue, PayloadEncryption, QueuePauseInfo},
+    queue::{DatabaseQueue, PayloadEncryption, QueuePauseInfo, lifecycle},
     rate_limit::ThrottleConfig,
     stats::{DeadJobSummary, QueueStats},
-    workflow::{JobGroup, WorkflowId, WorkflowStatus},
+    workflow::{
+        DependencyStatus, FailurePolicy, JobGroup, WorkflowId, WorkflowProgress, WorkflowStatus,
+    },
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -354,6 +356,147 @@ impl TestStorage {
         Ok(())
     }
 
+    /// Mark an unfinished job `Failed` with `error`, as a side effect of another job's
+    /// failure. A job still waiting on its dependencies records that they failed.
+    fn fail_as_side_effect(&mut self, job_id: JobId, error: String, now: DateTime<Utc>) {
+        if self.update_job_status(job_id, JobStatus::Failed).is_err() {
+            return;
+        }
+        self.leases.remove(&job_id);
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.failed_at = Some(now);
+            job.error_message = Some(error);
+            if job.dependency_status == DependencyStatus::Waiting {
+                job.dependency_status = DependencyStatus::Failed;
+            }
+        }
+    }
+
+    /// The workflow `job_id` belongs to: the one its `workflow_id` names, or else the
+    /// one listing it among its jobs.
+    fn workflow_of(&self, job_id: JobId) -> Option<&JobGroup> {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.workflow_id)
+            .and_then(|id| self.workflows.get(&id))
+            .or_else(|| {
+                self.workflows
+                    .values()
+                    .find(|w| w.jobs.iter().any(|j| j.id == job_id))
+            })
+    }
+
+    /// The jobs that depend directly on `job_id`.
+    fn direct_dependents(&self, job_id: JobId) -> Vec<JobId> {
+        let mut dependents = self.dependents.get(&job_id).cloned().unwrap_or_default();
+        for job in self.jobs.values() {
+            if job.depends_on.contains(&job_id) && !dependents.contains(&job.id) {
+                dependents.push(job.id);
+            }
+        }
+        dependents
+    }
+
+    /// Fail every pending job that (transitively) depends on `failed_job_id`.
+    fn fail_dependents(&mut self, failed_job_id: JobId, now: DateTime<Utc>) -> Vec<JobId> {
+        let mut failed = Vec::new();
+        let mut to_check = vec![failed_job_id];
+        while let Some(current) = to_check.pop() {
+            for id in self.direct_dependents(current) {
+                let pending = self.jobs.get(&id).is_some_and(|job| {
+                    job.status == JobStatus::Pending
+                        && job.dependency_status != DependencyStatus::Failed
+                });
+                if pending && !failed.contains(&id) {
+                    self.fail_as_side_effect(
+                        id,
+                        lifecycle::dependency_failed_message(current),
+                        now,
+                    );
+                    failed.push(id);
+                    to_check.push(id);
+                }
+            }
+        }
+        failed
+    }
+
+    /// Apply the failure policy of `failed_job_id`'s workflow, as the database
+    /// backends do (see [`FailurePolicy`]):
+    ///
+    /// - `FailFast` fails the workflow's other `Pending` and `Retrying` jobs, then
+    ///   every job that (transitively) depends on the failed one;
+    /// - `ContinueOnFailure`, and jobs outside any workflow, fail only the jobs that
+    ///   (transitively) depend on the failed one;
+    /// - `Manual` changes nothing: dependents keep waiting.
+    ///
+    /// Returns the jobs that were failed.
+    fn apply_workflow_failure(&mut self, failed_job_id: JobId, now: DateTime<Utc>) -> Vec<JobId> {
+        let workflow = self.workflow_of(failed_job_id).map(|w| {
+            (
+                w.failure_policy.clone(),
+                w.jobs.iter().map(|j| j.id).collect(),
+            )
+        });
+        match workflow {
+            Some((FailurePolicy::Manual, _)) => Vec::new(),
+            Some((FailurePolicy::FailFast, job_ids)) => {
+                let job_ids: Vec<JobId> = job_ids;
+                let mut failed = Vec::new();
+                for id in job_ids {
+                    let unstarted = self.jobs.get(&id).is_some_and(|job| {
+                        matches!(job.status, JobStatus::Pending | JobStatus::Retrying)
+                    });
+                    if id != failed_job_id && unstarted {
+                        self.fail_as_side_effect(
+                            id,
+                            lifecycle::workflow_failed_message(failed_job_id),
+                            now,
+                        );
+                        failed.push(id);
+                    }
+                }
+                for id in self.fail_dependents(failed_job_id, now) {
+                    if !failed.contains(&id) {
+                        failed.push(id);
+                    }
+                }
+                failed
+            }
+            Some((FailurePolicy::ContinueOnFailure, _)) | None => {
+                self.fail_dependents(failed_job_id, now)
+            }
+        }
+    }
+
+    /// Fail the `Pending` and `Retrying` jobs of a `FailFast` batch after one of its
+    /// jobs failed. Returns the jobs that were failed.
+    fn apply_batch_failure(&mut self, failed_job_id: JobId, now: DateTime<Utc>) -> Vec<JobId> {
+        let Some(batch_id) = self.jobs.get(&failed_job_id).and_then(|job| job.batch_id) else {
+            return Vec::new();
+        };
+        let fail_fast = self
+            .batches
+            .get(&batch_id)
+            .is_some_and(|batch| batch.failure_mode == crate::batch::PartialFailureMode::FailFast);
+        if !fail_fast {
+            return Vec::new();
+        }
+        let job_ids = self.batch_jobs.get(&batch_id).cloned().unwrap_or_default();
+        let mut failed = Vec::new();
+        for id in job_ids {
+            let unstarted = self
+                .jobs
+                .get(&id)
+                .is_some_and(|job| matches!(job.status, JobStatus::Pending | JobStatus::Retrying));
+            if unstarted {
+                self.fail_as_side_effect(id, lifecycle::batch_failed_message(failed_job_id), now);
+                failed.push(id);
+            }
+        }
+        failed
+    }
+
     /// Get the next job to dequeue based on priority and scheduled time
     fn get_next_job(&self, queue_name: &str, weights: Option<&PriorityWeights>) -> Option<JobId> {
         // Like the database backends, a paused queue hands out no jobs.
@@ -530,22 +673,29 @@ impl TestStorage {
 ///     .with_max_attempts(3);
 /// let job_id = queue.enqueue(job).await?;
 ///
-/// // Dequeue and fail the job
-/// let job = queue.dequeue("retry_queue").await?.unwrap();
-/// queue.fail_job(job_id, "Temporary network error").await?;
-///
-/// // Job should be in retrying state
-/// let retrying_job = queue.get_job(job_id).await?.unwrap();
-/// assert_eq!(retrying_job.status, JobStatus::Retrying);
-/// assert_eq!(retrying_job.attempts, 1);
-///
-/// // After 3 failures, job becomes dead
-/// queue.fail_job(job_id, "Still failing").await?;
-/// queue.fail_job(job_id, "Final failure").await?;
+/// // Each dequeue counts as an attempt. Like a worker, retry the job while it has
+/// // attempts left and mark it dead once they are used up.
+/// for attempt in 1..=3 {
+///     let job = queue.dequeue("retry_queue").await?.unwrap();
+///     assert_eq!(job.attempts, attempt);
+///     if job.attempts < job.max_attempts {
+///         queue.retry_job(job_id, queue.clock().now()).await?;
+///     } else {
+///         queue.mark_job_dead(job_id, "Still failing").await?;
+///     }
+/// }
 ///
 /// let dead_job = queue.get_job(job_id).await?.unwrap();
 /// assert_eq!(dead_job.status, JobStatus::Dead);
 /// assert_eq!(dead_job.attempts, 3);
+///
+/// // `fail_job` records a terminal failure that is not retried automatically.
+/// let job_id = queue
+///     .enqueue(Job::new("retry_queue".to_string(), json!({"data": "other"})))
+///     .await?;
+/// queue.dequeue("retry_queue").await?.unwrap();
+/// queue.fail_job(job_id, "Permanent error").await?;
+/// assert_eq!(queue.get_job(job_id).await?.unwrap().status, JobStatus::Failed);
 /// # Ok(())
 /// # }
 /// ```
@@ -868,6 +1018,8 @@ impl DatabaseQueue for TestQueue {
             let now = storage.clock.now();
             if let Some(job) = storage.jobs.get_mut(&job_id) {
                 job.started_at = Some(now);
+                // Like the database backends, every dequeue counts as an attempt.
+                job.attempts += 1;
                 return Ok(Some(job.clone()));
             }
         }
@@ -890,6 +1042,8 @@ impl DatabaseQueue for TestQueue {
             let now = storage.clock.now();
             if let Some(job) = storage.jobs.get_mut(&job_id) {
                 job.started_at = Some(now);
+                // Like the database backends, every dequeue counts as an attempt.
+                job.attempts += 1;
                 return Ok(Some(job.clone()));
             }
         }
@@ -965,69 +1119,18 @@ impl DatabaseQueue for TestQueue {
         let mut storage = self.storage.write().await;
         storage.check_transition(job_id, crate::queue::JobTransition::Fail)?;
 
-        // First increment attempts
-        if let Some(job) = storage.jobs.get_mut(&job_id) {
-            job.attempts += 1;
-            job.error_message = Some(error_message.to_string());
-        } else {
-            return Err(HammerworkError::JobNotFound {
-                id: job_id.to_string(),
-            });
-        }
-
-        // Then check if we should retry
-        let should_retry = if let Some(job) = storage.jobs.get(&job_id) {
-            job.attempts < job.max_attempts
-        } else {
-            return Err(HammerworkError::JobNotFound {
-                id: job_id.to_string(),
-            });
-        };
-
+        // A terminal failure, as on the database backends: no automatic retry, and
+        // `attempts` is left alone (it counts dequeues).
+        storage.update_job_status(job_id, JobStatus::Failed)?;
+        storage.leases.remove(&job_id);
         let now = storage.clock.now();
-
-        if should_retry {
-            storage.update_job_status(job_id, JobStatus::Retrying)?;
-        } else {
-            storage.update_job_status(job_id, JobStatus::Dead)?;
-            if let Some(job) = storage.jobs.get_mut(&job_id) {
-                job.failed_at = Some(now);
-            }
-
-            // Check if this job belongs to a workflow with fail-fast policy
-            let other_job_ids: Vec<JobId> = storage
-                .workflows
-                .values()
-                .find(|workflow| {
-                    workflow.failure_policy == crate::workflow::FailurePolicy::FailFast
-                        && workflow.jobs.iter().any(|j| j.id == job_id)
-                })
-                .map(|workflow| {
-                    workflow
-                        .jobs
-                        .iter()
-                        .filter(|j| j.id != job_id)
-                        .map(|j| j.id)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // Fail all other pending jobs in the workflow
-            for other_job_id in other_job_ids {
-                if let Some(j) = storage.jobs.get(&other_job_id)
-                    && (j.status == JobStatus::Pending || j.status == JobStatus::Retrying)
-                {
-                    storage
-                        .update_job_status(other_job_id, JobStatus::Failed)
-                        .ok();
-                    if let Some(j) = storage.jobs.get_mut(&other_job_id) {
-                        j.error_message = Some("Workflow failed (fail-fast policy)".to_string());
-                        j.failed_at = Some(now);
-                    }
-                }
-            }
+        if let Some(job) = storage.jobs.get_mut(&job_id) {
+            job.failed_at = Some(now);
+            job.error_message = Some(error_message.to_string());
         }
 
+        storage.apply_workflow_failure(job_id, now);
+        storage.apply_batch_failure(job_id, now);
         Ok(())
     }
 
@@ -2030,7 +2133,18 @@ impl DatabaseQueue for TestQueue {
         workflow.created_at = storage.clock.now();
         let workflow_id = workflow.id;
 
-        // Store dependencies
+        // Store dependencies: those of the workflow's dependency map and, like the
+        // database backends, each job's own `depends_on`.
+        for job in &workflow.jobs {
+            if !job.depends_on.is_empty() {
+                let deps = workflow.dependencies.entry(job.id).or_default();
+                for dep_id in &job.depends_on {
+                    if !deps.contains(dep_id) {
+                        deps.push(*dep_id);
+                    }
+                }
+            }
+        }
         for (job_id, deps) in &workflow.dependencies {
             storage.dependencies.insert(*job_id, deps.clone());
 
@@ -2084,34 +2198,37 @@ impl DatabaseQueue for TestQueue {
         let storage = self.storage.read().await;
 
         if let Some(mut workflow) = storage.workflows.get(&workflow_id).cloned() {
-            // Update workflow status based on job statuses
-            let mut completed = 0;
-            let mut failed = 0;
-
+            // Workflow counters and status from its jobs, as the database backends
+            // compute them on every terminal transition.
+            let mut progress = WorkflowProgress::default();
             for job_id in workflow.jobs.iter().map(|j| j.id) {
                 if let Some(job) = storage.jobs.get(&job_id) {
                     match &job.status {
-                        JobStatus::Completed => completed += 1,
-                        JobStatus::Failed | JobStatus::Dead | JobStatus::TimedOut => failed += 1,
+                        JobStatus::Completed => progress.completed += 1,
+                        JobStatus::Failed | JobStatus::Dead | JobStatus::TimedOut => {
+                            progress.failed += 1
+                        }
                         _ => {}
                     }
                 }
             }
 
-            workflow.completed_jobs = completed;
-            workflow.failed_jobs = failed;
-
-            // Only update status if it's not already set to a terminal state
-            if workflow.status != WorkflowStatus::Cancelled {
-                if failed > 0 {
-                    workflow.status = WorkflowStatus::Failed;
-                    workflow.failed_at = Some(storage.clock.now());
-                } else if completed == workflow.total_jobs {
-                    workflow.status = WorkflowStatus::Completed;
-                    workflow.completed_at = Some(storage.clock.now());
-                } else {
-                    workflow.status = WorkflowStatus::Running;
+            workflow.completed_jobs = progress.completed;
+            workflow.failed_jobs = progress.failed;
+            workflow.status = progress.status(
+                workflow.total_jobs,
+                &workflow.failure_policy,
+                &workflow.status,
+            );
+            let now = storage.clock.now();
+            match workflow.status {
+                WorkflowStatus::Completed => {
+                    workflow.completed_at.get_or_insert(now);
                 }
+                WorkflowStatus::Failed => {
+                    workflow.failed_at.get_or_insert(now);
+                }
+                _ => {}
             }
 
             Ok(Some(workflow))
@@ -2183,50 +2300,8 @@ impl DatabaseQueue for TestQueue {
 
     async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>> {
         let mut storage = self.storage.write().await;
-        let mut failed_jobs = Vec::new();
-
-        // Get the workflow this job belongs to
-        let workflow = storage
-            .workflows
-            .values()
-            .find(|w| w.jobs.iter().any(|j| j.id == failed_job_id))
-            .cloned();
-
-        if let Some(workflow) = workflow {
-            // Check failure policy
-            match workflow.failure_policy {
-                crate::workflow::FailurePolicy::ContinueOnFailure => {
-                    // Don't fail dependencies, continue with independent jobs
-                }
-                crate::workflow::FailurePolicy::Manual => {
-                    // Don't automatically fail dependencies, wait for manual intervention
-                }
-                crate::workflow::FailurePolicy::FailFast => {
-                    // Fail all pending jobs in the workflow
-                    let current_time = storage.clock.now();
-                    for job in &workflow.jobs {
-                        if let Some(j) = storage.jobs.get(&job.id)
-                            && j.status == JobStatus::Pending
-                        {
-                            storage.update_job_status(job.id, JobStatus::Failed).ok();
-                            if let Some(j) = storage.jobs.get_mut(&job.id) {
-                                j.error_message = Some("Dependency failed".to_string());
-                                j.failed_at = Some(current_time);
-                                // As in the database backends: a job still waiting on
-                                // its dependencies records that they failed.
-                                if j.dependency_status == crate::workflow::DependencyStatus::Waiting
-                                {
-                                    j.dependency_status = crate::workflow::DependencyStatus::Failed;
-                                }
-                            }
-                            failed_jobs.push(job.id);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(failed_jobs)
+        let now = storage.clock.now();
+        Ok(storage.apply_workflow_failure(failed_job_id, now))
     }
 
     async fn get_workflow_jobs(&self, workflow_id: WorkflowId) -> Result<Vec<Job>> {
@@ -2809,14 +2884,16 @@ mod tests {
         let job = Job::new("test_queue".to_string(), json!({"test": true})).with_max_attempts(3);
         let job_id = queue.enqueue(job).await.unwrap();
 
-        // Dequeue and fail the job
-        let _dequeued = queue.dequeue("test_queue").await.unwrap();
+        // Dequeue and fail the job: a terminal failure, not retried automatically.
+        let dequeued = queue.dequeue("test_queue").await.unwrap().unwrap();
+        assert_eq!(dequeued.attempts, 1);
         queue.fail_job(job_id, "Test error").await.unwrap();
 
-        // Job should be in retrying status
         let job = queue.get_job(job_id).await.unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::Retrying);
+        assert_eq!(job.status, JobStatus::Failed);
         assert_eq!(job.attempts, 1);
+        assert_eq!(job.error_message.as_deref(), Some("Test error"));
+        assert!(job.failed_at.is_some());
 
         // Retry the job
         let retry_at = queue.clock().now() + chrono::Duration::minutes(5);
@@ -3019,12 +3096,9 @@ mod tests {
             }
         }
 
-        // Fail one job
+        // One job runs out of attempts and dies, as a worker would record it.
         if let Some(job) = queue.dequeue("stats_queue").await.unwrap() {
-            queue.fail_job(job.id, "Test failure").await.unwrap();
-            // Exhaust retries
-            queue.fail_job(job.id, "Test failure").await.unwrap();
-            queue.fail_job(job.id, "Test failure").await.unwrap();
+            queue.mark_job_dead(job.id, "Test failure").await.unwrap();
         }
 
         // Get stats

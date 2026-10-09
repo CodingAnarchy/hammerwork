@@ -1651,11 +1651,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>> {
         super::retry_on_conflict(|| async {
             let mut tx = self.pool.begin().await?;
-            let result = async {
-                let now = db_now(&mut tx).await?;
-                Self::fail_dependents(&mut tx, failed_job_id, now).await
-            }
-            .await;
+            let result = Self::fail_job_dependencies_in_tx(&mut tx, failed_job_id).await;
             super::end_transaction(tx, result).await
         })
         .await
@@ -2642,19 +2638,8 @@ impl crate::queue::JobQueue<Postgres> {
         if status == JobStatus::Completed {
             recorded.unblocked = Self::resolve_dependents(conn, job.id).await?;
         } else {
-            match &workflow {
-                Some(w) if w.policy == FailurePolicy::Manual => {}
-                Some(w) if w.policy == FailurePolicy::FailFast => {
-                    recorded.cancelled =
-                        Self::fail_workflow_pending(conn, w.id, job.id, now).await?;
-                    recorded
-                        .cancelled
-                        .extend(Self::fail_dependents(conn, job.id, now).await?);
-                }
-                // ContinueOnFailure, and jobs with dependencies outside any workflow:
-                // only the jobs that (transitively) depend on this one can no longer run.
-                _ => recorded.cancelled = Self::fail_dependents(conn, job.id, now).await?,
-            }
+            recorded.cancelled =
+                Self::apply_failure_policy(conn, workflow.as_ref(), job.id, now).await?;
         }
 
         if let Some(workflow) = &workflow {
@@ -2665,6 +2650,61 @@ impl crate::queue::JobQueue<Postgres> {
             recorded.cancelled.extend(cancelled);
         }
         Ok(recorded)
+    }
+
+    /// Apply the [`FailurePolicy`] of `workflow` (the failed job's locked workflow, if
+    /// any) to the failure of `failed_job_id`. Returns the jobs that were failed.
+    ///
+    /// - `FailFast` fails the workflow's other `Pending` and `Retrying` jobs, then the
+    ///   jobs that (transitively) depend on the failed one;
+    /// - `ContinueOnFailure`, and jobs with dependencies outside any workflow, fail
+    ///   only the jobs that (transitively) depend on the failed one;
+    /// - `Manual` leaves the dependents waiting for an operator.
+    async fn apply_failure_policy(
+        conn: &mut sqlx::PgConnection,
+        workflow: Option<&LockedWorkflow>,
+        failed_job_id: JobId,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<JobId>> {
+        match workflow {
+            Some(w) if w.policy == FailurePolicy::Manual => Ok(Vec::new()),
+            Some(w) if w.policy == FailurePolicy::FailFast => {
+                let mut failed =
+                    Self::fail_workflow_pending(conn, w.id, failed_job_id, now).await?;
+                for id in Self::fail_dependents(conn, failed_job_id, now).await? {
+                    if !failed.contains(&id) {
+                        failed.push(id);
+                    }
+                }
+                Ok(failed)
+            }
+            _ => Self::fail_dependents(conn, failed_job_id, now).await,
+        }
+    }
+
+    /// [`DatabaseQueue::fail_job_dependencies`] in one transaction: lock the failed job
+    /// and its workflow (in the same order as a terminal transition), apply the
+    /// workflow's failure policy and update the workflow's counters and status.
+    async fn fail_job_dependencies_in_tx(
+        conn: &mut sqlx::PgConnection,
+        failed_job_id: JobId,
+    ) -> Result<Vec<JobId>> {
+        let workflow_id: Option<Option<uuid::Uuid>> =
+            sqlx::query_scalar("SELECT workflow_id FROM hammerwork_jobs WHERE id = $1 FOR UPDATE")
+                .bind(failed_job_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        let workflow = match workflow_id.flatten() {
+            Some(id) => Self::lock_workflow(conn, id).await?,
+            None => None,
+        };
+        let now = db_now(conn).await?;
+        let failed =
+            Self::apply_failure_policy(conn, workflow.as_ref(), failed_job_id, now).await?;
+        if let Some(workflow) = &workflow {
+            Self::refresh_workflow(conn, workflow, now).await?;
+        }
+        Ok(failed)
     }
 
     /// Put a recurring job back to `Pending` for its next run. A failed run's error and

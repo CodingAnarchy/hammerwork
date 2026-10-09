@@ -299,14 +299,22 @@ let workflow = JobGroup::new("manual_review_pipeline")
 ```
 
 With `Manual`, the dependents of the failed job stay `waiting` and the workflow stays
-`running`. Re-run the failed job with `queue.retry_dead_job(job_id)`; when it completes,
-its dependents become runnable. To give up instead, call `cancel_workflow`.
+`running`. Re-run the failed job with `queue.retry_dead_job(job_id)` (a `Dead` job) or
+`queue.retry_job(job_id, at)` (a `Failed` or `TimedOut` one); when it completes, its
+dependents become runnable. To give up instead, call `cancel_workflow`.
 
 With `FailFast`, every job of the workflow that has not started yet is marked `Failed`
 (jobs already running finish normally). With `ContinueOnFailure`, the jobs that depend
 on the failed job, directly or transitively, are marked `Failed` with
 `dependency_status = failed`; independent jobs keep running. Jobs that use
 `Job::depends_on` outside a workflow behave like `ContinueOnFailure`.
+
+`queue.fail_job_dependencies(job_id)` applies the same policy explicitly (and updates the
+workflow's counters and status), and returns the jobs it failed. On PostgreSQL and
+MySQL every terminal transition already applies it, so after one it finds nothing left
+to do. `TestQueue` applies the policies the same way, from `fail_job`, from a worker's
+`finish_job_run` and from `fail_job_dependencies`; its `mark_job_dead` and
+`mark_job_timed_out` only change the job's status.
 
 ## Workflow Management
 

@@ -390,7 +390,7 @@ async fn test_batch_fail_fast() {
     
     // Process first job and fail it
     let first_job = queue.dequeue("fail_fast_queue").await.unwrap().unwrap();
-    queue.fail_job(first_job.id, "Intentional failure".to_string()).await.unwrap();
+    queue.fail_job(first_job.id, "Intentional failure").await.unwrap();
     
     // With FailFast, remaining jobs should be automatically failed
     let batch_status = queue.get_batch_status(batch_id).await.unwrap();
@@ -470,7 +470,7 @@ async fn test_workflow_fail_fast() {
     
     // Dequeue any job and fail it
     let job = queue.dequeue("fail_fast_workflow").await.unwrap().unwrap();
-    queue.fail_job(job.id, "Intentional failure for testing".to_string()).await.unwrap();
+    queue.fail_job(job.id, "Intentional failure for testing").await.unwrap();
     
     // With FailFast policy, the workflow should be marked as failed
     let status = queue.get_workflow_status(workflow_id).await.unwrap();
@@ -493,24 +493,22 @@ async fn test_job_retry_logic() {
     
     let job_id = queue.enqueue(job).await.unwrap();
     
-    // First attempt
-    let attempt1 = queue.dequeue("retry_queue").await.unwrap().unwrap();
-    assert_eq!(attempt1.attempts, 0);
-    queue.fail_job(job_id, "First failure".to_string()).await.unwrap();
-    
-    // Second attempt
-    let attempt2 = queue.dequeue("retry_queue").await.unwrap().unwrap();
-    assert_eq!(attempt2.attempts, 1);
-    queue.fail_job(job_id, "Second failure".to_string()).await.unwrap();
-    
-    // Third attempt
-    let attempt3 = queue.dequeue("retry_queue").await.unwrap().unwrap();
-    assert_eq!(attempt3.attempts, 2);
-    queue.fail_job(job_id, "Third failure".to_string()).await.unwrap();
-    
-    // Fourth failure should make job dead (no more retries)
+    // `fail_job` is a terminal failure that is never retried automatically. A
+    // worker retries a failed run with `retry_job` while the job has attempts left
+    // (each dequeue counts as one) and marks it dead after the last one.
+    for attempt in 1..=3 {
+        let job = queue.dequeue("retry_queue").await.unwrap().unwrap();
+        assert_eq!(job.attempts, attempt);
+        if job.attempts < job.max_attempts {
+            queue.retry_job(job_id, queue.clock().now()).await.unwrap();
+        } else {
+            queue.mark_job_dead(job_id, "Third failure").await.unwrap();
+        }
+    }
+
+    // No more retries
     assert!(queue.dequeue("retry_queue").await.unwrap().is_none());
-    
+
     // Verify job is dead
     let final_job = queue.get_job(job_id).await.unwrap().unwrap();
     assert_eq!(final_job.status, JobStatus::Dead);
@@ -527,14 +525,14 @@ async fn test_dead_job_purging() {
     let clock = MockClock::new();
     let queue = TestQueue::with_clock(clock.clone());
     
-    // Create and fail jobs to make them dead
+    // Create jobs and mark them dead
     for i in 0..5 {
         let job = Job::new("purge_queue".to_string(), json!({"id": i}))
             .with_max_attempts(1);
         let job_id = queue.enqueue(job).await.unwrap();
         
         let dequeued = queue.dequeue("purge_queue").await.unwrap().unwrap();
-        queue.fail_job(job_id, "Failed for purge test".to_string()).await.unwrap();
+        queue.mark_job_dead(dequeued.id, "Failed for purge test").await.unwrap();
     }
     
     // Advance time to make jobs eligible for purging
@@ -765,12 +763,12 @@ async fn test_email_service() {
     let newsletter_job = queue.dequeue("email_queue").await.unwrap().unwrap();
     assert_eq!(newsletter_job.payload["template"], "newsletter");
     
-    // Simulate email sending failure and retry
-    queue.fail_job(newsletter_job.id, "SMTP server unavailable".to_string()).await.unwrap();
+    // Simulate email sending failure and retry it, as a worker would
+    queue.retry_job(newsletter_job.id, clock.now()).await.unwrap();
     
-    // Job should be available for retry
+    // Job should be available for retry; each dequeue counts as an attempt
     let retry_job = queue.dequeue("email_queue").await.unwrap().unwrap();
-    assert_eq!(retry_job.attempts, 1);
+    assert_eq!(retry_job.attempts, 2);
     queue.complete_job(retry_job.id).await.unwrap();
 }
 ```

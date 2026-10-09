@@ -446,9 +446,6 @@ async fn test_queue() -> Arc<hammerwork::queue::test::TestQueue> {
     Arc::new(hammerwork::queue::test::TestQueue::new())
 }
 
-// `statistics_queries` is not run on `TestQueue`: its `fail_job` retries the job (or
-// marks it dead) instead of moving it to the terminal `Failed` status the trait
-// documents and the database backends implement.
 #[cfg(feature = "test")]
 backend_tests!(
     test_queue_tests,
@@ -456,6 +453,7 @@ backend_tests!(
     allow(unused_attributes),
     [
         dead_job_management,
+        statistics_queries,
         recurring_jobs,
         throttle_configuration,
         pause_information,
