@@ -17,7 +17,7 @@ name = "cargo-hammerwork"
 path = "src/main.rs"
 
 [dependencies]
-hammerwork = { workspace = true, features = ["postgres", "mysql"] }
+hammerwork = { workspace = true, features = ["postgres", "mysql", "encryption"] }
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -34,6 +34,15 @@ toml = { workspace = true }
 dirs = { workspace = true }
 cron = { workspace = true }
 reqwest = { workspace = true }
+base64 = { workspace = true }
+
+# Key sources for the application's `[encryption]` settings (see `encryption_config` in
+# the CLI configuration). `env://` keys work without any of these.
+[features]
+aws-kms = ["hammerwork/aws-kms"]
+gcp-kms = ["hammerwork/gcp-kms"]
+vault-kms = ["hammerwork/vault-kms"]
+azure-kv = ["hammerwork/azure-kv"]
 
 [dev-dependencies]
 tempfile = "3.8"

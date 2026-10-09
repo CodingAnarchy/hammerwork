@@ -318,6 +318,7 @@ impl WorkflowCommand {
             } => {
                 self.create_workflow(
                     pool,
+                    &config.encryption_settings()?,
                     name,
                     jobs_file,
                     failure_policy.as_deref(),
@@ -412,6 +413,7 @@ impl WorkflowCommand {
     async fn create_workflow(
         &self,
         pool: DatabasePool,
+        encryption: &hammerwork::config::PayloadEncryptionConfig,
         name: &str,
         jobs_file: &str,
         failure_policy: Option<&str>,
@@ -448,7 +450,8 @@ impl WorkflowCommand {
             format!("{:?}", workflow.failure_policy),
         );
 
-        match pool.create_job_queue() {
+        // Encrypts like the application, and never writes plaintext to encrypted queues
+        match pool.create_enqueue_queue(encryption).await? {
             JobQueueWrapper::Postgres(q) => q.enqueue_workflow(workflow).await?,
             JobQueueWrapper::MySQL(q) => q.enqueue_workflow(workflow).await?,
         };

@@ -1417,6 +1417,26 @@ impl<DB: Database> JobQueue<DB> {
         self.encryption.engine.as_ref()
     }
 
+    /// Refuses to store a job unencrypted on a queue that already holds encrypted jobs.
+    ///
+    /// For tools that write jobs on behalf of an application and may not have its
+    /// encryption settings, such as `cargo hammerwork` and the web dashboard. Without
+    /// the guard, a handle without the application's engine or `encrypted_queues`
+    /// stores a job for such a queue in plaintext; with it, `enqueue`,
+    /// `enqueue_batch`, `enqueue_workflow` and `enqueue_cron_job` fail with
+    /// [`HammerworkError::Encryption`](crate::HammerworkError::Encryption) instead, and
+    /// nothing is written. Jobs this handle encrypts are not affected.
+    ///
+    /// The check looks for encrypted rows of the job's queue in `hammerwork_jobs`, so it
+    /// cannot protect a queue that has never held an encrypted job: configure the
+    /// encryption settings too (see
+    /// [`PayloadEncryptionConfig::load`](crate::config::PayloadEncryptionConfig::load)).
+    /// It costs one query per queue on each enqueue. Off by default.
+    pub fn with_plaintext_guard(mut self, enabled: bool) -> Self {
+        self.encryption.plaintext_guard = enabled;
+        self
+    }
+
     /// Encrypts the payloads of `jobs` that have an encryption config, before they are
     /// written. Fails (and nothing should be written) if a job needs encryption the
     /// queue cannot provide.

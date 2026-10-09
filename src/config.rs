@@ -351,7 +351,9 @@ impl HammerworkConfig {
 }
 
 /// Database configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` shows `url` with its password replaced by `***` ([`redact_url`]).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     /// Database connection URL
     pub url: String,
@@ -372,6 +374,78 @@ pub struct DatabaseConfig {
         note = "tables are created by the migration system; use `auto_migrate`"
     )]
     pub create_tables: bool,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    #[allow(deprecated)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &redact_url(&self.url))
+            .field("pool_size", &self.pool_size)
+            .field("connection_timeout_secs", &self.connection_timeout_secs)
+            .field("auto_migrate", &self.auto_migrate)
+            .field("create_tables", &self.create_tables)
+            .finish()
+    }
+}
+
+/// `url` with the password in its user info replaced by `***`, safe to print or log:
+/// `postgres://app:s3cret@db/jobs` becomes `postgres://app:***@db/jobs`. A URL without
+/// a password is returned unchanged.
+///
+/// ```
+/// use hammerwork::config::redact_url;
+///
+/// assert_eq!(
+///     redact_url("postgres://app:s3cret@db:5432/jobs"),
+///     "postgres://app:***@db:5432/jobs"
+/// );
+/// assert_eq!(redact_url("mysql://db/jobs"), "mysql://db/jobs");
+/// ```
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    // Credentials end at the last '@' before the first '/' of the path.
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else {
+        return url.to_string();
+    };
+    let (userinfo, tail) = rest.split_at(at);
+    match userinfo.split_once(':') {
+        Some((user, _password)) => format!("{scheme}://{user}:***{tail}"),
+        None => url.to_string(),
+    }
+}
+
+/// Only the scheme and host of `url`, safe to print or log for URLs whose path or query
+/// is itself a credential (Slack, Discord and Teams webhook URLs, signed URLs):
+/// `https://hooks.slack.com/services/T0/B0/xyz` becomes `https://hooks.slack.com/***`.
+/// User info is dropped. Something that is not a URL is replaced by `***`.
+///
+/// ```
+/// use hammerwork::config::redact_url_path;
+///
+/// assert_eq!(
+///     redact_url_path("https://hooks.slack.com/services/T0/B0/xyz"),
+///     "https://hooks.slack.com/***"
+/// );
+/// assert_eq!(redact_url_path("https://example.com"), "https://example.com");
+/// ```
+pub fn redact_url_path(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "***".to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if authority_end == rest.len() || rest[authority_end..] == *"/" {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}/***")
+    }
 }
 
 impl DatabaseConfig {
@@ -918,6 +992,63 @@ impl PayloadEncryptionConfig {
             return error("encryption.encrypted_queues has an empty queue name");
         }
         Ok(())
+    }
+
+    /// The encryption settings of an application, for tools that write jobs on its behalf
+    /// (`cargo hammerwork`, the web dashboard).
+    ///
+    /// Reads the `[encryption]` section of the application's `hammerwork.toml` at `path`
+    /// (other sections are ignored, so the file does not need to be complete; a file
+    /// without the section means encryption is disabled), then applies the
+    /// `HAMMERWORK_ENCRYPTION_*` environment variables ([`Self::apply_env`]). Without a
+    /// path, only the environment is used. The result is validated.
+    ///
+    /// ```no_run
+    /// use hammerwork::config::PayloadEncryptionConfig;
+    ///
+    /// let encryption = PayloadEncryptionConfig::load(Some("hammerwork.toml".as_ref()))?;
+    /// if encryption.enabled {
+    ///     println!("encrypting queues {:?}", encryption.encrypted_queues);
+    /// }
+    /// # Ok::<(), hammerwork::HammerworkError>(())
+    /// ```
+    pub fn load(path: Option<&std::path::Path>) -> crate::Result<Self> {
+        let mut config = match path {
+            Some(path) => {
+                let content = std::fs::read_to_string(path).map_err(|e| {
+                    crate::HammerworkError::Config(format!("Cannot read {}: {}", path.display(), e))
+                })?;
+                Self::from_toml_document(&content).map_err(|e| {
+                    crate::HammerworkError::Config(format!("{}: {}", path.display(), e))
+                })?
+            }
+            None => Self::default(),
+        };
+        config.apply_env()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// The `[encryption]` section of a `hammerwork.toml` document (the default if there
+    /// is none).
+    fn from_toml_document(content: &str) -> crate::Result<Self> {
+        #[derive(Deserialize)]
+        struct Document {
+            #[serde(default)]
+            encryption: PayloadEncryptionConfig,
+        }
+        let document: Document = toml::from_str(content)?;
+        Ok(document.encryption)
+    }
+
+    /// Whether jobs on `queue_name` are encrypted without an encryption config of their
+    /// own (`enabled` and listed in `encrypted_queues`, or `"*"` is listed).
+    pub fn encrypts_queue(&self, queue_name: &str) -> bool {
+        self.enabled
+            && self
+                .encrypted_queues
+                .iter()
+                .any(|queue| queue == "*" || queue == queue_name)
     }
 
     /// How often the retention purge runs, if configured.
@@ -1786,5 +1917,108 @@ service_name = "hammerwork"
             ..section
         };
         assert!(invalid.encryption_config().is_err());
+    }
+
+    #[test]
+    fn test_redact_url_hides_only_the_password() {
+        assert_eq!(
+            redact_url("postgres://admin:s3cret@db.internal:5432/app?sslmode=require"),
+            "postgres://admin:***@db.internal:5432/app?sslmode=require"
+        );
+        // The password itself may contain ':' and '@'.
+        assert_eq!(
+            redact_url("mysql://root:p@ss:word@127.0.0.1:3306/db"),
+            "mysql://root:***@127.0.0.1:3306/db"
+        );
+        assert_eq!(
+            redact_url("postgres://user@host/db"),
+            "postgres://user@host/db"
+        );
+        assert_eq!(redact_url("postgres://host/db"), "postgres://host/db");
+        assert_eq!(redact_url("not a url"), "not a url");
+        // An '@' after the path is not user info.
+        assert_eq!(
+            redact_url("postgres://host/db?options=a:b@c"),
+            "postgres://host/db?options=a:b@c"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_path_keeps_only_scheme_and_host() {
+        for (url, expected) in [
+            (
+                "https://hooks.slack.com/services/T0/B0/secret",
+                "https://hooks.slack.com/***",
+            ),
+            (
+                "https://discord.com/api/webhooks/1/token",
+                "https://discord.com/***",
+            ),
+            ("https://example.com?sig=secret", "https://example.com/***"),
+            (
+                "https://user:pw@example.com/hook",
+                "https://example.com/***",
+            ),
+            ("https://example.com/", "https://example.com"),
+            ("https://example.com", "https://example.com"),
+            ("garbage-secret", "***"),
+        ] {
+            assert_eq!(redact_url_path(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn test_debug_does_not_print_the_database_password() {
+        let config = HammerworkConfig::new()
+            .with_database_url("postgres://app:hunter2-db-password@db.internal/jobs");
+        for debug in [format!("{:?}", config.database), format!("{:?}", config)] {
+            assert!(!debug.contains("hunter2-db-password"), "{debug}");
+            assert!(
+                debug.contains("postgres://app:***@db.internal/jobs"),
+                "{debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encryption_section_is_loaded_from_an_application_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hammerwork.toml");
+        // Only the [encryption] section is read; the rest of the file may be partial.
+        std::fs::write(
+            &path,
+            "[database]\nurl = \"postgres://db/jobs\"\n\n[encryption]\nenabled = true\n\
+             encrypted_queues = [\"payments\"]\n",
+        )
+        .unwrap();
+        let section =
+            PayloadEncryptionConfig::from_toml_document(&std::fs::read_to_string(&path).unwrap())
+                .unwrap();
+        assert!(section.enabled);
+        assert!(section.encrypts_queue("payments"));
+        assert!(!section.encrypts_queue("emails"));
+
+        // No section: disabled.
+        let none = PayloadEncryptionConfig::from_toml_document("[database]\n").unwrap();
+        assert!(!none.enabled);
+        assert!(!none.encrypts_queue("payments"));
+
+        // A wildcard covers every queue, but only when enabled.
+        let mut all = PayloadEncryptionConfig {
+            enabled: true,
+            encrypted_queues: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert!(all.encrypts_queue("anything"));
+        all.enabled = false;
+        assert!(!all.encrypts_queue("anything"));
+
+        // Errors name the file.
+        let missing = dir.path().join("missing.toml");
+        let err = PayloadEncryptionConfig::load(Some(&missing)).unwrap_err();
+        assert!(err.to_string().contains("missing.toml"), "{err}");
+        std::fs::write(&path, "[encryption]\nenabled = \"yes\"\n").unwrap();
+        let err = PayloadEncryptionConfig::load(Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("hammerwork.toml"), "{err}");
     }
 }

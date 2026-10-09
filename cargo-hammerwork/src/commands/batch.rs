@@ -108,6 +108,7 @@ impl BatchCommand {
             } => {
                 batch_enqueue(
                     pool,
+                    &config.encryption_settings()?,
                     file.clone(),
                     queue,
                     priority.clone(),
@@ -237,14 +238,13 @@ pub fn parse_job_line(
 /// Enqueue every record of `reader` (see [`parse_job_line`]). A bad record stops the run unless
 /// `continue_on_error`, and is reported on stderr either way.
 pub async fn enqueue_lines(
-    pool: DatabasePool,
+    queue: JobQueueWrapper,
     reader: impl BufRead,
     default_queue: &str,
     default_priority: Option<&str>,
     progress_every: u32,
     continue_on_error: bool,
 ) -> Result<EnqueueSummary> {
-    let queue = pool.create_job_queue();
     let mut summary = EnqueueSummary::default();
 
     for (line_num, line) in reader.lines().enumerate() {
@@ -283,6 +283,7 @@ pub async fn enqueue_lines(
 
 async fn batch_enqueue(
     pool: DatabasePool,
+    encryption: &hammerwork::config::PayloadEncryptionConfig,
     file: Option<String>,
     default_queue: &str,
     default_priority: Option<String>,
@@ -303,8 +304,10 @@ async fn batch_enqueue(
         Box::new(BufReader::new(std::io::stdin()))
     };
 
+    // Encrypts like the application, and never writes plaintext to encrypted queues
+    let queue = pool.create_enqueue_queue(encryption).await?;
     let summary = enqueue_lines(
-        pool,
+        queue,
         reader,
         default_queue,
         default_priority.as_deref(),

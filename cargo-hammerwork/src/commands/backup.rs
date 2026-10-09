@@ -9,12 +9,28 @@ use tracing::info;
 use crate::commands::job::priority_display;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
+use crate::utils::job_rows::{self, Column, Param, RowInsert};
 use crate::utils::sql::{Backend, Bind, SqlParams, bind_mysql, bind_pg};
 use crate::utils::validation::validate_priority;
 
+/// Version of the JSON backup format written by `backup create`.
+///
+/// - `2.0`: every column of `hammerwork_jobs` (see [`job_rows`]), including encrypted
+///   payloads and their encryption metadata.
+/// - `1.0`: the 13 columns of [`JobData`]. Still restored.
+pub const BACKUP_VERSION: &str = "2.0";
+
 #[derive(Subcommand)]
 pub enum BackupCommand {
-    #[command(about = "Create a backup of job data")]
+    #[command(
+        about = "Create a backup of job data",
+        long_about = "Create a backup of job data.\n\n\
+            The JSON format (the default) holds every column of every selected job, \
+            including encrypted payloads (still encrypted) and their encryption metadata, \
+            cron schedules, timeouts, retry strategies, dependencies, workflows, results, \
+            tracing and retention, so `backup restore` recreates the jobs exactly. The CSV \
+            format is an export of the main columns only and cannot be restored."
+    )]
     Create {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
@@ -31,10 +47,21 @@ pub enum BackupCommand {
         include_completed: bool,
         #[arg(long, help = "Include failed jobs")]
         include_failed: bool,
-        #[arg(long, help = "Backup format (json, csv)")]
+        #[arg(
+            long,
+            help = "Backup format: json (complete, restorable; default) or csv (export only)"
+        )]
         format: Option<String>,
     },
-    #[command(about = "Restore job data from backup")]
+    #[command(
+        about = "Restore job data from backup",
+        long_about = "Restore jobs from a JSON backup made by `backup create`.\n\n\
+            Every column in the backup is restored as it was. Jobs whose id already exists \
+            in the database are never overwritten or duplicated: they are skipped and \
+            counted. The backup is checked before anything is written, and the jobs are \
+            inserted in one transaction, so a bad backup restores nothing. A backup taken \
+            from a newer schema must be restored into a database migrated at least as far."
+    )]
     Restore {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
@@ -42,7 +69,10 @@ pub enum BackupCommand {
         input: String,
         #[arg(long, help = "Confirm the restore operation")]
         confirm: bool,
-        #[arg(long, help = "Skip existing jobs")]
+        #[arg(
+            long,
+            help = "Skip existing jobs (always the case: existing jobs are never overwritten)"
+        )]
         skip_existing: bool,
     },
     #[command(about = "List available backups")]
@@ -130,15 +160,33 @@ impl BackupCommand {
     }
 }
 
-/// The `SELECT` that gathers the jobs to back up. The queue name is bound, never interpolated.
+/// The `SELECT` of [`JOB_DATA_COLUMNS`] that gathers the jobs to back up (as CSV). The
+/// queue name is bound, never interpolated.
 pub fn build_backup_query(
     backend: Backend,
     queue: Option<&str>,
     include_completed: bool,
     include_failed: bool,
 ) -> (String, Vec<Bind>) {
+    build_backup_select(
+        backend,
+        JOB_DATA_COLUMNS,
+        queue,
+        include_completed,
+        include_failed,
+    )
+}
+
+/// The `SELECT` of `select_list` that gathers the jobs to back up.
+pub fn build_backup_select(
+    backend: Backend,
+    select_list: &str,
+    queue: Option<&str>,
+    include_completed: bool,
+    include_failed: bool,
+) -> (String, Vec<Bind>) {
     let mut params = SqlParams::new(backend);
-    let mut query = format!("SELECT {JOB_DATA_COLUMNS} FROM hammerwork_jobs WHERE 1=1");
+    let mut query = format!("SELECT {select_list} FROM hammerwork_jobs WHERE 1=1");
     let mut conditions = Vec::new();
 
     if let Some(queue_name) = queue {
@@ -155,6 +203,38 @@ pub fn build_backup_query(
     }
     query.push_str(" ORDER BY created_at ASC");
     (query, params.into_binds())
+}
+
+/// Every column of the jobs to back up, as backup objects (see [`job_rows`]).
+async fn fetch_backup_rows(
+    pool: &DatabasePool,
+    columns: &[Column],
+    queue: Option<&str>,
+    include_completed: bool,
+    include_failed: bool,
+) -> Result<Vec<serde_json::Map<String, Value>>> {
+    let select = job_rows::select_list(pool.backend(), columns);
+    let (query, binds) = build_backup_select(
+        pool.backend(),
+        &select,
+        queue,
+        include_completed,
+        include_failed,
+    );
+    match pool {
+        DatabasePool::Postgres(pg_pool) => bind_pg(sqlx::query(&query), &binds)
+            .fetch_all(pg_pool)
+            .await?
+            .iter()
+            .map(|row| job_rows::pg_row_to_json(row, columns))
+            .collect(),
+        DatabasePool::MySQL(mysql_pool) => bind_mysql(sqlx::query(&query), &binds)
+            .fetch_all(mysql_pool)
+            .await?
+            .iter()
+            .map(|row| job_rows::mysql_row_to_json(row, columns))
+            .collect(),
+    }
 }
 
 async fn fetch_backup_jobs(
@@ -236,46 +316,58 @@ async fn create_backup(
     format: &str,
     pool_size: u32,
 ) -> Result<()> {
+    if !matches!(format, "json" | "csv") {
+        anyhow::bail!("Unknown backup format '{}': use json or csv", format);
+    }
     let pool = DatabasePool::connect(database_url, pool_size).await?;
 
-    let job_data =
-        fetch_backup_jobs(&pool, queue.as_deref(), include_completed, include_failed).await?;
+    // Read everything before creating the file, so a failure leaves no partial backup.
+    let (content, total) = if format == "csv" {
+        let job_data =
+            fetch_backup_jobs(&pool, queue.as_deref(), include_completed, include_failed).await?;
+        let mut csv = format!("{}\n", CSV_HEADER);
+        for job in &job_data {
+            csv.push_str(&csv_row(job));
+            csv.push('\n');
+        }
+        (csv, job_data.len())
+    } else {
+        let columns = job_rows::job_columns(&pool).await?;
+        let rows = fetch_backup_rows(
+            &pool,
+            &columns,
+            queue.as_deref(),
+            include_completed,
+            include_failed,
+        )
+        .await?;
+        let backup_data = serde_json::json!({
+            "version": BACKUP_VERSION,
+            "created_at": chrono::Utc::now(),
+            "backend": match pool.backend() {
+                Backend::Postgres => "postgres",
+                Backend::MySql => "mysql",
+            },
+            "total_jobs": rows.len(),
+            "filters": {
+                "queue": queue,
+                "include_completed": include_completed,
+                "include_failed": include_failed
+            },
+            "columns": columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            "jobs": rows
+        });
+        (serde_json::to_string_pretty(&backup_data)?, rows.len())
+    };
+    info!("Found {} jobs to backup", total);
 
-    info!("Found {} jobs to backup", job_data.len());
-
-    // Create output file
     let file = File::create(output)?;
     let mut writer = BufWriter::new(file);
-
-    match format {
-        "csv" => {
-            writeln!(writer, "{}", CSV_HEADER)?;
-            for job in &job_data {
-                writeln!(writer, "{}", csv_row(job))?;
-            }
-        }
-        _ => {
-            // JSON format (default)
-            let backup_data = serde_json::json!({
-                "version": "1.0",
-                "created_at": chrono::Utc::now(),
-                "total_jobs": job_data.len(),
-                "filters": {
-                    "queue": queue,
-                    "include_completed": include_completed,
-                    "include_failed": include_failed
-                },
-                "jobs": job_data
-            });
-
-            serde_json::to_writer_pretty(&mut writer, &backup_data)?;
-        }
-    }
-
+    writer.write_all(content.as_bytes())?;
     writer.flush()?;
     info!("✅ Backup created successfully: {}", output);
     println!("💾 Backup saved to: {}", output);
-    println!("📊 Total jobs backed up: {}", job_data.len());
+    println!("📊 Total jobs backed up: {}", total);
 
     Ok(())
 }
@@ -341,36 +433,37 @@ async fn restore_backup(
         )
     })?;
 
+    match backup_data.get("version").and_then(Value::as_str) {
+        None | Some("1.0") | Some("2.0") => {}
+        Some(other) => anyhow::bail!(
+            "{} is a version {} backup, which this cargo-hammerwork cannot restore; \
+             upgrade cargo-hammerwork",
+            input,
+            other
+        ),
+    }
     let jobs = backup_data["jobs"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("Invalid backup format: missing jobs array"))?;
 
     info!("Restoring {} jobs from backup", jobs.len());
 
-    let mut restored = 0;
+    // Check every job before writing anything.
+    let target = job_rows::job_columns(&pool).await?;
+    let mut rows = Vec::with_capacity(jobs.len());
     let mut skipped = 0;
-
     for job in jobs {
-        let id = job["id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid job: missing id"))?;
-
-        // Check if job already exists
-        if skip_existing {
-            let exists = check_job_exists(&pool, id).await?;
-            if exists {
-                skipped += 1;
-                continue;
-            }
-        }
-
-        // Insert job; a row that appeared since the check is left alone
-        if insert_job_from_backup(&pool, job).await? {
-            restored += 1;
-        } else {
+        let row = restore_row(job, &target)?;
+        if skip_existing && check_job_exists(&pool, &row.id).await? {
             skipped += 1;
+            continue;
         }
+        rows.push(row);
     }
+
+    // Jobs whose id exists (now, or by the time they are inserted) are left alone.
+    let restored = job_rows::insert_rows(&pool, &rows).await?;
+    skipped += rows.len() - restored;
 
     info!(
         "✅ Restore completed: {} jobs restored, {} skipped",
@@ -545,70 +638,83 @@ fn parse_backup_job(job: &Value) -> Result<BackupJobFields<'_>> {
     })
 }
 
-/// Insert one backed-up job. Returns `false` when a job with that id already exists (the
-/// existing row is left untouched).
-async fn insert_job_from_backup(pool: &DatabasePool, job: &Value) -> Result<bool> {
+/// A backed-up job with its core fields validated and normalized ([`parse_backup_job`]:
+/// priority names become levels, missing timestamps become now, a missing payload
+/// becomes `{}`), and every other column as it was backed up.
+fn normalized_backup_job(job: &Value) -> Result<serde_json::Map<String, Value>> {
+    let mut object = job
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("backup job must be a JSON object, got {}", job))?;
     let fields = parse_backup_job(job)?;
-    let empty = Value::Object(Default::default());
+    let time = |t: chrono::DateTime<chrono::Utc>| {
+        Value::String(t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+    };
+    let optional_time = |t: Option<chrono::DateTime<chrono::Utc>>| t.map_or(Value::Null, time);
     let payload = if fields.payload.is_null() {
-        &empty
+        Value::Object(Default::default())
     } else {
-        fields.payload
+        fields.payload.clone()
     };
+    for (column, value) in [
+        ("id", Value::String(fields.id.to_string())),
+        ("queue_name", Value::String(fields.queue_name.to_string())),
+        ("payload", payload),
+        ("status", Value::String(fields.status.to_string())),
+        ("priority", Value::from(fields.priority)),
+        ("attempts", Value::from(fields.attempts)),
+        ("max_attempts", Value::from(fields.max_attempts)),
+        ("created_at", time(fields.created_at)),
+        ("scheduled_at", time(fields.scheduled_at)),
+        ("started_at", optional_time(fields.started_at)),
+        ("completed_at", optional_time(fields.completed_at)),
+        ("failed_at", optional_time(fields.failed_at)),
+        (
+            "error_message",
+            fields
+                .error_message
+                .map_or(Value::Null, |m| Value::String(m.to_string())),
+        ),
+    ] {
+        object.insert(column.to_string(), value);
+    }
+    Ok(object)
+}
 
-    let affected = match pool {
-        DatabasePool::Postgres(pg_pool) => sqlx::query(
-            r#"
-                INSERT INTO hammerwork_jobs (
-                    id, queue_name, payload, status, priority, attempts, max_attempts,
-                    created_at, scheduled_at, started_at, completed_at, failed_at, error_message
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                ON CONFLICT (id) DO NOTHING
-            "#,
-        )
-        .bind(fields.id)
-        .bind(fields.queue_name)
-        .bind(payload)
-        .bind(fields.status)
-        .bind(fields.priority)
-        .bind(fields.attempts)
-        .bind(fields.max_attempts)
-        .bind(fields.created_at)
-        .bind(fields.scheduled_at)
-        .bind(fields.started_at)
-        .bind(fields.completed_at)
-        .bind(fields.failed_at)
-        .bind(fields.error_message)
-        .execute(pg_pool)
-        .await?
-        .rows_affected(),
-        DatabasePool::MySQL(mysql_pool) => sqlx::query(
-            r#"
-                INSERT IGNORE INTO hammerwork_jobs (
-                    id, queue_name, payload, status, priority, attempts, max_attempts,
-                    created_at, scheduled_at, started_at, completed_at, failed_at, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(fields.id.to_string())
-        .bind(fields.queue_name)
-        .bind(payload)
-        .bind(fields.status)
-        .bind(fields.priority)
-        .bind(fields.attempts)
-        .bind(fields.max_attempts)
-        .bind(fields.created_at)
-        .bind(fields.scheduled_at)
-        .bind(fields.started_at)
-        .bind(fields.completed_at)
-        .bind(fields.failed_at)
-        .bind(fields.error_message)
-        .execute(mysql_pool)
-        .await?
-        .rows_affected(),
-    };
-
-    Ok(affected > 0)
+/// The insert of one backed-up job into a `hammerwork_jobs` table with `target` columns.
+///
+/// Every column in the backup is restored. A non-null value for a column the table does
+/// not have is an error (the backup comes from a newer schema), so nothing is lost
+/// silently; columns missing from the backup get their defaults.
+fn restore_row(job: &Value, target: &[Column]) -> Result<RowInsert> {
+    let object = normalized_backup_job(job)?;
+    let id = object["id"].as_str().unwrap_or_default().to_string();
+    let mut columns = Vec::new();
+    let mut params = Vec::new();
+    for (name, value) in &object {
+        match target.iter().find(|column| column.name == *name) {
+            Some(column) => {
+                params.push(
+                    Param::from_backup(column, value)
+                        .map_err(|e| anyhow::anyhow!("backup job {}: {}", id, e))?,
+                );
+                columns.push(column.clone());
+            }
+            None if value.is_null() => {}
+            None => anyhow::bail!(
+                "backup job {} has a value for column '{}', which this database's \
+                 hammerwork_jobs table does not have; run `cargo hammerwork migration run` \
+                 on it first",
+                id,
+                name
+            ),
+        }
+    }
+    Ok(RowInsert {
+        id,
+        columns,
+        params,
+    })
 }
 
 async fn list_backups(path: Option<String>) -> Result<()> {
@@ -960,11 +1066,11 @@ mod tests {
         .unwrap();
         let doc: Value =
             serde_json::from_str(&std::fs::read_to_string(&default_out).unwrap()).unwrap();
-        assert_eq!(doc["version"], "1.0");
+        assert_eq!(doc["version"], BACKUP_VERSION);
         assert_eq!(doc["total_jobs"], 1);
         assert_eq!(doc["filters"]["queue"], hostile.as_str());
         assert_eq!(doc["jobs"][0]["id"], pending.as_str());
-        assert_eq!(doc["jobs"][0]["priority"], "critical");
+        assert_eq!(doc["jobs"][0]["priority"], 4);
         assert_eq!(doc["jobs"][0]["payload"]["to"], "a@example.com");
 
         let full_out = file("full.json");
@@ -1121,5 +1227,334 @@ mod tests {
         backup_roundtrip,
         test_backup_roundtrip_postgres,
         test_backup_roundtrip_mysql
+    );
+
+    use hammerwork::queue::DatabaseQueue;
+    use hammerwork::{Job, JobPriority};
+
+    const TEST_KEY: &str = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=";
+
+    fn test_engine_config() -> hammerwork::encryption::EncryptionConfig {
+        hammerwork::encryption::EncryptionConfig::new(
+            hammerwork::encryption::EncryptionAlgorithm::AES256GCM,
+        )
+        .with_key_id("backup-key")
+        .with_key_source(hammerwork::encryption::KeySource::Static(
+            TEST_KEY.to_string(),
+        ))
+    }
+
+    /// Jobs on `queue_name` that set every kind of attribute: encrypted (whole payload
+    /// and PII fields, with retention), recurring with a timezone, timeouts, retry
+    /// strategies, dependencies in a workflow, a batch, a stored result, tracing, and a
+    /// dead job. Returns their ids.
+    async fn seed_every_kind<DB>(
+        queue: &hammerwork::JobQueue<DB>,
+        queue_name: &str,
+        secret: &str,
+    ) -> Vec<uuid::Uuid>
+    where
+        DB: sqlx::Database,
+        hammerwork::JobQueue<DB>: hammerwork::queue::DatabaseQueue,
+    {
+        use hammerwork::encryption::RetentionPolicy;
+        use std::time::Duration;
+
+        let q = queue_name.to_string();
+        let thirty_days = RetentionPolicy::DeleteAfter(Duration::from_secs(30 * 24 * 3600));
+        let mut ids = Vec::new();
+
+        let whole = Job::new(q.clone(), serde_json::json!({"card": secret}))
+            .with_encryption(test_engine_config())
+            .with_retention_policy(thirty_days.clone())
+            .with_priority(JobPriority::High)
+            .with_max_attempts(7)
+            .with_timeout(Duration::from_secs(90));
+        ids.push(queue.enqueue(whole).await.unwrap());
+
+        let pii = Job::new(q.clone(), serde_json::json!({"card": secret, "amount": 3}))
+            .with_encryption(test_engine_config())
+            .with_pii_fields(vec!["card"])
+            .with_retention_policy(thirty_days)
+            .with_trace_id("trace-1")
+            .with_correlation_id("corr-1")
+            .with_parent_span_id("span-1")
+            .with_span_context("ctx");
+        ids.push(queue.enqueue(pii).await.unwrap());
+
+        let cron = Job::new(q.clone(), serde_json::json!({"report": "daily"}))
+            .with_cron(
+                hammerwork::cron::CronSchedule::with_timezone("0 0 9 * * *", "America/New_York")
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_retry_strategy(hammerwork::retry::RetryStrategy::exponential(
+                Duration::from_secs(2),
+                2.0,
+                Some(Duration::from_secs(600)),
+            ));
+        ids.push(queue.enqueue_cron_job(cron).await.unwrap());
+
+        let first = Job::new(q.clone(), serde_json::json!({"step": 1}));
+        let second = Job::new(q.clone(), serde_json::json!({"step": 2})).depends_on(&first.id);
+        ids.extend([first.id, second.id]);
+        queue
+            .enqueue_workflow(
+                hammerwork::workflow::JobGroup::new("backup workflow")
+                    .add_job(first)
+                    .add_job(second),
+            )
+            .await
+            .unwrap();
+
+        let batched = Job::new(q.clone(), serde_json::json!({"in": "batch"}));
+        ids.push(batched.id);
+        queue
+            .enqueue_batch(
+                hammerwork::batch::JobBatch::new("backup batch").with_jobs(vec![batched]),
+            )
+            .await
+            .unwrap();
+
+        let done = queue
+            .enqueue(
+                Job::new(q.clone(), serde_json::json!({"done": true}))
+                    .with_result_ttl(Duration::from_secs(3600)),
+            )
+            .await
+            .unwrap();
+        queue.complete_job(done).await.unwrap();
+        queue
+            .store_job_result(
+                done,
+                serde_json::json!({"rows": 42}),
+                Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            )
+            .await
+            .unwrap();
+        ids.push(done);
+
+        let dead = queue
+            .enqueue(Job::new(q, serde_json::json!({"doomed": true})))
+            .await
+            .unwrap();
+        queue.mark_job_dead(dead, "gave up").await.unwrap();
+        ids.push(dead);
+        ids
+    }
+
+    /// Every column of `id`, as text computed by the database (independent of the
+    /// backup code).
+    async fn row_fingerprint(pool: &DatabasePool, id: &str) -> String {
+        match pool {
+            DatabasePool::Postgres(p) => {
+                sqlx::query_scalar("SELECT j::text FROM hammerwork_jobs j WHERE id = $1::uuid")
+                    .bind(id)
+                    .fetch_one(p)
+                    .await
+                    .unwrap()
+            }
+            DatabasePool::MySQL(p) => {
+                let columns: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT CAST(COLUMN_NAME AS CHAR), CAST(DATA_TYPE AS CHAR) \
+                     FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() \
+                     AND TABLE_NAME = 'hammerwork_jobs' ORDER BY ORDINAL_POSITION",
+                )
+                .fetch_all(p)
+                .await
+                .unwrap();
+                let parts = columns
+                    .iter()
+                    .map(|(name, data_type)| {
+                        if data_type.contains("blob") || data_type.contains("binary") {
+                            format!("COALESCE(HEX(`{name}`), 'NULL')")
+                        } else {
+                            format!("COALESCE(CAST(`{name}` AS CHAR), 'NULL')")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                sqlx::query_scalar(&format!(
+                    "SELECT CONCAT_WS('|', {parts}) FROM hammerwork_jobs WHERE id = ?"
+                ))
+                .bind(id)
+                .fetch_one(p)
+                .await
+                .unwrap()
+            }
+        }
+    }
+
+    /// The names of every column of hammerwork_jobs, straight from the database.
+    async fn table_column_names(pool: &DatabasePool) -> Vec<String> {
+        let sql = match pool.backend() {
+            Backend::Postgres => {
+                "SELECT column_name::text AS name FROM information_schema.columns \
+                 WHERE table_schema = current_schema() AND table_name = 'hammerwork_jobs' \
+                 ORDER BY ordinal_position"
+            }
+            Backend::MySql => {
+                "SELECT CAST(COLUMN_NAME AS CHAR) AS name FROM information_schema.columns \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'hammerwork_jobs' \
+                 ORDER BY ORDINAL_POSITION"
+            }
+        };
+        column_strings(pool, sql, &[], "name").await
+    }
+
+    /// `backup create` + `backup restore` recreate every column of every job exactly,
+    /// including encrypted payloads, which still decrypt afterwards (#64 C3).
+    async fn backup_restores_every_column(url: String) {
+        let config = config_for(&url);
+        let pool = DatabasePool::connect(&url, 2).await.unwrap();
+        let queue_name = unique_queue("backup_full");
+        let secret = format!("4111-{}", uuid::Uuid::new_v4().simple());
+        let engine = || async {
+            hammerwork::encryption::EncryptionEngine::new(test_engine_config())
+                .await
+                .unwrap()
+        };
+        let ids: Vec<String> = match pool.clone() {
+            DatabasePool::Postgres(p) => {
+                let queue = hammerwork::JobQueue::new(p).with_encryption(engine().await);
+                seed_every_kind(&queue, &queue_name, &secret).await
+            }
+            DatabasePool::MySQL(p) => {
+                let queue = hammerwork::JobQueue::new(p).with_encryption(engine().await);
+                seed_every_kind(&queue, &queue_name, &secret).await
+            }
+        }
+        .iter()
+        .map(uuid::Uuid::to_string)
+        .collect();
+        // Columns no builder sets
+        exec_sql(
+            &pool,
+            &format!(
+                "UPDATE hammerwork_jobs SET last_heartbeat_at = created_at, \
+                 lease_expires_at = scheduled_at WHERE queue_name = '{queue_name}'"
+            ),
+        )
+        .await;
+
+        let mut before = Vec::new();
+        for id in &ids {
+            before.push(row_fingerprint(&pool, id).await);
+        }
+        let columns = job_rows::job_columns(&pool).await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("full.json").to_string_lossy().into_owned();
+        let run = |args: &[&str]| {
+            let cmd = parse(args);
+            let config = config.clone();
+            async move { cmd.execute(&config).await }
+        };
+        run(&[
+            "create",
+            "-o",
+            &file,
+            "-n",
+            &queue_name,
+            "--include-completed",
+            "--include-failed",
+        ])
+        .await
+        .unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains(&secret), "the backup holds only ciphertext");
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["version"], BACKUP_VERSION);
+        assert_eq!(doc["total_jobs"], ids.len());
+        // Every column of the table is in the backup: a column added by a migration
+        // that backups could not copy fails here.
+        let backed_up: Vec<String> = doc["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(backed_up, table_column_names(&pool).await);
+        for job in doc["jobs"].as_array().unwrap() {
+            assert_eq!(job.as_object().unwrap().len(), backed_up.len());
+        }
+
+        // Wipe and restore
+        cleanup(&pool, &[&queue_name]).await;
+        run(&["restore", "-i", &file, "--confirm"]).await.unwrap();
+        for (id, fingerprint) in ids.iter().zip(&before) {
+            assert_eq!(
+                &row_fingerprint(&pool, id).await,
+                fingerprint,
+                "job {id} differs after restore"
+            );
+        }
+        // The reader agrees column by column (clearer failures than the fingerprint)
+        let restored = fetch_backup_rows(&pool, &columns, Some(&queue_name), true, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            Value::from(restored.into_iter().map(Value::Object).collect::<Vec<_>>()),
+            doc["jobs"]
+        );
+
+        // Encrypted jobs decrypt after the restore
+        let opened = match pool.clone() {
+            DatabasePool::Postgres(p) => {
+                let queue = hammerwork::JobQueue::new(p).with_encryption(engine().await);
+                let mut payloads = Vec::new();
+                for id in &ids[..2] {
+                    let job = queue
+                        .get_job(uuid::Uuid::parse_str(id).unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(job.is_encrypted);
+                    payloads.push(queue.decrypt_job(job).await.unwrap().payload);
+                }
+                payloads
+            }
+            DatabasePool::MySQL(p) => {
+                let queue = hammerwork::JobQueue::new(p).with_encryption(engine().await);
+                let mut payloads = Vec::new();
+                for id in &ids[..2] {
+                    let job = queue
+                        .get_job(uuid::Uuid::parse_str(id).unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(job.is_encrypted);
+                    payloads.push(queue.decrypt_job(job).await.unwrap().payload);
+                }
+                payloads
+            }
+        };
+        assert_eq!(opened[0], serde_json::json!({"card": secret}));
+        assert_eq!(opened[1], serde_json::json!({"card": secret, "amount": 3}));
+
+        // Restoring again changes nothing: existing ids are skipped, never duplicated
+        run(&["restore", "-i", &file, "--confirm"]).await.unwrap();
+        assert_eq!(count_jobs(&pool, &queue_name, None).await, ids.len() as i64);
+        for (id, fingerprint) in ids.iter().zip(&before) {
+            assert_eq!(&row_fingerprint(&pool, id).await, fingerprint);
+        }
+
+        // A backup with a column this database lacks restores nothing
+        cleanup(&pool, &[&queue_name]).await;
+        let mut newer = doc.clone();
+        newer["jobs"][ids.len() - 1]["column_from_the_future"] = Value::from("x");
+        let newer_file = dir.path().join("newer.json").to_string_lossy().into_owned();
+        std::fs::write(&newer_file, newer.to_string()).unwrap();
+        let err = run(&["restore", "-i", &newer_file, "--confirm"])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("column_from_the_future"), "{err}");
+        assert_eq!(count_jobs(&pool, &queue_name, None).await, 0);
+    }
+
+    db_tests!(
+        backup_restores_every_column,
+        test_backup_restores_every_column_postgres,
+        test_backup_restores_every_column_mysql
     );
 }

@@ -168,7 +168,10 @@ mod uuid_string {
 /// .with_secret("hmac-signing-secret".to_string())
 /// .with_timeout_secs(15);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` never shows the signing secret, header values, credentials, or the path of
+/// the URL (webhook URLs of chat services are themselves credentials).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WebhookConfig {
     /// Unique identifier for this webhook
     #[serde(with = "uuid_string")]
@@ -220,6 +223,27 @@ impl Default for WebhookConfig {
     }
 }
 
+impl std::fmt::Debug for WebhookConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names: Vec<&String> = self.headers.keys().collect();
+        header_names.sort();
+        f.debug_struct("WebhookConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("url", &crate::config::redact_url_path(&self.url))
+            .field("method", &self.method)
+            .field("headers", &header_names)
+            .field("filter", &self.filter)
+            .field("retry_policy", &self.retry_policy)
+            .field("auth", &self.auth)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("enabled", &self.enabled)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("payload_template", &self.payload_template)
+            .finish()
+    }
+}
+
 /// HTTP methods supported for webhooks
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -240,7 +264,10 @@ impl std::fmt::Display for HttpMethod {
 }
 
 /// Authentication methods for webhooks
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` shows the kind of authentication and header names, never tokens, passwords,
+/// API keys or header values.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WebhookAuth {
     /// Bearer token authentication
@@ -254,6 +281,32 @@ pub enum WebhookAuth {
     },
     /// Custom header authentication
     Custom { headers: HashMap<String, String> },
+}
+
+impl std::fmt::Debug for WebhookAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const REDACTED: &str = "[REDACTED]";
+        match self {
+            WebhookAuth::Bearer { .. } => {
+                f.debug_struct("Bearer").field("token", &REDACTED).finish()
+            }
+            WebhookAuth::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &REDACTED)
+                .finish(),
+            WebhookAuth::ApiKey { header_name, .. } => f
+                .debug_struct("ApiKey")
+                .field("header_name", header_name)
+                .field("api_key", &REDACTED)
+                .finish(),
+            WebhookAuth::Custom { headers } => {
+                let mut names: Vec<&String> = headers.keys().collect();
+                names.sort();
+                f.debug_struct("Custom").field("headers", &names).finish()
+            }
+        }
+    }
 }
 
 /// Retry policy configuration
@@ -632,7 +685,12 @@ impl WebhookManager {
         self.start_webhook_delivery_task(webhook_id).await;
 
         if self.config.log_deliveries {
-            tracing::info!("Added webhook: {} -> {}", webhook.name, webhook.url);
+            // The URL path of chat webhooks (Slack, Discord, Teams) is a credential.
+            tracing::info!(
+                "Added webhook: {} -> {}",
+                webhook.name,
+                crate::config::redact_url_path(&webhook.url)
+            );
         }
 
         Ok(())
@@ -1549,6 +1607,40 @@ fn truncate_response_body(body: String, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_debug_does_not_print_webhook_secrets() {
+        let mut config = WebhookConfig::new(
+            "chat".to_string(),
+            "https://hooks.slack.com/services/T0/B0/url-hunter2".to_string(),
+        )
+        .with_secret("sign-hunter2".to_string());
+        config
+            .headers
+            .insert("X-Api-Token".to_string(), "header-hunter2".to_string());
+        for auth in [
+            WebhookAuth::Bearer {
+                token: "bearer-hunter2".to_string(),
+            },
+            WebhookAuth::Basic {
+                username: "svc".to_string(),
+                password: "basic-hunter2".to_string(),
+            },
+            WebhookAuth::ApiKey {
+                header_name: "X-Key".to_string(),
+                api_key: "api-hunter2".to_string(),
+            },
+            WebhookAuth::Custom {
+                headers: HashMap::from([("X-Custom".to_string(), "custom-hunter2".to_string())]),
+            },
+        ] {
+            config.auth = Some(auth);
+            let debug = format!("{:?}", config);
+            assert!(!debug.contains("hunter2"), "{debug}");
+            assert!(debug.contains("https://hooks.slack.com/***"), "{debug}");
+            assert!(debug.contains("X-Api-Token"), "{debug}");
+        }
+    }
 
     #[tokio::test]
     async fn test_webhook_manager_from_config() {

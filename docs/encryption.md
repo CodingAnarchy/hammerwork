@@ -200,7 +200,9 @@ Stored keys are scoped by name (`key-manager/master` for the `KeyManager` master
 - `KeyManager::new` handles `aws://` / `gcp://` master key sources this way automatically.
 - `EncryptionEngine` needs the database: create it with `EncryptionEngine::new_with_pool(config, &pool)`. `EncryptionEngine::new` returns `EncryptionError::InvalidConfiguration` for these sources instead of generating a key that would be lost on restart.
 
-**Rotation.** `KeyManager::rotate_kms_master_key()` and `EncryptionEngine::rotate_kms_key(&pool)` generate a new data key with the KMS, store it as the new active version and retire the previous one. Retired versions are kept and stay decryptable: the key manager decrypts keys wrapped by an older master key version (including key-encryption keys from `generate_master_key`), and the engine falls back to older versions when decrypting payloads. Other running instances keep the version they loaded until they are recreated. Rotating the KMS key itself inside AWS or GCP (automatic key rotation) needs no action: the KMS still decrypts blobs encrypted under earlier key versions.
+**Rotation.** `KeyManager::rotate_kms_master_key()` and `EncryptionEngine::rotate_kms_key(&pool)` generate a new data key with the KMS, store it as the new active version and retire the previous one. Retired versions are kept and stay decryptable: the key manager decrypts keys wrapped by an older master key version (including key-encryption keys from `generate_master_key`), and the engine falls back to older versions when decrypting payloads. Rotating the KMS key itself inside AWS or GCP (automatic key rotation) needs no action: the KMS still decrypts blobs encrypted under earlier key versions.
+
+**Rotating in a fleet.** An engine created with `new_with_pool` keeps a handle on the pool. When it meets a payload it cannot decrypt with the keys it holds (another process rotated the data key and encrypted jobs with the new version, or the payload names another key id stored in the same table), it loads the stored versions it does not have yet, decrypts them with the KMS and tries again; from then on it also encrypts with the newest active version. So a worker that started before a rotation still runs the jobs encrypted after it, instead of failing them until they go Dead. Reloading costs one database query (and a KMS call per new version); a payload that still cannot be decrypted (tampered, or a key the table does not hold) fails as before, and if the reload itself fails (database or KMS unavailable) the run fails and is retried like any other failed run. `EncryptionEngine::reload_kms_keys()` loads new versions without waiting for such a payload; call it periodically, or after a rotation, to move every process to the new version promptly. A two-phase rollout (deploy, then rotate) needs no restart.
 
 **Upgrading.** Before this change, each process asked the KMS for a fresh key on every start, so anything encrypted by an earlier process was already unrecoverable. After running migration 017, the first start generates and stores a key; from then on it is stable. Data encrypted by the old per-process keys cannot be recovered.
 
@@ -238,7 +240,7 @@ let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
 
 **Vault Requirements:**
 - KV v2 secrets engine enabled
-- Secret stored with `key` field containing base64-encoded key material
+- Secret stored with a `key` field holding a base64-encoded key of exactly the algorithm's key size (32 bytes). A passphrase, or key material of any other length, is rejected with `EncryptionError::InvalidConfiguration`: it is never hashed, padded or truncated into a key (a 1-byte value padded to 32 bytes would still have only 8 bits of entropy). The same applies to `vault://` master key sources of the `KeyManager`.
 - Proper authentication and access policies configured
 - The `vault-kms` feature
 
@@ -256,7 +258,7 @@ let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
 # }
 ```
 
-Credentials come from the environment (`AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`, workload identity, managed identity, or the Azure CLI). Requires the `azure-kv` feature.
+Credentials come from the environment (`AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`, workload identity, managed identity, or the Azure CLI). Requires the `azure-kv` feature. The key material must be exactly the algorithm's key size (32 bytes, e.g. a 256-bit `oct` key); shorter or longer material is rejected with `EncryptionError::InvalidConfiguration` instead of being padded or truncated, for engine keys and `KeyManager` master keys alike.
 
 #### Key loading fails closed
 
@@ -306,7 +308,7 @@ How it works:
 - **What `payload` holds.** Never the plaintext of encrypted data. With no PII fields the whole payload is encrypted and `payload` is the placeholder `{"encrypted": true}`. With PII fields (see below) `payload` is the original payload with each listed field's value replaced by `"[ENCRYPTED]"`.
 - **The engine decides.** The queue's engine sets the algorithm, key and compression. A job whose config names another algorithm, or a `key_id` other than the engine's, is rejected. Jobs without an encryption config are stored unchanged, also on a queue with an engine.
 - **Fail closed.** Enqueueing a job that has an encryption config on a queue without an engine fails with `HammerworkError::Encryption`.
-- **Dequeue and reads.** `dequeue`, `get_job`, `get_batch_jobs` and the other reads return jobs as stored: `is_encrypted` is `true`, `payload` is redacted and `encrypted_payload` holds the ciphertext. The web dashboard and `cargo hammerwork job show` therefore show the redacted payload (`job show` also prints the key id, algorithm and retention). They never need a key.
+- **Dequeue and reads.** `dequeue`, `get_job`, `get_batch_jobs`, `get_dead_jobs`, `get_dead_jobs_by_queue` and the other reads return jobs as stored: `is_encrypted` is `true`, `payload` is redacted and `encrypted_payload` holds the ciphertext, so `decrypt_job` works on any of them (a dead-letter tool can decrypt a dead job and re-enqueue its plaintext). The web dashboard and `cargo hammerwork job show` therefore show the redacted payload (`job show` also prints the key id, algorithm and retention). They never need a key to read.
 - **Workers.** A worker decrypts the job (`JobQueue::decrypt_job`) just before it calls the handler; only the handler sees the plaintext. Event hooks, webhooks and the recorded outcome keep using the redacted job. If the payload cannot be decrypted (the worker's queue has no engine, the engine does not have the job's key, the data was tampered with, or the ciphertext belongs to another job; see [Binding the ciphertext to its job](#binding-the-ciphertext-to-its-job)) the run fails with `Cannot decrypt the payload of job ...` and goes through the normal retry / dead path; the handler is not called.
 - **Reading the plaintext yourself.** `queue.decrypt_job(job).await?` returns the job with its plaintext payload.
 - **Without the `encryption` feature** a build cannot encrypt or decrypt. It still reads `is_encrypted`, so its workers fail encrypted jobs instead of running them with the redacted payload, and archiving and restoring still carry the ciphertext.
@@ -355,6 +357,16 @@ There is no decrypt-on-read for the archive: archived jobs are cold data, and ke
 ### Encrypting whole queues
 
 `JobQueue::with_encrypted_queues(["payments"])` (or `["*"]` for every queue) encrypts every job enqueued to those queues, also jobs created without `with_encryption`: they get the engine's algorithm and key id, and their PII fields (if any) or whole payload is encrypted. Jobs with their own encryption config are unaffected. This is how a queue configured from `hammerwork.toml` encrypts without code changes.
+
+### The CLI and the web dashboard
+
+`cargo hammerwork` and `hammerwork-web` write jobs on the application's behalf (`job enqueue`, `batch enqueue`, `cron create`, `workflow create`, and `POST /api/jobs`), so they use the application's encryption settings:
+
+- **The same settings.** They read the `[encryption]` section of the application's `hammerwork.toml` (the rest of the file is ignored) and apply the `HAMMERWORK_ENCRYPTION_*` environment variables on top (`PayloadEncryptionConfig::load`). Point the CLI at the file with `cargo hammerwork config set encryption_config /etc/app/hammerwork.toml` or `HAMMERWORK_ENCRYPTION_CONFIG`; the dashboard reads `HAMMERWORK_ENCRYPTION_CONFIG`. The key must be available to them too (for `env://` keys, the variable). Jobs on `encrypted_queues` are then encrypted exactly as the application would.
+- **Never plaintext by mistake.** When the settings are enabled but the key cannot be loaded, the CLI refuses to write jobs and the dashboard refuses to start. Without any settings, both still refuse to store a plaintext job on a queue that already holds encrypted jobs (`JobQueue::with_plaintext_guard`): the error names the queue and says to configure the settings. A queue that has never held an encrypted job cannot be recognised that way, so configure the settings wherever the CLI or dashboard writes jobs.
+- **Explicit encryption.** `cargo hammerwork job enqueue --encrypt` encrypts the whole payload with the application's key on any queue; `--pii-field card` (repeatable) encrypts only those fields.
+- **Reading** needs no key: both show the redacted payload, and never decrypt.
+- **Backups** (`cargo hammerwork backup create`, JSON format) hold every column of every job, with encrypted payloads still encrypted, and `backup restore` puts them back unchanged, so restored jobs decrypt with the same key. CSV backups are an export of the main columns and cannot be restored.
 
 ### Configuration file
 
@@ -855,7 +867,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 1. **Environment Variables**: Store keys in environment variables, not code
 2. **Secure Transmission**: Use TLS for all database connections
-3. **Memory Protection**: Keys are held in process memory while the engine exists; they are not printed by `Debug`
+3. **Memory Protection**: Keys are held in process memory while the engine exists, without copies per operation, and are wiped (`zeroize`) when the engine, key manager or KMS client drops them; they are not printed by `Debug`. Neither are database URL passwords, webhook and alert secrets and URLs (whose paths can be credentials), streaming credentials, KMS credentials or the dashboard's password hash; `cargo hammerwork config show` masks the database password.
 4. **Error Handling**: Encryption errors never include payload data
 
 ## Performance

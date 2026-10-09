@@ -46,21 +46,9 @@ pub fn validate_database_url(url: &str) -> Result<()> {
 }
 
 /// `url` with the password replaced by `***`, safe to log. A URL without credentials is
-/// returned unchanged.
+/// returned unchanged (see [`hammerwork::config::redact_url`]).
 pub fn redact_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
-    // Credentials end at the last '@' before the first '/' of the path.
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let Some(at) = rest[..authority_end].rfind('@') else {
-        return url.to_string();
-    };
-    let (userinfo, tail) = rest.split_at(at);
-    match userinfo.split_once(':') {
-        Some((user, _password)) => format!("{scheme}://{user}:***{tail}"),
-        None => url.to_string(),
-    }
+    hammerwork::config::redact_url(url)
 }
 
 pub fn validate_cron_expression(cron: &str) -> Result<()> {

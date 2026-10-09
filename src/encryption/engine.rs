@@ -3,20 +3,20 @@
 //! This module provides the actual cryptographic operations for encrypting and
 //! decrypting job payloads using various algorithms and key management strategies.
 
-use super::envelope::{self, DbStore, KmsKeyWrapper};
+use super::envelope::{self, DbStore, EnvelopeKey, KmsKeyWrapper, PoolStore, WrappedKeyStore};
 #[cfg(feature = "encryption")]
 use super::key_manager::KeyManager;
 use super::key_manager::KeyManagerBackend;
 use super::{
     EncryptedPayload, EncryptionAlgorithm, EncryptionConfig, EncryptionError, EncryptionMetadata,
-    EncryptionStats, KeySource, RetentionPolicy, kms,
+    EncryptionStats, KeySource, RetentionPolicy, SecretBytes, kms,
 };
 use serde_json::Value;
 use sqlx::{Database, Pool};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(feature = "encryption")]
 use {
@@ -85,13 +85,97 @@ use {
 /// ```
 pub struct EncryptionEngine {
     config: EncryptionConfig,
-    keys: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    /// Earlier (rotated) versions of KMS-wrapped keys, newest first, used to decrypt
-    /// payloads written before a rotation
-    previous_keys: Arc<Mutex<HashMap<String, Vec<Vec<u8>>>>>,
-    /// KMS that wraps the data key, for `aws://` and `gcp://` key sources
-    kms: Option<Arc<dyn KmsKeyWrapper>>,
+    /// Keys by key id. Key material is shared (never copied for an operation) and wiped
+    /// from memory when the engine drops it.
+    keys: Arc<Mutex<HashMap<String, KeyVersions>>>,
+    /// KMS that wraps the data keys and the database that stores them, for `aws://` and
+    /// `gcp://` key sources
+    kms: Option<KmsBacking>,
     stats: Arc<Mutex<EncryptionStats>>,
+}
+
+/// Key material shared without copying, wiped from memory when the last reference goes.
+type SharedKey = Arc<SecretBytes>;
+
+/// The keys an engine holds for one key id.
+struct KeyVersions {
+    /// The key used to encrypt under this key id (and tried first to decrypt)
+    active: SharedKey,
+    /// Stored version of `active`, for KMS-wrapped keys (0 for other keys)
+    active_version: u32,
+    /// Earlier versions of a KMS-wrapped key, newest first, used to decrypt payloads
+    /// written before a rotation
+    previous: Vec<(u32, SharedKey)>,
+}
+
+impl KeyVersions {
+    /// A key that is not KMS-wrapped (it has no versions).
+    fn single(key: SecretBytes) -> Self {
+        Self {
+            active: Arc::new(key),
+            active_version: 0,
+            previous: Vec::new(),
+        }
+    }
+
+    /// KMS-wrapped key versions loaded from the store; `None` if there are none.
+    fn from_envelope_keys(keys: Vec<EnvelopeKey>) -> Option<Self> {
+        let mut keys = keys.into_iter();
+        let first = keys.next()?;
+        let mut versions = Self {
+            active: Arc::new(first.key),
+            active_version: first.version,
+            previous: Vec::new(),
+        };
+        versions.add(keys);
+        Some(versions)
+    }
+
+    /// Versions of a KMS-wrapped key held.
+    fn versions(&self) -> Vec<u32> {
+        std::iter::once(self.active_version)
+            .chain(self.previous.iter().map(|(version, _)| *version))
+            .collect()
+    }
+
+    /// Add versions loaded from the store. A newer active version becomes the key used
+    /// for encryption, and the one it replaces is kept for decryption.
+    fn add(&mut self, keys: impl IntoIterator<Item = EnvelopeKey>) {
+        for key in keys {
+            if self.versions().contains(&key.version) {
+                continue;
+            }
+            let version = key.version;
+            let shared = Arc::new(key.key);
+            if key.active && version > self.active_version {
+                let old = std::mem::replace(&mut self.active, shared);
+                self.previous.push((self.active_version, old));
+                self.active_version = version;
+            } else {
+                self.previous.push((version, shared));
+            }
+        }
+        self.previous.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    }
+
+    /// Every key to try for decryption: the active one first, then earlier versions.
+    fn candidates(&self) -> Vec<SharedKey> {
+        std::iter::once(self.active.clone())
+            .chain(self.previous.iter().map(|(_, key)| key.clone()))
+            .collect()
+    }
+}
+
+/// Where an engine with an `aws://` or `gcp://` key source gets its data keys.
+struct KmsBacking {
+    kms: Arc<dyn KmsKeyWrapper>,
+    /// The database that stores the KMS-wrapped keys, to reload versions rotated by
+    /// other processes
+    store: Arc<dyn WrappedKeyStore>,
+}
+
+fn key_lock_error() -> EncryptionError {
+    EncryptionError::KeyManagement("Failed to acquire key lock".to_string())
 }
 
 impl std::fmt::Debug for EncryptionEngine {
@@ -114,6 +198,13 @@ impl EncryptionEngine {
     /// start at the same time converge on one stored key. Earlier versions (see
     /// [`EncryptionEngine::rotate_kms_key`]) are loaded too, so payloads encrypted before
     /// a rotation can still be decrypted.
+    ///
+    /// The engine keeps a handle on `pool`: when it meets a payload encrypted with a key
+    /// version it does not hold (another process rotated the key with
+    /// [`EncryptionEngine::rotate_kms_key`]), or with another key id stored in the same
+    /// table, it reloads the stored versions and retries before failing. From then on it
+    /// also encrypts with the newest active version. See also
+    /// [`EncryptionEngine::reload_kms_keys`].
     ///
     /// Other key sources behave exactly as with [`EncryptionEngine::new`].
     ///
@@ -150,31 +241,43 @@ impl EncryptionEngine {
         pool: &Pool<DB>,
         kms: Arc<dyn KmsKeyWrapper>,
     ) -> Result<Self, EncryptionError> {
+        Self::with_kms_store(config, Arc::new(PoolStore(pool.clone())), kms).await
+    }
+
+    /// Create an engine whose data key is wrapped by `kms` and stored in `store`.
+    async fn with_kms_store(
+        config: EncryptionConfig,
+        store: Arc<dyn WrappedKeyStore>,
+        kms: Arc<dyn KmsKeyWrapper>,
+    ) -> Result<Self, EncryptionError> {
         let key_id = config
             .key_id
             .clone()
             .unwrap_or_else(|| "default".to_string());
         let key_name = kms_key_name(&key_id);
         let size = config.key_size_bytes();
-        let store = DbStore(pool);
 
-        let active = envelope::load_or_create(&store, kms.as_ref(), &key_name, size).await?;
-        let previous: Vec<Vec<u8>> = if active.version > 1 {
-            envelope::load_all(&store, kms.as_ref(), &key_name, size)
-                .await?
-                .into_iter()
-                .filter(|key| key.version != active.version)
-                .map(|key| key.key)
-                .collect()
-        } else {
-            Vec::new()
+        let active =
+            envelope::load_or_create(store.as_ref(), kms.as_ref(), &key_name, size).await?;
+        let active_version = active.version;
+        let mut versions = KeyVersions {
+            active: Arc::new(active.key),
+            active_version,
+            previous: Vec::new(),
         };
+        if active_version > 1 {
+            versions.add(
+                envelope::load_new(store.as_ref(), kms.as_ref(), &key_name, size, |v| {
+                    v == active_version
+                })
+                .await?,
+            );
+        }
 
         Ok(Self {
             config,
-            keys: Arc::new(Mutex::new(HashMap::from([(key_id.clone(), active.key)]))),
-            previous_keys: Arc::new(Mutex::new(HashMap::from([(key_id, previous)]))),
-            kms: Some(kms),
+            keys: Arc::new(Mutex::new(HashMap::from([(key_id, versions)]))),
+            kms: Some(KmsBacking { kms, store }),
             stats: Arc::new(Mutex::new(EncryptionStats::new())),
         })
     }
@@ -184,8 +287,11 @@ impl EncryptionEngine {
     /// The KMS generates a new data key; its KMS-encrypted form becomes the active version
     /// in `hammerwork_kms_data_keys` and the previous version is retired but kept. This
     /// engine encrypts with the new key from now on and can still decrypt payloads
-    /// encrypted with earlier versions. Other engines pick up the new version when they
-    /// are recreated.
+    /// encrypted with earlier versions.
+    ///
+    /// Other engines (other workers and processes) load the new version from the database
+    /// the first time they meet a payload encrypted with it, and from then on encrypt
+    /// with it too; [`EncryptionEngine::reload_kms_keys`] loads it right away.
     ///
     /// Returns the new version number. Fails with
     /// [`EncryptionError::InvalidConfiguration`] for engines not created by
@@ -194,7 +300,12 @@ impl EncryptionEngine {
         &self,
         pool: &Pool<DB>,
     ) -> Result<u32, EncryptionError> {
-        let kms = self.kms.clone().ok_or_else(|| {
+        self.rotate_kms_key_in(&DbStore(pool)).await
+    }
+
+    /// [`EncryptionEngine::rotate_kms_key`] with the keys stored in `store`.
+    async fn rotate_kms_key_in(&self, store: &dyn WrappedKeyStore) -> Result<u32, EncryptionError> {
+        let kms = self.kms.as_ref().ok_or_else(|| {
             EncryptionError::InvalidConfiguration(
                 "rotate_kms_key needs an engine created by new_with_pool with an aws:// or \
                  gcp:// key source"
@@ -207,29 +318,82 @@ impl EncryptionEngine {
             .clone()
             .unwrap_or_else(|| "default".to_string());
         let rotated = envelope::rotate(
-            &DbStore(pool),
-            kms.as_ref(),
+            store,
+            kms.kms.as_ref(),
             &kms_key_name(&key_id),
             self.config.key_size_bytes(),
         )
         .await?;
+        let version = rotated.version;
 
-        let lock_error =
-            || EncryptionError::KeyManagement("Failed to acquire key lock".to_string());
-        let old_key = self
+        let mut keys = self.keys.lock().map_err(|_| key_lock_error())?;
+        match keys.get_mut(&key_id) {
+            Some(versions) => versions.add([rotated]),
+            None => {
+                if let Some(versions) = KeyVersions::from_envelope_keys(vec![rotated]) {
+                    keys.insert(key_id, versions);
+                }
+            }
+        }
+        Ok(version)
+    }
+
+    /// Loads the versions of this engine's KMS-wrapped data key that other processes
+    /// stored since it started (see [`EncryptionEngine::rotate_kms_key`]).
+    ///
+    /// A newer active version becomes the key this engine encrypts with; earlier ones
+    /// stay available for decryption. Returns whether a version was added. Engines reload
+    /// on their own when a payload cannot be decrypted, so this is only needed to switch
+    /// encryption to a rotated key without waiting for such a payload.
+    ///
+    /// Only engines created by [`EncryptionEngine::new_with_pool`] with an `aws://` or
+    /// `gcp://` key source have stored versions; for other engines this does nothing and
+    /// returns `false`.
+    pub async fn reload_kms_keys(&self) -> Result<bool, EncryptionError> {
+        self.reload_kms_key(self.key_id()).await
+    }
+
+    /// Load the stored versions of `key_id` that this engine does not hold yet. Returns
+    /// whether a version was added.
+    async fn reload_kms_key(&self, key_id: &str) -> Result<bool, EncryptionError> {
+        let Some(backing) = &self.kms else {
+            return Ok(false);
+        };
+        // The lock is not held across the queries below.
+        let known: Vec<u32> = self
             .keys
             .lock()
-            .map_err(|_| lock_error())?
-            .insert(key_id.clone(), rotated.key);
-        if let Some(old_key) = old_key {
-            self.previous_keys
-                .lock()
-                .map_err(|_| lock_error())?
-                .entry(key_id)
-                .or_default()
-                .insert(0, old_key);
+            .map_err(|_| key_lock_error())?
+            .get(key_id)
+            .map(KeyVersions::versions)
+            .unwrap_or_default();
+        let loaded = envelope::load_new(
+            backing.store.as_ref(),
+            backing.kms.as_ref(),
+            &kms_key_name(key_id),
+            self.config.key_size_bytes(),
+            |version| known.contains(&version),
+        )
+        .await?;
+        if loaded.is_empty() {
+            return Ok(false);
         }
-        Ok(rotated.version)
+        info!(
+            "Loaded {} new version(s) of KMS-wrapped data key {}",
+            loaded.len(),
+            key_id
+        );
+
+        let mut keys = self.keys.lock().map_err(|_| key_lock_error())?;
+        match keys.get_mut(key_id) {
+            Some(versions) => versions.add(loaded),
+            None => {
+                if let Some(versions) = KeyVersions::from_envelope_keys(loaded) {
+                    keys.insert(key_id.to_string(), versions);
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -262,12 +426,11 @@ impl EncryptionEngine {
 
             // Load the encryption key
             let key = Self::load_key(&config.key_source, config.key_size_bytes()).await?;
-            keys.insert(key_id, key);
+            keys.insert(key_id, KeyVersions::single(key));
 
             Ok(Self {
                 config,
                 keys: Arc::new(Mutex::new(keys)),
-                previous_keys: Arc::new(Mutex::new(HashMap::new())),
                 kms: None,
                 stats: Arc::new(Mutex::new(EncryptionStats::new())),
             })
@@ -286,19 +449,21 @@ impl EncryptionEngine {
     fn load_or_generate_key(
         location: &str,
         expected_size: usize,
-    ) -> Result<Vec<u8>, EncryptionError> {
+    ) -> Result<SecretBytes, EncryptionError> {
         use base64::Engine;
         use std::io::Write;
 
-        let decode = |stored: &str, place: &str| -> Result<Vec<u8>, EncryptionError> {
-            let key = base64::engine::general_purpose::STANDARD
-                .decode(stored.trim())
-                .map_err(|e| {
-                    EncryptionError::KeyManagement(format!(
-                        "Invalid base64 key stored in {}: {}",
-                        place, e
-                    ))
-                })?;
+        let decode = |stored: &str, place: &str| -> Result<SecretBytes, EncryptionError> {
+            let key = SecretBytes::new(
+                base64::engine::general_purpose::STANDARD
+                    .decode(stored.trim())
+                    .map_err(|e| {
+                        EncryptionError::KeyManagement(format!(
+                            "Invalid base64 key stored in {}: {}",
+                            place, e
+                        ))
+                    })?,
+            );
             if key.len() != expected_size {
                 return Err(EncryptionError::KeyManagement(format!(
                     "Key size mismatch in {}: expected {} bytes, got {}",
@@ -316,24 +481,25 @@ impl EncryptionEngine {
             ))
         };
 
-        let mut key = vec![0u8; expected_size];
+        let mut key = SecretBytes::new(vec![0u8; expected_size]);
         OsRng.fill_bytes(&mut key);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&key);
+        let encoded =
+            zeroize::Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&key));
 
         if let Some(var_name) = location.strip_prefix("env://") {
             if let Ok(stored) = std::env::var(var_name) {
-                return decode(&stored, var_name);
+                return decode(&zeroize::Zeroizing::new(stored), var_name);
             }
             // SAFETY: as for any `set_var`, the caller must not read or write the
             // environment from other threads meanwhile.
             unsafe {
-                std::env::set_var(var_name, encoded);
+                std::env::set_var(var_name, encoded.as_str());
             }
             info!("Stored generated key in environment variable: {}", var_name);
             return Ok(key);
         }
         if location.starts_with("stdout://") {
-            println!("Generated encryption key: {}", encoded);
+            println!("Generated encryption key: {}", encoded.as_str());
             println!("Store this key securely and set it as an environment variable.");
             return Ok(key);
         }
@@ -361,12 +527,13 @@ impl EncryptionEngine {
                 Ok(key)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stored = std::fs::read_to_string(file_path).map_err(|e| {
-                    EncryptionError::KeyManagement(format!(
-                        "Failed to read stored key {}: {}",
-                        file_path, e
-                    ))
-                })?;
+                let stored =
+                    zeroize::Zeroizing::new(std::fs::read_to_string(file_path).map_err(|e| {
+                        EncryptionError::KeyManagement(format!(
+                            "Failed to read stored key {}: {}",
+                            file_path, e
+                        ))
+                    })?);
                 info!("Loaded previously generated key from file: {}", file_path);
                 decode(&stored, file_path)
             }
@@ -378,14 +545,16 @@ impl EncryptionEngine {
     async fn load_key(
         key_source: &KeySource,
         expected_size: usize,
-    ) -> Result<Vec<u8>, EncryptionError> {
+    ) -> Result<SecretBytes, EncryptionError> {
         match key_source {
             KeySource::Static(key_str) => {
-                let key_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(key_str)
-                    .map_err(|e| {
-                        EncryptionError::KeyManagement(format!("Invalid base64 key: {}", e))
-                    })?;
+                let key_bytes = SecretBytes::new(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(key_str)
+                        .map_err(|e| {
+                            EncryptionError::KeyManagement(format!("Invalid base64 key: {}", e))
+                        })?,
+                );
 
                 if key_bytes.len() != expected_size {
                     return Err(EncryptionError::KeyManagement(format!(
@@ -398,21 +567,23 @@ impl EncryptionEngine {
                 Ok(key_bytes)
             }
             KeySource::Environment(var_name) => {
-                let key_str = std::env::var(var_name).map_err(|_| {
+                let key_str = zeroize::Zeroizing::new(std::env::var(var_name).map_err(|_| {
                     EncryptionError::KeyManagement(format!(
                         "Environment variable {} not found",
                         var_name
                     ))
-                })?;
+                })?);
 
-                let key_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&key_str)
-                    .map_err(|e| {
-                        EncryptionError::KeyManagement(format!(
-                            "Invalid base64 key in {}: {}",
-                            var_name, e
-                        ))
-                    })?;
+                let key_bytes = SecretBytes::new(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(key_str.as_str())
+                        .map_err(|e| {
+                            EncryptionError::KeyManagement(format!(
+                                "Invalid base64 key in {}: {}",
+                                var_name, e
+                            ))
+                        })?,
+                );
 
                 if key_bytes.len() != expected_size {
                     return Err(EncryptionError::KeyManagement(format!(
@@ -525,8 +696,8 @@ impl EncryptionEngine {
         let key = Self::load_key(key_source, self.config.key_size_bytes()).await?;
         self.keys
             .lock()
-            .map_err(|_| EncryptionError::KeyManagement("Failed to acquire key lock".to_string()))?
-            .insert(key_id, key);
+            .map_err(|_| key_lock_error())?
+            .insert(key_id, KeyVersions::single(key));
         Ok(self)
     }
 
@@ -545,14 +716,12 @@ impl EncryptionEngine {
         &self.config.algorithm
     }
 
-    /// The key used for encryption.
-    fn active_key(&self) -> Result<Vec<u8>, EncryptionError> {
+    /// The key used for encryption (shared, not copied).
+    fn active_key(&self) -> Result<SharedKey, EncryptionError> {
         let key_id = self.key_id();
-        let keys = self.keys.lock().map_err(|_| {
-            EncryptionError::KeyManagement("Failed to acquire key lock".to_string())
-        })?;
+        let keys = self.keys.lock().map_err(|_| key_lock_error())?;
         keys.get(key_id)
-            .cloned()
+            .map(|versions| versions.active.clone())
             .ok_or_else(|| EncryptionError::KeyManagement(format!("Key not found: {}", key_id)))
     }
 
@@ -749,7 +918,22 @@ impl EncryptionEngine {
         encrypted_payload: &EncryptedPayload,
         associated_data: &[u8],
     ) -> Result<Value, EncryptionError> {
-        let result = self.decrypt_value(encrypted_payload, associated_data);
+        let mut result = self.decrypt_value(encrypted_payload, associated_data);
+        // The payload may use a key version (or key id) that another process stored after
+        // this engine loaded its keys, e.g. after a rotation: reload and try again.
+        if result.is_err() && self.kms.is_some() {
+            match self
+                .reload_kms_key(&encrypted_payload.metadata.key_id)
+                .await
+            {
+                Ok(true) => result = self.decrypt_value(encrypted_payload, associated_data),
+                Ok(false) => {}
+                Err(e) => warn!(
+                    "Could not reload KMS-wrapped data key {} after a decryption failure: {}",
+                    encrypted_payload.metadata.key_id, e
+                ),
+            }
+        }
         if result.is_err()
             && let Ok(mut stats) = self.stats.lock()
         {
@@ -764,33 +948,22 @@ impl EncryptionEngine {
         associated_data: &[u8],
     ) -> Result<Value, EncryptionError> {
         let start_time = Instant::now();
-        let lock_error =
-            || EncryptionError::KeyManagement("Failed to acquire key lock".to_string());
 
         // The key named by the payload, then earlier versions of a rotated KMS-wrapped key
         let key_id = &encrypted_payload.metadata.key_id;
-        let mut candidates = vec![
-            self.keys
-                .lock()
-                .map_err(|_| lock_error())?
-                .get(key_id)
-                .cloned()
-                .ok_or_else(|| {
-                    EncryptionError::KeyManagement(format!(
-                        "Key not found: {} (the payload was encrypted with a key this engine \
-                         does not have; see EncryptionEngine::with_decryption_key)",
-                        key_id
-                    ))
-                })?,
-        ];
-        candidates.extend(
-            self.previous_keys
-                .lock()
-                .map_err(|_| lock_error())?
-                .get(key_id)
-                .cloned()
-                .unwrap_or_default(),
-        );
+        let candidates = self
+            .keys
+            .lock()
+            .map_err(|_| key_lock_error())?
+            .get(key_id)
+            .map(KeyVersions::candidates)
+            .ok_or_else(|| {
+                EncryptionError::KeyManagement(format!(
+                    "Key not found: {} (the payload was encrypted with a key this engine \
+                     does not have; see EncryptionEngine::with_decryption_key)",
+                    key_id
+                ))
+            })?;
 
         let ciphertext = encrypted_payload.decode_ciphertext()?;
         let nonce = encrypted_payload.decode_nonce()?;
@@ -1242,7 +1415,7 @@ fn keyed_payload_hash(key: &[u8], data: &[u8]) -> Result<String, EncryptionError
 async fn load_external_key(
     service_config: &str,
     expected_size: usize,
-) -> Result<Vec<u8>, EncryptionError> {
+) -> Result<SecretBytes, EncryptionError> {
     if service_config.starts_with("aws://") || service_config.starts_with("gcp://") {
         // Validates the configuration and the cargo feature first
         envelope::parse_kms_source(&KeySource::External(service_config.to_string()))?;
@@ -1265,12 +1438,12 @@ async fn load_external_key(
 
 /// Load a key from a HashiCorp Vault KV v2 secret (`vault://<mount>/<path>?addr=<url>`).
 ///
-/// The secret's string `key` field is used: a base64 key is truncated or padded to
-/// `expected_size`, any other string is hashed with SHA-256.
+/// The secret's string `key` field must be a base64-encoded key of exactly
+/// `expected_size` bytes; anything else is an [`EncryptionError::InvalidConfiguration`].
 async fn load_from_vault(
     service_config: &str,
     expected_size: usize,
-) -> Result<Vec<u8>, EncryptionError> {
+) -> Result<SecretBytes, EncryptionError> {
     let (secret_path, params) = kms::parse_service_config(service_config, "vault://");
     let vault_addr = kms::vault_address(&params)?;
     let (mount, secret) = kms::vault_mount_and_path(secret_path)?;
@@ -1289,48 +1462,19 @@ async fn load_from_vault(
     #[cfg(feature = "vault-kms")]
     {
         let key_str = kms::vault_read_key_field(&vault_addr, mount, secret).await?;
-        Ok(fit_vault_key(&key_str, expected_size))
+        let key = kms::exact_vault_key(&key_str, expected_size)?;
+        info!("Successfully loaded encryption key from HashiCorp Vault");
+        Ok(key)
     }
-}
-
-/// Turn the `key` field of a Vault secret into a key of `expected_size` bytes: base64
-/// key material is used as is (truncated, or padded with its SHA-256 hash when short);
-/// anything else is hashed.
-#[cfg(feature = "vault-kms")]
-fn fit_vault_key(key_str: &str, expected_size: usize) -> Vec<u8> {
-    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(key_str) {
-        if decoded.len() == expected_size {
-            info!("Successfully loaded encryption key from HashiCorp Vault");
-            return decoded;
-        }
-        // Wrong size: truncate, or pad with a hash of the decoded key
-        let mut key = vec![0u8; expected_size];
-        let copy_len = std::cmp::min(decoded.len(), expected_size);
-        key[..copy_len].copy_from_slice(&decoded[..copy_len]);
-        if decoded.len() < expected_size {
-            let hash = Sha256::digest(&decoded);
-            for (i, byte) in key.iter_mut().enumerate().skip(decoded.len()) {
-                *byte = hash[i % hash.len()];
-            }
-        }
-        info!("Successfully loaded and resized encryption key from HashiCorp Vault");
-        return key;
-    }
-
-    // Not base64: hash the string to the expected size
-    let hash = Sha256::digest(key_str.as_bytes());
-    let key = (0..expected_size).map(|i| hash[i % hash.len()]).collect();
-    info!("Successfully loaded and hashed encryption key from HashiCorp Vault");
-    key
 }
 
 /// Load a key from Azure Key Vault (`azure://<vault-host>/keys/<key-name>`, key name
-/// defaults to `encryption-key`). Material shorter than `expected_size` is padded with
-/// HMAC-SHA256 output keyed by the material.
+/// defaults to `encryption-key`). The key material must be exactly `expected_size`
+/// bytes; anything else is an [`EncryptionError::InvalidConfiguration`].
 async fn load_from_azure_kv(
     service_config: &str,
     expected_size: usize,
-) -> Result<Vec<u8>, EncryptionError> {
+) -> Result<SecretBytes, EncryptionError> {
     let (vault_url, key_name) = kms::azure_vault_and_key(service_config, "encryption-key")?;
 
     info!(
@@ -1355,45 +1499,14 @@ async fn load_from_azure_kv(
                 ))
             })?;
 
-        fit_azure_key(&decoded_key, &vault_url, &key_name, expected_size)
-    }
-}
-
-/// Turn Azure Key Vault key material into a key of `expected_size` bytes: longer
-/// material is truncated; shorter material is padded with HMAC-SHA256 output keyed by
-/// the material and bound to the vault URL and key name.
-#[cfg(feature = "azure-kv")]
-fn fit_azure_key(
-    decoded_key: &[u8],
-    vault_url: &str,
-    key_name: &str,
-    expected_size: usize,
-) -> Result<Vec<u8>, EncryptionError> {
-    if decoded_key.len() >= expected_size {
+        let key = kms::exact_size(
+            decoded_key,
+            expected_size,
+            &format!("Azure Key Vault key {} in {}", key_name, vault_url),
+        )?;
         info!("Successfully loaded encryption key from Azure Key Vault");
-        return Ok(decoded_key[..expected_size].to_vec());
+        Ok(key)
     }
-
-    // Key is shorter than expected: pad it using key derivation
-    use hmac::{Hmac, Mac};
-    type HmacSha256 = Hmac<Sha256>;
-
-    let mut final_key = vec![0u8; expected_size];
-    final_key[..decoded_key.len()].copy_from_slice(decoded_key);
-
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(decoded_key)
-        .map_err(|e| EncryptionError::KeyManagement(format!("HMAC creation failed: {}", e)))?;
-    mac.update(b"azure-kv-key-derivation");
-    mac.update(vault_url.as_bytes());
-    mac.update(key_name.as_bytes());
-    let derived = mac.finalize().into_bytes();
-
-    for (i, byte) in final_key.iter_mut().enumerate().skip(decoded_key.len()) {
-        *byte = derived[i % derived.len()];
-    }
-
-    info!("Successfully loaded and padded encryption key from Azure Key Vault");
-    Ok(final_key)
 }
 
 #[cfg(test)]
@@ -1772,17 +1885,93 @@ mod tests {
     }
 
     fn active_key(engine: &EncryptionEngine, key_id: &str) -> Vec<u8> {
-        engine.keys.lock().unwrap()[key_id].clone()
+        engine.keys.lock().unwrap()[key_id].active.to_vec()
     }
 
     fn previous_keys(engine: &EncryptionEngine, key_id: &str) -> Vec<Vec<u8>> {
         engine
-            .previous_keys
+            .keys
             .lock()
             .unwrap()
             .get(key_id)
-            .cloned()
+            .map(|versions| versions.previous.iter().map(|(_, k)| k.to_vec()).collect())
             .unwrap_or_default()
+    }
+
+    /// Two engines (two workers, or two processes) share one key store. After one of them
+    /// rotates the data key, the other decrypts payloads encrypted with the new version
+    /// by reloading the stored versions, and then encrypts with it too (#64 H4).
+    #[tokio::test]
+    async fn test_engines_sharing_a_store_survive_a_rotation() {
+        use crate::encryption::envelope::test_support::MemoryStore;
+
+        let kms = MockKms::unique();
+        let store: Arc<dyn WrappedKeyStore> = Arc::new(MemoryStore::default());
+        let config = || EncryptionConfig::new(EncryptionAlgorithm::AES256GCM);
+        let payload = json!({"ssn": "123-45-6789"});
+
+        let rotating = EncryptionEngine::with_kms_store(config(), store.clone(), same_kms(&kms))
+            .await
+            .unwrap();
+        let other = EncryptionEngine::with_kms_store(config(), store.clone(), same_kms(&kms))
+            .await
+            .unwrap();
+        let v1 = active_key(&other, "default");
+        // Nothing new to load yet.
+        assert!(!other.reload_kms_keys().await.unwrap());
+
+        assert_eq!(rotating.rotate_kms_key_in(store.as_ref()).await.unwrap(), 2);
+        let after_rotation = rotating.encrypt_payload(&payload, &["ssn"]).await.unwrap();
+
+        // The other engine only held v1: it reloads v2 and decrypts.
+        assert_eq!(
+            other.decrypt_payload(&after_rotation).await.unwrap(),
+            payload
+        );
+        let v2 = active_key(&rotating, "default");
+        assert_ne!(v1, v2);
+        assert_eq!(active_key(&other, "default"), v2, "now encrypts with v2");
+        assert_eq!(previous_keys(&other, "default"), vec![v1.clone()]);
+        assert_eq!(other.get_stats().decryption_errors, 0);
+
+        // What it encrypts now is readable by an engine that only knows v2 and v1.
+        let from_other = other.encrypt_payload(&payload, &["ssn"]).await.unwrap();
+        assert_eq!(
+            rotating.decrypt_payload(&from_other).await.unwrap(),
+            payload
+        );
+
+        // A third rotation is picked up by an explicit reload.
+        rotating.rotate_kms_key_in(store.as_ref()).await.unwrap();
+        assert!(other.reload_kms_keys().await.unwrap());
+        assert_eq!(
+            active_key(&other, "default"),
+            active_key(&rotating, "default")
+        );
+        assert_eq!(previous_keys(&other, "default").len(), 2);
+
+        // A payload under another key id stored in the same table is looked up by the
+        // key id it records.
+        let other_id = EncryptionEngine::with_kms_store(
+            config().with_key_id("tenant-b"),
+            store.clone(),
+            same_kms(&kms),
+        )
+        .await
+        .unwrap();
+        let tenant_b = other_id.encrypt_payload(&payload, &["ssn"]).await.unwrap();
+        assert_eq!(other.decrypt_payload(&tenant_b).await.unwrap(), payload);
+
+        // A tampered payload still fails, after one reload attempt that finds nothing.
+        let mut tampered = rotating.encrypt_payload(&payload, &["ssn"]).await.unwrap();
+        tampered.metadata.payload_hash = "hmac-sha256:00".to_string();
+        assert!(other.decrypt_payload(&tampered).await.is_err());
+
+        // Engines without a KMS have nothing to reload.
+        let static_engine = EncryptionEngine::new(static_engine("k", KEY_A))
+            .await
+            .unwrap();
+        assert!(!static_engine.reload_kms_keys().await.unwrap());
     }
 
     /// Engines in different processes (or after a restart) load the same stored data key,
@@ -1870,6 +2059,85 @@ mod tests {
         assert_eq!(stored.len(), 1);
     }
 
+    /// Two processes share the KMS-wrapped key in the database. One rotates the data key
+    /// and enqueues; a worker of the other, started before the rotation, still runs the
+    /// job with its plaintext instead of failing it until it goes Dead (#64 H4).
+    async fn worker_survives_a_rotation_by_another_process<DB>(pool: Pool<DB>)
+    where
+        DB: KeyManagerBackend + Send + Sync + 'static,
+        crate::JobQueue<DB>: crate::queue::DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    {
+        use crate::queue::DatabaseQueue;
+        use crate::{Job, JobQueue, JobStatus, Worker};
+
+        let kms = MockKms::unique();
+        let config = || EncryptionConfig::new(EncryptionAlgorithm::AES256GCM);
+        let producer_engine = EncryptionEngine::with_kms(config(), &pool, same_kms(&kms))
+            .await
+            .unwrap();
+        let worker_engine = EncryptionEngine::with_kms(config(), &pool, same_kms(&kms))
+            .await
+            .unwrap();
+        let queue_name = format!("kms_rotation_{}", uuid::Uuid::new_v4().simple());
+
+        // The producer rotates after the worker loaded version 1
+        producer_engine.rotate_kms_key(&pool).await.unwrap();
+        let producer = JobQueue::new(pool.clone())
+            .with_encryption(producer_engine)
+            .with_encrypted_queues([queue_name.clone()]);
+        let payload = json!({"ssn": "123-45-6789"});
+        let id = producer
+            .enqueue(Job::new(queue_name.clone(), payload.clone()).with_max_attempts(1))
+            .await
+            .unwrap();
+
+        let consumer = Arc::new(JobQueue::new(pool.clone()).with_encryption(worker_engine));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler_seen = Arc::clone(&seen);
+        let handler: crate::worker::JobHandler = Arc::new(move |job: Job| {
+            let seen = Arc::clone(&handler_seen);
+            Box::pin(async move {
+                seen.lock().unwrap().push(job.payload.clone());
+                Ok(())
+            })
+        });
+        let worker = Worker::new(Arc::clone(&consumer), queue_name, handler)
+            .with_poll_interval(Duration::from_millis(50));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let job = loop {
+            let job = consumer.get_job(id).await.unwrap().unwrap();
+            if !matches!(job.status, JobStatus::Pending | JobStatus::Running)
+                || std::time::Instant::now() > deadline
+            {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        shutdown_tx.send(()).await.unwrap();
+        task.await.unwrap().unwrap();
+
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.error_message);
+        assert_eq!(*seen.lock().unwrap(), vec![payload]);
+        consumer.delete_job(id).await.unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_worker_survives_a_rotation_by_another_process_postgres() {
+        worker_survives_a_rotation_by_another_process(postgres_pool().await).await;
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_worker_survives_a_rotation_by_another_process_mysql() {
+        worker_survives_a_rotation_by_another_process(mysql_pool().await).await;
+    }
+
     /// Payloads encrypted before a restart and before a rotation can be decrypted.
     async fn engine_kms_payload_roundtrip<DB: KeyManagerBackend>(pool: Pool<DB>) {
         let kms = MockKms::unique();
@@ -1906,8 +2174,15 @@ mod tests {
             third.decrypt_payload(&after_rotation).await.unwrap(),
             payload
         );
-        // The engine that did not rotate cannot read the new version until it reloads
-        assert!(first.decrypt_payload(&after_rotation).await.is_err());
+        // The engine that did not rotate loads the new version from the database (#64 H4)
+        assert_eq!(
+            first.decrypt_payload(&after_rotation).await.unwrap(),
+            payload
+        );
+        assert_eq!(
+            active_key(&first, "default"),
+            active_key(&second, "default")
+        );
     }
 
     #[cfg(feature = "postgres")]
@@ -2293,55 +2568,59 @@ mod tests {
         assert_eq!(engine.get_stats().retention_cleanups, 1);
     }
 
-    #[cfg(feature = "vault-kms")]
     #[test]
-    fn test_fit_vault_key() {
+    fn test_vault_key_must_be_exactly_the_key_size() {
         use base64::Engine as _;
         let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
 
         // The right size is used as is.
         let exact: Vec<u8> = (0..32).collect();
-        assert_eq!(fit_vault_key(&b64(&exact), 32), exact);
-        // Longer material is truncated.
-        let long: Vec<u8> = (0..40).collect();
-        assert_eq!(fit_vault_key(&b64(&long), 32), long[..32].to_vec());
-        // Shorter material keeps its bytes and is padded deterministically.
-        let short = fit_vault_key(&b64(b"short"), 32);
-        assert_eq!(&short[..5], b"short");
-        assert_eq!(short.len(), 32);
-        assert_eq!(short, fit_vault_key(&b64(b"short"), 32));
-        assert_ne!(short[5..], [0u8; 27]);
-        // Not base64: hashed to the right size.
-        let hashed = fit_vault_key("a passphrase!", 16);
-        assert_eq!(hashed.len(), 16);
-        assert_eq!(hashed, fit_vault_key("a passphrase!", 16));
-        assert_ne!(hashed, fit_vault_key("another one!", 16));
+        assert_eq!(
+            kms::exact_vault_key(&b64(&exact), 32).unwrap().as_slice(),
+            exact.as_slice()
+        );
+        // Longer or shorter material is rejected, not truncated or padded.
+        for wrong in [(0..40).collect::<Vec<u8>>(), b"short".to_vec(), vec![7]] {
+            let err = kms::exact_vault_key(&b64(&wrong), 32).unwrap_err();
+            assert!(
+                matches!(err, EncryptionError::InvalidConfiguration(_)),
+                "{err}"
+            );
+            assert!(
+                err.to_string().contains("expected exactly 32 bytes"),
+                "{err}"
+            );
+        }
+        // A passphrase (not base64) is rejected, not hashed into a key.
+        let err = kms::exact_vault_key("a passphrase!", 32).unwrap_err();
+        assert!(
+            matches!(err, EncryptionError::InvalidConfiguration(_)),
+            "{err}"
+        );
+        assert!(err.to_string().contains("not base64"), "{err}");
     }
 
-    #[cfg(feature = "azure-kv")]
     #[test]
-    fn test_fit_azure_key() {
-        let long: Vec<u8> = (0..40).collect();
+    fn test_azure_key_material_must_be_exactly_the_key_size() {
+        let exact: Vec<u8> = (0..32).collect();
         assert_eq!(
-            fit_azure_key(&long, "https://v", "k", 32).unwrap(),
-            long[..32].to_vec()
+            kms::exact_size(SecretBytes::new(exact.clone()), 32, "Azure key")
+                .unwrap()
+                .as_slice(),
+            exact.as_slice()
         );
-        let padded = fit_azure_key(b"0123456789", "https://v", "k", 32).unwrap();
-        assert_eq!(&padded[..10], b"0123456789");
-        assert_eq!(padded.len(), 32);
-        // The padding is bound to the vault and key name.
-        assert_ne!(
-            padded,
-            fit_azure_key(b"0123456789", "https://other", "k", 32).unwrap()
-        );
-        assert_ne!(
-            padded,
-            fit_azure_key(b"0123456789", "https://v", "other", 32).unwrap()
-        );
-        assert_eq!(
-            padded,
-            fit_azure_key(b"0123456789", "https://v", "k", 32).unwrap()
-        );
+        for wrong in [(0..40).collect::<Vec<u8>>(), b"0123456789".to_vec()] {
+            let err = kms::exact_size(SecretBytes::new(wrong), 32, "Azure key").unwrap_err();
+            assert!(
+                matches!(err, EncryptionError::InvalidConfiguration(_)),
+                "{err}"
+            );
+            assert!(
+                err.to_string()
+                    .starts_with("Invalid configuration: Azure key"),
+                "{err}"
+            );
+        }
     }
 
     #[cfg(feature = "azure-kv")]

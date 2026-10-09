@@ -121,8 +121,11 @@ impl CronCommand {
                 priority,
                 ..
             } => {
+                let job_queue = pool
+                    .create_enqueue_queue(&config.encryption_settings()?)
+                    .await?;
                 create_cron_job(
-                    pool,
+                    job_queue,
                     queue,
                     payload,
                     schedule,
@@ -355,7 +358,7 @@ pub fn build_cron_job(
 }
 
 async fn create_cron_job(
-    pool: DatabasePool,
+    job_queue: JobQueueWrapper,
     queue: &str,
     payload: &str,
     schedule: &str,
@@ -368,7 +371,7 @@ async fn create_cron_job(
     let timezone = job.timezone.clone().unwrap_or_else(|| "UTC".to_string());
 
     info!("Creating cron job with schedule: {}", schedule);
-    let job_id = match pool.create_job_queue() {
+    let job_id = match job_queue {
         JobQueueWrapper::Postgres(q) => q.enqueue_cron_job(job).await?,
         JobQueueWrapper::MySQL(q) => q.enqueue_cron_job(job).await?,
     };

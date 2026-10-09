@@ -497,6 +497,195 @@ where
     queue.delete_job(job_id).await.unwrap();
 }
 
+/// `job` decrypts back to `payload` with `queue`'s engine. `path` names the read path.
+async fn assert_decrypts<DB>(queue: &JobQueue<DB>, job: Job, payload: &Value, path: &str)
+where
+    DB: sqlx::Database,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    assert!(job.is_encrypted, "{path}: is_encrypted");
+    assert!(job.encrypted_payload.is_some(), "{path}: ciphertext");
+    assert_eq!(job.pii_fields, vec!["ssn"], "{path}: PII fields");
+    assert_eq!(job.payload["ssn"], "[ENCRYPTED]", "{path}: stored form");
+    let opened = queue
+        .decrypt_job(job)
+        .await
+        .unwrap_or_else(|e| panic!("{path}: {e}"));
+    assert_eq!(&opened.payload, payload, "{path}");
+}
+
+/// The job `id` in `jobs`, which a read path named `path` returned.
+fn find_job(jobs: Vec<Job>, id: JobId, path: &str) -> Job {
+    jobs.into_iter()
+        .find(|job| job.id == id)
+        .unwrap_or_else(|| panic!("{path} does not list job {id}"))
+}
+
+/// Every read path returns an encrypted job with its ciphertext, key id and PII fields,
+/// so `decrypt_job` works on it. The dead-letter listings used to drop them and return
+/// the redacted payload labelled as plaintext (#64 H2).
+async fn every_read_path_keeps_the_ciphertext<DB>(plain: Arc<JobQueue<DB>>)
+where
+    DB: Inspect + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let queue = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
+    let queue_name = test_utils::unique_queue("enc_reads");
+    let payload = json!({"ssn": secret("ssn"), "amount": 7});
+    let job = || {
+        Job::new(queue_name.clone(), payload.clone())
+            .with_encryption(config("k1"))
+            .with_pii_fields(vec!["ssn"])
+            .with_retention_policy(long_retention())
+    };
+
+    // Dead letter queue
+    let dead = queue.enqueue(job()).await.unwrap();
+    queue.mark_job_dead(dead, "boom").await.unwrap();
+    let path = "get_dead_jobs";
+    let listed = queue.get_dead_jobs(Some(100_000), None).await.unwrap();
+    assert_decrypts(&queue, find_job(listed, dead, path), &payload, path).await;
+    let path = "get_dead_jobs_by_queue";
+    let listed = queue
+        .get_dead_jobs_by_queue(&queue_name, None, None)
+        .await
+        .unwrap();
+    assert_decrypts(&queue, find_job(listed, dead, path), &payload, path).await;
+    queue.delete_job(dead).await.unwrap();
+
+    // Pending and completed jobs
+    let pending = queue.enqueue(job()).await.unwrap();
+    let got = queue.get_job(pending).await.unwrap().unwrap();
+    assert_decrypts(&queue, got, &payload, "get_job").await;
+    let path = "get_ready_jobs";
+    let ready = queue.get_ready_jobs(&queue_name, 100).await.unwrap();
+    assert_decrypts(&queue, find_job(ready, pending, path), &payload, path).await;
+    queue.complete_job(pending).await.unwrap();
+    let now = Utc::now();
+    let path = "get_jobs_completed_in_range";
+    let completed = queue
+        .get_jobs_completed_in_range(
+            Some(&queue_name),
+            now - chrono::Duration::hours(1),
+            now + chrono::Duration::hours(1),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_decrypts(&queue, find_job(completed, pending, path), &payload, path).await;
+    queue.delete_job(pending).await.unwrap();
+
+    // Batches, workflows and recurring jobs
+    let batch_id = queue
+        .enqueue_batch(JobBatch::new("reads").with_jobs(vec![job()]))
+        .await
+        .unwrap();
+    let batch = queue.get_batch_jobs(batch_id).await.unwrap();
+    assert_eq!(batch.len(), 1);
+    for listed in batch {
+        assert_decrypts(&queue, listed, &payload, "get_batch_jobs").await;
+    }
+    queue.delete_batch(batch_id).await.unwrap();
+
+    let workflow_job = job();
+    let workflow_job_id = workflow_job.id;
+    let workflow_id = queue
+        .enqueue_workflow(JobGroup::new("reads").add_job(workflow_job))
+        .await
+        .unwrap();
+    let path = "get_workflow_jobs";
+    let listed = queue.get_workflow_jobs(workflow_id).await.unwrap();
+    assert_decrypts(
+        &queue,
+        find_job(listed, workflow_job_id, path),
+        &payload,
+        path,
+    )
+    .await;
+    queue.delete_job(workflow_job_id).await.unwrap();
+
+    let cron = job()
+        .with_cron(hammerwork::cron::CronSchedule::new("0 0 0 1 1 *").unwrap())
+        .unwrap();
+    let cron_id = queue.enqueue_cron_job(cron).await.unwrap();
+    let path = "get_recurring_jobs";
+    let listed = queue.get_recurring_jobs(&queue_name).await.unwrap();
+    assert_decrypts(&queue, find_job(listed, cron_id, path), &payload, path).await;
+    queue.delete_job(cron_id).await.unwrap();
+}
+
+/// A queue handle with the plaintext guard (the CLI's and dashboard's) refuses to store
+/// a plaintext job on a queue that holds encrypted jobs, and still stores jobs it
+/// encrypts (#64 H1).
+async fn plaintext_guard_refuses_plaintext_on_encrypted_queues<DB>(plain: Arc<JobQueue<DB>>)
+where
+    DB: Inspect + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let app = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
+    let encrypted_queue_name = test_utils::unique_queue("enc_guard");
+    let other_queue_name = test_utils::unique_queue("plain_guard");
+    let card = secret("card");
+    let encrypted = app
+        .enqueue(
+            Job::new(encrypted_queue_name.clone(), json!({"card": card}))
+                .with_encryption(config("k1"))
+                .with_retention_policy(long_retention()),
+        )
+        .await
+        .unwrap();
+
+    // A tool without the application's encryption settings
+    let tool = JobQueue::new(plain.pool.clone()).with_plaintext_guard(true);
+    let refused = Job::new(encrypted_queue_name.clone(), json!({"card": card}));
+    let refused_id = refused.id;
+    let err = tool.enqueue(refused).await.unwrap_err();
+    assert!(matches!(err, HammerworkError::Encryption { .. }), "{err:?}");
+    assert!(err.to_string().contains(&encrypted_queue_name), "{err}");
+    assert!(
+        tool.get_job(refused_id).await.unwrap().is_none(),
+        "nothing written"
+    );
+    let batch = JobBatch::new("guarded").with_jobs(vec![Job::new(
+        encrypted_queue_name.clone(),
+        json!({"n": 1}),
+    )]);
+    assert!(tool.enqueue_batch(batch).await.is_err());
+    let workflow =
+        JobGroup::new("guarded").add_job(Job::new(encrypted_queue_name.clone(), json!({"n": 2})));
+    assert!(tool.enqueue_workflow(workflow).await.is_err());
+    let cron = Job::new(encrypted_queue_name.clone(), json!({"n": 3}))
+        .with_cron(hammerwork::cron::CronSchedule::new("0 0 0 1 1 *").unwrap())
+        .unwrap();
+    assert!(tool.enqueue_cron_job(cron).await.is_err());
+
+    // Queues without encrypted jobs are unaffected
+    let fine = tool
+        .enqueue(Job::new(other_queue_name.clone(), json!({"n": 4})))
+        .await
+        .unwrap();
+    tool.delete_job(fine).await.unwrap();
+
+    // With the application's engine and encrypted queues, its jobs pass the guard
+    let tool = JobQueue::new(plain.pool.clone())
+        .with_encryption(engine("k1", KEY_A).await)
+        .with_encrypted_queues([encrypted_queue_name.clone()])
+        .with_plaintext_guard(true);
+    let sealed = tool
+        .enqueue(
+            Job::new(encrypted_queue_name.clone(), json!({"card": card}))
+                .with_retention_policy(long_retention()),
+        )
+        .await
+        .unwrap();
+    assert_row_has_no_plaintext(&tool.pool, "hammerwork_jobs", sealed, &card).await;
+    assert!(tool.get_job(sealed).await.unwrap().unwrap().is_encrypted);
+
+    for id in [encrypted, sealed] {
+        app.delete_job(id).await.unwrap();
+    }
+}
+
 /// A queue without an encryption engine refuses jobs that ask for encryption, and
 /// writes nothing.
 async fn missing_engine_fails_closed<DB>(plain: Arc<JobQueue<DB>>)
@@ -1170,6 +1359,21 @@ mod postgres {
 
     #[tokio::test]
     #[ignore] // Requires database connection
+    async fn test_postgres_every_read_path_keeps_the_ciphertext() {
+        every_read_path_keeps_the_ciphertext(test_utils::setup_postgres_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_plaintext_guard_refuses_plaintext_on_encrypted_queues() {
+        plaintext_guard_refuses_plaintext_on_encrypted_queues(
+            test_utils::setup_postgres_queue().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_postgres_batch_and_workflow_are_encrypted() {
         batch_and_workflow_are_encrypted(test_utils::setup_postgres_queue().await).await;
     }
@@ -1262,6 +1466,21 @@ mod mysql {
     #[ignore] // Requires database connection
     async fn test_mysql_pii_fields_round_trip() {
         pii_fields_round_trip(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_every_read_path_keeps_the_ciphertext() {
+        every_read_path_keeps_the_ciphertext(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_plaintext_guard_refuses_plaintext_on_encrypted_queues() {
+        plaintext_guard_refuses_plaintext_on_encrypted_queues(
+            test_utils::setup_mysql_queue().await,
+        )
+        .await;
     }
 
     #[tokio::test]

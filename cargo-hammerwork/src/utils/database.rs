@@ -255,6 +255,47 @@ impl DatabasePool {
         }
     }
 
+    /// Create a job queue for commands that write new jobs (`job enqueue`,
+    /// `batch enqueue`, `cron create`, `workflow create`).
+    ///
+    /// The queue encrypts like the application: when `encryption` (the application's
+    /// `[encryption]` settings, see [`Config::encryption_settings`]) is enabled, its key
+    /// is loaded and jobs on its `encrypted_queues` are encrypted. A key that cannot be
+    /// loaded is an error: the CLI never falls back to writing plaintext. The queue also
+    /// has the plaintext guard (`JobQueue::with_plaintext_guard`), so even without
+    /// encryption settings it refuses to write a plaintext job to a queue that already
+    /// holds encrypted jobs.
+    ///
+    /// [`Config::encryption_settings`]: crate::config::Config::encryption_settings
+    pub async fn create_enqueue_queue(
+        self,
+        encryption: &hammerwork::config::PayloadEncryptionConfig,
+    ) -> Result<JobQueueWrapper> {
+        let key_error = |e: hammerwork::HammerworkError| {
+            anyhow::anyhow!(
+                "Cannot set up payload encryption from the application's [encryption] \
+                 settings ({}); refusing to write jobs rather than store them in plaintext",
+                e
+            )
+        };
+        Ok(match self {
+            DatabasePool::Postgres(pool) => JobQueueWrapper::Postgres(
+                JobQueue::new(pool)
+                    .apply_encryption_config(encryption)
+                    .await
+                    .map_err(key_error)?
+                    .with_plaintext_guard(true),
+            ),
+            DatabasePool::MySQL(pool) => JobQueueWrapper::MySQL(
+                JobQueue::new(pool)
+                    .apply_encryption_config(encryption)
+                    .await
+                    .map_err(key_error)?
+                    .with_plaintext_guard(true),
+            ),
+        })
+    }
+
     /// Run database migrations.
     ///
     /// This method runs all pending migrations on the connected database.
@@ -358,6 +399,19 @@ impl DatabasePool {
 pub enum JobQueueWrapper {
     Postgres(JobQueue<sqlx::Postgres>),
     MySQL(JobQueue<sqlx::MySql>),
+}
+
+impl JobQueueWrapper {
+    /// The queue's encryption engine, if it has one
+    /// ([`DatabasePool::create_enqueue_queue`] with encryption enabled).
+    pub fn encryption_engine(
+        &self,
+    ) -> Option<&std::sync::Arc<hammerwork::encryption::EncryptionEngine>> {
+        match self {
+            JobQueueWrapper::Postgres(queue) => queue.encryption_engine(),
+            JobQueueWrapper::MySQL(queue) => queue.encryption_engine(),
+        }
+    }
 }
 
 #[cfg(test)]

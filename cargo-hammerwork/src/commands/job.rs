@@ -64,6 +64,19 @@ pub enum JobCommand {
         max_attempts: Option<u32>,
         #[arg(long, help = "Timeout in seconds")]
         timeout: Option<u32>,
+        #[arg(
+            long,
+            help = "Encrypt the payload with the application's encryption key (see the \
+                    encryption_config setting), even if the queue is not one of its \
+                    encrypted_queues"
+        )]
+        encrypt: bool,
+        #[arg(
+            long = "pii-field",
+            value_name = "FIELD",
+            help = "Encrypt only this payload field (repeatable; implies --encrypt)"
+        )]
+        pii_fields: Vec<String>,
     },
     #[command(
         about = "Retry failed, dead and timed-out jobs",
@@ -197,16 +210,25 @@ impl JobCommand {
                 delay,
                 max_attempts,
                 timeout,
+                encrypt,
+                pii_fields,
                 ..
             } => {
+                let job_queue = pool
+                    .create_enqueue_queue(&config.encryption_settings()?)
+                    .await?;
                 enqueue_job(
-                    pool,
+                    job_queue,
                     queue,
                     payload,
                     priority,
                     *delay,
                     *max_attempts,
                     *timeout,
+                    EncryptionRequest {
+                        encrypt: *encrypt,
+                        pii_fields: pii_fields.clone(),
+                    },
                 )
                 .await?;
             }
@@ -626,14 +648,52 @@ fn encryption_detail_lines(details: &EncryptionDetails) -> Vec<String> {
     lines
 }
 
+/// `job enqueue --encrypt` / `--pii-field`.
+#[derive(Debug, Clone, Default)]
+struct EncryptionRequest {
+    encrypt: bool,
+    pii_fields: Vec<String>,
+}
+
+/// Ask for `job` to be encrypted with `job_queue`'s engine (the application's key), as
+/// requested by `--encrypt` / `--pii-field`. Fails if the queue has no engine.
+fn request_encryption(
+    job: Job,
+    job_queue: &JobQueueWrapper,
+    request: &EncryptionRequest,
+) -> Result<Job> {
+    if !request.encrypt && request.pii_fields.is_empty() {
+        return Ok(job);
+    }
+    let engine = job_queue.encryption_engine().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--encrypt and --pii-field need the application's encryption settings with \
+             encryption enabled: set encryption_config (`cargo hammerwork config set \
+             encryption_config <path to hammerwork.toml>`) or the HAMMERWORK_ENCRYPTION_* \
+             environment variables, and make its key available"
+        )
+    })?;
+    let mut config = hammerwork::encryption::EncryptionConfig::new(engine.algorithm().clone())
+        .with_key_id(engine.key_id());
+    config.compression_enabled = engine.config().compression_enabled;
+    let job = job.with_encryption(config);
+    Ok(if request.pii_fields.is_empty() {
+        job
+    } else {
+        job.with_pii_fields(request.pii_fields.clone())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_job(
-    pool: DatabasePool,
+    job_queue: JobQueueWrapper,
     queue: &str,
     payload: &str,
     priority: &Option<String>,
     delay: Option<u64>,
     max_attempts: Option<u32>,
     timeout: Option<u32>,
+    encryption: EncryptionRequest,
 ) -> Result<()> {
     let payload_value = validate_json_payload(payload)?;
     let job_priority = if let Some(p) = priority {
@@ -642,8 +702,11 @@ async fn enqueue_job(
         JobPriority::Normal
     };
 
-    let job_queue = pool.create_job_queue();
-    let mut job = Job::new(queue.to_string(), payload_value);
+    let mut job = request_encryption(
+        Job::new(queue.to_string(), payload_value),
+        &job_queue,
+        &encryption,
+    )?;
     job.priority = job_priority;
 
     if let Some(max_att) = max_attempts {
@@ -1602,5 +1665,173 @@ mod tests {
         job_commands,
         test_job_commands_postgres,
         test_job_commands_mysql
+    );
+
+    /// `job enqueue` encrypts like the application (its `[encryption]` settings), and
+    /// without them refuses to write plaintext to a queue that holds encrypted jobs
+    /// (#64 H1).
+    async fn enqueue_follows_the_application_encryption(url: String) {
+        use base64::Engine as _;
+
+        let _guard = serial().await;
+        let pool = DatabasePool::connect(&url, 2).await.unwrap();
+        let encrypted_q = unique_queue("cli_enc");
+        let plain_q = unique_queue("cli_plain");
+        let key_var = format!("HW_CLI_TEST_KEY_{}", uuid::Uuid::new_v4().simple());
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        // SAFETY: tests touching the environment hold the `serial` lock.
+        unsafe { std::env::set_var(&key_var, &key) };
+
+        let dir = tempfile::tempdir().unwrap();
+        let app_config = dir.path().join("hammerwork.toml");
+        std::fs::write(
+            &app_config,
+            format!(
+                "[database]\nurl = \"ignored\"\n\n[encryption]\nenabled = true\n\
+                 key_source = \"env://{key_var}\"\nkey_id = \"cli-key\"\n\
+                 encrypted_queues = [\"{encrypted_q}\"]\n"
+            ),
+        )
+        .unwrap();
+        let with_app = Config {
+            encryption_config: Some(app_config.to_string_lossy().into_owned()),
+            ..config_for(&url)
+        };
+        let without_app = config_for(&url);
+        let run = |config: &Config, args: &[&str]| {
+            let cmd = parse(args);
+            let config = config.clone();
+            async move { cmd.execute(&config).await }
+        };
+        let ids = |queue: String| {
+            let pool = pool.clone();
+            async move { fetch_job_ids(&pool, &queue).await }
+        };
+        let secret = format!("4111-{}", uuid::Uuid::new_v4().simple());
+        let payload = format!(r#"{{"card": "{secret}", "amount": 5}}"#);
+
+        // An encrypted queue of the application: encrypted without asking
+        run(&with_app, &["enqueue", "-n", &encrypted_q, "-j", &payload])
+            .await
+            .unwrap();
+        let id = ids(encrypted_q.clone()).await.pop().unwrap();
+        let is_encrypted = job_column(&pool, &id, "is_encrypted").await.unwrap();
+        assert!(
+            is_encrypted == "true" || is_encrypted == "1",
+            "{is_encrypted}"
+        );
+        assert_eq!(
+            job_column(&pool, &id, "encryption_key_id").await.as_deref(),
+            Some("cli-key")
+        );
+        let stored = job_column(&pool, &id, "payload").await.unwrap();
+        assert!(!stored.contains(&secret), "{stored}");
+
+        // --encrypt / --pii-field encrypt jobs for any queue
+        run(
+            &with_app,
+            &[
+                "enqueue",
+                "-n",
+                &plain_q,
+                "-j",
+                &payload,
+                "--pii-field",
+                "card",
+            ],
+        )
+        .await
+        .unwrap();
+        let id = ids(plain_q.clone()).await.pop().unwrap();
+        let stored = job_column(&pool, &id, "payload").await.unwrap();
+        assert!(
+            !stored.contains(&secret) && stored.contains("amount"),
+            "{stored}"
+        );
+        assert!(
+            job_column(&pool, &id, "pii_fields")
+                .await
+                .unwrap()
+                .contains("card")
+        );
+
+        // The application's engine decrypts what the CLI wrote
+        let app_queue = match pool.clone() {
+            DatabasePool::Postgres(p) => JobQueueWrapper::Postgres(hammerwork::JobQueue::new(p)),
+            DatabasePool::MySQL(p) => JobQueueWrapper::MySQL(hammerwork::JobQueue::new(p)),
+        };
+        let engine = hammerwork::encryption::EncryptionEngine::new(
+            hammerwork::encryption::EncryptionConfig::new(
+                hammerwork::encryption::EncryptionAlgorithm::AES256GCM,
+            )
+            .with_key_id("cli-key")
+            .with_key_source(hammerwork::encryption::KeySource::Static(key.clone())),
+        )
+        .await
+        .unwrap();
+        let job_id = uuid::Uuid::parse_str(&id).unwrap();
+        let opened = match app_queue {
+            JobQueueWrapper::Postgres(q) => {
+                let q = q.with_encryption(engine);
+                q.decrypt_job(q.get_job(job_id).await.unwrap().unwrap())
+                    .await
+            }
+            JobQueueWrapper::MySQL(q) => {
+                let q = q.with_encryption(engine);
+                q.decrypt_job(q.get_job(job_id).await.unwrap().unwrap())
+                    .await
+            }
+        }
+        .unwrap();
+        assert_eq!(opened.payload["card"], secret.as_str());
+
+        // Without the application's settings: refused on the queue holding encrypted
+        // jobs, for jobs, cron jobs and batches; other queues are unaffected.
+        let before = count_jobs(&pool, &encrypted_q, None).await;
+        let err = run(
+            &without_app,
+            &["enqueue", "-n", &encrypted_q, "-j", &payload],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("holds encrypted jobs"), "{err}");
+        let cron = crate::commands::cron::CronCommand::Create {
+            database_url: None,
+            queue: encrypted_q.clone(),
+            payload: payload.clone(),
+            schedule: "0 0 0 1 1 *".to_string(),
+            timezone: None,
+            priority: None,
+        };
+        assert!(cron.execute(&without_app).await.is_err());
+        assert_eq!(count_jobs(&pool, &encrypted_q, None).await, before);
+        let err = run(
+            &without_app,
+            &["enqueue", "-n", &plain_q, "-j", "{}", "--encrypt"],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--encrypt"), "{err}");
+        let fresh_q = unique_queue("cli_fresh");
+        run(&without_app, &["enqueue", "-n", &fresh_q, "-j", "{}"])
+            .await
+            .unwrap();
+
+        // Settings whose key is unavailable: nothing is written
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(&key_var) };
+        let err = run(&with_app, &["enqueue", "-n", &fresh_q, "-j", "{}"])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to write jobs"), "{err}");
+        assert_eq!(count_jobs(&pool, &fresh_q, None).await, 1);
+
+        cleanup(&pool, &[&encrypted_q, &plain_q, &fresh_q]).await;
+    }
+
+    db_tests!(
+        enqueue_follows_the_application_encryption,
+        test_enqueue_follows_the_application_encryption_postgres,
+        test_enqueue_follows_the_application_encryption_mysql
     );
 }

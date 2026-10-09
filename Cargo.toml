@@ -55,6 +55,7 @@ hex = "0.4"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
+zeroize = "1.8"
 
 [package]
 name = "hammerwork"
@@ -100,6 +101,7 @@ hex = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 base64 = { workspace = true }
 toml = { workspace = true }
 aws-sdk-kms = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
@@ -131,7 +133,7 @@ mysql = ["sqlx/mysql"]
 metrics = ["prometheus", "warp"]
 alerting = ["reqwest", "lettre"]
 webhooks = ["reqwest", "hmac", "sha2", "hex"]
-encryption = ["aes-gcm", "chacha20poly1305", "argon2", "hmac", "sha2", "hex"]
+encryption = ["aes-gcm", "chacha20poly1305", "argon2", "hmac", "sha2", "hex", "zeroize"]
 aws-kms = ["aws-sdk-kms", "aws-config"]
 gcp-kms = ["google-cloud-kms", "google-cloud-auth", "rustls"]
 vault-kms = ["vaultrs", "url"]

@@ -116,7 +116,9 @@ use std::path::{Path, PathBuf};
 /// assert_eq!(config.get_log_level(), "info");
 /// assert_eq!(config.get_connection_pool_size(), 5);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` shows `database_url` with its password replaced by `***`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Database connection URL (e.g., "postgresql://localhost/hammerwork")
     pub database_url: Option<String>,
@@ -136,6 +138,33 @@ pub struct Config {
     /// Seconds to wait for a database connection before failing (default 10)
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+
+    /// Path of the application's `hammerwork.toml`, whose `[encryption]` section commands
+    /// that write jobs (`job enqueue`, `batch enqueue`, `cron create`,
+    /// `workflow create`) use, so they encrypt exactly like the application. See
+    /// [`Config::encryption_settings`].
+    #[serde(default)]
+    pub encryption_config: Option<String>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field(
+                "database_url",
+                &self
+                    .database_url
+                    .as_deref()
+                    .map(crate::utils::validation::redact_url),
+            )
+            .field("default_queue", &self.default_queue)
+            .field("default_limit", &self.default_limit)
+            .field("log_level", &self.log_level)
+            .field("connection_pool_size", &self.connection_pool_size)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("encryption_config", &self.encryption_config)
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -147,6 +176,7 @@ impl Default for Config {
             log_level: Some("info".to_string()),
             connection_pool_size: Some(5),
             connect_timeout_secs: None,
+            encryption_config: None,
         }
     }
 }
@@ -217,6 +247,24 @@ impl Config {
         if let Some(secs) = get("HAMMERWORK_CONNECT_TIMEOUT").and_then(|v| v.parse().ok()) {
             self.connect_timeout_secs = Some(secs);
         }
+        if let Some(path) = get("HAMMERWORK_ENCRYPTION_CONFIG").filter(|p| !p.is_empty()) {
+            self.encryption_config = Some(path);
+        }
+    }
+
+    /// The application's payload encryption settings, for commands that write jobs.
+    ///
+    /// The `[encryption]` section of [`Config::encryption_config`] (the application's
+    /// `hammerwork.toml`; `HAMMERWORK_ENCRYPTION_CONFIG` overrides it), with the
+    /// `HAMMERWORK_ENCRYPTION_*` environment variables applied on top, exactly as
+    /// `HammerworkConfig::from_env` does for the application. Without either, encryption
+    /// is disabled: the CLI then still refuses to write plaintext jobs to queues that hold
+    /// encrypted jobs (see `DatabasePool::create_enqueue_queue`).
+    pub fn encryption_settings(&self) -> Result<hammerwork::config::PayloadEncryptionConfig> {
+        hammerwork::config::PayloadEncryptionConfig::load(
+            self.encryption_config.as_deref().map(Path::new),
+        )
+        .map_err(|e| anyhow::anyhow!("Invalid encryption settings: {}", e))
     }
 
     /// Save configuration to file.
@@ -354,6 +402,7 @@ mod tests {
             log_level: None,
             connection_pool_size: None,
             connect_timeout_secs: None,
+            encryption_config: None,
         };
         assert_eq!(bare.get_default_limit(), 50);
         assert_eq!(bare.get_log_level(), "info");
@@ -443,6 +492,7 @@ mod tests {
             log_level: Some("warn".into()),
             connection_pool_size: Some(3),
             connect_timeout_secs: Some(7),
+            encryption_config: None,
         };
         config.save_to(&path).unwrap();
         let loaded = Config::load_from_path(&path).unwrap();
