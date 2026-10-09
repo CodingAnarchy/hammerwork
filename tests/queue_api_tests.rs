@@ -485,6 +485,44 @@ where
     }
 }
 
+/// Job timeouts are stored in whole seconds: a sub-second timeout is rounded up instead of
+/// becoming an immediate zero, a zero timeout is stored as none, and a huge one saturates
+/// instead of wrapping into a negative value that later reads would reject.
+async fn job_timeout_storage<Q>(queue: Arc<Q>)
+where
+    Q: DatabaseQueue + Send + Sync + 'static,
+{
+    let queue_name = test_utils::unique_queue("job_timeouts");
+    let cases = [
+        (
+            std::time::Duration::from_millis(200),
+            Some(std::time::Duration::from_secs(1)),
+        ),
+        (
+            std::time::Duration::from_secs(45),
+            Some(std::time::Duration::from_secs(45)),
+        ),
+        (std::time::Duration::ZERO, None),
+        (
+            std::time::Duration::from_secs(u64::MAX / 2),
+            Some(std::time::Duration::from_secs(i32::MAX as u64)),
+        ),
+    ];
+    let mut ids = Vec::new();
+    for (timeout, expected) in cases {
+        let id = queue
+            .enqueue(Job::new(queue_name.clone(), json!({})).with_timeout(timeout))
+            .await
+            .unwrap();
+        let stored = queue.get_job(id).await.unwrap().unwrap();
+        assert_eq!(stored.timeout, expected, "{timeout:?}");
+        ids.push(id);
+    }
+    for id in ids {
+        queue.delete_job(id).await.unwrap();
+    }
+}
+
 /// One `#[tokio::test]` per scenario, run against the queue returned by `$setup`.
 macro_rules! backend_tests {
     ($module:ident, $setup:path, $ignore:meta, [$($scenario:ident),* $(,)?]) => {
@@ -514,6 +552,7 @@ backend_tests!(
         throttle_configuration,
         pause_information,
         workflow_dependency_helpers,
+        job_timeout_storage,
     ]
 );
 
@@ -530,6 +569,7 @@ backend_tests!(
         throttle_configuration,
         pause_information,
         workflow_dependency_helpers,
+        job_timeout_storage,
     ]
 );
 
