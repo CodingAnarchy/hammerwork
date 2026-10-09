@@ -398,7 +398,10 @@ impl<DB: sqlx::Database> SpawnManager<DB> {
     /// Execute spawn logic for a completed job.
     ///
     /// This method checks if the job has a registered spawn handler and executes it
-    /// if found. The spawned jobs are automatically enqueued and tracked.
+    /// if found. The spawned jobs are enqueued one at a time, outside any transaction;
+    /// [`Worker`](crate::Worker)s instead use [`prepare_spawn`](Self::prepare_spawn) and
+    /// enqueue the children together with the parent's completion
+    /// ([`DatabaseQueue::complete_job_run_with_children`]).
     ///
     /// # Arguments
     ///
@@ -415,77 +418,103 @@ impl<DB: sqlx::Database> SpawnManager<DB> {
         config: SpawnConfig,
         queue: Arc<dyn DatabaseQueue<Database = DB> + Send + Sync>,
     ) -> Result<Option<SpawnResult>> {
-        if let Some(handler) = self.handlers.get(&job.queue_name) {
-            // Validate spawn operation
-            handler.validate_spawn(&job, &config).await?;
+        let Some(child_jobs) = self.prepare_spawn(&job, &config, queue.clone()).await? else {
+            return Ok(None);
+        };
 
-            // Create spawn context
-            let context = SpawnContext {
-                parent_job: job.clone(),
-                config: config.clone(),
-                queue: queue.clone(),
-            };
+        // Enqueue child jobs
+        let mut spawned_job_ids = Vec::new();
+        for child_job in child_jobs {
+            let job_id = queue.enqueue(child_job).await?;
+            spawned_job_ids.push(job_id);
+        }
 
-            // Generate child jobs
-            let mut child_jobs = handler.spawn_jobs(context).await?;
+        let spawn_result = SpawnResult {
+            parent_job_id: job.id,
+            spawned_jobs: spawned_job_ids,
+            spawned_at: Utc::now(),
+            spawn_operation_id: config.operation_id.clone(),
+        };
+        self.notify_spawn_complete(&job, &spawn_result).await?;
+        Ok(Some(spawn_result))
+    }
 
-            // Check spawn limits
-            if let Some(max_count) = config.max_spawn_count
-                && child_jobs.len() > max_count
-            {
-                return Err(HammerworkError::SpawnError(
-                    SpawnError::SpawnLimitExceeded {
-                        attempted: child_jobs.len(),
-                        limit: max_count,
-                    },
-                ));
+    /// Build the child jobs `job` spawns, without enqueueing them.
+    ///
+    /// Runs the job type's handler (`validate_spawn`, then `spawn_jobs`), enforces
+    /// `config.max_spawn_count` and applies the inheritance settings. Every child
+    /// depends on the parent and joins its workflow. Returns `None` when no handler is
+    /// registered for the job's queue.
+    ///
+    /// Workers call this before recording the parent's completion and then enqueue the
+    /// children in the same transaction as the completion
+    /// ([`DatabaseQueue::complete_job_run_with_children`]); an error here fails the
+    /// parent's run, so it is retried instead of completing without its children.
+    pub async fn prepare_spawn(
+        &self,
+        job: &Job,
+        config: &SpawnConfig,
+        queue: Arc<dyn DatabaseQueue<Database = DB> + Send + Sync>,
+    ) -> Result<Option<Vec<Job>>> {
+        let Some(handler) = self.handlers.get(&job.queue_name) else {
+            return Ok(None);
+        };
+        // Validate spawn operation
+        handler.validate_spawn(job, config).await?;
+
+        // Generate child jobs
+        let context = SpawnContext {
+            parent_job: job.clone(),
+            config: config.clone(),
+            queue,
+        };
+        let mut child_jobs = handler.spawn_jobs(context).await?;
+
+        // Check spawn limits
+        if let Some(max_count) = config.max_spawn_count
+            && child_jobs.len() > max_count
+        {
+            return Err(HammerworkError::SpawnError(
+                SpawnError::SpawnLimitExceeded {
+                    attempted: child_jobs.len(),
+                    limit: max_count,
+                },
+            ));
+        }
+
+        // Apply inheritance settings
+        for child_job in &mut child_jobs {
+            if config.inherit_priority {
+                child_job.priority = job.priority;
+            }
+            if config.inherit_retry_strategy {
+                child_job.retry_strategy = job.retry_strategy.clone();
+            }
+            if config.inherit_timeout {
+                child_job.timeout = job.timeout;
+            }
+            if config.inherit_trace_context {
+                child_job.trace_id = job.trace_id.clone();
+                child_job.correlation_id = job.correlation_id.clone();
+                child_job.parent_span_id = job.parent_span_id.clone();
+                child_job.span_context = job.span_context.clone();
             }
 
-            // Apply inheritance settings
-            for child_job in &mut child_jobs {
-                if config.inherit_priority {
-                    child_job.priority = job.priority;
-                }
-                if config.inherit_retry_strategy {
-                    child_job.retry_strategy = job.retry_strategy.clone();
-                }
-                if config.inherit_timeout {
-                    child_job.timeout = job.timeout;
-                }
-                if config.inherit_trace_context {
-                    child_job.trace_id = job.trace_id.clone();
-                    child_job.correlation_id = job.correlation_id.clone();
-                    child_job.parent_span_id = job.parent_span_id.clone();
-                    child_job.span_context = job.span_context.clone();
-                }
+            // Set up parent-child relationship
+            child_job.depends_on = vec![job.id];
+            child_job.workflow_id = job.workflow_id;
+            child_job.workflow_name = job.workflow_name.clone();
+        }
 
-                // Set up parent-child relationship
-                child_job.depends_on = vec![job.id];
-                child_job.workflow_id = job.workflow_id;
-                child_job.workflow_name = job.workflow_name.clone();
-            }
+        Ok(Some(child_jobs))
+    }
 
-            // Enqueue child jobs
-            let mut spawned_job_ids = Vec::new();
-            for child_job in child_jobs {
-                let job_id = queue.enqueue(child_job).await?;
-                spawned_job_ids.push(job_id);
-            }
-
-            // Create spawn result
-            let spawn_result = SpawnResult {
-                parent_job_id: job.id,
-                spawned_jobs: spawned_job_ids,
-                spawned_at: Utc::now(),
-                spawn_operation_id: config.operation_id.clone(),
-            };
-
-            // Call post-spawn callback
-            handler.on_spawn_complete(&spawn_result).await?;
-
-            Ok(Some(spawn_result))
-        } else {
-            Ok(None)
+    /// Call the post-spawn callback (`on_spawn_complete`) of `parent`'s handler, once
+    /// its children were enqueued.
+    pub async fn notify_spawn_complete(&self, parent: &Job, result: &SpawnResult) -> Result<()> {
+        match self.handlers.get(&parent.queue_name) {
+            Some(handler) => handler.on_spawn_complete(result).await,
+            None => Ok(()),
         }
     }
 

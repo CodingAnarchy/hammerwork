@@ -45,14 +45,23 @@ pub enum CronCommand {
         #[arg(short = 'r', long, help = "Job priority")]
         priority: Option<String>,
     },
-    #[command(about = "Enable cron job execution")]
+    #[command(
+        about = "Enable a cron job",
+        long_about = "Enable a cron job. It resumes at the next occurrence of its schedule \
+            (occurrences missed while it was disabled are not run), also when its last run \
+            finished while it was disabled. A run in progress is rescheduled when it ends."
+    )]
     Enable {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
         #[arg(help = "Job ID")]
         job_id: String,
     },
-    #[command(about = "Disable cron job execution")]
+    #[command(
+        about = "Disable a cron job",
+        long_about = "Disable a cron job. Its pending run is held (not executed) until the \
+            job is enabled again; a run in progress finishes and is not rescheduled."
+    )]
     Disable {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
@@ -388,19 +397,33 @@ async fn create_cron_job(
     Ok(())
 }
 
+/// Enable or disable a cron job through the library (`enable_recurring_job` /
+/// `disable_recurring_job`), so the CLI has the same semantics as applications: a
+/// disabled job's pending run is held, and enabling resumes it at the next occurrence,
+/// also after its last run finished while it was disabled.
 async fn toggle_cron_job(pool: &DatabasePool, job_id: &str, enable: bool) -> Result<()> {
-    let id = parse_job_id(job_id)?.to_string();
+    let id = parse_job_id(job_id)?;
     let status = if enable { "enabled" } else { "disabled" };
 
-    let mut params = SqlParams::new(pool.backend());
-    let id_expr = params.uuid(&id);
-    let flag = if enable { "true" } else { "false" };
-    let sql = format!(
-        "UPDATE hammerwork_jobs SET recurring = {flag} WHERE id = {id_expr} AND cron_schedule IS NOT NULL"
-    );
-    let updated = execute_binds(pool, &sql, params.binds()).await?;
-    if updated == 0 {
-        return Err(anyhow!("Cron job not found: {}", job_id));
+    let result = match (pool.clone().create_job_queue(), enable) {
+        (JobQueueWrapper::Postgres(q), true) => q.enable_recurring_job(id).await,
+        (JobQueueWrapper::Postgres(q), false) => q.disable_recurring_job(id).await,
+        (JobQueueWrapper::MySQL(q), true) => q.enable_recurring_job(id).await,
+        (JobQueueWrapper::MySQL(q), false) => q.disable_recurring_job(id).await,
+    };
+    match result {
+        Ok(()) => {}
+        Err(hammerwork::HammerworkError::JobNotFound { .. }) => {
+            return Err(anyhow!("Cron job not found: {}", job_id));
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "Cannot {} job {}: {}",
+                &status[..status.len() - 1],
+                job_id,
+                e
+            ));
+        }
     }
 
     println!("✅ Cron job {} successfully", status);

@@ -430,6 +430,44 @@ where
     delete_jobs(&queue, &ids).await;
 }
 
+/// #64 M6: polls that claim no job (empty or paused queue) do not spend the rate limit,
+/// so a burst is available when jobs arrive.
+async fn rate_limit_is_not_spent_on_empty_polls<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let queue_name = test_utils::unique_queue("cfg_rate_idle");
+    let concurrency = Concurrency::default();
+    // Three jobs an hour: after the burst, the next token takes 20 minutes.
+    let worker = Worker::new(
+        Arc::clone(&queue),
+        queue_name.clone(),
+        concurrency.handler(Duration::ZERO),
+    )
+    .with_poll_interval(Duration::from_millis(10))
+    .with_rate_limit(hammerwork::RateLimit::per_hour(3));
+    let mut pool = WorkerPool::new().without_stale_job_reaper();
+    pool.add_worker(worker);
+
+    run_pool_until(&mut pool, async {
+        // Dozens of empty polls, then a paused stretch.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        queue.pause_queue(&queue_name, Some("test")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        queue.resume_queue(&queue_name, Some("test")).await.unwrap();
+
+        // The whole burst is still there.
+        let ids = enqueue_many(&queue, &queue_name, 3).await;
+        assert!(
+            wait_for_jobs(&queue, &ids, Duration::from_secs(10), completed).await,
+            "idle polls spent the rate limit"
+        );
+        delete_jobs(&queue, &ids).await;
+    })
+    .await;
+}
+
 /// An autoscaling pool starts workers from its template while the queue is deep (up
 /// to `max_workers`) and retires them down to `min_workers` once it drains.
 async fn autoscaling_adds_and_retires_workers<DB>(queue: Arc<JobQueue<DB>>)
@@ -504,6 +542,79 @@ where
     delete_jobs(&queue, &ids).await;
     delete_jobs(&queue, &more).await;
     delete_jobs(&queue, &again).await;
+}
+
+/// #64 H9: autoscaling scales only the template's queue. Workers of other queues are
+/// never retired (even when the scaled queue is idle) and never cloned.
+async fn autoscaling_only_scales_the_template_queue<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let scaled = test_utils::unique_queue("cfg_scaled");
+    let others = [
+        test_utils::unique_queue("cfg_other_a"),
+        test_utils::unique_queue("cfg_other_b"),
+    ];
+    let scaled_load = Concurrency::default();
+    let other_load = Concurrency::default();
+    let worker = |name: &str, load: &Concurrency| {
+        Worker::new(
+            Arc::clone(&queue),
+            name.to_string(),
+            load.handler(Duration::from_millis(150)),
+        )
+        .with_poll_interval(Duration::from_millis(20))
+    };
+    let mut pool = WorkerPool::new()
+        .with_autoscaling(
+            hammerwork::worker::AutoscaleConfig::new()
+                .with_min_workers(1)
+                .with_max_workers(3)
+                .with_scale_up_threshold(2)
+                .with_scale_down_threshold(1)
+                .with_cooldown_period(Duration::ZERO)
+                .with_evaluation_window(Duration::from_millis(100)),
+        )
+        .without_stale_job_reaper();
+    // The first worker is the template; the scaled queue starts with two workers.
+    pool.add_worker(worker(&scaled, &scaled_load));
+    pool.add_worker(worker(&others[0], &other_load));
+    pool.add_worker(worker(&scaled, &scaled_load));
+    pool.add_worker(worker(&others[1], &other_load));
+
+    // Run the pool for many evaluations while the scaled queue is idle, then drop the
+    // `start` future: the workers keep running in their own tasks.
+    tokio::select! {
+        result = pool.start() => panic!("pool stopped early: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(1500)) => {}
+    }
+    // The idle scaled queue shrank to min_workers...
+    assert_eq!(
+        pool.get_autoscale_metrics().active_workers,
+        1,
+        "metrics: {:?}",
+        pool.get_autoscale_metrics()
+    );
+    // ...and both other queues are still served.
+    let mut ids = Vec::new();
+    for name in &others {
+        ids.extend(enqueue_many(&queue, name, 2).await);
+    }
+    assert!(
+        wait_for_jobs(&queue, &ids, Duration::from_secs(10), completed).await,
+        "a worker of another queue was retired"
+    );
+    delete_jobs(&queue, &ids).await;
+
+    // A backlog on the scaled queue grows it to max_workers with clones of the template.
+    let backlog = enqueue_many(&queue, &scaled, 24).await;
+    assert!(wait_for_jobs(&queue, &backlog, Duration::from_secs(30), completed).await);
+    assert_eq!(scaled_load.peak(), 3, "scaled up to max_workers");
+    assert!(other_load.peak() <= 2, "the other queues were not scaled");
+    delete_jobs(&queue, &backlog).await;
+
+    pool.shutdown().await.unwrap();
 }
 
 /// A worker leaves a paused queue alone and picks its jobs up once it is resumed.
@@ -748,8 +859,8 @@ async fn next_alert(
     .unwrap_or_else(|_| panic!("no {alert_type} alert"))
 }
 
-/// A worker configured with alerting sends queue depth alerts (from its monitoring
-/// task) and worker starvation alerts (when it finds no work) to the webhook target.
+/// A worker configured with alerting sends queue depth and worker starvation alerts
+/// (from its monitoring task) to the webhook target.
 #[cfg(feature = "alerting")]
 async fn worker_sends_queue_depth_and_starvation_alerts<DB>(queue: Arc<JobQueue<DB>>)
 where
@@ -769,6 +880,7 @@ where
     config.alerting = AlertingConfig::new().alert_on_queue_depth(2).webhook(&url);
     let worker = Worker::new(Arc::clone(&queue), deep.clone(), Arc::clone(&noop))
         .with_poll_interval(Duration::from_millis(20))
+        .with_monitoring_interval(Duration::from_millis(50))
         .with_hammerwork_config(&config);
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
@@ -785,6 +897,7 @@ where
     let idle = test_utils::unique_queue("cfg_alert_starved");
     let worker = Worker::new(Arc::clone(&queue), idle.clone(), noop)
         .with_poll_interval(Duration::from_millis(20))
+        .with_monitoring_interval(Duration::from_millis(50))
         .with_alerting_config(
             AlertingConfig::new()
                 .alert_on_worker_starvation(Duration::from_millis(50))
@@ -796,6 +909,70 @@ where
     assert_eq!(alert["queue_name"], idle.as_str());
     shutdown_tx.send(()).await.unwrap();
     task.await.unwrap().unwrap();
+}
+
+/// #64 H10: an alert target that never answers does not hold up job processing; alerts
+/// are checked and delivered by the monitoring task, not the polling loop.
+#[cfg(feature = "alerting")]
+async fn hanging_alert_target_does_not_block_jobs<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    use hammerwork::{alerting::AlertingConfig, stats::InMemoryStatsCollector};
+
+    // Accepts connections and never answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/alert", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let accepted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                open.push(socket);
+            }
+        })
+    };
+
+    let queue_name = test_utils::unique_queue("cfg_alert_hang");
+    let noop: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
+    let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), noop)
+        .with_poll_interval(Duration::from_millis(20))
+        .with_monitoring_interval(Duration::from_millis(20))
+        .with_stats_collector(Arc::new(InMemoryStatsCollector::new_default()))
+        .with_alerting_config(
+            AlertingConfig::new()
+                .alert_on_worker_starvation(Duration::from_millis(1))
+                .alert_on_queue_depth(0)
+                .alert_on_high_error_rate(0.0)
+                .webhook(&url),
+        );
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+    // Let alerts fire (and hang) while the queue is idle, then give it work.
+    let fired = eventually(Duration::from_secs(5), || async {
+        accepted.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    assert!(fired, "no alert was sent");
+    let ids = enqueue_many(&queue, &queue_name, 3).await;
+    assert!(
+        wait_for_jobs(&queue, &ids, Duration::from_secs(5), completed).await,
+        "a hanging alert target blocked job processing"
+    );
+
+    // Shutdown does not wait for the hanging alert either.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        shutdown_tx.send(()).await.unwrap();
+        task.await.unwrap().unwrap();
+    })
+    .await
+    .expect("shutdown waited for a hanging alert");
+    server.abort();
+    delete_jobs(&queue, &ids).await;
 }
 
 /// A worker with an alert manager and a statistics collector raises a high error rate
@@ -836,6 +1013,7 @@ where
     ));
     let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), failing)
         .with_poll_interval(Duration::from_millis(20))
+        .with_monitoring_interval(Duration::from_millis(50))
         .with_stats_collector(Arc::new(InMemoryStatsCollector::new_default()))
         .with_alert_manager(manager);
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -1024,6 +1202,18 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore] // Requires database connection
+    async fn test_postgres_autoscaling_only_scales_the_template_queue() {
+        autoscaling_only_scales_the_template_queue(queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_rate_limit_is_not_spent_on_empty_polls() {
+        rate_limit_is_not_spent_on_empty_polls(queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_postgres_worker_waits_while_queue_is_paused() {
         worker_waits_while_queue_is_paused(queue().await).await;
     }
@@ -1052,6 +1242,13 @@ mod postgres_tests {
     #[ignore] // Requires database connection
     async fn test_postgres_worker_sends_error_rate_alerts() {
         worker_sends_error_rate_alerts(queue().await).await;
+    }
+
+    #[cfg(feature = "alerting")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_hanging_alert_target_does_not_block_jobs() {
+        hanging_alert_target_does_not_block_jobs(queue().await).await;
     }
 
     #[cfg(feature = "metrics")]
@@ -1124,6 +1321,18 @@ mod mysql_tests {
 
     #[tokio::test]
     #[ignore] // Requires database connection
+    async fn test_mysql_autoscaling_only_scales_the_template_queue() {
+        autoscaling_only_scales_the_template_queue(queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_rate_limit_is_not_spent_on_empty_polls() {
+        rate_limit_is_not_spent_on_empty_polls(queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
     async fn test_mysql_worker_waits_while_queue_is_paused() {
         worker_waits_while_queue_is_paused(queue().await).await;
     }
@@ -1152,6 +1361,13 @@ mod mysql_tests {
     #[ignore] // Requires database connection
     async fn test_mysql_worker_sends_error_rate_alerts() {
         worker_sends_error_rate_alerts(queue().await).await;
+    }
+
+    #[cfg(feature = "alerting")]
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_hanging_alert_target_does_not_block_jobs() {
+        hanging_alert_target_does_not_block_jobs(queue().await).await;
     }
 
     #[cfg(feature = "metrics")]

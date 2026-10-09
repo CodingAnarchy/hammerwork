@@ -631,10 +631,15 @@ impl crate::queue::JobQueue<MySql> {
     /// Lock and claim happen in one transaction. SKIP LOCKED (MySQL 8.0+) lets
     /// concurrent workers move past rows another worker is claiming instead of
     /// blocking on them. The claim time comes from the database clock.
+    ///
+    /// The lease (`lease` microseconds, capped at the latest time a TIMESTAMP column
+    /// holds) is written by the claiming UPDATE, so the stale job reaper never sees this
+    /// run without one (`last_heartbeat_at = started_at` marks it as this run's lease).
     async fn claim_attempt(
         &self,
         queue_name: &str,
         priority: Option<JobPriority>,
+        lease: i64,
     ) -> Result<Option<Job>> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = Self::begin_claim_transaction(&mut conn).await?;
@@ -659,12 +664,16 @@ impl crate::queue::JobQueue<MySql> {
             let job_row = JobRow::from_row(&row)?;
             let started_at: DateTime<Utc> = row.try_get("claimed_at")?;
 
-            sqlx::query(
-                "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1 \
-                 WHERE id = ?",
-            )
+            sqlx::query(&format!(
+                "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1, \
+                 last_heartbeat_at = ?, lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
+                 CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ?"
+            ))
             .bind(JobStatus::Running)
             .bind(started_at)
+            .bind(started_at)
+            .bind(started_at)
+            .bind(lease)
             .bind(&job_row.id)
             .execute(&mut *tx)
             .await?;
@@ -683,6 +692,7 @@ impl crate::queue::JobQueue<MySql> {
         &self,
         queue_name: &str,
         weights: &crate::priority::PriorityWeights,
+        lease: i64,
     ) -> Result<Option<Job>> {
         // Which priority levels have a runnable job: one index probe per level, so
         // every level is considered however many jobs of other levels are queued.
@@ -707,7 +717,7 @@ impl crate::queue::JobQueue<MySql> {
             super::weighted_seed(queue_name, attempt),
         ) {
             if let Some(job) =
-                retry_on_deadlock(|| self.claim_attempt(queue_name, Some(priority))).await?
+                retry_on_deadlock(|| self.claim_attempt(queue_name, Some(priority), lease)).await?
             {
                 return Ok(Some(job));
             }
@@ -767,7 +777,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
-        retry_on_deadlock(|| self.claim_attempt(queue_name, None)).await
+        self.dequeue_leased(queue_name, None, super::DEFAULT_LEASE_DURATION)
+            .await
     }
 
     async fn dequeue_with_priority_weights(
@@ -775,11 +786,24 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         queue_name: &str,
         weights: &crate::priority::PriorityWeights,
     ) -> Result<Option<Job>> {
-        if weights.is_strict() {
-            return self.dequeue(queue_name).await;
-        }
-        self.dequeue_with_priority_weights_inner(queue_name, weights)
+        self.dequeue_leased(queue_name, Some(weights), super::DEFAULT_LEASE_DURATION)
             .await
+    }
+
+    async fn dequeue_leased(
+        &self,
+        queue_name: &str,
+        weights: Option<&crate::priority::PriorityWeights>,
+        lease: std::time::Duration,
+    ) -> Result<Option<Job>> {
+        let lease = lease_micros(lease);
+        match weights {
+            Some(weights) if !weights.is_strict() => {
+                self.dequeue_with_priority_weights_inner(queue_name, weights, lease)
+                    .await
+            }
+            _ => retry_on_deadlock(|| self.claim_attempt(queue_name, None, lease)).await,
+        }
     }
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
@@ -823,6 +847,41 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .transition_job(run.id, Guard::Run(run), &target, true)
             .await?
             .into_run())
+    }
+
+    async fn complete_job_run_with_children(
+        &self,
+        run: &Job,
+        mut children: Vec<Job>,
+    ) -> Result<Option<RecordedOutcome>> {
+        // Encrypt before anything is written, so a child that cannot be encrypted fails
+        // the whole completion.
+        self.seal_jobs(&mut children).await?;
+        super::retry_on_conflict(|| async {
+            let mut conn = self.pool.acquire().await?;
+            let mut tx = Self::begin_claim_transaction(&mut conn).await?;
+            let result = async {
+                let transition = Self::transition_in_tx(
+                    &mut tx,
+                    run.id,
+                    Guard::Run(run),
+                    &Target::Completed,
+                    true,
+                )
+                .await?;
+                let Some(mut recorded) = transition.into_run() else {
+                    return Ok(None);
+                };
+                // Children depending on the parent see it Completed in this transaction.
+                let mut jobs = children.clone();
+                insert_dependent_jobs(&mut tx, &mut jobs).await?;
+                recorded.spawned = jobs.iter().map(|job| job.id).collect();
+                Ok(Some(recorded))
+            }
+            .await;
+            super::end_transaction(tx, result).await
+        })
+        .await
     }
 
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
@@ -1494,21 +1553,68 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn disable_recurring_job(&self, job_id: JobId) -> Result<()> {
-        sqlx::query("UPDATE hammerwork_jobs SET recurring = FALSE WHERE id = ?")
-            .bind(job_id.to_string())
-            .execute(&self.pool)
-            .await?;
-
+        // A pending occurrence is held by the dequeue (see RUNNABLE_IN_QUEUE_SQL).
+        let result = sqlx::query(
+            "UPDATE hammerwork_jobs SET recurring = FALSE, next_run_at = NULL \
+             WHERE id = ? AND cron_schedule IS NOT NULL",
+        )
+        .bind(job_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        // MySQL counts changed rows, so an already disabled job also reports 0.
+        if result.rows_affected() == 0 {
+            return super::disable_recurring_job_not_applied(self.get_job(job_id).await?, job_id);
+        }
         Ok(())
     }
 
     async fn enable_recurring_job(&self, job_id: JobId) -> Result<()> {
-        sqlx::query("UPDATE hammerwork_jobs SET recurring = TRUE WHERE id = ?")
-            .bind(job_id.to_string())
-            .execute(&self.pool)
-            .await?;
-
-        Ok(())
+        super::retry_on_conflict(|| async {
+            let mut conn = self.pool.acquire().await?;
+            let mut tx = Self::begin_claim_transaction(&mut conn).await?;
+            let result = async {
+                let row = sqlx::query_as::<_, JobRow>(&format!(
+                    "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = ? FOR UPDATE"
+                ))
+                .bind(job_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(row) = row else {
+                    return Err(crate::HammerworkError::JobNotFound {
+                        id: job_id.to_string(),
+                    });
+                };
+                let job = row.into_job()?;
+                let now = db_now(&mut tx).await?;
+                match super::enabled_recurring_next_run(&job, now)? {
+                    // Running: the run's outcome reschedules it.
+                    None => {
+                        sqlx::query("UPDATE hammerwork_jobs SET recurring = TRUE WHERE id = ?")
+                            .bind(job_id.to_string())
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    Some(next_run_at) => {
+                        sqlx::query(
+                            "UPDATE hammerwork_jobs SET recurring = TRUE, status = 'Pending', \
+                             scheduled_at = ?, next_run_at = ?, attempts = 0, \
+                             started_at = NULL, completed_at = NULL, failed_at = NULL, \
+                             timed_out_at = NULL, error_message = NULL, \
+                             last_heartbeat_at = NULL, lease_expires_at = NULL WHERE id = ?",
+                        )
+                        .bind(next_run_at)
+                        .bind(next_run_at)
+                        .bind(job_id.to_string())
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            super::end_transaction(tx, result).await
+        })
+        .await
     }
 
     async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
@@ -2177,25 +2283,30 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         rows.iter().map(pause_info_from_row).collect()
     }
 
-    async fn heartbeat_job(&self, job_id: JobId, lease: std::time::Duration) -> Result<bool> {
+    async fn heartbeat_job(&self, run: &Job, lease: std::time::Duration) -> Result<bool> {
         // The lease is measured on the database clock, like the reaper that checks it,
-        // and capped at the latest time a TIMESTAMP column holds.
-        let lease = super::clamp_interval(lease)
-            .num_microseconds()
-            .unwrap_or(i64::MAX);
+        // and capped at the latest time a TIMESTAMP column holds. Only the run that was
+        // dequeued is extended: a stale worker whose job was reclaimed and claimed again
+        // must not keep the new run's lease alive.
+        let started = super::run_started_range(run);
         let result = sqlx::query(&format!(
             "UPDATE hammerwork_jobs SET last_heartbeat_at = UTC_TIMESTAMP(6), \
              lease_expires_at = LEAST(DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? MICROSECOND), \
-             CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ? AND status = ?"
+             CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ? AND status = ? \
+             AND attempts = ? AND (? IS NULL OR (started_at > ? AND started_at < ?))"
         ))
-        .bind(lease)
-        .bind(job_id.to_string())
+        .bind(lease_micros(lease))
+        .bind(run.id.to_string())
         .bind(JobStatus::Running)
+        .bind(run.attempts)
+        .bind(started.map(|(from, _)| from))
+        .bind(started.map(|(from, _)| from))
+        .bind(started.map(|(_, to)| to))
         .execute(&self.pool)
         .await?;
 
         // MySQL reports "rows changed", not "rows matched"; the timestamps always change
-        // (microsecond precision), so 0 means the job is no longer Running.
+        // (microsecond precision), so 0 means the run is no longer Running.
         Ok(result.rows_affected() > 0)
     }
 
@@ -2276,6 +2387,10 @@ impl crate::queue::JobQueue<MySql> {
 
         // Claim stale rows with SKIP LOCKED so concurrent reapers never wait on (or
         // double-process) the same row. Each UPDATE re-checks `status` as well.
+        //
+        // A run's lease is written when it is claimed (`last_heartbeat_at = started_at`),
+        // so only its expiry counts. The `started_at` cutoff applies only to runs without
+        // a lease of their own: claimed by an older version that wrote none.
         let candidates = sqlx::query_as::<_, JobRow>(&format!(
             r#"
             SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs
@@ -2284,7 +2399,8 @@ impl crate::queue::JobQueue<MySql> {
                 (last_heartbeat_at IS NOT NULL
                     AND last_heartbeat_at >= started_at
                     AND lease_expires_at < ?)
-                OR ((last_heartbeat_at IS NULL OR last_heartbeat_at < started_at)
+                OR ((last_heartbeat_at IS NULL OR lease_expires_at IS NULL
+                        OR last_heartbeat_at < started_at)
                     AND started_at < ?)
               )
             FOR UPDATE SKIP LOCKED
@@ -2460,6 +2576,15 @@ async fn insert_jobs(conn: &mut sqlx::MySqlConnection, jobs: &[Job]) -> Result<(
 /// The latest instant a MySQL `TIMESTAMP` column can hold, as SQL.
 const TIMESTAMP_MAX_SQL: &str = "2038-01-19 03:14:07.999999";
 
+/// A lease as the microseconds bound to `INTERVAL ? MICROSECOND` (a zero lease never
+/// expires; see [`super::lease_interval`]). Statements cap the resulting time at
+/// [`TIMESTAMP_MAX_SQL`].
+fn lease_micros(lease: std::time::Duration) -> i64 {
+    super::lease_interval(lease)
+        .num_microseconds()
+        .unwrap_or(i64::MAX)
+}
+
 /// The range of instants a MySQL `TIMESTAMP` column can hold:
 /// 1970-01-01 00:00:01 to 2038-01-19 03:14:07.999999 UTC.
 fn timestamp_range() -> (DateTime<Utc>, DateTime<Utc>) {
@@ -2548,8 +2673,12 @@ fn pause_info_from_row(row: &sqlx::mysql::MySqlRow) -> Result<super::QueuePauseI
 /// be dequeued now: pending, due by the database clock, not waiting on dependencies,
 /// and its queue not paused. The pause check is uncorrelated and looks up the pause
 /// table's primary key.
+///
+/// A job with a cron schedule only runs while it is recurring: a disabled recurring
+/// job's pending occurrence is held (see `disable_recurring_job`).
 const RUNNABLE_IN_QUEUE_SQL: &str = "j.queue_name = ? AND j.status = 'Pending' \
      AND j.scheduled_at <= UTC_TIMESTAMP(6) AND j.dependency_status IN ('none', 'satisfied') \
+     AND (j.recurring OR j.cron_schedule IS NULL) \
      AND NOT EXISTS (SELECT 1 FROM hammerwork_queue_pause p WHERE p.queue_name = ?)";
 
 /// Insert `jobs`, settling the dependency state of those that depend on jobs that

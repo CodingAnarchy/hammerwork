@@ -593,12 +593,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
-        let row = sqlx::query_as::<_, JobRow>(&claim_sql(false))
-            .bind(queue_name)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        row.map(JobRow::into_job).transpose()
+        self.dequeue_leased(queue_name, None, super::DEFAULT_LEASE_DURATION)
+            .await
     }
 
     async fn dequeue_with_priority_weights(
@@ -606,10 +602,29 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         queue_name: &str,
         weights: &crate::priority::PriorityWeights,
     ) -> Result<Option<Job>> {
-        if weights.is_strict() {
-            // Use strict priority - same as regular dequeue
-            return self.dequeue(queue_name).await;
-        }
+        self.dequeue_leased(queue_name, Some(weights), super::DEFAULT_LEASE_DURATION)
+            .await
+    }
+
+    async fn dequeue_leased(
+        &self,
+        queue_name: &str,
+        weights: Option<&crate::priority::PriorityWeights>,
+        lease: std::time::Duration,
+    ) -> Result<Option<Job>> {
+        let lease = super::lease_interval(lease);
+        let weights = match weights {
+            Some(weights) if !weights.is_strict() => weights,
+            // Strict priority: the highest priority, then the oldest job.
+            _ => {
+                let row = sqlx::query_as::<_, JobRow>(&claim_sql(false))
+                    .bind(queue_name)
+                    .bind(lease)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                return row.map(JobRow::into_job).transpose();
+            }
+        };
 
         // Which priority levels have a runnable job: one index probe per level, so
         // every level is considered however many jobs of other levels are queued.
@@ -633,6 +648,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         ) {
             let claimed = sqlx::query_as::<_, JobRow>(&claim_sql(true))
                 .bind(queue_name)
+                .bind(lease)
                 .bind(priority.as_i32())
                 .fetch_optional(&self.pool)
                 .await?;
@@ -685,6 +701,40 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .transition_job(run.id, Guard::Run(run), &target, true)
             .await?
             .into_run())
+    }
+
+    async fn complete_job_run_with_children(
+        &self,
+        run: &Job,
+        mut children: Vec<Job>,
+    ) -> Result<Option<RecordedOutcome>> {
+        // Encrypt before anything is written, so a child that cannot be encrypted fails
+        // the whole completion.
+        self.seal_jobs(&mut children).await?;
+        super::retry_on_conflict(|| async {
+            let mut tx = self.pool.begin().await?;
+            let result = async {
+                let transition = Self::transition_in_tx(
+                    &mut tx,
+                    run.id,
+                    Guard::Run(run),
+                    &Target::Completed,
+                    true,
+                )
+                .await?;
+                let Some(mut recorded) = transition.into_run() else {
+                    return Ok(None);
+                };
+                // Children depending on the parent see it Completed in this transaction.
+                let mut jobs = children.clone();
+                insert_dependent_jobs(&mut tx, &mut jobs).await?;
+                recorded.spawned = jobs.iter().map(|job| job.id).collect();
+                Ok(Some(recorded))
+            }
+            .await;
+            super::end_transaction(tx, result).await
+        })
+        .await
     }
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
         let row = sqlx::query_as::<_, JobRow>(&format!(
@@ -1356,21 +1406,65 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn disable_recurring_job(&self, job_id: JobId) -> Result<()> {
-        sqlx::query("UPDATE hammerwork_jobs SET recurring = FALSE WHERE id = $1")
-            .bind(job_id)
-            .execute(&self.pool)
-            .await?;
-
+        // A pending occurrence is held by the dequeue (see RUNNABLE_IN_QUEUE_SQL).
+        let result = sqlx::query(
+            "UPDATE hammerwork_jobs SET recurring = FALSE, next_run_at = NULL \
+             WHERE id = $1 AND cron_schedule IS NOT NULL",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return super::disable_recurring_job_not_applied(self.get_job(job_id).await?, job_id);
+        }
         Ok(())
     }
 
     async fn enable_recurring_job(&self, job_id: JobId) -> Result<()> {
-        sqlx::query("UPDATE hammerwork_jobs SET recurring = TRUE WHERE id = $1")
-            .bind(job_id)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(())
+        super::retry_on_conflict(|| async {
+            let mut tx = self.pool.begin().await?;
+            let result = async {
+                let row = sqlx::query_as::<_, JobRow>(&format!(
+                    "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = $1 FOR UPDATE"
+                ))
+                .bind(job_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(row) = row else {
+                    return Err(crate::HammerworkError::JobNotFound {
+                        id: job_id.to_string(),
+                    });
+                };
+                let job = row.into_job()?;
+                let now = db_now(&mut tx).await?;
+                match super::enabled_recurring_next_run(&job, now)? {
+                    // Running: the run's outcome reschedules it.
+                    None => {
+                        sqlx::query("UPDATE hammerwork_jobs SET recurring = TRUE WHERE id = $1")
+                            .bind(job_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    Some(next_run_at) => {
+                        sqlx::query(
+                            "UPDATE hammerwork_jobs SET recurring = TRUE, status = 'Pending', \
+                             scheduled_at = $2, next_run_at = $2, attempts = 0, \
+                             started_at = NULL, completed_at = NULL, failed_at = NULL, \
+                             timed_out_at = NULL, error_message = NULL, \
+                             last_heartbeat_at = NULL, lease_expires_at = NULL WHERE id = $1",
+                        )
+                        .bind(job_id)
+                        .bind(next_run_at)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            super::end_transaction(tx, result).await
+        })
+        .await
     }
 
     async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
@@ -2054,15 +2148,22 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         rows.iter().map(pause_info_from_row).collect()
     }
 
-    async fn heartbeat_job(&self, job_id: JobId, lease: std::time::Duration) -> Result<bool> {
+    async fn heartbeat_job(&self, run: &Job, lease: std::time::Duration) -> Result<bool> {
         // The lease is measured on the database clock, like the reaper that checks it.
+        // Only the run that was dequeued is extended: a stale worker whose job was
+        // reclaimed and claimed again must not keep the new run's lease alive.
+        let started = super::run_started_range(run);
         let result = sqlx::query(
             "UPDATE hammerwork_jobs SET last_heartbeat_at = now(), \
-             lease_expires_at = now() + $1 WHERE id = $2 AND status = $3",
+             lease_expires_at = now() + $1 WHERE id = $2 AND status = $3 AND attempts = $4 \
+             AND ($5::timestamptz IS NULL OR (started_at > $5 AND started_at < $6))",
         )
-        .bind(super::clamp_interval(lease))
-        .bind(job_id)
+        .bind(super::lease_interval(lease))
+        .bind(run.id)
         .bind(JobStatus::Running)
+        .bind(run.attempts)
+        .bind(started.map(|(from, _)| from))
+        .bind(started.map(|(_, to)| to))
         .execute(&self.pool)
         .await?;
 
@@ -2146,6 +2247,10 @@ impl crate::queue::JobQueue<Postgres> {
         // (or double-process) the same row; the outer UPDATE re-checks `status` so a row
         // that changed state after the snapshot is left alone. All SET expressions read
         // the pre-update row, so `attempts >= max_attempts` picks Dead vs Pending.
+        //
+        // A run's lease is written when it is claimed (`last_heartbeat_at = started_at`),
+        // so only its expiry counts. The `started_at` cutoff applies only to runs without
+        // a lease of their own: claimed by an older version that wrote none.
         let rows = sqlx::query(
             r#"
             WITH stale AS (
@@ -2155,7 +2260,8 @@ impl crate::queue::JobQueue<Postgres> {
                     (last_heartbeat_at IS NOT NULL
                         AND last_heartbeat_at >= started_at
                         AND lease_expires_at < $2)
-                    OR ((last_heartbeat_at IS NULL OR last_heartbeat_at < started_at)
+                    OR ((last_heartbeat_at IS NULL OR lease_expires_at IS NULL
+                            OR last_heartbeat_at < started_at)
                         AND started_at < $3)
                   )
                 FOR UPDATE SKIP LOCKED
@@ -2338,22 +2444,30 @@ fn pause_info_from_row(row: &sqlx::postgres::PgRow) -> Result<super::QueuePauseI
 ///
 /// Status and dependency values are literals so the planner can use the partial
 /// polling indexes; the pause check is uncorrelated and runs once per query.
+///
+/// A job with a cron schedule only runs while it is recurring: a disabled recurring
+/// job's pending occurrence is held (see `disable_recurring_job`).
 const RUNNABLE_IN_QUEUE_SQL: &str = "j.queue_name = $1 AND j.status = 'Pending' \
      AND j.scheduled_at <= now() AND j.dependency_status IN ('none', 'satisfied') \
+     AND (j.recurring OR j.cron_schedule IS NULL) \
      AND NOT EXISTS (SELECT 1 FROM hammerwork_queue_pause p WHERE p.queue_name = $1)";
 
-/// Claims the next runnable job of queue `$1` (of priority `$2` when `by_priority`),
-/// highest priority and oldest first, in one statement. `FOR UPDATE SKIP LOCKED` lets
-/// concurrent workers pass over rows another worker is claiming.
+/// Claims the next runnable job of queue `$1` (of priority `$3` when `by_priority`),
+/// highest priority and oldest first, in one statement, with a lease of `$2` (an
+/// interval). `FOR UPDATE SKIP LOCKED` lets concurrent workers pass over rows another
+/// worker is claiming.
+///
+/// The lease is written with the claim, so the stale job reaper never sees this run
+/// without one (`last_heartbeat_at = started_at` marks it as this run's lease).
 fn claim_sql(by_priority: bool) -> String {
     format!(
         "UPDATE hammerwork_jobs SET status = 'Running', started_at = now(), \
-         attempts = attempts + 1 \
+         attempts = attempts + 1, last_heartbeat_at = now(), lease_expires_at = now() + $2 \
          WHERE id = (SELECT j.id FROM hammerwork_jobs j WHERE {RUNNABLE_IN_QUEUE_SQL}{} \
          ORDER BY j.priority DESC, j.scheduled_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) \
          RETURNING {JOB_SELECT_FIELDS}",
         if by_priority {
-            " AND j.priority = $2"
+            " AND j.priority = $3"
         } else {
             ""
         }

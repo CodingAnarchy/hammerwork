@@ -323,10 +323,10 @@ for job in &recurring_jobs {
     println!("Recurring job: {} - Next run: {:?}", job.id, job.next_run_at);
 }
 
-// Stop future executions
+// Stop future executions: a pending run is held, a running one is not rescheduled
 queue.disable_recurring_job(job_id).await?;
 
-// Resume
+// Resume at the next occurrence (also revives a job whose last run finished meanwhile)
 queue.enable_recurring_job(job_id).await?;
 
 // Move a job back to Pending at an explicit time
@@ -335,6 +335,20 @@ queue.reschedule_cron_job(job_id, next).await?;
 # Ok(())
 # }
 ```
+
+Disabling and enabling:
+
+- `disable_recurring_job` clears `recurring` and `next_run_at`. If the job's next run is
+  pending, it stays `Pending` but is held: a job with a cron schedule is only dequeued
+  while it is recurring. A run already in progress finishes and is then not
+  rescheduled (it ends `Completed`, `Dead` or `TimedOut`). Disabling a disabled job does
+  nothing.
+- `enable_recurring_job` sets `recurring` again and, unless the job is `Running` (that
+  run's outcome reschedules it), schedules it for the next occurrence of its schedule
+  after now: `Pending`, attempts reset. This also revives a job whose last run finished
+  while it was disabled. Occurrences missed while it was disabled are not run.
+- Both fail with `JobNotFound` for a missing job and with an error for a job without a
+  cron schedule. `cargo hammerwork cron disable|enable <JOB_ID>` call them.
 
 ### Job Lifecycle
 

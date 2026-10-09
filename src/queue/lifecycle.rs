@@ -177,6 +177,9 @@ pub struct RecordedOutcome {
     /// Jobs failed as a consequence of this one failing: dependents that can no longer
     /// run, or the remaining jobs of a fail-fast workflow or batch.
     pub cancelled: Vec<JobId>,
+    /// Child jobs enqueued together with the completion, by
+    /// [`DatabaseQueue::complete_job_run_with_children`](super::DatabaseQueue::complete_job_run_with_children).
+    pub spawned: Vec<JobId>,
 }
 
 impl RecordedOutcome {
@@ -186,6 +189,7 @@ impl RecordedOutcome {
             next_run_at: None,
             unblocked: Vec::new(),
             cancelled: Vec::new(),
+            spawned: Vec::new(),
         }
     }
 }

@@ -310,11 +310,11 @@ on the failed job, directly or transitively, are marked `Failed` with
 `Job::depends_on` outside a workflow behave like `ContinueOnFailure`.
 
 `queue.fail_job_dependencies(job_id)` applies the same policy explicitly (and updates the
-workflow's counters and status), and returns the jobs it failed. On PostgreSQL and
-MySQL every terminal transition already applies it, so after one it finds nothing left
-to do. `TestQueue` applies the policies the same way, from `fail_job`, from a worker's
-`finish_job_run` and from `fail_job_dependencies`; its `mark_job_dead` and
-`mark_job_timed_out` only change the job's status.
+workflow's counters and status), and returns the jobs it failed. Every terminal
+transition (`fail_job`, `mark_job_dead`, `mark_job_timed_out`, a worker's
+`finish_job_run` and a stale job the reaper marks `Dead`) already applies it, so after
+one it finds nothing left to do. `TestQueue` applies the policies the same way as
+PostgreSQL and MySQL.
 
 ## Workflow Management
 

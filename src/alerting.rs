@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
+/// Timeout of a whole webhook or Slack alert request (connect, send and response).
+pub const ALERT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long an alert that could not be delivered to any target waits before it is
+/// tried again (at most the cooldown period), so a failing endpoint is not retried on
+/// every check.
+pub const FAILED_ALERT_RETRY_DELAY: Duration = Duration::from_secs(60);
+
 /// Configuration for alerting thresholds and targets
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertingConfig {
@@ -453,10 +461,31 @@ pub struct Alert {
 /// Type alias for last alerts storage
 type LastAlertsStorage = Arc<RwLock<HashMap<(String, AlertType), DateTime<Utc>>>>;
 
+/// The HTTP client for webhook and Slack alerts: every request is bounded by
+/// [`ALERT_HTTP_TIMEOUT`], so a hanging endpoint cannot stall the caller.
+#[cfg(feature = "alerting")]
+fn alert_http_client() -> reqwest::Client {
+    alert_http_client_with_timeout(ALERT_HTTP_TIMEOUT)
+}
+
+#[cfg(feature = "alerting")]
+fn alert_http_client_with_timeout(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout)
+        .build()
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to build the alert HTTP client with a timeout: {e}");
+            reqwest::Client::new()
+        })
+}
+
 /// Alert manager for monitoring thresholds and sending notifications
 pub struct AlertManager {
     config: AlertingConfig,
     last_alerts: LastAlertsStorage,
+    /// When each alert last failed to reach any target
+    failed_alerts: LastAlertsStorage,
     #[cfg(feature = "alerting")]
     http_client: reqwest::Client,
 }
@@ -474,8 +503,9 @@ impl AlertManager {
         Self {
             config,
             last_alerts: Arc::new(RwLock::new(HashMap::new())),
+            failed_alerts: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "alerting")]
-            http_client: reqwest::Client::new(),
+            http_client: alert_http_client(),
         }
     }
 
@@ -664,6 +694,19 @@ impl AlertManager {
                 }
             }
         }
+        // An alert that reached no target is retried after a shorter delay.
+        {
+            let failed_alerts = self.failed_alerts.read().await;
+            if let Some(failed_at) = failed_alerts.get(&alert_key) {
+                let retry_delay = chrono::Duration::from_std(
+                    FAILED_ALERT_RETRY_DELAY.min(self.config.cooldown_period),
+                )
+                .unwrap_or(chrono::Duration::MAX);
+                if Utc::now() - *failed_at < retry_delay {
+                    return Ok(());
+                }
+            }
+        }
 
         // Send alert to all targets
         let mut failures = Vec::new();
@@ -674,11 +717,18 @@ impl AlertManager {
             }
         }
 
-        // Start the cooldown only once some target was reached, so an alert that
-        // could not be delivered anywhere is tried again on the next check.
+        // Start the cooldown only once some target was reached. An alert that could not
+        // be delivered anywhere is tried again after FAILED_ALERT_RETRY_DELAY (or the
+        // cooldown, if shorter), not on every check.
         if failures.len() < self.config.targets.len() || self.config.targets.is_empty() {
+            self.failed_alerts.write().await.remove(&alert_key);
             let mut last_alerts = self.last_alerts.write().await;
             last_alerts.insert(alert_key, alert.timestamp);
+        } else {
+            self.failed_alerts
+                .write()
+                .await
+                .insert(alert_key, Utc::now());
         }
 
         if failures.is_empty() {
@@ -1660,9 +1710,50 @@ mod tests {
         let err = manager.check_queue_depth("q", 5).await.unwrap_err();
         assert!(err.to_string().contains("500"), "{err}");
         next_request(&mut requests).await;
-        // Not delivered anywhere, so the next check tries again.
+        assert!(manager.last_alerts.read().await.is_empty());
+        // Not delivered anywhere: the next check within the retry delay does not hit the
+        // failing endpoint again.
+        manager.check_queue_depth("q", 5).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), requests.recv())
+                .await
+                .is_err(),
+            "a failed alert was retried on the next check"
+        );
+
+        // With a cooldown shorter than the retry delay, the cooldown applies.
+        let manager = AlertManager::new(
+            AlertingConfig::new()
+                .alert_on_queue_depth(1)
+                .webhook(&url)
+                .with_cooldown(Duration::ZERO),
+        );
         assert!(manager.check_queue_depth("q", 5).await.is_err());
         next_request(&mut requests).await;
+        assert!(manager.check_queue_depth("q", 5).await.is_err());
+        next_request(&mut requests).await;
+    }
+
+    #[tokio::test]
+    async fn test_hanging_webhook_times_out() {
+        // Accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/alert", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                open.push(socket);
+            }
+        });
+        let mut manager =
+            AlertManager::new(AlertingConfig::new().alert_on_queue_depth(1).webhook(&url));
+        // The same client as ALERT_HTTP_TIMEOUT, with a timeout short enough for a test.
+        manager.http_client = alert_http_client_with_timeout(Duration::from_millis(200));
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), manager.check_queue_depth("q", 5))
+                .await
+                .expect("the alert request did not time out");
+        assert!(result.is_err());
     }
 
     #[tokio::test]

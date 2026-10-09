@@ -349,7 +349,7 @@ where
     // The worker running `a` loses its lease and its outcome is not recorded
     assert!(
         !queue
-            .heartbeat_job(a_id, Duration::from_secs(30))
+            .heartbeat_job(&run, Duration::from_secs(30))
             .await
             .unwrap()
     );
@@ -807,7 +807,7 @@ mod mysql_tests {
             Err(HammerworkError::InvalidJobPayload { .. })
         ));
         // A lease longer than the column can hold is capped, not an error
-        assert!(queue.heartbeat_job(id, Duration::MAX).await.unwrap());
+        assert!(queue.heartbeat_job(&run, Duration::MAX).await.unwrap());
         // A worker's retry far in the future is capped at the latest storable time
         queue
             .finish_job_run(

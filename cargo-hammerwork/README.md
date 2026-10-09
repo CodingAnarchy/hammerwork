@@ -187,8 +187,10 @@ cargo hammerwork job requeue-stale --older-than-secs 3600
 - `job purge` needs at least one of `--completed`, `--dead`, `--failed`, optionally
   narrowed with `--queue` and `--older-than-days`, plus `--confirm`.
 - `job requeue-stale` moves `Running` jobs whose lease has expired (their worker crashed
-  or was killed) back to `Pending`, or to `Dead` when they have no attempts left. Jobs
-  that never recorded a lease are reclaimed once they started more than
+  or was killed) back to `Pending`, or to `Dead` when they have no attempts left. Workers
+  take the lease when they claim a job, so a job whose worker is alive is never
+  reclaimed, whatever `--older-than-secs` is. Only jobs without a lease (claimed by an
+  older Hammerwork version) are reclaimed by age, once they started more than
   `--older-than-secs` ago (default 3600). It is safe to run alongside workers, and needs
   migration `015_add_job_leases`.
 - `job show` prints the redacted payload of an encrypted job (the CLI never decrypts)
@@ -299,7 +301,9 @@ cargo hammerwork cron delete <job-id> --confirm
 `cron create` requires `--queue`, `--payload` and `--schedule`. Cron expressions have a
 leading seconds field (six fields, e.g. `0 0 9 * * MON-FRI`). `cron next` shows 10
 executions unless `--count` is given. There is no `cron add` or `cron remove`; use
-`create` and `delete`.
+`create` and `delete`. `cron disable` holds the job's pending run until `cron enable`,
+which resumes it at the next occurrence of its schedule (also when its last run finished
+while it was disabled).
 
 ### Maintenance Commands
 

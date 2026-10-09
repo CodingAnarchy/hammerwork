@@ -46,10 +46,18 @@ use tracing::{debug, error, info, warn};
 /// Default time a worker waits for an in-flight job to finish after shutdown is requested.
 pub const DEFAULT_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
-/// Default lease a worker holds on a running job. The worker renews it every third of
-/// this period; if the worker dies, the job becomes eligible for
-/// [`DatabaseQueue::requeue_stale_jobs`] once the lease expires.
-pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(300);
+/// Default lease a worker holds on a running job. The lease is taken when the job is
+/// claimed and renewed every third of this period; if the worker dies, the job becomes
+/// eligible for [`DatabaseQueue::requeue_stale_jobs`] once the lease expires.
+pub const DEFAULT_LEASE_DURATION: Duration = crate::queue::DEFAULT_LEASE_DURATION;
+
+/// Default interval at which a worker's monitoring task updates its queue depth metric
+/// and checks its alert thresholds ([`Worker::with_monitoring_interval`]).
+pub const DEFAULT_MONITORING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Floor on the monitoring interval.
+#[cfg(any(feature = "metrics", feature = "alerting"))]
+const MIN_MONITORING_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Default interval at which a [`WorkerPool`] runs the stale job reaper.
 pub const DEFAULT_STALE_JOB_REAPER_INTERVAL: Duration = Duration::from_secs(60);
@@ -64,6 +72,10 @@ const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Floor on the error backoff so a zero poll interval can never cause a hot loop.
 const MIN_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Floor on the wait between polls of an idle worker, so a zero poll interval can never
+/// cause a hot loop.
+pub const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Floor on the heartbeat interval derived from the lease duration.
 const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
@@ -125,6 +137,17 @@ fn effective_attempt_limit(job_max_attempts: i32, worker_cap: Option<i32>) -> i3
     match worker_cap {
         Some(cap) => job_max_attempts.min(cap),
         None => job_max_attempts,
+    }
+}
+
+/// Aborts a background task when dropped, so it never outlives its owner.
+#[cfg(any(feature = "metrics", feature = "alerting"))]
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+#[cfg(any(feature = "metrics", feature = "alerting"))]
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -302,6 +325,11 @@ impl JobEventHooks {
 }
 
 /// Configuration for worker autoscaling behavior.
+///
+/// A [`WorkerPool`] does not autoscale until it is given a configuration with
+/// [`WorkerPool::with_autoscaling`]. [`AutoscaleConfig::default`] (and the presets) are
+/// enabled, so `with_autoscaling(AutoscaleConfig::default())` turns autoscaling on; see
+/// [`WorkerPool::with_autoscaling`] for which workers it starts and retires.
 #[derive(Debug, Clone)]
 pub struct AutoscaleConfig {
     /// Whether autoscaling is enabled
@@ -442,7 +470,8 @@ impl AutoscaleConfig {
 /// Metrics for autoscaling decisions
 #[derive(Debug, Clone, Default)]
 pub struct AutoscaleMetrics {
-    /// Current number of active workers
+    /// Current number of active workers: those of the autoscaled queue when
+    /// autoscaling is enabled, otherwise all of the pool's workers
     pub active_workers: usize,
     /// Average queue depth over evaluation window
     pub avg_queue_depth: f64,
@@ -470,10 +499,14 @@ type QueueDepthHistory = Arc<std::sync::RwLock<Vec<(chrono::DateTime<Utc>, u64)>
 
 /// What a [`WorkerPool`] supervisor needs to apply autoscaling decisions.
 struct Scaling<DB: Database> {
-    /// Cloned for every worker started by a scale-up
+    /// Cloned for every worker started by a scale-up. Only workers of its queue are
+    /// started or retired.
     template: Worker<DB>,
-    /// Desired number of workers, published by the autoscaling task
+    /// Desired number of workers on the template's queue, published by the
+    /// autoscaling task
     desired: watch::Receiver<usize>,
+    /// Workers on the template's queue when the pool started
+    initial: usize,
 }
 
 /// Wait for the next value on `rx`. Returns `None` once the sender is gone, and never
@@ -758,6 +791,8 @@ pub struct Worker<DB: Database> {
     shutdown_grace_period: Duration,
     /// Lease held on a running job, renewed by heartbeats
     lease_duration: Duration,
+    /// How often the monitoring task updates metrics and checks alerts
+    monitoring_interval: Duration,
 }
 
 impl<DB: Database + Send + Sync + 'static> Clone for Worker<DB>
@@ -793,6 +828,7 @@ where
             event_manager: self.event_manager.clone(),
             shutdown_grace_period: self.shutdown_grace_period,
             lease_duration: self.lease_duration,
+            monitoring_interval: self.monitoring_interval,
         }
     }
 }
@@ -805,8 +841,11 @@ where
     ///
     /// The worker will be created with:
     /// - 1 second polling interval
-    /// - 3 maximum retry attempts
+    /// - no cap on attempts: each job runs up to its own
+    ///   [`max_attempts`](crate::Job::with_max_attempts) (3 unless set); see
+    ///   [`with_max_retries`](Self::with_max_retries)
     /// - 30 second retry delay
+    /// - a [lease](Self::with_lease_duration) of [`DEFAULT_LEASE_DURATION`] (5 minutes)
     /// - No timeout, rate limiting, or priority configuration
     ///
     /// # Arguments
@@ -876,6 +915,7 @@ where
             event_manager: None,
             shutdown_grace_period: DEFAULT_SHUTDOWN_GRACE_PERIOD,
             lease_duration: DEFAULT_LEASE_DURATION,
+            monitoring_interval: DEFAULT_MONITORING_INTERVAL,
         }
     }
 
@@ -951,6 +991,7 @@ where
             event_manager: None,
             shutdown_grace_period: DEFAULT_SHUTDOWN_GRACE_PERIOD,
             lease_duration: DEFAULT_LEASE_DURATION,
+            monitoring_interval: DEFAULT_MONITORING_INTERVAL,
         }
     }
 
@@ -997,6 +1038,8 @@ where
     ///
     /// Shorter intervals result in lower latency but higher database load.
     /// Longer intervals reduce database load but increase job processing latency.
+    /// Intervals below [`MIN_POLL_INTERVAL`] (10ms), including zero, wait
+    /// [`MIN_POLL_INTERVAL`], so an idle worker never polls in a tight loop.
     ///
     /// # Arguments
     ///
@@ -1056,9 +1099,11 @@ where
     /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
-    /// // Critical jobs get more retry attempts
-    /// let critical_worker = Worker::new(queue, "critical".to_string(), handler)
-    ///     .with_max_retries(10);
+    /// // Expensive calls: never run a job more than twice on this worker, even if the
+    /// // job itself allows more attempts. To give jobs *more* attempts, raise their own
+    /// // limit with `Job::with_max_attempts`; this setting can only lower it.
+    /// let expensive_worker = Worker::new(queue, "expensive".to_string(), handler)
+    ///     .with_max_retries(2);
     /// # Ok(())
     /// # }
     /// ```
@@ -1143,6 +1188,8 @@ where
     ///
     /// Jobs that don't have their own timeout setting will use this default.
     /// Job-specific timeouts always take precedence over worker defaults.
+    /// `Duration::ZERO` means no default timeout (it would otherwise time every job
+    /// out before its handler ran).
     ///
     /// # Arguments
     ///
@@ -1203,17 +1250,38 @@ where
 
     /// Set the lease the worker holds on a running job.
     ///
-    /// While a handler runs, the worker records a heartbeat and extends the job's lease
-    /// every third of this duration (via [`DatabaseQueue::heartbeat_job`]). If the
-    /// worker process dies, the lease stops being renewed and
-    /// [`DatabaseQueue::requeue_stale_jobs`] reclaims the job once it expires. Shorter
-    /// leases recover crashed jobs faster at the cost of more heartbeat writes for
-    /// long-running jobs; jobs that finish within a third of the lease never write one.
+    /// The lease is taken in the same statement that claims the job
+    /// ([`DatabaseQueue::dequeue_leased`]). While the handler runs, the worker records a
+    /// heartbeat and extends the lease every third of this duration (via
+    /// [`DatabaseQueue::heartbeat_job`]). If the worker process dies, the lease stops
+    /// being renewed and [`DatabaseQueue::requeue_stale_jobs`] reclaims the job once it
+    /// expires; a reaper never reclaims a job whose lease is still valid, whatever its
+    /// own staleness window. Shorter leases recover crashed jobs faster at the cost of
+    /// more heartbeat writes for long-running jobs; jobs that finish within a third of
+    /// the lease never write one.
+    ///
+    /// `Duration::ZERO` takes a lease that never expires and sends no heartbeats: the
+    /// reaper never reclaims this worker's jobs, so if the worker dies an operator has
+    /// to re-run them (for example with `cargo hammerwork job retry`).
     ///
     /// Defaults to [`DEFAULT_LEASE_DURATION`] (5 minutes). Requires migration
     /// `015_add_job_leases`.
     pub fn with_lease_duration(mut self, lease: Duration) -> Self {
         self.lease_duration = lease;
+        self
+    }
+
+    /// Set how often the worker's monitoring task runs (default
+    /// [`DEFAULT_MONITORING_INTERVAL`], 30 seconds).
+    ///
+    /// With a [metrics collector](Self::with_metrics_collector) or alerting configured,
+    /// a background task updates the queue depth metric and checks the alert thresholds
+    /// (queue depth, worker starvation, and with a statistics collector the error rate
+    /// and processing time) at this interval. These checks never run in the job polling
+    /// loop, so a slow alert target or the queue depth `COUNT(*)` never delays
+    /// dequeuing. Values below 10ms are raised to 10ms.
+    pub fn with_monitoring_interval(mut self, interval: Duration) -> Self {
+        self.monitoring_interval = interval;
         self
     }
 
@@ -1674,9 +1742,11 @@ where
     pub async fn run(&self, mut shutdown_rx: mpsc::Receiver<()>) -> Result<()> {
         info!("Worker started for queue: {}", self.queue_name);
 
-        // Start background monitoring task for metrics and alerting
+        // Start background monitoring task for metrics and alerting. The guard aborts it
+        // however `run` ends: a normal return, an error, a panic, or this future being
+        // dropped (for example by a pool restarting the worker).
         #[cfg(any(feature = "metrics", feature = "alerting"))]
-        let monitoring_task = self.start_monitoring_task();
+        let _monitoring_task = AbortOnDrop(self.start_monitoring_task());
 
         let mut consecutive_errors: u32 = 0;
 
@@ -1746,10 +1816,6 @@ where
             }
         }
 
-        // Stop monitoring task
-        #[cfg(any(feature = "metrics", feature = "alerting"))]
-        monitoring_task.abort();
-
         Ok(())
     }
 
@@ -1817,19 +1883,14 @@ where
     /// paused, `Shutdown` when shutdown is requested during a wait, and `Err` when the
     /// dequeue itself fails. Database calls are never interrupted by shutdown.
     async fn acquire_job(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> Result<Acquired> {
-        // Check statistics and alert thresholds periodically
-        #[cfg(feature = "alerting")]
-        self.check_alert_thresholds().await;
+        // Alert checks and queue depth metrics run in the monitoring task
+        // (`start_monitoring_task`), never here: a slow alert endpoint or a COUNT(*) must
+        // not hold up dequeuing.
 
-        // Check rate limit before dequeuing jobs
-        if let Some(ref rate_limiter) = self.rate_limiter {
-            // Check if we can process a job (non-blocking)
-            if !rate_limiter.check() {
-                debug!(
-                    "Rate limit exceeded for queue: {}, waiting before retry",
-                    self.queue_name
-                );
-                // Wait for the rate limiter to allow processing
+        // Take a rate limit token before dequeuing. It is handed back when no job is
+        // claimed, so empty or paused polls never spend the budget.
+        let rate_token = match &self.rate_limiter {
+            Some(rate_limiter) => {
                 let permit = tokio::select! {
                     biased;
                     _ = shutdown_rx.recv() => return Ok(Acquired::Shutdown),
@@ -1839,49 +1900,18 @@ where
                     warn!("Rate limiter error: {}", e);
                     return Ok(self.idle_wait(shutdown_rx).await);
                 }
+                Some(rate_limiter)
             }
-        }
-
-        // Check if the queue is paused
-        match self.queue.is_queue_paused(&self.queue_name).await {
-            Ok(true) => {
-                debug!(
-                    "Queue '{}' is paused, skipping job dequeue",
-                    self.queue_name
-                );
-                return Ok(self.idle_wait(shutdown_rx).await);
-            }
-            Ok(false) => {
-                // Queue is not paused, continue with normal processing
-            }
-            Err(e) => {
-                warn!("Failed to check queue pause status: {}", e);
-                // Continue with normal processing if we can't check pause status
-            }
-        }
-
-        // Update queue depth metrics before dequeuing
-        #[cfg(feature = "metrics")]
-        if let Some(metrics_collector) = &self.metrics_collector
-            && let Ok(queue_depth) = self.queue.get_queue_depth(&self.queue_name).await
-            && let Err(e) = metrics_collector
-                .update_queue_depth(&self.queue_name, queue_depth)
-                .await
-        {
-            warn!("Failed to update queue depth metrics: {}", e);
-        }
-
-        let job = if let Some(ref weights) = self.priority_weights {
-            // Use priority-aware dequeuing
-            self.queue
-                .dequeue_with_priority_weights(&self.queue_name, weights)
-                .await?
-        } else {
-            // Use regular dequeuing
-            self.queue.dequeue(&self.queue_name).await?
+            None => None,
         };
+        let job = self.claim_job().await;
+        if !matches!(job, Ok(Some(_)))
+            && let Some(rate_limiter) = rate_token
+        {
+            rate_limiter.refund();
+        }
 
-        match job {
+        match job? {
             Some(job) => {
                 debug!(
                     "Processing job: {} with priority: {:?}",
@@ -1889,63 +1919,45 @@ where
                 );
                 Ok(Acquired::Job(Box::new(job)))
             }
-            None => {
-                // No jobs available, check for worker starvation
-                #[cfg(feature = "alerting")]
-                if let Some(alert_manager) = &self.alert_manager {
-                    let last_time_value = {
-                        if let Ok(last_time) = self.last_job_time.read() {
-                            Some(*last_time)
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(last_time_value) = last_time_value
-                        && let Err(e) = alert_manager
-                            .check_worker_starvation(&self.queue_name, last_time_value)
-                            .await
-                    {
-                        warn!("Failed to check worker starvation: {}", e);
-                    }
-                }
-
-                // Wait before polling again
-                Ok(self.idle_wait(shutdown_rx).await)
-            }
+            // No job available (or the queue is paused): wait before polling again.
+            None => Ok(self.idle_wait(shutdown_rx).await),
         }
     }
 
-    /// Sleep for the poll interval, returning early with `Shutdown` if shutdown is
-    /// requested meanwhile.
+    /// Claim the next job of this worker's queue, with this worker's lease.
+    async fn claim_job(&self) -> Result<Option<Job>> {
+        // Check if the queue is paused
+        match self.queue.is_queue_paused(&self.queue_name).await {
+            Ok(true) => {
+                debug!(
+                    "Queue '{}' is paused, skipping job dequeue",
+                    self.queue_name
+                );
+                return Ok(None);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // The dequeue checks the pause itself, so carry on.
+                warn!("Failed to check queue pause status: {}", e);
+            }
+        }
+
+        self.queue
+            .dequeue_leased(
+                &self.queue_name,
+                self.priority_weights.as_ref(),
+                self.lease_duration,
+            )
+            .await
+    }
+
+    /// Sleep for the poll interval (at least [`MIN_POLL_INTERVAL`]), returning early
+    /// with `Shutdown` if shutdown is requested meanwhile.
     async fn idle_wait(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> Acquired {
         tokio::select! {
             biased;
             _ = shutdown_rx.recv() => Acquired::Shutdown,
-            _ = sleep(self.poll_interval) => Acquired::Idle,
-        }
-    }
-
-    #[cfg(feature = "alerting")]
-    async fn check_alert_thresholds(&self) {
-        if let (Some(alert_manager), Some(stats_collector)) =
-            (&self.alert_manager, &self.stats_collector)
-        {
-            match stats_collector
-                .get_queue_statistics(&self.queue_name, Duration::from_secs(300))
-                .await
-            {
-                Ok(stats) => {
-                    if let Err(e) = alert_manager
-                        .check_thresholds(&self.queue_name, &stats)
-                        .await
-                    {
-                        warn!("Failed to check alert thresholds: {}", e);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to get queue statistics for alerting: {}", e);
-                }
-            }
+            _ = sleep(self.poll_interval.max(MIN_POLL_INTERVAL)) => Acquired::Idle,
         }
     }
 
@@ -1982,18 +1994,39 @@ where
         job: &Job,
         outcome: JobOutcome,
     ) -> Result<Option<RecordedOutcome>> {
+        self.record(job, outcome, None).await
+    }
+
+    /// Record the outcome of this run of `job`; with `children`, record its completion
+    /// and enqueue the children in one transaction
+    /// ([`DatabaseQueue::complete_job_run_with_children`]). See
+    /// [`record_outcome`](Self::record_outcome).
+    async fn record(
+        &self,
+        job: &Job,
+        outcome: JobOutcome,
+        children: Option<Vec<Job>>,
+    ) -> Result<Option<RecordedOutcome>> {
         // Record the outcome in a spawned task so that it always runs to commit or
         // rollback, even if this future is dropped (for example when the shutdown grace
         // period expires). Cancelling a database transaction mid-flight can leave its
         // connection in the pool with the transaction still open.
         let queue = Arc::clone(&self.queue);
         let finished_job = job.clone();
-        let recorded =
-            tokio::spawn(async move { queue.finish_job_run(&finished_job, outcome).await })
-                .await
-                .map_err(|e| HammerworkError::Worker {
-                    message: format!("recording the outcome of job {} failed: {e}", job.id),
-                })??;
+        let recorded = tokio::spawn(async move {
+            match children {
+                Some(children) => {
+                    queue
+                        .complete_job_run_with_children(&finished_job, children)
+                        .await
+                }
+                None => queue.finish_job_run(&finished_job, outcome).await,
+            }
+        })
+        .await
+        .map_err(|e| HammerworkError::Worker {
+            message: format!("recording the outcome of job {} failed: {e}", job.id),
+        })??;
         match recorded {
             Some(recorded) => {
                 if let Some(next_run_at) = recorded.next_run_at {
@@ -2078,8 +2111,11 @@ where
         // here.
         let spawn_parent = self.spawn_manager.is_some().then(|| handler_job.clone());
 
-        // Determine timeout duration (job-specific or default)
-        let timeout_duration = job.timeout.or(self.default_timeout);
+        // Determine timeout duration (job-specific or default). A zero worker default
+        // means no default (see `with_default_timeout`).
+        let timeout_duration = job
+            .timeout
+            .or(self.default_timeout.filter(|timeout| !timeout.is_zero()));
 
         // Ok(handler result), or Err(timeout) when the handler ran out of time.
         let handler_result = match timeout_duration {
@@ -2091,11 +2127,44 @@ where
 
         match handler_result {
             Ok(Ok(job_result)) => {
-                self.handle_success(&job, spawn_parent, job_result, start_time)
+                self.handle_success(&job, spawn_parent, job_result, start_time, attempts_left)
                     .await
             }
             Ok(Err(e)) => self.handle_failure(&job, e, attempts_left).await,
             Err(timeout) => self.handle_timeout(&job, timeout, attempts_left).await,
+        }
+    }
+
+    /// The child jobs `job` spawns, with their configuration, or `None` when it spawns
+    /// none (no spawn manager, no `_spawn_config`, or no handler for its queue).
+    ///
+    /// `spawn_parent` is the decrypted job: an encrypted job's stored payload does not
+    /// carry the spawn configuration. A malformed configuration or a failing spawn
+    /// handler is an error, which fails the run.
+    async fn prepare_spawn(
+        &self,
+        job: &Job,
+        spawn_parent: Option<&Job>,
+    ) -> Result<Option<(Vec<Job>, crate::spawn::SpawnConfig)>> {
+        let Some(spawn_manager) = &self.spawn_manager else {
+            return Ok(None);
+        };
+        let parent = spawn_parent.unwrap_or(job);
+        let Some(config) = crate::spawn::spawn_config_from_payload(&parent.payload)? else {
+            return Ok(None);
+        };
+        match spawn_manager
+            .prepare_spawn(parent, &config, self.queue.clone())
+            .await?
+        {
+            Some(children) => Ok(Some((children, config))),
+            None => {
+                debug!(
+                    "No spawn handler registered for job type: {}",
+                    job.queue_name
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -2105,6 +2174,7 @@ where
         spawn_parent: Option<Job>,
         job_result: JobResult,
         start_time: DateTime<Utc>,
+        attempts_left: bool,
     ) -> Result<()> {
         let job_id = job.id;
         debug!("Job {} completed successfully", job_id);
@@ -2132,14 +2202,55 @@ where
             }
         }
 
+        // Build the children the job spawns before completing it: they are enqueued in
+        // the transaction that completes the parent, and a spawn failure fails this run
+        // (so it is retried) instead of completing the parent without its children.
+        let spawn = match self.prepare_spawn(job, spawn_parent.as_ref()).await {
+            Ok(spawn) => spawn,
+            Err(e) => {
+                warn!("Failed to spawn child jobs for job {}: {}", job_id, e);
+                return self.handle_failure(job, e, attempts_left).await;
+            }
+        };
+        let (children, spawn_config) = match spawn {
+            Some((children, config)) => (Some(children), Some(config)),
+            None => (None, None),
+        };
+
         // Completing also reschedules a recurring job, and makes dependents whose
         // dependencies have all completed runnable, in the same transaction.
-        if self
-            .record_outcome(job, JobOutcome::Completed)
-            .await?
-            .is_none()
-        {
-            return Ok(());
+        let recorded = match self.record(job, JobOutcome::Completed, children).await {
+            Ok(Some(recorded)) => recorded,
+            Ok(None) => return Ok(()),
+            // Enqueueing a child failed, so nothing was written and the job is still
+            // Running this run: fail the run so it is retried.
+            Err(e) if spawn_config.is_some() => {
+                warn!("Failed to enqueue the child jobs of job {}: {}", job_id, e);
+                return self.handle_failure(job, e, attempts_left).await;
+            }
+            Err(e) => return Err(e),
+        };
+
+        if let (Some(config), Some(spawn_manager)) = (spawn_config, &self.spawn_manager) {
+            let spawn_result = crate::spawn::SpawnResult {
+                parent_job_id: job_id,
+                spawned_jobs: recorded.spawned.clone(),
+                spawned_at: Utc::now(),
+                spawn_operation_id: config.operation_id,
+            };
+            info!(
+                "Job {} spawned {} child jobs: {:?}",
+                job_id,
+                spawn_result.spawned_jobs.len(),
+                spawn_result.spawned_jobs
+            );
+            let parent = spawn_parent.as_ref().unwrap_or(job);
+            if let Err(e) = spawn_manager
+                .notify_spawn_complete(parent, &spawn_result)
+                .await
+            {
+                warn!("Spawn completion callback for job {} failed: {}", job_id, e);
+            }
         }
 
         // Update batch statistics for successful completion
@@ -2157,54 +2268,6 @@ where
                     "Failed to update batch status for batch {}: {}",
                     batch_id, e
                 );
-            }
-        }
-
-        // Handle job spawning if spawn manager is configured
-        if let Some(spawn_manager) = &self.spawn_manager {
-            // The parent handed to spawn handlers is the decrypted job, so encrypted jobs spawn
-            // like any other (their stored payload does not carry the configuration).
-            let parent = spawn_parent.as_ref().unwrap_or(job);
-            match crate::spawn::spawn_config_from_payload(&parent.payload) {
-                Ok(Some(spawn_config)) => {
-                    match spawn_manager
-                        .execute_spawn(parent.clone(), spawn_config, self.queue.clone())
-                        .await
-                    {
-                        Ok(Some(spawn_result)) => {
-                            info!(
-                                "Job {} spawned {} child jobs: {:?}",
-                                job_id,
-                                spawn_result.spawned_jobs.len(),
-                                spawn_result.spawned_jobs
-                            );
-
-                            // Call spawn completion hook if present
-                            if let Some(ref hook) = self.event_hooks.on_job_complete {
-                                let hook_event = JobHookEvent {
-                                    job: job.clone(),
-                                    timestamp: Utc::now(),
-                                    duration: Some(Duration::from_millis(processing_time_ms)),
-                                    error: None,
-                                };
-                                hook(hook_event);
-                            }
-                        }
-                        Ok(None) => {
-                            debug!(
-                                "No spawn handler registered for job type: {}",
-                                job.queue_name
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Failed to spawn child jobs for job {}: {}", job_id, e);
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!("Not spawning children for job {}: {}", job_id, e);
-                }
             }
         }
 
@@ -2448,6 +2511,12 @@ where
     /// renewed in the background.
     async fn execute_handler(&self, job: Job) -> Result<JobResult> {
         let job_id = job.id;
+        // The run whose lease is renewed: the job as dequeued (same id, attempts and
+        // started_at), without its payload.
+        let run = Job {
+            payload: serde_json::Value::Null,
+            ..job.clone()
+        };
         let handler_future =
             match std::panic::catch_unwind(AssertUnwindSafe(|| self.start_handler(job))) {
                 Ok(future) => future,
@@ -2467,7 +2536,7 @@ where
                 error!("Handler for job {} panicked", job_id);
                 Err(handler_panic_error(payload.as_ref()))
             }),
-            () = self.maintain_lease(job_id) => Err(HammerworkError::Worker {
+            () = self.maintain_lease(&run) => Err(HammerworkError::Worker {
                 message: "job lease heartbeat stopped unexpectedly".to_string(),
             }),
         }
@@ -2477,19 +2546,20 @@ where
     ///
     /// Heartbeats every third of the lease duration; the first one is sent after that
     /// interval, so short jobs never pay for a heartbeat write. Never completes.
-    async fn maintain_lease(&self, job_id: crate::job::JobId) {
+    async fn maintain_lease(&self, run: &Job) {
+        let job_id = run.id;
         if self.lease_duration.is_zero() {
             return std::future::pending().await;
         }
         let interval = (self.lease_duration / 3).max(MIN_HEARTBEAT_INTERVAL);
         loop {
             sleep(interval).await;
-            match self.queue.heartbeat_job(job_id, self.lease_duration).await {
+            match self.queue.heartbeat_job(run, self.lease_duration).await {
                 Ok(true) => debug!("Renewed lease on job {}", job_id),
                 Ok(false) => {
                     warn!(
-                        "Lost the lease on job {}: it is no longer Running (it may have been \
-                         reclaimed as stale); the handler keeps running",
+                        "Lost the lease on job {}: it is no longer Running this run (it may \
+                         have been reclaimed as stale); the handler keeps running",
                         job_id
                     );
                     return std::future::pending().await;
@@ -2668,6 +2738,7 @@ where
     #[cfg(any(feature = "metrics", feature = "alerting"))]
     fn start_monitoring_task(&self) -> tokio::task::JoinHandle<()> {
         let queue_name = self.queue_name.clone();
+        let monitoring_interval = self.monitoring_interval;
 
         let queue = Arc::clone(&self.queue);
 
@@ -2684,7 +2755,9 @@ where
         let stats_collector = self.stats_collector.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30)); // Monitor every 30 seconds
+            // `interval` panics on a zero period.
+            let mut interval =
+                tokio::time::interval(monitoring_interval.max(MIN_MONITORING_INTERVAL));
 
             loop {
                 interval.tick().await;
@@ -2820,6 +2893,8 @@ impl<DB: Database + Send + Sync + 'static> WorkerPool<DB>
 where
     JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync,
 {
+    /// Create an empty pool. Autoscaling is off; enable it with
+    /// [`with_autoscaling`](Self::with_autoscaling).
     pub fn new() -> Self {
         Self {
             workers: Vec::new(),
@@ -2830,7 +2905,7 @@ where
             encrypted_job_purge_interval: None,
             stats_collector: None,
             worker_template: None,
-            autoscale_config: AutoscaleConfig::default(),
+            autoscale_config: AutoscaleConfig::disabled(),
             autoscale_metrics: Arc::new(std::sync::RwLock::new(AutoscaleMetrics::default())),
             queue_depth_history: Arc::new(std::sync::RwLock::new(Vec::new())),
             autoscale_task: None,
@@ -2864,6 +2939,7 @@ where
         config: &crate::config::HammerworkConfig,
     ) -> Result<Self> {
         config.encryption.validate()?;
+        config.worker.validate()?;
         let mut pool = Self::from_config(worker, &config.worker);
         pool.encrypted_job_purge_interval = config.encryption.purge_interval();
         Ok(pool)
@@ -2874,7 +2950,16 @@ where
         self
     }
 
-    /// Configure autoscaling for the worker pool
+    /// Configure autoscaling for the worker pool.
+    ///
+    /// Autoscaling is off unless enabled here (or by
+    /// [`from_config`](Self::from_config) with `autoscaling_enabled`). It scales one
+    /// queue: that of the [worker template](Self::with_worker_template), or of the first
+    /// worker added when no template is set. It measures that queue's depth, starts
+    /// clones of the template while it is deep and retires workers of that queue (never
+    /// below `min_workers`) once it drains. Workers of other queues are never started
+    /// or retired. A retired worker stops like on shutdown: it finishes its in-flight
+    /// job within its [shutdown grace period](Worker::with_shutdown_grace_period).
     pub fn with_autoscaling(mut self, config: AutoscaleConfig) -> Self {
         self.autoscale_config = config;
         self
@@ -2891,12 +2976,15 @@ where
     /// Every `interval` the pool calls
     /// [`DatabaseQueue::requeue_stale_jobs`]`(older_than)`, which moves `Running` jobs
     /// whose lease expired back to `Pending` (or to `Dead` when they have no attempts
-    /// left). `older_than` only applies to jobs that never recorded a lease; by default
-    /// it is the longest [lease duration](Worker::with_lease_duration) of the pool's
-    /// workers. The reaper is enabled by default with a 60 second interval.
+    /// left). Workers take their lease when they claim a job, so a job whose worker is
+    /// alive is never reclaimed, whatever this pool's settings or those of other pools.
+    /// `older_than` only applies to running jobs without a lease of their own (claimed
+    /// by an older Hammerwork version); by default it is the longest
+    /// [lease duration](Worker::with_lease_duration) of the pool's workers. The reaper
+    /// is enabled by default with a 60 second interval.
     ///
     /// Requires migration `015_add_job_leases`. Running reapers in several pools or
-    /// processes at once is safe.
+    /// processes at once, with different settings, is safe.
     pub fn with_stale_job_reaper(mut self, interval: Duration, older_than: Duration) -> Self {
         self.reaper_interval = Some(interval);
         self.reaper_older_than = Some(older_than);
@@ -2944,7 +3032,8 @@ where
             worker.stats_collector = Some(Arc::clone(stats_collector));
         }
 
-        // If no worker template is set and autoscaling is enabled, use the first worker as template
+        // If no worker template is set and autoscaling is enabled, use the first worker
+        // as template (`start` also falls back to the first worker).
         if self.worker_template.is_none()
             && self.autoscale_config.enabled
             && self.workers.is_empty()
@@ -2964,11 +3053,6 @@ where
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting worker pool with {} workers", self.workers.len());
 
-        // Update initial worker count metrics
-        if let Ok(mut metrics) = self.autoscale_metrics.write() {
-            metrics.active_workers = self.workers.len();
-        }
-
         let (signal_tx, signal_rx) = watch::channel(false);
         let (done_tx, done_rx) = watch::channel(false);
         self.shutdown_signal = Some(signal_tx);
@@ -2983,13 +3067,20 @@ where
         .flatten()
         .collect();
 
-        // Start autoscaling task if enabled. It publishes the desired worker count, which
-        // the supervisor applies by starting workers from the template or retiring them.
+        // Start autoscaling task if enabled. It publishes the desired number of workers
+        // on the template's queue, which the supervisor applies by starting workers from
+        // the template or retiring workers of that queue.
         let scaling = if self.autoscale_config.enabled {
-            self.start_autoscaling_task(workers.len())
+            self.start_autoscaling_task(&workers)
         } else {
             None
         };
+        if let Ok(mut metrics) = self.autoscale_metrics.write() {
+            metrics.active_workers = match &scaling {
+                Some(scaling) => scaling.initial,
+                None => workers.len(),
+            };
+        }
 
         let supervisor = tokio::spawn(Self::supervise(
             workers,
@@ -3076,7 +3167,11 @@ where
                         desired_rx = None;
                         continue;
                     };
-                    let active: Vec<usize> = (0..senders.len()).filter(|i| !retired[*i]).collect();
+                    // Only the template's queue is scaled: workers of other queues are
+                    // never retired, and new workers are clones of the template.
+                    let active: Vec<usize> = (0..senders.len())
+                        .filter(|i| !retired[*i] && templates[*i].queue_name == template.queue_name)
+                        .collect();
                     if desired > active.len() {
                         for _ in active.len()..desired {
                             let worker = template.clone();
@@ -3095,14 +3190,20 @@ where
                                 finished[index] = false;
                             }
                         }
-                        info!("Autoscaling: started workers, now {}", desired);
+                        info!(
+                            "Autoscaling: started workers for queue {}, now {}",
+                            template.queue_name, desired
+                        );
                     } else {
                         for index in active.iter().rev().take(active.len() - desired) {
                             retired[*index] = true;
                             let _ = senders[*index].try_send(());
                         }
                         if desired < active.len() {
-                            info!("Autoscaling: retiring workers, now {}", desired);
+                            info!(
+                                "Autoscaling: retiring workers of queue {}, now {}",
+                                template.queue_name, desired
+                            );
                         }
                     }
                 }
@@ -3222,12 +3323,17 @@ where
     ///
     /// Returns the worker template and a channel carrying the desired worker count,
     /// which the supervisor applies, or `None` when there is no worker template.
-    fn start_autoscaling_task(&mut self, initial_workers: usize) -> Option<Scaling<DB>> {
-        let Some(worker_template) = &self.worker_template else {
+    fn start_autoscaling_task(&mut self, workers: &[Worker<DB>]) -> Option<Scaling<DB>> {
+        // Without an explicit template, scale the first worker's queue.
+        let Some(worker_template) = self.worker_template.as_ref().or(workers.first()) else {
             warn!("Cannot start autoscaling: no worker template available");
             return None;
         };
         let mut template = worker_template.clone();
+        let initial_workers = workers
+            .iter()
+            .filter(|worker| worker.queue_name == template.queue_name)
+            .count();
         if let Some(stats_collector) = &self.stats_collector {
             template.stats_collector = Some(Arc::clone(stats_collector));
         }
@@ -3252,6 +3358,7 @@ where
         Some(Scaling {
             template,
             desired: desired_rx,
+            initial: initial_workers,
         })
     }
 
@@ -3661,9 +3768,9 @@ mod tests {
         assert!(rate_limiter.try_acquire());
         assert!(rate_limiter.try_acquire());
 
-        // Check remaining tokens
+        // Check remaining tokens (refill is continuous, so a little has come back)
         let remaining_tokens = rate_limiter.available_tokens();
-        assert_eq!(remaining_tokens, 8.0);
+        assert!((8.0..8.5).contains(&remaining_tokens), "{remaining_tokens}");
     }
 
     #[test]
@@ -4501,6 +4608,12 @@ mod tests {
         let mut pool = WorkerPool::new().without_autoscaling();
         pool.add_worker(lazy_worker("s"));
         assert!(pool.worker_template.is_none());
+
+        // #64 H9: a plain pool does not autoscale.
+        let mut pool = WorkerPool::new();
+        assert!(!pool.autoscale_config.enabled);
+        pool.add_worker(lazy_worker("s"));
+        assert!(pool.worker_template.is_none());
     }
 
     #[cfg(all(feature = "postgres", feature = "webhooks"))]
@@ -4551,5 +4664,57 @@ mod tests {
             assert_eq!(error.message, "bad");
             assert_eq!(error.error_type.as_deref(), error_type);
         }
+    }
+
+    /// #64 M10: the monitoring task stops however the worker's `run` ends, including
+    /// when its future is dropped or aborted (as a pool does when a worker panics).
+    #[cfg(all(feature = "postgres", feature = "metrics"))]
+    #[tokio::test]
+    async fn monitoring_task_stops_when_run_is_dropped() {
+        let metrics = Arc::new(
+            PrometheusMetricsCollector::new(crate::metrics::MetricsConfig::default()).unwrap(),
+        );
+        let worker = lazy_worker("monitor")
+            .with_metrics_collector(Arc::clone(&metrics))
+            .with_poll_interval(Duration::from_millis(10));
+        // This test and the worker.
+        assert_eq!(Arc::strong_count(&metrics), 2);
+        let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let run = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+        // The monitoring task holds its own handle on the collector once it runs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&metrics) < 3 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(Arc::strong_count(&metrics), 3);
+
+        run.abort();
+        let _ = run.await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&metrics) > 1 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&metrics),
+            1,
+            "the monitoring task outlived the worker"
+        );
+    }
+
+    /// #64 M5: a zero poll interval waits at least MIN_POLL_INTERVAL between polls.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn zero_poll_interval_does_not_hot_loop() {
+        let worker = lazy_worker("idle").with_poll_interval(Duration::ZERO);
+        let (_shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(matches!(
+                worker.idle_wait(&mut shutdown_rx).await,
+                Acquired::Idle
+            ));
+        }
+        assert!(started.elapsed() >= MIN_POLL_INTERVAL * 5);
     }
 }

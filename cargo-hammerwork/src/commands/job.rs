@@ -153,9 +153,12 @@ pub enum JobCommand {
     #[command(
         about = "Reclaim jobs stuck in Running after a worker crashed",
         long_about = "Reclaim jobs left in Running by workers that crashed or were killed.\n\n\
-            A Running job is stale when its lease (renewed by worker heartbeats) has \
-            expired, or, if it never recorded a lease, when it started more than \
-            --older-than-secs ago. Stale jobs with attempts left go back to Pending; \
+            A Running job is stale when its lease has expired. Workers take the lease \
+            when they claim a job and renew it with heartbeats, so a job whose worker \
+            is alive is never reclaimed, whatever --older-than-secs is. Only a job \
+            without a lease (claimed by an older Hammerwork version) is reclaimed by \
+            age, when it started more than --older-than-secs ago. Stale jobs with \
+            attempts left go back to Pending; \
             the rest are marked Dead. Safe to run while workers and other reapers are \
             running. Requires migration 015_add_job_leases.\n\n\
             Example: cargo hammerwork job requeue-stale --older-than-secs 3600"
@@ -166,7 +169,7 @@ pub enum JobCommand {
         #[arg(
             long,
             default_value_t = 3600,
-            help = "For jobs without a lease: reclaim if started more than N seconds ago"
+            help = "For jobs without a lease (claimed by older versions): reclaim if started more than N seconds ago"
         )]
         older_than_secs: u64,
     },

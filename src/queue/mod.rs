@@ -71,6 +71,9 @@ pub trait DatabaseQueue: Send + Sync {
     /// Claim the next runnable job of `queue_name`: `Pending`, due (by the database
     /// clock), not waiting on dependencies, highest priority first, then oldest.
     /// Returns `None` when there is none or the queue is paused.
+    ///
+    /// The claim holds a lease of [`DEFAULT_LEASE_DURATION`] (see
+    /// [`dequeue_leased`](Self::dequeue_leased)).
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>>;
 
     /// Like [`dequeue`](Self::dequeue), but picks the priority level by weight among
@@ -83,6 +86,38 @@ pub trait DatabaseQueue: Send + Sync {
         queue_name: &str,
         weights: &crate::priority::PriorityWeights,
     ) -> Result<Option<Job>>;
+
+    /// Claim the next runnable job of `queue_name` and hold a lease on it until
+    /// `now + lease` (by the database clock).
+    ///
+    /// Picks the job like
+    /// [`dequeue_with_priority_weights`](Self::dequeue_with_priority_weights) when
+    /// `weights` is given, otherwise like [`dequeue`](Self::dequeue). The lease
+    /// (`lease_expires_at`, with `last_heartbeat_at`) is written by the statement that
+    /// claims the job, so a claimed job is never without a lease:
+    /// [`requeue_stale_jobs`](Self::requeue_stale_jobs) leaves it alone until the lease
+    /// expires, and the worker extends it with [`heartbeat_job`](Self::heartbeat_job).
+    ///
+    /// A zero `lease` never expires: the reaper never reclaims the job, even if its
+    /// worker dies, so an operator has to (see
+    /// [`Worker::with_lease_duration`](crate::worker::Worker::with_lease_duration)).
+    ///
+    /// The default implementation ignores `lease`, for backends that predate leases.
+    async fn dequeue_leased(
+        &self,
+        queue_name: &str,
+        weights: Option<&crate::priority::PriorityWeights>,
+        lease: std::time::Duration,
+    ) -> Result<Option<Job>> {
+        let _ = lease;
+        match weights {
+            Some(weights) => {
+                self.dequeue_with_priority_weights(queue_name, weights)
+                    .await
+            }
+            None => self.dequeue(queue_name).await,
+        }
+    }
 
     /// Manually mark a job `Completed`.
     ///
@@ -210,10 +245,27 @@ pub trait DatabaseQueue: Send + Sync {
     /// Get all recurring jobs for a queue
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>>;
 
-    /// Disable a recurring job (stop future executions)
+    /// Disable a recurring job: it does not run again until it is enabled.
+    ///
+    /// Clears `recurring` and `next_run_at`. A pending occurrence that has not started
+    /// stays `Pending` but is held: a job with a cron schedule is only dequeued while
+    /// it is recurring. A run already in progress finishes, and is then not
+    /// rescheduled. Disabling a disabled job does nothing.
+    ///
+    /// Fails with `JobNotFound` for a missing job, and with a queue error for a job
+    /// without a cron schedule.
     async fn disable_recurring_job(&self, job_id: JobId) -> Result<()>;
 
-    /// Enable a previously disabled recurring job
+    /// Enable a recurring job again: it resumes at the next occurrence of its schedule.
+    ///
+    /// Sets `recurring` and, unless the job is `Running` (that run's outcome
+    /// reschedules it), schedules it for the next occurrence after now: `Pending` at
+    /// `next_run_at`, attempts reset. This revives a job whose last run finished while
+    /// it was disabled (`Completed`, `Failed`, `Dead` or `TimedOut`) as well as a held
+    /// pending occurrence. Occurrences missed while it was disabled are not run.
+    ///
+    /// Fails with `JobNotFound` for a missing (or archived) job, and with a queue error
+    /// for a job without a valid cron schedule.
     async fn enable_recurring_job(&self, job_id: JobId) -> Result<()>;
 
     // Throttling configuration
@@ -382,7 +434,7 @@ pub trait DatabaseQueue: Send + Sync {
     /// counters and status are updated in the same transaction.
     ///
     /// Terminal transitions ([`fail_job`](Self::fail_job),
-    /// [`finish_job_run`](Self::finish_job_run) and, on the database backends,
+    /// [`finish_job_run`](Self::finish_job_run),
     /// [`mark_job_dead`](Self::mark_job_dead) and
     /// [`mark_job_timed_out`](Self::mark_job_timed_out)) already apply the policy, so
     /// calling this afterwards changes nothing and returns an empty list.
@@ -775,20 +827,65 @@ pub trait DatabaseQueue: Send + Sync {
         Ok(Some(recorded))
     }
 
+    /// Record that a run completed and enqueue the child jobs it spawned, as one unit.
+    ///
+    /// Like [`finish_job_run`](Self::finish_job_run) with
+    /// [`JobOutcome::Completed`], and in the same transaction every job of `children` is
+    /// enqueued (encrypted first when it or its queue requires it, like
+    /// [`enqueue`](Self::enqueue)). Either the parent is completed and all its children
+    /// exist, or nothing is written: if enqueueing a child fails the parent stays
+    /// `Running` this run and the caller can fail the run so it is retried. Returns
+    /// `Ok(None)`, and enqueues nothing, when the job is no longer `Running` this run.
+    /// The ids of the enqueued children are in [`RecordedOutcome::spawned`].
+    ///
+    /// Workers call this for jobs whose [`SpawnManager`](crate::spawn::SpawnManager)
+    /// handler produced children.
+    ///
+    /// The default implementation, for backends without transactions, enqueues the
+    /// children first and then records the completion, so a failure part-way leaves the
+    /// parent `Running` (to be retried) rather than completed without its children; a
+    /// retry may then enqueue the children again.
+    async fn complete_job_run_with_children(
+        &self,
+        run: &Job,
+        children: Vec<Job>,
+    ) -> Result<Option<RecordedOutcome>> {
+        let Some(current) = self.get_job(run.id).await? else {
+            return Ok(None);
+        };
+        if !lifecycle::Guard::Run(run).admits(&current) {
+            return Ok(None);
+        }
+        let mut spawned = Vec::with_capacity(children.len());
+        for child in children {
+            spawned.push(self.enqueue(child).await?);
+        }
+        let recorded = self.finish_job_run(run, JobOutcome::Completed).await?;
+        Ok(recorded.map(|mut recorded| {
+            recorded.spawned = spawned;
+            recorded
+        }))
+    }
+
     // Lease / stale job recovery
 
-    /// Record a heartbeat for a `Running` job and extend its lease to `now + lease`.
+    /// Record a heartbeat for a run of a `Running` job and extend its lease to
+    /// `now + lease` (a zero `lease` never expires, as in
+    /// [`dequeue_leased`](Self::dequeue_leased)).
     ///
-    /// Workers call this periodically while a handler runs. The lease tells
-    /// [`requeue_stale_jobs`](Self::requeue_stale_jobs) that the job is still owned by a
-    /// live worker.
+    /// `run` is the job as returned by the dequeue. Workers call this periodically while
+    /// a handler runs. The lease tells [`requeue_stale_jobs`](Self::requeue_stale_jobs)
+    /// that the job is still owned by a live worker.
     ///
-    /// Returns `false` when the job is no longer `Running` (for example because a reaper
-    /// already reclaimed it), which means the caller has lost its lease.
+    /// Only the run that was dequeued is extended (same `attempts` and `started_at`, as
+    /// in [`finish_job_run`](Self::finish_job_run)). Returns `false` when the job is no
+    /// longer `Running` that run, for example because a reaper reclaimed it and another
+    /// worker is running it again: the caller has lost its lease, and its heartbeat does
+    /// not extend the new run's lease.
     ///
     /// The default implementation returns an error, for backends that predate leases.
-    async fn heartbeat_job(&self, job_id: JobId, lease: std::time::Duration) -> Result<bool> {
-        let _ = (job_id, lease);
+    async fn heartbeat_job(&self, run: &Job, lease: std::time::Duration) -> Result<bool> {
+        let _ = (run, lease);
         Err(crate::HammerworkError::Queue {
             message: "job leases are not supported by this queue backend".to_string(),
         })
@@ -797,19 +894,22 @@ pub trait DatabaseQueue: Send + Sync {
     /// Reclaim jobs left in `Running` by workers that crashed or were killed.
     ///
     /// A `Running` job is stale when:
-    /// - it has a lease from its current run (a heartbeat recorded after `started_at`)
-    ///   and that lease has expired, or
-    /// - it has no lease from its current run (it has not heartbeated yet, or was
-    ///   started by a worker that predates leases) and it started more than
-    ///   `older_than` ago.
+    /// - it has a lease from its current run and that lease has expired. Every job
+    ///   claimed by [`dequeue`](Self::dequeue) or [`dequeue_leased`](Self::dequeue_leased)
+    ///   holds a lease from the moment it is claimed, so it is reclaimed only once its
+    ///   worker stopped renewing it, whatever `older_than` is; or
+    /// - it has no lease from its current run, because it was claimed by an older
+    ///   Hammerwork version that did not write one at claim time, and it started more
+    ///   than `older_than` ago. Choose `older_than` longer than such jobs run.
     ///
     /// Stale jobs whose `attempts` have reached `max_attempts` are moved to `Dead`;
     /// the others go back to `Pending` and are scheduled immediately. The interrupted
     /// run already counted as an attempt when the job was dequeued.
     ///
-    /// Safe to call from several processes at once: rows are claimed with row locks
-    /// (`FOR UPDATE SKIP LOCKED`) and only updated while still `Running`, so each stale
-    /// job is reclaimed exactly once.
+    /// Safe to call from several pools or processes at once, with different
+    /// `older_than` values: rows are claimed with row locks (`FOR UPDATE SKIP LOCKED`)
+    /// and only updated while still `Running`, so each stale job is reclaimed exactly
+    /// once, and a job whose lease is still valid is never reclaimed.
     ///
     /// # Examples
     ///
@@ -995,6 +1095,69 @@ pub(crate) fn prepare_cron_job(mut job: Job) -> Result<Job> {
         }
     }
     Ok(job)
+}
+
+/// When to schedule recurring job `job`, being enabled at `now`: `None` when it is
+/// `Running` (its run's outcome reschedules it), otherwise the next occurrence of its
+/// schedule after `now`. Fails for a job without a valid cron schedule.
+#[cfg_attr(
+    not(any(feature = "postgres", feature = "mysql", feature = "test")),
+    allow(dead_code)
+)]
+pub(crate) fn enabled_recurring_next_run(
+    job: &Job,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>> {
+    let schedule = match job.get_cron_schedule() {
+        Some(Ok(schedule)) => schedule,
+        Some(Err(e)) => {
+            return Err(crate::HammerworkError::Queue {
+                message: format!(
+                    "job {} has an invalid cron schedule {:?}: {e}",
+                    job.id, job.cron_schedule
+                ),
+            });
+        }
+        None => return Err(not_a_cron_job(job.id)),
+    };
+    if job.status == crate::job::JobStatus::Running {
+        return Ok(None);
+    }
+    schedule
+        .next_execution(now)
+        .map(Some)
+        .ok_or_else(|| crate::HammerworkError::Queue {
+            message: format!("the cron schedule of job {} has no next occurrence", job.id),
+        })
+}
+
+/// Why `disable_recurring_job` changed no row: fine for a job that is already
+/// disabled, an error for a missing (or archived) job or one without a cron schedule.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn disable_recurring_job_not_applied(job: Option<Job>, job_id: JobId) -> Result<()> {
+    match job {
+        Some(job) if job.status == crate::job::JobStatus::Archived => {
+            Err(crate::HammerworkError::JobNotFound {
+                id: job_id.to_string(),
+            })
+        }
+        Some(job) if job.cron_schedule.is_some() => Ok(()),
+        Some(_) => Err(not_a_cron_job(job_id)),
+        None => Err(crate::HammerworkError::JobNotFound {
+            id: job_id.to_string(),
+        }),
+    }
+}
+
+/// The error for a recurring job operation on a job without a cron schedule.
+#[cfg_attr(
+    not(any(feature = "postgres", feature = "mysql", feature = "test")),
+    allow(dead_code)
+)]
+pub(crate) fn not_a_cron_job(job_id: JobId) -> crate::HammerworkError {
+    crate::HammerworkError::Queue {
+        message: format!("job {job_id} has no cron schedule, so it is not a recurring job"),
+    }
 }
 
 /// A [`RetryStrategy::Custom`](crate::retry::RetryStrategy::Custom) holds a closure and
@@ -1223,6 +1386,37 @@ pub(crate) fn weighted_seed(queue_name: &str, attempt: usize) -> u64 {
         .hash(&mut hasher);
     std::thread::current().id().hash(&mut hasher);
     hasher.finish()
+}
+
+/// The lease a claim holds when the caller does not choose one:
+/// [`DatabaseQueue::dequeue`] and [`DatabaseQueue::dequeue_with_priority_weights`], and
+/// workers by default
+/// ([`Worker::with_lease_duration`](crate::worker::Worker::with_lease_duration)).
+pub const DEFAULT_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The lease interval written for `lease`: a zero lease never expires (it is clamped to
+/// the longest interval, like any lease longer than that).
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn lease_interval(lease: std::time::Duration) -> chrono::Duration {
+    if lease.is_zero() {
+        clamp_interval(std::time::Duration::MAX)
+    } else {
+        clamp_interval(lease)
+    }
+}
+
+/// The range a stored `started_at` must fall in for the row to be the run `run` was
+/// dequeued as (see [`lifecycle::is_same_run`]): within 1ms either way, because the
+/// backends store microseconds while `Job` carries nanoseconds. `None` when `run` has
+/// no start time.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn run_started_range(run: &Job) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let started = run.started_at?;
+    let tolerance = chrono::Duration::milliseconds(1);
+    Some((
+        started.checked_sub_signed(tolerance).unwrap_or(started),
+        started.checked_add_signed(tolerance).unwrap_or(started),
+    ))
 }
 
 /// The longest lease or staleness window passed to the database as an interval;
