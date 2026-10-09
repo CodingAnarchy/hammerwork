@@ -264,7 +264,7 @@ jobs:
     env:
       PG_URL: postgres://postgres:password@localhost:5432/hammerwork_test
       MY_URL: mysql://root:password@127.0.0.1:3306/hammerwork_test
-      COVERAGE_FLOOR: "70"
+      COVERAGE_FLOOR: "90"
       COVERAGE_IGNORE: "(/tests/|/examples/|/integrations/)"
     steps:
       - uses: actions/checkout@v5
@@ -317,8 +317,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      # Cargo.lock is not committed (library crate), so resolve one for the audit.
-      - run: cargo generate-lockfile
+      # Audits the committed Cargo.lock (the versions this repository builds and tests).
       # Fails the job on any unignored vulnerability. Ignores (with justification)
       # live in .cargo/audit.toml, which cargo-audit reads from the workspace root.
       # v2.0.0 is the latest release and still declares node20 (GitHub runs it on
