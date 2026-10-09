@@ -82,6 +82,24 @@ pub struct MigrationRecord {
 /// Migration runner trait for database-specific implementations
 #[async_trait::async_trait]
 pub trait MigrationRunner<DB: Database> {
+    /// Take the lock that serializes migration runs on the database, waiting while
+    /// another process holds it. [`MigrationManager::run_migrations`] holds it for the
+    /// whole run and releases it with
+    /// [`release_migration_lock`](Self::release_migration_lock).
+    ///
+    /// The built-in runners use a session lock (`pg_advisory_lock` on PostgreSQL,
+    /// `GET_LOCK` on MySQL) on a dedicated connection that also runs every statement
+    /// of the run; if the run is abandoned the connection is closed, which releases
+    /// the lock. The default implementation takes no lock.
+    async fn acquire_migration_lock(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Release the lock taken by [`acquire_migration_lock`](Self::acquire_migration_lock).
+    async fn release_migration_lock(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Run a specific migration SQL for this database type
     async fn run_migration(&self, migration: &Migration, sql: &str) -> Result<()>;
 
@@ -128,10 +146,32 @@ impl<DB: Database> MigrationManager<DB> {
             .insert(migration.id.clone(), (migration, postgres_sql, mysql_sql));
     }
 
-    /// Run all pending migrations
+    /// Run all pending migrations.
+    ///
+    /// Safe to call from several processes at once (for example every replica of a
+    /// service starting with `auto_migrate`, or the CLI while the application starts):
+    /// the run holds the runner's migration lock
+    /// ([`MigrationRunner::acquire_migration_lock`]) from before it reads which
+    /// migrations were applied until the last one is recorded, so concurrent runs wait
+    /// for each other and each migration runs once. The lock is released on every path,
+    /// including errors.
     pub async fn run_migrations(&self) -> Result<()> {
         info!("Starting migration process...");
 
+        self.runner.acquire_migration_lock().await?;
+        let result = self.run_pending_migrations().await;
+        let released = self.runner.release_migration_lock().await;
+        if let Err(e) = &released {
+            tracing::warn!("Failed to release the migration lock: {e}");
+        }
+        result?;
+        released
+    }
+
+    /// Apply the migrations not yet recorded, in version order. The caller holds the
+    /// migration lock, so the list of applied migrations is read after any concurrent
+    /// run finished.
+    async fn run_pending_migrations(&self) -> Result<()> {
         // Ensure migration table exists
         if !self.runner.migration_table_exists().await? {
             info!("Creating migration tracking table...");

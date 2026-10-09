@@ -237,6 +237,16 @@ impl Default for MockClock {
     }
 }
 
+/// When a lease of `lease` taken at `now` expires: never for a zero lease, as on the
+/// database backends.
+fn lease_expiry(now: DateTime<Utc>, lease: std::time::Duration) -> DateTime<Utc> {
+    if lease.is_zero() {
+        DateTime::<Utc>::MAX_UTC
+    } else {
+        super::saturating_add_to(now, lease)
+    }
+}
+
 /// In-memory storage for the test queue
 #[derive(Debug)]
 struct TestStorage {
@@ -511,6 +521,8 @@ impl TestStorage {
             .iter()
             .filter_map(|id| self.jobs.get(id))
             .filter(|job| job.scheduled_at <= now)
+            // A disabled recurring job's pending occurrence is held.
+            .filter(|job| job.recurring || job.cron_schedule.is_none())
             .collect();
 
         if eligible_jobs.is_empty() {
@@ -967,6 +979,51 @@ impl TestQueue {
     }
 }
 
+impl TestQueue {
+    /// End `job_id` as `Dead` or `TimedOut` with `error`, like the database backends'
+    /// terminal transitions. With `apply_policy`, the failure is applied to its
+    /// dependents, its workflow's [`FailurePolicy`] and a fail-fast batch; returns the
+    /// jobs failed with it.
+    async fn end_with_failure(
+        &self,
+        job_id: JobId,
+        status: JobStatus,
+        error: &str,
+        apply_policy: bool,
+    ) -> Result<Vec<JobId>> {
+        let transition = if status == JobStatus::TimedOut {
+            crate::queue::JobTransition::MarkTimedOut
+        } else {
+            crate::queue::JobTransition::MarkDead
+        };
+        let mut storage = self.storage.write().await;
+        storage.check_transition(job_id, transition)?;
+        storage.update_job_status(job_id, status)?;
+        storage.leases.remove(&job_id);
+
+        let now = storage.clock.now();
+        if let Some(job) = storage.jobs.get_mut(&job_id) {
+            if status == JobStatus::TimedOut {
+                job.timed_out_at = Some(now);
+            } else {
+                job.failed_at = Some(now);
+            }
+            job.error_message = Some(error.to_string());
+        }
+
+        if !apply_policy {
+            return Ok(Vec::new());
+        }
+        let mut cancelled = storage.apply_workflow_failure(job_id, now);
+        for id in storage.apply_batch_failure(job_id, now) {
+            if !cancelled.contains(&id) {
+                cancelled.push(id);
+            }
+        }
+        Ok(cancelled)
+    }
+}
+
 impl Default for TestQueue {
     fn default() -> Self {
         Self::new()
@@ -1008,23 +1065,8 @@ impl DatabaseQueue for TestQueue {
     }
 
     async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
-        let mut storage = self.storage.write().await;
-
-        if let Some(job_id) = storage.get_next_job(queue_name, None) {
-            // Update job status to Running
-            storage.update_job_status(job_id, JobStatus::Running)?;
-
-            // Set started_at
-            let now = storage.clock.now();
-            if let Some(job) = storage.jobs.get_mut(&job_id) {
-                job.started_at = Some(now);
-                // Like the database backends, every dequeue counts as an attempt.
-                job.attempts += 1;
-                return Ok(Some(job.clone()));
-            }
-        }
-
-        Ok(None)
+        self.dequeue_leased(queue_name, None, super::DEFAULT_LEASE_DURATION)
+            .await
     }
 
     async fn dequeue_with_priority_weights(
@@ -1032,23 +1074,34 @@ impl DatabaseQueue for TestQueue {
         queue_name: &str,
         weights: &PriorityWeights,
     ) -> Result<Option<Job>> {
+        self.dequeue_leased(queue_name, Some(weights), super::DEFAULT_LEASE_DURATION)
+            .await
+    }
+
+    async fn dequeue_leased(
+        &self,
+        queue_name: &str,
+        weights: Option<&PriorityWeights>,
+        lease: std::time::Duration,
+    ) -> Result<Option<Job>> {
         let mut storage = self.storage.write().await;
 
-        if let Some(job_id) = storage.get_next_job(queue_name, Some(weights)) {
-            // Update job status to Running
-            storage.update_job_status(job_id, JobStatus::Running)?;
+        let Some(job_id) = storage.get_next_job(queue_name, weights) else {
+            return Ok(None);
+        };
+        storage.update_job_status(job_id, JobStatus::Running)?;
 
-            // Set started_at
-            let now = storage.clock.now();
-            if let Some(job) = storage.jobs.get_mut(&job_id) {
-                job.started_at = Some(now);
-                // Like the database backends, every dequeue counts as an attempt.
-                job.attempts += 1;
-                return Ok(Some(job.clone()));
-            }
-        }
-
-        Ok(None)
+        let now = storage.clock.now();
+        // Like the database backends, the claim holds a lease from the start.
+        storage
+            .leases
+            .insert(job_id, (now, lease_expiry(now, lease)));
+        Ok(storage.jobs.get_mut(&job_id).map(|job| {
+            job.started_at = Some(now);
+            // Like the database backends, every dequeue counts as an attempt.
+            job.attempts += 1;
+            job.clone()
+        }))
     }
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
@@ -1353,33 +1406,76 @@ impl DatabaseQueue for TestQueue {
 
     // Dead job management
     async fn mark_job_dead(&self, job_id: JobId, error_message: &str) -> Result<()> {
-        let mut storage = self.storage.write().await;
-        storage.check_transition(job_id, crate::queue::JobTransition::MarkDead)?;
-
-        storage.update_job_status(job_id, JobStatus::Dead)?;
-
-        let now = storage.clock.now();
-        if let Some(job) = storage.jobs.get_mut(&job_id) {
-            job.failed_at = Some(now);
-            job.error_message = Some(error_message.to_string());
-        }
-
+        self.end_with_failure(job_id, JobStatus::Dead, error_message, true)
+            .await?;
         Ok(())
     }
 
     async fn mark_job_timed_out(&self, job_id: JobId, error_message: &str) -> Result<()> {
-        let mut storage = self.storage.write().await;
-        storage.check_transition(job_id, crate::queue::JobTransition::MarkTimedOut)?;
-
-        storage.update_job_status(job_id, JobStatus::TimedOut)?;
-
-        let now = storage.clock.now();
-        if let Some(job) = storage.jobs.get_mut(&job_id) {
-            job.timed_out_at = Some(now);
-            job.error_message = Some(error_message.to_string());
-        }
-
+        self.end_with_failure(job_id, JobStatus::TimedOut, error_message, true)
+            .await?;
         Ok(())
+    }
+
+    async fn finish_job_run(
+        &self,
+        run: &Job,
+        outcome: crate::queue::JobOutcome,
+    ) -> Result<Option<crate::queue::RecordedOutcome>> {
+        use crate::queue::{JobOutcome, RecordedOutcome};
+
+        // Like the database backends: only the run that was dequeued is recorded, and a
+        // recurring job that finished is rescheduled instead of failing its dependents.
+        let next_run_at = {
+            let storage = self.storage.read().await;
+            let Some(current) = storage.jobs.get(&run.id) else {
+                return Ok(None);
+            };
+            if !lifecycle::Guard::Run(run).admits(current) {
+                return Ok(None);
+            }
+            match outcome.terminal_status() {
+                Some(_) if current.recurring => {
+                    lifecycle::next_cron_run(current, storage.clock.now())
+                }
+                _ => None,
+            }
+        };
+        let apply_policy = next_run_at.is_none();
+        let mut recorded = match outcome {
+            JobOutcome::Completed => {
+                if next_run_at.is_none() {
+                    self.complete_job(run.id).await?;
+                }
+                RecordedOutcome::new(JobStatus::Completed)
+            }
+            JobOutcome::Retry { retry_at, .. } => {
+                self.retry_job(run.id, retry_at).await?;
+                RecordedOutcome::new(JobStatus::Pending)
+            }
+            JobOutcome::Dead { error } => {
+                let mut recorded = RecordedOutcome::new(JobStatus::Dead);
+                recorded.cancelled = self
+                    .end_with_failure(run.id, JobStatus::Dead, &error, apply_policy)
+                    .await?;
+                recorded
+            }
+            JobOutcome::TimedOut { error } => {
+                let mut recorded = RecordedOutcome::new(JobStatus::TimedOut);
+                recorded.cancelled = self
+                    .end_with_failure(run.id, JobStatus::TimedOut, &error, apply_policy)
+                    .await?;
+                recorded
+            }
+        };
+        if let Some(next) = next_run_at {
+            self.reschedule_cron_job(run.id, next).await?;
+            recorded.status = JobStatus::Pending;
+            recorded.next_run_at = Some(next);
+        } else if recorded.status == JobStatus::Completed {
+            recorded.unblocked = self.resolve_job_dependencies(run.id).await?;
+        }
+        Ok(Some(recorded))
     }
 
     async fn get_dead_jobs(&self, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>> {
@@ -1954,13 +2050,11 @@ impl DatabaseQueue for TestQueue {
             .ok_or_else(|| HammerworkError::JobNotFound {
                 id: job_id.to_string(),
             })?;
-
-        if !job.recurring {
-            return Err(HammerworkError::Queue {
-                message: "Job is not a recurring job".to_string(),
-            });
+        if job.cron_schedule.is_none() {
+            return Err(super::not_a_cron_job(job_id));
         }
 
+        // A pending occurrence is held by `get_next_job`, like on the database backends.
         job.recurring = false;
         job.next_run_at = None;
 
@@ -1969,56 +2063,37 @@ impl DatabaseQueue for TestQueue {
 
     async fn enable_recurring_job(&self, job_id: JobId) -> Result<()> {
         let mut storage = self.storage.write().await;
-
-        // First, check if job exists and has cron schedule
-        let cron_schedule = {
-            let job = storage
-                .jobs
-                .get(&job_id)
-                .ok_or_else(|| HammerworkError::JobNotFound {
-                    id: job_id.to_string(),
-                })?;
-
-            if job.cron_schedule.is_none() {
-                return Err(HammerworkError::Queue {
-                    message: "Job does not have a cron schedule".to_string(),
-                });
-            }
-
-            (job.cron_schedule.clone(), job.timezone.clone())
-        };
-
-        // Get current time
         let now = storage.clock.now();
+        let job = storage
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| HammerworkError::JobNotFound {
+                id: job_id.to_string(),
+            })?;
+        let next_run_at = super::enabled_recurring_next_run(job, now)?;
 
-        // Calculate next run time
-        let next_run_at =
-            if let Ok(schedule) = cron_schedule.0.as_ref().unwrap().parse::<cron::Schedule>() {
-                let timezone = cron_schedule
-                    .1
-                    .as_ref()
-                    .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
-                    .unwrap_or(chrono_tz::UTC);
-
-                let now_in_tz = now.with_timezone(&timezone);
-                schedule
-                    .after(&now_in_tz)
-                    .next()
-                    .map(|next| next.with_timezone(&Utc))
-            } else {
-                None
-            };
-
-        // Now update the job
+        if next_run_at.is_some() {
+            // Not running: resume at the next occurrence, like the database backends.
+            storage.update_job_status(job_id, JobStatus::Pending)?;
+            storage.leases.remove(&job_id);
+        }
         let job = storage
             .jobs
             .get_mut(&job_id)
             .ok_or_else(|| HammerworkError::JobNotFound {
                 id: job_id.to_string(),
             })?;
-
         job.recurring = true;
-        job.next_run_at = next_run_at;
+        if let Some(next_run_at) = next_run_at {
+            job.scheduled_at = next_run_at;
+            job.next_run_at = Some(next_run_at);
+            job.attempts = 0;
+            job.started_at = None;
+            job.completed_at = None;
+            job.failed_at = None;
+            job.timed_out_at = None;
+            job.error_message = None;
+        }
 
         Ok(())
     }
@@ -2654,19 +2729,19 @@ impl DatabaseQueue for TestQueue {
         Ok(storage.paused_queues.values().cloned().collect())
     }
 
-    async fn heartbeat_job(&self, job_id: JobId, lease: std::time::Duration) -> Result<bool> {
+    async fn heartbeat_job(&self, run: &Job, lease: std::time::Duration) -> Result<bool> {
         let mut storage = self.storage.write().await;
-        let running = storage
-            .jobs
-            .get(&job_id)
-            .is_some_and(|job| job.status == JobStatus::Running);
-        if !running {
+        // Only the run that was dequeued is extended, as on the database backends.
+        let same_run = storage.jobs.get(&run.id).is_some_and(|job| {
+            job.status == JobStatus::Running && lifecycle::is_same_run(job, run)
+        });
+        if !same_run {
             return Ok(false);
         }
         let now = storage.clock.now();
         storage
             .leases
-            .insert(job_id, (now, super::saturating_add_to(now, lease)));
+            .insert(run.id, (now, lease_expiry(now, lease)));
         Ok(true)
     }
 
@@ -2701,6 +2776,9 @@ impl DatabaseQueue for TestQueue {
                     job.failed_at = Some(now);
                     job.error_message = Some(super::STALE_JOB_ERROR_MESSAGE.to_string());
                 }
+                // A terminal failure like any other, as on the database backends.
+                storage.apply_workflow_failure(job_id, now);
+                storage.apply_batch_failure(job_id, now);
                 recovery.dead.push(job_id);
             } else {
                 storage.update_job_status(job_id, JobStatus::Pending)?;
@@ -3114,6 +3192,7 @@ mod tests {
     async fn test_requeue_stale_jobs_uses_leases_and_fallback() {
         let queue = TestQueue::new();
         let clock = queue.clock();
+        let lease = std::time::Duration::from_secs(30);
 
         let leased = queue
             .enqueue(Job::new("stale".to_string(), json!({"n": 1})))
@@ -3127,15 +3206,17 @@ mod tests {
             .enqueue(Job::new("stale".to_string(), json!({"n": 3})).with_max_attempts(0))
             .await
             .unwrap();
+        let mut runs = HashMap::new();
         for _ in 0..3 {
-            queue.dequeue("stale").await.unwrap().unwrap();
-        }
-        assert!(
-            queue
-                .heartbeat_job(leased, std::time::Duration::from_secs(30))
+            let run = queue
+                .dequeue_leased("stale", None, lease)
                 .await
                 .unwrap()
-        );
+                .unwrap();
+            runs.insert(run.id, run);
+        }
+        // `unleased` stands for a job claimed by a version that wrote no lease.
+        queue.storage.write().await.leases.remove(&unleased);
 
         // Nothing is stale yet.
         let recovery = queue
@@ -3144,22 +3225,22 @@ mod tests {
             .unwrap();
         assert!(recovery.is_empty());
 
-        // After 60s the lease has expired but the 600s fallback has not.
+        // A short staleness window does not reclaim leased jobs.
+        clock.advance(chrono::Duration::seconds(10));
+        assert!(queue.heartbeat_job(&runs[&leased], lease).await.unwrap());
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(recovery.requeued, vec![unleased]);
+
+        // After 60s the leases have expired but the 600s fallback has not.
         clock.advance(chrono::Duration::seconds(60));
         let recovery = queue
             .requeue_stale_jobs(std::time::Duration::from_secs(600))
             .await
             .unwrap();
         assert_eq!(recovery.requeued, vec![leased]);
-        assert!(recovery.dead.is_empty());
-
-        // After the fallback window the un-leased jobs are reclaimed too.
-        clock.advance(chrono::Duration::seconds(600));
-        let recovery = queue
-            .requeue_stale_jobs(std::time::Duration::from_secs(600))
-            .await
-            .unwrap();
-        assert_eq!(recovery.requeued, vec![unleased]);
         assert_eq!(recovery.dead, vec![exhausted]);
 
         let job = queue.get_job(leased).await.unwrap().unwrap();
@@ -3170,11 +3251,169 @@ mod tests {
         );
 
         // A heartbeat for a job that is no longer Running reports a lost lease.
+        assert!(!queue.heartbeat_job(&runs[&exhausted], lease).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_stale_heartbeat_does_not_extend_a_new_run() {
+        let queue = TestQueue::new();
+        let clock = queue.clock();
+        let lease = std::time::Duration::from_secs(30);
+        let id = queue
+            .enqueue(Job::new("rerun".to_string(), json!({})))
+            .await
+            .unwrap();
+
+        let first = queue
+            .dequeue_leased("rerun", None, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        clock.advance(chrono::Duration::seconds(60));
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(recovery.requeued, vec![id]);
+
+        let second = queue
+            .dequeue_leased("rerun", None, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.attempts, 2);
+        // The first run's worker is still alive and heartbeats: it lost its lease.
+        assert!(!queue.heartbeat_job(&first, lease).await.unwrap());
+        assert!(queue.heartbeat_job(&second, lease).await.unwrap());
+
+        // Its heartbeats did not keep the second run alive.
+        clock.advance(chrono::Duration::seconds(60));
+        assert!(!queue.heartbeat_job(&first, lease).await.unwrap());
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(recovery.requeued, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn test_zero_lease_never_expires() {
+        let queue = TestQueue::new();
+        let id = queue
+            .enqueue(Job::new("forever".to_string(), json!({})))
+            .await
+            .unwrap();
+        let run = queue
+            .dequeue_leased("forever", None, std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        queue.clock().advance(chrono::Duration::days(365));
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(recovery.is_empty(), "{recovery:?}");
         assert!(
-            !queue
-                .heartbeat_job(exhausted, std::time::Duration::from_secs(30))
+            queue
+                .heartbeat_job(&run, std::time::Duration::ZERO)
                 .await
                 .unwrap()
+        );
+        assert_eq!(
+            queue.get_job(id).await.unwrap().unwrap().status,
+            JobStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_job_dead_and_timed_out_apply_the_failure_policy() {
+        use crate::workflow::{FailurePolicy, JobGroup};
+
+        for timed_out in [false, true] {
+            let queue = TestQueue::new();
+            let a = Job::new("policy".to_string(), json!({"step": "a"}));
+            let b = Job::new("policy".to_string(), json!({"step": "b"})).depends_on(&a.id);
+            let other = Job::new("policy".to_string(), json!({"step": "other"}));
+            let (a_id, b_id, other_id) = (a.id, b.id, other.id);
+            queue
+                .enqueue_workflow(
+                    JobGroup::new("policy")
+                        .add_job(a)
+                        .add_job(b)
+                        .add_job(other)
+                        .with_failure_policy(FailurePolicy::FailFast),
+                )
+                .await
+                .unwrap();
+            let run = queue.dequeue("policy").await.unwrap().unwrap();
+            let failed_id = run.id;
+            if timed_out {
+                queue
+                    .mark_job_timed_out(failed_id, "too slow")
+                    .await
+                    .unwrap();
+            } else {
+                queue.mark_job_dead(failed_id, "broken").await.unwrap();
+            }
+            // Fail-fast: every other unfinished job of the workflow fails with it.
+            for id in [a_id, b_id, other_id] {
+                if id == failed_id {
+                    continue;
+                }
+                let job = queue.get_job(id).await.unwrap().unwrap();
+                assert_eq!(job.status, JobStatus::Failed, "{job:?}");
+            }
+            // Already applied, as on the database backends.
+            assert!(
+                queue
+                    .fail_job_dependencies(failed_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_finish_job_run_reports_the_jobs_failed_with_it() {
+        use crate::queue::JobOutcome;
+        use crate::workflow::{FailurePolicy, JobGroup};
+
+        let queue = TestQueue::new();
+        let a = Job::new("finish_policy".to_string(), json!({"step": "a"}));
+        let b = Job::new("finish_policy".to_string(), json!({"step": "b"})).depends_on(&a.id);
+        let (a_id, b_id) = (a.id, b.id);
+        queue
+            .enqueue_workflow(
+                JobGroup::new("finish_policy")
+                    .add_job(a)
+                    .add_job(b)
+                    .with_failure_policy(FailurePolicy::ContinueOnFailure),
+            )
+            .await
+            .unwrap();
+        let run = queue.dequeue("finish_policy").await.unwrap().unwrap();
+        assert_eq!(run.id, a_id);
+        let recorded = queue
+            .finish_job_run(
+                &run,
+                JobOutcome::Dead {
+                    error: "broken".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("the run is current");
+        assert_eq!(recorded.status, JobStatus::Dead);
+        assert_eq!(recorded.cancelled, vec![b_id]);
+        // A second report for the same run is discarded.
+        assert!(
+            queue
+                .finish_job_run(&run, JobOutcome::Completed)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

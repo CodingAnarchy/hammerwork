@@ -18,9 +18,12 @@ The spawning system provides:
 3. The worker looks up the spawn handler registered for the job's **queue name**. If there is none, nothing is spawned.
 4. The handler's `validate_spawn` is called, then `spawn_jobs` returns the child jobs.
 5. If the number of children exceeds `max_spawn_count`, the operation fails with `SpawnError::SpawnLimitExceeded` and nothing is enqueued.
-6. The manager applies the inheritance settings, sets each child's `depends_on` to the parent, copies the parent's workflow, enqueues the children and calls `on_spawn_complete`.
+6. The manager applies the inheritance settings, sets each child's `depends_on` to the parent and copies the parent's workflow (`SpawnManager::prepare_spawn`).
+7. The worker completes the parent and enqueues the children **in one transaction** (`DatabaseQueue::complete_job_run_with_children`), then calls `on_spawn_complete`.
 
-A failure to spawn is logged by the worker; it does not fail the parent job, which has already completed.
+Spawning is part of the parent's run. If the spawn handler fails, the spawn limit is exceeded, the `_spawn_config` is malformed or a child cannot be enqueued, nothing is written: the parent is not completed and none of its children exist, and the run fails like a handler error, so the parent is retried (or ends `Dead` once it is out of attempts). A crash between the two steps cannot leave a completed parent without its children either. Spawn handlers should therefore be deterministic and free of side effects: a retried parent calls them again. An error from `on_spawn_complete`, which runs after the commit, is only logged.
+
+`SpawnManager::execute_spawn` remains for code that spawns outside a worker; it enqueues the children one at a time and does not complete the parent.
 
 ## Key Concepts
 
@@ -463,12 +466,12 @@ The web dashboard has no spawn endpoints; spawn trees are available from the CLI
 2. **Set operation IDs** so spawn operations can be traced in `SpawnResult`.
 3. **Size `max_spawn_count`** to the largest fan-out you expect.
 4. **Bound recursion yourself**: children that carry their own `_spawn_config` can spawn further, so track depth in the payload if you need a limit.
-5. **Handle spawn failures**: they are logged, not retried, and do not fail the parent.
+5. **Keep spawn handlers retry-safe**: a spawn failure fails the parent's run, so the parent (and its spawn handler) runs again.
 6. **Test with both databases** if you run both.
 
 ## Error Handling
 
-Return a `HammerworkError` (for example a `SpawnError` wrapped in `HammerworkError::SpawnError`) to abort a spawn:
+Return a `HammerworkError` (for example a `SpawnError` wrapped in `HammerworkError::SpawnError`) to abort a spawn. Nothing is enqueued and the parent's run fails, so it is retried like any failed run:
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;

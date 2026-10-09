@@ -168,8 +168,8 @@ where
     queue.delete_job(id).await.unwrap();
 }
 
-/// H2: a worker whose run was reclaimed by the stale-job reaper (and finished by
-/// someone else) cannot overwrite the job's newer state when it finally returns.
+/// H2: a worker whose run was reclaimed (and finished by someone else) cannot
+/// overwrite the job's newer state when it finally returns.
 async fn zombie_worker_cannot_overwrite_reclaimed_job<DB>(queue: Arc<JobQueue<DB>>)
 where
     DB: sqlx::Database + Send + Sync + 'static,
@@ -196,14 +196,13 @@ where
             })
         })
     };
-    let zombie = RunningWorker::start(
-        worker(&queue, &queue_name, handler).with_lease_duration(Duration::ZERO),
-    );
+    let zombie = RunningWorker::start(worker(&queue, &queue_name, handler));
     started.notified().await;
 
-    // The reaper reclaims the run, and another worker runs the job to completion.
-    let recovery = queue.requeue_stale_jobs(Duration::ZERO).await.unwrap();
-    assert!(recovery.requeued.contains(&id), "{recovery:?}");
+    // The run is reclaimed while the zombie still works on it (here by an operator: the
+    // zombie's heartbeats keep its lease valid, so the stale job reaper leaves it alone),
+    // and another worker runs the job to completion.
+    queue.retry_job(id, Utc::now()).await.unwrap();
     let rerun = queue
         .dequeue(&queue_name)
         .await

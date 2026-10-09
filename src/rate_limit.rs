@@ -177,11 +177,22 @@ impl TokenBucket {
         }
     }
 
-    /// Refill tokens based on elapsed time
+    /// Return tokens taken by [`try_consume`](Self::try_consume) that were not used,
+    /// up to the capacity.
+    pub fn refund(&mut self, tokens: f64) {
+        self.refill();
+        self.tokens = (self.tokens + tokens).min(self.capacity);
+    }
+
+    /// Refill tokens based on elapsed time.
+    ///
+    /// Uses the elapsed time at full precision: rounding it down to whole milliseconds
+    /// would drop the remainder on every call, so frequent calls would refill slower
+    /// than the configured rate (or not at all).
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill);
-        let tokens_to_add = self.refill_rate * elapsed.as_millis() as f64;
+        let tokens_to_add = self.refill_rate * elapsed.as_secs_f64() * 1000.0;
 
         self.tokens = (self.tokens + tokens_to_add).min(self.capacity);
         self.last_refill = now;
@@ -263,6 +274,17 @@ impl RateLimiter {
         self.check()
     }
 
+    /// Hand back a permit taken by [`check`](Self::check), [`acquire`](Self::acquire) or
+    /// [`try_acquire`](Self::try_acquire) that was not used.
+    ///
+    /// Workers take a permit before they poll and refund it when the poll claims no job,
+    /// so empty or paused polls do not spend the rate limit.
+    pub fn refund(&self) {
+        if let Ok(mut bucket) = self.bucket.lock() {
+            bucket.refund(1.0);
+        }
+    }
+
     /// Get the current rate limit configuration
     pub fn rate_limit(&self) -> &RateLimit {
         &self.rate_limit
@@ -316,31 +338,64 @@ mod tests {
 
     #[test]
     fn test_token_bucket() {
-        let mut bucket = TokenBucket::new(10.0, 1.0); // 10 tokens, 1 token per ms
+        // 10 tokens, refilling so slowly that the test never sees a refill
+        let mut bucket = TokenBucket::new(10.0, 1e-9);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-3;
 
         // Should start with full capacity
-        assert_eq!(bucket.available_tokens(), 10.0);
+        assert!(close(bucket.available_tokens(), 10.0));
 
         // Should be able to consume tokens
         assert!(bucket.try_consume(5.0));
-        assert_eq!(bucket.available_tokens(), 5.0);
+        assert!(close(bucket.available_tokens(), 5.0));
 
         // Should not be able to consume more than available
         assert!(!bucket.try_consume(10.0));
-        assert_eq!(bucket.available_tokens(), 5.0);
+        assert!(close(bucket.available_tokens(), 5.0));
 
         // Should be able to consume remaining tokens
         assert!(bucket.try_consume(5.0));
-        assert_eq!(bucket.available_tokens(), 0.0);
+        assert!(close(bucket.available_tokens(), 0.0));
+    }
+
+    #[test]
+    fn test_token_bucket_refills_between_sub_millisecond_calls() {
+        // 1 token per ms. Calls closer together than 1ms used to refill nothing (the
+        // elapsed time was truncated to whole milliseconds and then discarded).
+        let mut bucket = TokenBucket::new(5.0, 1.0);
+        assert!(bucket.try_consume(5.0));
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(3) {
+            bucket.available_tokens();
+        }
+        assert!(
+            bucket.available_tokens() >= 2.5,
+            "{}",
+            bucket.available_tokens()
+        );
+    }
+
+    #[test]
+    fn test_refund_returns_an_unused_permit() {
+        let limiter = RateLimiter::new(RateLimit::per_hour(1));
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+        // The permit was not used (an empty poll): hand it back.
+        limiter.refund();
+        assert!(limiter.try_acquire());
+        // Refunds never raise the bucket above its capacity.
+        limiter.refund();
+        limiter.refund();
+        assert!(limiter.available_tokens() <= 1.0);
     }
 
     #[tokio::test]
     async fn test_token_bucket_refill() {
         let mut bucket = TokenBucket::new(10.0, 10.0); // 10 tokens capacity, 10 tokens per ms
 
-        // Consume all tokens
+        // Consume all tokens (refill is continuous, so a sliver may already be back)
         assert!(bucket.try_consume(10.0));
-        assert_eq!(bucket.available_tokens(), 0.0);
+        assert!(bucket.available_tokens() < 1.0);
 
         // Wait for refill (1ms should add 10 tokens, bringing us back to capacity)
         sleep(Duration::from_millis(2)).await;

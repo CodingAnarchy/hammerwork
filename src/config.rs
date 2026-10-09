@@ -43,7 +43,12 @@ mod duration_secs {
         S: Serializer,
     {
         let secs = duration.as_secs();
-        if secs == 0 {
+        if duration.subsec_nanos() != 0 {
+            // Sub-second precision (e.g. the default 500ms polling interval) is kept in
+            // milliseconds; whole seconds would round it down, to zero for short ones.
+            let millis = duration.as_millis().max(1);
+            serializer.serialize_str(&format!("{millis}ms"))
+        } else if secs == 0 {
             serializer.serialize_str("0s")
         } else if secs.is_multiple_of(3600) {
             serializer.serialize_str(&format!("{}h", secs / 3600))
@@ -64,13 +69,21 @@ mod duration_secs {
         parse_duration(&s).map_err(D::Error::custom)
     }
 
-    /// Parse a duration string like "30s", "5m", "1h", "90", etc.
+    /// Parse a duration string like "500ms", "30s", "5m", "1h", "90", etc.
     fn parse_duration(s: &str) -> Result<Duration, String> {
         let s = s.trim();
 
         // Handle just numbers (assume seconds)
         if let Ok(secs) = s.parse::<u64>() {
             return Ok(Duration::from_secs(secs));
+        }
+
+        if let Some(millis) = s.strip_suffix("ms") {
+            let millis: u64 = millis
+                .trim()
+                .parse()
+                .map_err(|_| format!("Invalid number in duration: {}", millis))?;
+            return Ok(Duration::from_millis(millis));
         }
 
         // Handle suffixed durations
@@ -292,6 +305,7 @@ impl HammerworkConfig {
     pub fn from_file(path: &str) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
+        config.worker.validate()?;
         config.validate_delivery_targets()?;
         Ok(config)
     }
@@ -345,6 +359,7 @@ impl HammerworkConfig {
         }
 
         config.encryption.apply_env()?;
+        config.worker.validate()?;
 
         Ok(config)
     }
@@ -474,11 +489,14 @@ pub struct WorkerConfig {
     /// Number of workers in the pool
     pub pool_size: usize,
 
-    /// Polling interval for checking new jobs
+    /// Polling interval for checking new jobs. Must be greater than zero (see
+    /// [`WorkerConfig::validate`]).
     #[serde(with = "duration_secs")]
     pub polling_interval: StdDuration,
 
-    /// Default job timeout
+    /// Default job timeout, applied by [`Worker::with_config`](crate::Worker::with_config)
+    /// to every job that has no timeout of its own (default 5 minutes). Must be greater
+    /// than zero (see [`WorkerConfig::validate`]).
     #[serde(with = "duration_secs")]
     pub job_timeout: StdDuration,
 
@@ -518,6 +536,25 @@ impl Default for WorkerConfig {
 }
 
 impl WorkerConfig {
+    /// Reject settings that cannot work: a zero `polling_interval` (idle workers would
+    /// poll in a tight loop) or a zero `job_timeout` (every job would time out before
+    /// its handler ran). Called when a configuration is loaded
+    /// ([`HammerworkConfig::from_file`], [`HammerworkConfig::from_env`]) and by
+    /// [`WorkerPool::from_hammerwork_config`](crate::WorkerPool::from_hammerwork_config).
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.polling_interval.is_zero() {
+            return Err(crate::HammerworkError::Config(
+                "worker.polling_interval must be greater than zero".to_string(),
+            ));
+        }
+        if self.job_timeout.is_zero() {
+            return Err(crate::HammerworkError::Config(
+                "worker.job_timeout must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Build the [`AutoscaleConfig`] described by this configuration.
     ///
     /// Returns a disabled autoscale configuration unless `autoscaling_enabled` is set.
@@ -1339,6 +1376,47 @@ mod tests {
             std::env::remove_var("HAMMERWORK_WORKER_POOL_SIZE");
             std::env::remove_var("HAMMERWORK_JOB_TIMEOUT_SECONDS");
         }
+    }
+
+    /// #64 M5: zero durations that would hot-loop or time every job out are rejected.
+    #[test]
+    fn test_zero_worker_durations_are_rejected() {
+        assert!(WorkerConfig::default().validate().is_ok());
+        let zero_poll = WorkerConfig {
+            polling_interval: StdDuration::ZERO,
+            ..WorkerConfig::default()
+        };
+        let err = zero_poll.validate().unwrap_err().to_string();
+        assert!(err.contains("polling_interval"), "{err}");
+        let zero_timeout = WorkerConfig {
+            job_timeout: StdDuration::ZERO,
+            ..WorkerConfig::default()
+        };
+        let err = zero_timeout.validate().unwrap_err().to_string();
+        assert!(err.contains("job_timeout"), "{err}");
+
+        // The default 500ms polling interval survives a save and load (it used to be
+        // written as "0s", which loaded as a zero interval).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.toml");
+        HammerworkConfig::new()
+            .save_to_file(path.to_str().unwrap())
+            .unwrap();
+        let loaded = HammerworkConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            loaded.worker.polling_interval,
+            StdDuration::from_millis(500)
+        );
+
+        // Loading a file with a zero interval fails.
+        let path = dir.path().join("zero.toml");
+        let mut config = HammerworkConfig::new();
+        config.worker.polling_interval = StdDuration::ZERO;
+        config.save_to_file(path.to_str().unwrap()).unwrap();
+        assert!(matches!(
+            HammerworkConfig::from_file(path.to_str().unwrap()),
+            Err(crate::HammerworkError::Config(_))
+        ));
     }
 
     #[test]

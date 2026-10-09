@@ -102,6 +102,29 @@ All migrations are designed to be idempotent - you can run them multiple times s
 - Uses `ADD COLUMN IF NOT EXISTS` for PostgreSQL column additions
 - Checks for existing columns before adding them in MySQL
 
+### Concurrent Runs
+
+Several processes may migrate the same database at once: every replica of a service
+starting with `auto_migrate`, or `cargo hammerwork migration run` while the application
+starts. `MigrationManager::run_migrations` serializes them with a database lock held
+for the whole run:
+
+- PostgreSQL: a session-level `pg_advisory_lock` (key `0x686d72776b6d6967`, per
+  database);
+- MySQL: `GET_LOCK` on `hammerwork_migrations:` followed by the SHA-1 of the database
+  name (lock names are server-wide), waiting up to 10 minutes.
+
+The lock is taken on a dedicated connection that also runs every statement of the
+run, and the list of applied migrations is read only after it is acquired, so a run
+that waited sees what the previous one applied and runs nothing twice. The lock is
+released when the run ends, also after an error; if the run is abandoned the
+connection is closed, which releases it too. Recording a migration also ignores a row
+that already exists (`ON CONFLICT DO NOTHING` / `INSERT IGNORE`), for runs by older
+Hammerwork versions that take no lock.
+
+A custom `MigrationRunner` can take part by implementing `acquire_migration_lock` and
+`release_migration_lock`; the default implementations take no lock.
+
 ### Tracking
 
 The migration system creates a `hammerwork_migrations` table to track which migrations have been executed:

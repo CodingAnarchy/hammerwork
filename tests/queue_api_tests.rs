@@ -238,6 +238,96 @@ where
     queue.delete_job(id).await.unwrap();
 }
 
+/// #64 M1: disabling a recurring job stops its pending occurrence, and enabling it
+/// resumes the schedule, also for a job whose last run finished while disabled.
+async fn disable_and_enable_recurring_jobs<Q>(queue: Arc<Q>)
+where
+    Q: DatabaseQueue + Send + Sync + 'static,
+{
+    let queue_name = test_utils::unique_queue("recurring_toggle");
+    let hourly = CronSchedule::new("0 0 * * * *").unwrap();
+    let due_cron_job = || {
+        let mut job = Job::new(queue_name.clone(), json!({}))
+            .with_cron(hourly.clone())
+            .unwrap();
+        // Due now (an hour ago, so it is due on TestQueue's mock clock too).
+        job.scheduled_at = Utc::now() - Duration::hours(1);
+        job.next_run_at = Some(job.scheduled_at);
+        job
+    };
+
+    // A pending occurrence is held while the job is disabled.
+    let held = queue.enqueue(due_cron_job()).await.unwrap();
+    queue.disable_recurring_job(held).await.unwrap();
+    queue.disable_recurring_job(held).await.unwrap(); // idempotent
+    let job = queue.get_job(held).await.unwrap().unwrap();
+    assert!(!job.recurring);
+    assert_eq!(job.next_run_at, None);
+    assert_eq!(job.status, JobStatus::Pending);
+    assert!(
+        queue.dequeue(&queue_name).await.unwrap().is_none(),
+        "a disabled recurring job ran"
+    );
+
+    // Enabling resumes it at the next occurrence (missed ones are not run).
+    queue.enable_recurring_job(held).await.unwrap();
+    let job = queue.get_job(held).await.unwrap().unwrap();
+    assert!(job.recurring);
+    assert_eq!(job.status, JobStatus::Pending);
+    assert!(
+        job.scheduled_at > Utc::now() - Duration::minutes(5),
+        "{job:?}"
+    );
+    assert_eq!(job.next_run_at, Some(job.scheduled_at));
+    assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+    queue.delete_job(held).await.unwrap();
+
+    // A run in progress finishes; without `recurring` it is not rescheduled.
+    let finished = queue.enqueue(due_cron_job()).await.unwrap();
+    let run = queue.dequeue(&queue_name).await.unwrap().expect("due job");
+    assert_eq!(run.id, finished);
+    queue.disable_recurring_job(finished).await.unwrap();
+    queue
+        .finish_job_run(&run, hammerwork::queue::JobOutcome::Completed)
+        .await
+        .unwrap()
+        .expect("current run");
+    assert_eq!(
+        queue.get_job(finished).await.unwrap().unwrap().status,
+        JobStatus::Completed
+    );
+
+    // Enabling revives the finished job.
+    queue.enable_recurring_job(finished).await.unwrap();
+    let job = queue.get_job(finished).await.unwrap().unwrap();
+    assert!(job.recurring);
+    assert_eq!(job.status, JobStatus::Pending, "{job:?}");
+    assert_eq!(job.attempts, 0);
+    assert!(job.completed_at.is_none());
+    assert_eq!(job.next_run_at, Some(job.scheduled_at));
+    queue.delete_job(finished).await.unwrap();
+
+    // Errors: a missing job, and a job without a cron schedule.
+    let missing = uuid::Uuid::new_v4();
+    assert!(matches!(
+        queue.disable_recurring_job(missing).await,
+        Err(hammerwork::HammerworkError::JobNotFound { .. })
+    ));
+    assert!(matches!(
+        queue.enable_recurring_job(missing).await,
+        Err(hammerwork::HammerworkError::JobNotFound { .. })
+    ));
+    let plain = enqueue(&queue, &queue_name).await;
+    assert!(queue.disable_recurring_job(plain).await.is_err());
+    assert!(queue.enable_recurring_job(plain).await.is_err());
+    // A plain job (no cron schedule) is not held.
+    assert_eq!(
+        queue.dequeue(&queue_name).await.unwrap().map(|job| job.id),
+        Some(plain)
+    );
+    queue.delete_job(plain).await.unwrap();
+}
+
 /// The `DatabaseQueue` throttle methods use the queue's throttle registry.
 async fn throttle_configuration<Q>(queue: Arc<Q>)
 where
@@ -420,6 +510,7 @@ backend_tests!(
         dead_job_management,
         statistics_queries,
         recurring_jobs,
+        disable_and_enable_recurring_jobs,
         throttle_configuration,
         pause_information,
         workflow_dependency_helpers,
@@ -435,6 +526,7 @@ backend_tests!(
         dead_job_management,
         statistics_queries,
         recurring_jobs,
+        disable_and_enable_recurring_jobs,
         throttle_configuration,
         pause_information,
         workflow_dependency_helpers,
@@ -455,6 +547,7 @@ backend_tests!(
         dead_job_management,
         statistics_queries,
         recurring_jobs,
+        disable_and_enable_recurring_jobs,
         throttle_configuration,
         pause_information,
         workflow_dependency_helpers,

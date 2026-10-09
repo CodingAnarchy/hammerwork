@@ -21,6 +21,11 @@ let worker = Worker::new(queue, "email_queue".to_string(), handler)
 
 `handler` is a `JobHandler`: an `Arc` of a function from `Job` to a boxed future returning `hammerwork::Result<()>`.
 
+An idle worker waits the poll interval between polls, and never less than 10ms
+(`worker::MIN_POLL_INTERVAL`), so a zero interval cannot make it poll in a tight loop.
+`HammerworkConfig` rejects `worker.polling_interval = 0` (and `worker.job_timeout = 0`)
+when it is loaded.
+
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
 # #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
@@ -63,6 +68,11 @@ let worker = Worker::new(queue, "processing_queue".to_string(), handler)
 1. **Job-specific timeout** (highest priority)
 2. **Worker default timeout**
 3. **No timeout** (job runs until completion)
+
+`with_default_timeout(Duration::ZERO)` means no default timeout. A worker built with
+`Worker::with_config` or `with_hammerwork_config` uses `worker.job_timeout` (5 minutes
+by default) as its default timeout, so every job without its own timeout is limited to
+it.
 
 ## Priority Configuration
 
@@ -124,6 +134,10 @@ let worker = Worker::new(queue, "api_queue".to_string(), handler)
 # Ok(())
 # }
 ```
+
+A worker takes a token before it polls and hands it back when the poll claims no job
+(the queue is empty or paused), so only claimed jobs spend the rate limit and the
+full burst is available when jobs arrive after an idle period.
 
 ### Advanced Throttling
 
@@ -212,10 +226,20 @@ let alerting_config = AlertingConfig::new()
     .with_cooldown(Duration::from_secs(300));
 
 let worker = Worker::new(queue, "production_queue".to_string(), handler)
-    .with_alerting_config(alerting_config);
+    .with_alerting_config(alerting_config)
+    // How often thresholds are checked (default 30 seconds)
+    .with_monitoring_interval(Duration::from_secs(30));
 # Ok(())
 # }
 ```
+
+Alert thresholds (and the queue depth metric) are checked by a background monitoring
+task every `with_monitoring_interval` (30 seconds by default), never in the loop that
+dequeues jobs, so a slow or unreachable alert target cannot hold up job processing.
+Webhook and Slack alerts time out after 10 seconds. An alert that reached no target is
+retried after 60 seconds (or the cooldown, if shorter) instead of on every check; one
+that was delivered starts the cooldown. The monitoring task stops with the worker,
+however the worker stops.
 
 ## Worker Pools
 
@@ -268,6 +292,39 @@ tokio::select! {
 
 Dropping the pool also shuts its workers down gracefully.
 
+### Autoscaling
+
+A `WorkerPool` does not autoscale unless you enable it with `with_autoscaling` (or
+`WorkerPool::from_config` with `worker.autoscaling_enabled = true`). Autoscaling scales
+a single queue: that of the worker template (`with_worker_template`), or of the first
+worker added. It measures that queue's depth, starts clones of the template while the
+queue is deep (up to `max_workers`), and retires workers of that queue (down to
+`min_workers`) once it drains. Workers of other queues in the same pool are never
+started or retired. A retired worker stops like on shutdown: it finishes its in-flight
+job within its shutdown grace period.
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, job: hammerwork::Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Worker, WorkerPool, worker::AutoscaleConfig};
+
+let mut pool = WorkerPool::new().with_autoscaling(
+    AutoscaleConfig::new()
+        .with_min_workers(1)
+        .with_max_workers(8)
+        .with_scale_up_threshold(10), // queued jobs per worker before scaling up
+);
+// The first worker is the template: only "email" is scaled.
+pool.add_worker(Worker::new(queue.clone(), "email".to_string(), handler.clone()));
+// Always exactly one "reports" worker.
+pool.add_worker(Worker::new(queue.clone(), "reports".to_string(), handler.clone()));
+# Ok(())
+# }
+```
+
+To scale several queues, run one pool per queue.
+
 ### Supervision
 
 If a worker task stops unexpectedly (a bug that panics outside a job handler, for
@@ -306,17 +363,27 @@ let worker = Worker::new(queue.clone(), "reports".to_string(), handler)
 A worker that crashes, is OOM-killed or loses its pod leaves its job in `Running`.
 Hammerwork recovers these jobs with leases (requires migration `015_add_job_leases`):
 
-- While a handler runs, the worker records a heartbeat and extends the job's lease
-  every third of its lease duration (5 minutes by default). Jobs that finish sooner
-  never write a heartbeat.
-- `DatabaseQueue::requeue_stale_jobs(older_than)` reclaims `Running` jobs whose
-  lease has expired. Jobs that never recorded a lease (they had not reached their
-  first heartbeat, or were started by an older Hammerwork version) count as stale
-  once they started more than `older_than` ago.
+- A worker takes the lease in the same statement that claims the job
+  (`DatabaseQueue::dequeue_leased`; plain `dequeue` takes the default 5 minute lease).
+  While the handler runs, the worker records a heartbeat and extends the lease every
+  third of its lease duration (5 minutes by default). Jobs that finish sooner never
+  write a heartbeat.
+- A heartbeat only extends the run it belongs to (same attempt and start time): a
+  worker whose job was reclaimed and picked up by another worker cannot keep the new
+  run's lease alive.
+- `DatabaseQueue::requeue_stale_jobs(older_than)` reclaims `Running` jobs whose lease
+  has expired. A job whose lease is valid is never reclaimed, whatever `older_than` is,
+  so pools with different lease durations (or `cargo hammerwork job requeue-stale
+  --older-than-secs 1`) can share a database safely. `older_than` only applies to jobs
+  claimed by an older Hammerwork version that did not take a lease at claim time:
+  they count as stale once they started more than `older_than` ago.
 - A reclaimed job goes back to `Pending` and runs again immediately. The interrupted
   run already counted as an attempt; a job with no attempts left is moved to `Dead`.
 - Every `WorkerPool` runs this reaper every 60 seconds, with `older_than` set to the
   longest lease of its workers. Several pools or processes can reap at once safely.
+- `with_lease_duration(Duration::ZERO)` takes a lease that never expires and sends no
+  heartbeats: the reaper never reclaims that worker's jobs, so if it dies an operator
+  has to re-run them (`cargo hammerwork job retry`).
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;

@@ -4,26 +4,97 @@ use super::split::{Dialect, split_statements};
 use super::{Migration, MigrationRecord, MigrationRunner};
 use crate::Result;
 use chrono::Utc;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Postgres, Row, pool::PoolConnection};
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info};
+
+/// Key of the session-level advisory lock that serializes migration runs on a database
+/// (`pg_advisory_lock`). The ASCII bytes of "hmrwkmig".
+pub const MIGRATION_LOCK_KEY: i64 = 0x686d_7277_6b6d_6967;
 
 /// PostgreSQL migration runner
 pub struct PostgresMigrationRunner {
     pool: PgPool,
+    /// The connection holding the migration lock while a run is in progress. Every
+    /// statement of the run goes through it.
+    locked: Mutex<Option<PoolConnection<Postgres>>>,
 }
 
 impl PostgresMigrationRunner {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            locked: Mutex::new(None),
+        }
+    }
+
+    /// The connection to run a statement on: the one holding the migration lock, or
+    /// else a pooled connection.
+    async fn connection(&self) -> Result<Conn<'_>> {
+        let guard = self.locked.lock().await;
+        if guard.is_some() {
+            return Ok(Conn::Locked(guard));
+        }
+        drop(guard);
+        Ok(Conn::Pooled(self.pool.acquire().await?))
+    }
+}
+
+/// A connection for one runner operation.
+enum Conn<'a> {
+    Locked(MutexGuard<'a, Option<PoolConnection<Postgres>>>),
+    Pooled(PoolConnection<Postgres>),
+}
+
+impl Conn<'_> {
+    fn get(&mut self) -> Result<&mut PgConnection> {
+        match self {
+            Self::Locked(guard) => guard.as_mut().map(|conn| &mut **conn).ok_or_else(|| {
+                crate::HammerworkError::Queue {
+                    message: "the migration lock connection is gone".to_string(),
+                }
+            }),
+            Self::Pooled(conn) => Ok(&mut **conn),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
+    async fn acquire_migration_lock(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        // If the run is abandoned (an error, or its future is dropped) the connection is
+        // closed instead of going back to the pool, which releases the session lock.
+        conn.close_on_drop();
+        debug!("Waiting for the PostgreSQL migration lock");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_LOCK_KEY)
+            .execute(&mut *conn)
+            .await?;
+        debug!("Acquired the PostgreSQL migration lock");
+        *self.locked.lock().await = Some(conn);
+        Ok(())
+    }
+
+    async fn release_migration_lock(&self) -> Result<()> {
+        let Some(mut conn) = self.locked.lock().await.take() else {
+            return Ok(());
+        };
+        // Dropping the connection closes it (close_on_drop), so the lock is released
+        // even if the unlock fails.
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_LOCK_KEY)
+            .execute(&mut *conn)
+            .await?;
+        debug!("Released the PostgreSQL migration lock");
+        Ok(())
+    }
+
     async fn run_migration(&self, migration: &Migration, sql: &str) -> Result<()> {
         debug!("Executing PostgreSQL migration: {}", migration.id);
 
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.connection().await?;
+        let mut tx = sqlx::Connection::begin(conn.get()?).await?;
 
         // Statements run exactly as written; the splitter only finds top-level `;`.
         let statements = split_statements(sql, Dialect::Postgres);
@@ -75,20 +146,23 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
     }
 
     async fn migration_table_exists(&self) -> Result<bool> {
+        let mut conn = self.connection().await?;
+        // The schema the tables are created in: the first schema of the search path.
         let row = sqlx::query(
             "SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'public' 
+                SELECT FROM information_schema.tables
+                WHERE table_schema = current_schema()
                 AND table_name = 'hammerwork_migrations'
             )",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(conn.get()?)
         .await?;
 
         Ok(row.try_get::<bool, _>(0)?)
     }
 
     async fn create_migration_table(&self) -> Result<()> {
+        let mut conn = self.connection().await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS hammerwork_migrations (
@@ -98,7 +172,7 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
             )
             "#,
         )
-        .execute(&self.pool)
+        .execute(conn.get()?)
         .await?;
 
         info!("Created PostgreSQL migration tracking table");
@@ -106,12 +180,13 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
     }
 
     async fn get_executed_migrations(&self) -> Result<Vec<MigrationRecord>> {
+        let mut conn = self.connection().await?;
         let rows = sqlx::query(
             "SELECT migration_id, executed_at, execution_time_ms 
              FROM hammerwork_migrations 
              ORDER BY executed_at",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(conn.get()?)
         .await?;
 
         let mut records = Vec::new();
@@ -130,14 +205,16 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
     }
 
     async fn record_migration(&self, migration: &Migration, execution_time_ms: u64) -> Result<()> {
+        let mut conn = self.connection().await?;
+        // A run that does not take the lock (an older version) may have recorded it too.
         sqlx::query(
             "INSERT INTO hammerwork_migrations (migration_id, executed_at, execution_time_ms) 
-             VALUES ($1, $2, $3)",
+             VALUES ($1, $2, $3) ON CONFLICT (migration_id) DO NOTHING",
         )
         .bind(&migration.id)
         .bind(Utc::now())
-        .bind(execution_time_ms as i64)
-        .execute(&self.pool)
+        .bind(i64::try_from(execution_time_ms).unwrap_or(i64::MAX))
+        .execute(conn.get()?)
         .await?;
 
         debug!("Recorded PostgreSQL migration: {}", migration.id);

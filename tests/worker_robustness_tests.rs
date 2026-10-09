@@ -218,8 +218,9 @@ where
     queue.delete_job(id).await.unwrap();
 }
 
-/// Enqueue a job and claim it, leaving it `Running` as a crashed worker would.
-async fn start_job<DB>(queue: &Arc<JobQueue<DB>>, job: Job) -> JobId
+/// Enqueue a job and claim it with `lease`, leaving it `Running` as a crashed worker
+/// would. Returns the run.
+async fn start_job<DB>(queue: &Arc<JobQueue<DB>>, job: Job, lease: Duration) -> Job
 where
     DB: sqlx::Database,
     JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
@@ -227,12 +228,50 @@ where
     let queue_name = job.queue_name.clone();
     let id = queue.enqueue(job).await.unwrap();
     let claimed = queue
-        .dequeue(&queue_name)
+        .dequeue_leased(&queue_name, None, lease)
         .await
         .unwrap()
         .expect("job claimed");
     assert_eq!(claimed.id, id);
-    id
+    claimed
+}
+
+/// Raw access the generic scenarios need to simulate rows written by older versions.
+#[async_trait::async_trait]
+trait LegacyRows {
+    /// Remove the lease of a `Running` job, as left by a version that claimed jobs
+    /// without writing one.
+    async fn forget_lease(&self, id: JobId);
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait::async_trait]
+impl LegacyRows for JobQueue<sqlx::Postgres> {
+    async fn forget_lease(&self, id: JobId) {
+        sqlx::query(
+            "UPDATE hammerwork_jobs SET last_heartbeat_at = NULL, lease_expires_at = NULL \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(self.get_pool())
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(feature = "mysql")]
+#[async_trait::async_trait]
+impl LegacyRows for JobQueue<sqlx::MySql> {
+    async fn forget_lease(&self, id: JobId) {
+        sqlx::query(
+            "UPDATE hammerwork_jobs SET last_heartbeat_at = NULL, lease_expires_at = NULL \
+             WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .execute(self.get_pool())
+        .await
+        .unwrap();
+    }
 }
 
 /// Jobs whose lease expired go back to `Pending` (or `Dead` when out of attempts);
@@ -240,90 +279,310 @@ where
 async fn reaper_requeues_expired_leases<DB>(queue: Arc<JobQueue<DB>>)
 where
     DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + LegacyRows + Send + Sync + 'static,
 {
     let _serial = test_utils::serial().await;
     let hour = Duration::from_secs(3600);
+    let short = Duration::from_millis(500);
 
     let expiring = start_job(
         &queue,
         Job::new(test_utils::unique_queue("reaper_expiring"), json!({})).with_max_attempts(3),
+        short,
     )
     .await;
     let exhausted = start_job(
         &queue,
         Job::new(test_utils::unique_queue("reaper_exhausted"), json!({})).with_max_attempts(1),
+        short,
     )
     .await;
     let live = start_job(
         &queue,
         Job::new(test_utils::unique_queue("reaper_live"), json!({})),
+        short,
     )
     .await;
     let unleased = start_job(
         &queue,
         Job::new(test_utils::unique_queue("reaper_unleased"), json!({})),
+        short,
     )
     .await;
+    queue.forget_lease(unleased.id).await;
 
-    assert!(
-        queue
-            .heartbeat_job(expiring, Duration::from_millis(500))
-            .await
-            .unwrap()
-    );
-    assert!(
-        queue
-            .heartbeat_job(exhausted, Duration::from_millis(500))
-            .await
-            .unwrap()
-    );
-    assert!(queue.heartbeat_job(live, hour).await.unwrap());
+    assert!(queue.heartbeat_job(&live, hour).await.unwrap());
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let recovery = queue.requeue_stale_jobs(hour).await.unwrap();
-    assert!(recovery.requeued.contains(&expiring), "{recovery:?}");
-    assert!(recovery.dead.contains(&exhausted), "{recovery:?}");
-    for id in [live, unleased] {
+    assert!(recovery.requeued.contains(&expiring.id), "{recovery:?}");
+    assert!(recovery.dead.contains(&exhausted.id), "{recovery:?}");
+    for id in [live.id, unleased.id] {
         assert!(
             !recovery.requeued.contains(&id) && !recovery.dead.contains(&id),
             "job {id} must not be reclaimed: {recovery:?}"
         );
     }
 
-    let job = queue.get_job(expiring).await.unwrap().unwrap();
+    let job = queue.get_job(expiring.id).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Pending);
     assert_eq!(job.attempts, 1, "the interrupted run counts as an attempt");
     assert!(job.started_at.is_none());
     assert!(job.error_message.unwrap().contains("lease expired"));
     // The requeued job can be claimed again.
     let reclaimed = queue.dequeue(&job.queue_name).await.unwrap().unwrap();
-    assert_eq!(reclaimed.id, expiring);
+    assert_eq!(reclaimed.id, expiring.id);
     assert_eq!(reclaimed.attempts, 2);
 
-    let job = queue.get_job(exhausted).await.unwrap().unwrap();
+    let job = queue.get_job(exhausted.id).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Dead);
     assert!(job.failed_at.is_some());
     // A worker that lost its lease finds out on its next heartbeat.
     assert!(
         !queue
-            .heartbeat_job(exhausted, Duration::from_secs(1))
+            .heartbeat_job(&exhausted, Duration::from_secs(1))
             .await
             .unwrap()
     );
 
-    // Without a lease, `older_than` (measured from `started_at`) decides.
+    // Without a lease (claimed by an older version), `older_than` (measured from
+    // `started_at`) decides.
     let recovery = queue
         .requeue_stale_jobs(Duration::from_millis(500))
         .await
         .unwrap();
-    assert!(recovery.requeued.contains(&unleased), "{recovery:?}");
-    assert!(!recovery.requeued.contains(&live), "{recovery:?}");
+    assert!(recovery.requeued.contains(&unleased.id), "{recovery:?}");
+    assert!(!recovery.requeued.contains(&live.id), "{recovery:?}");
 
-    for id in [expiring, exhausted, live, unleased] {
+    for id in [expiring.id, exhausted.id, live.id, unleased.id] {
         queue.delete_job(id).await.unwrap();
     }
+}
+
+/// #64 C1: a job is leased from the moment it is claimed, so a reaper with a short
+/// staleness window (another pool's, or `cargo hammerwork job requeue-stale
+/// --older-than-secs 1`) never reclaims it while its lease is valid, even before the
+/// worker's first heartbeat. Once the lease expires it is reclaimed.
+async fn claim_lease_protects_job_from_short_reaper_window<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+
+    // A worker with a long lease (its first heartbeat would come after 20 minutes),
+    // and one using the default lease of a plain `dequeue`.
+    let long = start_job(
+        &queue,
+        Job::new(test_utils::unique_queue("lease_long"), json!({})),
+        Duration::from_secs(3600),
+    )
+    .await;
+    let queue_name = test_utils::unique_queue("lease_default");
+    let id = queue
+        .enqueue(Job::new(queue_name.clone(), json!({})))
+        .await
+        .unwrap();
+    let default = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    assert_eq!(default.id, id);
+    let short = start_job(
+        &queue,
+        Job::new(test_utils::unique_queue("lease_short"), json!({})),
+        Duration::from_millis(400),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Reapers with any window, down to zero, leave valid leases alone.
+    for older_than in [
+        Duration::ZERO,
+        Duration::from_millis(1),
+        Duration::from_secs(1),
+    ] {
+        let recovery = queue.requeue_stale_jobs(older_than).await.unwrap();
+        for run in [&long, &default] {
+            assert!(
+                !recovery.requeued.contains(&run.id) && !recovery.dead.contains(&run.id),
+                "job {} was reclaimed while its lease is valid: {recovery:?}",
+                run.id
+            );
+        }
+        if older_than.is_zero() {
+            assert!(recovery.requeued.contains(&short.id), "{recovery:?}");
+        }
+    }
+    for run in [&long, &default] {
+        let job = queue.get_job(run.id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Running);
+        assert_eq!(job.attempts, 1);
+        // The worker still holds the run, so it can extend and finish it.
+        assert!(
+            queue
+                .heartbeat_job(run, Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        queue.get_job(short.id).await.unwrap().unwrap().status,
+        JobStatus::Pending
+    );
+
+    for id in [long.id, default.id, short.id] {
+        queue.delete_job(id).await.unwrap();
+    }
+}
+
+/// #64 C1: after a run is reclaimed and claimed again, the first run's worker (still
+/// alive, still heartbeating) cannot extend the new run's lease.
+async fn stale_heartbeat_cannot_extend_new_run<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+    let lease = Duration::from_millis(400);
+    let first = start_job(
+        &queue,
+        Job::new(test_utils::unique_queue("lease_rerun"), json!({})).with_max_attempts(5),
+        lease,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let recovery = queue
+        .requeue_stale_jobs(Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert!(recovery.requeued.contains(&first.id), "{recovery:?}");
+
+    let second = queue
+        .dequeue_leased(&first.queue_name, None, lease)
+        .await
+        .unwrap()
+        .expect("requeued job");
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.attempts, 2);
+
+    // The old run's heartbeats report the lost lease and change nothing.
+    for _ in 0..3 {
+        assert!(
+            !queue
+                .heartbeat_job(&first, Duration::from_secs(3600))
+                .await
+                .unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // So the new run's lease expired on schedule.
+    let recovery = queue
+        .requeue_stale_jobs(Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert!(
+        recovery.requeued.contains(&second.id),
+        "the stale heartbeat extended the new run's lease: {recovery:?}"
+    );
+    assert!(
+        !queue
+            .heartbeat_job(&second, Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
+    queue.delete_job(first.id).await.unwrap();
+}
+
+/// A zero lease never expires: the reaper never reclaims the job.
+async fn zero_lease_is_never_reclaimed<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+    let run = start_job(
+        &queue,
+        Job::new(test_utils::unique_queue("lease_zero"), json!({})),
+        Duration::ZERO,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let recovery = queue.requeue_stale_jobs(Duration::ZERO).await.unwrap();
+    assert!(
+        !recovery.requeued.contains(&run.id) && !recovery.dead.contains(&run.id),
+        "{recovery:?}"
+    );
+    assert!(queue.heartbeat_job(&run, Duration::ZERO).await.unwrap());
+    let recovery = queue.requeue_stale_jobs(Duration::ZERO).await.unwrap();
+    assert!(!recovery.requeued.contains(&run.id), "{recovery:?}");
+    assert_eq!(
+        queue.get_job(run.id).await.unwrap().unwrap().status,
+        JobStatus::Running
+    );
+    queue.delete_job(run.id).await.unwrap();
+}
+
+/// #64 C1 scenario A: a worker with a long lease runs a job while another pool's reaper
+/// uses a tiny staleness window. The job runs once.
+async fn other_pools_reaper_does_not_rerun_live_job<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+    let queue_name = test_utils::unique_queue("lease_two_pools");
+    let id = queue
+        .enqueue(Job::new(queue_name.clone(), json!({})))
+        .await
+        .unwrap();
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let handler: JobHandler = {
+        let runs = Arc::clone(&runs);
+        Arc::new(move |_job: Job| {
+            let runs = Arc::clone(&runs);
+            Box::pin(async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                Ok::<(), HammerworkError>(())
+            })
+        })
+    };
+    // Service A: two workers with a one hour lease, so no heartbeat during the job.
+    let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+        .with_poll_interval(Duration::from_millis(50))
+        .with_lease_duration(Duration::from_secs(3600));
+    let mut service_a = WorkerPool::new().without_stale_job_reaper();
+    service_a.add_worker(worker.clone());
+    service_a.add_worker(worker);
+    // Service B: no workers on this queue, only an aggressive reaper.
+    let idle_handler: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
+    let mut service_b = WorkerPool::new()
+        .with_stale_job_reaper(Duration::from_millis(100), Duration::from_millis(1));
+    service_b.add_worker(Worker::new(
+        Arc::clone(&queue),
+        test_utils::unique_queue("lease_other_service"),
+        idle_handler,
+    ));
+
+    tokio::select! {
+        result = async { tokio::join!(service_a.start(), service_b.start()) } => {
+            panic!("pools stopped early: {result:?}")
+        }
+        _ = wait_for_job(&queue, id, Duration::from_secs(10), |job| {
+            job.status == JobStatus::Completed
+        }) => {}
+    }
+    // Let the reaper run a few more passes, then stop both pools.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    service_a.shutdown().await.unwrap();
+    service_b.shutdown().await.unwrap();
+
+    let job = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Completed);
+    assert_eq!(job.attempts, 1, "the job was reclaimed and run again");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the job ran twice");
+    queue.delete_job(id).await.unwrap();
 }
 
 /// Concurrent reapers must reclaim every stale job exactly once.
@@ -336,18 +595,13 @@ where
     let queue_name = test_utils::unique_queue("reaper_concurrency");
     let mut stale = HashSet::new();
     for i in 0..40 {
-        let id = start_job(
+        let run = start_job(
             &queue,
             Job::new(queue_name.clone(), json!({ "index": i })).with_max_attempts(3),
+            Duration::from_millis(200),
         )
         .await;
-        assert!(
-            queue
-                .heartbeat_job(id, Duration::from_millis(200))
-                .await
-                .unwrap()
-        );
-        stale.insert(id);
+        stale.insert(run.id);
     }
     tokio::time::sleep(Duration::from_millis(800)).await;
 
@@ -437,84 +691,55 @@ where
     queue.delete_job(id).await.unwrap();
 }
 
-#[cfg(feature = "postgres")]
-mod postgres_tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_handler_panic_fails_job_and_worker_survives() {
-        handler_panic_fails_job_and_worker_survives(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_handler_panic_is_retried() {
-        handler_panic_is_retried(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_graceful_shutdown_completes_in_flight_job() {
-        graceful_shutdown_completes_in_flight_job(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_reaper_requeues_expired_leases() {
-        reaper_requeues_expired_leases(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_concurrent_reapers_never_double_requeue() {
-        concurrent_reapers_never_double_requeue(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_worker_heartbeat_keeps_long_job_leased() {
-        worker_heartbeat_keeps_long_job_leased(test_utils::setup_postgres_queue().await).await;
-    }
+macro_rules! backend_tests {
+    ($module:ident, $setup:path, $ignore:meta, [$($scenario:ident),* $(,)?]) => {
+        mod $module {
+            use super::*;
+            $(
+                #[tokio::test]
+                #[$ignore]
+                async fn $scenario() {
+                    super::$scenario($setup().await).await;
+                }
+            )*
+        }
+    };
 }
+
+#[cfg(feature = "postgres")]
+backend_tests!(
+    postgres_tests,
+    test_utils::setup_postgres_queue,
+    ignore = "requires PostgreSQL: DATABASE_URL",
+    [
+        handler_panic_fails_job_and_worker_survives,
+        handler_panic_is_retried,
+        graceful_shutdown_completes_in_flight_job,
+        reaper_requeues_expired_leases,
+        claim_lease_protects_job_from_short_reaper_window,
+        stale_heartbeat_cannot_extend_new_run,
+        zero_lease_is_never_reclaimed,
+        other_pools_reaper_does_not_rerun_live_job,
+        concurrent_reapers_never_double_requeue,
+        worker_heartbeat_keeps_long_job_leased,
+    ]
+);
 
 #[cfg(feature = "mysql")]
-mod mysql_tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_handler_panic_fails_job_and_worker_survives() {
-        handler_panic_fails_job_and_worker_survives(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_handler_panic_is_retried() {
-        handler_panic_is_retried(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_graceful_shutdown_completes_in_flight_job() {
-        graceful_shutdown_completes_in_flight_job(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_reaper_requeues_expired_leases() {
-        reaper_requeues_expired_leases(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_concurrent_reapers_never_double_requeue() {
-        concurrent_reapers_never_double_requeue(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_worker_heartbeat_keeps_long_job_leased() {
-        worker_heartbeat_keeps_long_job_leased(test_utils::setup_mysql_queue().await).await;
-    }
-}
+backend_tests!(
+    mysql_tests,
+    test_utils::setup_mysql_queue,
+    ignore = "requires MySQL: MYSQL_DATABASE_URL",
+    [
+        handler_panic_fails_job_and_worker_survives,
+        handler_panic_is_retried,
+        graceful_shutdown_completes_in_flight_job,
+        reaper_requeues_expired_leases,
+        claim_lease_protects_job_from_short_reaper_window,
+        stale_heartbeat_cannot_extend_new_run,
+        zero_lease_is_never_reclaimed,
+        other_pools_reaper_does_not_rerun_live_job,
+        concurrent_reapers_never_double_requeue,
+        worker_heartbeat_keeps_long_job_leased,
+    ]
+);
