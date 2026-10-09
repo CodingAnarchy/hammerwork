@@ -61,6 +61,7 @@
 //!     time_range: Some(time_range),
 //!     queues: Some(vec!["email".to_string(), "notifications".to_string()]),
 //!     granularity: Some("hour".to_string()),
+//!     hours: None,
 //! };
 //!
 //! assert!(query.time_range.is_some());
