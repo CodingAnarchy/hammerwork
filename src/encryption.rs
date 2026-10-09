@@ -1233,4 +1233,84 @@ mod tests {
         );
         assert_eq!(config.compression_enabled, deserialized.compression_enabled);
     }
+
+    #[test]
+    fn test_stats_rates_and_algorithm_usage() {
+        let mut stats = EncryptionStats::new();
+        assert_eq!(stats.encryption_success_rate(), 100.0, "no attempts yet");
+        assert_eq!(stats.decryption_success_rate(), 100.0);
+        assert_eq!(stats.most_used_algorithm(), None);
+
+        stats.record_encryption(&EncryptionAlgorithm::AES256GCM, 100, 2.0);
+        stats.record_encryption(&EncryptionAlgorithm::AES256GCM, 100, 4.0);
+        stats.record_encryption(&EncryptionAlgorithm::ChaCha20Poly1305, 50, 6.0);
+        stats.record_encryption_error();
+        assert_eq!(stats.encryption_success_rate(), 75.0);
+        assert_eq!(stats.avg_encryption_time_ms, 4.0);
+        assert_eq!(stats.total_encrypted_bytes, 250);
+        assert_eq!(stats.most_used_algorithm().as_deref(), Some("AES256GCM"));
+
+        stats.record_decryption(10, 1.0);
+        stats.record_decryption(10, 3.0);
+        stats.record_decryption_error();
+        stats.record_decryption_error();
+        assert_eq!(stats.decryption_success_rate(), 50.0);
+        assert_eq!(stats.avg_decryption_time_ms, 2.0);
+
+        stats.record_key_rotation();
+        stats.record_retention_cleanup(3);
+        stats.record_retention_cleanup(2);
+        assert_eq!(stats.key_rotations, 1);
+        assert_eq!(stats.retention_cleanups, 5);
+    }
+
+    #[test]
+    fn test_update_deletion_time_follows_the_policy() {
+        let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM);
+        let completed = Utc::now() - chrono::Duration::hours(2);
+
+        let mut metadata = EncryptionMetadata::new(
+            &config,
+            vec![],
+            RetentionPolicy::DeleteImmediately,
+            "hash".to_string(),
+        );
+        metadata.update_deletion_time(completed, None);
+        assert_eq!(
+            metadata.delete_at,
+            Some(completed),
+            "deleted once completed"
+        );
+        assert!(metadata.should_delete_now());
+
+        let mut metadata = EncryptionMetadata::new(
+            &config,
+            vec![],
+            RetentionPolicy::UseDefault,
+            "hash".to_string(),
+        );
+        metadata.update_deletion_time(completed, Some(Duration::from_secs(24 * 3600)));
+        assert!(!metadata.should_delete_now(), "the default keeps it a day");
+        assert!(metadata.delete_at.is_some());
+
+        let payload = EncryptedPayload::new(vec![1], vec![2], vec![3], metadata);
+        assert!(!payload.should_delete_now());
+        assert_eq!(payload.decode_ciphertext().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn test_deterministic_keys() {
+        let key = generate_deterministic_key("svc", &["a", "b"]);
+        assert_eq!(key.len(), 32);
+        assert_eq!(key, generate_deterministic_key("svc", &["a", "b"]));
+        assert_ne!(key, generate_deterministic_key("svc", &["a", "c"]));
+        assert_ne!(key, generate_deterministic_key("other", &["a", "b"]));
+
+        let short = generate_deterministic_key_with_size("svc", &["a", "b"], 16);
+        assert_eq!(short, key[..16].to_vec());
+        let long = generate_deterministic_key_with_size("svc", &["a", "b"], 40);
+        assert_eq!(long.len(), 40);
+        assert_eq!(long[..32], key[..]);
+        assert_eq!(long[32..], key[..8], "longer keys repeat the hash");
+    }
 }

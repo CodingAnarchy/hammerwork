@@ -2412,4 +2412,189 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_status_as_str_for_every_status() {
+        for (status, name) in [
+            (JobStatus::Pending, "Pending"),
+            (JobStatus::Running, "Running"),
+            (JobStatus::Completed, "Completed"),
+            (JobStatus::Failed, "Failed"),
+            (JobStatus::Dead, "Dead"),
+            (JobStatus::TimedOut, "TimedOut"),
+            (JobStatus::Retrying, "Retrying"),
+            (JobStatus::Archived, "Archived"),
+        ] {
+            assert_eq!(status.as_str(), name);
+        }
+    }
+
+    #[test]
+    fn test_result_config_builders() {
+        let config = ResultConfig::new(ResultStorage::Database)
+            .with_ttl(std::time::Duration::from_secs(60))
+            .with_max_size(1024);
+        assert_eq!(config.ttl, Some(std::time::Duration::from_secs(60)));
+        assert_eq!(config.max_size_bytes, Some(1024));
+        assert_eq!(ResultConfig::default().storage, ResultStorage::None);
+
+        let job = Job::new("q".to_string(), json!({}));
+        assert!(!job.has_result_storage());
+        assert!(!job.has_result_data());
+        let mut job = job.with_result_config(config);
+        assert!(job.has_result_storage());
+        job.result_data = Some(json!({"ok": true}));
+        assert!(job.has_result_data());
+    }
+
+    #[test]
+    fn test_backoff_builders_set_the_retry_strategy() {
+        use std::time::Duration;
+        let job = Job::new("q".to_string(), json!({})).with_exponential_backoff(
+            Duration::from_secs(1),
+            2.0,
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            job.retry_strategy,
+            Some(RetryStrategy::exponential(
+                Duration::from_secs(1),
+                2.0,
+                Some(Duration::from_secs(60))
+            ))
+        );
+        let job = Job::new("q".to_string(), json!({})).with_linear_backoff(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            None,
+        );
+        assert_eq!(
+            job.retry_strategy.as_ref().unwrap().calculate_delay(3),
+            Duration::from_secs(7),
+            "base + 3 * increment"
+        );
+        let job = Job::new("q".to_string(), json!({}))
+            .with_fibonacci_backoff(Duration::from_secs(1), Some(Duration::from_secs(4)));
+        assert_eq!(
+            job.retry_strategy.as_ref().unwrap().calculate_delay(10),
+            Duration::from_secs(4),
+            "capped at max_delay"
+        );
+    }
+
+    #[test]
+    fn test_dependency_and_workflow_predicates() {
+        let a = Job::new("q".to_string(), json!({}));
+        let b = Job::new("q".to_string(), json!({}));
+        assert!(!a.has_dependencies());
+        assert!(a.dependencies_satisfied());
+        assert!(!a.dependencies_failed());
+        assert_eq!(a.dependency_count(), 0);
+        assert_eq!(a.dependent_count(), 0);
+
+        let mut c = Job::new("q".to_string(), json!({})).depends_on_jobs(&[a.id, b.id]);
+        assert!(c.has_dependencies());
+        assert_eq!(c.dependency_count(), 2);
+        assert!(!c.dependencies_satisfied());
+        c.dependency_status = crate::workflow::DependencyStatus::Satisfied;
+        assert!(c.dependencies_satisfied());
+        c.dependency_status = crate::workflow::DependencyStatus::Failed;
+        assert!(c.dependencies_failed());
+        assert!(!c.dependencies_satisfied());
+
+        // An empty list does not make a job wait.
+        let d = Job::new("q".to_string(), json!({})).depends_on_jobs(&[]);
+        assert!(d.dependencies_satisfied());
+
+        let mut e = Job::new("q".to_string(), json!({}));
+        e.dependents.push(a.id);
+        assert_eq!(e.dependent_count(), 1);
+        assert!(!e.is_part_of_workflow());
+        let e = e.with_workflow(uuid::Uuid::new_v4(), "flow");
+        assert!(e.is_part_of_workflow());
+        assert_eq!(e.workflow_name.as_deref(), Some("flow"));
+    }
+
+    #[test]
+    fn test_tracing_helpers() {
+        let job = Job::new("q".to_string(), json!({}));
+        assert!(!job.has_tracing_info());
+        assert_eq!(job.get_trace_id(), None);
+        assert_eq!(job.get_correlation_id(), None);
+
+        let job = job.with_tracing_id("op-1");
+        assert!(job.has_tracing_info());
+        assert_eq!(job.get_trace_id(), Some("op-1"));
+        assert_eq!(job.get_correlation_id(), Some("op-1"));
+
+        for job in [
+            Job::new("q".to_string(), json!({})).with_span_context("ctx"),
+            Job::new("q".to_string(), json!({})).with_parent_span_id("p"),
+            Job::new("q".to_string(), json!({})).with_correlation_id("c"),
+        ] {
+            assert!(job.has_tracing_info());
+        }
+        assert_eq!(
+            Job::new("q".to_string(), json!({}))
+                .with_span_context("ctx")
+                .span_context
+                .as_deref(),
+            Some("ctx")
+        );
+    }
+
+    #[test]
+    fn test_next_run_needs_a_valid_schedule_on_a_recurring_job() {
+        let mut job = Job::new("q".to_string(), json!({}));
+        assert_eq!(job.calculate_next_run(), None, "not recurring");
+        assert_eq!(job.prepare_for_next_run(), None);
+
+        job.recurring = true;
+        assert_eq!(job.calculate_next_run(), None, "no schedule");
+        job.cron_schedule = Some("not a cron expression".to_string());
+        assert!(matches!(job.get_cron_schedule(), Some(Err(_))));
+        assert_eq!(job.calculate_next_run(), None, "invalid schedule");
+
+        job.cron_schedule = Some("0 0 * * * *".to_string());
+        job.timezone = Some("America/New_York".to_string());
+        let next = job.calculate_next_run().expect("next run");
+        assert!(next > chrono::Utc::now());
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn test_encryption_accessors_and_cleanup() {
+        use crate::encryption::{EncryptionAlgorithm, EncryptionConfig, RetentionPolicy};
+
+        let job = Job::new("q".to_string(), json!({}));
+        assert!(!job.has_pii_fields());
+        assert!(!job.is_payload_encrypted());
+        assert!(job.get_pii_fields().is_empty());
+        assert!(job.get_encryption_config().is_none());
+        assert!(job.get_retention_policy().is_none());
+        assert!(!job.should_cleanup_encrypted_data());
+
+        let config = EncryptionConfig::new(EncryptionAlgorithm::ChaCha20Poly1305);
+        let job = Job::new("q".to_string(), json!({}))
+            .with_encryption(config.clone())
+            .with_pii_fields(vec!["ssn"])
+            .with_retention_policy(RetentionPolicy::DeleteAt(
+                chrono::Utc::now() - chrono::Duration::minutes(1),
+            ));
+        assert!(job.has_pii_fields());
+        assert_eq!(job.get_pii_fields(), ["ssn".to_string()]);
+        assert_eq!(
+            job.get_encryption_config().unwrap().algorithm,
+            EncryptionAlgorithm::ChaCha20Poly1305
+        );
+        assert!(job.should_cleanup_encrypted_data(), "retention ended");
+
+        let kept = Job::new("q".to_string(), json!({}))
+            .with_retention_policy(RetentionPolicy::KeepIndefinitely);
+        assert!(!kept.should_cleanup_encrypted_data());
+        assert_eq!(
+            kept.get_retention_policy(),
+            Some(&RetentionPolicy::KeepIndefinitely)
+        );
+    }
 }

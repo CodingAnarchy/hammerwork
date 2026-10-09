@@ -947,6 +947,35 @@ pub(crate) async fn end_transaction<DB: sqlx::Database, T>(
 
 /// The JSON stored in the `retry_strategy` column for `job`.
 ///
+/// Validate a job passed to [`DatabaseQueue::enqueue_cron_job`] and mark it recurring.
+///
+/// The job must have a valid cron schedule (in its timezone, if set). When it has no
+/// `next_run_at` yet, the next execution is computed and the job is scheduled for it.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn prepare_cron_job(mut job: Job) -> Result<Job> {
+    let schedule = match job.get_cron_schedule() {
+        Some(Ok(schedule)) => schedule,
+        Some(Err(e)) => {
+            return Err(crate::HammerworkError::Queue {
+                message: format!("Invalid cron schedule {:?}: {}", job.cron_schedule, e),
+            });
+        }
+        None => {
+            return Err(crate::HammerworkError::Queue {
+                message: "Job must have a cron schedule".to_string(),
+            });
+        }
+    };
+    job.recurring = true;
+    if job.next_run_at.is_none() {
+        job.next_run_at = schedule.next_execution_from_now();
+        if let Some(next_run_at) = job.next_run_at {
+            job.scheduled_at = next_run_at;
+        }
+    }
+    Ok(job)
+}
+
 /// A [`RetryStrategy::Custom`](crate::retry::RetryStrategy::Custom) holds a closure and
 /// cannot be persisted, so enqueueing a job that carries one is rejected; set it as the
 /// worker's default with

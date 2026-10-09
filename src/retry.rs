@@ -265,7 +265,7 @@ impl<'de> Deserialize<'de> for JitterType {
 /// // Simple fixed delay
 /// let fixed = RetryStrategy::Fixed(Duration::from_secs(30));
 ///
-/// // Linear backoff: 10s, 20s, 30s, 40s...
+/// // Linear backoff (base + attempt × increment): 20s, 30s, 40s...
 /// let linear = RetryStrategy::Linear {
 ///     base: Duration::from_secs(10),
 ///     increment: Duration::from_secs(10),

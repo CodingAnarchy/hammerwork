@@ -1348,4 +1348,149 @@ mod tests {
         assert_eq!(deserialized.max_payload_size_bytes, 128 * 1024);
         assert!(deserialized.log_events);
     }
+
+    #[test]
+    fn test_event_type_display_matches_serde_name() {
+        for event_type in [
+            JobLifecycleEventType::Enqueued,
+            JobLifecycleEventType::Started,
+            JobLifecycleEventType::Completed,
+            JobLifecycleEventType::Failed,
+            JobLifecycleEventType::Retried,
+            JobLifecycleEventType::Dead,
+            JobLifecycleEventType::TimedOut,
+            JobLifecycleEventType::Cancelled,
+            JobLifecycleEventType::Archived,
+            JobLifecycleEventType::Restored,
+        ] {
+            assert_eq!(
+                serde_json::to_value(&event_type).unwrap(),
+                serde_json::Value::String(event_type.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_dead_and_timed_out_builders() {
+        let job_id = Uuid::new_v4();
+        let error = JobError {
+            message: "gave up".to_string(),
+            error_type: Some("fatal".to_string()),
+            details: None,
+            retry_attempt: Some(3),
+        };
+        let dead = JobLifecycleEvent::dead(job_id, "q".to_string(), JobPriority::Low, error);
+        assert_eq!(dead.event_type, JobLifecycleEventType::Dead);
+        assert_eq!(dead.job_id, job_id);
+        assert_eq!(dead.priority, JobPriority::Low);
+        assert_eq!(dead.error.as_ref().unwrap().retry_attempt, Some(3));
+
+        let timed_out =
+            JobLifecycleEvent::timed_out(job_id, "q".to_string(), JobPriority::High, 1500);
+        assert_eq!(timed_out.event_type, JobLifecycleEventType::TimedOut);
+        assert_eq!(timed_out.processing_time_ms, Some(1500));
+        assert_eq!(timed_out.metadata["timeout_duration_ms"], "1500");
+        let error = timed_out.error.unwrap();
+        assert_eq!(error.message, "Job timed out after 1500ms");
+        assert_eq!(error.error_type.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn test_filter_rejects_each_mismatch() {
+        let mut event =
+            JobLifecycleEvent::started(Uuid::new_v4(), "emails".to_string(), JobPriority::High);
+        event.metadata.insert("tenant".to_string(), "a".to_string());
+
+        assert!(EventFilter::new().matches(&event));
+        assert!(
+            !EventFilter::new()
+                .with_queue_names(vec!["reports".to_string()])
+                .matches(&event)
+        );
+        assert!(
+            !EventFilter::new()
+                .with_priorities(vec![JobPriority::Low])
+                .matches(&event)
+        );
+        assert!(
+            EventFilter::new()
+                .with_metadata_filter("tenant".to_string(), "a".to_string())
+                .matches(&event)
+        );
+        assert!(
+            !EventFilter::new()
+                .with_metadata_filter("tenant".to_string(), "b".to_string())
+                .matches(&event),
+            "a different metadata value"
+        );
+        assert!(
+            !EventFilter::new()
+                .with_metadata_filter("region".to_string(), "x".to_string())
+                .matches(&event),
+            "missing metadata key"
+        );
+        // Without a processing time the time range does not apply.
+        assert!(
+            EventFilter::new()
+                .with_processing_time_range(Some(10), Some(20))
+                .matches(&event)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_payloads_are_dropped_or_truncated_per_config() {
+        let event_with_payload = |payload: serde_json::Value| {
+            let mut event =
+                JobLifecycleEvent::started(Uuid::new_v4(), "q".to_string(), JobPriority::Normal);
+            event.payload = Some(payload);
+            event
+        };
+
+        // Not included by default.
+        let manager = EventManager::new_default();
+        let mut subscription = manager.subscribe(EventFilter::new()).await.unwrap();
+        manager
+            .publish_event(event_with_payload(serde_json::json!({"a": 1})))
+            .await
+            .unwrap();
+        assert!(
+            subscription
+                .receiver
+                .recv()
+                .await
+                .unwrap()
+                .payload
+                .is_none()
+        );
+
+        // Included up to the size limit, dropped (and noted) above it.
+        let manager = EventManager::new(EventConfig {
+            include_payload_default: true,
+            max_payload_size_bytes: 20,
+            log_events: true,
+            ..EventConfig::default()
+        });
+        let mut subscription = manager.subscribe(EventFilter::new()).await.unwrap();
+        manager
+            .publish_event(event_with_payload(serde_json::json!({"a": 1})))
+            .await
+            .unwrap();
+        let small = subscription.receiver.recv().await.unwrap();
+        assert_eq!(small.payload, Some(serde_json::json!({"a": 1})));
+        assert!(!small.metadata.contains_key("payload_truncated"));
+
+        manager
+            .publish_event(event_with_payload(
+                serde_json::json!({"text": "x".repeat(100)}),
+            ))
+            .await
+            .unwrap();
+        let large = subscription.receiver.recv().await.unwrap();
+        assert!(large.payload.is_none());
+        assert!(
+            large.metadata["payload_truncated"].contains("exceeded limit 20"),
+            "{:?}",
+            large.metadata
+        );
+    }
 }

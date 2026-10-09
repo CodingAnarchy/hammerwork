@@ -1629,18 +1629,12 @@ impl DatabaseQueue for TestQueue {
         let mut counts = HashMap::new();
 
         if let Some(queue_jobs) = storage.queues.get(queue_name) {
+            // Keyed by the stored status name ("Pending", ...) like the database
+            // backends, which group by the status column; empty statuses are omitted.
             for (status, jobs) in queue_jobs {
-                let status_str = match status {
-                    JobStatus::Pending => "pending",
-                    JobStatus::Running => "running",
-                    JobStatus::Completed => "completed",
-                    JobStatus::Failed => "failed",
-                    JobStatus::Dead => "dead",
-                    JobStatus::TimedOut => "timed_out",
-                    JobStatus::Retrying => "retrying",
-                    JobStatus::Archived => "archived",
-                };
-                counts.insert(status_str.to_string(), jobs.len() as u64);
+                if !jobs.is_empty() {
+                    counts.insert(status.as_str().to_string(), jobs.len() as u64);
+                }
             }
         }
 
@@ -2218,6 +2212,12 @@ impl DatabaseQueue for TestQueue {
                             if let Some(j) = storage.jobs.get_mut(&job.id) {
                                 j.error_message = Some("Dependency failed".to_string());
                                 j.failed_at = Some(current_time);
+                                // As in the database backends: a job still waiting on
+                                // its dependencies records that they failed.
+                                if j.dependency_status == crate::workflow::DependencyStatus::Waiting
+                                {
+                                    j.dependency_status = crate::workflow::DependencyStatus::Failed;
+                                }
                             }
                             failed_jobs.push(job.id);
                         }

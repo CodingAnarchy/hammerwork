@@ -702,9 +702,9 @@ async fn test_queue_statistics() {
 
     // Get job counts by status
     let counts = queue.get_job_counts_by_status("stats_queue").await.unwrap();
-    assert_eq!(counts["pending"], 5);
-    assert_eq!(counts["completed"], 3);
-    assert_eq!(counts["dead"], 2);
+    assert_eq!(counts["Pending"], 5);
+    assert_eq!(counts["Completed"], 3);
+    assert_eq!(counts["Dead"], 2);
 
     // Get processing times
     let since = clock.now() - Duration::hours(1);
