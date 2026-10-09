@@ -435,4 +435,28 @@ mod doc_examples {
 
     #[doc = include_str!("../docs/priority-system.md")]
     struct PrioritySystemDoctests;
+
+    #[doc = include_str!("../docs/cron-scheduling.md")]
+    struct CronSchedulingDoctests;
+
+    #[doc = include_str!("../docs/tracing.md")]
+    struct TracingDoctests;
+
+    #[doc = include_str!("../docs/job-spawning.md")]
+    struct JobSpawningDoctests;
+
+    #[doc = include_str!("../docs/workflows.md")]
+    struct WorkflowsDoctests;
+
+    #[doc = include_str!("../docs/worker-configuration.md")]
+    struct WorkerConfigurationDoctests;
+
+    #[doc = include_str!("../docs/batch-operations.md")]
+    struct BatchOperationsDoctests;
+
+    #[doc = include_str!("../docs/archiving.md")]
+    struct ArchivingDoctests;
+
+    #[doc = include_str!("../docs/encryption.md")]
+    struct EncryptionDoctests;
 }

@@ -8,10 +8,10 @@ Before starting, you need to set up your database schema using the migration too
 
 ```bash
 # For PostgreSQL
-cargo hammerwork migrate --database-url postgresql://localhost/hammerwork
+cargo hammerwork migration run --database-url postgresql://localhost/hammerwork
 
 # For MySQL  
-cargo hammerwork migrate --database-url mysql://localhost/hammerwork
+cargo hammerwork migration run --database-url mysql://localhost/hammerwork
 ```
 
 ## Dependencies
@@ -371,7 +371,7 @@ DATABASE_URL=mysql://username:password@localhost/hammerwork
 
 ```bash
 # Set up the database first
-cargo hammerwork migrate --database-url postgresql://localhost/hammerwork
+cargo hammerwork migration run --database-url postgresql://localhost/hammerwork
 
 # Run PostgreSQL example
 DATABASE_URL=postgresql://localhost/hammerwork cargo run --example postgres_example --features postgres
