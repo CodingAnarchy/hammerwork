@@ -46,6 +46,10 @@ let custom_job = Job::new("custom".to_string(), payload.clone())
 
 Ensures high-priority jobs are processed more frequently while preventing starvation of low-priority jobs.
 
+Each time a worker polls, it picks one of the priorities that currently have a runnable job, with probability `weight / (sum of the weights of those priorities)`, and takes the oldest job of that priority. A priority with a non-zero weight is therefore picked regularly however many higher-priority jobs are queued: with the weights below and Critical, Normal and Background jobs all waiting, Background is picked 1 time in 61. To give a priority a bigger share, raise its weight. A weight of `0` means "only when nothing with a weight is runnable".
+
+`PriorityWeights::with_fairness_factor` is deprecated: it was documented as a fairness knob but never applied, and the weighted pick above already prevents starvation. Configuration files that set `fairness_factor` still load; the value is ignored.
+
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};
 # #[allow(unused_imports)] use serde_json::json;
@@ -62,8 +66,7 @@ let priority_weights = PriorityWeights::new()
     .with_weight(JobPriority::High, 20)         // High jobs are 20x more likely than normal
     .with_weight(JobPriority::Normal, 10)       // Normal jobs baseline weight
     .with_weight(JobPriority::Low, 5)           // Low jobs are 2x less likely than normal
-    .with_weight(JobPriority::Background, 1)    // Background jobs are 10x less likely than normal
-    .with_fairness_factor(0.1); // 10% chance to select from lower priorities
+    .with_weight(JobPriority::Background, 1);   // Background jobs are 10x less likely than normal
 
 let worker = Worker::new(queue, "priority_queue".to_string(), handler)
     .with_priority_weights(priority_weights);
@@ -140,8 +143,7 @@ let high_throughput_weights = PriorityWeights::new()
     .with_weight(JobPriority::High, 50)         // High weight for important jobs
     .with_weight(JobPriority::Normal, 10)       // Standard baseline
     .with_weight(JobPriority::Low, 2)           // Very low weight for analytics
-    .with_weight(JobPriority::Background, 1)    // Minimal background processing
-    .with_fairness_factor(0.05); // Only 5% fairness to maximize critical job processing
+    .with_weight(JobPriority::Background, 1);   // Minimal background processing
 # Ok(())
 # }
 ```
@@ -163,8 +165,7 @@ let balanced_weights = PriorityWeights::new()
     .with_weight(JobPriority::High, 15)         // Moderate boost for high
     .with_weight(JobPriority::Normal, 10)       // Baseline
     .with_weight(JobPriority::Low, 7)           // Small reduction for low
-    .with_weight(JobPriority::Background, 3)    // Background jobs still get reasonable processing
-    .with_fairness_factor(0.2); // 20% fairness ensures good coverage
+    .with_weight(JobPriority::Background, 3);   // Background jobs still get reasonable processing
 # Ok(())
 # }
 ```
@@ -186,8 +187,7 @@ let background_heavy_weights = PriorityWeights::new()
     .with_weight(JobPriority::High, 15)         // High gets some priority
     .with_weight(JobPriority::Normal, 10)       // Standard baseline
     .with_weight(JobPriority::Low, 8)           // Low priority gets good processing
-    .with_weight(JobPriority::Background, 6)    // Background jobs get substantial processing time
-    .with_fairness_factor(0.3); // High fairness ensures background jobs aren't starved
+    .with_weight(JobPriority::Background, 6);   // Background jobs get substantial processing time
 # Ok(())
 # }
 ```
@@ -242,14 +242,13 @@ if !priority_stats.check_starvation(2.0).is_empty() { // 2% threshold
     eprintln!("WARNING: Priority starvation detected!");
     eprintln!("Lower priority jobs may not be getting processed adequately");
 
-    // Consider adjusting weights or fairness factor
+    // Consider raising the weights of the lower priorities
     let adjusted_weights = PriorityWeights::new()
         .with_weight(JobPriority::Critical, 30)  // Reduce critical weight
         .with_weight(JobPriority::High, 15)      // Reduce high weight
         .with_weight(JobPriority::Normal, 10)
         .with_weight(JobPriority::Low, 8)
-        .with_weight(JobPriority::Background, 5)
-        .with_fairness_factor(0.25); // Increase fairness
+        .with_weight(JobPriority::Background, 5);
 }
 # Ok(())
 # }
@@ -328,7 +327,6 @@ let background_worker = Worker::new(queue.clone(), "maintenance".to_string(), ma
             .with_weight(JobPriority::Normal, 2)
             .with_weight(JobPriority::Low, 2)
             .with_weight(JobPriority::Background, 1)
-            .with_fairness_factor(0.5) // Very fair processing
     );
 
 let email_worker = Worker::new(queue.clone(), "email".to_string(), email_handler)
@@ -339,7 +337,6 @@ let email_worker = Worker::new(queue.clone(), "email".to_string(), email_handler
             .with_weight(JobPriority::Normal, 10)
             .with_weight(JobPriority::Low, 5)
             .with_weight(JobPriority::Background, 2)
-            .with_fairness_factor(0.15)
     );
 # Ok(())
 # }
@@ -403,7 +400,6 @@ let worker = Worker::new(queue, "priority_limited".to_string(), handler)
             .with_weight(JobPriority::Normal, 10)
             .with_weight(JobPriority::Low, 5)
             .with_weight(JobPriority::Background, 1)
-            .with_fairness_factor(0.1)
     )
     .with_rate_limit(RateLimit::per_second(10)); // Overall rate limit
 
@@ -543,7 +539,7 @@ async fn check_priority_health(
             "critical_percentage": stats.priority_distribution.get(&JobPriority::Critical),
             "background_percentage": stats.priority_distribution.get(&JobPriority::Background),
             "total_jobs": stats.job_counts.values().sum::<u64>(),
-            "recommendation": "Consider adjusting priority weights or fairness factor"
+            "recommendation": "Consider raising the weights of the lower priorities"
         });
 
         // Send alert via webhook (implement based on your alerting setup)

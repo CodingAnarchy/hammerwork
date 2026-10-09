@@ -133,8 +133,7 @@ async fn demonstrate_weighted_scheduling(
         .with_weight(JobPriority::High, 20) // High weight
         .with_weight(JobPriority::Normal, 5) // Normal weight
         .with_weight(JobPriority::Low, 2) // Low weight
-        .with_weight(JobPriority::Background, 1) // Minimal weight
-        .with_fairness_factor(0.1); // 10% fairness to prevent starvation
+        .with_weight(JobPriority::Background, 1); // Minimal weight, but never starved
 
     info!("🎛️  Priority weights configured:");
     info!(
@@ -150,10 +149,6 @@ async fn demonstrate_weighted_scheduling(
     info!(
         "   Background: {}x weight",
         weights.get_weight(JobPriority::Background)
-    );
-    info!(
-        "   Fairness factor: {:.1}%",
-        weights.fairness_factor() * 100.0
     );
 
     // Create worker with weighted priority
@@ -348,7 +343,7 @@ async fn show_priority_statistics(
                         let starved = priority_stats.check_starvation(5.0); // 5% threshold
                         if !starved.is_empty() {
                             info!("   ⚠️  Potential starvation detected for: {:?}", starved);
-                            info!("      Consider adjusting priority weights or fairness factor");
+                            info!("      Consider raising the weights of the starved priorities");
                         }
                     }
                 }
@@ -437,8 +432,7 @@ async fn demonstrate_worker_pool_priorities(
     // Worker 3: Custom weights for specialized tasks
     let custom_weights = PriorityWeights::new()
         .with_weight(JobPriority::Critical, 50)
-        .with_weight(JobPriority::High, 15)
-        .with_fairness_factor(0.2);
+        .with_weight(JobPriority::High, 15);
 
     let custom_worker = Worker::new(queue.clone(), "cleanup".to_string(), handler)
         .with_priority_weights(custom_weights)

@@ -253,8 +253,7 @@ where
         .with_scale_down_threshold(1)
         .with_cooldown_period(Duration::from_secs(45))
         .with_scale_step(2)
-        .with_evaluation_window(Duration::from_secs(20))
-        .with_idle_timeout(Duration::from_secs(180));
+        .with_evaluation_window(Duration::from_secs(20));
 
     let mut pool = WorkerPool::new()
         .with_worker_template(worker_template.clone())

@@ -81,7 +81,6 @@ static_dir = "./assets"
 enable_cors = false
 # Other origins whose pages may change data / open WebSockets (and, with enable_cors, read the API)
 allowed_origins = []
-request_timeout = "30s"
 
 [auth]
 enabled = true
@@ -130,7 +129,6 @@ hammerwork-web = { version = "1.15", features = ["postgres"] }
 
 ```rust
 use hammerwork_web::{WebDashboard, DashboardConfig};
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -143,7 +141,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enable_cors: true,
         // CORS is only granted to listed origins; enabling it without any is an error.
         allowed_origins: vec!["https://ops.example.com".to_string()],
-        request_timeout: Duration::from_secs(30),
         ..Default::default()
     };
 
@@ -490,7 +487,7 @@ server {
 
 - **Connection Pooling**: Tune `pool_size` based on concurrent users
 - **WebSocket Limits**: Configure `max_connections` for your use case  
-- **Request Timeouts**: Set appropriate `request_timeout` for your network
+- **Request Timeouts**: The dashboard applies none of its own (`request_timeout` is deprecated and ignored); set them on a reverse proxy in front of it
 - **Database Indexes**: Ensure proper indexes on hammerwork_jobs table
 - **Static Assets**: Use a CDN for production deployments
 - **Monitoring**: Enable structured logging and metrics collection

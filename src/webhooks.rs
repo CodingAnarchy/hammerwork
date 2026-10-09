@@ -95,15 +95,15 @@
 //! });
 //! ```
 
-use crate::events::{EventFilter, EventManager, EventSubscription, JobLifecycleEvent};
-use crate::task_tracker::TaskTracker;
+use crate::events::{EventFilter, EventManager, JobLifecycleEvent};
+use crate::task_tracker::{ListenerHandle, TaskTracker, clamp_permits};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
-    sync::{RwLock, Semaphore, broadcast},
-    time::{sleep, timeout},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, broadcast, oneshot},
+    time::{Instant, sleep, timeout_at},
 };
 use uuid::Uuid;
 
@@ -190,7 +190,11 @@ pub struct WebhookConfig {
     pub retry_policy: RetryPolicy,
     /// Authentication configuration
     pub auth: Option<WebhookAuth>,
-    /// Timeout for HTTP requests
+    /// Timeout for one delivery attempt, in seconds: sending the request and reading
+    /// the response, body included. `0` (also the value when a configuration file
+    /// leaves it out) uses the manager's
+    /// [`default_timeout_secs`](WebhookManagerConfig::default_timeout_secs).
+    #[serde(default)]
     pub timeout_secs: u64,
     /// Whether this webhook is currently enabled
     pub enabled: bool,
@@ -401,6 +405,12 @@ pub struct WebhookStats {
     pub last_success_at: Option<DateTime<Utc>>,
     /// Last failure timestamp
     pub last_failure_at: Option<DateTime<Utc>>,
+    /// Events this webhook never attempted because its listener fell behind: while
+    /// [`max_pending_deliveries`](WebhookManagerConfig::max_pending_deliveries)
+    /// deliveries are pending the listener waits, and events that overflow the event
+    /// manager's buffer in the meantime are dropped (oldest first).
+    #[serde(default)]
+    pub dropped_events: u64,
     /// Time window these statistics cover
     pub calculated_at: DateTime<Utc>,
 }
@@ -452,6 +462,7 @@ pub struct WebhookManagerStats {
 ///     max_response_body_size: 64 * 1024,
 ///     log_deliveries: true,
 ///     default_timeout_secs: 30,
+///     max_pending_deliveries: 1_000,
 ///     user_agent: "MyApp/1.0".to_string(),
 /// };
 /// let webhook_manager = WebhookManager::new(event_manager, config);
@@ -479,8 +490,8 @@ pub struct WebhookManager {
     http_client: Client,
     /// Active webhook configurations
     webhooks: Arc<RwLock<HashMap<Uuid, WebhookConfig>>>,
-    /// Active event subscriptions for webhooks
-    subscriptions: Arc<RwLock<HashMap<Uuid, EventSubscription>>>,
+    /// The running listener of each webhook
+    subscriptions: Arc<RwLock<HashMap<Uuid, ListenerHandle>>>,
     /// Event manager for subscribing to events
     event_manager: Arc<EventManager>,
     /// Rate limiting semaphore for concurrent deliveries
@@ -498,14 +509,29 @@ pub struct WebhookManager {
 /// Configuration for the webhook manager
 #[derive(Debug, Clone)]
 pub struct WebhookManagerConfig {
-    /// Maximum number of concurrent webhook deliveries
+    /// Maximum number of HTTP requests in flight at once, across all webhooks.
+    /// A delivery holds a slot only while a request is in flight, not while it waits
+    /// to retry.
     pub max_concurrent_deliveries: usize,
-    /// Maximum response body size to store (in bytes)
+    /// Maximum response body size to read and store (in bytes); the rest of a
+    /// longer body is not read.
     pub max_response_body_size: usize,
     /// Whether to log webhook deliveries
     pub log_deliveries: bool,
-    /// Default timeout for webhook requests
+    /// Timeout, in seconds, for webhooks whose
+    /// [`timeout_secs`](WebhookConfig::timeout_secs) is `0`.
     pub default_timeout_secs: u64,
+    /// Maximum number of deliveries pending per webhook: waiting for a request slot,
+    /// in flight, or waiting to retry.
+    ///
+    /// When a webhook reaches it (for example because its endpoint is down and every
+    /// delivery is retrying), its listener stops taking new events until a delivery
+    /// finishes. Events keep arriving in the [`EventManager`]'s broadcast buffer
+    /// (`EventConfig::max_buffer_size`); once that overflows, the oldest events are
+    /// dropped for this webhook, logged at `warn` and counted in
+    /// [`WebhookStats::dropped_events`]. Memory use stays bounded however long the
+    /// endpoint is down. Values below 1 are treated as 1.
+    pub max_pending_deliveries: usize,
     /// User agent string for webhook requests
     pub user_agent: String,
 }
@@ -517,6 +543,7 @@ impl Default for WebhookManagerConfig {
             max_response_body_size: 64 * 1024, // 64KB
             log_deliveries: true,
             default_timeout_secs: 30,
+            max_pending_deliveries: 1_000,
             user_agent: format!("hammerwork-webhooks/{}", env!("CARGO_PKG_VERSION")),
         }
     }
@@ -528,8 +555,9 @@ impl From<&crate::config::WebhookGlobalSettings> for WebhookManagerConfig {
             max_concurrent_deliveries: settings.max_concurrent_deliveries,
             max_response_body_size: settings.max_response_body_size,
             log_deliveries: settings.log_deliveries,
+            default_timeout_secs: settings.default_timeout_secs,
+            max_pending_deliveries: settings.max_pending_deliveries,
             user_agent: settings.user_agent.clone(),
-            ..Self::default()
         }
     }
 }
@@ -539,15 +567,55 @@ impl From<&crate::config::WebhookGlobalSettings> for WebhookManagerConfig {
 /// `0` permits would deadlock every delivery task, and more than
 /// `Semaphore::MAX_PERMITS` panics inside tokio.
 fn clamp_delivery_permits(configured: usize) -> usize {
-    let permits = configured.clamp(1, Semaphore::MAX_PERMITS);
-    if permits != configured {
-        tracing::warn!(
-            configured,
-            effective = permits,
-            "max_concurrent_deliveries is out of range, clamping"
-        );
+    clamp_permits(configured, "max_concurrent_deliveries")
+}
+
+/// The time allowed for one delivery attempt of `webhook`.
+fn attempt_timeout(webhook: &WebhookConfig, config: &WebhookManagerConfig) -> Duration {
+    let secs = if webhook.timeout_secs == 0 {
+        config.default_timeout_secs
+    } else {
+        webhook.timeout_secs
+    };
+    Duration::from_secs(secs)
+}
+
+/// Read at most `max_bytes` of `response`'s body. Stops reading (and drops the
+/// connection) once the limit is reached, so a huge or endless body costs nothing more.
+async fn read_body_limited(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> reqwest::Result<String> {
+    let mut body = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = response.chunk().await? {
+        let room = max_bytes.saturating_sub(body.len());
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
     }
-    permits
+    Ok(response_body_text(body, truncated))
+}
+
+/// The response body as text, marked when it was cut off.
+///
+/// The cut can fall inside a multi-byte UTF-8 character; the incomplete character is
+/// dropped rather than replaced. Invalid UTF-8 elsewhere becomes U+FFFD.
+fn response_body_text(mut body: Vec<u8>, truncated: bool) -> String {
+    if truncated
+        && let Err(e) = std::str::from_utf8(&body)
+        && e.error_len().is_none()
+    {
+        body.truncate(e.valid_up_to());
+    }
+    let mut text = String::from_utf8_lossy(&body).into_owned();
+    if truncated {
+        text.push_str("... [truncated]");
+    }
+    text
 }
 
 impl WebhookManager {
@@ -642,24 +710,25 @@ impl WebhookManager {
 
     /// Add a new webhook configuration.
     ///
+    /// The webhook receives every matching event published after this returns.
+    /// Adding a webhook with the id of an existing one replaces it (and resets its
+    /// statistics); use [`update_webhook`](Self::update_webhook) to change a webhook
+    /// without a gap in delivery.
+    ///
     /// Fails with a configuration error when the webhook is invalid (see
     /// [`WebhookConfig::validate`]), for example an invalid payload template.
     pub async fn add_webhook(&self, webhook: WebhookConfig) -> crate::Result<()> {
         webhook.validate()?;
         let webhook_id = webhook.id;
 
-        // Subscribe to events for this webhook
+        // Subscribe before returning, and hand this receiver to the listener: events
+        // published from now on are buffered for it even before its task first runs.
         let subscription = self.event_manager.subscribe(webhook.filter.clone()).await?;
+        let (handle, stop) = ListenerHandle::new(subscription.id);
 
-        // Store webhook and subscription
         {
             let mut webhooks = self.webhooks.write().await;
             webhooks.insert(webhook_id, webhook.clone());
-        }
-
-        {
-            let mut subscriptions = self.subscriptions.write().await;
-            subscriptions.insert(webhook_id, subscription);
         }
 
         // Initialize statistics
@@ -676,13 +745,21 @@ impl WebhookManager {
                     avg_response_time_ms: 0.0,
                     last_success_at: None,
                     last_failure_at: None,
+                    dropped_events: 0,
                     calculated_at: Utc::now(),
                 },
             );
         }
 
-        // Start delivery task for this webhook
-        self.start_webhook_delivery_task(webhook_id).await;
+        // Replacing the handle of an existing listener stops that listener.
+        let replaced = self.subscriptions.write().await.insert(webhook_id, handle);
+        if let Some(replaced) = replaced {
+            self.event_manager
+                .unsubscribe(replaced.subscription_id)
+                .await?;
+        }
+
+        self.start_webhook_delivery_task(webhook_id, subscription.receiver, stop);
 
         if self.config.log_deliveries {
             // The URL path of chat webhooks (Slack, Discord, Teams) is a credential.
@@ -696,18 +773,22 @@ impl WebhookManager {
         Ok(())
     }
 
-    /// Remove a webhook configuration
+    /// Remove a webhook configuration.
+    ///
+    /// Its listener stops right away. Deliveries already started finish (including
+    /// their retries).
     pub async fn remove_webhook(&self, webhook_id: Uuid) -> crate::Result<()> {
         {
             let mut webhooks = self.webhooks.write().await;
             webhooks.remove(&webhook_id);
         }
 
-        {
-            let mut subscriptions = self.subscriptions.write().await;
-            if let Some(subscription) = subscriptions.remove(&webhook_id) {
-                self.event_manager.unsubscribe(subscription.id).await?;
-            }
+        // Dropping the handle stops the listener.
+        let handle = self.subscriptions.write().await.remove(&webhook_id);
+        if let Some(handle) = handle {
+            self.event_manager
+                .unsubscribe(handle.subscription_id)
+                .await?;
         }
 
         {
@@ -760,19 +841,26 @@ impl WebhookManager {
         }
     }
 
-    /// Update webhook configuration
+    /// Update a webhook's configuration.
+    ///
+    /// The new configuration (URL, filter, method, auth, ...) applies to every event
+    /// the webhook's listener handles from now on. The listener and the statistics
+    /// are kept, so no event is missed or delivered twice because of the update.
+    /// Deliveries already started finish with the configuration they started with.
+    /// A webhook with an unknown id is added.
     pub async fn update_webhook(&self, webhook: WebhookConfig) -> crate::Result<()> {
-        let webhook_id = webhook.id;
         // Validate first so an invalid update leaves the existing webhook in place.
         webhook.validate()?;
 
-        // Remove existing webhook
-        self.remove_webhook(webhook_id).await?;
+        {
+            let mut webhooks = self.webhooks.write().await;
+            if let Some(existing) = webhooks.get_mut(&webhook.id) {
+                *existing = webhook;
+                return Ok(());
+            }
+        }
 
-        // Add updated webhook
-        self.add_webhook(webhook).await?;
-
-        Ok(())
+        self.add_webhook(webhook).await
     }
 
     /// Get webhook statistics
@@ -807,106 +895,116 @@ impl WebhookManager {
         }
     }
 
-    /// Start delivery task for a specific webhook
-    async fn start_webhook_delivery_task(&self, webhook_id: Uuid) {
+    /// Start the listener of a webhook: it reads `receiver` until `stop` fires (its
+    /// [`ListenerHandle`] is dropped) and starts a delivery for every matching event.
+    fn start_webhook_delivery_task(
+        &self,
+        webhook_id: Uuid,
+        mut receiver: broadcast::Receiver<JobLifecycleEvent>,
+        mut stop: oneshot::Receiver<()>,
+    ) {
         let webhooks = self.webhooks.clone();
-        let subscriptions = self.subscriptions.clone();
         let http_client = self.http_client.clone();
         let stats = self.stats.clone();
         let delivery_semaphore = self.delivery_semaphore.clone();
         let config = self.config.clone();
-
         let deliveries = self.deliveries.clone();
+        let pending = Arc::new(Semaphore::new(clamp_permits(
+            config.max_pending_deliveries,
+            "max_pending_deliveries",
+        )));
 
         self.listeners.spawn("listener", async move {
-            // Subscribe once and keep the receiver for the lifetime of the listener.
-            // Re-subscribing on every iteration would skip every event published
-            // while the previous one was being handled.
-            let mut receiver = {
-                let subscriptions = subscriptions.read().await;
-                match subscriptions.get(&webhook_id) {
-                    Some(subscription) => subscription.receiver.resubscribe(),
-                    None => return,
-                }
-            };
-
+            // Whether the listener is waiting for pending deliveries (logged once per pause).
+            let mut paused = false;
             loop {
-                // Get webhook configuration
-                let webhook = {
-                    let webhooks = webhooks.read().await;
-                    match webhooks.get(&webhook_id) {
-                        Some(webhook) => webhook.clone(),
-                        // Webhook removed, exit task
-                        None => break,
-                    }
+                let received = tokio::select! {
+                    biased;
+                    _ = &mut stop => break,
+                    received = receiver.recv() => received,
                 };
-
-                // Exit once the subscription is removed
-                if !subscriptions.read().await.contains_key(&webhook_id) {
-                    break;
-                }
-
-                // Wait for events
-                match receiver.recv().await {
-                    Ok(event) => {
-                        // A disabled webhook drops events but keeps listening, so that
-                        // enabling it again resumes delivery. Check the current state:
-                        // it may have changed while waiting for the event.
-                        let webhook = match webhooks.read().await.get(&webhook_id) {
-                            Some(current) => current.clone(),
-                            None => break,
-                        };
-                        if webhook.enabled && webhook.filter.matches(&event) {
-                            // Clone necessary data for delivery task
-                            let webhook_clone = webhook.clone();
-                            let event_clone = event.clone();
-                            let http_client_clone = http_client.clone();
-                            let stats_clone = stats.clone();
-                            let config_clone = config.clone();
-                            let semaphore_clone = delivery_semaphore.clone();
-
-                            // Spawn a tracked delivery task
-                            deliveries.spawn("delivery", async move {
-                                // Acquire delivery permit inside the task
-                                let Ok(_permit) = semaphore_clone.acquire().await else {
-                                    tracing::error!("webhook delivery semaphore closed");
-                                    return;
-                                };
-                                Self::deliver_webhook_event(
-                                    webhook_clone,
-                                    event_clone,
-                                    http_client_clone,
-                                    stats_clone,
-                                    config_clone,
-                                )
-                                .await;
-                            });
-                        }
-                    }
+                let event = match received {
+                    Ok(event) => event,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
-                            "Webhook {} listener fell behind and skipped {} events; \
-                             consider a larger event buffer",
-                            webhook.name,
-                            skipped
+                            "Webhook {webhook_id} listener fell behind and dropped {skipped} \
+                             events; the endpoint may be slow or down, or the event buffer \
+                             too small"
                         );
+                        if let Some(webhook_stats) = stats.write().await.get_mut(&webhook_id) {
+                            webhook_stats.dropped_events += skipped;
+                        }
+                        continue;
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        // Event manager dropped, exit task
-                        break;
-                    }
+                    // Event manager dropped
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+
+                // Use the current configuration: it may have been updated, enabled or
+                // disabled while waiting. A disabled webhook drops events but keeps
+                // listening, so that enabling it again resumes delivery.
+                let webhook = match webhooks.read().await.get(&webhook_id) {
+                    Some(current) => current.clone(),
+                    None => break,
+                };
+                if !webhook.enabled || !webhook.filter.matches(&event) {
+                    continue;
                 }
+
+                // Bound the backlog: wait for a pending-delivery slot. While waiting,
+                // new events queue up in the broadcast buffer (and the oldest are
+                // dropped once it is full) instead of in unbounded delivery tasks.
+                let full = pending.available_permits() == 0;
+                if full && !paused && config.log_deliveries {
+                    tracing::warn!(
+                        "Webhook {} has {} deliveries pending; pausing its listener",
+                        webhook.name,
+                        config.max_pending_deliveries
+                    );
+                }
+                paused = full;
+                let slot = tokio::select! {
+                    biased;
+                    _ = &mut stop => break,
+                    slot = pending.clone().acquire_owned() => match slot {
+                        Ok(slot) => slot,
+                        Err(_) => break,
+                    },
+                };
+
+                let http_client = http_client.clone();
+                let stats = stats.clone();
+                let config = config.clone();
+                let delivery_semaphore = delivery_semaphore.clone();
+                deliveries.spawn("delivery", async move {
+                    Self::deliver_webhook_event(
+                        webhook,
+                        event,
+                        http_client,
+                        stats,
+                        config,
+                        delivery_semaphore,
+                        slot,
+                    )
+                    .await;
+                });
             }
         });
     }
 
-    /// Deliver an event to a webhook endpoint with retries
+    /// Deliver an event to a webhook endpoint with retries.
+    ///
+    /// Each attempt holds a slot of `delivery_semaphore` while its request is in
+    /// flight; the backoff between attempts does not. `_pending` is the webhook's
+    /// pending-delivery slot, released when the delivery is finished.
     async fn deliver_webhook_event(
         webhook: WebhookConfig,
         event: JobLifecycleEvent,
         http_client: Client,
         stats: Arc<RwLock<HashMap<Uuid, WebhookStats>>>,
         config: WebhookManagerConfig,
+        delivery_semaphore: Arc<Semaphore>,
+        _pending: OwnedSemaphorePermit,
     ) {
         let mut attempt = 0;
         let max_attempts = webhook.retry_policy.max_attempts;
@@ -914,9 +1012,14 @@ impl WebhookManager {
         while attempt < max_attempts {
             attempt += 1;
 
-            let delivery_result =
+            let delivery_result = {
+                let Ok(_permit) = delivery_semaphore.acquire().await else {
+                    tracing::error!("webhook delivery semaphore closed");
+                    return;
+                };
                 Self::attempt_webhook_delivery(&webhook, &event, &http_client, &config, attempt)
-                    .await;
+                    .await
+            };
 
             // Update statistics
             Self::update_webhook_stats(&webhook.id, &delivery_result, stats.clone()).await;
@@ -926,7 +1029,7 @@ impl WebhookManager {
                     tracing::debug!(
                         "Webhook delivery successful: {} -> {} (attempt {})",
                         webhook.name,
-                        webhook.url,
+                        crate::config::redact_url_path(&webhook.url),
                         attempt
                     );
                 }
@@ -945,7 +1048,7 @@ impl WebhookManager {
                             "Webhook delivery failed, retrying in {:?}: {} -> {} (attempt {}/{})",
                             delay,
                             webhook.name,
-                            webhook.url,
+                            crate::config::redact_url_path(&webhook.url),
                             attempt,
                             max_attempts
                         );
@@ -957,7 +1060,7 @@ impl WebhookManager {
                             "Webhook delivery failed with non-retryable status {}: {} -> {}",
                             delivery_result.status_code.unwrap_or(0),
                             webhook.name,
-                            webhook.url
+                            crate::config::redact_url_path(&webhook.url)
                         );
                     }
                     break;
@@ -967,13 +1070,18 @@ impl WebhookManager {
                     "Webhook delivery failed after {} attempts: {} -> {}",
                     max_attempts,
                     webhook.name,
-                    webhook.url
+                    crate::config::redact_url_path(&webhook.url)
                 );
             }
         }
     }
 
-    /// Attempt a single webhook delivery
+    /// Attempt a single webhook delivery.
+    ///
+    /// The webhook's timeout covers the whole attempt: connecting, sending, the
+    /// response headers and reading the response body. When the status arrived but
+    /// the body did not finish in time, the attempt counts by its status (the endpoint
+    /// did answer) and the body is not recorded.
     async fn attempt_webhook_delivery(
         webhook: &WebhookConfig,
         event: &JobLifecycleEvent,
@@ -983,24 +1091,24 @@ impl WebhookManager {
     ) -> WebhookDelivery {
         let delivery_id = Uuid::new_v4();
         let start_time = std::time::Instant::now();
+        let elapsed_ms = || u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let failure = |status_code: Option<u16>, error: String, duration_ms: u64| WebhookDelivery {
+            delivery_id,
+            webhook_id: webhook.id,
+            event_id: event.event_id,
+            status_code,
+            response_body: None,
+            error_message: Some(error),
+            attempted_at: Utc::now(),
+            duration_ms: Some(duration_ms),
+            attempt_number,
+            success: false,
+        };
 
         // Prepare payload
         let payload = match Self::build_payload(webhook, event) {
             Ok(payload) => payload,
-            Err(e) => {
-                return WebhookDelivery {
-                    delivery_id,
-                    webhook_id: webhook.id,
-                    event_id: event.event_id,
-                    status_code: None,
-                    response_body: None,
-                    error_message: Some(format!("failed to build payload: {e}")),
-                    attempted_at: Utc::now(),
-                    duration_ms: Some(0),
-                    attempt_number,
-                    success: false,
-                };
-            }
+            Err(e) => return failure(None, format!("failed to build payload: {e}"), 0),
         };
 
         // Build request
@@ -1031,73 +1139,55 @@ impl WebhookManager {
             .header("Content-Type", "application/json")
             .json(&payload);
 
-        // Set timeout
-        let timeout_duration = Duration::from_secs(webhook.timeout_secs);
+        // One deadline for the whole attempt, body included.
+        let deadline = Instant::now() + attempt_timeout(webhook, config);
 
-        // Make request
-        match timeout(timeout_duration, request.send()).await {
-            Ok(Ok(response)) => {
-                let duration_ms =
-                    u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-                let status_code = response.status().as_u16();
-                let success = response.status().is_success();
+        let response = match timeout_at(deadline, request.send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => return failure(None, err.to_string(), elapsed_ms()),
+            Err(_) => return failure(Some(408), "Request timeout".to_string(), elapsed_ms()),
+        };
 
-                // Read response body
-                let response_body = match response.text().await {
-                    Ok(body) => Some(truncate_response_body(body, config.max_response_body_size)),
-                    Err(_) => None,
-                };
-
-                WebhookDelivery {
-                    delivery_id,
-                    webhook_id: webhook.id,
-                    event_id: event.event_id,
-                    status_code: Some(status_code),
-                    response_body,
-                    error_message: if success {
-                        None
-                    } else {
-                        Some(format!("HTTP {}", status_code))
-                    },
-                    attempted_at: Utc::now(),
-                    duration_ms: Some(duration_ms),
-                    attempt_number,
-                    success,
-                }
-            }
-            Ok(Err(err)) => {
-                let duration_ms =
-                    u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-                WebhookDelivery {
-                    delivery_id,
-                    webhook_id: webhook.id,
-                    event_id: event.event_id,
-                    status_code: None,
-                    response_body: None,
-                    error_message: Some(err.to_string()),
-                    attempted_at: Utc::now(),
-                    duration_ms: Some(duration_ms),
-                    attempt_number,
-                    success: false,
-                }
+        let status_code = response.status().as_u16();
+        let success = response.status().is_success();
+        let response_body = match timeout_at(
+            deadline,
+            read_body_limited(response, config.max_response_body_size),
+        )
+        .await
+        {
+            Ok(Ok(body)) => Some(body),
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    "Webhook {}: failed to read response body: {e}",
+                    webhook.name
+                );
+                None
             }
             Err(_) => {
-                // Timeout
-                let duration_ms =
-                    u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-                WebhookDelivery {
-                    delivery_id,
-                    webhook_id: webhook.id,
-                    event_id: event.event_id,
-                    status_code: Some(408),
-                    response_body: None,
-                    error_message: Some("Request timeout".to_string()),
-                    attempted_at: Utc::now(),
-                    duration_ms: Some(duration_ms),
-                    attempt_number,
-                    success: false,
-                }
+                tracing::debug!(
+                    "Webhook {}: timed out reading the response body",
+                    webhook.name
+                );
+                None
             }
+        };
+
+        WebhookDelivery {
+            delivery_id,
+            webhook_id: webhook.id,
+            event_id: event.event_id,
+            status_code: Some(status_code),
+            response_body,
+            error_message: if success {
+                None
+            } else {
+                Some(format!("HTTP {}", status_code))
+            },
+            attempted_at: Utc::now(),
+            duration_ms: Some(elapsed_ms()),
+            attempt_number,
+            success,
         }
     }
 
@@ -1588,22 +1678,6 @@ pub fn verify_hmac_signature(secret: &str, payload: &[u8], signature: &str) -> b
         && expected.bytes().zip(signature.bytes()).all(|(a, b)| a == b)
 }
 
-/// Truncate a webhook response body to at most `max_bytes` bytes (plus a marker).
-///
-/// The response comes from a remote endpoint, so the cut point can fall inside a
-/// multi-byte UTF-8 character. Back up to the nearest character boundary instead of
-/// slicing at the raw byte offset, which would panic.
-fn truncate_response_body(body: String, max_bytes: usize) -> String {
-    if body.len() <= max_bytes {
-        return body;
-    }
-    let mut end = max_bytes;
-    while !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}... [truncated]", &body[..end])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1790,6 +1864,7 @@ mod tests {
             avg_response_time_ms: 0.0,
             last_success_at: None,
             last_failure_at: None,
+            dropped_events: 0,
             calculated_at: Utc::now(),
         };
 
@@ -2162,6 +2237,7 @@ mod tests {
             avg_response_time_ms: 150.5,
             last_success_at: Some(Utc::now() - chrono::Duration::minutes(5)),
             last_failure_at: Some(Utc::now() - chrono::Duration::minutes(10)),
+            dropped_events: 0,
             calculated_at: Utc::now(),
         };
 
@@ -2185,20 +2261,31 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_response_body_respects_utf8_boundaries() {
+    fn test_response_body_text_respects_utf8_boundaries() {
+        let cut = |body: &str, max: usize| {
+            let bytes = body.as_bytes();
+            let truncated = bytes.len() > max;
+            response_body_text(bytes[..max.min(bytes.len())].to_vec(), truncated)
+        };
         // Short bodies are returned unchanged.
-        assert_eq!(truncate_response_body("ok".to_string(), 10), "ok");
+        assert_eq!(cut("ok", 10), "ok");
 
-        // "é" is 2 bytes and "😀" is 4; cutting inside either must not panic.
-        let body = "aé😀b".to_string(); // bytes: a(1) é(2) 😀(4) b(1) = 8
-        assert_eq!(truncate_response_body(body.clone(), 2), "a... [truncated]");
-        assert_eq!(truncate_response_body(body.clone(), 3), "aé... [truncated]");
+        // "é" is 2 bytes and "😀" is 4; a cut inside either drops the partial character.
+        let body = "aé😀b"; // bytes: a(1) é(2) 😀(4) b(1) = 8
+        assert_eq!(cut(body, 2), "a... [truncated]");
+        assert_eq!(cut(body, 3), "aé... [truncated]");
         for max in 0..body.len() {
-            let truncated = truncate_response_body(body.clone(), max);
+            let truncated = cut(body, max);
             assert!(truncated.ends_with("... [truncated]"));
             assert!(truncated.len() <= max + "... [truncated]".len());
         }
-        assert_eq!(truncate_response_body(body.clone(), body.len()), body);
+        assert_eq!(cut(body, body.len()), body);
+
+        // Invalid UTF-8 from the endpoint is replaced, not an error.
+        assert_eq!(
+            response_body_text(vec![b'a', 0xff, b'b'], false),
+            "a\u{fffd}b"
+        );
     }
 
     fn completed_event() -> JobLifecycleEvent {
@@ -2267,8 +2354,6 @@ mod tests {
         let webhook_id = webhook.id;
         manager.add_webhook(webhook).await.unwrap();
 
-        // Let the listener task start and subscribe before the event is published.
-        tokio::time::sleep(Duration::from_millis(100)).await;
         events.publish_event(completed_event()).await.unwrap();
         wait_for(&received, 1).await;
 
@@ -2289,8 +2374,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Let the listener task start and subscribe before the event is published.
-        tokio::time::sleep(Duration::from_millis(100)).await;
         events.publish_event(completed_event()).await.unwrap();
         wait_for(&received, 1).await;
 
@@ -2325,8 +2408,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Let the listener task start and subscribe before the events are published.
-        tokio::time::sleep(Duration::from_millis(100)).await;
         for _ in 0..100 {
             events.publish_event(completed_event()).await.unwrap();
         }
@@ -2345,19 +2426,26 @@ mod tests {
             ..Default::default()
         }));
         let manager = WebhookManager::new_default(events.clone());
-        manager
-            .add_webhook(WebhookConfig::new("lagging".to_string(), url))
-            .await
-            .unwrap();
-
-        // Let the listener task start and subscribe before the events are published.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let webhook = WebhookConfig::new("lagging".to_string(), url);
+        let id = webhook.id;
+        manager.add_webhook(webhook).await.unwrap();
 
         // Overrun the 4-event channel so the listener sees RecvError::Lagged.
         for _ in 0..50 {
             events.publish_event(completed_event()).await.unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Every event is either delivered or counted as dropped.
+        let mut accounted = false;
+        for _ in 0..400 {
+            let dropped = manager.get_webhook_stats(id).await.unwrap().dropped_events;
+            let delivered = received.load(std::sync::atomic::Ordering::SeqCst) as u64;
+            if dropped > 0 && dropped + delivered == 50 {
+                accounted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(accounted, "dropped events are counted");
         let before = received.load(std::sync::atomic::Ordering::SeqCst);
         assert!(before >= 1, "some events from the burst must be delivered");
 
@@ -2379,8 +2467,13 @@ mod tests {
             panic!("expected test panic in a listener task");
         });
 
-        // Let the listener task start and subscribe before the event is published.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Let both tasks run (and panic) before shutting down.
+        for _ in 0..200 {
+            if manager.task_panics() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         manager.shutdown(Duration::from_secs(5)).await;
         assert_eq!(manager.task_panics(), 2);
     }
@@ -2614,7 +2707,6 @@ mod tests {
             r#"{"text": "{{event.queue_name}} job {{event.job_id}}", "job_id": "{{event.job_id}}"}"#,
         );
         manager.add_webhook(webhook).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let event = completed_event();
         events.publish_event(event.clone()).await.unwrap();
@@ -2724,7 +2816,6 @@ mod tests {
         let events = Arc::new(EventManager::new_default());
         let manager = WebhookManager::new_default(events.clone());
         manager.add_webhook(webhook).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         events.publish_event(completed_event()).await.unwrap();
         let recorded = next_recorded(url_rx).await;
         manager.shutdown(Duration::from_secs(5)).await;
@@ -2823,7 +2914,6 @@ mod tests {
         });
         let id = webhook.id;
         manager.add_webhook(webhook).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         events.publish_event(completed_event()).await.unwrap();
         next_recorded(&mut rx).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2842,7 +2932,6 @@ mod tests {
             .with_retry_policy(no_retries());
         let id = webhook.id;
         manager.add_webhook(webhook).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         events.publish_event(completed_event()).await.unwrap();
         next_recorded(&mut rx).await;
         let mut failed = false;
@@ -2872,7 +2961,6 @@ mod tests {
             WebhookConfig::new("toggle".to_string(), url.clone()).with_retry_policy(no_retries());
         let id = webhook.id;
         manager.add_webhook(webhook.clone()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         manager.disable_webhook(id).await.unwrap();
         assert_eq!(manager.get_stats().await.active_webhooks, 0);
@@ -2899,7 +2987,6 @@ mod tests {
             manager.get_webhook(id).await.unwrap().method,
             HttpMethod::Put
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
         events.publish_event(completed_event()).await.unwrap();
         assert!(next_recorded(&mut rx).await.request_line.starts_with("PUT"));
 
@@ -2911,6 +2998,327 @@ mod tests {
             assert!(result.unwrap_err().to_string().contains("not found"));
         }
         manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// Wait until `condition` holds, polling every 10 ms for up to 10 seconds.
+    async fn eventually<F, Fut>(what: &str, mut condition: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..1000 {
+            if condition().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    /// M9: the subscription exists when `add_webhook` returns, so an event published
+    /// immediately afterwards (before the listener task has even run) is delivered.
+    #[tokio::test]
+    async fn test_event_published_right_after_add_is_delivered() {
+        let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        let event = completed_event();
+        manager
+            .add_webhook(WebhookConfig::new("immediate".to_string(), url))
+            .await
+            .unwrap();
+        events.publish_event(event.clone()).await.unwrap();
+
+        let recorded = next_recorded(&mut rx).await;
+        assert!(recorded.body.contains(&event.event_id.to_string()));
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// H11: updating a webhook (or re-adding it under the same id) leaves exactly one
+    /// listener, so an event is delivered once, not once per update.
+    #[tokio::test]
+    async fn test_updates_do_not_duplicate_delivery() {
+        let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        let webhook =
+            WebhookConfig::new("updated".to_string(), url.clone()).with_retry_policy(no_retries());
+        let id = webhook.id;
+        manager.add_webhook(webhook.clone()).await.unwrap();
+
+        for i in 0..5 {
+            manager
+                .update_webhook(
+                    webhook
+                        .clone()
+                        .with_header("X-Version".to_string(), i.to_string()),
+                )
+                .await
+                .unwrap();
+        }
+        // Re-adding and removing then adding under the same id replace the listener too.
+        manager.add_webhook(webhook.clone()).await.unwrap();
+        manager.remove_webhook(id).await.unwrap();
+        manager
+            .add_webhook(webhook.with_header("X-Version".to_string(), "last".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(events.subscription_count().await, 1);
+
+        let event = completed_event();
+        events.publish_event(event.clone()).await.unwrap();
+        let recorded = next_recorded(&mut rx).await;
+        assert_eq!(
+            recorded.headers.get("x-version").map(String::as_str),
+            Some("last")
+        );
+        assert!(recorded.body.contains(&event.event_id.to_string()));
+
+        // No duplicate arrives, and exactly one attempt was made.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the event was delivered more than once"
+        );
+        assert_eq!(
+            manager.get_webhook_stats(id).await.unwrap().total_attempts,
+            1
+        );
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// An updated configuration applies to the next event without re-adding.
+    #[tokio::test]
+    async fn test_update_keeps_stats_and_applies_new_filter() {
+        let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        let webhook =
+            WebhookConfig::new("filtered".to_string(), url).with_retry_policy(no_retries());
+        let id = webhook.id;
+        manager.add_webhook(webhook.clone()).await.unwrap();
+        events.publish_event(completed_event()).await.unwrap();
+        next_recorded(&mut rx).await;
+        eventually("the first delivery is recorded", || async {
+            manager.get_webhook_stats(id).await.unwrap().total_attempts == 1
+        })
+        .await;
+
+        // Only failed events from now on.
+        manager
+            .update_webhook(
+                webhook.with_filter(
+                    EventFilter::new()
+                        .with_event_types(vec![crate::events::JobLifecycleEventType::Failed]),
+                ),
+            )
+            .await
+            .unwrap();
+        events.publish_event(completed_event()).await.unwrap();
+        let mut failed = completed_event();
+        failed.event_type = crate::events::JobLifecycleEventType::Failed;
+        events.publish_event(failed.clone()).await.unwrap();
+
+        let recorded = next_recorded(&mut rx).await;
+        assert!(recorded.body.contains(&failed.event_id.to_string()));
+        eventually("the second delivery is recorded", || async {
+            manager.get_webhook_stats(id).await.unwrap().total_attempts == 2
+        })
+        .await;
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// A local HTTP server that holds every request until `gate` has a permit (one per
+    /// response), then answers `200 OK`. Returns its URL and a request counter.
+    async fn gated_http_server(
+        gate: Arc<Semaphore>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let received = Arc::new(AtomicUsize::new(0));
+        let counter = received.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = counter.clone();
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = socket.read(&mut buf).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(permit) = gate.acquire().await {
+                        permit.forget();
+                    }
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (url, received)
+    }
+
+    /// H12: with the endpoint stuck, at most `max_pending_deliveries` deliveries exist
+    /// for the webhook; the listener waits and the overflow is dropped and counted.
+    #[tokio::test]
+    async fn test_pending_deliveries_are_bounded() {
+        use std::sync::atomic::Ordering;
+        let gate = Arc::new(Semaphore::new(0));
+        let (url, received) = gated_http_server(gate.clone()).await;
+        let events = Arc::new(EventManager::new(crate::events::EventConfig {
+            max_buffer_size: 4,
+            ..Default::default()
+        }));
+        let manager = WebhookManager::new(
+            events.clone(),
+            WebhookManagerConfig {
+                max_pending_deliveries: 2,
+                ..Default::default()
+            },
+        );
+        let webhook = WebhookConfig::new("stuck".to_string(), url).with_retry_policy(no_retries());
+        let id = webhook.id;
+        manager.add_webhook(webhook).await.unwrap();
+
+        for _ in 0..20 {
+            events.publish_event(completed_event()).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        eventually("two requests are in flight", || async {
+            received.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        // The listener is waiting: no third delivery is started.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+        assert!(
+            manager.deliveries.len() <= 2,
+            "{}",
+            manager.deliveries.len()
+        );
+
+        // Once the endpoint answers, the rest is delivered or counted as dropped.
+        gate.add_permits(1_000);
+        eventually("every event is delivered or dropped", || async {
+            let stats = manager.get_webhook_stats(id).await.unwrap();
+            stats.successful_deliveries + stats.dropped_events == 20
+        })
+        .await;
+        let stats = manager.get_webhook_stats(id).await.unwrap();
+        assert!(stats.dropped_events > 0, "{stats:?}");
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// H13: an endpoint that sends its headers and then stalls the body cannot hold a
+    /// delivery longer than the webhook's timeout.
+    #[tokio::test]
+    async fn test_timeout_covers_the_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial")
+                        .await;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                });
+            }
+        });
+
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        let webhook = WebhookConfig::new("stalling".to_string(), url)
+            .with_timeout_secs(1)
+            .with_retry_policy(no_retries());
+        let id = webhook.id;
+        manager.add_webhook(webhook).await.unwrap();
+        let started = std::time::Instant::now();
+        events.publish_event(completed_event()).await.unwrap();
+
+        eventually("the attempt finishes", || async {
+            manager.get_webhook_stats(id).await.unwrap().total_attempts == 1
+        })
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The endpoint did answer 200, so the delivery counts as successful.
+        let stats = manager.get_webhook_stats(id).await.unwrap();
+        assert_eq!(stats.successful_deliveries, 1);
+        assert_eq!(
+            manager.shutdown(Duration::ZERO).await,
+            0,
+            "nothing still running"
+        );
+    }
+
+    /// H13: only `max_bytes` of a response body are read, even an endless one.
+    #[tokio::test]
+    async fn test_response_body_read_is_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 16 * 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await;
+            // An endless body.
+            while socket.write_all(b"400\r\n").await.is_ok()
+                && socket.write_all(&[b'x'; 1024]).await.is_ok()
+                && socket.write_all(b"\r\n").await.is_ok()
+            {}
+        });
+
+        let response = Client::new().get(&url).send().await.unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(5), read_body_limited(response, 10))
+            .await
+            .expect("reading stops at the limit")
+            .unwrap();
+        assert_eq!(body, "xxxxxxxxxx... [truncated]");
+    }
+
+    /// M4: `timeout_secs = 0` (or missing in a file) uses the manager's default.
+    #[test]
+    fn test_zero_timeout_uses_manager_default() {
+        let config = WebhookManagerConfig {
+            default_timeout_secs: 7,
+            ..Default::default()
+        };
+        let webhook = WebhookConfig::new("w".to_string(), "http://x".to_string());
+        assert_eq!(
+            attempt_timeout(&webhook.clone().with_timeout_secs(3), &config),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            attempt_timeout(&webhook.clone().with_timeout_secs(0), &config),
+            Duration::from_secs(7)
+        );
+
+        let mut value = serde_json::to_value(&webhook).unwrap();
+        value.as_object_mut().unwrap().remove("timeout_secs");
+        let parsed: WebhookConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.timeout_secs, 0);
+        assert_eq!(attempt_timeout(&parsed, &config), Duration::from_secs(7));
+
+        let settings = crate::config::WebhookGlobalSettings {
+            default_timeout_secs: 9,
+            max_pending_deliveries: 5,
+            ..Default::default()
+        };
+        let from_settings = WebhookManagerConfig::from(&settings);
+        assert_eq!(from_settings.default_timeout_secs, 9);
+        assert_eq!(from_settings.max_pending_deliveries, 5);
     }
 
     #[test]

@@ -136,8 +136,8 @@
 
 use crate::{
     HammerworkError,
-    events::{EventFilter, EventManager, EventSubscription, JobLifecycleEvent},
-    task_tracker::TaskTracker,
+    events::{EventFilter, EventManager, JobLifecycleEvent},
+    task_tracker::{ListenerHandle, TaskTracker, clamp_permits},
 };
 
 #[cfg(feature = "kafka")]
@@ -172,7 +172,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{RwLock, Semaphore, broadcast, watch};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, broadcast, oneshot, watch};
 use uuid::Uuid;
 
 /// Processors by stream id. Processors are reference-counted so a batch can send
@@ -760,6 +760,12 @@ pub struct StreamStats {
     /// Error from the most recent failed delivery (after retries were exhausted)
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Events this stream never processed because its listener fell behind: while
+    /// [`BufferConfig::max_events`] events are being delivered the listener waits, and
+    /// events that overflow the event manager's buffer in the meantime are dropped
+    /// (oldest first).
+    #[serde(default)]
+    pub dropped_events: u64,
     /// Statistics calculation timestamp
     pub calculated_at: DateTime<Utc>,
 }
@@ -821,7 +827,7 @@ pub struct StreamManager {
     /// Active stream configurations
     streams: Arc<RwLock<HashMap<Uuid, StreamConfig>>>,
     /// Active event subscriptions for streams
-    subscriptions: Arc<RwLock<HashMap<Uuid, EventSubscription>>>,
+    subscriptions: Arc<RwLock<HashMap<Uuid, ListenerHandle>>>,
     /// Event manager for subscribing to events
     event_manager: Arc<EventManager>,
     /// Stream processors by stream id
@@ -869,11 +875,14 @@ pub struct StreamManager {
 /// ```
 #[derive(Debug, Clone)]
 pub struct StreamManagerConfig {
-    /// Maximum number of concurrent stream processors
+    /// Maximum number of batches being sent at once, across all streams. A batch
+    /// holds a slot only while it is being sent, not while it waits to retry.
     pub max_concurrent_processors: usize,
     /// Whether to log stream operations
     pub log_operations: bool,
-    /// Global buffer flush interval (in seconds)
+    /// Upper bound, in seconds, on how long any stream buffers an event before
+    /// flushing it: a stream flushes after
+    /// `min(buffer_config.max_buffer_time_secs, global_flush_interval_secs)`.
     pub global_flush_interval_secs: u64,
 }
 
@@ -995,15 +1004,7 @@ pub trait StreamProcessor {
 /// `0` permits would make every processing task wait forever and more than
 /// `Semaphore::MAX_PERMITS` panics inside tokio.
 fn clamp_processor_permits(configured: usize) -> usize {
-    let permits = configured.clamp(1, Semaphore::MAX_PERMITS);
-    if permits != configured {
-        tracing::warn!(
-            configured,
-            effective = permits,
-            "max_concurrent_processors is out of range, clamping"
-        );
-    }
-    permits
+    clamp_permits(configured, "max_concurrent_processors")
 }
 
 /// First four characters of a credential for display, cut on a character
@@ -1223,10 +1224,12 @@ impl StreamManager {
     ) -> crate::Result<()> {
         let stream_id = stream.id;
 
-        // Subscribe to events for this stream
+        // Subscribe before returning, and hand this receiver to the listener: events
+        // published from now on are buffered for it even before its task first runs.
         let subscription = self.event_manager.subscribe(stream.filter.clone()).await?;
+        let (handle, stop) = ListenerHandle::new(subscription.id);
 
-        // Store stream, processor, and subscription
+        // Store stream and processor
         {
             let mut streams = self.streams.write().await;
             streams.insert(stream_id, stream.clone());
@@ -1235,11 +1238,6 @@ impl StreamManager {
         {
             let mut processors = self.processors.write().await;
             processors.insert(stream_id, Arc::from(processor));
-        }
-
-        {
-            let mut subscriptions = self.subscriptions.write().await;
-            subscriptions.insert(stream_id, subscription);
         }
 
         // Initialize statistics
@@ -1258,13 +1256,22 @@ impl StreamManager {
                     last_success_at: None,
                     last_failure_at: None,
                     last_error: None,
+                    dropped_events: 0,
                     calculated_at: Utc::now(),
                 },
             );
         }
 
+        // Replacing the handle of an existing listener (same stream id) stops it.
+        let replaced = self.subscriptions.write().await.insert(stream_id, handle);
+        if let Some(replaced) = replaced {
+            self.event_manager
+                .unsubscribe(replaced.subscription_id)
+                .await?;
+        }
+
         // Start processing task for this stream
-        self.start_stream_processing_task(stream_id).await;
+        self.start_stream_processing_task(stream_id, subscription.receiver, stop);
 
         if self.config.log_operations {
             tracing::info!("Added stream: {} ({:?})", stream.name, stream.backend);
@@ -1293,18 +1300,18 @@ impl StreamManager {
 
     /// Remove a stream configuration
     pub async fn remove_stream(&self, stream_id: Uuid) -> crate::Result<()> {
+        // Stop the listener first (dropping its handle) and remove the subscription
+        let handle = self.subscriptions.write().await.remove(&stream_id);
+        if let Some(handle) = handle {
+            self.event_manager
+                .unsubscribe(handle.subscription_id)
+                .await?;
+        }
+
         // Shutdown processor
         let processor = self.processors.write().await.remove(&stream_id);
         if let Some(processor) = processor {
             processor.shutdown().await?;
-        }
-
-        // Remove subscription
-        {
-            let mut subscriptions = self.subscriptions.write().await;
-            if let Some(subscription) = subscriptions.remove(&stream_id) {
-                self.event_manager.unsubscribe(subscription.id).await?;
-            }
         }
 
         // Remove stream configuration
@@ -1442,32 +1449,37 @@ impl StreamManager {
         }
     }
 
-    /// Start processing task for a specific stream
-    async fn start_stream_processing_task(&self, stream_id: Uuid) {
+    /// Start the listener of a stream: it reads `receiver` until `stop` fires (its
+    /// [`ListenerHandle`] is dropped), buffers matching events and hands full or
+    /// expired buffers to batch tasks.
+    ///
+    /// A buffer is flushed when it holds `batch_size` or `max_events` events, or when
+    /// its oldest event has waited [`flush_after`](Self::flush_after). At most
+    /// `max_events` events are in batches at once (being sent or waiting to retry);
+    /// beyond that the listener waits, and events that overflow the event manager's
+    /// buffer meanwhile are dropped and counted in [`StreamStats::dropped_events`].
+    fn start_stream_processing_task(
+        &self,
+        stream_id: Uuid,
+        mut receiver: broadcast::Receiver<JobLifecycleEvent>,
+        mut stop: oneshot::Receiver<()>,
+    ) {
         let streams = self.streams.clone();
-        let subscriptions = self.subscriptions.clone();
         let processors = self.processors.clone();
         let stats = self.stats.clone();
         let processing_semaphore = self.processing_semaphore.clone();
         let config = self.config.clone();
         let shutdown_signal = self.shutdown_signal.clone();
-
         let batches = self.batches.clone();
 
         self.listeners.spawn("listener", async move {
             let mut event_buffer: Vec<JobLifecycleEvent> = Vec::new();
-            let mut last_flush = std::time::Instant::now();
-
-            // Subscribe once and keep the receiver for the lifetime of the listener.
-            // Re-subscribing on every iteration would skip every event published
-            // while the previous one was being handled.
-            let mut receiver = {
-                let subscriptions = subscriptions.read().await;
-                match subscriptions.get(&stream_id) {
-                    Some(subscription) => subscription.receiver.resubscribe(),
-                    None => return,
-                }
-            };
+            // When the oldest buffered event arrived.
+            let mut buffered_since: Option<tokio::time::Instant> = None;
+            // Events handed to batches and not finished yet.
+            let mut in_flight_limit: Option<(usize, Arc<Semaphore>)> = None;
+            // Whether the listener is waiting for in-flight batches (logged once per pause).
+            let mut paused = false;
 
             loop {
                 // Get stream configuration
@@ -1479,23 +1491,48 @@ impl StreamManager {
                         None => break,
                     }
                 };
+                let max_events = clamp_permits(stream.buffer_config.max_events, "max_events");
+                let in_flight = match &in_flight_limit {
+                    Some((limit, semaphore)) if *limit == max_events => semaphore.clone(),
+                    _ => {
+                        let semaphore = Arc::new(Semaphore::new(max_events));
+                        in_flight_limit = Some((max_events, semaphore.clone()));
+                        semaphore
+                    }
+                };
+                let flush_after = Self::flush_after(&stream, &config);
+                let flush_at = buffered_since.map(|since| since + flush_after);
 
-                // Exit once the subscription is removed
-                if !subscriptions.read().await.contains_key(&stream_id) {
-                    break;
-                }
-
-                // Check if we should flush the buffer
                 let should_flush = event_buffer.len() >= stream.buffer_config.batch_size
-                    || last_flush.elapsed().as_secs() >= stream.buffer_config.max_buffer_time_secs
-                    || event_buffer.len() >= stream.buffer_config.max_events;
+                    || event_buffer.len() >= max_events
+                    || flush_at.is_some_and(|at| tokio::time::Instant::now() >= at);
 
                 if should_flush && !event_buffer.is_empty() {
-                    let events_to_process = event_buffer.clone();
-                    event_buffer.clear();
-                    last_flush = std::time::Instant::now();
+                    let events_to_process = std::mem::take(&mut event_buffer);
+                    buffered_since = None;
 
-                    // Clone necessary data for processing task
+                    // Bound the backlog: wait until these events fit in the in-flight
+                    // limit. While waiting, new events queue up in the broadcast buffer.
+                    let wanted =
+                        u32::try_from(events_to_process.len().min(max_events)).unwrap_or(u32::MAX);
+                    let full = (in_flight.available_permits() as u32) < wanted;
+                    if full && !paused && config.log_operations {
+                        tracing::warn!(
+                            "Stream {} has {} events in flight; pausing its listener",
+                            stream.name,
+                            max_events - in_flight.available_permits()
+                        );
+                    }
+                    paused = full;
+                    let slots = tokio::select! {
+                        biased;
+                        _ = &mut stop => break,
+                        slots = in_flight.clone().acquire_many_owned(wanted) => match slots {
+                            Ok(slots) => slots,
+                            Err(_) => break,
+                        },
+                    };
+
                     let stream_clone = stream.clone();
                     let processors_clone = processors.clone();
                     let stats_clone = stats.clone();
@@ -1503,13 +1540,7 @@ impl StreamManager {
                     let semaphore_clone = processing_semaphore.clone();
                     let shutdown = shutdown_signal.subscribe();
 
-                    // Spawn a tracked processing task
                     batches.spawn("batch", async move {
-                        // Acquire processing permit inside the task
-                        let Ok(_permit) = semaphore_clone.acquire().await else {
-                            tracing::error!("stream processing semaphore closed");
-                            return;
-                        };
                         Self::process_event_batch(
                             stream_id,
                             stream_clone,
@@ -1517,15 +1548,30 @@ impl StreamManager {
                             processors_clone,
                             stats_clone,
                             config_clone,
+                            semaphore_clone,
                             shutdown,
+                            slots,
                         )
                         .await;
                     });
+                    continue;
                 }
 
-                // Try to receive new events (with timeout to allow periodic flushing)
-                match tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await {
-                    Ok(Ok(event)) => {
+                // Wait for the next event, or until the buffer is due to be flushed.
+                let flush_due = async {
+                    match flush_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let received = tokio::select! {
+                    biased;
+                    _ = &mut stop => break,
+                    received = receiver.recv() => received,
+                    _ = flush_due => continue,
+                };
+                match received {
+                    Ok(event) => {
                         // A disabled stream drops events (but keeps listening, so
                         // that enabling it again resumes delivery). Check the current
                         // state: it may have changed while waiting.
@@ -1535,28 +1581,41 @@ impl StreamManager {
                             .get(&stream_id)
                             .is_some_and(|stream| stream.enabled);
                         if enabled && stream.filter.matches(&event) {
+                            if event_buffer.is_empty() {
+                                buffered_since = Some(tokio::time::Instant::now());
+                            }
                             event_buffer.push(event);
                         }
                     }
-                    Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
-                            "Stream {} listener fell behind and skipped {} events; \
-                             consider a larger event buffer",
+                            "Stream {} listener fell behind and dropped {} events; the \
+                             backend may be slow or down, or the event buffer too small",
                             stream.name,
                             skipped
                         );
+                        if let Some(stream_stats) = stats.write().await.get_mut(&stream_id) {
+                            stream_stats.dropped_events += skipped;
+                        }
                     }
-                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    Err(broadcast::error::RecvError::Closed) => {
                         // Event manager dropped, exit task
                         break;
-                    }
-                    Err(_) => {
-                        // Timeout - continue to check for flush conditions
-                        continue;
                     }
                 }
             }
         });
+    }
+
+    /// How long an event may wait in a stream's buffer: the stream's
+    /// `max_buffer_time_secs`, capped by the manager's `global_flush_interval_secs`.
+    fn flush_after(stream: &StreamConfig, config: &StreamManagerConfig) -> Duration {
+        Duration::from_secs(
+            stream
+                .buffer_config
+                .max_buffer_time_secs
+                .min(config.global_flush_interval_secs),
+        )
     }
 
     /// Deliver a batch of events through the stream's processor.
@@ -1565,6 +1624,11 @@ impl StreamManager {
     /// event whose delivery failed (or that has no delivery result) is retried
     /// according to the stream's [`StreamRetryPolicy`]. Statistics are updated from
     /// the final per-event outcome.
+    ///
+    /// `processing_semaphore` limits sends across all streams; a send holds a slot only
+    /// while it runs, not during the backoff before a retry. `_in_flight` is the
+    /// stream's in-flight allowance for these events, released when the batch is done.
+    #[allow(clippy::too_many_arguments)]
     async fn process_event_batch(
         stream_id: Uuid,
         stream: StreamConfig,
@@ -1572,9 +1636,11 @@ impl StreamManager {
         processors: ProcessorMap,
         stats: Arc<RwLock<HashMap<Uuid, StreamStats>>>,
         config: StreamManagerConfig,
+        processing_semaphore: Arc<Semaphore>,
         mut shutdown: watch::Receiver<bool>,
+        _in_flight: OwnedSemaphorePermit,
     ) {
-        // The stream may have been removed while the batch waited for a permit.
+        // The stream may have been removed while the batch waited.
         let Some(processor) = processors.read().await.get(&stream_id).cloned() else {
             return;
         };
@@ -1609,6 +1675,7 @@ impl StreamManager {
                 &stream,
                 processor.as_ref(),
                 streamed_events,
+                &processing_semaphore,
                 &mut shutdown,
                 &config,
                 &mut outcome,
@@ -1626,6 +1693,7 @@ impl StreamManager {
         stream: &StreamConfig,
         processor: &(dyn StreamProcessor + Send + Sync),
         mut pending: Vec<StreamedEvent>,
+        processing_semaphore: &Semaphore,
         shutdown: &mut watch::Receiver<bool>,
         config: &StreamManagerConfig,
         outcome: &mut BatchOutcome,
@@ -1645,8 +1713,14 @@ impl StreamManager {
                 pending.clone()
             };
 
+            let Ok(permit) = processing_semaphore.acquire().await else {
+                tracing::error!("stream processing semaphore closed");
+                outcome.failed += event_ids.len() as u64;
+                return;
+            };
             let started = std::time::Instant::now();
             let result = processor.send_batch(batch).await;
+            drop(permit);
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             let failed_ids: HashSet<Uuid> = match result {
@@ -3747,6 +3821,7 @@ mod tests {
             last_success_at: Some(Utc::now() - chrono::Duration::minutes(2)),
             last_failure_at: Some(Utc::now() - chrono::Duration::minutes(10)),
             last_error: None,
+            dropped_events: 0,
             calculated_at: Utc::now(),
         };
 
@@ -4445,8 +4520,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Let the listener task start and subscribe before the event is published.
-        tokio::time::sleep(Duration::from_millis(100)).await;
         events.publish_event(completed_event()).await.unwrap();
         for _ in 0..100 {
             let processed = manager
@@ -4487,8 +4560,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Let the listener task start and subscribe before the events are published.
-        tokio::time::sleep(Duration::from_millis(100)).await;
         for _ in 0..100 {
             events.publish_event(completed_event()).await.unwrap();
         }
@@ -4536,8 +4607,13 @@ mod tests {
             panic!("expected test panic in a listener task");
         });
 
-        // Let the listener task start and subscribe before the event is published.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Let both tasks run (and panic) before shutting down.
+        for _ in 0..200 {
+            if manager.task_panics() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         manager.shutdown(Duration::from_secs(5)).await;
         assert_eq!(manager.task_panics(), 2);
     }
@@ -4582,8 +4658,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Let the listener task start and subscribe before the events are published.
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let mut ids = Vec::new();
         for _ in 0..count {
             let event = completed_event();
@@ -4686,7 +4760,6 @@ mod tests {
             .add_stream_with_processor(stream, Box::new(processor.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let published: Vec<JobLifecycleEvent> = (0..4).map(|_| completed_event()).collect();
         // The second and fourth events are rejected on every attempt.
@@ -4762,7 +4835,6 @@ mod tests {
             .add_stream_with_processor(stream, Box::new(ForgetfulProcessor))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         events.publish_event(completed_event()).await.unwrap();
         wait_for_total_events(&manager, stream_id, 1).await;
         manager.shutdown(Duration::from_secs(5)).await;
@@ -4793,7 +4865,6 @@ mod tests {
             .add_stream_with_processor(stream, Box::new(processor.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         events.publish_event(completed_event()).await.unwrap();
 
         // Wait for the first attempt; the batch is now sleeping before its retry.
@@ -4959,7 +5030,6 @@ mod tests {
             .add_stream_with_processor(stream, Box::new(processor.clone()))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(manager.get_stream(stream_id).await.unwrap().id, stream_id);
         assert_eq!(manager.list_streams().await.len(), 1);
@@ -5051,5 +5121,186 @@ mod tests {
             Some(key),
             "the metadata value is part of the key"
         );
+    }
+
+    /// Wait until `condition` holds, polling every 10 ms for up to 10 seconds.
+    async fn eventually<F, Fut>(what: &str, mut condition: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..1000 {
+            if condition().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    /// H11/M9: re-adding a stream under the same id (directly, or after removing it)
+    /// leaves one listener, and an event published right after `add_stream` returns
+    /// is streamed exactly once.
+    #[tokio::test]
+    async fn test_readding_a_stream_does_not_duplicate_events() {
+        let processor = InMemoryProcessor::default();
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        let stream = test_stream(1, immediate_retries(1));
+        let stream_id = stream.id;
+        for _ in 0..3 {
+            manager
+                .add_stream_with_processor(stream.clone(), Box::new(processor.clone()))
+                .await
+                .unwrap();
+        }
+        manager.remove_stream(stream_id).await.unwrap();
+        manager
+            .add_stream_with_processor(stream, Box::new(processor.clone()))
+            .await
+            .unwrap();
+        assert_eq!(events.subscription_count().await, 1);
+
+        let event = completed_event();
+        events.publish_event(event.clone()).await.unwrap();
+        wait_for_total_events(&manager, stream_id, 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(processor.delivered_ids(), vec![event.event_id]);
+        assert_eq!(processor.calls(), 1);
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// A processor whose sends wait until `gate` has a permit (one per send).
+    #[derive(Clone)]
+    struct GatedProcessor {
+        gate: Arc<Semaphore>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamProcessor for GatedProcessor {
+        async fn send_batch(
+            &self,
+            events: Vec<StreamedEvent>,
+        ) -> crate::Result<Vec<StreamDelivery>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(permit) = self.gate.acquire().await {
+                permit.forget();
+            }
+            Ok(events
+                .into_iter()
+                .map(|event| StreamDelivery {
+                    delivery_id: Uuid::new_v4(),
+                    stream_id: Uuid::nil(),
+                    event_id: event.event.event_id,
+                    success: true,
+                    error_message: None,
+                    attempted_at: Utc::now(),
+                    duration_ms: Some(0),
+                    attempt_number: 1,
+                    partition: None,
+                })
+                .collect())
+        }
+
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+
+        async fn get_stats(&self) -> crate::Result<HashMap<String, serde_json::Value>> {
+            Ok(HashMap::new())
+        }
+
+        async fn shutdown(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// H12: with the backend stuck, at most `max_events` events are in batches; the
+    /// listener waits and the overflow is dropped and counted.
+    #[tokio::test]
+    async fn test_in_flight_events_are_bounded() {
+        use std::sync::atomic::Ordering;
+        let processor = GatedProcessor {
+            gate: Arc::new(Semaphore::new(0)),
+            calls: Default::default(),
+        };
+        let events = Arc::new(EventManager::new(crate::events::EventConfig {
+            max_buffer_size: 4,
+            ..Default::default()
+        }));
+        let manager = StreamManager::new_default(events.clone());
+        let stream = StreamConfig {
+            buffer_config: BufferConfig {
+                batch_size: 1,
+                max_events: 2,
+                max_buffer_time_secs: 1,
+            },
+            retry_policy: immediate_retries(1),
+            ..Default::default()
+        };
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(processor.clone()))
+            .await
+            .unwrap();
+
+        for _ in 0..20 {
+            events.publish_event(completed_event()).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        eventually("two batches are being sent", || async {
+            processor.calls.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        // The listener is waiting: no third batch is started.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(processor.calls.load(Ordering::SeqCst), 2);
+        assert!(manager.batches.len() <= 2, "{}", manager.batches.len());
+
+        // Once the backend recovers, the rest is delivered or counted as dropped.
+        processor.gate.add_permits(1_000);
+        eventually("every event is delivered or dropped", || async {
+            let stats = manager.get_stream_stats(stream_id).await.unwrap();
+            stats.successful_deliveries + stats.dropped_events == 20
+        })
+        .await;
+        let stats = manager.get_stream_stats(stream_id).await.unwrap();
+        assert!(stats.dropped_events > 0, "{stats:?}");
+        manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// M4: `global_flush_interval_secs` caps how long a stream buffers an event.
+    #[tokio::test]
+    async fn test_global_flush_interval_caps_buffer_time() {
+        let mut stream = test_stream(100, immediate_retries(1));
+        stream.buffer_config.max_buffer_time_secs = 60;
+        let config = StreamManagerConfig {
+            global_flush_interval_secs: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            StreamManager::flush_after(&stream, &config),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            StreamManager::flush_after(&stream, &StreamManagerConfig::default()),
+            Duration::from_secs(10)
+        );
+
+        let processor = InMemoryProcessor::default();
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new(events.clone(), config);
+        let stream_id = stream.id;
+        manager
+            .add_stream_with_processor(stream, Box::new(processor.clone()))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        events.publish_event(completed_event()).await.unwrap();
+        wait_for_total_events(&manager, stream_id, 1).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(processor.delivered_ids().len(), 1);
+        manager.shutdown(Duration::from_secs(5)).await;
     }
 }

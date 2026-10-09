@@ -187,7 +187,10 @@ pub struct JobBatch {
     pub name: String,
     /// Jobs to be processed in this batch.
     pub jobs: Vec<Job>,
-    /// Maximum number of jobs to process in a single database operation.
+    /// Chunk size used by [`into_chunks`](Self::into_chunks) (1000 when unset).
+    ///
+    /// It does not change how `enqueue_batch` writes the batch: that always inserts
+    /// the whole batch in one transaction, in statements sized by the backend.
     pub batch_size: Option<u32>,
     /// Strategy for handling partial failures.
     pub failure_mode: PartialFailureMode,
@@ -261,10 +264,11 @@ impl JobBatch {
         self
     }
 
-    /// Sets the maximum batch size for database operations.
+    /// Sets the chunk size used by [`into_chunks`](Self::into_chunks).
     ///
-    /// When enqueueing large batches, they will be split into chunks
-    /// of this size for optimal database performance.
+    /// To enqueue a large batch in several transactions, split it with `into_chunks`
+    /// and enqueue each chunk. `enqueue_batch` itself ignores this value: it always
+    /// inserts the whole batch in one transaction, in statements sized by the backend.
     ///
     /// # Examples
     ///
@@ -368,9 +372,11 @@ impl JobBatch {
         Ok(())
     }
 
-    /// Splits the batch into smaller chunks based on the configured batch size.
+    /// Splits the batch into chunks of [`batch_size`](Self::batch_size) jobs (1000
+    /// when unset), each a new batch with its own id.
     ///
-    /// This is useful for processing very large batches in manageable chunks.
+    /// Enqueue the chunks one by one to write a very large batch in several
+    /// transactions.
     pub fn into_chunks(self) -> Vec<JobBatch> {
         let chunk_size = self.batch_size.unwrap_or(1000) as usize;
 

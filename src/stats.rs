@@ -1,7 +1,11 @@
 use crate::priority::{JobPriority, PriorityStats};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 /// Statistics for job processing over a time window
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,26 +142,40 @@ pub trait StatisticsCollector: Send + Sync {
     async fn cleanup_old_statistics(&self, older_than: Duration) -> crate::Result<u64>;
 }
 
-/// In-memory statistics collector with time-windowed data
+/// In-memory statistics collector with time-windowed data.
+///
+/// Events are kept in a ring buffer ordered by timestamp, bounded by
+/// [`StatsConfig::max_events`] and [`StatsConfig::max_event_age_secs`]. Recording an
+/// event is amortised O(1) (events normally arrive in time order, so they are appended
+/// and the oldest ones fall off the front). Queries find the start of their window by
+/// binary search and aggregate the events in it in one pass, without copying them.
 pub struct InMemoryStatsCollector {
-    events: Arc<std::sync::RwLock<Vec<JobEvent>>>,
+    events: Arc<std::sync::RwLock<VecDeque<JobEvent>>>,
     config: StatsConfig,
 }
 
 /// Configuration for statistics collection
 #[derive(Debug, Clone)]
 pub struct StatsConfig {
-    /// Maximum number of events to keep in memory
+    /// Maximum number of events to keep in memory; the oldest are dropped first.
     pub max_events: usize,
-    /// How often to clean up old events (in seconds)
+    /// Unused: old events are now pruned whenever an event is recorded.
+    #[deprecated(
+        since = "1.15.6",
+        note = "old events are pruned whenever an event is recorded; this value is ignored"
+    )]
     pub cleanup_interval_secs: u64,
-    /// Maximum age of events to keep (in seconds)
+    /// Maximum age of events to keep (in seconds). Older events are pruned whenever an
+    /// event is recorded, and events older than this are not recorded at all.
     pub max_event_age_secs: u64,
-    /// Whether to collect detailed timing information
+    /// Whether to keep the processing time of each event. When `false`, processing
+    /// times are discarded, so the timing fields of [`JobStatistics`] and of the priority
+    /// breakdown stay at zero.
     pub collect_timing: bool,
 }
 
 impl Default for StatsConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             max_events: 100_000,
@@ -180,10 +198,127 @@ fn cutoff_before(now: DateTime<Utc>, age: Duration) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
+/// Per-priority running totals for [`StatsAccumulator`].
+#[derive(Default)]
+struct PriorityTotals {
+    events: u64,
+    timed_events: u64,
+    processing_time_ms: u128,
+}
+
+/// Single-pass aggregation of the events of one window into [`JobStatistics`].
+#[derive(Default)]
+struct StatsAccumulator {
+    events: u64,
+    started: u64,
+    completed: u64,
+    failed: u64,
+    retried: u64,
+    dead: u64,
+    timed_out: u64,
+    timed_events: u64,
+    processing_time_ms: u128,
+    min_processing_time_ms: Option<u64>,
+    max_processing_time_ms: u64,
+    priorities: HashMap<JobPriority, PriorityTotals>,
+}
+
+impl StatsAccumulator {
+    fn add(&mut self, event: &JobEvent) {
+        self.events += 1;
+        match event.event_type {
+            JobEventType::Started => self.started += 1,
+            JobEventType::Completed => self.completed += 1,
+            JobEventType::Failed => self.failed += 1,
+            JobEventType::Retried => self.retried += 1,
+            JobEventType::Dead => self.dead += 1,
+            JobEventType::TimedOut => self.timed_out += 1,
+        }
+
+        let priority = self.priorities.entry(event.priority).or_default();
+        priority.events += 1;
+        if let Some(time) = event.processing_time_ms {
+            priority.timed_events += 1;
+            priority.processing_time_ms += u128::from(time);
+            self.timed_events += 1;
+            self.processing_time_ms += u128::from(time);
+            self.min_processing_time_ms =
+                Some(self.min_processing_time_ms.map_or(time, |m| m.min(time)));
+            self.max_processing_time_ms = self.max_processing_time_ms.max(time);
+        }
+    }
+
+    fn finish(self, window: Duration) -> JobStatistics {
+        if self.events == 0 {
+            return JobStatistics {
+                time_window: window,
+                calculated_at: Utc::now(),
+                ..Default::default()
+            };
+        }
+
+        // A run is counted once, when it finishes: `Started` marks the beginning of a
+        // run that is counted by its outcome event.
+        let total_processed = self.events - self.started;
+
+        let avg_processing_time_ms = if self.timed_events > 0 {
+            self.processing_time_ms as f64 / self.timed_events as f64
+        } else {
+            0.0
+        };
+
+        let error_rate = if total_processed > 0 {
+            (self.failed + self.dead + self.timed_out + self.retried) as f64
+                / total_processed as f64
+        } else {
+            0.0
+        };
+
+        let throughput_per_minute = if window.as_secs() > 0 {
+            total_processed as f64 * 60.0 / window.as_secs() as f64
+        } else {
+            0.0
+        };
+
+        let mut priority_stats = PriorityStats::new();
+        for (priority, totals) in self.priorities {
+            priority_stats.job_counts.insert(priority, totals.events);
+            // Every event in the window counts towards the recent throughput.
+            priority_stats
+                .recent_throughput
+                .insert(priority, totals.events);
+            if totals.timed_events > 0 {
+                priority_stats.avg_processing_times.insert(
+                    priority,
+                    totals.processing_time_ms as f64 / totals.timed_events as f64,
+                );
+            }
+        }
+        priority_stats.calculate_distribution();
+
+        JobStatistics {
+            total_processed,
+            completed: self.completed,
+            failed: self.failed,
+            dead: self.dead,
+            timed_out: self.timed_out,
+            running: self.started,
+            avg_processing_time_ms,
+            min_processing_time_ms: self.min_processing_time_ms.unwrap_or(0),
+            max_processing_time_ms: self.max_processing_time_ms,
+            throughput_per_minute,
+            error_rate,
+            priority_stats: Some(priority_stats),
+            time_window: window,
+            calculated_at: Utc::now(),
+        }
+    }
+}
+
 impl InMemoryStatsCollector {
     pub fn new(config: StatsConfig) -> Self {
         Self {
-            events: Arc::new(std::sync::RwLock::new(Vec::new())),
+            events: Arc::new(std::sync::RwLock::new(VecDeque::new())),
             config,
         }
     }
@@ -196,162 +331,47 @@ impl InMemoryStatsCollector {
     ///
     /// The buffer is only ever appended to, drained or filtered, so a panic in
     /// another thread cannot leave it in a state that is unsafe to keep using.
-    fn read_events(&self) -> std::sync::RwLockReadGuard<'_, Vec<JobEvent>> {
+    fn read_events(&self) -> std::sync::RwLockReadGuard<'_, VecDeque<JobEvent>> {
         self.events
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Lock the event buffer for writing, recovering from a poisoned lock.
-    fn write_events(&self) -> std::sync::RwLockWriteGuard<'_, Vec<JobEvent>> {
+    fn write_events(&self) -> std::sync::RwLockWriteGuard<'_, VecDeque<JobEvent>> {
         self.events
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn filter_events_by_window(&self, window: Duration) -> Vec<JobEvent> {
+    /// The oldest timestamp an event may have and still be kept.
+    fn retention_cutoff(&self) -> DateTime<Utc> {
+        cutoff_before(
+            Utc::now(),
+            Duration::from_secs(self.config.max_event_age_secs),
+        )
+    }
+
+    /// Aggregate the events of the last `window` that `include` accepts.
+    fn aggregate_window(
+        &self,
+        window: Duration,
+        mut include: impl FnMut(&JobEvent) -> bool,
+    ) -> StatsAccumulator {
         let cutoff = cutoff_before(Utc::now(), window);
         let events = self.read_events();
-        events
-            .iter()
-            .filter(|event| event.timestamp >= cutoff)
-            .cloned()
-            .collect()
-    }
-
-    fn calculate_statistics(&self, events: &[JobEvent], window: Duration) -> JobStatistics {
-        if events.is_empty() {
-            return JobStatistics {
-                time_window: window,
-                calculated_at: Utc::now(),
-                ..Default::default()
-            };
+        // The buffer is ordered by timestamp, so the window is a suffix of it.
+        let start = events.partition_point(|event| event.timestamp < cutoff);
+        let mut totals = StatsAccumulator::default();
+        for event in events.range(start..).filter(|event| include(event)) {
+            totals.add(event);
         }
-
-        // A run is counted once, when it finishes: `Started` marks the beginning of a
-        // run that is counted by its outcome event.
-        let total_processed = events
-            .iter()
-            .filter(|e| e.event_type != JobEventType::Started)
-            .count() as u64;
-        let completed = events
-            .iter()
-            .filter(|e| e.event_type == JobEventType::Completed)
-            .count() as u64;
-        let failed = events
-            .iter()
-            .filter(|e| e.event_type == JobEventType::Failed)
-            .count() as u64;
-        let dead = events
-            .iter()
-            .filter(|e| e.event_type == JobEventType::Dead)
-            .count() as u64;
-        let timed_out = events
-            .iter()
-            .filter(|e| e.event_type == JobEventType::TimedOut)
-            .count() as u64;
-        let retried = events
-            .iter()
-            .filter(|e| e.event_type == JobEventType::Retried)
-            .count() as u64;
-        let running = events
-            .iter()
-            .filter(|e| e.event_type == JobEventType::Started)
-            .count() as u64;
-
-        let processing_times: Vec<u64> =
-            events.iter().filter_map(|e| e.processing_time_ms).collect();
-
-        let (avg_processing_time_ms, min_processing_time_ms, max_processing_time_ms) =
-            if processing_times.is_empty() {
-                (0.0, 0, 0)
-            } else {
-                let sum: u64 = processing_times.iter().sum();
-                let avg = sum as f64 / processing_times.len() as f64;
-                let min = processing_times.iter().copied().min().unwrap_or(0);
-                let max = processing_times.iter().copied().max().unwrap_or(0);
-                (avg, min, max)
-            };
-
-        let error_rate = if total_processed > 0 {
-            (failed + dead + timed_out + retried) as f64 / total_processed as f64
-        } else {
-            0.0
-        };
-
-        let throughput_per_minute = if window.as_secs() > 0 {
-            total_processed as f64 * 60.0 / window.as_secs() as f64
-        } else {
-            0.0
-        };
-
-        // Calculate priority statistics
-        let priority_stats = self.calculate_priority_statistics(events);
-
-        JobStatistics {
-            total_processed,
-            completed,
-            failed,
-            dead,
-            timed_out,
-            running,
-            avg_processing_time_ms,
-            min_processing_time_ms,
-            max_processing_time_ms,
-            throughput_per_minute,
-            error_rate,
-            priority_stats: Some(priority_stats),
-            time_window: window,
-            calculated_at: Utc::now(),
-        }
-    }
-
-    fn calculate_priority_statistics(&self, events: &[JobEvent]) -> PriorityStats {
-        let mut priority_stats = PriorityStats::new();
-
-        // Count jobs by priority
-        for event in events {
-            *priority_stats.job_counts.entry(event.priority).or_insert(0) += 1;
-        }
-
-        // Calculate average processing times by priority
-        let mut priority_processing_times: HashMap<JobPriority, Vec<u64>> = HashMap::new();
-        for event in events {
-            if let Some(processing_time) = event.processing_time_ms {
-                priority_processing_times
-                    .entry(event.priority)
-                    .or_default()
-                    .push(processing_time);
-            }
-        }
-
-        for (priority, times) in priority_processing_times {
-            if !times.is_empty() {
-                let avg = times.iter().sum::<u64>() as f64 / times.len() as f64;
-                priority_stats.avg_processing_times.insert(priority, avg);
-            }
-        }
-
-        // Calculate recent throughput (count events in the time window)
-        for event in events {
-            *priority_stats
-                .recent_throughput
-                .entry(event.priority)
-                .or_insert(0) += 1;
-        }
-
-        // Calculate priority distribution percentages
-        priority_stats.calculate_distribution();
-
-        priority_stats
+        totals
     }
 
     /// Clean up events older than max_event_age_secs
     pub fn cleanup_old_events(&self) -> usize {
-        let cutoff = cutoff_before(
-            Utc::now(),
-            Duration::from_secs(self.config.max_event_age_secs),
-        );
+        let cutoff = self.retention_cutoff();
         let mut events = self.write_events();
         let original_len = events.len();
         events.retain(|event| event.timestamp >= cutoff);
@@ -359,24 +379,42 @@ impl InMemoryStatsCollector {
         // Also limit by max_events if we still have too many
         if events.len() > self.config.max_events {
             let excess = events.len() - self.config.max_events;
-            events.drain(0..excess);
-            original_len - events.len()
-        } else {
-            original_len - events.len()
+            events.drain(..excess);
         }
+        original_len - events.len()
     }
 }
 
 #[async_trait::async_trait]
 impl StatisticsCollector for InMemoryStatsCollector {
-    async fn record_event(&self, event: JobEvent) -> crate::Result<()> {
-        let mut events = self.write_events();
-        events.push(event);
+    async fn record_event(&self, mut event: JobEvent) -> crate::Result<()> {
+        if !self.config.collect_timing {
+            event.processing_time_ms = None;
+        }
+        let cutoff = self.retention_cutoff();
+        if event.timestamp < cutoff {
+            return Ok(());
+        }
 
-        // Periodic cleanup to prevent memory growth
-        if events.len() > self.config.max_events {
-            let excess = events.len() - self.config.max_events;
-            events.drain(0..excess);
+        let mut events = self.write_events();
+        // Keep the buffer ordered by timestamp. Events normally arrive in order, so
+        // this is an append; a late one is inserted near the back.
+        if events
+            .back()
+            .is_none_or(|last| last.timestamp <= event.timestamp)
+        {
+            events.push_back(event);
+        } else {
+            let at = events.partition_point(|e| e.timestamp <= event.timestamp);
+            events.insert(at, event);
+        }
+
+        // Prune from the front: expired events, then anything over the size limit.
+        while events.front().is_some_and(|e| e.timestamp < cutoff) {
+            events.pop_front();
+        }
+        while events.len() > self.config.max_events {
+            events.pop_front();
         }
 
         Ok(())
@@ -387,49 +425,50 @@ impl StatisticsCollector for InMemoryStatsCollector {
         queue_name: &str,
         window: Duration,
     ) -> crate::Result<JobStatistics> {
-        let events = self.filter_events_by_window(window);
-        let queue_events: Vec<JobEvent> = events
-            .into_iter()
-            .filter(|e| e.queue_name == queue_name)
-            .collect();
-
-        Ok(self.calculate_statistics(&queue_events, window))
+        Ok(self
+            .aggregate_window(window, |event| event.queue_name == queue_name)
+            .finish(window))
     }
 
     async fn get_all_statistics(&self, window: Duration) -> crate::Result<Vec<QueueStats>> {
-        let events = self.filter_events_by_window(window);
-        let mut queue_events: HashMap<String, Vec<JobEvent>> = HashMap::new();
-
-        for event in events {
-            queue_events
-                .entry(event.queue_name.clone())
-                .or_default()
-                .push(event);
+        let cutoff = cutoff_before(Utc::now(), window);
+        let mut queues: HashMap<String, StatsAccumulator> = HashMap::new();
+        {
+            let events = self.read_events();
+            let start = events.partition_point(|event| event.timestamp < cutoff);
+            for event in events.range(start..) {
+                match queues.get_mut(&event.queue_name) {
+                    Some(totals) => totals.add(event),
+                    None => {
+                        let mut totals = StatsAccumulator::default();
+                        totals.add(event);
+                        queues.insert(event.queue_name.clone(), totals);
+                    }
+                }
+            }
         }
 
-        let mut results = Vec::new();
-        for (queue_name, events) in queue_events {
-            let statistics = self.calculate_statistics(&events, window);
-
-            // Note: pending/running/dead counts would come from database queries
-            // This is just for the statistics calculation
-            results.push(QueueStats {
-                queue_name,
-                pending_count: 0, // Would be filled by database implementation
-                running_count: statistics.running,
-                dead_count: statistics.dead,
-                timed_out_count: statistics.timed_out,
-                completed_count: statistics.completed,
-                statistics,
-            });
-        }
-
-        Ok(results)
+        Ok(queues
+            .into_iter()
+            .map(|(queue_name, totals)| {
+                let statistics = totals.finish(window);
+                // Note: pending/running/dead counts would come from database queries
+                // This is just for the statistics calculation
+                QueueStats {
+                    queue_name,
+                    pending_count: 0, // Would be filled by database implementation
+                    running_count: statistics.running,
+                    dead_count: statistics.dead,
+                    timed_out_count: statistics.timed_out,
+                    completed_count: statistics.completed,
+                    statistics,
+                }
+            })
+            .collect())
     }
 
     async fn get_system_statistics(&self, window: Duration) -> crate::Result<JobStatistics> {
-        let events = self.filter_events_by_window(window);
-        Ok(self.calculate_statistics(&events, window))
+        Ok(self.aggregate_window(window, |_| true).finish(window))
     }
 
     async fn cleanup_old_statistics(&self, older_than: Duration) -> crate::Result<u64> {
@@ -533,6 +572,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_stats_config_default() {
         let config = StatsConfig::default();
         assert_eq!(config.max_events, 100_000);
@@ -594,7 +634,7 @@ mod tests {
         // Add events
         {
             let mut events = collector.events.write().unwrap();
-            events.push(JobEvent {
+            events.push_back(JobEvent {
                 job_id: uuid::Uuid::new_v4(),
                 queue_name: "test".to_string(),
                 event_type: JobEventType::Completed,
@@ -603,7 +643,7 @@ mod tests {
                 error_message: None,
                 timestamp: Utc::now() - chrono::Duration::seconds(2), // Old event
             });
-            events.push(JobEvent {
+            events.push_back(JobEvent {
                 job_id: uuid::Uuid::new_v4(),
                 queue_name: "test".to_string(),
                 event_type: JobEventType::Completed,
@@ -812,7 +852,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_old_statistics() {
-        let collector = InMemoryStatsCollector::new_default();
+        // Keep events for 3 hours so the 2-hour-old one is recorded.
+        let collector = InMemoryStatsCollector::new(StatsConfig {
+            max_event_age_secs: 3 * 3600,
+            ..Default::default()
+        });
 
         // Add an old event
         let old_event = JobEvent {
@@ -1024,5 +1068,178 @@ mod tests {
         assert_eq!(stats.total_processed, 2);
         assert_eq!(stats.error_rate, 1.0);
         assert_eq!(stats.throughput_per_minute, 2.0);
+    }
+
+    fn event_at(queue: &str, seconds_ago: i64, processing_time_ms: Option<u64>) -> JobEvent {
+        JobEvent {
+            timestamp: Utc::now() - chrono::Duration::seconds(seconds_ago),
+            ..create_test_job_event(
+                queue,
+                JobEventType::Completed,
+                None,
+                processing_time_ms,
+                None,
+            )
+        }
+    }
+
+    /// M7: at the size limit, recording drops the oldest event instead of shifting the
+    /// whole buffer, and the buffer never grows past `max_events`.
+    #[tokio::test]
+    async fn test_record_event_is_bounded_and_drops_the_oldest() {
+        let collector = InMemoryStatsCollector::new(StatsConfig {
+            max_events: 3,
+            ..Default::default()
+        });
+        for seconds_ago in [50, 40, 30, 20, 10] {
+            collector
+                .record_event(event_at("q", seconds_ago, Some(seconds_ago as u64)))
+                .await
+                .unwrap();
+        }
+        let times: Vec<_> = collector
+            .read_events()
+            .iter()
+            .map(|e| e.processing_time_ms.unwrap())
+            .collect();
+        assert_eq!(times, vec![30, 20, 10]);
+    }
+
+    /// Late events are inserted in timestamp order, so windows stay exact.
+    #[tokio::test]
+    async fn test_out_of_order_events_are_kept_in_time_order() {
+        let collector = InMemoryStatsCollector::new_default();
+        for seconds_ago in [10, 500, 5, 120] {
+            collector
+                .record_event(event_at("q", seconds_ago, Some(seconds_ago as u64)))
+                .await
+                .unwrap();
+        }
+        {
+            let events = collector.read_events();
+            assert!(
+                events
+                    .iter()
+                    .zip(events.iter().skip(1))
+                    .all(|(a, b)| a.timestamp <= b.timestamp)
+            );
+        }
+
+        // The last 60 seconds hold the events from 10 s and 5 s ago only.
+        let stats = collector
+            .get_queue_statistics("q", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(stats.total_processed, 2);
+        assert_eq!(
+            (stats.min_processing_time_ms, stats.max_processing_time_ms),
+            (5, 10)
+        );
+        let all = collector
+            .get_system_statistics(Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(all.total_processed, 4);
+    }
+
+    /// `max_event_age_secs` is applied when recording, without a cleanup call.
+    #[tokio::test]
+    async fn test_expired_events_are_pruned_when_recording() {
+        let collector = InMemoryStatsCollector::new(StatsConfig {
+            max_event_age_secs: 60,
+            ..Default::default()
+        });
+        collector
+            .record_event(event_at("q", 120, None))
+            .await
+            .unwrap();
+        assert_eq!(collector.read_events().len(), 0, "too old to record");
+
+        // Recorded while fresh, then expired by the time the next event arrives.
+        collector
+            .record_event(event_at("q", 59, None))
+            .await
+            .unwrap();
+        collector.write_events()[0].timestamp = Utc::now() - chrono::Duration::seconds(61);
+        collector
+            .record_event(event_at("q", 0, None))
+            .await
+            .unwrap();
+        assert_eq!(collector.read_events().len(), 1);
+    }
+
+    /// `collect_timing = false` discards processing times.
+    #[tokio::test]
+    async fn test_collect_timing_false_discards_processing_times() {
+        let collector = InMemoryStatsCollector::new(StatsConfig {
+            collect_timing: false,
+            ..Default::default()
+        });
+        collector
+            .record_event(event_at("q", 0, Some(250)))
+            .await
+            .unwrap();
+        let stats = collector
+            .get_queue_statistics("q", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(stats.total_processed, 1);
+        assert_eq!(stats.avg_processing_time_ms, 0.0);
+        assert_eq!(stats.max_processing_time_ms, 0);
+        assert!(
+            stats
+                .priority_stats
+                .unwrap()
+                .avg_processing_times
+                .is_empty()
+        );
+    }
+
+    /// Per-priority and per-queue aggregates match the events.
+    #[tokio::test]
+    async fn test_priority_breakdown_and_queue_split() {
+        let collector = InMemoryStatsCollector::new_default();
+        for (queue, priority, time) in [
+            ("a", JobPriority::High, Some(10)),
+            ("a", JobPriority::High, Some(30)),
+            ("a", JobPriority::Low, None),
+            ("b", JobPriority::Low, Some(7)),
+        ] {
+            collector
+                .record_event(create_test_job_event(
+                    queue,
+                    JobEventType::Completed,
+                    Some(priority),
+                    time,
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
+        let a = collector
+            .get_queue_statistics("a", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let priorities = a.priority_stats.unwrap();
+        assert_eq!(priorities.job_counts[&JobPriority::High], 2);
+        assert_eq!(priorities.job_counts[&JobPriority::Low], 1);
+        assert_eq!(priorities.avg_processing_times[&JobPriority::High], 20.0);
+        assert!(
+            !priorities
+                .avg_processing_times
+                .contains_key(&JobPriority::Low)
+        );
+        assert_eq!(a.avg_processing_time_ms, 20.0);
+
+        let mut all = collector
+            .get_all_statistics(Duration::from_secs(60))
+            .await
+            .unwrap();
+        all.sort_by(|x, y| x.queue_name.cmp(&y.queue_name));
+        let counts: Vec<_> = all
+            .iter()
+            .map(|q| (q.queue_name.as_str(), q.statistics.total_processed))
+            .collect();
+        assert_eq!(counts, vec![("a", 3), ("b", 1)]);
     }
 }

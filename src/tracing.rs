@@ -431,11 +431,45 @@ impl Default for TracingConfig {
 /// ```
 #[cfg(feature = "tracing")]
 pub async fn init_tracing(config: TracingConfig) -> Result<()> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    let tracer_provider = install_tracer_provider(&config)?;
+
+    // Create OpenTelemetry layer
+    let telemetry_layer = OpenTelemetryLayer::new(tracer_provider.tracer("hammerwork"));
+
+    // Initialize tracing subscriber
+    let subscriber = tracing_subscriber::registry().with(telemetry_layer);
+
+    if config.console_exporter {
+        // Add console layer for debugging
+        subscriber
+            .with(tracing_subscriber::fmt::layer())
+            .try_init()
+            .map_err(|e| crate::HammerworkError::Tracing {
+                message: format!("Failed to initialize tracing subscriber: {}", e),
+            })?;
+    } else {
+        subscriber
+            .try_init()
+            .map_err(|e| crate::HammerworkError::Tracing {
+                message: format!("Failed to initialize tracing subscriber: {}", e),
+            })?;
+    }
+
+    Ok(())
+}
+
+/// Build the tracer provider described by `config`, keep it for [`shutdown_tracing`]
+/// and install it as the global OpenTelemetry tracer provider.
+#[cfg(feature = "tracing")]
+pub(crate) fn install_tracer_provider(
+    config: &TracingConfig,
+) -> Result<opentelemetry_sdk::trace::SdkTracerProvider> {
     use opentelemetry_sdk::{
         Resource,
         trace::{Sampler, SdkTracerProvider},
     };
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     // Build resource with service information
     let mut resource = Resource::builder().with_service_name(config.service_name.clone());
@@ -489,29 +523,7 @@ pub async fn init_tracing(config: TracingConfig) -> Result<()> {
     // Set global tracer provider
     global::set_tracer_provider(tracer_provider.clone());
 
-    // Create OpenTelemetry layer
-    let telemetry_layer = OpenTelemetryLayer::new(tracer_provider.tracer("hammerwork"));
-
-    // Initialize tracing subscriber
-    let subscriber = tracing_subscriber::registry().with(telemetry_layer);
-
-    if config.console_exporter {
-        // Add console layer for debugging
-        subscriber
-            .with(tracing_subscriber::fmt::layer())
-            .try_init()
-            .map_err(|e| crate::HammerworkError::Tracing {
-                message: format!("Failed to initialize tracing subscriber: {}", e),
-            })?;
-    } else {
-        subscriber
-            .try_init()
-            .map_err(|e| crate::HammerworkError::Tracing {
-                message: format!("Failed to initialize tracing subscriber: {}", e),
-            })?;
-    }
-
-    Ok(())
+    Ok(tracer_provider)
 }
 
 /// Shutdown the global tracing infrastructure.

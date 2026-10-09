@@ -141,9 +141,71 @@ impl TaskTracker {
     }
 }
 
+/// The running listener of one webhook or stream.
+///
+/// Dropping the handle stops the listener right away, even while it is waiting for
+/// an event: the listener selects on the receiver returned by [`ListenerHandle::new`],
+/// which completes when the handle is dropped. So removing or re-adding a webhook or
+/// stream never leaves an old listener running next to the new one.
+pub(crate) struct ListenerHandle {
+    /// The listener's event manager subscription
+    pub(crate) subscription_id: uuid::Uuid,
+    _stop: tokio::sync::oneshot::Sender<()>,
+}
+
+impl ListenerHandle {
+    /// A handle for the listener of `subscription_id`, and the stop signal the
+    /// listener must watch.
+    pub(crate) fn new(subscription_id: uuid::Uuid) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                subscription_id,
+                _stop: stop,
+            },
+            stopped,
+        )
+    }
+}
+
+/// Clamp a configured limit into `1..=Semaphore::MAX_PERMITS`, warning when it changes.
+///
+/// `0` permits would make every waiter wait forever, and more than
+/// `Semaphore::MAX_PERMITS` panics inside tokio.
+pub(crate) fn clamp_permits(configured: usize, name: &str) -> usize {
+    let permits = configured.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+    if permits != configured {
+        tracing::warn!(
+            configured,
+            effective = permits,
+            "{name} is out of range, clamping"
+        );
+    }
+    permits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_a_listener_handle_stops_the_listener() {
+        let (handle, mut stopped) = ListenerHandle::new(uuid::Uuid::new_v4());
+        assert!(stopped.try_recv().is_err());
+        drop(handle);
+        // The receiver completes (with an error) once the handle is gone.
+        assert!(stopped.await.is_err());
+    }
+
+    #[test]
+    fn clamp_permits_bounds_the_value() {
+        assert_eq!(clamp_permits(0, "x"), 1);
+        assert_eq!(clamp_permits(5, "x"), 5);
+        assert_eq!(
+            clamp_permits(usize::MAX, "x"),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[tokio::test]
