@@ -16,6 +16,9 @@ pub(crate) struct PayloadEncryption {
     /// Queues whose jobs are encrypted even without an encryption config (`"*"`: all)
     #[cfg(feature = "encryption")]
     pub(crate) encrypted_queues: Vec<String>,
+    /// Refuse to store plaintext jobs on queues that hold encrypted jobs (see
+    /// `JobQueue::with_plaintext_guard`)
+    pub(crate) plaintext_guard: bool,
 }
 
 impl std::fmt::Debug for PayloadEncryption {
@@ -24,11 +27,43 @@ impl std::fmt::Debug for PayloadEncryption {
         #[cfg(feature = "encryption")]
         s.field("engine", &self.engine)
             .field("encrypted_queues", &self.encrypted_queues);
+        s.field("plaintext_guard", &self.plaintext_guard);
         s.finish()
     }
 }
 
 impl PayloadEncryption {
+    /// The queues the plaintext guard must check before `jobs` (already sealed) are
+    /// stored: the distinct queues of the jobs that stay unencrypted. Empty when the
+    /// guard is off.
+    #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+    pub(crate) fn guarded_queues(&self, jobs: &[Job]) -> Vec<String> {
+        if !self.plaintext_guard {
+            return Vec::new();
+        }
+        let mut queues: Vec<String> = jobs
+            .iter()
+            .filter(|job| !job.is_encrypted)
+            .map(|job| job.queue_name.clone())
+            .collect();
+        queues.sort();
+        queues.dedup();
+        queues
+    }
+
+    /// The error for a plaintext job refused by the plaintext guard.
+    #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+    pub(crate) fn plaintext_refused(queue_name: &str) -> HammerworkError {
+        HammerworkError::Encryption {
+            message: format!(
+                "Queue '{}' holds encrypted jobs, but this queue handle would store the new \
+                 job in plaintext; refusing. Give it the application's encryption settings \
+                 (the [encryption] section and its key), or encrypt the job explicitly",
+                queue_name
+            ),
+        }
+    }
+
     /// Whether jobs on `queue_name` are encrypted without an encryption config.
     #[cfg(feature = "encryption")]
     fn encrypts_queue(&self, queue_name: &str) -> bool {
@@ -135,5 +170,41 @@ fn has_ciphertext(#[allow(unused_variables)] job: &Job) -> bool {
     #[cfg(not(feature = "encryption"))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn plaintext_guard_checks_each_unencrypted_queue_once() {
+        let mut sealed = Job::new("payments".into(), json!({}));
+        sealed.is_encrypted = true;
+        let jobs = vec![
+            Job::new("emails".into(), json!({})),
+            Job::new("emails".into(), json!({})),
+            Job::new("audit".into(), json!({})),
+            sealed,
+        ];
+        assert!(
+            PayloadEncryption::default()
+                .guarded_queues(&jobs)
+                .is_empty()
+        );
+        // Without the `encryption` feature `plaintext_guard` is the only field.
+        #[allow(clippy::needless_update)]
+        let guard = PayloadEncryption {
+            plaintext_guard: true,
+            ..Default::default()
+        };
+        assert_eq!(guard.guarded_queues(&jobs), vec!["audit", "emails"]);
+        let message = PayloadEncryption::plaintext_refused("payments").to_string();
+        assert!(
+            message.contains("'payments' holds encrypted jobs"),
+            "{message}"
+        );
+        assert!(format!("{guard:?}").contains("plaintext_guard: true"));
     }
 }

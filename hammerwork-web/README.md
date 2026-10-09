@@ -104,6 +104,17 @@ Then start with:
 hammerwork-web --config dashboard.toml
 ```
 
+### Encrypted Queues
+
+Jobs created from the dashboard (`POST /api/jobs`) are encrypted like your application's.
+Set `HAMMERWORK_ENCRYPTION_CONFIG` to the application's `hammerwork.toml` (only its
+`[encryption]` section is read; the `HAMMERWORK_ENCRYPTION_*` variables apply on top) and
+make its key available, e.g. `HAMMERWORK_ENCRYPTION_KEY`. Jobs on its `encrypted_queues` are
+then encrypted with its key. If encryption is enabled but the key cannot be loaded, the
+dashboard does not start. Without these settings it still refuses to create a plaintext job
+on a queue that already holds encrypted jobs. Viewing jobs never needs the key: encrypted
+payloads are shown redacted.
+
 ## Library Usage
 
 Add to your `Cargo.toml`:

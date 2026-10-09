@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Core Hammerwork functionality
-hammerwork = { workspace = true, features = ["postgres", "mysql", "metrics"] }
+hammerwork = { workspace = true, features = ["postgres", "mysql", "metrics", "encryption"] }
 
 # Web framework and HTTP
 warp = { workspace = true }

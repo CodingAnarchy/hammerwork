@@ -320,7 +320,10 @@ pub struct StreamConfig {
 ///     config: HashMap::new(),
 /// };
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` never shows credentials (`secret_access_key`, `service_account_key`) or the
+/// values of the `config` maps (they may hold SASL passwords), only their keys.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum StreamBackend {
     /// Apache Kafka backend
@@ -356,6 +359,55 @@ pub enum StreamBackend {
         /// Additional Pub/Sub configuration
         config: HashMap<String, String>,
     },
+}
+
+impl std::fmt::Debug for StreamBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn keys(map: &HashMap<String, String>) -> Vec<&String> {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            keys
+        }
+        let redacted = |secret: &Option<String>| secret.as_ref().map(|_| "[REDACTED]");
+        match self {
+            StreamBackend::Kafka {
+                brokers,
+                topic,
+                config,
+            } => f
+                .debug_struct("Kafka")
+                .field("brokers", brokers)
+                .field("topic", topic)
+                .field("config", &keys(config))
+                .finish(),
+            StreamBackend::Kinesis {
+                region,
+                stream_name,
+                access_key_id,
+                secret_access_key,
+                config,
+            } => f
+                .debug_struct("Kinesis")
+                .field("region", region)
+                .field("stream_name", stream_name)
+                .field("access_key_id", access_key_id)
+                .field("secret_access_key", &redacted(secret_access_key))
+                .field("config", &keys(config))
+                .finish(),
+            StreamBackend::PubSub {
+                project_id,
+                topic_name,
+                service_account_key,
+                config,
+            } => f
+                .debug_struct("PubSub")
+                .field("project_id", project_id)
+                .field("topic_name", topic_name)
+                .field("service_account_key", &redacted(service_account_key))
+                .field("config", &keys(config))
+                .finish(),
+        }
+    }
 }
 
 /// Partitioning strategies for distributing events across stream partitions.
@@ -3009,6 +3061,35 @@ impl StreamProcessor for InMemoryProcessor {
 mod tests {
     use super::*;
     use crate::{events::JobLifecycleEventType, priority::JobPriority};
+
+    #[test]
+    fn test_stream_backend_debug_hides_credentials() {
+        let config = HashMap::from([("sasl.password".to_string(), "hunter2-sasl".to_string())]);
+        for backend in [
+            StreamBackend::Kafka {
+                brokers: vec!["kafka:9092".to_string()],
+                topic: "events".to_string(),
+                config: config.clone(),
+            },
+            StreamBackend::Kinesis {
+                region: "us-east-1".to_string(),
+                stream_name: "events".to_string(),
+                access_key_id: Some("AKIDEXAMPLE".to_string()),
+                secret_access_key: Some("hunter2-aws".to_string()),
+                config: config.clone(),
+            },
+            StreamBackend::PubSub {
+                project_id: "project".to_string(),
+                topic_name: "events".to_string(),
+                service_account_key: Some("hunter2-gcp".to_string()),
+                config: config.clone(),
+            },
+        ] {
+            let debug = format!("{backend:?}");
+            assert!(!debug.contains("hunter2"), "{debug}");
+            assert!(debug.contains("sasl.password"), "{debug}");
+        }
+    }
 
     #[test]
     fn test_clamp_processor_permits() {

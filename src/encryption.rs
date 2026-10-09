@@ -78,6 +78,9 @@ use thiserror::Error;
 
 use base64::Engine;
 
+/// Key material that is wiped from memory when dropped.
+pub(crate) type SecretBytes = zeroize::Zeroizing<Vec<u8>>;
+
 /// Errors that can occur during encryption operations.
 #[derive(Error, Debug)]
 pub enum EncryptionError {

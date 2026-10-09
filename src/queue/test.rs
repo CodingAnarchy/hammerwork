@@ -3367,6 +3367,36 @@ mod tests {
             );
         }
 
+        /// Every read path returns an encrypted job with its ciphertext and PII fields, so
+        /// `decrypt_job` works on it (#64 H2).
+        #[tokio::test]
+        async fn dead_and_listed_jobs_keep_their_ciphertext() {
+            let queue = encrypted_queue().await;
+            let payload = json!({"ssn": "123-45-6789", "amount": 5});
+            let id = queue
+                .enqueue(
+                    Job::new("dlq".into(), payload.clone())
+                        .with_encryption(config())
+                        .with_pii_fields(vec!["ssn"]),
+                )
+                .await
+                .unwrap();
+            queue.mark_job_dead(id, "boom").await.unwrap();
+
+            let dead = queue.get_dead_jobs(None, None).await.unwrap();
+            let by_queue = queue
+                .get_dead_jobs_by_queue("dlq", None, None)
+                .await
+                .unwrap();
+            for job in dead.into_iter().chain(by_queue) {
+                assert_eq!(job.id, id);
+                assert!(job.is_encrypted);
+                assert!(job.encrypted_payload.is_some());
+                assert_eq!(job.pii_fields, vec!["ssn"]);
+                assert_eq!(queue.decrypt_job(job).await.unwrap().payload, payload);
+            }
+        }
+
         #[tokio::test]
         async fn retention_purge_uses_the_mock_clock() {
             let queue = encrypted_queue().await;

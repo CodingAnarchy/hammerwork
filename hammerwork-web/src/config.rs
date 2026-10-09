@@ -90,7 +90,9 @@ use std::time::Duration;
 /// assert_eq!(config.bind_addr(), "0.0.0.0:9090");
 /// assert!(config.enable_cors);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` shows `database_url` with its password replaced by `***`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DashboardConfig {
     /// Server bind address
     pub bind_address: String,
@@ -369,7 +371,9 @@ impl DashboardConfig {
 /// assert_eq!(auth_config.username, "dashboard_admin");
 /// assert_eq!(auth_config.max_failed_attempts, 3);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` never shows `password_hash`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     /// Whether authentication is enabled
     pub enabled: bool,
@@ -430,6 +434,60 @@ impl Default for WebSocketConfig {
             message_buffer_size: 1024,
             max_message_size: 64 * 1024, // 64KB
         }
+    }
+}
+
+impl std::fmt::Debug for DashboardConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DashboardConfig")
+            .field("bind_address", &self.bind_address)
+            .field("port", &self.port)
+            .field(
+                "database_url",
+                &hammerwork::config::redact_url(&self.database_url),
+            )
+            .field("pool_size", &self.pool_size)
+            .field("static_dir", &self.static_dir)
+            .field("auth", &self.auth)
+            .field("websocket", &self.websocket)
+            .field("enable_cors", &self.enable_cors)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Fields added later are left out rather than risk printing a secret.
+        f.debug_struct("AuthConfig")
+            .field("enabled", &self.enabled)
+            .field("username", &self.username)
+            .field("password_hash", &"[REDACTED]")
+            .field("session_timeout", &self.session_timeout)
+            .field("max_failed_attempts", &self.max_failed_attempts)
+            .field("lockout_duration", &self.lockout_duration)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_does_not_print_secrets() {
+        let mut config = DashboardConfig {
+            database_url: "postgres://app:hunter2-db@db.internal/jobs".to_string(),
+            ..Default::default()
+        };
+        config.auth.password_hash = "$2b$12$hunter2hashhunter2hashhu".to_string();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(
+            debug.contains("postgres://app:***@db.internal/jobs"),
+            "{debug}"
+        );
+        assert!(debug.contains("[REDACTED]"), "{debug}");
     }
 }
 

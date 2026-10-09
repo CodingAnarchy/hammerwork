@@ -124,9 +124,31 @@ cargo hammerwork config reset --confirm         # Back to defaults
 ```
 
 Valid keys for `set` and `get` are `database_url`, `default_queue`, `default_limit`,
-`log_level`, `connection_pool_size` and `connect_timeout_secs`. `set` validates the value (the database URL must
+`log_level`, `connection_pool_size`, `connect_timeout_secs` and `encryption_config`. `set` validates the value (the database URL must
 start with `postgres://`, `postgresql://` or `mysql://`, `log_level` must be one of
-`trace`, `debug`, `info`, `warn`, `error`, and `connection_pool_size` must be 1-100, `connect_timeout_secs` 1-600).
+`trace`, `debug`, `info`, `warn`, `error`, and `connection_pool_size` must be 1-100, `connect_timeout_secs` 1-600,
+and `encryption_config` must be a readable `hammerwork.toml`). `config show` masks the
+password of the database URL, and summarises the payload encryption settings.
+
+#### Encrypted queues
+
+Commands that write jobs (`job enqueue`, `batch enqueue`, `cron create`, `workflow create`)
+encrypt them like your application. Point the CLI at the application's `hammerwork.toml`
+and make its key available:
+
+```bash
+cargo hammerwork config set encryption_config /etc/myapp/hammerwork.toml
+export HAMMERWORK_ENCRYPTION_KEY=...   # the key its [encryption] key_source names
+```
+
+Only the `[encryption]` section is read; `HAMMERWORK_ENCRYPTION_CONFIG` overrides the path,
+and the `HAMMERWORK_ENCRYPTION_*` variables override the settings, as for the application.
+Jobs on its `encrypted_queues` are then encrypted; `job enqueue --encrypt` (whole payload)
+or `--pii-field <field>` (repeatable) encrypt a job on any queue. The CLI never writes
+plaintext by mistake: with encryption enabled but the key unavailable, these commands fail,
+and without any settings they still refuse to write a plaintext job to a queue that already
+holds encrypted jobs. KMS key sources need the matching cargo feature of `cargo-hammerwork`
+(`aws-kms`, `gcp-kms`, `vault-kms`, `azure-kv`).
 
 ### Job Management Commands
 
@@ -141,6 +163,7 @@ cargo hammerwork job show <job-id>                # Detailed job information
 
 cargo hammerwork job enqueue --queue emails --payload '{"to": "a@example.com"}'
 cargo hammerwork job enqueue --queue emails --payload '{"n": 1}' --priority high --delay 60 --max-attempts 5 --timeout 30
+cargo hammerwork job enqueue --queue payments --payload '{"card": "4111..."}' --pii-field card   # encrypted
 
 cargo hammerwork job retry <job-id>                 # Retry one job (--job-id also works)
 cargo hammerwork job retry --queue emails         # Retry every failed job in a queue
@@ -422,10 +445,21 @@ cargo hammerwork backup restore --input backup.json --confirm
 cargo hammerwork backup restore --input backup.json --skip-existing --confirm
 ```
 
-`backup create` requires `--output` and `--format` is `json` or `csv`. `backup restore`
-requires `--input` and refuses to run without `--confirm`. `backup list` only reads the
-`.json` and `.csv` files in a local directory (default `./backups`). There is no
-`backup verify`.
+`backup create` requires `--output` and `--format` is `json` or `csv`. A JSON backup
+(format version 2.0) holds every column of every selected job: encrypted payloads stay
+encrypted, with their nonce, tag, key id and metadata, and cron schedules, timeouts, retry
+strategies, dependencies, workflows, batches, results, tracing ids and retention are all
+kept. A CSV backup is an export of the main columns and cannot be restored.
+
+`backup restore` requires `--input` and refuses to run without `--confirm`. It recreates
+the jobs exactly as they were backed up (into PostgreSQL or MySQL, whichever the backup
+came from), and restored encrypted jobs decrypt with the same key. Jobs whose id already
+exists are never overwritten or duplicated: they are skipped and counted, with or without
+`--skip-existing`. The whole backup is checked before anything is written and the jobs are
+inserted in one transaction, so a bad backup restores nothing; a backup from a newer schema
+must be restored into a database migrated at least as far. Backups from earlier versions
+(format 1.0) still restore. `backup list` only reads the `.json` and `.csv` files in a local
+directory (default `./backups`). There is no `backup verify`.
 
 ## Architecture & Design
 
@@ -453,7 +487,8 @@ Settings come from these sources, highest priority first:
 
 1. **Command-line flags**: for the database URL, `--database-url` / `-u` (`-d` on `queue` commands)
 2. **Environment variables**: `DATABASE_URL`, `HAMMERWORK_DEFAULT_QUEUE`,
-   `HAMMERWORK_DEFAULT_LIMIT`, `HAMMERWORK_LOG_LEVEL`, `HAMMERWORK_POOL_SIZE`
+   `HAMMERWORK_DEFAULT_LIMIT`, `HAMMERWORK_LOG_LEVEL`, `HAMMERWORK_POOL_SIZE`,
+   `HAMMERWORK_ENCRYPTION_CONFIG` (and the `HAMMERWORK_ENCRYPTION_*` payload encryption settings)
 3. **Configuration file**
 4. **Default values** (`default_limit = 50`, `log_level = "info"`, `connection_pool_size = 5`)
 
@@ -472,6 +507,7 @@ default_queue = "emails"
 default_limit = 50
 log_level = "info"
 connection_pool_size = 5
+encryption_config = "/etc/myapp/hammerwork.toml"   # optional: the application's encryption settings
 ```
 
 ### Database Support

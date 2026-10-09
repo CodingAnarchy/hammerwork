@@ -58,52 +58,79 @@ impl ConfigCommand {
     }
 }
 
+/// The rows of `config show`: setting, value, source. Secrets are never shown: the
+/// database URL's password is replaced by `***`, and encryption keys are only ever
+/// referenced (`env://VAR`, a KMS URI), never stored in a configuration.
+fn config_rows(
+    config: &Config,
+    env: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'static str, String, &'static str)> {
+    let from = |value: &Option<String>, var: &str| match (value, env(var)) {
+        (Some(value), _) => (value.clone(), "Config File"),
+        (None, Some(value)) => (value, "Environment"),
+        (None, None) => ("Not set".to_string(), "Default"),
+    };
+    let (db_url, db_source) = from(&config.database_url, "DATABASE_URL");
+    let db_url = crate::utils::validation::redact_url(&db_url);
+    let (queue, queue_source) = from(&config.default_queue, "HAMMERWORK_DEFAULT_QUEUE");
+    let (encryption_config, encryption_source) =
+        from(&config.encryption_config, "HAMMERWORK_ENCRYPTION_CONFIG");
+    let encryption = match config.encryption_settings() {
+        Ok(settings) if settings.enabled => format!(
+            "enabled ({:?}, key {} from {}, encrypted queues: {})",
+            settings.algorithm,
+            settings.key_id.as_deref().unwrap_or("default"),
+            settings.key_source,
+            if settings.encrypted_queues.is_empty() {
+                "none".to_string()
+            } else {
+                settings.encrypted_queues.join(", ")
+            }
+        ),
+        Ok(_) => "disabled".to_string(),
+        Err(e) => format!("invalid: {}", e),
+    };
+    vec![
+        ("database_url", db_url, db_source),
+        ("default_queue", queue, queue_source),
+        (
+            "default_limit",
+            config.get_default_limit().to_string(),
+            "Config File",
+        ),
+        (
+            "log_level",
+            config.get_log_level().to_string(),
+            "Config File",
+        ),
+        (
+            "connection_pool_size",
+            config.get_connection_pool_size().to_string(),
+            "Config File",
+        ),
+        (
+            "connect_timeout_secs",
+            config.get_connect_timeout_secs().to_string(),
+            "Config File",
+        ),
+        ("encryption_config", encryption_config, encryption_source),
+        (
+            "encryption",
+            encryption,
+            "encryption_config + HAMMERWORK_ENCRYPTION_*",
+        ),
+    ]
+}
+
 async fn show_config(config: &Config) -> Result<()> {
     println!("⚙️  Hammerwork Configuration");
     println!("═══════════════════════════");
 
     let mut table = comfy_table::Table::new();
     table.set_header(vec!["Setting", "Value", "Source"]);
-
-    // Database URL
-    let (db_url, db_source) = if let Some(url) = &config.database_url {
-        (url.clone(), "Config File")
-    } else if let Ok(env_url) = std::env::var("DATABASE_URL") {
-        (env_url, "Environment")
-    } else {
-        ("Not set".to_string(), "Default")
-    };
-    table.add_row(vec!["database_url", &db_url, db_source]);
-
-    // Default queue
-    let (queue, queue_source) = if let Some(q) = &config.default_queue {
-        (q.clone(), "Config File")
-    } else if let Ok(env_queue) = std::env::var("HAMMERWORK_DEFAULT_QUEUE") {
-        (env_queue, "Environment")
-    } else {
-        ("Not set".to_string(), "Default")
-    };
-    table.add_row(vec!["default_queue", &queue, queue_source]);
-
-    // Default limit
-    let limit = config.get_default_limit().to_string();
-    table.add_row(vec!["default_limit", &limit, "Config File"]);
-
-    // Log level
-    let log_level = config.get_log_level();
-    table.add_row(vec!["log_level", log_level, "Config File"]);
-
-    // Connection pool size
-    let pool_size = config.get_connection_pool_size().to_string();
-    table.add_row(vec!["connection_pool_size", &pool_size, "Config File"]);
-
-    // Connect timeout
-    let connect_timeout = config.get_connect_timeout_secs().to_string();
-    table.add_row(vec![
-        "connect_timeout_secs",
-        &connect_timeout,
-        "Config File",
-    ]);
+    for (setting, value, source) in config_rows(config, |var| std::env::var(var).ok()) {
+        table.add_row(vec![setting, value.as_str(), source]);
+    }
 
     println!("{}", table);
 
@@ -165,10 +192,20 @@ async fn set_config_value(config: &mut Config, key: &str, value: &str, path: &Pa
             config.connect_timeout_secs = Some(secs);
             info!("✅ Set connect_timeout_secs to: {}", secs);
         }
+        "encryption_config" => {
+            let candidate = Config {
+                encryption_config: Some(value.to_string()),
+                ..config.clone()
+            };
+            candidate.encryption_settings()?;
+            config.encryption_config = Some(value.to_string());
+            info!("✅ Set encryption_config to: {}", value);
+        }
         _ => {
             return Err(anyhow::anyhow!(
-                "Unknown configuration key: {}. Valid keys: database_url, default_queue, default_limit, log_level, connection_pool_size, connect_timeout_secs",
-                key
+                "Unknown configuration key: {}. Valid keys: {}",
+                key,
+                VALID_KEYS
             ));
         }
     }
@@ -188,10 +225,16 @@ async fn get_config_value(config: &Config, key: &str) -> Result<()> {
         "log_level" => config.get_log_level().to_string(),
         "connection_pool_size" => config.get_connection_pool_size().to_string(),
         "connect_timeout_secs" => config.get_connect_timeout_secs().to_string(),
+        "encryption_config" => config
+            .encryption_config
+            .as_deref()
+            .unwrap_or("Not set")
+            .to_string(),
         _ => {
             return Err(anyhow::anyhow!(
-                "Unknown configuration key: {}. Valid keys: database_url, default_queue, default_limit, log_level, connection_pool_size, connect_timeout_secs",
-                key
+                "Unknown configuration key: {}. Valid keys: {}",
+                key,
+                VALID_KEYS
             ));
         }
     };
@@ -199,6 +242,9 @@ async fn get_config_value(config: &Config, key: &str) -> Result<()> {
     println!("{}", value);
     Ok(())
 }
+
+const VALID_KEYS: &str = "database_url, default_queue, default_limit, log_level, \
+                          connection_pool_size, connect_timeout_secs, encryption_config";
 
 async fn reset_config(config: &mut Config, confirm: bool, path: &Path) -> Result<()> {
     if !confirm {
@@ -402,6 +448,99 @@ mod tests {
             Config::load_from_path(&path).unwrap().get_default_limit(),
             50
         );
+    }
+
+    #[test]
+    fn show_never_prints_the_database_password() {
+        let config = Config {
+            database_url: Some("postgres://app:hunter2-db@db.internal/jobs".into()),
+            ..Config::default()
+        };
+        let rows = config_rows(&config, |_| None);
+        let shown = format!("{rows:?}");
+        assert!(!shown.contains("hunter2-db"), "{shown}");
+        assert!(
+            shown.contains("postgres://app:***@db.internal/jobs"),
+            "{shown}"
+        );
+        assert!(!format!("{config:?}").contains("hunter2-db"));
+
+        // Also when the URL comes from the environment
+        let rows = config_rows(&Config::default(), |var| {
+            (var == "DATABASE_URL").then(|| "mysql://root:hunter2-env@db/jobs".to_string())
+        });
+        let (_, url, source) = &rows[0];
+        assert_eq!(
+            (url.as_str(), *source),
+            ("mysql://root:***@db/jobs", "Environment")
+        );
+    }
+
+    #[test]
+    fn show_summarises_the_encryption_settings() {
+        let _guard = crate::utils::test_support::serial_blocking();
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("hammerwork.toml");
+        std::fs::write(
+            &app,
+            "[encryption]\nenabled = true\nkey_source = \"env://APP_KEY\"\n\
+             encrypted_queues = [\"payments\"]\n",
+        )
+        .unwrap();
+        let config = Config {
+            encryption_config: Some(app.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let rows = config_rows(&config, |_| None);
+        let encryption = &rows.iter().find(|r| r.0 == "encryption").unwrap().1;
+        assert!(encryption.starts_with("enabled"), "{encryption}");
+        assert!(encryption.contains("env://APP_KEY"), "{encryption}");
+        assert!(encryption.contains("payments"), "{encryption}");
+        let rows = config_rows(&Config::default(), |_| None);
+        assert_eq!(
+            rows.iter().find(|r| r.0 == "encryption").unwrap().1,
+            "disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn encryption_config_can_be_set_and_read() {
+        let _guard = crate::utils::test_support::serial().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let app = dir.path().join("hammerwork.toml");
+        std::fs::write(&app, "[encryption]\nenabled = false\n").unwrap();
+        let mut config = Config::default();
+        run(
+            &["set", "encryption_config", app.to_str().unwrap()],
+            &mut config,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Config::load_from_path(&path)
+                .unwrap()
+                .encryption_config
+                .as_deref(),
+            app.to_str()
+        );
+        run(&["get", "encryption_config"], &mut config, &path)
+            .await
+            .unwrap();
+        // A file that cannot be read is rejected and not saved
+        let err = run(
+            &["set", "encryption_config", "/no/such/hammerwork.toml"],
+            &mut config,
+            &path,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid encryption settings"),
+            "{err}"
+        );
+        assert_eq!(config.encryption_config.as_deref(), app.to_str());
     }
 
     #[tokio::test]

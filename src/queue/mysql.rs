@@ -560,91 +560,6 @@ impl JobRow {
     }
 }
 
-#[derive(FromRow)]
-pub(crate) struct DeadJobRow {
-    pub id: String,
-    pub queue_name: String,
-    pub payload: serde_json::Value,
-    pub status: String,
-    pub priority: i32,
-    pub attempts: i32,
-    pub max_attempts: i32,
-    pub timeout_seconds: Option<i32>,
-    pub created_at: DateTime<Utc>,
-    pub scheduled_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub failed_at: Option<DateTime<Utc>>,
-    pub timed_out_at: Option<DateTime<Utc>>,
-    pub error_message: Option<String>,
-}
-
-impl DeadJobRow {
-    pub fn into_job(self) -> Result<Job> {
-        Ok(Job {
-            id: uuid::Uuid::parse_str(&self.id)?,
-            queue_name: self.queue_name,
-            payload: self.payload,
-            status: {
-                // Handle both quoted (old format) and unquoted (new format) status values
-                let cleaned_str = self.status.trim_matches('"');
-                match cleaned_str {
-                    "Pending" => JobStatus::Pending,
-                    "Running" => JobStatus::Running,
-                    "Completed" => JobStatus::Completed,
-                    "Failed" => JobStatus::Failed,
-                    "Dead" => JobStatus::Dead,
-                    "TimedOut" => JobStatus::TimedOut,
-                    "Retrying" => JobStatus::Retrying,
-                    "Archived" => JobStatus::Archived,
-                    _ => JobStatus::Dead, // Default fallback for unknown status
-                }
-            },
-            priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
-            attempts: self.attempts,
-            max_attempts: self.max_attempts,
-            created_at: self.created_at,
-            scheduled_at: self.scheduled_at,
-            started_at: self.started_at,
-            completed_at: self.completed_at,
-            failed_at: self.failed_at,
-            timed_out_at: self.timed_out_at,
-            timeout: self
-                .timeout_seconds
-                .map(|s| super::db_seconds(s, "timeout_seconds"))
-                .transpose()?,
-            error_message: self.error_message,
-            cron_schedule: None,
-            next_run_at: None,
-            recurring: false,
-            timezone: None,
-            batch_id: None,
-            result_config: crate::job::ResultConfig::default(),
-            result_data: None,
-            result_stored_at: None,
-            result_expires_at: None,
-            retry_strategy: None,
-            depends_on: Vec::new(),
-            dependents: Vec::new(),
-            dependency_status: crate::workflow::DependencyStatus::None,
-            workflow_id: None,
-            workflow_name: None,
-            trace_id: None,
-            correlation_id: None,
-            parent_span_id: None,
-            span_context: None,
-            #[cfg(feature = "encryption")]
-            encryption_config: None,
-            pii_fields: Vec::new(),
-            #[cfg(feature = "encryption")]
-            retention_policy: None,
-            is_encrypted: false,
-            #[cfg(feature = "encryption")]
-            encrypted_payload: None,
-        })
-    }
-}
-
 /// Number of attempts for a job claim that keeps hitting InnoDB deadlocks.
 const CLAIM_DEADLOCK_ATTEMPTS: u32 = 5;
 
@@ -803,12 +718,36 @@ impl crate::queue::JobQueue<MySql> {
     }
 }
 
+impl crate::queue::JobQueue<MySql> {
+    /// Seals `jobs` for storage ([`JobQueue::seal_jobs`](super::JobQueue)), then applies
+    /// the plaintext guard ([`JobQueue::with_plaintext_guard`](super::JobQueue)).
+    async fn seal_for_insert(&self, jobs: &mut [Job]) -> Result<()> {
+        self.seal_jobs(jobs).await?;
+        for queue_name in self.encryption.guarded_queues(jobs) {
+            let holds_encrypted_jobs = sqlx::query(
+                "SELECT 1 FROM hammerwork_jobs WHERE queue_name = ? AND is_encrypted = TRUE \
+                 LIMIT 1",
+            )
+            .bind(&queue_name)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            if holds_encrypted_jobs {
+                return Err(
+                    super::payload_encryption::PayloadEncryption::plaintext_refused(&queue_name),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     type Database = MySql;
 
     async fn enqueue(&self, mut job: Job) -> Result<JobId> {
-        self.seal_jobs(std::slice::from_mut(&mut job)).await?;
+        self.seal_for_insert(std::slice::from_mut(&mut job)).await?;
         if job.depends_on.is_empty() {
             let mut conn = self.pool.acquire().await?;
             insert_jobs(&mut conn, std::slice::from_ref(&job)).await?;
@@ -933,7 +872,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 job
             })
             .collect();
-        self.seal_jobs(&mut jobs).await?;
+        self.seal_for_insert(&mut jobs).await?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -1094,9 +1033,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         let limit = limit.unwrap_or(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let rows = sqlx::query_as::<_, DeadJobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
-        )
+        let rows = sqlx::query_as::<_, JobRow>(&format!(
+            "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE status = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
+        ))
         .bind(JobStatus::Dead)
         .bind(limit)
         .bind(offset)
@@ -1117,9 +1056,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         let limit = limit.unwrap_or(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let rows = sqlx::query_as::<_, DeadJobRow>(
-            "SELECT id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message FROM hammerwork_jobs WHERE status = ? AND queue_name = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
-        )
+        let rows = sqlx::query_as::<_, JobRow>(&format!(
+            "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE status = ? AND queue_name = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
+        ))
         .bind(JobStatus::Dead)
         .bind(queue_name)
         .bind(limit)
@@ -1668,7 +1607,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         workflow.validate()?;
 
         let mut jobs = workflow.jobs.clone();
-        self.seal_jobs(&mut jobs).await?;
+        self.seal_for_insert(&mut jobs).await?;
 
         let mut tx = self.pool.begin().await?;
 

@@ -185,7 +185,8 @@ impl WebDashboard {
                     "Connected to PostgreSQL with {} connections",
                     self.config.pool_size
                 );
-                self.serve(JobQueue::new(pool), "PostgreSQL").await
+                let queue = job_queue(pool, &encryption_settings()?).await?;
+                self.serve(queue, "PostgreSQL").await
             }
             #[cfg(feature = "mysql")]
             DatabaseBackend::MySql => {
@@ -197,7 +198,8 @@ impl WebDashboard {
                     "Connected to MySQL with {} connections",
                     self.config.pool_size
                 );
-                self.serve(JobQueue::new(pool), "MySQL").await
+                let queue = job_queue(pool, &encryption_settings()?).await?;
+                self.serve(queue, "MySQL").await
             }
         }
     }
@@ -410,11 +412,95 @@ impl DatabaseBackend {
     }
 }
 
+/// The application's payload encryption settings: the `[encryption]` section of the
+/// `hammerwork.toml` named by `HAMMERWORK_ENCRYPTION_CONFIG`, with the
+/// `HAMMERWORK_ENCRYPTION_*` environment variables applied on top (see
+/// `PayloadEncryptionConfig::load`). Disabled when neither is set.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn encryption_settings() -> Result<hammerwork::config::PayloadEncryptionConfig> {
+    let path = std::env::var("HAMMERWORK_ENCRYPTION_CONFIG")
+        .ok()
+        .filter(|path| !path.is_empty());
+    Ok(hammerwork::config::PayloadEncryptionConfig::load(
+        path.as_deref().map(std::path::Path::new),
+    )?)
+}
+
+/// The dashboard's job queue.
+///
+/// It encrypts like the application (jobs created from the dashboard on the
+/// application's `encrypted_queues` are encrypted with its key), and it has the plaintext
+/// guard, so it refuses to write a plaintext job to a queue that holds encrypted jobs
+/// even without encryption settings. A key that cannot be loaded is an error: the
+/// dashboard does not start rather than write plaintext.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+async fn job_queue<DB: hammerwork::encryption::KeyManagerBackend>(
+    pool: sqlx::Pool<DB>,
+    encryption: &hammerwork::config::PayloadEncryptionConfig,
+) -> Result<JobQueue<DB>> {
+    let queue = JobQueue::new(pool)
+        .apply_encryption_config(encryption)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Cannot set up payload encryption from the application's [encryption] \
+                 settings ({}); refusing to start rather than store jobs in plaintext",
+                e
+            )
+        })?;
+    if encryption.enabled {
+        info!(
+            "Payload encryption enabled for queues: {:?}",
+            encryption.encrypted_queues
+        );
+    }
+    Ok(queue.with_plaintext_guard(true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::DashboardConfig;
     use tempfile::tempdir;
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn test_job_queue_encrypts_like_the_application() {
+        use base64::Engine as _;
+        let pool = || {
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+                .unwrap()
+        };
+
+        // No settings: no engine (the plaintext guard still applies)
+        let queue = job_queue(pool(), &Default::default()).await.unwrap();
+        assert!(queue.encryption_engine().is_none());
+
+        // The application's settings: its engine, with its key
+        let var = format!("HW_WEB_TEST_KEY_{}", uuid::Uuid::new_v4().simple());
+        let settings = hammerwork::config::PayloadEncryptionConfig {
+            enabled: true,
+            key_source: hammerwork::config::KeySourceRef::parse(&format!("env://{var}")).unwrap(),
+            key_id: Some("web-key".to_string()),
+            encrypted_queues: vec!["payments".to_string()],
+            ..Default::default()
+        };
+        let err = job_queue(pool(), &settings)
+            .await
+            .err()
+            .expect("the key is missing");
+        assert!(err.to_string().contains("refusing to start"), "{err}");
+        // SAFETY: the variable name is unique to this test.
+        unsafe {
+            std::env::set_var(
+                &var,
+                base64::engine::general_purpose::STANDARD.encode([3u8; 32]),
+            )
+        };
+        let queue = job_queue(pool(), &settings).await.unwrap();
+        assert_eq!(queue.encryption_engine().unwrap().key_id(), "web-key");
+    }
 
     #[tokio::test]
     async fn test_dashboard_creation() {

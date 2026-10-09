@@ -335,7 +335,10 @@ fn single_line(value: &str) -> String {
 }
 
 /// Alert target configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` never shows header values or the path of a webhook or Slack URL (a Slack
+/// webhook URL is itself a credential).
+#[derive(Clone, Serialize, Deserialize)]
 pub enum AlertTarget {
     /// Webhook alert target
     Webhook {
@@ -356,6 +359,34 @@ pub enum AlertTarget {
         webhook_url: String,
         channel: String,
     },
+}
+
+impl std::fmt::Debug for AlertTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AlertTarget::Webhook { url, headers } => {
+                let mut names: Vec<&String> = headers.keys().collect();
+                names.sort();
+                f.debug_struct("Webhook")
+                    .field("url", &crate::config::redact_url_path(url))
+                    .field("headers", &names)
+                    .finish()
+            }
+            AlertTarget::Email { recipient, smtp } => f
+                .debug_struct("Email")
+                .field("recipient", recipient)
+                .field("smtp", smtp)
+                .finish(),
+            AlertTarget::Slack {
+                webhook_url,
+                channel,
+            } => f
+                .debug_struct("Slack")
+                .field("webhook_url", &crate::config::redact_url_path(webhook_url))
+                .field("channel", channel)
+                .finish(),
+        }
+    }
 }
 
 /// Alert severity levels
@@ -1409,6 +1440,36 @@ mod tests {
             SmtpConfig::new("smtp.example.com", "alerts@example.com"),
         );
         assert!(bad_recipient.validate().is_err());
+    }
+
+    #[test]
+    fn test_alert_target_debug_hides_urls_and_header_values() {
+        let targets = [
+            AlertTarget::Webhook {
+                url: "https://alerts.example.com/hook/hunter2-path".to_string(),
+                headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer hunter2-token".to_string(),
+                )]),
+            },
+            AlertTarget::Slack {
+                webhook_url: "https://hooks.slack.com/services/T0/B0/hunter2-path".to_string(),
+                channel: "#ops".to_string(),
+            },
+        ];
+        for target in targets {
+            let debug = format!("{target:?}");
+            assert!(!debug.contains("hunter2"), "{debug}");
+            assert!(debug.contains("/***"), "{debug}");
+        }
+        let debug = format!(
+            "{:?}",
+            AlertTarget::Email {
+                recipient: "ops@example.com".to_string(),
+                smtp: None,
+            }
+        );
+        assert!(debug.contains("ops@example.com"), "{debug}");
     }
 
     #[test]

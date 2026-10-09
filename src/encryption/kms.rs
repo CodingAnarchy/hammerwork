@@ -87,13 +87,61 @@ pub(crate) fn vault_mount_and_path(secret_path: &str) -> Result<(&str, &str), En
     }
 }
 
+/// The key in the `key` field of a Vault secret: base64 of exactly `expected_size` bytes.
+///
+/// Anything else (a passphrase, or base64 of another length) is a configuration error.
+/// Short material is never padded or hashed into a key: that would give a full-size key
+/// with only the entropy of the input.
+#[cfg_attr(not(feature = "vault-kms"), allow(dead_code))]
+pub(crate) fn exact_vault_key(
+    key_str: &str,
+    expected_size: usize,
+) -> Result<super::SecretBytes, EncryptionError> {
+    use base64::Engine;
+    let decoded = super::SecretBytes::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(key_str.trim())
+            .map_err(|_| {
+                EncryptionError::InvalidConfiguration(format!(
+                    "The Vault secret's `key` field is not base64; it must be a base64-encoded \
+                     {}-byte key (passphrases are not accepted)",
+                    expected_size
+                ))
+            })?,
+    );
+    exact_size(decoded, expected_size, "The Vault secret's `key` field")
+}
+
+/// Key material of exactly `expected_size` bytes, or a configuration error naming `what`.
+#[cfg_attr(
+    not(any(feature = "vault-kms", feature = "azure-kv")),
+    allow(dead_code)
+)]
+pub(crate) fn exact_size(
+    material: super::SecretBytes,
+    expected_size: usize,
+    what: &str,
+) -> Result<super::SecretBytes, EncryptionError> {
+    if material.len() == expected_size {
+        Ok(material)
+    } else {
+        Err(EncryptionError::InvalidConfiguration(format!(
+            "{} holds a {}-byte key, expected exactly {} bytes; key material of the wrong \
+             size is rejected rather than padded or truncated",
+            what,
+            material.len(),
+            expected_size
+        )))
+    }
+}
+
 /// Read the string `key` field of a KV v2 secret, authenticating with `VAULT_TOKEN`.
 #[cfg(feature = "vault-kms")]
 pub(crate) async fn vault_read_key_field(
     vault_addr: &str,
     mount: &str,
     path: &str,
-) -> Result<String, EncryptionError> {
+) -> Result<zeroize::Zeroizing<String>, EncryptionError> {
     let token = std::env::var("VAULT_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -112,7 +160,7 @@ pub(crate) async fn vault_read_key_field_with_token(
     token: &str,
     mount: &str,
     path: &str,
-) -> Result<String, EncryptionError> {
+) -> Result<zeroize::Zeroizing<String>, EncryptionError> {
     use vaultrs::{
         client::{VaultClient, VaultClientSettingsBuilder},
         kv2,
@@ -146,7 +194,7 @@ pub(crate) async fn vault_read_key_field_with_token(
     secret
         .get("key")
         .and_then(|key| key.as_str())
-        .map(str::to_string)
+        .map(|key| zeroize::Zeroizing::new(key.to_string()))
         .ok_or_else(|| {
             EncryptionError::KeyManagement(format!(
                 "Vault secret {}/{} has no string `key` field",
@@ -352,7 +400,7 @@ mod tests {
         let key = vault_read_key_field_with_token(&addr, "s.token", "secret", "hammerwork")
             .await
             .unwrap();
-        assert_eq!(key, "c2VjcmV0");
+        assert_eq!(key.as_str(), "c2VjcmV0");
         assert_eq!(tokens.lock().unwrap().as_slice(), ["s.token"]);
 
         for (path, expected) in [

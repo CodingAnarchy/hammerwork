@@ -138,7 +138,7 @@
 //! ```
 
 use super::envelope::{self, DbStore, KmsKeyWrapper};
-use super::{EncryptionAlgorithm, EncryptionError, KeySource, kms};
+use super::{EncryptionAlgorithm, EncryptionError, KeySource, SecretBytes, kms};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
@@ -176,7 +176,9 @@ pub struct KeyManagerConfig {
 }
 
 /// Configuration for external Key Management Service integration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` shows the names of the `auth_config` entries but never their values.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ExternalKmsConfig {
     /// KMS service type (AWS, GCP, Azure, HashiCorp Vault, etc.)
     pub service_type: String,
@@ -192,6 +194,26 @@ pub struct ExternalKmsConfig {
 
     /// Key namespace or project ID
     pub namespace: Option<String>,
+}
+
+impl std::fmt::Debug for ExternalKmsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut auth_keys: Vec<&String> = self.auth_config.keys().collect();
+        auth_keys.sort();
+        f.debug_struct("ExternalKmsConfig")
+            .field("service_type", &self.service_type)
+            .field("endpoint", &crate::config::redact_url(&self.endpoint))
+            .field(
+                "auth_config",
+                &auth_keys
+                    .into_iter()
+                    .map(|key| (key, "[REDACTED]"))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+            .field("region", &self.region)
+            .field("namespace", &self.namespace)
+            .finish()
+    }
 }
 
 /// Configuration for key derivation from passwords or passphrases
@@ -378,9 +400,10 @@ pub struct KeyManagerStats {
 }
 
 /// Main key management system
-type KeyCacheEntry = (Vec<u8>, DateTime<Utc>); // (decrypted_material, cached_at)
+// Key material held in memory is `SecretBytes`, wiped when dropped.
+type KeyCacheEntry = (SecretBytes, DateTime<Utc>); // (decrypted_material, cached_at)
 type KeyCache = Arc<Mutex<HashMap<String, KeyCacheEntry>>>;
-type RootKey = (Uuid, Vec<u8>); // (derived ID, key material)
+type RootKey = (Uuid, SecretBytes); // (derived ID, key material)
 
 /// Name under which [`KeyManager`] stores its KMS-wrapped master key in
 /// `hammerwork_kms_data_keys` (for `aws://` and `gcp://` master key sources).
@@ -430,12 +453,12 @@ pub struct KeyManager<DB: Database> {
     /// Key loaded from `master_key_source`, with its derived ID
     root_key: Arc<Mutex<Option<RootKey>>>,
     /// Key that wraps newly generated keys (the active KEK, or the root key)
-    master_key: Arc<Mutex<Option<Vec<u8>>>>,
+    master_key: Arc<Mutex<Option<SecretBytes>>>,
     master_key_id: Arc<Mutex<Option<Uuid>>>,
     /// KMS that wraps the master key, for `aws://` and `gcp://` master key sources
     kms: Option<Arc<dyn KmsKeyWrapper>>,
     /// Earlier versions of a KMS-wrapped master key, by derived ID
-    retired_root_keys: Arc<Mutex<HashMap<Uuid, Vec<u8>>>>,
+    retired_root_keys: Arc<Mutex<HashMap<Uuid, SecretBytes>>>,
     key_cache: KeyCache,
     stats: Arc<Mutex<KeyManagerStats>>,
 }
@@ -1143,7 +1166,9 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         check_key_usable(&key_record)?;
         let key_material = self.unwrap_key_material(&key_record).await?;
 
-        self.cache_key(key_id, key_material.clone());
+        // The caller gets its own copy; the cached one is wiped when evicted or dropped.
+        let copy = key_material.to_vec();
+        self.cache_key(key_id, key_material);
         self.record_key_usage(key_id).await?;
 
         if self.config.audit_enabled {
@@ -1151,7 +1176,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
                 .await?;
         }
 
-        Ok(key_material)
+        Ok(copy)
     }
 
     /// Retrieve the key material of a specific version of a key
@@ -1181,7 +1206,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         }
         self.update_stats(|stats| stats.total_access_operations += 1);
 
-        Ok(key_material)
+        Ok(key_material.to_vec())
     }
 
     /// Rotate a key to a new version
@@ -1523,7 +1548,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
             .map_err(|_| lock_error("retired root keys"))?
             .insert(old_id, old_key);
         *self.root_key.lock().map_err(|_| lock_error("root key"))? =
-            Some((new_id, rotated.key.clone()));
+            Some((new_id, SecretBytes::new(rotated.key.to_vec())));
         if self.get_master_key_id().await == Some(old_id) {
             // No key-encryption key: the root key wraps new keys directly
             *self
@@ -1661,7 +1686,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
     }
 
     /// The master key that new keys are encrypted with, and its ID.
-    fn current_master_key(&self) -> Result<(Uuid, Vec<u8>), EncryptionError> {
+    fn current_master_key(&self) -> Result<(Uuid, SecretBytes), EncryptionError> {
         let id = (*self
             .master_key_id
             .lock()
@@ -1677,7 +1702,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
     }
 
     /// The configured master key (from `master_key_source`) and its ID.
-    fn root_key(&self) -> Result<(Uuid, Vec<u8>), EncryptionError> {
+    fn root_key(&self) -> Result<(Uuid, SecretBytes), EncryptionError> {
         self.root_key
             .lock()
             .map_err(|_| lock_error("root key"))?
@@ -1686,7 +1711,10 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
     }
 
     /// Decrypt a stored key with the master key that encrypted it.
-    async fn unwrap_key_material(&self, key: &EncryptionKey) -> Result<Vec<u8>, EncryptionError> {
+    async fn unwrap_key_material(
+        &self,
+        key: &EncryptionKey,
+    ) -> Result<SecretBytes, EncryptionError> {
         let (current_id, current_key) = self.current_master_key()?;
         let wrapping_key = match key.master_key_id {
             None => current_key,
@@ -1711,7 +1739,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
     }
 
     /// Decrypt a key-encryption key with the root key that encrypted it.
-    async fn unwrap_kek(&self, kek: &EncryptionKey) -> Result<Vec<u8>, EncryptionError> {
+    async fn unwrap_kek(&self, kek: &EncryptionKey) -> Result<SecretBytes, EncryptionError> {
         let (root_id, root_key) = self.root_key()?;
         let wrapping_key = match kek.master_key_id {
             Some(id) if id != root_id => self.root_key_by_id(id).await?.unwrap_or(root_key),
@@ -1722,7 +1750,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
 
     /// The configured master key (root key) with derived ID `id`: the current one or, for
     /// a KMS-wrapped master key, an earlier (rotated) version.
-    async fn root_key_by_id(&self, id: Uuid) -> Result<Option<Vec<u8>>, EncryptionError> {
+    async fn root_key_by_id(&self, id: Uuid) -> Result<Option<SecretBytes>, EncryptionError> {
         let (root_id, root_key) = self.root_key()?;
         if id == root_id {
             return Ok(Some(root_key));
@@ -1756,7 +1784,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         Ok(retired.get(&id).cloned())
     }
 
-    fn cache_key(&self, key_id: &str, key_material: Vec<u8>) {
+    fn cache_key(&self, key_id: &str, key_material: SecretBytes) {
         if let Ok(mut cache) = self.key_cache.lock() {
             cache.insert(key_id.to_string(), (key_material, Utc::now()));
         }
@@ -1768,7 +1796,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         cache
             .get(key_id)
             .filter(|(_, cached_at)| Utc::now() - *cached_at < Duration::hours(1))
-            .map(|(key_material, _)| key_material.clone())
+            .map(|(key_material, _)| key_material.to_vec())
     }
 
     fn update_stats(&self, update: impl FnOnce(&mut KeyManagerStats)) {
@@ -1858,12 +1886,12 @@ fn check_key_usable(key: &EncryptionKey) -> Result<(), EncryptionError> {
     Ok(())
 }
 
-fn random_key_material(algorithm: &EncryptionAlgorithm) -> Vec<u8> {
+fn random_key_material(algorithm: &EncryptionAlgorithm) -> SecretBytes {
     let key_length = match algorithm {
         EncryptionAlgorithm::AES256GCM => 32,
         EncryptionAlgorithm::ChaCha20Poly1305 => 32,
     };
-    let mut key_material = vec![0u8; key_length];
+    let mut key_material = SecretBytes::new(vec![0u8; key_length]);
     OsRng.fill_bytes(&mut key_material);
     key_material
 }
@@ -1897,7 +1925,10 @@ fn wrap_key_material(wrapping_key: &[u8], key_material: &[u8]) -> Result<Vec<u8>
 }
 
 /// Decrypt key material produced by [`wrap_key_material`].
-fn unwrap_key_material(wrapping_key: &[u8], encrypted: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+fn unwrap_key_material(
+    wrapping_key: &[u8],
+    encrypted: &[u8],
+) -> Result<SecretBytes, EncryptionError> {
     if encrypted.len() < 12 {
         return Err(EncryptionError::DecryptionFailed(
             "Encrypted key data too short".to_string(),
@@ -1908,6 +1939,7 @@ fn unwrap_key_material(wrapping_key: &[u8], encrypted: &[u8]) -> Result<Vec<u8>,
     let (nonce, ciphertext) = encrypted.split_at(12);
     cipher
         .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map(SecretBytes::new)
         .map_err(|e| EncryptionError::DecryptionFailed(format!("Key decryption failed: {}", e)))
 }
 
@@ -1950,23 +1982,25 @@ fn to_u32(value: i32, what: &str) -> Result<u32, EncryptionError> {
 /// Load the master key material named by a [`KeySource`].
 ///
 /// Fails closed: there is no fallback key when the source is unavailable.
-async fn load_master_key_material(source: &KeySource) -> Result<Vec<u8>, EncryptionError> {
+async fn load_master_key_material(source: &KeySource) -> Result<SecretBytes, EncryptionError> {
     match source {
         KeySource::Environment(env_var) => {
-            let key_str = std::env::var(env_var).map_err(|_| {
+            let key_str = zeroize::Zeroizing::new(std::env::var(env_var).map_err(|_| {
                 EncryptionError::KeyManagement(format!(
                     "Master key environment variable {} not found",
                     env_var
                 ))
-            })?;
+            })?);
             base64::engine::general_purpose::STANDARD
                 .decode(key_str.trim())
+                .map(SecretBytes::new)
                 .map_err(|e| {
                     EncryptionError::KeyManagement(format!("Invalid base64 master key: {}", e))
                 })
         }
         KeySource::Static(key_str) => base64::engine::general_purpose::STANDARD
             .decode(key_str)
+            .map(SecretBytes::new)
             .map_err(|e| {
                 EncryptionError::KeyManagement(format!("Invalid base64 master key: {}", e))
             }),
@@ -2005,8 +2039,9 @@ async fn load_master_key_material(source: &KeySource) -> Result<Vec<u8>, Encrypt
 ///
 /// Format: `vault://<mount>/<path>?addr=<vault-address>`. The address falls back to
 /// `VAULT_ADDR`; the token is read from `VAULT_TOKEN`. The secret must have a string `key`
-/// field: a base64-encoded 32-byte key, or a passphrase that is hashed with SHA-256.
-async fn load_master_key_from_vault(service_config: &str) -> Result<Vec<u8>, EncryptionError> {
+/// field holding a base64-encoded 32-byte key; anything else (a passphrase, or key
+/// material of another length) is an [`EncryptionError::InvalidConfiguration`].
+async fn load_master_key_from_vault(service_config: &str) -> Result<SecretBytes, EncryptionError> {
     let (secret_path, params) = kms::parse_service_config(service_config, "vault://");
     let vault_addr = kms::vault_address(&params)?;
     let (mount, secret) = kms::vault_mount_and_path(secret_path)?;
@@ -2025,19 +2060,9 @@ async fn load_master_key_from_vault(service_config: &str) -> Result<Vec<u8>, Enc
     #[cfg(feature = "vault-kms")]
     {
         let key_str = kms::vault_read_key_field(&vault_addr, mount, secret).await?;
-
-        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&key_str)
-            && decoded.len() == 32
-        {
-            info!("Successfully loaded master key from HashiCorp Vault");
-            return Ok(decoded);
-        }
-
-        // Not a base64 32-byte key: treat it as a passphrase
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(key_str.as_bytes());
-        info!("Successfully loaded and hashed master key from HashiCorp Vault");
-        Ok(hash.to_vec())
+        let key = kms::exact_vault_key(&key_str, 32)?;
+        info!("Successfully loaded master key from HashiCorp Vault");
+        Ok(key)
     }
 }
 
@@ -2045,9 +2070,9 @@ async fn load_master_key_from_vault(service_config: &str) -> Result<Vec<u8>, Enc
 ///
 /// Format: `azure://<vault-host>/keys/<key-name>` (key name defaults to `master-key`).
 /// Credentials are resolved from the environment (client secret, workload identity,
-/// managed identity, Azure CLI). Key material shorter than 32 bytes is expanded with
-/// HMAC-SHA256; longer material is truncated.
-async fn load_master_key_from_azure(service_config: &str) -> Result<Vec<u8>, EncryptionError> {
+/// managed identity, Azure CLI). The key material must be exactly 32 bytes; anything else
+/// is an [`EncryptionError::InvalidConfiguration`].
+async fn load_master_key_from_azure(service_config: &str) -> Result<SecretBytes, EncryptionError> {
     let (vault_url, key_name) = kms::azure_vault_and_key(service_config, "master-key")?;
 
     info!(
@@ -2063,7 +2088,7 @@ async fn load_master_key_from_azure(service_config: &str) -> Result<Vec<u8>, Enc
 
     #[cfg(feature = "azure-kv")]
     {
-        let key_material = load_from_azure_key_vault(&vault_url, &key_name)
+        let key_material = super::azure::fetch_key_material(&vault_url, &key_name)
             .await
             .map_err(|e| {
                 EncryptionError::KeyManagement(format!(
@@ -2071,32 +2096,13 @@ async fn load_master_key_from_azure(service_config: &str) -> Result<Vec<u8>, Enc
                     e
                 ))
             })?;
+        let key = kms::exact_size(
+            key_material,
+            32,
+            &format!("Azure Key Vault master key {} in {}", key_name, vault_url),
+        )?;
         info!("Successfully loaded master key from Azure Key Vault");
-        Ok(key_material)
-    }
-}
-
-/// Load key material from Azure Key Vault and normalize it to 32 bytes.
-///
-/// Material of 32 bytes or more is truncated to 32 bytes; shorter material is used as the
-/// HMAC-SHA256 key to derive 32 bytes.
-#[cfg(feature = "azure-kv")]
-async fn load_from_azure_key_vault(vault_url: &str, key_name: &str) -> Result<Vec<u8>, String> {
-    let decoded_key = super::azure::fetch_key_material(vault_url, key_name).await?;
-
-    if decoded_key.len() >= 32 {
-        Ok(decoded_key[0..32].to_vec())
-    } else {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        let mut hmac = <Hmac<Sha256> as Mac>::new_from_slice(&decoded_key)
-            .map_err(|e| format!("Failed to create HMAC: {}", e))?;
-        hmac.update(b"azure-kv-master-key-derivation");
-        hmac.update(vault_url.as_bytes());
-        hmac.update(key_name.as_bytes());
-        let result = hmac.finalize();
-        Ok(result.into_bytes()[0..32].to_vec())
+        Ok(key)
     }
 }
 
@@ -4103,8 +4109,10 @@ mod tests {
         assert_eq!(wrapped.len(), 12 + 32 + 16);
         assert!(!wrapped.windows(32).any(|w| w == material));
         assert_eq!(
-            unwrap_key_material(&wrapping_key, &wrapped).unwrap(),
-            material
+            unwrap_key_material(&wrapping_key, &wrapped)
+                .unwrap()
+                .as_slice(),
+            material.as_slice()
         );
         assert!(unwrap_key_material(&[8u8; 32], &wrapped).is_err());
     }
