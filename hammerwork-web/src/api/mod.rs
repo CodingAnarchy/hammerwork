@@ -127,7 +127,10 @@ pub fn internal_error(context: &str, err: &dyn std::fmt::Display) -> warp::reply
 
 /// Turn a failed queue operation into a JSON error reply: a missing job is a `404`, a
 /// transition the job's status does not allow a `409`, anything else a logged `500`.
-pub fn queue_error_reply(context: &str, err: &hammerwork::HammerworkError) -> warp::reply::Response {
+pub fn queue_error_reply(
+    context: &str,
+    err: &hammerwork::HammerworkError,
+) -> warp::reply::Response {
     use hammerwork::HammerworkError;
     match err {
         HammerworkError::JobNotFound { .. } => error_reply(

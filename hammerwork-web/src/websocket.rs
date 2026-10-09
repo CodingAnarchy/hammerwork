@@ -690,11 +690,13 @@ mod tests {
     }
 
     async fn connect(
-        route: &(impl Filter<Extract = (impl warp::Reply + 'static,), Error = warp::Rejection>
-              + Clone
-              + Send
-              + Sync
-              + 'static),
+        route: &(
+             impl Filter<Extract = (impl warp::Reply + 'static,), Error = warp::Rejection>
+             + Clone
+             + Send
+             + Sync
+             + 'static
+         ),
     ) -> warp::test::WsClient {
         warp::test::ws()
             .path("/ws")
@@ -806,8 +808,14 @@ mod tests {
             .unwrap();
         drop(guard);
 
-        assert_eq!(next_json(&mut everything).await.unwrap()["type"], "SystemAlert");
-        assert_eq!(next_json(&mut everything).await.unwrap()["type"], "JobsPurged");
+        assert_eq!(
+            next_json(&mut everything).await.unwrap()["type"],
+            "SystemAlert"
+        );
+        assert_eq!(
+            next_json(&mut everything).await.unwrap()["type"],
+            "JobsPurged"
+        );
         let only = next_json(&mut archive_only).await.unwrap();
         assert_eq!(only["type"], "JobsPurged", "the alert was filtered out");
         assert_eq!(only["count"], 3);
@@ -921,7 +929,12 @@ mod tests {
         assert!(matches!(end, Ok(Err(_))) || matches!(end, Ok(Ok(ref m)) if m.is_close()));
         assert_eq!(state.read().await.connection_count(), 1);
 
-        state.read().await.broadcast_to_all(alert("x")).await.unwrap();
+        state
+            .read()
+            .await
+            .broadcast_to_all(alert("x"))
+            .await
+            .unwrap();
         assert!(next_json(&mut first).await.is_some());
     }
 
@@ -992,7 +1005,12 @@ mod tests {
             },
         ];
         for event in events {
-            state.read().await.publish_archive_event(event).await.unwrap();
+            state
+                .read()
+                .await
+                .publish_archive_event(event)
+                .await
+                .unwrap();
         }
 
         let mut seen = Vec::new();
@@ -1083,7 +1101,10 @@ mod tests {
         assert_eq!(queue["queue_name"], "emails");
         assert_eq!(queue["stats"]["dead_count"], 5);
         let job = next_json(&mut queue_only).await.unwrap();
-        assert_eq!((job["type"].as_str(), job["job"]["id"].as_str()), (Some("JobUpdate"), Some("j1")));
+        assert_eq!(
+            (job["type"].as_str(), job["job"]["id"].as_str()),
+            (Some("JobUpdate"), Some("j1"))
+        );
         let alert = next_json(&mut queue_only).await.unwrap();
         assert_eq!(alert["severity"], "Critical");
         assert!(next_json(&mut queue_only).await.is_none());
@@ -1095,7 +1116,10 @@ mod tests {
         assert!(sub.wants("anything"));
         sub.unsubscribe(&["job_updates".to_string()]);
         assert!(!sub.wants("job_updates") && sub.wants("queue_updates"));
-        assert!(!sub.wants("custom"), "after the first change only known types remain");
+        assert!(
+            !sub.wants("custom"),
+            "after the first change only known types remain"
+        );
 
         let mut sub = Subscription::everything();
         sub.subscribe(vec!["archive_events".to_string()]);

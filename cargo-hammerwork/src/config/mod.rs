@@ -448,8 +448,10 @@ mod tests {
         assert_eq!(Config::config_file_path().unwrap(), path);
         assert_eq!(Config::default().webhooks_file_path().unwrap(), webhooks);
 
-        let mut config = Config::default();
-        config.default_queue = Some("via_env_path".into());
+        let config = Config {
+            default_queue: Some("via_env_path".into()),
+            ..Config::default()
+        };
         config.save().unwrap();
         assert!(path.exists());
 

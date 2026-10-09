@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hammerwork-web"));
-    cmd.env_remove("DATABASE_URL").env_remove("RUST_LOG").env("NO_COLOR", "1");
+    cmd.env_remove("DATABASE_URL")
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1");
     cmd
 }
 
@@ -106,7 +108,10 @@ impl Server {
             if reqwest::get(self.url("/health")).await.is_ok() {
                 return;
             }
-            assert!(Instant::now() < deadline, "the dashboard never became ready");
+            assert!(
+                Instant::now() < deadline,
+                "the dashboard never became ready"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -142,15 +147,36 @@ async fn serve_and_query(database_url: &str, database_name: &str) {
     let static_dir = dir.path().to_str().unwrap();
 
     // --- open dashboard
-    let mut server = Server::start(&["-d", database_url, "--static-dir", static_dir], free_port());
+    let mut server = Server::start(
+        &["-d", database_url, "--static-dir", static_dir],
+        free_port(),
+    );
     server.wait_until_ready().await;
 
-    let health: serde_json::Value = reqwest::get(server.url("/health")).await.unwrap().json().await.unwrap();
+    let health: serde_json::Value = reqwest::get(server.url("/health"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(health["status"], "healthy");
-    let page = reqwest::get(server.url("/")).await.unwrap().text().await.unwrap();
+    let page = reqwest::get(server.url("/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(page.contains("dashboard"));
-    let info: serde_json::Value = reqwest::get(server.url("/api/system/info")).await.unwrap().json().await.unwrap();
-    assert_eq!(info["data"]["database_info"]["database_type"], database_name);
+    let info: serde_json::Value = reqwest::get(server.url("/api/system/info"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        info["data"]["database_info"]["database_type"],
+        database_name
+    );
     assert_eq!(info["data"]["database_info"]["connection_health"], true);
     let queues = reqwest::get(server.url("/api/queues")).await.unwrap();
     assert_eq!(queues.status(), 200);
@@ -216,8 +242,17 @@ async fn serve_and_query(database_url: &str, database_name: &str) {
         free_port(),
     );
     server.wait_until_ready().await;
-    assert_eq!(reqwest::get(server.url("/health")).await.unwrap().status(), 200);
-    assert_eq!(reqwest::get(server.url("/api/queues")).await.unwrap().status(), 401);
+    assert_eq!(
+        reqwest::get(server.url("/health")).await.unwrap().status(),
+        200
+    );
+    assert_eq!(
+        reqwest::get(server.url("/api/queues"))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
     let denied = client
         .get(server.url("/api/queues"))
         .basic_auth("ops", Some("wrong"))
@@ -240,7 +275,11 @@ async fn serve_and_query(database_url: &str, database_name: &str) {
         .send()
         .await
         .unwrap();
-    assert!(preflight.headers().contains_key("access-control-allow-origin"));
+    assert!(
+        preflight
+            .headers()
+            .contains_key("access-control-allow-origin")
+    );
     assert!(server.stop().success());
 }
 
@@ -248,12 +287,20 @@ async fn serve_and_query(database_url: &str, database_name: &str) {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL (PostgreSQL)"]
 async fn test_binary_serves_postgres() {
-    serve_and_query(&std::env::var("DATABASE_URL").expect("DATABASE_URL"), "PostgreSQL").await;
+    serve_and_query(
+        &std::env::var("DATABASE_URL").expect("DATABASE_URL"),
+        "PostgreSQL",
+    )
+    .await;
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
 #[ignore = "requires MYSQL_DATABASE_URL"]
 async fn test_binary_serves_mysql() {
-    serve_and_query(&std::env::var("MYSQL_DATABASE_URL").expect("MYSQL_DATABASE_URL"), "MySQL").await;
+    serve_and_query(
+        &std::env::var("MYSQL_DATABASE_URL").expect("MYSQL_DATABASE_URL"),
+        "MySQL",
+    )
+    .await;
 }

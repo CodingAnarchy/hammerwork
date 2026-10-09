@@ -304,7 +304,8 @@ impl WebDashboard {
             .map(
                 |_: (), ws: warp::ws::Ws, websocket_state: Arc<RwLock<WebSocketState>>| {
                     ws.on_upgrade(move |socket| async move {
-                        if let Err(e) = WebSocketState::serve_connection(websocket_state, socket).await
+                        if let Err(e) =
+                            WebSocketState::serve_connection(websocket_state, socket).await
                         {
                             error!("WebSocket error: {}", e);
                         }

@@ -332,8 +332,10 @@ mod tests {
     async fn get_reads_known_keys_and_rejects_unknown_ones() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let mut config = Config::default();
-        config.database_url = Some("mysql://h/db".into());
+        let mut config = Config {
+            database_url: Some("mysql://h/db".into()),
+            ..Config::default()
+        };
         for key in [
             "database_url",
             "default_queue",

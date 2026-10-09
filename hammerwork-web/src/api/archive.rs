@@ -382,7 +382,10 @@ where
 }
 
 /// Everything archived in `queue_name` (all queues for `None`), read in pages.
-async fn all_archived_jobs<Q>(queue: &Q, queue_name: Option<&str>) -> hammerwork::Result<Vec<ArchivedJob>>
+async fn all_archived_jobs<Q>(
+    queue: &Q,
+    queue_name: Option<&str>,
+) -> hammerwork::Result<Vec<ArchivedJob>>
 where
     Q: DatabaseQueue + Send + Sync,
 {

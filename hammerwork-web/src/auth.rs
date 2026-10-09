@@ -428,7 +428,10 @@ mod tests {
     async fn lockout_blocks_even_the_right_password_until_it_expires() {
         let state = AuthState::new(auth_config(2, Duration::from_millis(150)));
         assert!(!state.verify_credentials("admin", "bad").await);
-        assert!(!state.is_locked_out("admin").await, "one failure is not enough");
+        assert!(
+            !state.is_locked_out("admin").await,
+            "one failure is not enough"
+        );
         assert!(!state.verify_credentials("admin", "bad").await);
         assert!(state.is_locked_out("admin").await);
         assert!(
@@ -445,7 +448,10 @@ mod tests {
             "a successful login clears the failures"
         );
         assert!(!state.verify_credentials("admin", "bad").await);
-        assert!(!state.is_locked_out("admin").await, "the count started over");
+        assert!(
+            !state.is_locked_out("admin").await,
+            "the count started over"
+        );
     }
 
     #[tokio::test]
@@ -474,10 +480,16 @@ mod tests {
             Some((String::new(), String::new()))
         );
         // No colon at all, bad base64, non-UTF-8 payload, wrong scheme, wrong case.
-        let no_colon = format!("Basic {}", base64::prelude::BASE64_STANDARD.encode("nocolon"));
+        let no_colon = format!(
+            "Basic {}",
+            base64::prelude::BASE64_STANDARD.encode("nocolon")
+        );
         assert!(extract_basic_auth(&no_colon).is_none());
         assert!(extract_basic_auth("Basic !!!").is_none());
-        let binary = format!("Basic {}", base64::prelude::BASE64_STANDARD.encode([0xff, 0xfe, b':']));
+        let binary = format!(
+            "Basic {}",
+            base64::prelude::BASE64_STANDARD.encode([0xff, 0xfe, b':'])
+        );
         assert!(extract_basic_auth(&binary).is_none());
         assert!(extract_basic_auth("Digest abc").is_none());
         assert!(extract_basic_auth("basic YWRtaW46cA==").is_none());
@@ -498,7 +510,11 @@ mod tests {
             password_hash: "not-a-bcrypt-hash".into(),
             ..auth_config(5, Duration::from_secs(60))
         });
-        assert!(!broken.verify_credentials("admin", "not-a-bcrypt-hash").await);
+        assert!(
+            !broken
+                .verify_credentials("admin", "not-a-bcrypt-hash")
+                .await
+        );
     }
 
     async fn request_status(state: &AuthState, header: Option<&str>) -> (u16, String) {

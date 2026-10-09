@@ -168,7 +168,9 @@ fn resolve_config(matches: &ArgMatches, env_database_url: Option<&str>) -> Resul
         || matches.get_one::<String>("password").is_some()
         || matches.get_one::<String>("password-file").is_some()
     {
-        warnings.push("--username, --password and --password-file have no effect without --auth".into());
+        warnings.push(
+            "--username, --password and --password-file have no effect without --auth".into(),
+        );
     }
 
     // The built-in default enables authentication but cannot know a password: with none
@@ -283,7 +285,9 @@ mod tests {
     fn resolve(args: &[&str], env: Option<&str>) -> Result<Resolved> {
         let mut argv = vec!["hammerwork-web"];
         argv.extend_from_slice(args);
-        let matches = cli().try_get_matches_from(argv).map_err(|e| anyhow!("{e}"))?;
+        let matches = cli()
+            .try_get_matches_from(argv)
+            .map_err(|e| anyhow!("{e}"))?;
         resolve_config(&matches, env)
     }
 
@@ -361,7 +365,10 @@ mod tests {
 
         // An empty variable is as good as unset.
         let empty = resolve(&[], Some("")).unwrap();
-        assert_eq!(empty.config.database_url, DashboardConfig::new().database_url);
+        assert_eq!(
+            empty.config.database_url,
+            DashboardConfig::new().database_url
+        );
     }
 
     fn write_config(dir: &tempfile::TempDir, content: &str) -> String {
@@ -415,7 +422,10 @@ mod tests {
             .unwrap(),
         );
         let err = resolve(&["-c", &empty_url], None).unwrap_err();
-        assert!(err.to_string().contains("Database URL is required"), "{err}");
+        assert!(
+            err.to_string().contains("Database URL is required"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -423,7 +433,11 @@ mod tests {
         // By default there is no password: the dashboard runs open, with a warning.
         let open = resolve(&[], None).unwrap();
         assert!(!open.config.auth.enabled);
-        assert!(open.warnings.iter().any(|w| w.contains("no password is configured")));
+        assert!(
+            open.warnings
+                .iter()
+                .any(|w| w.contains("no password is configured"))
+        );
 
         // --auth without any password is an error.
         let err = resolve(&["--auth"], None).unwrap_err();
@@ -434,26 +448,44 @@ mod tests {
         let file = dir.path().join("hash.txt");
         std::fs::write(&file, "  $2b$12$abcdefghijklmnopqrstuv  \n").unwrap();
         let resolved = resolve(
-            &["--auth", "--username", "ops", "--password-file", file.to_str().unwrap()],
+            &[
+                "--auth",
+                "--username",
+                "ops",
+                "--password-file",
+                file.to_str().unwrap(),
+            ],
             None,
         )
         .unwrap();
         assert!(resolved.config.auth.enabled);
         assert_eq!(resolved.config.auth.username, "ops");
-        assert_eq!(resolved.config.auth.password_hash, "$2b$12$abcdefghijklmnopqrstuv");
+        assert_eq!(
+            resolved.config.auth.password_hash,
+            "$2b$12$abcdefghijklmnopqrstuv"
+        );
         assert!(resolved.warnings.is_empty());
 
         let err = resolve(&["--auth", "--password-file", "/no/such/hash"], None).unwrap_err();
         assert!(format!("{err:#}").contains("/no/such/hash"));
         let blank = dir.path().join("blank.txt");
         std::fs::write(&blank, "\n").unwrap();
-        let err = resolve(&["--auth", "--password-file", blank.to_str().unwrap()], None).unwrap_err();
+        let err = resolve(
+            &["--auth", "--password-file", blank.to_str().unwrap()],
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("must not be empty"), "{err}");
 
         // Credentials without --auth are ignored, and the user is told.
         let ignored = resolve(&["--username", "x", "--password", "y"], None).unwrap();
         assert!(!ignored.config.auth.enabled);
-        assert!(ignored.warnings.iter().any(|w| w.contains("no effect without --auth")));
+        assert!(
+            ignored
+                .warnings
+                .iter()
+                .any(|w| w.contains("no effect without --auth"))
+        );
     }
 
     #[test]

@@ -219,10 +219,7 @@ where
 
 /// The API representation of a job.
 fn job_info(job: &hammerwork::Job) -> JobInfo {
-    let end = job
-        .completed_at
-        .or(job.failed_at)
-        .or(job.timed_out_at);
+    let end = job.completed_at.or(job.failed_at).or(job.timed_out_at);
     JobInfo {
         id: job.id.to_string(),
         queue_name: job.queue_name.clone(),
@@ -403,9 +400,9 @@ where
     // Sort jobs
     let ascending = sort.sort_order.as_deref() == Some("asc");
     match sort.sort_by.as_deref() {
-        Some("scheduled_at") => all_jobs.sort_by(|a, b| a.scheduled_at.cmp(&b.scheduled_at)),
+        Some("scheduled_at") => all_jobs.sort_by_key(|j| j.scheduled_at),
         Some("priority") => all_jobs.sort_by_key(|j| priority_rank(&j.priority)),
-        Some("created_at") => all_jobs.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
+        Some("created_at") => all_jobs.sort_by_key(|j| j.created_at),
         _ => {
             // Default sort by created_at desc
             all_jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
@@ -613,12 +610,13 @@ async fn retry_job_action<T>(queue: &T, job_id: uuid::Uuid) -> hammerwork::Resul
 where
     T: DatabaseQueue + Send + Sync,
 {
-    let job = queue
-        .get_job(job_id)
-        .await?
-        .ok_or_else(|| hammerwork::HammerworkError::JobNotFound {
-            id: job_id.to_string(),
-        })?;
+    let job =
+        queue
+            .get_job(job_id)
+            .await?
+            .ok_or_else(|| hammerwork::HammerworkError::JobNotFound {
+                id: job_id.to_string(),
+            })?;
     match job.status {
         hammerwork::JobStatus::Dead | hammerwork::JobStatus::TimedOut => {
             queue.retry_dead_job(job_id).await
