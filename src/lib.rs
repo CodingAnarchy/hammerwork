@@ -439,4 +439,7 @@ mod doc_examples {
 
     #[doc = include_str!("../docs/batch-operations.md")]
     struct BatchOperationsDoctests;
+
+    #[doc = include_str!("../docs/archiving.md")]
+    struct ArchivingDoctests;
 }
