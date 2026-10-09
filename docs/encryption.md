@@ -39,10 +39,17 @@ The Hammerwork encryption system provides:
 - **Features**: Authenticated encryption (AEAD), hardware acceleration
 - **Use Case**: General purpose, high performance requirements
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::encryption::{EncryptionConfig, EncryptionAlgorithm};
 
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM);
+# Ok(())
+# }
 ```
 
 ### ChaCha20-Poly1305
@@ -52,45 +59,72 @@ let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM);
 - **Features**: Constant-time execution, mobile/embedded friendly
 - **Use Case**: Environments without AES hardware acceleration
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::encryption::{EncryptionConfig, EncryptionAlgorithm};
 
 let config = EncryptionConfig::new(EncryptionAlgorithm::ChaCha20Poly1305);
+# Ok(())
+# }
 ```
 
 ## Configuration
 
 ### Basic Configuration
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::encryption::{EncryptionConfig, EncryptionAlgorithm, KeySource};
 
 // Environment variable key source
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()));
+# Ok(())
+# }
 ```
 
 ### Advanced Configuration
 
-```rust
-use hammerwork::encryption::{EncryptionConfig, KeySource};
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::encryption::{EncryptionAlgorithm, EncryptionConfig, KeySource};
 use std::time::Duration;
 
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::Environment("ENCRYPTION_KEY".to_string()))
     .with_key_rotation_enabled(true)
     .with_key_rotation_interval(Duration::from_secs(30 * 24 * 60 * 60)) // 30 days
-    .with_compression_enabled(true)
-    .with_compression_threshold(1024); // Compress payloads > 1KB
+    .with_compression_enabled(true); // Compress payloads before encrypting them
+# Ok(())
+# }
 ```
 
 ### Key Sources
 
 #### Environment Variable (Recommended)
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::Environment("HAMMERWORK_ENCRYPTION_KEY".to_string()));
+# Ok(())
+# }
 ```
 
 Generate a secure key:
@@ -102,10 +136,17 @@ export HAMMERWORK_ENCRYPTION_KEY="your-generated-key-here"
 
 #### Static Key (Testing Only)
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 // WARNING: Only for testing - never use static keys in production
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::Static("base64-encoded-key".to_string()));
+# Ok(())
+# }
 ```
 
 #### External KMS
@@ -114,20 +155,34 @@ Hammerwork supports multiple external Key Management Services for enterprise key
 
 ##### AWS KMS
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::External("aws://alias/hammerwork-key?region=us-east-1".to_string()));
 let engine = EncryptionEngine::new_with_pool(config, &pool).await?;
+# Ok(())
+# }
 ```
 
 Add `&endpoint=<url>` to use a different KMS endpoint (for example LocalStack). Requires the `aws-kms` feature. The application needs `kms:GenerateDataKey` and `kms:Decrypt` on the key.
 
 ##### Google Cloud KMS
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::External("gcp://projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY".to_string()));
 let engine = EncryptionEngine::new_with_pool(config, &pool).await?;
+# Ok(())
+# }
 ```
 
 Requires the `gcp-kms` feature. The application needs `cloudkms.locations.generateRandomBytes` on the location and `cloudkms.cryptoKeyVersions.useToEncrypt` / `useToDecrypt` on the key (`roles/cloudkms.cryptoKeyEncrypterDecrypter` plus a role that allows generating random bytes).
@@ -151,16 +206,30 @@ Stored keys are scoped by name (`key-manager/master` for the `KeyManager` master
 
 ##### HashiCorp Vault KMS
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::External("vault://secret/hammerwork/encryption-key".to_string()));
+# Ok(())
+# }
 ```
 
 With custom Vault address:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::External("vault://secret/hammerwork/encryption-key?addr=https://vault.example.com".to_string()));
+# Ok(())
+# }
 ```
 
 **Environment Variables:**
@@ -175,9 +244,16 @@ let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
 
 ##### Azure Key Vault
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
     .with_key_source(KeySource::External("azure://my-vault.vault.azure.net/keys/encryption-key".to_string()));
+# Ok(())
+# }
 ```
 
 Credentials come from the environment (`AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`, workload identity, managed identity, or the Azure CLI). Requires the `azure-kv` feature.
@@ -199,7 +275,12 @@ A stored KMS-wrapped key that the configured KMS key cannot decrypt is also an e
 
 Give the queue an engine with `JobQueue::with_encryption`, and mark the jobs to encrypt with `Job::with_encryption`:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::{Job, JobQueue, queue::DatabaseQueue};
 use hammerwork::encryption::{EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource};
 use serde_json::json;
@@ -215,6 +296,8 @@ let queue = Arc::new(JobQueue::new(pool).with_encryption(engine));
 let job = Job::new("payments".to_string(), json!({"card": "4111-1111-1111-1111", "amount": 10}))
     .with_encryption(config);
 queue.enqueue(job).await?;
+# Ok(())
+# }
 ```
 
 How it works:
@@ -254,10 +337,17 @@ Archiving and restoring keep the job id, queue name and encryption columns, so r
 
 Archiving moves the ciphertext to `hammerwork_jobs_archive` without decrypting it. `get_job` of an archived job returns it with `status == Archived`, `is_encrypted`, `pii_fields` and the redacted payload, but not the ciphertext, so `decrypt_job` on it fails with an error that says to restore it. To read the plaintext of an archived job, restore it first:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let job = queue.restore_archived_job(job_id).await?; // back in hammerwork_jobs, ciphertext unchanged
 let job = queue.get_job(job_id).await?.unwrap();
 let plaintext = queue.decrypt_job(job).await?.payload;
+# Ok(())
+# }
 ```
 
 There is no decrypt-on-read for the archive: archived jobs are cold data, and keeping the plaintext path to the live table keeps one place (restore) where an archived payload comes back. Retention still applies to archived jobs (see [Enforcing Retention](#enforcing-retention)).
@@ -285,10 +375,17 @@ encrypted_queues = ["payments"]                  # encrypt these queues' jobs ("
 "payments-2026" = "env://HAMMERWORK_KEY_2026"
 ```
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let config = HammerworkConfig::from_file("hammerwork.toml")?;
 let queue = Arc::new(JobQueue::<sqlx::Postgres>::from_config(&config).await?);
 let pool = WorkerPool::from_hammerwork_config(worker, &config)?;
+# Ok(())
+# }
 ```
 
 - **Keys are referenced, never written in the file.** `key_source` and the `decryption_keys` values are `KeySourceRef`s: `env://VAR` (a base64 key in that environment variable) or a KMS URI (`aws://`, `gcp://`, `vault://`, `azure://`, each needing its cargo feature). Static keys and anything else are rejected when the file is loaded, and the error does not repeat the value. `Debug` output and `save_to_file` only ever contain these references.
@@ -300,11 +397,20 @@ let pool = WorkerPool::from_hammerwork_config(worker, &config)?;
 
 The in-memory `TestQueue` (feature `test`) applies the same semantics when given an engine, so unit tests exercise the real redaction and decryption paths:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::queue::test::TestQueue;
+
 let queue = TestQueue::new().with_encryption(EncryptionEngine::new(config.clone()).await?);
 let id = queue.enqueue(Job::new("payments".into(), json!({"card": "4111"})).with_encryption(config)).await?;
 let stored = queue.get_job(id).await?.unwrap();          // {"encrypted": true}, is_encrypted
 let opened = queue.decrypt_job(stored).await?;           // what a handler sees
+# Ok(())
+# }
 ```
 
 It seals jobs in `enqueue`, `enqueue_batch`, `enqueue_workflow` and `enqueue_cron_job`, rejects jobs with an encryption config when it has no engine, binds ciphertexts to their jobs, supports `with_encrypted_queues`, hides the ciphertext of archived jobs until they are restored, and implements `purge_expired_encrypted_jobs` against its `MockClock`.
@@ -313,7 +419,12 @@ It seals jobs in `enqueue`, `enqueue_batch`, `enqueue_workflow` and `enqueue_cro
 
 Each encrypted job records the id of the key it was encrypted with. To switch to a new key, give the engine a new `key_id` and keep the previous key for decryption:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let engine = EncryptionEngine::new(
     EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
         .with_key_id("payments-2027")
@@ -325,6 +436,8 @@ let engine = EncryptionEngine::new(
     &KeySource::Environment("HAMMERWORK_KEY_2026".to_string()),
 )
 .await?;
+# Ok(())
+# }
 ```
 
 New jobs are encrypted with `payments-2027`; jobs written with `payments-2026` still decrypt. For `aws://` and `gcp://` sources, `EncryptionEngine::rotate_kms_key` adds a new key version under the same key id and keeps earlier versions for decryption (see above).
@@ -333,7 +446,12 @@ New jobs are encrypted with `payments-2027`; jobs written with `payments-2026` s
 
 To encrypt only some fields, list them with `with_pii_fields`:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let job = Job::new("user_data_processing".to_string(), json!({
     "user_id": "user123",
     "credit_card": "4111-1111-1111-1111",
@@ -342,6 +460,8 @@ let job = Job::new("user_data_processing".to_string(), json!({
 }))
 .with_encryption(EncryptionConfig::new(EncryptionAlgorithm::AES256GCM))
 .with_pii_fields(vec!["credit_card", "billing.address"]);
+# Ok(())
+# }
 ```
 
 is stored with `payload`
@@ -366,34 +486,41 @@ and the values of the two fields encrypted in `encrypted_payload`. The handler r
 
 ### Basic Key Management
 
-```rust
-use hammerwork::encryption::{KeyManager, KeyManagerConfig, EncryptionAlgorithm};
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::encryption::{EncryptionAlgorithm, KeyManager, KeyManagerConfig};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = KeyManagerConfig::new()
-        .with_master_key_env("HAMMERWORK_MASTER_KEY")
-        .with_auto_rotation_enabled(true)
-        .with_rotation_interval(chrono::Duration::days(90));
+let config = KeyManagerConfig::new()
+    .with_master_key_env("HAMMERWORK_MASTER_KEY")
+    .with_auto_rotation_enabled(true)
+    .with_rotation_interval(chrono::Duration::days(90));
 
-    let mut key_manager = KeyManager::new(config, pool).await?;
+// `pool` is the sqlx pool of the database that holds the key tables
+let mut key_manager = KeyManager::new(config, pool).await?;
 
-    // Generate a new encryption key
-    let key_id = key_manager.generate_key(
-        "payment-encryption", 
-        EncryptionAlgorithm::AES256GCM
-    ).await?;
+// Generate a new encryption key
+let key_id = key_manager
+    .generate_key("payment-encryption", EncryptionAlgorithm::AES256GCM)
+    .await?;
 
-    // Use the key
-    let key_material = key_manager.get_key(&key_id).await?;
-
-    Ok(())
-}
+// Use the key
+let key_material = key_manager.get_key(&key_id).await?;
+# Ok(())
+# }
 ```
 
 ### Key Rotation
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 // Manual key rotation
 let new_version = key_manager.rotate_key("payment-encryption").await?;
 println!("Rotated to version {}", new_version);
@@ -407,6 +534,8 @@ let rotated_keys = key_manager.perform_automatic_rotation().await?;
 for key_id in rotated_keys {
     println!("Auto-rotated key: {}", key_id);
 }
+# Ok(())
+# }
 ```
 
 ### Key Storage and Master Keys
@@ -417,29 +546,43 @@ The master key is loaded from `master_key_source` when the `KeyManager` is creat
 
 ### Key Audit Trails
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 // Get key usage statistics
 let stats = key_manager.get_stats().await;
 println!("Total keys: {}", stats.total_keys);
 println!("Active keys: {}", stats.active_keys);
 println!("Rotations performed: {}", stats.rotations_performed);
 
-// Query audit records (requires custom implementation)
-let audit_records = key_manager.get_audit_trail("payment-encryption", None, None).await?;
-for record in audit_records {
-    println!("{:?}: {} by {:?}", 
-        record.timestamp, 
-        record.operation, 
-        record.actor
-    );
-}
+# Ok(())
+# }
+```
+
+With `audit_enabled` (the default), creating, reading and rotating keys writes a row to
+`hammerwork_key_audit_log` (`key_id`, `operation`, `success`, `error_message`,
+`timestamp`). `KeyManager` has no method to query it; read the table directly:
+
+```sql
+SELECT timestamp, operation, success, error_message
+FROM hammerwork_key_audit_log
+WHERE key_id = 'payment-encryption'
+ORDER BY timestamp DESC;
 ```
 
 ## Retention Policies
 
 ### Policy Types
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::encryption::RetentionPolicy;
 use std::time::Duration;
 use chrono::{Utc, Duration as ChronoDuration};
@@ -458,23 +601,39 @@ let policy = RetentionPolicy::DeleteImmediately;
 
 // Use system default
 let policy = RetentionPolicy::UseDefault;
+# Ok(())
+# }
 ```
 
 ### Enforcing Retention
 
 When a job is encrypted, its retention policy (`Job::with_retention_policy`, or `UseDefault`, which uses the engine's `default_retention`) is stored in `retention_policy` and the deletion time in `retention_delete_at`. Expired jobs are deleted by a purge, which you run periodically. The simplest way is to let a `WorkerPool` schedule it:
 
-```rust
-let mut pool = WorkerPool::new()
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+let mut pool = WorkerPool::<sqlx::Postgres>::new()
     .with_encrypted_job_purge(Duration::from_secs(3600)); // off by default
 // or WorkerPool::from_hammerwork_config(worker, &config)? with encryption.purge_interval_secs
+# Ok(())
+# }
 ```
 
 The pool runs the first purge when it starts and then every interval, on its first worker's queue. Each purge runs in its own task, so shutting the pool down never cancels one part-way through its transaction. Several pools or processes purging at once is safe. Without a pool purge, call it yourself:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 let purge = queue.purge_expired_encrypted_jobs().await?;
 println!("deleted {} jobs and {} archived jobs", purge.jobs, purge.archived_jobs);
+# Ok(())
+# }
 ```
 
 or from the CLI (e.g. from cron):
@@ -493,7 +652,12 @@ The purge deletes the whole job row (ciphertext, redacted payload and result) of
 
 ### Compliance Examples
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 // GDPR compliance (right to be forgotten)
 let gdpr_job = Job::new("user_data_export".to_string(), user_data)
     .with_encryption(encryption_config.clone())
@@ -511,6 +675,8 @@ let pci_job = Job::new("payment_processing".to_string(), payment_data)
     .with_encryption(encryption_config.clone())
     .with_pii_fields(vec!["card_number", "cvv"])
     .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(365 * 24 * 60 * 60))); // 1 year
+# Ok(())
+# }
 ```
 
 ## Database Schema
@@ -575,7 +741,7 @@ CREATE INDEX idx_encryption_keys_next_rotation ON hammerwork_encryption_keys(nex
 
 ### Complete Encryption Workflow
 
-```rust
+```rust,no_run
 use hammerwork::{Job, JobQueue, Worker, WorkerPool, queue::DatabaseQueue, worker::JobHandler};
 use hammerwork::encryption::{
     EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, KeySource, RetentionPolicy,
@@ -621,13 +787,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut worker_pool = WorkerPool::new();
     worker_pool.add_worker(worker);
 
-    worker_pool.start().await
+    worker_pool.start().await?;
+    Ok(())
 }
 ```
 
 ### Key Management Example
 
-```rust
+```rust,no_run
 use hammerwork::encryption::{KeyManager, KeyManagerConfig, EncryptionAlgorithm, KeySource};
 use chrono::Duration;
 
@@ -711,42 +878,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### GDPR (General Data Protection Regulation)
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 // Right to be forgotten
 let job = Job::new("user_export".to_string(), user_data)
     .with_encryption(encryption_config)
     .with_pii_fields(vec!["personal_data"])
     .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(30 * 24 * 60 * 60)));
+# Ok(())
+# }
 ```
 
 ### HIPAA (Health Insurance Portability and Accountability Act)
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 // Healthcare data protection
 let job = Job::new("patient_processing".to_string(), patient_data)
     .with_encryption(EncryptionConfig::new(EncryptionAlgorithm::AES256GCM))
     .with_pii_fields(vec!["medical_record_number", "patient_info"])
     .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(6 * 365 * 24 * 60 * 60)));
+# Ok(())
+# }
 ```
 
 ### PCI DSS (Payment Card Industry Data Security Standard)
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 // Payment card data protection
 let job = Job::new("payment_processing".to_string(), payment_data)
     .with_encryption(EncryptionConfig::new(EncryptionAlgorithm::AES256GCM))
     .with_pii_fields(vec!["card_number", "cvv", "cardholder_name"])
     .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(365 * 24 * 60 * 60)));
+# Ok(())
+# }
 ```
 
 ### SOX (Sarbanes-Oxley Act)
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 // Financial data retention
 let job = Job::new("financial_reporting".to_string(), financial_data)
     .with_encryption(encryption_config)
     .with_pii_fields(vec!["financial_records"])
     .with_retention_policy(RetentionPolicy::DeleteAfter(Duration::from_secs(7 * 365 * 24 * 60 * 60)));
+# Ok(())
+# }
 ```
 
 ## Migration Guide
@@ -762,7 +957,12 @@ let job = Job::new("financial_reporting".to_string(), financial_data)
 
 Jobs enqueued before encryption was enabled stay in plaintext; nothing re-encrypts them. To protect pending ones, re-enqueue them with an encryption config on a queue with an engine and delete the originals:
 
-```rust
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
 async fn encrypt_pending(
     queue: &JobQueue<sqlx::Postgres>,
     job_ids: &[uuid::Uuid],
@@ -781,4 +981,6 @@ async fn encrypt_pending(
     }
     Ok(())
 }
+# Ok(())
+# }
 ```

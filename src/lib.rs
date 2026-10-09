@@ -442,4 +442,7 @@ mod doc_examples {
 
     #[doc = include_str!("../docs/archiving.md")]
     struct ArchivingDoctests;
+
+    #[doc = include_str!("../docs/encryption.md")]
+    struct EncryptionDoctests;
 }
