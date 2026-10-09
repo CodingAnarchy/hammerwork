@@ -155,7 +155,8 @@ impl KeyVersions {
                 self.previous.push((version, shared));
             }
         }
-        self.previous.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+        self.previous
+            .sort_by_key(|(version, _)| std::cmp::Reverse(*version));
     }
 
     /// Every key to try for decryption: the active one first, then earlier versions.
