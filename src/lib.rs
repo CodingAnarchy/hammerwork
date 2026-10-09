@@ -433,4 +433,7 @@ mod doc_examples {
 
     #[doc = include_str!("../docs/workflows.md")]
     struct WorkflowsDoctests;
+
+    #[doc = include_str!("../docs/worker-configuration.md")]
+    struct WorkerConfigurationDoctests;
 }
