@@ -427,4 +427,7 @@ mod doc_examples {
 
     #[doc = include_str!("../docs/tracing.md")]
     struct TracingDoctests;
+
+    #[doc = include_str!("../docs/job-spawning.md")]
+    struct JobSpawningDoctests;
 }
