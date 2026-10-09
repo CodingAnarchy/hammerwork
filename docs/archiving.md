@@ -437,7 +437,7 @@ cargo hammerwork archive purge --older-than-days 730 --confirm
 
 `archive run` takes its retention periods from flags; the defaults are 7 days for completed jobs and 30 days for failed, dead and timed-out jobs.
 
-`archive set-policy`, `get-policy` and `remove-policy` exist as commands but are placeholders: the CLI has no policy storage yet, so they only print a note and change nothing. Pass the retention flags to `archive run` instead, or keep the policy in your application (see the per-queue policies above).
+The CLI does not store archival policies. Pass the retention flags to `archive run` instead, or keep the policy in your application (see the per-queue policies above).
 
 ## Web API
 
