@@ -53,15 +53,20 @@ hammerwork-web \
   --username admin \
   --password-file /path/to/password_hash.txt
 
-# Start with custom port and CORS enabled
+# Start with custom port, and let pages on https://ops.example.com call the API (CORS)
 hammerwork-web \
   --database-url mysql://user:pass@localhost/hammerwork \
   --bind 0.0.0.0 \
   --port 9090 \
   --cors \
+  --allowed-origin https://ops.example.com \
   --auth \
   --password-file /path/to/password_hash.txt
 ```
+
+The password file holds a **bcrypt hash** of the password, never the password itself
+(see [Generate Password Hash](#example-generate-password-hash)). `--password` hashes a
+password given on the command line for you.
 
 ### Configuration File
 
@@ -74,21 +79,23 @@ database_url = "postgresql://localhost/hammerwork"
 pool_size = 10
 static_dir = "./assets"
 enable_cors = false
+# Other origins whose pages may change data / open WebSockets (and, with enable_cors, read the API)
+allowed_origins = []
 request_timeout = "30s"
 
 [auth]
 enabled = true
 username = "admin"
-password_hash = "$2b$12$..." # bcrypt hash
-session_timeout = "8h"
-max_failed_attempts = 5
+password_hash = "$2b$12$..." # bcrypt hash, never the password itself
+session_timeout = "8h"        # caps how long a verified login is remembered (at most 60 s)
+max_failed_attempts = 5       # per client address
 lockout_duration = "15m"
 
 [websocket]
 ping_interval = "30s"
 max_connections = 100
-message_buffer_size = 1024
-max_message_size = 65536
+message_buffer_size = 1024    # outgoing messages queued per connection
+max_message_size = 65536      # largest message a client may send
 ```
 
 Then start with:
@@ -123,6 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool_size: 5,
         static_dir: "./assets".into(),
         enable_cors: true,
+        // CORS is only granted to listed origins; enabling it without any is an error.
+        allowed_origins: vec!["https://ops.example.com".to_string()],
         request_timeout: Duration::from_secs(30),
         ..Default::default()
     };
@@ -143,7 +152,8 @@ let config = DashboardConfig::new()
     .with_database_url("postgresql://localhost/hammerwork")
     .with_bind_address("0.0.0.0", 8080)
     .with_auth("admin", "$2b$12$hash...") // bcrypt hash
-    .with_cors(true);
+    .with_cors(true)
+    .with_allowed_origin("https://ops.example.com");
 
 let dashboard = WebDashboard::new(config).await?;
 dashboard.start().await?;
@@ -248,8 +258,9 @@ cargo build --features postgres
 # Build with MySQL support
 cargo build --features mysql
 
-# Build with authentication support
-cargo build --features "postgres,auth"
+# Authentication (bcrypt) is a default feature. A build without it
+# (--no-default-features) refuses to start with authentication enabled.
+cargo build --no-default-features --features postgres
 
 # Build everything
 cargo build --all-features
@@ -340,9 +351,47 @@ curl -u admin:password http://localhost:8080/api/archive/stats?queue=email
 ### Authentication
 
 - **Basic Authentication**: RFC 7617 compliant with base64 encoding
-- **Password Hashing**: bcrypt with configurable cost (default: 12)
-- **Rate Limiting**: Failed login attempt tracking with account lockout
-- **Session Management**: Configurable session timeouts
+- **Password Hashing**: the configured `password_hash` is a bcrypt hash and is only ever
+  verified with bcrypt, never compared to the password as text. bcrypt comes with the
+  `auth` feature, which is on by default; a build without it refuses to start with
+  authentication enabled.
+- **No blocking**: bcrypt runs on Tokio's blocking pool, one verification per CPU at a
+  time. A successful login is remembered for 60 seconds (or `session_timeout`, if shorter;
+  `0` turns this off), so a dashboard polling several endpoints does not pay for bcrypt on
+  every request.
+- **Constant-time checks**: usernames are compared in constant time, and bcrypt runs
+  whether or not the username matched, so response times do not reveal the username.
+- **Lockout**: failures are counted per client address (the TCP peer address, never a
+  header) and username. After `max_failed_attempts` failures that client is refused with
+  `429` for `lockout_duration`; afterwards the count starts over, and a successful login
+  resets it. An attacker therefore cannot lock the administrator out from other addresses.
+  Behind a reverse proxy every client shares the proxy's address. At most 10,000 clients are
+  tracked, and made-up usernames share one record per address.
+
+### Cross-site requests (CSRF)
+
+A page the operator visits in the same browser could make it send requests to the dashboard,
+with any cached Basic credentials attached. The dashboard therefore:
+
+- requires `Content-Type: application/json` on every request with a body (`415` otherwise),
+  which a page on another origin cannot send without a CORS preflight;
+- refuses state-changing requests (`POST`, `PUT`, `DELETE`, ...) and WebSocket handshakes
+  that a browser sent from another origin (`403`), judged by `Sec-Fetch-Site` or, without
+  it, by comparing `Origin` with `Host`. Requests without either header (curl, scripts) are
+  not from a browser page and pass. Origins in `allowed_origins` (`--allowed-origin`) pass too.
+- grants CORS (`enable_cors` / `--cors`) only to the origins in `allowed_origins`, never to
+  every origin; enabling CORS without any is a startup error.
+
+### Request limits
+
+- JSON request bodies are limited to 1 MiB and need a `Content-Length` header (`413` / `411`).
+- A bulk job action takes at most 1,000 job IDs.
+- Pages hold at most 1,000 items (`limit` is clamped before the offset is computed).
+  Archive listings are filtered, counted and paged in the database.
+- WebSocket messages from clients are limited to `websocket.max_message_size`; each
+  connection queues at most `websocket.message_buffer_size` outgoing messages, and messages
+  for a client that does not read are dropped. Subscriptions accept only the known event
+  types.
 
 ### Best Practices
 
@@ -357,8 +406,8 @@ curl -u admin:password http://localhost:8080/api/archive/stats?queue=email
 ### Example: Generate Password Hash
 
 ```bash
-# Using bcrypt command-line tool
-echo -n "your-password" | bcrypt-tool hash
+# Using the htpasswd tool (Apache utils); strip the leading "user:"
+htpasswd -bnBC 12 "" "your-password" | tr -d ':\n'
 
 # Or in Rust
 use bcrypt::{hash, DEFAULT_COST};

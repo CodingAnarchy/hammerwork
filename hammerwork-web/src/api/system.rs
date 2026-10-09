@@ -274,7 +274,7 @@ where
         .and(warp::path::end())
         .and(warp::post())
         .and(queue_filter.clone())
-        .and(warp::body::json())
+        .and(crate::security::json_body())
         .and_then(maintenance_handler);
 
     let version = warp::path("version")

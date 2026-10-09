@@ -11,9 +11,11 @@
 //! was then retried to success is counted only as completed, because retrying clears its
 //! failure timestamps.
 
+use super::archive::ArchiveFilterParams;
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
+use hammerwork::archive::{ArchivalReason, ArchivedJob};
 use hammerwork::queue::DatabaseQueue;
-use hammerwork::{JobQueue, Result};
+use hammerwork::{JobQueue, JobStatus, Result};
 use serde::Serialize;
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -140,6 +142,139 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
         kind: FinishedKind,
         older_than: Option<DateTime<Utc>>,
     ) -> impl Future<Output = Result<u64>> + Send;
+
+    /// One page of the archived jobs matching `filter`, newest first, and the number of
+    /// matching archived jobs. Filtering, counting and paging all happen in the database.
+    fn archived_jobs(
+        &self,
+        filter: &ArchiveFilterParams,
+        limit: u32,
+        offset: u32,
+    ) -> impl Future<Output = Result<(Vec<ArchivedJob>, u64)>> + Send;
+}
+
+/// A value bound to an archive filter placeholder.
+#[derive(Debug, Clone, PartialEq)]
+enum ArchiveBind {
+    Text(String),
+    Time(DateTime<Utc>),
+    Bool(bool),
+}
+
+/// The `WHERE` clause (empty without filters) for `filter`, with `$n`/`?` placeholders, and
+/// the values to bind to them in order. Statuses and reasons compare case-insensitively and
+/// ignore the JSON quotes older rows may carry.
+fn archive_conditions(filter: &ArchiveFilterParams, postgres: bool) -> (String, Vec<ArchiveBind>) {
+    let mut clauses = Vec::new();
+    let mut binds = Vec::new();
+    let mut add = |clause: &str, bind: ArchiveBind| {
+        binds.push(bind);
+        let placeholder = if postgres {
+            format!("${}", binds.len())
+        } else {
+            "?".to_string()
+        };
+        clauses.push(clause.replace('?', &placeholder));
+    };
+    if let Some(queue) = &filter.queue {
+        add("queue_name = ?", ArchiveBind::Text(queue.clone()));
+    }
+    if let Some(reason) = &filter.reason {
+        add(
+            "LOWER(TRIM(BOTH '\"' FROM archival_reason)) = ?",
+            ArchiveBind::Text(reason.to_lowercase()),
+        );
+    }
+    if let Some(after) = filter.archived_after {
+        add("archived_at >= ?", ArchiveBind::Time(after));
+    }
+    if let Some(before) = filter.archived_before {
+        add("archived_at <= ?", ArchiveBind::Time(before));
+    }
+    if let Some(by) = &filter.archived_by {
+        add("archived_by = ?", ArchiveBind::Text(by.clone()));
+    }
+    if let Some(compressed) = filter.compressed {
+        add("payload_compressed = ?", ArchiveBind::Bool(compressed));
+    }
+    if let Some(status) = &filter.original_status {
+        add(
+            "LOWER(TRIM(BOTH '\"' FROM status)) = ?",
+            ArchiveBind::Text(status.to_lowercase()),
+        );
+    }
+    if clauses.is_empty() {
+        (String::new(), binds)
+    } else {
+        (format!("WHERE {}", clauses.join(" AND ")), binds)
+    }
+}
+
+/// Binds every [`ArchiveBind`] to a query, in order.
+macro_rules! bind_archive_filter {
+    ($query:expr, $binds:expr) => {{
+        let mut query = $query;
+        for bind in $binds {
+            query = match bind {
+                ArchiveBind::Text(value) => query.bind(value.clone()),
+                ArchiveBind::Time(value) => query.bind(*value),
+                ArchiveBind::Bool(value) => query.bind(*value),
+            };
+        }
+        query
+    }};
+}
+
+/// Columns of an archived job listing.
+const ARCHIVED_JOB_COLUMNS: &str = "id, queue_name, status, created_at, archived_at, \
+     archival_reason, original_payload_size, payload_compressed, archived_by";
+
+/// The status stored in the archive (possibly JSON-quoted); unknown values read as `Dead`,
+/// as the core library does.
+fn archived_status(value: &str) -> JobStatus {
+    let value = value.trim_matches('"');
+    [
+        JobStatus::Pending,
+        JobStatus::Running,
+        JobStatus::Completed,
+        JobStatus::Failed,
+        JobStatus::Dead,
+        JobStatus::TimedOut,
+        JobStatus::Retrying,
+        JobStatus::Archived,
+    ]
+    .into_iter()
+    .find(|status| status.as_str() == value)
+    .unwrap_or(JobStatus::Dead)
+}
+
+/// An archived job from a row of [`ARCHIVED_JOB_COLUMNS`], with the id already decoded.
+fn archived_job<R>(row: &R, id: uuid::Uuid) -> Result<ArchivedJob>
+where
+    R: Row,
+    for<'a> &'a str: sqlx::ColumnIndex<R>,
+    for<'a> String: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<i32>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> bool: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> DateTime<Utc>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
+    Ok(ArchivedJob {
+        id,
+        queue_name: row.try_get("queue_name")?,
+        status: archived_status(&row.try_get::<String, _>("status")?),
+        created_at: row.try_get("created_at")?,
+        archived_at: row.try_get("archived_at")?,
+        archival_reason: ArchivalReason::parse_from_db(
+            &row.try_get::<String, _>("archival_reason")?,
+        )
+        .unwrap_or_default(),
+        original_payload_size: row
+            .try_get::<Option<i32>, _>("original_payload_size")?
+            .and_then(|size| usize::try_from(size).ok()),
+        payload_compressed: row.try_get("payload_compressed")?,
+        archived_by: row.try_get("archived_by")?,
+    })
 }
 
 /// Filters shared by count and delete: `$n`/`?` placeholders, queue then cutoff.
@@ -287,6 +422,37 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
         }
         Ok(q.execute(&self.pool).await?.rows_affected())
     }
+
+    async fn archived_jobs(
+        &self,
+        filter: &ArchiveFilterParams,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<ArchivedJob>, u64)> {
+        let (conditions, binds) = archive_conditions(filter, true);
+        let count_sql = format!("SELECT COUNT(*) FROM hammerwork_jobs_archive {conditions}");
+        let total = bind_archive_filter!(sqlx::query_scalar::<_, i64>(&count_sql), &binds)
+            .fetch_one(&self.pool)
+            .await?;
+        let (limit_ph, offset_ph) = (
+            format!("${}", binds.len() + 1),
+            format!("${}", binds.len() + 2),
+        );
+        let page_sql = format!(
+            "SELECT {ARCHIVED_JOB_COLUMNS} FROM hammerwork_jobs_archive {conditions} \
+             ORDER BY archived_at DESC, id DESC LIMIT {limit_ph} OFFSET {offset_ph}"
+        );
+        let rows = bind_archive_filter!(sqlx::query(&page_sql), &binds)
+            .bind(i64::from(limit))
+            .bind(i64::from(offset))
+            .fetch_all(&self.pool)
+            .await?;
+        let jobs = rows
+            .iter()
+            .map(|row| archived_job(row, row.try_get::<uuid::Uuid, _>("id")?))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((jobs, to_u64(total)))
+    }
 }
 
 impl JobHistory for JobQueue<sqlx::MySql> {
@@ -417,6 +583,38 @@ impl JobHistory for JobQueue<sqlx::MySql> {
         }
         Ok(q.execute(&self.pool).await?.rows_affected())
     }
+
+    async fn archived_jobs(
+        &self,
+        filter: &ArchiveFilterParams,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<ArchivedJob>, u64)> {
+        let (conditions, binds) = archive_conditions(filter, false);
+        let count_sql = format!("SELECT COUNT(*) FROM hammerwork_jobs_archive {conditions}");
+        let total = bind_archive_filter!(sqlx::query_scalar::<_, i64>(&count_sql), &binds)
+            .fetch_one(&self.pool)
+            .await?;
+        let page_sql = format!(
+            "SELECT {ARCHIVED_JOB_COLUMNS} FROM hammerwork_jobs_archive {conditions} \
+             ORDER BY archived_at DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let rows = bind_archive_filter!(sqlx::query(&page_sql), &binds)
+            .bind(i64::from(limit))
+            .bind(i64::from(offset))
+            .fetch_all(&self.pool)
+            .await?;
+        let jobs = rows
+            .iter()
+            .map(|row| {
+                archived_job(
+                    row,
+                    uuid::Uuid::parse_str(&row.try_get::<String, _>("id")?)?,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((jobs, to_u64(total)))
+    }
 }
 
 fn parse_bucket(bucket: &str) -> Option<DateTime<Utc>> {
@@ -466,6 +664,55 @@ mod tests {
         assert_eq!((buckets[1].completed, buckets[1].failed), (0, 0));
         assert_eq!(buckets[1].avg_processing_time_ms, None);
         assert_eq!((buckets[2].completed, buckets[2].failed), (0, 2));
+    }
+
+    /// M11: archive filters become SQL, so the listing never reads the whole archive.
+    #[test]
+    fn archive_filters_become_sql_conditions() {
+        let (sql, binds) = archive_conditions(&ArchiveFilterParams::default(), true);
+        assert_eq!(sql, "");
+        assert!(binds.is_empty());
+
+        let at = Utc.with_ymd_and_hms(2024, 5, 1, 0, 0, 0).unwrap();
+        let filter = ArchiveFilterParams {
+            queue: Some("emails".into()),
+            reason: Some("Manual".into()),
+            archived_after: Some(at),
+            archived_before: Some(at),
+            archived_by: Some("ops".into()),
+            compressed: Some(true),
+            original_status: Some("COMPLETED".into()),
+        };
+        let (pg, binds) = archive_conditions(&filter, true);
+        assert_eq!(
+            pg,
+            "WHERE queue_name = $1 AND LOWER(TRIM(BOTH '\"' FROM archival_reason)) = $2 \
+             AND archived_at >= $3 AND archived_at <= $4 AND archived_by = $5 \
+             AND payload_compressed = $6 AND LOWER(TRIM(BOTH '\"' FROM status)) = $7"
+        );
+        assert_eq!(
+            binds,
+            vec![
+                ArchiveBind::Text("emails".into()),
+                ArchiveBind::Text("manual".into()),
+                ArchiveBind::Time(at),
+                ArchiveBind::Time(at),
+                ArchiveBind::Text("ops".into()),
+                ArchiveBind::Bool(true),
+                ArchiveBind::Text("completed".into()),
+            ]
+        );
+        let (mysql, _) = archive_conditions(&filter, false);
+        assert_eq!(mysql.matches('?').count(), 7);
+        assert!(!mysql.contains('$'));
+    }
+
+    #[test]
+    fn archived_statuses_parse_like_the_core_library() {
+        assert_eq!(archived_status("Completed"), JobStatus::Completed);
+        assert_eq!(archived_status("\"TimedOut\""), JobStatus::TimedOut);
+        assert_eq!(archived_status("Archived"), JobStatus::Archived);
+        assert_eq!(archived_status("whatever"), JobStatus::Dead);
     }
 
     #[test]

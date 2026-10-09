@@ -64,6 +64,7 @@
 //! assert!(archived_job.payload_compressed);
 //! ```
 
+use super::history::JobHistory;
 use super::{
     ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, error_reply,
     internal_error, json_reply,
@@ -71,7 +72,6 @@ use super::{
 use hammerwork::{
     JobId, JobStatus,
     archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason, ArchivalStats, ArchivedJob},
-    queue::DatabaseQueue,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -280,11 +280,11 @@ pub fn archive_routes<Q>(
     queue: Arc<Q>,
 ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
 where
-    Q: DatabaseQueue + Send + Sync + 'static,
+    Q: JobHistory + 'static,
 {
     let archive_jobs = warp::path!("archive" / "jobs")
         .and(warp::post())
-        .and(warp::body::json())
+        .and(crate::security::json_body())
         .and(with_queue(queue.clone()))
         .and_then(handle_archive_jobs);
 
@@ -297,13 +297,13 @@ where
 
     let restore_job = warp::path!("archive" / "jobs" / String / "restore")
         .and(warp::post())
-        .and(warp::body::json())
+        .and(crate::security::json_body())
         .and(with_queue(queue.clone()))
         .and_then(handle_restore_job);
 
     let purge_jobs = warp::path!("archive" / "purge")
         .and(warp::delete())
-        .and(warp::body::json())
+        .and(crate::security::json_body())
         .and(with_queue(queue.clone()))
         .and_then(handle_purge_jobs);
 
@@ -325,7 +325,7 @@ fn with_queue<Q>(
     queue: Arc<Q>,
 ) -> impl Filter<Extract = (Arc<Q>,), Error = std::convert::Infallible> + Clone
 where
-    Q: DatabaseQueue + Send + Sync + 'static,
+    Q: JobHistory + 'static,
 {
     warp::any().map(move || queue.clone())
 }
@@ -342,7 +342,7 @@ async fn handle_archive_jobs<Q>(
     queue: Arc<Q>,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    Q: DatabaseQueue + Send + Sync + 'static,
+    Q: JobHistory + 'static,
 {
     let policy = request.policy.unwrap_or_default();
     let config = request.config.unwrap_or_default();
@@ -381,107 +381,22 @@ where
     }
 }
 
-/// Everything archived in `queue_name` (all queues for `None`), read in pages.
-async fn all_archived_jobs<Q>(
-    queue: &Q,
-    queue_name: Option<&str>,
-) -> hammerwork::Result<Vec<ArchivedJob>>
-where
-    Q: DatabaseQueue + Send + Sync,
-{
-    const PAGE: u32 = 1000;
-    let mut all = Vec::new();
-    loop {
-        let page = queue
-            .list_archived_jobs(queue_name, Some(PAGE), Some(all.len() as u32))
-            .await?;
-        let count = page.len() as u32;
-        all.extend(page);
-        if count < PAGE {
-            return Ok(all);
-        }
-    }
-}
-
-/// Whether the filters beyond the queue name narrow the listing.
-fn has_extra_filters(filters: &ArchiveFilterParams) -> bool {
-    filters.reason.is_some()
-        || filters.archived_after.is_some()
-        || filters.archived_before.is_some()
-        || filters.archived_by.is_some()
-        || filters.compressed.is_some()
-        || filters.original_status.is_some()
-}
-
-/// Whether `job` passes every filter (the queue filter is applied by the query).
-fn archived_job_matches(job: &ArchivedJob, filters: &ArchiveFilterParams) -> bool {
-    filters
-        .reason
-        .as_deref()
-        .is_none_or(|reason| format!("{:?}", job.archival_reason).eq_ignore_ascii_case(reason))
-        && filters.archived_after.is_none_or(|t| job.archived_at >= t)
-        && filters.archived_before.is_none_or(|t| job.archived_at <= t)
-        && filters
-            .archived_by
-            .as_deref()
-            .is_none_or(|by| job.archived_by.as_deref() == Some(by))
-        && filters
-            .compressed
-            .is_none_or(|compressed| job.payload_compressed == compressed)
-        && filters
-            .original_status
-            .as_deref()
-            .is_none_or(|status| job.status.as_str().eq_ignore_ascii_case(status))
-}
-
-/// Handle list archived jobs request
+/// Handle list archived jobs request. Filtering, counting and paging happen in the database,
+/// so a request reads one page, never the whole archive.
 async fn handle_list_archived_jobs<Q>(
     pagination: PaginationParams,
     filters: ArchiveFilterParams,
     queue: Arc<Q>,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    Q: DatabaseQueue + Send + Sync + 'static,
+    Q: JobHistory + 'static,
 {
     let limit = pagination.get_limit();
     let offset = pagination.get_offset();
 
-    let (page, total) = if has_extra_filters(&filters) {
-        // The database only filters by queue: read everything and filter here.
-        let all = match all_archived_jobs(queue.as_ref(), filters.queue.as_deref()).await {
-            Ok(all) => all,
-            Err(e) => return Ok(internal_error("Failed to list archived jobs", &e)),
-        };
-        let matching: Vec<ArchivedJob> = all
-            .into_iter()
-            .filter(|job| archived_job_matches(job, &filters))
-            .collect();
-        let total = matching.len() as u64;
-        let page: Vec<ArchivedJob> = matching
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
-        (page, total)
-    } else {
-        let page = match queue
-            .list_archived_jobs(filters.queue.as_deref(), Some(limit), Some(offset))
-            .await
-        {
-            Ok(page) => page,
-            Err(e) => return Ok(internal_error("Failed to list archived jobs", &e)),
-        };
-        let total = if page.len() as u32 == limit {
-            // A full page: there may be more, so count them all.
-            match all_archived_jobs(queue.as_ref(), filters.queue.as_deref()).await {
-                Ok(all) => all.len() as u64,
-                Err(e) => return Ok(internal_error("Failed to count archived jobs", &e)),
-            }
-        } else {
-            // A short page is the end of the list.
-            u64::from(offset) + page.len() as u64
-        };
-        (page, total)
+    let (page, total) = match queue.archived_jobs(&filters, limit, offset).await {
+        Ok(listing) => listing,
+        Err(e) => return Ok(internal_error("Failed to list archived jobs", &e)),
     };
 
     let response = PaginatedResponse {
@@ -498,7 +413,7 @@ async fn handle_restore_job<Q>(
     queue: Arc<Q>,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    Q: DatabaseQueue + Send + Sync + 'static,
+    Q: JobHistory + 'static,
 {
     let job_id = match uuid::Uuid::parse_str(&job_id_str) {
         Ok(id) => id,
@@ -529,15 +444,17 @@ async fn handle_purge_jobs<Q>(
     queue: Arc<Q>,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    Q: DatabaseQueue + Send + Sync + 'static,
+    Q: JobHistory + 'static,
 {
     if request.dry_run {
-        // Count the archived jobs the real purge would delete: those archived before the cutoff
-        let count = match all_archived_jobs(queue.as_ref(), None).await {
-            Ok(jobs) => jobs
-                .iter()
-                .filter(|job| job.archived_at < request.older_than)
-                .count() as u64,
+        // Count the archived jobs the real purge would delete: those archived at or before
+        // the cutoff. Only the count is read.
+        let cutoff = ArchiveFilterParams {
+            archived_before: Some(request.older_than),
+            ..ArchiveFilterParams::default()
+        };
+        let count = match queue.archived_jobs(&cutoff, 0, 0).await {
+            Ok((_, count)) => count,
             Err(e) => return Ok(internal_error("Failed to count archived jobs", &e)),
         };
 
@@ -568,7 +485,7 @@ async fn handle_archive_stats<Q>(
     queue: Arc<Q>,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    Q: DatabaseQueue + Send + Sync + 'static,
+    Q: JobHistory + 'static,
 {
     match queue.get_archival_stats(filters.queue.as_deref()).await {
         Ok(stats) => {

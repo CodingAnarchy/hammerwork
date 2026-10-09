@@ -55,8 +55,18 @@ fn cli() -> Command {
         .arg(
             Arg::new("cors")
                 .long("cors")
-                .help("Enable CORS support")
+                .help("Enable CORS for the origins given with --allowed-origin")
                 .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("allowed-origin")
+                .long("allowed-origin")
+                .value_name("ORIGIN")
+                .action(clap::ArgAction::Append)
+                .help(
+                    "Another origin (scheme://host[:port]) whose pages may change data and \
+                     open WebSockets, and with --cors read the API; repeatable",
+                ),
         )
         .arg(
             Arg::new("auth")
@@ -80,7 +90,7 @@ fn cli() -> Command {
             Arg::new("password-file")
                 .long("password-file")
                 .value_name("FILE")
-                .help("File containing password hash (requires --auth)"),
+                .help("File containing the bcrypt hash of the password (requires --auth)"),
         )
         .arg(
             Arg::new("no-auth")
@@ -139,6 +149,9 @@ fn resolve_config(matches: &ArgMatches, env_database_url: Option<&str>) -> Resul
     }
     if matches.get_flag("cors") {
         config.enable_cors = true;
+    }
+    if let Some(origins) = matches.get_many::<String>("allowed-origin") {
+        config.allowed_origins.extend(origins.cloned());
     }
 
     // Handle authentication
@@ -199,6 +212,7 @@ fn resolve_config(matches: &ArgMatches, env_database_url: Option<&str>) -> Resul
         );
     }
 
+    config.validate()?;
     Ok(Resolved { config, warnings })
 }
 
@@ -353,6 +367,10 @@ mod tests {
                 "--static-dir",
                 "/srv/www",
                 "--cors",
+                "--allowed-origin",
+                "https://ops.example.com",
+                "--allowed-origin",
+                "http://localhost:3000",
             ],
             None,
         )
@@ -362,6 +380,27 @@ mod tests {
         assert_eq!(config.bind_addr(), "0.0.0.0:9191");
         assert_eq!(config.static_dir, PathBuf::from("/srv/www"));
         assert!(config.enable_cors);
+        assert_eq!(
+            config.allowed_origins,
+            ["https://ops.example.com", "http://localhost:3000"]
+        );
+    }
+
+    #[test]
+    fn cors_needs_explicit_origins() {
+        // M16: CORS is never granted to every origin.
+        let err = resolve(&["--no-auth", "--cors"], None).unwrap_err();
+        assert!(err.to_string().contains("allowed_origins"), "{err}");
+        let err = resolve(&["--no-auth", "--allowed-origin", "*"], None).unwrap_err();
+        assert!(err.to_string().contains("invalid origin"), "{err}");
+        // An allowed origin without --cors only relaxes the cross-origin write check.
+        let resolved = resolve(
+            &["--no-auth", "--allowed-origin", "https://a.example"],
+            None,
+        )
+        .unwrap();
+        assert!(!resolved.config.enable_cors);
+        assert_eq!(resolved.config.allowed_origins, ["https://a.example"]);
     }
 
     #[test]
@@ -404,7 +443,8 @@ mod tests {
             .with_bind_address("10.1.2.3", 9999)
             .with_database_url("mysql://file/db")
             .with_static_dir(PathBuf::from("/from/file"))
-            .with_cors(true);
+            .with_cors(true)
+            .with_allowed_origin("https://ops.example.com");
         file_config.auth.enabled = false;
         let path = dir.path().join("dashboard.toml");
         file_config.save_to_file(path.to_str().unwrap()).unwrap();
@@ -437,6 +477,10 @@ mod tests {
             &dir,
             &toml::to_string(&DashboardConfig {
                 database_url: String::new(),
+                auth: hammerwork_web::AuthConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
                 ..DashboardConfig::new()
             })
             .unwrap(),
@@ -448,6 +492,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "auth")]
     #[test]
     fn authentication_needs_a_password_or_an_explicit_opt_out() {
         // By default there is no password: refuse to start rather than run open.
@@ -514,6 +559,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "auth")]
     #[test]
     fn a_hash_in_the_config_file_is_used_by_auth() {
         let dir = tempfile::tempdir().unwrap();
@@ -540,6 +586,20 @@ mod tests {
         let hash = &resolved.config.auth.password_hash;
         assert!(hash.starts_with("$2"));
         assert!(bcrypt::verify("hunter2", hash).unwrap());
+    }
+
+    /// H5: without bcrypt a stored hash cannot be verified, so authentication refuses to start
+    /// instead of comparing the hash to passwords as text.
+    #[cfg(not(feature = "auth"))]
+    #[test]
+    fn authentication_needs_the_auth_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hash.txt");
+        std::fs::write(&file, "$2b$12$abcdefghijklmnopqrstuv").unwrap();
+        let err =
+            resolve(&["--auth", "--password-file", file.to_str().unwrap()], None).unwrap_err();
+        assert!(err.to_string().contains("`auth` feature"), "{err}");
+        assert!(resolve(&["--no-auth"], None).is_ok());
     }
 
     #[cfg(not(feature = "auth"))]

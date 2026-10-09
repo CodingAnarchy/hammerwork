@@ -132,7 +132,10 @@ pub struct JobActionRequest {
     pub reason: Option<String>,
 }
 
-/// Bulk job action request
+/// The most job IDs one bulk action may name.
+pub const MAX_BULK_JOB_IDS: usize = 1000;
+
+/// Bulk job action request (at most [`MAX_BULK_JOB_IDS`] IDs)
 #[derive(Debug, Deserialize)]
 pub struct BulkJobActionRequest {
     pub job_ids: Vec<String>,
@@ -173,7 +176,7 @@ where
         .and(warp::path::end())
         .and(warp::post())
         .and(queue_filter.clone())
-        .and(warp::body::json())
+        .and(crate::security::json_body())
         .and_then(create_job_handler);
 
     let get_job = warp::path("jobs")
@@ -189,7 +192,7 @@ where
         .and(warp::path::end())
         .and(warp::post())
         .and(queue_filter.clone())
-        .and(warp::body::json())
+        .and(crate::security::json_body())
         .and_then(job_action_handler);
 
     let bulk_action = warp::path("jobs")
@@ -197,7 +200,7 @@ where
         .and(warp::path::end())
         .and(warp::post())
         .and(queue_filter.clone())
-        .and(warp::body::json())
+        .and(crate::security::json_body())
         .and_then(bulk_job_action_handler);
 
     let search_jobs = warp::path("jobs")
@@ -205,7 +208,7 @@ where
         .and(warp::path::end())
         .and(warp::post())
         .and(queue_filter)
-        .and(warp::body::json())
+        .and(crate::security::json_body())
         .and(with_pagination())
         .and_then(search_jobs_handler);
 
@@ -312,7 +315,7 @@ fn paginate<I>(items: Vec<I>, pagination: &PaginationParams) -> PaginatedRespons
         .collect();
     // Describe the page that was actually served, not the requested limit.
     let served = PaginationParams {
-        page: Some(offset / limit + 1),
+        page: Some((offset / limit).saturating_add(1)),
         limit: Some(limit),
         offset: Some(offset),
     };
@@ -637,6 +640,16 @@ where
         return Ok(error_reply(
             StatusCode::BAD_REQUEST,
             format!("Unknown action: {}", request.action),
+        ));
+    }
+    if request.job_ids.len() > MAX_BULK_JOB_IDS {
+        return Ok(error_reply(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Too many job IDs: {} (at most {} per request)",
+                request.job_ids.len(),
+                MAX_BULK_JOB_IDS
+            ),
         ));
     }
 

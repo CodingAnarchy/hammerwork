@@ -195,7 +195,7 @@ where
         .and(warp::path::end())
         .and(warp::post())
         .and(queue_filter.clone())
-        .and(warp::body::json())
+        .and(crate::security::json_body())
         .and_then(queue_action_handler);
 
     let queue_jobs = warp::path("queues")
