@@ -128,7 +128,7 @@ impl ScratchDb {
             }
             DatabasePool::MySQL(p) => {
                 let tables: Vec<String> = sqlx::query_scalar(
-                    "SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE()",
+                    "SELECT CAST(TABLE_NAME AS CHAR) FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE()",
                 )
                 .fetch_all(p)
                 .await
