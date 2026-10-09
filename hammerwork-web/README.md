@@ -42,8 +42,9 @@ cargo build --release --features postgres
 ### Basic Usage
 
 ```bash
-# Start the dashboard (PostgreSQL)
-hammerwork-web --database-url postgresql://user:pass@localhost/hammerwork
+# Start the dashboard locally without authentication (PostgreSQL). Without --no-auth,
+# the dashboard refuses to start until a password is configured.
+hammerwork-web --database-url postgresql://user:pass@localhost/hammerwork --no-auth
 
 # Start with authentication enabled
 hammerwork-web \
@@ -57,7 +58,9 @@ hammerwork-web \
   --database-url mysql://user:pass@localhost/hammerwork \
   --bind 0.0.0.0 \
   --port 9090 \
-  --cors
+  --cors \
+  --auth \
+  --password-file /path/to/password_hash.txt
 ```
 
 ### Configuration File
@@ -378,7 +381,7 @@ COPY --from=builder /app/target/release/hammerwork-web /usr/local/bin/
 COPY --from=builder /app/hammerwork-web/assets /app/assets
 WORKDIR /app
 EXPOSE 8080
-CMD ["hammerwork-web", "--bind", "0.0.0.0", "--port", "8080"]
+CMD ["hammerwork-web", "--bind", "0.0.0.0", "--port", "8080", "--auth", "--password-file", "/run/secrets/dashboard_password_hash"]
 ```
 
 ### systemd Service

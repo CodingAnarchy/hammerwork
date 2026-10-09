@@ -217,6 +217,111 @@ where
         .or(search_jobs)
 }
 
+/// The API representation of a job.
+fn job_info(job: &hammerwork::Job) -> JobInfo {
+    let end = job.completed_at.or(job.failed_at).or(job.timed_out_at);
+    JobInfo {
+        id: job.id.to_string(),
+        queue_name: job.queue_name.clone(),
+        status: job.status.as_str().to_string(),
+        priority: job.priority.to_string(),
+        attempts: job.attempts,
+        max_attempts: job.max_attempts,
+        payload: job.payload.clone(),
+        created_at: job.created_at,
+        scheduled_at: job.scheduled_at,
+        started_at: job.started_at,
+        completed_at: job.completed_at,
+        failed_at: job.failed_at,
+        error_message: job.error_message.clone(),
+        processing_time_ms: job
+            .started_at
+            .zip(end)
+            .map(|(start, end)| (end - start).num_milliseconds()),
+        cron_schedule: job.cron_schedule.clone(),
+        is_recurring: job.is_recurring(),
+        trace_id: job.trace_id.clone(),
+        correlation_id: job.correlation_id.clone(),
+    }
+}
+
+/// Whether a job satisfies the `status` filter of the listing: `failed` covers every
+/// unsuccessful terminal status, `recurring` selects recurring jobs, anything else must equal
+/// the job's status (ignoring case).
+fn status_matches(filter: &str, job: &JobInfo) -> bool {
+    let status = job.status.to_lowercase();
+    match filter {
+        "failed" => matches!(status.as_str(), "failed" | "dead" | "timedout"),
+        "recurring" => job.is_recurring,
+        other => status == other,
+    }
+}
+
+/// Order of priorities for sorting (`background` lowest).
+fn priority_rank(priority: &str) -> i32 {
+    priority
+        .parse::<hammerwork::JobPriority>()
+        .map(|p| p.as_i32())
+        .unwrap_or(-1)
+}
+
+/// The jobs of `queue_name` the API can enumerate: pending jobs ready to run, dead jobs
+/// and recurring jobs, without duplicates (a recurring job can also be ready).
+async fn collect_jobs<T>(
+    queue: &T,
+    queue_name: &str,
+    include_ready: bool,
+    include_dead: bool,
+    include_recurring: bool,
+    limit: u32,
+) -> hammerwork::Result<Vec<hammerwork::Job>>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    let mut jobs = Vec::new();
+    if include_ready {
+        jobs.extend(queue.get_ready_jobs(queue_name, limit).await?);
+    }
+    if include_dead {
+        jobs.extend(
+            queue
+                .get_dead_jobs_by_queue(queue_name, Some(limit), Some(0))
+                .await?,
+        );
+    }
+    if include_recurring {
+        jobs.extend(queue.get_recurring_jobs(queue_name).await?);
+    }
+    let mut seen = std::collections::HashSet::new();
+    jobs.retain(|job| seen.insert(job.id));
+    Ok(jobs)
+}
+
+/// Page `items` according to `pagination` (default 20 per page, at most 100).
+fn paginate<I>(items: Vec<I>, pagination: &PaginationParams) -> PaginatedResponse<I> {
+    let limit = pagination.limit.unwrap_or(20).clamp(1, 100);
+    let page = pagination.page.unwrap_or(1).max(1);
+    let offset = pagination
+        .offset
+        .unwrap_or_else(|| (page - 1).saturating_mul(limit));
+    let total = items.len() as u64;
+    let items = items
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    // Describe the page that was actually served, not the requested limit.
+    let served = PaginationParams {
+        page: Some(offset / limit + 1),
+        limit: Some(limit),
+        offset: Some(offset),
+    };
+    PaginatedResponse {
+        items,
+        pagination: PaginationMeta::new(&served, total),
+    }
+}
+
 /// Handler for listing jobs
 pub(crate) async fn list_jobs_handler<T>(
     queue: Arc<T>,
@@ -249,80 +354,41 @@ where
         queue_stats.iter().map(|s| s.queue_name.clone()).collect()
     };
 
+    let status_filter = filters.status.as_deref().map(str::to_lowercase);
+    let wants = |names: &[&str]| {
+        status_filter
+            .as_deref()
+            .is_none_or(|status| names.contains(&status))
+    };
+
     // For each queue, get jobs from different sources based on status filter
     for queue_name in &target_queues {
-        let mut queue_jobs = Vec::new();
+        let queue_jobs = try_api!(
+            collect_jobs(
+                queue.as_ref(),
+                queue_name,
+                wants(&["pending"]),
+                wants(&["failed", "dead"]),
+                wants(&["recurring"]),
+                100
+            )
+            .await,
+            "Failed to list jobs"
+        );
 
-        // Collect jobs based on status filter or get all types if no filter
-        if filters.status.is_none() || filters.status.as_ref().unwrap().to_lowercase() == "pending"
-        {
-            // Get ready jobs (pending jobs ready to be processed)
-            queue_jobs.extend(try_api!(
-                queue.get_ready_jobs(queue_name, 100).await,
-                "Failed to get ready jobs"
-            ));
-        }
-
-        if filters.status.is_none()
-            || filters.status.as_ref().unwrap().to_lowercase() == "failed"
-            || filters.status.as_ref().unwrap().to_lowercase() == "dead"
-        {
-            // Get dead jobs
-            queue_jobs.extend(try_api!(
-                queue
-                    .get_dead_jobs_by_queue(queue_name, Some(100), Some(0))
-                    .await,
-                "Failed to get dead jobs"
-            ));
-        }
-
-        if filters.status.is_none()
-            || filters.status.as_ref().unwrap().to_lowercase() == "recurring"
-        {
-            // Get recurring jobs
-            queue_jobs.extend(try_api!(
-                queue.get_recurring_jobs(queue_name).await,
-                "Failed to get recurring jobs"
-            ));
-        }
-
-        for job in queue_jobs {
-            let processing_time_ms = match (job.started_at, job.completed_at) {
-                (Some(started), Some(completed)) => Some((completed - started).num_milliseconds()),
-                _ => None,
-            };
-
-            let job_info = JobInfo {
-                id: job.id.to_string(),
-                queue_name: job.queue_name.clone(),
-                status: job.status.as_str().to_string(),
-                priority: format!("{:?}", job.priority),
-                attempts: job.attempts,
-                max_attempts: job.max_attempts,
-                payload: job.payload.clone(),
-                created_at: job.created_at,
-                scheduled_at: job.scheduled_at,
-                started_at: job.started_at,
-                completed_at: job.completed_at,
-                failed_at: job.failed_at,
-                error_message: job.error_message.clone(),
-                processing_time_ms,
-                cron_schedule: job.cron_schedule.as_ref().map(|c| c.to_string()),
-                is_recurring: job.is_recurring(),
-                trace_id: job.trace_id.clone(),
-                correlation_id: job.correlation_id.clone(),
-            };
+        for job in &queue_jobs {
+            let job_info = job_info(job);
 
             // Apply status filter
-            if let Some(ref status) = filters.status
-                && job_info.status.to_lowercase() != status.to_lowercase()
+            if let Some(ref status) = status_filter
+                && !status_matches(status, &job_info)
             {
                 continue;
             }
 
             // Apply priority filter
             if let Some(ref priority) = filters.priority
-                && job_info.priority.to_lowercase() != priority.to_lowercase()
+                && !job_info.priority.eq_ignore_ascii_case(priority)
             {
                 continue;
             }
@@ -332,54 +398,28 @@ where
     }
 
     // Sort jobs
+    let ascending = sort.sort_order.as_deref() == Some("asc");
     match sort.sort_by.as_deref() {
-        Some("created_at") => {
-            all_jobs.sort_by(|a, b| {
-                if sort.sort_order.as_deref() == Some("asc") {
-                    a.created_at.cmp(&b.created_at)
-                } else {
-                    b.created_at.cmp(&a.created_at)
-                }
-            });
-        }
-        Some("scheduled_at") => {
-            all_jobs.sort_by(|a, b| {
-                if sort.sort_order.as_deref() == Some("asc") {
-                    a.scheduled_at.cmp(&b.scheduled_at)
-                } else {
-                    b.scheduled_at.cmp(&a.scheduled_at)
-                }
-            });
-        }
-        Some("priority") => {
-            all_jobs.sort_by(|a, b| {
-                if sort.sort_order.as_deref() == Some("asc") {
-                    a.priority.cmp(&b.priority)
-                } else {
-                    b.priority.cmp(&a.priority)
-                }
-            });
-        }
+        Some("scheduled_at") => all_jobs.sort_by_key(|j| j.scheduled_at),
+        Some("priority") => all_jobs.sort_by_key(|j| priority_rank(&j.priority)),
+        Some("created_at") => all_jobs.sort_by_key(|j| j.created_at),
         _ => {
             // Default sort by created_at desc
             all_jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
         }
     }
+    let sorted_by_default = !matches!(
+        sort.sort_by.as_deref(),
+        Some("scheduled_at") | Some("priority") | Some("created_at")
+    );
+    if !ascending && !sorted_by_default {
+        all_jobs.reverse();
+    }
 
-    // Apply pagination
-    let total_count = all_jobs.len() as u64;
-    let page_size = pagination.limit.unwrap_or(20).min(100) as usize;
-    let page = pagination.page.unwrap_or(1).max(1) as usize;
-    let offset = (page - 1) * page_size;
-
-    let paginated_jobs: Vec<JobInfo> = all_jobs.into_iter().skip(offset).take(page_size).collect();
-
-    let response = PaginatedResponse {
-        items: paginated_jobs,
-        pagination: PaginationMeta::new(&pagination, total_count),
-    };
-
-    Ok(json_reply(&ApiResponse::success(response)))
+    Ok(json_reply(&ApiResponse::success(paginate(
+        all_jobs,
+        &pagination,
+    ))))
 }
 
 /// Handler for creating a new job
@@ -390,20 +430,62 @@ async fn create_job_handler<T>(
 where
     T: DatabaseQueue + Send + Sync,
 {
-    use hammerwork::{Job, JobPriority};
+    use hammerwork::{CronSchedule, Job, JobPriority};
+
+    if request.queue_name.trim().is_empty() {
+        return Ok(error_reply(
+            StatusCode::BAD_REQUEST,
+            "queue_name must not be empty",
+        ));
+    }
 
     let priority = match request.priority.as_deref() {
-        Some("background") => JobPriority::Background,
-        Some("low") => JobPriority::Low,
-        Some("normal") => JobPriority::Normal,
-        Some("high") => JobPriority::High,
-        Some("critical") => JobPriority::Critical,
-        _ => JobPriority::Normal,
+        None => JobPriority::Normal,
+        Some(name) => match name.parse::<JobPriority>() {
+            Ok(priority) => priority,
+            Err(_) => {
+                return Ok(error_reply(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Invalid priority '{}'. Valid options: background, low, normal, high, critical",
+                        name
+                    ),
+                ));
+            }
+        },
     };
+
+    if let Some(max_attempts) = request.max_attempts
+        && max_attempts < 1
+    {
+        return Ok(error_reply(
+            StatusCode::BAD_REQUEST,
+            "max_attempts must be at least 1",
+        ));
+    }
 
     let mut job = Job::new(request.queue_name, request.payload).with_priority(priority);
 
-    if let Some(scheduled_at) = request.scheduled_at {
+    if let Some(expression) = request.cron_schedule.as_deref() {
+        let schedule = match CronSchedule::new(expression) {
+            Ok(schedule) => schedule,
+            Err(e) => {
+                return Ok(error_reply(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid cron schedule: {}", e),
+                ));
+            }
+        };
+        job = match job.with_cron(schedule) {
+            Ok(job) => job,
+            Err(e) => {
+                return Ok(error_reply(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid cron schedule: {}", e),
+                ));
+            }
+        };
+    } else if let Some(scheduled_at) = request.scheduled_at {
         job.scheduled_at = scheduled_at;
     }
 
@@ -450,35 +532,7 @@ where
     };
 
     match queue.get_job(job_uuid).await {
-        Ok(Some(job)) => {
-            let job_info = JobInfo {
-                id: job.id.to_string(),
-                queue_name: job.queue_name.clone(),
-                status: format!("{:?}", job.status),
-                priority: format!("{:?}", job.priority),
-                attempts: job.attempts,
-                max_attempts: job.max_attempts,
-                payload: job.payload.clone(),
-                created_at: job.created_at,
-                scheduled_at: job.scheduled_at,
-                started_at: job.started_at,
-                completed_at: job.completed_at,
-                failed_at: job.failed_at,
-                error_message: job.error_message.clone(),
-                processing_time_ms: job.started_at.and_then(|start| {
-                    job.completed_at
-                        .or(job.failed_at)
-                        .or(job.timed_out_at)
-                        .map(|end| (end - start).num_milliseconds())
-                }),
-                cron_schedule: job.cron_schedule.clone(),
-                is_recurring: job.is_recurring(),
-                trace_id: job.trace_id.clone(),
-                correlation_id: job.correlation_id.clone(),
-            };
-
-            Ok(json_reply(&ApiResponse::success(job_info)))
-        }
+        Ok(Some(job)) => Ok(json_reply(&ApiResponse::success(job_info(&job)))),
         Ok(None) => Ok(error_reply(
             StatusCode::NOT_FOUND,
             format!("Job '{}' not found", job_id),
@@ -517,22 +571,16 @@ where
                 }));
                 Ok(json_reply(&response))
             }
-            Err(e) => Ok(error_reply(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to retry job: {}", e),
-            )),
+            Err(e) => Ok(super::queue_error_reply("Failed to retry job", &e)),
         },
-        "cancel" | "delete" => match queue.delete_job(job_uuid).await {
+        "cancel" | "delete" => match delete_job_action(queue.as_ref(), job_uuid).await {
             Ok(()) => {
                 let response = ApiResponse::success(serde_json::json!({
                     "message": format!("Job '{}' deleted", job_id)
                 }));
                 Ok(json_reply(&response))
             }
-            Err(e) => Ok(error_reply(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to delete job: {}", e),
-            )),
+            Err(e) => Ok(super::queue_error_reply("Failed to delete job", &e)),
         },
         _ => Ok(error_reply(
             StatusCode::BAD_REQUEST,
@@ -541,15 +589,36 @@ where
     }
 }
 
-/// Re-run a job now: `Dead` jobs go through `retry_dead_job` (which also resets their
-/// attempts); other retryable statuses through `retry_job`. Statuses that cannot be
-/// retried (e.g. `Completed`) return an `InvalidJobTransition` error.
+/// Delete a job, reporting a missing job as `JobNotFound` instead of silently succeeding.
+async fn delete_job_action<T>(queue: &T, job_id: uuid::Uuid) -> hammerwork::Result<()>
+where
+    T: DatabaseQueue + Send + Sync,
+{
+    if queue.get_job(job_id).await?.is_none() {
+        return Err(hammerwork::HammerworkError::JobNotFound {
+            id: job_id.to_string(),
+        });
+    }
+    queue.delete_job(job_id).await
+}
+
+/// Re-run a job now: `Dead` and `TimedOut` jobs go through `retry_dead_job` (which also
+/// resets their attempts); other retryable statuses through `retry_job`. Statuses that
+/// cannot be retried (e.g. `Completed`) return an `InvalidJobTransition` error, and a
+/// missing job `JobNotFound`.
 async fn retry_job_action<T>(queue: &T, job_id: uuid::Uuid) -> hammerwork::Result<()>
 where
     T: DatabaseQueue + Send + Sync,
 {
-    match queue.get_job(job_id).await? {
-        Some(job) if job.status == hammerwork::JobStatus::Dead => {
+    let job =
+        queue
+            .get_job(job_id)
+            .await?
+            .ok_or_else(|| hammerwork::HammerworkError::JobNotFound {
+                id: job_id.to_string(),
+            })?;
+    match job.status {
+        hammerwork::JobStatus::Dead | hammerwork::JobStatus::TimedOut => {
             queue.retry_dead_job(job_id).await
         }
         _ => queue.retry_job(job_id, chrono::Utc::now()).await,
@@ -564,6 +633,13 @@ async fn bulk_job_action_handler<T>(
 where
     T: DatabaseQueue + Send + Sync,
 {
+    if !matches!(request.action.as_str(), "retry" | "delete") {
+        return Ok(error_reply(
+            StatusCode::BAD_REQUEST,
+            format!("Unknown action: {}", request.action),
+        ));
+    }
+
     let mut successful = 0;
     let mut failed = 0;
     let mut errors = Vec::new();
@@ -580,12 +656,7 @@ where
 
         let result = match request.action.as_str() {
             "retry" => retry_job_action(queue.as_ref(), job_uuid).await,
-            "delete" => queue.delete_job(job_uuid).await,
-            _ => {
-                failed += 1;
-                errors.push(format!("Unknown action: {}", request.action));
-                continue;
-            }
+            _ => delete_job_action(queue.as_ref(), job_uuid).await,
         };
 
         match result {
@@ -605,6 +676,17 @@ where
     }));
 
     Ok(json_reply(&response))
+}
+
+/// Whether `job` matches the lowercase search `term` (id, queue, payload, error, trace ids).
+fn job_matches_search(job: &hammerwork::Job, term: &str) -> bool {
+    job.id.to_string().contains(term)
+        || job.queue_name.to_lowercase().contains(term)
+        || payload_search_text(&job.payload).contains(term)
+        || [&job.error_message, &job.trace_id, &job.correlation_id]
+            .into_iter()
+            .flatten()
+            .any(|text| text.to_lowercase().contains(term))
 }
 
 /// Handler for searching jobs
@@ -639,49 +721,14 @@ where
     };
 
     for queue_name in &target_queues {
-        let mut queue_jobs = Vec::new();
+        // Search every source: ready, dead and recurring jobs
+        let queue_jobs = try_api!(
+            collect_jobs(queue.as_ref(), queue_name, true, true, true, 200).await,
+            "Failed to list jobs"
+        );
 
-        // Collect jobs from all sources for comprehensive search
-        queue_jobs.extend(try_api!(
-            queue.get_ready_jobs(queue_name, 200).await,
-            "Failed to get ready jobs"
-        ));
-
-        queue_jobs.extend(try_api!(
-            queue
-                .get_dead_jobs_by_queue(queue_name, Some(200), Some(0))
-                .await,
-            "Failed to get dead jobs"
-        ));
-
-        queue_jobs.extend(try_api!(
-            queue.get_recurring_jobs(queue_name).await,
-            "Failed to get recurring jobs"
-        ));
-
-        for job in queue_jobs {
-            // Check if job matches search criteria
-            let payload_str = payload_search_text(&job.payload);
-            let matches_search = job.id.to_string().contains(&search_term)
-                || job.queue_name.to_lowercase().contains(&search_term)
-                || payload_str.contains(&search_term)
-                || job
-                    .error_message
-                    .as_ref()
-                    .map(|e| e.to_lowercase().contains(&search_term))
-                    .unwrap_or(false)
-                || job
-                    .trace_id
-                    .as_ref()
-                    .map(|t| t.to_lowercase().contains(&search_term))
-                    .unwrap_or(false)
-                || job
-                    .correlation_id
-                    .as_ref()
-                    .map(|c| c.to_lowercase().contains(&search_term))
-                    .unwrap_or(false);
-
-            if !matches_search {
+        for job in &queue_jobs {
+            if !job_matches_search(job, &search_term) {
                 continue;
             }
 
@@ -696,10 +743,10 @@ where
 
             // Apply priority filter
             if let Some(ref priorities) = search_request.priorities {
-                let job_priority_str = format!("{:?}", job.priority);
+                let job_priority = job.priority.to_string();
                 if !priorities
                     .iter()
-                    .any(|p| p.eq_ignore_ascii_case(&job_priority_str))
+                    .any(|p| p.eq_ignore_ascii_case(&job_priority))
                 {
                     continue;
                 }
@@ -718,145 +765,17 @@ where
                 continue;
             }
 
-            let processing_time_ms = match (job.started_at, job.completed_at) {
-                (Some(started), Some(completed)) => Some((completed - started).num_milliseconds()),
-                _ => None,
-            };
-
-            matching_jobs.push(JobInfo {
-                id: job.id.to_string(),
-                queue_name: job.queue_name.clone(),
-                status: job.status.as_str().to_string(),
-                priority: format!("{:?}", job.priority),
-                attempts: job.attempts,
-                max_attempts: job.max_attempts,
-                payload: job.payload.clone(),
-                created_at: job.created_at,
-                scheduled_at: job.scheduled_at,
-                started_at: job.started_at,
-                completed_at: job.completed_at,
-                failed_at: job.failed_at,
-                error_message: job.error_message.clone(),
-                processing_time_ms,
-                cron_schedule: job.cron_schedule.as_ref().map(|c| c.to_string()),
-                is_recurring: job.is_recurring(),
-                trace_id: job.trace_id.clone(),
-                correlation_id: job.correlation_id.clone(),
-            });
-        }
-
-        // Also search recurring jobs
-        let recurring_jobs = try_api!(
-            queue.get_recurring_jobs(queue_name).await,
-            "Failed to get recurring jobs"
-        );
-
-        for job in recurring_jobs {
-            // Check if job matches search criteria
-            let payload_str = payload_search_text(&job.payload);
-            let matches_search = job.id.to_string().contains(&search_term)
-                || job.queue_name.to_lowercase().contains(&search_term)
-                || payload_str.contains(&search_term)
-                || job
-                    .error_message
-                    .as_ref()
-                    .map(|e| e.to_lowercase().contains(&search_term))
-                    .unwrap_or(false)
-                || job
-                    .trace_id
-                    .as_ref()
-                    .map(|t| t.to_lowercase().contains(&search_term))
-                    .unwrap_or(false)
-                || job
-                    .correlation_id
-                    .as_ref()
-                    .map(|c| c.to_lowercase().contains(&search_term))
-                    .unwrap_or(false);
-
-            if !matches_search {
-                continue;
-            }
-
-            // Apply additional filters
-            if let Some(ref statuses) = search_request.statuses
-                && !statuses
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(job.status.as_str()))
-            {
-                continue;
-            }
-
-            if let Some(ref priorities) = search_request.priorities {
-                let job_priority_str = format!("{:?}", job.priority);
-                if !priorities
-                    .iter()
-                    .any(|p| p.eq_ignore_ascii_case(&job_priority_str))
-                {
-                    continue;
-                }
-            }
-
-            if let Some(ref created_after) = search_request.created_after
-                && job.created_at < *created_after
-            {
-                continue;
-            }
-
-            if let Some(ref created_before) = search_request.created_before
-                && job.created_at > *created_before
-            {
-                continue;
-            }
-
-            let processing_time_ms = match (job.started_at, job.completed_at) {
-                (Some(started), Some(completed)) => Some((completed - started).num_milliseconds()),
-                _ => None,
-            };
-
-            matching_jobs.push(JobInfo {
-                id: job.id.to_string(),
-                queue_name: job.queue_name.clone(),
-                status: job.status.as_str().to_string(),
-                priority: format!("{:?}", job.priority),
-                attempts: job.attempts,
-                max_attempts: job.max_attempts,
-                payload: job.payload.clone(),
-                created_at: job.created_at,
-                scheduled_at: job.scheduled_at,
-                started_at: job.started_at,
-                completed_at: job.completed_at,
-                failed_at: job.failed_at,
-                error_message: job.error_message.clone(),
-                processing_time_ms,
-                cron_schedule: job.cron_schedule.as_ref().map(|c| c.to_string()),
-                is_recurring: job.is_recurring(),
-                trace_id: job.trace_id.clone(),
-                correlation_id: job.correlation_id.clone(),
-            });
+            matching_jobs.push(job_info(job));
         }
     }
 
     // Sort by created_at desc by default
     matching_jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
 
-    // Apply pagination
-    let total_count = matching_jobs.len() as u64;
-    let page_size = pagination.limit.unwrap_or(20).min(100) as usize;
-    let page = pagination.page.unwrap_or(1).max(1) as usize;
-    let offset = (page - 1) * page_size;
-
-    let paginated_jobs: Vec<JobInfo> = matching_jobs
-        .into_iter()
-        .skip(offset)
-        .take(page_size)
-        .collect();
-
-    let response = PaginatedResponse {
-        items: paginated_jobs,
-        pagination: PaginationMeta::new(&pagination, total_count),
-    };
-
-    Ok(json_reply(&ApiResponse::success(response)))
+    Ok(json_reply(&ApiResponse::success(paginate(
+        matching_jobs,
+        &pagination,
+    ))))
 }
 
 /// Lowercased text of a job payload used for substring search.

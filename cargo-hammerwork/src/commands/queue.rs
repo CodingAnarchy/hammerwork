@@ -1,14 +1,18 @@
 use anyhow::Result;
 use clap::Subcommand;
+use hammerwork::JobQueue;
+use hammerwork::queue::DatabaseQueue;
 use sqlx::Row;
 use tracing::info;
 
 use crate::commands::job::priority_display;
 use crate::commands::monitor::build_status_counts_query;
 use crate::config::Config;
-use crate::utils::database::DatabasePool;
+use crate::utils::database::{DatabasePool, JobQueueWrapper};
 use crate::utils::display::StatsTable;
-use crate::utils::sql::{Backend, Bind, IntervalUnit, SqlParams, bind_mysql, bind_pg, fetch_i64};
+use crate::utils::sql::{
+    Backend, Bind, IntervalUnit, SqlParams, bind_mysql, bind_pg, execute_binds, fetch_i64,
+};
 
 #[derive(Subcommand)]
 pub enum QueueCommand {
@@ -123,23 +127,85 @@ impl QueueCommand {
     }
 }
 
-async fn list_queues(pool: DatabasePool) -> Result<()> {
-    let query = r#"
-        SELECT 
-            j.queue_name,
-            COUNT(j.id) as total_jobs,
-            COUNT(CASE WHEN j.status = 'Pending' THEN 1 END) as pending,
-            COUNT(CASE WHEN j.status = 'Running' THEN 1 END) as running,
-            COUNT(CASE WHEN j.status = 'Completed' THEN 1 END) as completed,
-            COUNT(CASE WHEN j.status = 'Failed' THEN 1 END) as failed,
-            COUNT(CASE WHEN j.status = 'Dead' THEN 1 END) as dead,
-            CASE WHEN p.queue_name IS NOT NULL THEN true ELSE false END as is_paused
-        FROM hammerwork_jobs j
-        LEFT JOIN hammerwork_queue_pause p ON j.queue_name = p.queue_name
-        GROUP BY j.queue_name, p.queue_name
-        ORDER BY j.queue_name
-    "#;
+/// One row of `queue list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueSummary {
+    pub name: String,
+    pub total: i64,
+    pub pending: i64,
+    pub running: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub dead: i64,
+    pub paused: bool,
+}
 
+const QUEUE_SUMMARY_SQL: &str = r#"
+    SELECT
+        queue_name,
+        COUNT(id) as total_jobs,
+        COUNT(CASE WHEN status = 'Pending' THEN 1 END) as pending,
+        COUNT(CASE WHEN status = 'Running' THEN 1 END) as running,
+        COUNT(CASE WHEN status = 'Completed' THEN 1 END) as completed,
+        COUNT(CASE WHEN status = 'Failed' THEN 1 END) as failed,
+        COUNT(CASE WHEN status = 'Dead' THEN 1 END) as dead
+    FROM hammerwork_jobs
+    GROUP BY queue_name
+    ORDER BY queue_name
+"#;
+
+/// Job counts per queue, plus paused queues that currently hold no jobs. Sorted by name.
+pub async fn fetch_queue_summaries(pool: &DatabasePool) -> Result<Vec<QueueSummary>> {
+    macro_rules! summaries {
+        ($rows:expr) => {{
+            let mut out = Vec::new();
+            for row in $rows {
+                out.push(QueueSummary {
+                    name: row.try_get("queue_name")?,
+                    total: row.try_get("total_jobs")?,
+                    pending: row.try_get("pending")?,
+                    running: row.try_get("running")?,
+                    completed: row.try_get("completed")?,
+                    failed: row.try_get("failed")?,
+                    dead: row.try_get("dead")?,
+                    paused: false,
+                });
+            }
+            out
+        }};
+    }
+    let (mut summaries, paused) = match pool {
+        DatabasePool::Postgres(pg) => {
+            let rows = sqlx::query(QUEUE_SUMMARY_SQL).fetch_all(pg).await?;
+            let paused = JobQueue::new(pg.clone()).get_paused_queues().await?;
+            (summaries!(rows), paused)
+        }
+        DatabasePool::MySQL(my) => {
+            let rows = sqlx::query(QUEUE_SUMMARY_SQL).fetch_all(my).await?;
+            let paused = JobQueue::new(my.clone()).get_paused_queues().await?;
+            (summaries!(rows), paused)
+        }
+    };
+    for info in paused {
+        match summaries.iter_mut().find(|s| s.name == info.queue_name) {
+            Some(summary) => summary.paused = true,
+            None => summaries.push(QueueSummary {
+                name: info.queue_name,
+                total: 0,
+                pending: 0,
+                running: 0,
+                completed: 0,
+                failed: 0,
+                dead: 0,
+                paused: true,
+            }),
+        }
+    }
+    summaries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(summaries)
+}
+
+fn render_queue_summaries(summaries: &[QueueSummary]) -> String {
     let mut table = comfy_table::Table::new();
     table.set_header(vec![
         "Queue",
@@ -151,72 +217,30 @@ async fn list_queues(pool: DatabasePool) -> Result<()> {
         "Failed",
         "Dead",
     ]);
-
-    match pool {
-        DatabasePool::Postgres(pg_pool) => {
-            let rows = sqlx::query(query).fetch_all(&pg_pool).await?;
-            for row in rows {
-                let queue_name: String = row.try_get("queue_name")?;
-                let total: i64 = row.try_get("total_jobs")?;
-                let pending: i64 = row.try_get("pending")?;
-                let running: i64 = row.try_get("running")?;
-                let completed: i64 = row.try_get("completed")?;
-                let failed: i64 = row.try_get("failed")?;
-                let dead: i64 = row.try_get("dead")?;
-                let is_paused: bool = row.try_get("is_paused")?;
-
-                let status = if is_paused {
-                    "⏸️ Paused"
-                } else {
-                    "▶️ Active"
-                };
-
-                table.add_row(vec![
-                    queue_name,
-                    status.to_string(),
-                    total.to_string(),
-                    pending.to_string(),
-                    running.to_string(),
-                    completed.to_string(),
-                    failed.to_string(),
-                    dead.to_string(),
-                ]);
+    for s in summaries {
+        table.add_row(vec![
+            s.name.clone(),
+            if s.paused {
+                "⏸️ Paused"
+            } else {
+                "▶️ Active"
             }
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            let rows = sqlx::query(query).fetch_all(&mysql_pool).await?;
-            for row in rows {
-                let queue_name: String = row.try_get("queue_name")?;
-                let total: i64 = row.try_get("total_jobs")?;
-                let pending: i64 = row.try_get("pending")?;
-                let running: i64 = row.try_get("running")?;
-                let completed: i64 = row.try_get("completed")?;
-                let failed: i64 = row.try_get("failed")?;
-                let dead: i64 = row.try_get("dead")?;
-                let is_paused: bool = row.try_get("is_paused")?;
-
-                let status = if is_paused {
-                    "⏸️ Paused"
-                } else {
-                    "▶️ Active"
-                };
-
-                table.add_row(vec![
-                    queue_name,
-                    status.to_string(),
-                    total.to_string(),
-                    pending.to_string(),
-                    running.to_string(),
-                    completed.to_string(),
-                    failed.to_string(),
-                    dead.to_string(),
-                ]);
-            }
-        }
+            .to_string(),
+            s.total.to_string(),
+            s.pending.to_string(),
+            s.running.to_string(),
+            s.completed.to_string(),
+            s.failed.to_string(),
+            s.dead.to_string(),
+        ]);
     }
+    table.to_string()
+}
 
+async fn list_queues(pool: DatabasePool) -> Result<()> {
+    let summaries = fetch_queue_summaries(&pool).await?;
     println!("📋 Queue Overview");
-    println!("{}", table);
+    println!("{}", render_queue_summaries(&summaries));
     Ok(())
 }
 
@@ -416,133 +440,63 @@ async fn clear_queue(
     queue: &str,
     pending_only: bool,
     confirm: bool,
-) -> Result<()> {
+) -> Result<u64> {
     if !confirm {
         println!(
             "⚠️  This will permanently delete jobs from queue '{}'. Use --confirm to proceed.",
             queue
         );
-        return Ok(());
+        return Ok(0);
     }
 
-    let condition = if pending_only {
-        " AND status = 'Pending'"
-    } else {
-        ""
-    };
-
-    let affected = match pool {
-        DatabasePool::Postgres(ref pg_pool) => {
-            let query = format!(
-                "DELETE FROM hammerwork_jobs WHERE queue_name = $1{}",
-                condition
-            );
-            let result = sqlx::query(&query).bind(queue).execute(pg_pool).await?;
-            result.rows_affected()
-        }
-        DatabasePool::MySQL(ref mysql_pool) => {
-            let query = format!(
-                "DELETE FROM hammerwork_jobs WHERE queue_name = ?{}",
-                condition
-            );
-            let result = sqlx::query(&query).bind(queue).execute(mysql_pool).await?;
-            result.rows_affected()
-        }
-    };
+    let mut params = SqlParams::new(pool.backend());
+    let mut sql = format!(
+        "DELETE FROM hammerwork_jobs WHERE queue_name = {}",
+        params.text(queue)
+    );
+    if pending_only {
+        sql.push_str(" AND status = 'Pending'");
+    }
+    let affected = execute_binds(&pool, &sql, params.binds()).await?;
 
     let job_type = if pending_only { "pending" } else { "all" };
-    info!(
+    println!(
         "✅ Cleared {} {} jobs from queue '{}'",
         affected, job_type, queue
     );
-    Ok(())
+    Ok(affected)
 }
 
 async fn pause_queue(pool: DatabasePool, queue: &str) -> Result<()> {
-    match pool {
-        DatabasePool::Postgres(pg_pool) => {
-            let result = sqlx::query(
-                r#"
-                INSERT INTO hammerwork_queue_pause (queue_name, paused_by, paused_at, created_at, updated_at)
-                VALUES ($1, $2, NOW(), NOW(), NOW())
-                ON CONFLICT (queue_name) 
-                DO UPDATE SET 
-                    paused_by = EXCLUDED.paused_by,
-                    paused_at = NOW(),
-                    updated_at = NOW()
-                "#,
-            )
-            .bind(queue)
-            .bind("cli")
-            .execute(&pg_pool)
-            .await?;
-
-            if result.rows_affected() > 0 {
-                println!("⏸️  Queue '{}' has been paused", queue);
-                info!("Queue '{}' has been paused via CLI", queue);
-            } else {
-                println!("⚠️  Failed to pause queue '{}'", queue);
-            }
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            let result = sqlx::query(
-                r#"
-                INSERT INTO hammerwork_queue_pause (queue_name, paused_by, paused_at, created_at, updated_at)
-                VALUES (?, ?, NOW(), NOW(), NOW())
-                ON DUPLICATE KEY UPDATE 
-                    paused_by = VALUES(paused_by),
-                    paused_at = NOW(),
-                    updated_at = NOW()
-                "#,
-            )
-            .bind(queue)
-            .bind("cli")
-            .execute(&mysql_pool)
-            .await?;
-
-            if result.rows_affected() > 0 {
-                println!("⏸️  Queue '{}' has been paused", queue);
-                info!("Queue '{}' has been paused via CLI", queue);
-            } else {
-                println!("⚠️  Failed to pause queue '{}'", queue);
-            }
-        }
+    match pool.create_job_queue() {
+        JobQueueWrapper::Postgres(q) => q.pause_queue(queue, Some("cli")).await?,
+        JobQueueWrapper::MySQL(q) => q.pause_queue(queue, Some("cli")).await?,
     }
-
+    println!("⏸️  Queue '{}' has been paused", queue);
+    info!("Queue '{}' has been paused via CLI", queue);
     Ok(())
 }
 
 async fn resume_queue(pool: DatabasePool, queue: &str) -> Result<()> {
-    match pool {
-        DatabasePool::Postgres(pg_pool) => {
-            let result = sqlx::query("DELETE FROM hammerwork_queue_pause WHERE queue_name = $1")
-                .bind(queue)
-                .execute(&pg_pool)
-                .await?;
-
-            if result.rows_affected() > 0 {
-                println!("▶️  Queue '{}' has been resumed", queue);
-                info!("Queue '{}' has been resumed via CLI", queue);
-            } else {
-                println!("ℹ️  Queue '{}' was not paused", queue);
-            }
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            let result = sqlx::query("DELETE FROM hammerwork_queue_pause WHERE queue_name = ?")
-                .bind(queue)
-                .execute(&mysql_pool)
-                .await?;
-
-            if result.rows_affected() > 0 {
-                println!("▶️  Queue '{}' has been resumed", queue);
-                info!("Queue '{}' has been resumed via CLI", queue);
-            } else {
-                println!("ℹ️  Queue '{}' was not paused", queue);
-            }
-        }
+    let was_paused = match pool.create_job_queue() {
+        JobQueueWrapper::Postgres(q) => resume_if_paused(&q, queue).await?,
+        JobQueueWrapper::MySQL(q) => resume_if_paused(&q, queue).await?,
+    };
+    if was_paused {
+        println!("▶️  Queue '{}' has been resumed", queue);
+        info!("Queue '{}' has been resumed via CLI", queue);
+    } else {
+        println!("ℹ️  Queue '{}' was not paused", queue);
     }
-
     Ok(())
+}
+
+async fn resume_if_paused<Q: DatabaseQueue>(queue: &Q, name: &str) -> Result<bool> {
+    if !queue.is_queue_paused(name).await? {
+        return Ok(false);
+    }
+    queue.resume_queue(name, Some("cli")).await?;
+    Ok(true)
 }
 
 async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<()> {
@@ -609,64 +563,25 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
 }
 
 async fn list_paused_queues(pool: DatabasePool) -> Result<()> {
-    let query = r#"
-        SELECT 
-            queue_name,
-            paused_at,
-            paused_by,
-            reason
-        FROM hammerwork_queue_pause 
-        ORDER BY paused_at DESC
-    "#;
+    let paused = match pool.create_job_queue() {
+        JobQueueWrapper::Postgres(q) => q.get_paused_queues().await?,
+        JobQueueWrapper::MySQL(q) => q.get_paused_queues().await?,
+    };
+
+    if paused.is_empty() {
+        println!("✅ No paused queues found - all queues are active");
+        return Ok(());
+    }
 
     let mut table = comfy_table::Table::new();
     table.set_header(vec!["Queue Name", "Paused At", "Paused By", "Reason"]);
-
-    match pool {
-        DatabasePool::Postgres(pg_pool) => {
-            let rows = sqlx::query(query).fetch_all(&pg_pool).await?;
-
-            if rows.is_empty() {
-                println!("✅ No paused queues found - all queues are active");
-                return Ok(());
-            }
-
-            for row in rows {
-                let queue_name: String = row.try_get("queue_name")?;
-                let paused_at: chrono::DateTime<chrono::Utc> = row.try_get("paused_at")?;
-                let paused_by: Option<String> = row.try_get("paused_by")?;
-                let reason: Option<String> = row.try_get("reason")?;
-
-                table.add_row(vec![
-                    queue_name,
-                    paused_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-                    paused_by.unwrap_or_else(|| "Unknown".to_string()),
-                    reason.unwrap_or_else(|| "-".to_string()),
-                ]);
-            }
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            let rows = sqlx::query(query).fetch_all(&mysql_pool).await?;
-
-            if rows.is_empty() {
-                println!("✅ No paused queues found - all queues are active");
-                return Ok(());
-            }
-
-            for row in rows {
-                let queue_name: String = row.try_get("queue_name")?;
-                let paused_at: chrono::DateTime<chrono::Utc> = row.try_get("paused_at")?;
-                let paused_by: Option<String> = row.try_get("paused_by")?;
-                let reason: Option<String> = row.try_get("reason")?;
-
-                table.add_row(vec![
-                    queue_name,
-                    paused_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-                    paused_by.unwrap_or_else(|| "Unknown".to_string()),
-                    reason.unwrap_or_else(|| "-".to_string()),
-                ]);
-            }
-        }
+    for info in paused {
+        table.add_row(vec![
+            info.queue_name,
+            info.paused_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            info.paused_by.unwrap_or_else(|| "Unknown".to_string()),
+            info.reason.unwrap_or_else(|| "-".to_string()),
+        ]);
     }
 
     println!("⏸️  Paused Queues");
@@ -718,7 +633,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE queue_name = ? AND status = 'Running' AND started_at < DATE_SUB(NOW(), INTERVAL ? HOUR)"
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE queue_name = ? AND status = 'Running' AND started_at < DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? HOUR)"
         );
         assert_eq!(binds.len(), 2);
 
@@ -785,5 +700,286 @@ mod tests {
     #[ignore = "requires MYSQL_DATABASE_URL"]
     async fn test_queue_stats_and_health_are_injection_safe_mysql() {
         queue_roundtrip(mysql_pool().await).await;
+    }
+
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: QueueCommand,
+    }
+
+    fn parse(args: &[&str]) -> QueueCommand {
+        let mut argv = vec!["test"];
+        argv.extend_from_slice(args);
+        TestCli::try_parse_from(argv).unwrap().command
+    }
+
+    #[test]
+    fn parses_every_subcommand_with_its_flags() {
+        assert!(matches!(
+            parse(&["list", "-d", "u"]),
+            QueueCommand::List { database_url: Some(u) } if u == "u"
+        ));
+        match parse(&["stats", "-n", "q", "--detailed"]) {
+            QueueCommand::Stats {
+                queue, detailed, ..
+            } => {
+                assert_eq!(queue.as_deref(), Some("q"));
+                assert!(detailed);
+            }
+            _ => panic!("expected Stats"),
+        }
+        match parse(&["clear", "-n", "q", "--pending-only", "--confirm"]) {
+            QueueCommand::Clear {
+                queue,
+                pending_only,
+                confirm,
+                ..
+            } => assert_eq!((queue.as_str(), pending_only, confirm), ("q", true, true)),
+            _ => panic!("expected Clear"),
+        }
+        assert!(matches!(
+            parse(&["pause", "-n", "q"]),
+            QueueCommand::Pause { queue, .. } if queue == "q"
+        ));
+        assert!(matches!(
+            parse(&["resume", "--queue", "q"]),
+            QueueCommand::Resume { queue, .. } if queue == "q"
+        ));
+        assert!(matches!(parse(&["paused"]), QueueCommand::Paused { .. }));
+        assert!(matches!(
+            parse(&["health", "-n", "q"]),
+            QueueCommand::Health { queue: Some(q), .. } if q == "q"
+        ));
+        // clear/pause/resume require a queue
+        assert!(TestCli::try_parse_from(["test", "clear"]).is_err());
+        assert!(TestCli::try_parse_from(["test", "pause"]).is_err());
+    }
+
+    #[test]
+    fn database_url_comes_from_the_flag_then_the_config() {
+        let config = config_for("postgres://config/db");
+        assert_eq!(
+            parse(&["paused"]).get_database_url(&config).unwrap(),
+            "postgres://config/db"
+        );
+        assert_eq!(
+            parse(&["health", "-d", "mysql://flag/db"])
+                .get_database_url(&config)
+                .unwrap(),
+            "mysql://flag/db"
+        );
+        assert!(
+            parse(&["list"])
+                .get_database_url(&Config::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn summaries_render_status_and_counts() {
+        let rendered = render_queue_summaries(&[
+            QueueSummary {
+                name: "alpha".into(),
+                total: 12,
+                pending: 5,
+                running: 4,
+                completed: 3,
+                failed: 2,
+                dead: 1,
+                paused: false,
+            },
+            QueueSummary {
+                name: "beta".into(),
+                total: 0,
+                pending: 0,
+                running: 0,
+                completed: 0,
+                failed: 0,
+                dead: 0,
+                paused: true,
+            },
+        ]);
+        assert!(rendered.contains("alpha") && rendered.contains("▶️ Active"));
+        assert!(rendered.contains("beta") && rendered.contains("⏸️ Paused"));
+        assert!(rendered.contains("12"));
+        for header in [
+            "Queue",
+            "Status",
+            "Pending",
+            "Running",
+            "Completed",
+            "Failed",
+            "Dead",
+        ] {
+            assert!(rendered.contains(header), "{header}");
+        }
+    }
+
+    async fn queue_commands(url: String) {
+        let config = config_for(&url);
+        let pool = DatabasePool::connect(&url, 2).await.unwrap();
+        let queue = hostile_queue();
+        let empty = unique_queue("paused_empty");
+        let run = |cmd: QueueCommand| {
+            let config = config.clone();
+            async move { cmd.execute(&config).await }
+        };
+        let q_arg = |queue: &str| queue.to_string();
+
+        for status in ["Pending", "Pending", "Failed", "Completed"] {
+            seed(&pool, &SeedJob::new(&queue, status)).await;
+        }
+        let mut running = SeedJob::new(&queue, "Running");
+        running.started_long_ago = true;
+        seed(&pool, &running).await;
+
+        // list: counts per queue, and a paused queue without jobs still shows up
+        let summaries = fetch_queue_summaries(&pool).await.unwrap();
+        let mine = summaries.iter().find(|s| s.name == queue).unwrap();
+        assert_eq!(
+            (
+                mine.total,
+                mine.pending,
+                mine.running,
+                mine.completed,
+                mine.failed,
+                mine.dead
+            ),
+            (5, 2, 1, 1, 1, 0)
+        );
+        assert!(!mine.paused);
+        run(QueueCommand::List { database_url: None })
+            .await
+            .unwrap();
+
+        // pause records who paused it; resume of an active queue is a no-op message
+        run(QueueCommand::Pause {
+            database_url: None,
+            queue: q_arg(&queue),
+        })
+        .await
+        .unwrap();
+        run(QueueCommand::Pause {
+            database_url: None,
+            queue: q_arg(&empty),
+        })
+        .await
+        .unwrap();
+        let library = pool.clone().create_job_queue();
+        let info = match &library {
+            JobQueueWrapper::Postgres(q) => q.get_queue_pause_info(&queue).await.unwrap(),
+            JobQueueWrapper::MySQL(q) => q.get_queue_pause_info(&queue).await.unwrap(),
+        }
+        .expect("queue is paused");
+        assert_eq!(info.paused_by.as_deref(), Some("cli"));
+        let summaries = fetch_queue_summaries(&pool).await.unwrap();
+        assert!(summaries.iter().find(|s| s.name == queue).unwrap().paused);
+        let empty_row = summaries.iter().find(|s| s.name == empty).unwrap();
+        assert!(empty_row.paused && empty_row.total == 0);
+        // pausing twice just refreshes the row
+        run(QueueCommand::Pause {
+            database_url: None,
+            queue: q_arg(&queue),
+        })
+        .await
+        .unwrap();
+        run(QueueCommand::Paused { database_url: None })
+            .await
+            .unwrap();
+
+        run(QueueCommand::Resume {
+            database_url: None,
+            queue: q_arg(&queue),
+        })
+        .await
+        .unwrap();
+        run(QueueCommand::Resume {
+            database_url: None,
+            queue: q_arg(&queue),
+        })
+        .await
+        .unwrap(); // already active
+        let still_paused = match &library {
+            JobQueueWrapper::Postgres(q) => q.is_queue_paused(&queue).await.unwrap(),
+            JobQueueWrapper::MySQL(q) => q.is_queue_paused(&queue).await.unwrap(),
+        };
+        assert!(!still_paused);
+        run(QueueCommand::Resume {
+            database_url: None,
+            queue: q_arg(&empty),
+        })
+        .await
+        .unwrap();
+
+        // stats and health, with and without a queue filter
+        for (queue_filter, detailed) in [
+            (Some(&queue), false),
+            (Some(&queue), true),
+            (None, false),
+            (None, true),
+        ] {
+            run(QueueCommand::Stats {
+                database_url: None,
+                queue: queue_filter.cloned(),
+                detailed,
+            })
+            .await
+            .unwrap();
+        }
+        run(QueueCommand::Health {
+            database_url: None,
+            queue: Some(queue.clone()),
+        })
+        .await
+        .unwrap();
+        run(QueueCommand::Health {
+            database_url: None,
+            queue: None,
+        })
+        .await
+        .unwrap();
+
+        // clear refuses without --confirm, --pending-only keeps other statuses
+        let clear = |pending_only: bool, confirm: bool| QueueCommand::Clear {
+            database_url: None,
+            queue: queue.clone(),
+            pending_only,
+            confirm,
+        };
+        run(clear(false, false)).await.unwrap();
+        assert_eq!(count_jobs(&pool, &queue, None).await, 5);
+        run(clear(true, true)).await.unwrap();
+        assert_eq!(count_jobs(&pool, &queue, None).await, 3);
+        assert_eq!(count_jobs(&pool, &queue, Some("Pending")).await, 0);
+        run(clear(false, true)).await.unwrap();
+        assert_eq!(count_jobs(&pool, &queue, None).await, 0);
+        assert!(table_exists(&pool).await);
+        cleanup(&pool, &[&queue, &empty]).await;
+    }
+
+    db_tests!(
+        queue_commands,
+        test_queue_commands_postgres,
+        test_queue_commands_mysql
+    );
+
+    #[tokio::test]
+    async fn missing_database_url_is_reported_before_connecting() {
+        let err = parse(&["list"])
+            .execute(&Config::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Database URL is required"));
+        let err = parse(&["list", "-d", "sqlite://x"])
+            .execute(&Config::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported database URL"),
+            "{err}"
+        );
     }
 }

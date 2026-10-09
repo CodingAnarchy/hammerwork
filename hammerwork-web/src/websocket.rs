@@ -52,12 +52,57 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use warp::ws::Message;
 
+/// The event types a client can subscribe to.
+pub const EVENT_TYPES: [&str; 4] = [
+    "queue_updates",
+    "job_updates",
+    "system_alerts",
+    "archive_events",
+];
+
+/// What a connection wants to receive. A new connection receives every event until it
+/// sends its first `Subscribe` or `Unsubscribe`.
+#[derive(Debug)]
+struct Subscription {
+    all: bool,
+    types: std::collections::HashSet<String>,
+}
+
+impl Subscription {
+    fn everything() -> Self {
+        Self {
+            all: true,
+            types: std::collections::HashSet::new(),
+        }
+    }
+
+    fn wants(&self, event_type: &str) -> bool {
+        self.all || self.types.contains(event_type)
+    }
+
+    fn subscribe(&mut self, event_types: Vec<String>) {
+        // The first explicit choice replaces the default of "everything".
+        self.all = false;
+        self.types.extend(event_types);
+    }
+
+    fn unsubscribe(&mut self, event_types: &[String]) {
+        if self.all {
+            self.all = false;
+            self.types = EVENT_TYPES.iter().map(|t| t.to_string()).collect();
+        }
+        for event_type in event_types {
+            self.types.remove(event_type);
+        }
+    }
+}
+
 /// WebSocket connection state manager
 #[derive(Debug)]
 pub struct WebSocketState {
     config: WebSocketConfig,
     connections: HashMap<Uuid, mpsc::UnboundedSender<Message>>,
-    subscriptions: HashMap<Uuid, std::collections::HashSet<String>>,
+    subscriptions: HashMap<Uuid, Subscription>,
     broadcast_sender: mpsc::UnboundedSender<BroadcastMessage>,
     broadcast_receiver: Option<mpsc::UnboundedReceiver<BroadcastMessage>>,
 }
@@ -75,30 +120,40 @@ impl WebSocketState {
         }
     }
 
-    /// Handle a new WebSocket connection
-    pub async fn handle_connection(&mut self, websocket: warp::ws::WebSocket) -> crate::Result<()> {
+    /// Serve one WebSocket connection until it closes.
+    ///
+    /// The shared `state` is only locked for the short moments that register the connection,
+    /// handle a client message and unregister it, never while waiting for the client: a
+    /// connection that held the lock for its whole lifetime would block every other connection,
+    /// the ping task and the broadcast listener.
+    pub async fn serve_connection(
+        state: Arc<tokio::sync::RwLock<WebSocketState>>,
+        websocket: warp::ws::WebSocket,
+    ) -> crate::Result<()> {
         let connection_id = Uuid::new_v4();
-
-        if self.connections.len() >= self.config.max_connections {
-            warn!("Maximum WebSocket connections reached, rejecting new connection");
-            return Ok(());
-        }
-
         let (mut ws_sender, mut ws_receiver) = websocket.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
-        // Store the connection
-        self.connections.insert(connection_id, tx);
+        {
+            let mut guard = state.write().await;
+            if guard.connections.len() >= guard.config.max_connections {
+                warn!("Maximum WebSocket connections reached, rejecting new connection");
+                return Ok(());
+            }
+            guard.connections.insert(connection_id, tx);
+            guard
+                .subscriptions
+                .insert(connection_id, Subscription::everything());
+        }
         info!("WebSocket connection established: {}", connection_id);
 
         // Spawn task to handle outgoing messages to this client
-        let connection_id_clone = connection_id;
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 if let Err(e) = ws_sender.send(message).await {
                     debug!(
                         "Failed to send WebSocket message to {}: {}",
-                        connection_id_clone, e
+                        connection_id, e
                     );
                     break;
                 }
@@ -106,19 +161,22 @@ impl WebSocketState {
         });
 
         // Handle incoming messages from this client
-        let broadcast_sender = self.broadcast_sender.clone();
-
         while let Some(result) = ws_receiver.next().await {
             match result {
                 Ok(message) => {
-                    if let Err(e) = self
-                        .handle_client_message(connection_id, message, &broadcast_sender)
-                        .await
-                    {
+                    let close = message.is_close();
+                    let outcome = {
+                        let mut guard = state.write().await;
+                        guard.handle_client_message(connection_id, message).await
+                    };
+                    if let Err(e) = outcome {
                         error!(
                             "Error handling client message from {}: {}",
                             connection_id, e
                         );
+                        break;
+                    }
+                    if close {
                         break;
                     }
                 }
@@ -130,8 +188,12 @@ impl WebSocketState {
         }
 
         // Clean up connection and subscriptions
-        self.connections.remove(&connection_id);
-        self.subscriptions.remove(&connection_id);
+        {
+            let mut guard = state.write().await;
+            guard.connections.remove(&connection_id);
+            guard.subscriptions.remove(&connection_id);
+        }
+        writer.abort();
         info!("WebSocket connection closed: {}", connection_id);
 
         Ok(())
@@ -142,7 +204,6 @@ impl WebSocketState {
         &mut self,
         connection_id: Uuid,
         message: Message,
-        _broadcast_sender: &mpsc::UnboundedSender<BroadcastMessage>,
     ) -> crate::Result<()> {
         if message.is_text() {
             if let Ok(text) = message.to_str() {
@@ -187,31 +248,27 @@ impl WebSocketState {
                     "Client {} subscribed to events: {:?}",
                     connection_id, event_types
                 );
-                // Store subscription preferences per connection
-                let subscription_set = self.subscriptions.entry(connection_id).or_default();
-                for event_type in event_types {
-                    subscription_set.insert(event_type);
-                }
+                self.subscriptions
+                    .entry(connection_id)
+                    .or_insert_with(Subscription::everything)
+                    .subscribe(event_types);
             }
             ClientMessage::Unsubscribe { event_types } => {
                 info!(
                     "Client {} unsubscribed from events: {:?}",
                     connection_id, event_types
                 );
-                // Update subscription preferences
-                if let Some(subscription_set) = self.subscriptions.get_mut(&connection_id) {
-                    for event_type in event_types {
-                        subscription_set.remove(&event_type);
-                    }
-                    // Remove empty subscription sets
-                    if subscription_set.is_empty() {
-                        self.subscriptions.remove(&connection_id);
-                    }
-                }
+                self.subscriptions
+                    .entry(connection_id)
+                    .or_insert_with(Subscription::everything)
+                    .unsubscribe(&event_types);
             }
             ClientMessage::Ping => {
-                // Client ping - we'll send a pong back via broadcast
-                self.broadcast_to_all(ServerMessage::Pong).await?;
+                // Answer the client that asked, not everyone.
+                if let Some(sender) = self.connections.get(&connection_id) {
+                    let pong = Message::text(serde_json::to_string(&ServerMessage::Pong)?);
+                    let _ = sender.send(pong);
+                }
             }
         }
 
@@ -223,22 +280,16 @@ impl WebSocketState {
         let json_message = serde_json::to_string(&message)?;
         let ws_message = Message::text(json_message);
 
-        let mut disconnected = Vec::new();
-
-        for (&connection_id, sender) in &self.connections {
-            if sender.send(ws_message.clone()).is_err() {
-                disconnected.push(connection_id);
-            }
+        // A closed channel belongs to a connection that is shutting down; its handler
+        // removes it, so a failed send is not an error here.
+        for sender in self.connections.values() {
+            let _ = sender.send(ws_message.clone());
         }
-
-        // Clean up disconnected clients
-        // Note: In a real implementation, we'd need mutable access to self.connections
-        // This would be handled by the connection cleanup in handle_connection
 
         Ok(())
     }
 
-    /// Broadcast a message to subscribed clients only
+    /// Broadcast a message to the clients subscribed to `event_type`
     pub async fn broadcast_to_subscribed(
         &self,
         message: ServerMessage,
@@ -247,15 +298,13 @@ impl WebSocketState {
         let json_message = serde_json::to_string(&message)?;
         let ws_message = Message::text(json_message);
 
-        let mut disconnected = Vec::new();
-
-        for (&connection_id, sender) in &self.connections {
-            // Check if this connection is subscribed to this event type
-            if let Some(subscription_set) = self.subscriptions.get(&connection_id)
-                && subscription_set.contains(event_type)
-                && sender.send(ws_message.clone()).is_err()
-            {
-                disconnected.push(connection_id);
+        for (connection_id, sender) in &self.connections {
+            let wanted = self
+                .subscriptions
+                .get(connection_id)
+                .is_none_or(|subscription| subscription.wants(event_type));
+            if wanted {
+                let _ = sender.send(ws_message.clone());
             }
         }
 
@@ -619,5 +668,522 @@ mod tests {
         let message = ServerMessage::Pong;
         let result = state.broadcast_to_all(message).await;
         assert!(result.is_ok());
+    }
+
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+    use warp::Filter;
+
+    type Shared = Arc<RwLock<WebSocketState>>;
+
+    fn ws_route(
+        state: Shared,
+    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
+        warp::path("ws")
+            .and(warp::ws())
+            .and(warp::any().map(move || state.clone()))
+            .map(|ws: warp::ws::Ws, state: Shared| {
+                ws.on_upgrade(move |socket| async move {
+                    let _ = WebSocketState::serve_connection(state, socket).await;
+                })
+            })
+    }
+
+    async fn connect(
+        route: &(
+             impl Filter<Extract = (impl warp::Reply + 'static,), Error = warp::Rejection>
+             + Clone
+             + Send
+             + Sync
+             + 'static
+         ),
+    ) -> warp::test::WsClient {
+        warp::test::ws()
+            .path("/ws")
+            .handshake(route.clone())
+            .await
+            .expect("handshake")
+    }
+
+    async fn wait_for_connections(state: &Shared, expected: usize) {
+        for _ in 0..200 {
+            if state.read().await.connection_count() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "expected {expected} connections, have {}",
+            state.read().await.connection_count()
+        );
+    }
+
+    /// The next text message as JSON, or `None` if nothing arrives soon.
+    async fn next_json(client: &mut warp::test::WsClient) -> Option<serde_json::Value> {
+        match tokio::time::timeout(Duration::from_millis(400), client.recv()).await {
+            Ok(Ok(message)) if message.is_text() => {
+                Some(serde_json::from_str(message.to_str().unwrap()).unwrap())
+            }
+            Ok(Ok(other)) => panic!("unexpected frame: {other:?}"),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    fn new_state() -> Shared {
+        Arc::new(RwLock::new(WebSocketState::new(WebSocketConfig::default())))
+    }
+
+    fn alert(message: &str) -> ServerMessage {
+        ServerMessage::SystemAlert {
+            message: message.to_string(),
+            severity: AlertSeverity::Warning,
+        }
+    }
+
+    #[tokio::test]
+    async fn several_clients_connect_at_once_and_all_receive_broadcasts() {
+        let state = new_state();
+        let route = ws_route(state.clone());
+        let mut first = connect(&route).await;
+        let mut second = connect(&route).await;
+        let mut third = connect(&route).await;
+        wait_for_connections(&state, 3).await;
+
+        state
+            .read()
+            .await
+            .broadcast_to_all(alert("hello"))
+            .await
+            .unwrap();
+        for client in [&mut first, &mut second, &mut third] {
+            let message = next_json(client).await.expect("broadcast delivered");
+            assert_eq!(message["type"], "SystemAlert");
+            assert_eq!(message["message"], "hello");
+            assert_eq!(message["severity"], "Warning");
+        }
+
+        // Closing one connection frees only that connection.
+        drop(first);
+        wait_for_connections(&state, 2).await;
+        state
+            .read()
+            .await
+            .broadcast_to_all(alert("again"))
+            .await
+            .unwrap();
+        assert!(next_json(&mut second).await.is_some());
+        assert!(next_json(&mut third).await.is_some());
+        drop((second, third));
+        wait_for_connections(&state, 0).await;
+    }
+
+    #[tokio::test]
+    async fn subscriptions_filter_events_and_new_clients_get_everything() {
+        let state = new_state();
+        let route = ws_route(state.clone());
+        let mut everything = connect(&route).await;
+        let mut archive_only = connect(&route).await;
+        wait_for_connections(&state, 2).await;
+
+        archive_only
+            .send_text(r#"{"type": "Subscribe", "event_types": ["archive_events"]}"#)
+            .await;
+        // Give the server a moment to apply the subscription.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let guard = state.read().await;
+        guard
+            .broadcast_to_subscribed(alert("a system alert"), "system_alerts")
+            .await
+            .unwrap();
+        guard
+            .broadcast_to_subscribed(
+                ServerMessage::JobsPurged {
+                    count: 3,
+                    older_than: Utc::now(),
+                },
+                "archive_events",
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        assert_eq!(
+            next_json(&mut everything).await.unwrap()["type"],
+            "SystemAlert"
+        );
+        assert_eq!(
+            next_json(&mut everything).await.unwrap()["type"],
+            "JobsPurged"
+        );
+        let only = next_json(&mut archive_only).await.unwrap();
+        assert_eq!(only["type"], "JobsPurged", "the alert was filtered out");
+        assert_eq!(only["count"], 3);
+        assert!(next_json(&mut archive_only).await.is_none());
+
+        // Unsubscribing removes a type again; adding one brings it back.
+        archive_only
+            .send_text(r#"{"type": "Unsubscribe", "event_types": ["archive_events"]}"#)
+            .await;
+        archive_only
+            .send_text(r#"{"type": "Subscribe", "event_types": ["system_alerts"]}"#)
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let guard = state.read().await;
+        guard
+            .broadcast_to_subscribed(
+                ServerMessage::JobsPurged {
+                    count: 1,
+                    older_than: Utc::now(),
+                },
+                "archive_events",
+            )
+            .await
+            .unwrap();
+        guard
+            .broadcast_to_subscribed(alert("now wanted"), "system_alerts")
+            .await
+            .unwrap();
+        drop(guard);
+        let got = next_json(&mut archive_only).await.unwrap();
+        assert_eq!(got["message"], "now wanted");
+        assert!(next_json(&mut archive_only).await.is_none());
+
+        // Unsubscribing from a type while on the default keeps all the others.
+        let mut fresh = connect(&route).await;
+        wait_for_connections(&state, 3).await;
+        fresh
+            .send_text(r#"{"type": "Unsubscribe", "event_types": ["job_updates"]}"#)
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let guard = state.read().await;
+        guard
+            .broadcast_to_subscribed(alert("kept"), "system_alerts")
+            .await
+            .unwrap();
+        guard
+            .broadcast_to_subscribed(alert("dropped"), "job_updates")
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(next_json(&mut fresh).await.unwrap()["message"], "kept");
+        assert!(next_json(&mut fresh).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_client_ping_is_answered_to_that_client_only() {
+        let state = new_state();
+        let route = ws_route(state.clone());
+        let mut asker = connect(&route).await;
+        let mut bystander = connect(&route).await;
+        wait_for_connections(&state, 2).await;
+
+        asker.send_text(r#"{"type": "Ping"}"#).await;
+        assert_eq!(next_json(&mut asker).await.unwrap()["type"], "Pong");
+        assert!(next_json(&mut bystander).await.is_none());
+
+        // A protocol-level ping gets a protocol-level pong.
+        asker.send(warp::ws::Message::ping(b"hi".to_vec())).await;
+        let reply = tokio::time::timeout(Duration::from_secs(1), asker.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.is_pong());
+        assert_eq!(reply.as_bytes(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unsupported_messages_are_ignored() {
+        let state = new_state();
+        let route = ws_route(state.clone());
+        let mut client = connect(&route).await;
+        wait_for_connections(&state, 1).await;
+
+        client.send_text("not json at all").await;
+        client.send_text(r#"{"type": "Dance"}"#).await;
+        client.send(warp::ws::Message::binary(vec![1, 2, 3])).await;
+        client.send(warp::ws::Message::pong(b"x".to_vec())).await;
+
+        // The connection survives and still works.
+        client.send_text(r#"{"type": "Ping"}"#).await;
+        assert_eq!(next_json(&mut client).await.unwrap()["type"], "Pong");
+        assert_eq!(state.read().await.connection_count(), 1);
+
+        client.send(warp::ws::Message::close()).await;
+        wait_for_connections(&state, 0).await;
+    }
+
+    #[tokio::test]
+    async fn connections_beyond_the_limit_are_turned_away() {
+        let state = Arc::new(RwLock::new(WebSocketState::new(WebSocketConfig {
+            max_connections: 1,
+            ..WebSocketConfig::default()
+        })));
+        let route = ws_route(state.clone());
+        let mut first = connect(&route).await;
+        wait_for_connections(&state, 1).await;
+
+        let mut rejected = connect(&route).await;
+        // The server drops the extra socket without registering it.
+        let end = tokio::time::timeout(Duration::from_secs(1), rejected.recv()).await;
+        assert!(matches!(end, Ok(Err(_))) || matches!(end, Ok(Ok(ref m)) if m.is_close()));
+        assert_eq!(state.read().await.connection_count(), 1);
+
+        state
+            .read()
+            .await
+            .broadcast_to_all(alert("x"))
+            .await
+            .unwrap();
+        assert!(next_json(&mut first).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_ping_task_reaches_every_connection() {
+        let state = new_state();
+        let route = ws_route(state.clone());
+        let mut client = connect(&route).await;
+        wait_for_connections(&state, 1).await;
+
+        state.read().await.ping_all_connections().await;
+        let frame = tokio::time::timeout(Duration::from_secs(1), client.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame.is_ping());
+        assert_eq!(frame.as_bytes(), b"ping");
+        drop(client);
+        wait_for_connections(&state, 0).await;
+        // With nobody left, pinging is a no-op.
+        state.read().await.ping_all_connections().await;
+    }
+
+    #[tokio::test]
+    async fn archive_events_flow_through_the_broadcast_listener() {
+        use hammerwork::archive::ArchiveEvent;
+        let state = new_state();
+        WebSocketState::start_broadcast_listener(state.clone())
+            .await
+            .unwrap();
+        // The receiver can only be taken once.
+        WebSocketState::start_broadcast_listener(state.clone())
+            .await
+            .unwrap();
+        let route = ws_route(state.clone());
+        let mut client = connect(&route).await;
+        wait_for_connections(&state, 1).await;
+
+        let job_id = Uuid::new_v4();
+        let older_than = Utc::now();
+        let events = vec![
+            ArchiveEvent::JobArchived {
+                job_id,
+                queue: "q".into(),
+                reason: ArchivalReason::Manual,
+            },
+            ArchiveEvent::JobRestored {
+                job_id,
+                queue: "q".into(),
+                restored_by: Some("me".into()),
+            },
+            ArchiveEvent::BulkArchiveStarted {
+                operation_id: "op".into(),
+                estimated_jobs: 10,
+            },
+            ArchiveEvent::BulkArchiveProgress {
+                operation_id: "op".into(),
+                jobs_processed: 5,
+                total: 10,
+            },
+            ArchiveEvent::BulkArchiveCompleted {
+                operation_id: "op".into(),
+                stats: ArchivalStats::default(),
+            },
+            ArchiveEvent::JobsPurged {
+                count: 2,
+                older_than,
+            },
+        ];
+        for event in events {
+            state
+                .read()
+                .await
+                .publish_archive_event(event)
+                .await
+                .unwrap();
+        }
+
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            seen.push(next_json(&mut client).await.expect("event delivered"));
+        }
+        let types: Vec<&str> = seen.iter().map(|m| m["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "JobArchived",
+                "JobRestored",
+                "BulkArchiveStarted",
+                "BulkArchiveProgress",
+                "BulkArchiveCompleted",
+                "JobsPurged"
+            ]
+        );
+        assert_eq!(seen[0]["job_id"], job_id.to_string());
+        assert_eq!(seen[0]["reason"], "Manual");
+        assert_eq!(seen[1]["restored_by"], "me");
+        assert_eq!(seen[2]["estimated_jobs"], 10);
+        assert_eq!(seen[3]["jobs_processed"], 5);
+        assert_eq!(seen[4]["stats"]["jobs_archived"], 0);
+        assert_eq!(seen[5]["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn the_other_broadcast_kinds_are_converted_and_filtered_by_type() {
+        let state = new_state();
+        WebSocketState::start_broadcast_listener(state.clone())
+            .await
+            .unwrap();
+        let route = ws_route(state.clone());
+        let mut queue_only = connect(&route).await;
+        wait_for_connections(&state, 1).await;
+        queue_only
+            .send_text(r#"{"type": "Subscribe", "event_types": ["queue_updates", "job_updates", "system_alerts"]}"#)
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let sender = state.read().await.broadcast_sender.clone();
+        let now = Utc::now();
+        sender
+            .send(BroadcastMessage::QueueUpdate {
+                queue_name: "emails".into(),
+                stats: QueueStats {
+                    pending_count: 1,
+                    running_count: 2,
+                    completed_count: 3,
+                    failed_count: 4,
+                    dead_count: 5,
+                    throughput_per_minute: 6.0,
+                    avg_processing_time_ms: 7.0,
+                    error_rate: 0.5,
+                    updated_at: now,
+                },
+            })
+            .unwrap();
+        sender
+            .send(BroadcastMessage::JobUpdate {
+                job: JobUpdate {
+                    id: "j1".into(),
+                    queue_name: "emails".into(),
+                    status: "Running".into(),
+                    priority: "High".into(),
+                    attempts: 1,
+                    updated_at: now,
+                },
+            })
+            .unwrap();
+        sender
+            .send(BroadcastMessage::SystemAlert {
+                message: "disk".into(),
+                severity: AlertSeverity::Critical,
+            })
+            .unwrap();
+        // Not subscribed to archive events: never delivered.
+        sender
+            .send(BroadcastMessage::JobsPurged {
+                count: 9,
+                older_than: now,
+            })
+            .unwrap();
+
+        let queue = next_json(&mut queue_only).await.unwrap();
+        assert_eq!(queue["type"], "QueueUpdate");
+        assert_eq!(queue["queue_name"], "emails");
+        assert_eq!(queue["stats"]["dead_count"], 5);
+        let job = next_json(&mut queue_only).await.unwrap();
+        assert_eq!(
+            (job["type"].as_str(), job["job"]["id"].as_str()),
+            (Some("JobUpdate"), Some("j1"))
+        );
+        let alert = next_json(&mut queue_only).await.unwrap();
+        assert_eq!(alert["severity"], "Critical");
+        assert!(next_json(&mut queue_only).await.is_none());
+    }
+
+    #[test]
+    fn subscription_rules() {
+        let mut sub = Subscription::everything();
+        assert!(sub.wants("anything"));
+        sub.unsubscribe(&["job_updates".to_string()]);
+        assert!(!sub.wants("job_updates") && sub.wants("queue_updates"));
+        assert!(
+            !sub.wants("custom"),
+            "after the first change only known types remain"
+        );
+
+        let mut sub = Subscription::everything();
+        sub.subscribe(vec!["archive_events".to_string()]);
+        assert!(sub.wants("archive_events") && !sub.wants("queue_updates"));
+        sub.subscribe(vec!["queue_updates".to_string()]);
+        assert!(sub.wants("queue_updates") && sub.wants("archive_events"));
+    }
+
+    #[test]
+    fn every_server_message_is_tagged_with_its_type() {
+        let now = Utc::now();
+        let messages = vec![
+            (ServerMessage::Pong, "Pong"),
+            (alert("x"), "SystemAlert"),
+            (
+                ServerMessage::JobArchived {
+                    job_id: "j".into(),
+                    queue: "q".into(),
+                    reason: ArchivalReason::Automatic,
+                },
+                "JobArchived",
+            ),
+            (
+                ServerMessage::JobRestored {
+                    job_id: "j".into(),
+                    queue: "q".into(),
+                    restored_by: None,
+                },
+                "JobRestored",
+            ),
+            (
+                ServerMessage::BulkArchiveStarted {
+                    operation_id: "o".into(),
+                    estimated_jobs: 1,
+                },
+                "BulkArchiveStarted",
+            ),
+            (
+                ServerMessage::JobsPurged {
+                    count: 1,
+                    older_than: now,
+                },
+                "JobsPurged",
+            ),
+        ];
+        for (message, expected) in messages {
+            let json: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+            assert_eq!(json["type"], expected);
+        }
+        for severity in [
+            AlertSeverity::Info,
+            AlertSeverity::Warning,
+            AlertSeverity::Error,
+            AlertSeverity::Critical,
+        ] {
+            assert!(serde_json::to_string(&severity).unwrap().starts_with('"'));
+        }
+        for text in [
+            r#"{"type": "Ping"}"#,
+            r#"{"type": "Unsubscribe", "event_types": []}"#,
+        ] {
+            assert!(serde_json::from_str::<ClientMessage>(text).is_ok());
+        }
+        assert!(serde_json::from_str::<ClientMessage>(r#"{"type": "Subscribe"}"#).is_err());
     }
 }

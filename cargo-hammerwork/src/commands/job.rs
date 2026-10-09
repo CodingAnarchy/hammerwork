@@ -241,7 +241,7 @@ impl JobCommand {
 
 /// The value the library stores in the `status` column for a CLI status name
 /// (`pending`, `timed_out`, ...). Expects a name accepted by `validate_status`.
-fn status_db_value(status: &str) -> &'static str {
+pub(crate) fn status_db_value(status: &str) -> &'static str {
     match status.to_lowercase().as_str() {
         "pending" => "Pending",
         "running" => "Running",
@@ -432,147 +432,129 @@ async fn list_jobs(
     Ok(())
 }
 
-async fn show_job_details(pool: DatabasePool, job_id: &str) -> Result<()> {
-    match pool {
-        DatabasePool::Postgres(pg_pool) => {
-            let job_uuid = uuid::Uuid::parse_str(job_id)?;
-            let row = sqlx::query("SELECT * FROM hammerwork_jobs WHERE id = $1")
-                .bind(job_uuid)
-                .fetch_optional(&pg_pool)
-                .await?;
+/// A job as shown by `job show`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobDetails {
+    pub id: String,
+    pub queue: String,
+    pub status: String,
+    pub priority: i32,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub failed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error_message: Option<String>,
+    pub payload: serde_json::Value,
+    encryption: EncryptionDetails,
+}
 
-            if let Some(row) = row {
-                print_job_details_postgres(&row)?;
-            } else {
-                println!("❌ Job not found: {}", job_id);
-            }
+macro_rules! job_details {
+    ($row:expr, $id:expr) => {{
+        let row = $row;
+        JobDetails {
+            id: $id,
+            queue: row.try_get("queue_name")?,
+            status: row.try_get("status")?,
+            priority: row.try_get("priority")?,
+            attempts: row.try_get("attempts")?,
+            max_attempts: row.try_get("max_attempts")?,
+            created_at: row.try_get("created_at")?,
+            scheduled_at: row.try_get("scheduled_at")?,
+            started_at: row.try_get("started_at")?,
+            completed_at: row.try_get("completed_at")?,
+            failed_at: row.try_get("failed_at")?,
+            error_message: row.try_get("error_message")?,
+            payload: row.try_get("payload")?,
+            encryption: EncryptionDetails {
+                is_encrypted: row.try_get("is_encrypted")?,
+                key_id: row.try_get("encryption_key_id")?,
+                algorithm: row.try_get("encryption_algorithm")?,
+                retention_policy: row.try_get("retention_policy")?,
+                retention_delete_at: row.try_get("retention_delete_at")?,
+            },
+        }
+    }};
+}
+
+/// Look a job up by id; `None` if there is no such job.
+pub async fn fetch_job_details(pool: &DatabasePool, job_id: &str) -> Result<Option<JobDetails>> {
+    let job_uuid = uuid::Uuid::parse_str(job_id)
+        .map_err(|e| anyhow::anyhow!("Invalid job ID '{}': {}", job_id, e))?;
+    Ok(match pool {
+        DatabasePool::Postgres(pg_pool) => {
+            sqlx::query("SELECT * FROM hammerwork_jobs WHERE id = $1")
+                .bind(job_uuid)
+                .fetch_optional(pg_pool)
+                .await?
+                .map(|row| -> Result<JobDetails> {
+                    let id = row.try_get::<uuid::Uuid, _>("id")?.to_string();
+                    Ok(job_details!(&row, id))
+                })
+                .transpose()?
         }
         DatabasePool::MySQL(mysql_pool) => {
-            let row = sqlx::query("SELECT * FROM hammerwork_jobs WHERE id = ?")
-                .bind(job_id)
-                .fetch_optional(&mysql_pool)
-                .await?;
-
-            if let Some(row) = row {
-                print_job_details_mysql(&row)?;
-            } else {
-                println!("❌ Job not found: {}", job_id);
-            }
+            sqlx::query("SELECT * FROM hammerwork_jobs WHERE id = ?")
+                .bind(job_uuid.to_string())
+                .fetch_optional(mysql_pool)
+                .await?
+                .map(|row| -> Result<JobDetails> {
+                    let id = row.try_get::<String, _>("id")?;
+                    Ok(job_details!(&row, id))
+                })
+                .transpose()?
         }
-    }
-
-    Ok(())
+    })
 }
 
-fn print_job_details_postgres(row: &sqlx::postgres::PgRow) -> Result<()> {
-    println!("📋 Job Details");
-    println!("═══════════════");
-    println!("ID: {}", row.try_get::<String, _>("id")?);
-    println!("Queue: {}", row.try_get::<String, _>("queue_name")?);
-    println!("Status: {}", row.try_get::<String, _>("status")?);
-    println!("Priority: {}", row.try_get::<String, _>("priority")?);
-    println!(
-        "Attempts: {}/{}",
-        row.try_get::<i32, _>("attempts")?,
-        row.try_get::<i32, _>("max_attempts")?
-    );
-
-    let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-    let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
-
-    println!("Created: {}", created_at.format("%Y-%m-%d %H:%M:%S UTC"));
-    println!(
-        "Scheduled: {}",
-        scheduled_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-
-    if let Some(started) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")? {
-        println!("Started: {}", started.format("%Y-%m-%d %H:%M:%S UTC"));
+/// The text `job show` prints.
+pub fn render_job_details(job: &JobDetails) -> String {
+    let time = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let mut lines = vec![
+        "📋 Job Details".to_string(),
+        "═══════════════".to_string(),
+        format!("ID: {}", job.id),
+        format!("Queue: {}", job.queue),
+        format!("Status: {}", job.status),
+        format!("Priority: {}", priority_display(job.priority)),
+        format!("Attempts: {}/{}", job.attempts, job.max_attempts),
+        format!("Created: {}", time(job.created_at)),
+        format!("Scheduled: {}", time(job.scheduled_at)),
+    ];
+    if let Some(started) = job.started_at {
+        lines.push(format!("Started: {}", time(started)));
     }
-
-    if let Some(completed) =
-        row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")?
-    {
-        println!("Completed: {}", completed.format("%Y-%m-%d %H:%M:%S UTC"));
+    if let Some(completed) = job.completed_at {
+        lines.push(format!("Completed: {}", time(completed)));
     }
-
-    if let Some(failed) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at")? {
-        println!("Failed: {}", failed.format("%Y-%m-%d %H:%M:%S UTC"));
+    if let Some(failed) = job.failed_at {
+        lines.push(format!("Failed: {}", time(failed)));
     }
-
-    if let Some(error) = row.try_get::<Option<String>, _>("error_message")? {
-        println!("Error: {}", error);
+    if let Some(error) = &job.error_message {
+        lines.push(format!("Error: {}", error));
     }
-
-    print_encryption_details(&EncryptionDetails {
-        is_encrypted: row.try_get("is_encrypted")?,
-        key_id: row.try_get("encryption_key_id")?,
-        algorithm: row.try_get("encryption_algorithm")?,
-        retention_policy: row.try_get("retention_policy")?,
-        retention_delete_at: row.try_get("retention_delete_at")?,
-    });
-
-    let payload: serde_json::Value = row.try_get("payload")?;
-    println!("Payload: {}", serde_json::to_string_pretty(&payload)?);
-
-    Ok(())
+    lines.extend(encryption_detail_lines(&job.encryption));
+    lines.push(format!(
+        "Payload: {}",
+        serde_json::to_string_pretty(&job.payload).unwrap_or_else(|_| job.payload.to_string())
+    ));
+    lines.join("\n")
 }
 
-fn print_job_details_mysql(row: &sqlx::mysql::MySqlRow) -> Result<()> {
-    println!("📋 Job Details");
-    println!("═══════════════");
-    println!("ID: {}", row.try_get::<String, _>("id")?);
-    println!("Queue: {}", row.try_get::<String, _>("queue_name")?);
-    println!("Status: {}", row.try_get::<String, _>("status")?);
-    println!("Priority: {}", row.try_get::<String, _>("priority")?);
-    println!(
-        "Attempts: {}/{}",
-        row.try_get::<i32, _>("attempts")?,
-        row.try_get::<i32, _>("max_attempts")?
-    );
-
-    let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-    let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
-
-    println!("Created: {}", created_at.format("%Y-%m-%d %H:%M:%S UTC"));
-    println!(
-        "Scheduled: {}",
-        scheduled_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-
-    if let Some(started) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")? {
-        println!("Started: {}", started.format("%Y-%m-%d %H:%M:%S UTC"));
+async fn show_job_details(pool: DatabasePool, job_id: &str) -> Result<()> {
+    match fetch_job_details(&pool, job_id).await? {
+        Some(job) => {
+            println!("{}", render_job_details(&job));
+            Ok(())
+        }
+        None => Err(anyhow::anyhow!("Job not found: {}", job_id)),
     }
-
-    if let Some(completed) =
-        row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")?
-    {
-        println!("Completed: {}", completed.format("%Y-%m-%d %H:%M:%S UTC"));
-    }
-
-    if let Some(failed) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at")? {
-        println!("Failed: {}", failed.format("%Y-%m-%d %H:%M:%S UTC"));
-    }
-
-    if let Some(error) = row.try_get::<Option<String>, _>("error_message")? {
-        println!("Error: {}", error);
-    }
-
-    print_encryption_details(&EncryptionDetails {
-        is_encrypted: row.try_get("is_encrypted")?,
-        key_id: row.try_get("encryption_key_id")?,
-        algorithm: row.try_get("encryption_algorithm")?,
-        retention_policy: row.try_get("retention_policy")?,
-        retention_delete_at: row.try_get("retention_delete_at")?,
-    });
-
-    let payload: serde_json::Value = row.try_get("payload")?;
-    println!("Payload: {}", serde_json::to_string_pretty(&payload)?);
-
-    Ok(())
 }
 
 /// Encryption columns of a job row, as shown by `job show`.
+#[derive(Debug, Clone, PartialEq)]
 struct EncryptionDetails {
     is_encrypted: bool,
     key_id: Option<String>,
@@ -602,12 +584,6 @@ fn encryption_detail_lines(details: &EncryptionDetails) -> Vec<String> {
         _ => {}
     }
     lines
-}
-
-fn print_encryption_details(details: &EncryptionDetails) {
-    for line in encryption_detail_lines(details) {
-        println!("{}", line);
-    }
 }
 
 async fn enqueue_job(
@@ -957,7 +933,7 @@ mod tests {
         );
         assert!(query.contains("queue_name = ?"));
         assert!(query.contains("status IN ('Failed', 'Dead')"));
-        assert!(query.contains("DATE_SUB(NOW(), INTERVAL ? HOUR)"));
+        assert!(query.contains("DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? HOUR)"));
         // User input is bound, never interpolated
         assert!(!query.contains("DROP"));
         assert_eq!(
@@ -994,7 +970,7 @@ mod tests {
         assert_eq!(
             query,
             "DELETE FROM hammerwork_jobs WHERE status IN ('Dead') AND queue_name = ? \
-             AND created_at < DATE_SUB(NOW(), INTERVAL ? DAY)"
+             AND created_at < DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? DAY)"
         );
         assert_eq!(binds.len(), 2);
 
@@ -1126,4 +1102,465 @@ mod tests {
             ]
         );
     }
+
+    fn parse(args: &[&str]) -> JobCommand {
+        let mut argv = vec!["test"];
+        argv.extend_from_slice(args);
+        TestCli::try_parse_from(argv).unwrap().command
+    }
+
+    #[test]
+    fn parses_every_subcommand_with_its_flags() {
+        match parse(&[
+            "list",
+            "-n",
+            "q",
+            "-t",
+            "failed",
+            "-r",
+            "high",
+            "-l",
+            "5",
+            "--failed",
+            "--completed",
+            "--last-hours",
+            "3",
+        ]) {
+            JobCommand::List {
+                queue,
+                status,
+                priority,
+                limit,
+                failed,
+                completed,
+                last_hours,
+                ..
+            } => {
+                assert_eq!(queue.as_deref(), Some("q"));
+                assert_eq!(status.as_deref(), Some("failed"));
+                assert_eq!(priority.as_deref(), Some("high"));
+                assert_eq!(limit, Some(5));
+                assert!(failed && completed);
+                assert_eq!(last_hours, Some(3));
+            }
+            _ => panic!("expected List"),
+        }
+        assert!(matches!(
+            parse(&["show", "abc"]),
+            JobCommand::Show { job_id, .. } if job_id == "abc"
+        ));
+        match parse(&[
+            "enqueue",
+            "-n",
+            "q",
+            "-j",
+            "{}",
+            "-r",
+            "low",
+            "--delay",
+            "30",
+            "--max-attempts",
+            "7",
+            "--timeout",
+            "60",
+        ]) {
+            JobCommand::Enqueue {
+                queue,
+                payload,
+                priority,
+                delay,
+                max_attempts,
+                timeout,
+                ..
+            } => {
+                assert_eq!((queue.as_str(), payload.as_str()), ("q", "{}"));
+                assert_eq!(priority.as_deref(), Some("low"));
+                assert_eq!(
+                    (delay, max_attempts, timeout),
+                    (Some(30), Some(7), Some(60))
+                );
+            }
+            _ => panic!("expected Enqueue"),
+        }
+        match parse(&["retry", "--job-id", "x", "-n", "q", "--all"]) {
+            JobCommand::Retry {
+                job_id, queue, all, ..
+            } => assert_eq!(
+                (job_id.as_deref(), queue.as_deref(), all),
+                (Some("x"), Some("q"), true)
+            ),
+            _ => panic!("expected Retry"),
+        }
+        match parse(&["cancel", "--job-id", "x", "-n", "q", "--all-pending"]) {
+            JobCommand::Cancel {
+                job_id,
+                queue,
+                all_pending,
+                ..
+            } => assert_eq!(
+                (job_id.as_deref(), queue.as_deref(), all_pending),
+                (Some("x"), Some("q"), true)
+            ),
+            _ => panic!("expected Cancel"),
+        }
+        match parse(&[
+            "purge",
+            "-Q",
+            "q",
+            "--completed",
+            "--dead",
+            "--failed",
+            "--older-than-days",
+            "4",
+            "--confirm",
+        ]) {
+            JobCommand::Purge {
+                queue,
+                completed,
+                dead,
+                failed,
+                older_than_days,
+                confirm,
+                ..
+            } => {
+                assert_eq!(queue.as_deref(), Some("q"));
+                assert!(completed && dead && failed && confirm);
+                assert_eq!(older_than_days, Some(4));
+            }
+            _ => panic!("expected Purge"),
+        }
+        assert!(
+            TestCli::try_parse_from(["test", "enqueue", "-n", "q"]).is_err(),
+            "payload is required"
+        );
+    }
+
+    #[test]
+    fn database_url_comes_from_the_flag_then_the_config() {
+        let config = config_for("postgres://config/db");
+        for args in [
+            &["list"][..],
+            &["show", "x"],
+            &["retry"],
+            &["cancel"],
+            &["requeue-stale"],
+        ] {
+            assert_eq!(
+                parse(args).get_database_url(&config).unwrap(),
+                "postgres://config/db"
+            );
+            assert!(parse(args).get_database_url(&Config::default()).is_err());
+        }
+        assert_eq!(
+            parse(&["list", "-u", "mysql://flag/db"])
+                .get_database_url(&config)
+                .unwrap(),
+            "mysql://flag/db"
+        );
+    }
+
+    fn sample_details() -> JobDetails {
+        let at = chrono::DateTime::parse_from_rfc3339("2030-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        JobDetails {
+            id: "11111111-1111-1111-1111-111111111111".into(),
+            queue: "emails".into(),
+            status: "Failed".into(),
+            priority: 3,
+            attempts: 2,
+            max_attempts: 5,
+            created_at: at,
+            scheduled_at: at,
+            started_at: Some(at),
+            completed_at: None,
+            failed_at: Some(at),
+            error_message: Some("smtp down".into()),
+            payload: serde_json::json!({"to": "a@example.com"}),
+            encryption: EncryptionDetails {
+                is_encrypted: true,
+                key_id: Some("k1".into()),
+                algorithm: Some("AES256GCM".into()),
+                retention_policy: Some("DeleteAfter".into()),
+                retention_delete_at: None,
+            },
+        }
+    }
+
+    #[test]
+    fn job_details_render_every_present_field() {
+        let out = render_job_details(&sample_details());
+        for expected in [
+            "ID: 11111111-1111-1111-1111-111111111111",
+            "Queue: emails",
+            "Status: Failed",
+            "Priority: high",
+            "Attempts: 2/5",
+            "Created: 2030-01-02 03:04:05 UTC",
+            "Started: 2030-01-02 03:04:05 UTC",
+            "Failed: 2030-01-02 03:04:05 UTC",
+            "Error: smtp down",
+            "Encrypted: yes (AES256GCM, key k1)",
+            "Retention: DeleteAfter",
+            "\"to\": \"a@example.com\"",
+        ] {
+            assert!(out.contains(expected), "{expected} in {out}");
+        }
+        assert!(!out.contains("Completed:"));
+
+        let mut plain = sample_details();
+        plain.started_at = None;
+        plain.failed_at = None;
+        plain.error_message = None;
+        plain.encryption.is_encrypted = false;
+        plain.completed_at = Some(plain.created_at);
+        let out = render_job_details(&plain);
+        assert!(out.contains("Completed:") && !out.contains("Started:") && !out.contains("Error:"));
+        assert!(!out.contains("Encrypted"));
+    }
+
+    async fn job_commands(base_url: String) {
+        // retry --all, cancel --all-pending and requeue-stale act on every queue
+        let db = ScratchDb::create(&base_url).await;
+        let pool = &db.pool;
+        let config = db.config();
+        let run = |args: &[&str]| {
+            let cmd = parse(args);
+            let config = config.clone();
+            async move { cmd.execute(&config).await }
+        };
+        let q = hostile_queue();
+        let other = unique_queue("job_other");
+
+        // --- enqueue stores what was asked for
+        run(&[
+            "enqueue",
+            "-n",
+            &q,
+            "-j",
+            r#"{"to": "a@example.com"}"#,
+            "-r",
+            "critical",
+            "--max-attempts",
+            "7",
+            "--timeout",
+            "90",
+            "--delay",
+            "3600",
+        ])
+        .await
+        .unwrap();
+        run(&["enqueue", "-n", &q, "-j", "[1, 2]"]).await.unwrap();
+        assert_eq!(count_jobs(pool, &q, Some("Pending")).await, 2);
+        let jobs = fetch_job_ids(pool, &q).await;
+        let delayed = &jobs[0];
+        assert_eq!(
+            job_column(pool, delayed, "priority").await.as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            job_column(pool, delayed, "max_attempts").await.as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            job_column(pool, delayed, "timeout_seconds")
+                .await
+                .as_deref(),
+            Some("90")
+        );
+        let payload = job_column(pool, delayed, "payload").await.unwrap();
+        assert!(payload.contains("a@example.com"), "{payload}");
+        let later = fetch_i64_sql(
+            pool,
+            &format!(
+                "SELECT COUNT(*) AS count FROM hammerwork_jobs WHERE id = '{delayed}' AND scheduled_at > {}",
+                match pool.backend() {
+                    Backend::Postgres => "NOW() + INTERVAL '30 minutes'",
+                    Backend::MySql => "DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 30 MINUTE)",
+                }
+            ),
+        )
+        .await;
+        assert_eq!(later, 1, "--delay pushes scheduled_at into the future");
+        for (args, expected) in [
+            (vec!["enqueue", "-n", "q", "-j", "{broken"], "Invalid JSON"),
+            (
+                vec!["enqueue", "-n", "q", "-j", "{}", "-r", "urgent"],
+                "Invalid priority",
+            ),
+            (
+                vec![
+                    "enqueue",
+                    "-n",
+                    "q",
+                    "-j",
+                    "{}",
+                    "--delay",
+                    "18446744073709551615",
+                ],
+                "out of range",
+            ),
+        ] {
+            let err = run(&args).await.unwrap_err().to_string();
+            assert!(err.contains(expected), "{args:?}: {err}");
+        }
+
+        // --- show works on both backends and reports unknown/malformed ids
+        run(&["show", delayed]).await.unwrap();
+        let details = fetch_job_details(pool, delayed).await.unwrap().unwrap();
+        assert_eq!(&details.id, delayed);
+        assert_eq!(details.queue, q);
+        assert_eq!(
+            (
+                details.status.as_str(),
+                details.priority,
+                details.max_attempts
+            ),
+            ("Pending", 4, 7)
+        );
+        assert_eq!(details.payload["to"], "a@example.com");
+        let missing = uuid::Uuid::new_v4().to_string();
+        let err = run(&["show", &missing]).await.unwrap_err().to_string();
+        assert!(err.contains("Job not found"), "{err}");
+        let err = run(&["show", "nope"]).await.unwrap_err().to_string();
+        assert!(err.contains("Invalid job ID"), "{err}");
+
+        // --- list with every filter
+        let mut failed = SeedJob::new(&q, "Failed");
+        failed.failed_now = true;
+        let failed_id = seed(pool, &failed).await;
+        let dead_id = seed(pool, &SeedJob::new(&q, "Dead")).await;
+        let mut completed = SeedJob::new(&q, "Completed");
+        completed.completed_now = true;
+        let completed_id = seed(pool, &completed).await;
+        seed(pool, &SeedJob::new(&other, "Pending")).await;
+        for args in [
+            vec!["list"],
+            vec!["list", "-n", &q],
+            vec!["list", "-n", &q, "-t", "failed", "-l", "1"],
+            vec!["list", "-t", "timed_out"],
+            vec!["list", "-r", "critical", "--last-hours", "1"],
+            vec!["list", "--failed"],
+            vec!["list", "--completed", "-n", &q],
+        ] {
+            run(&args).await.unwrap();
+        }
+        assert!(run(&["list", "-t", "bogus"]).await.is_err());
+        assert!(run(&["list", "-r", "urgent"]).await.is_err());
+
+        // --- retry: a single job, by queue, everything; refuses non-retryable and unknown jobs
+        assert!(run(&["retry"]).await.is_err(), "needs a target");
+        run(&["retry", "--job-id", &failed_id]).await.unwrap();
+        assert_eq!(job_status(pool, &failed_id).await, "Pending");
+        assert!(
+            run(&["retry", "--job-id", &failed_id]).await.is_err(),
+            "a pending job cannot be retried"
+        );
+        assert!(run(&["retry", "--job-id", &missing]).await.is_err());
+        assert!(run(&["retry", "--job-id", "nope"]).await.is_err());
+        run(&["retry", "-n", &q]).await.unwrap();
+        assert_eq!(job_status(pool, &dead_id).await, "Pending");
+        let foreign_dead = seed(pool, &SeedJob::new(&other, "Dead")).await;
+        let foreign_failed = seed(pool, &SeedJob::new(&other, "Failed")).await;
+        run(&["retry", "--all"]).await.unwrap();
+        assert_eq!(job_status(pool, &foreign_dead).await, "Pending");
+        assert_eq!(job_status(pool, &foreign_failed).await, "Pending");
+
+        // --- cancel: only pending jobs can be cancelled
+        assert!(run(&["cancel"]).await.is_err(), "needs a target");
+        assert!(run(&["cancel", "--job-id", &completed_id]).await.is_err());
+        assert_eq!(job_status(pool, &completed_id).await, "Completed");
+        run(&["cancel", "--job-id", &failed_id]).await.unwrap();
+        assert!(job_column(pool, &failed_id, "status").await.is_none());
+        assert!(run(&["cancel", "--job-id", &missing]).await.is_err());
+        run(&["cancel", "-n", &q]).await.unwrap();
+        assert_eq!(
+            count_jobs(pool, &q, None).await,
+            1,
+            "only the completed job is left"
+        );
+        run(&["cancel", "--all-pending"]).await.unwrap();
+        assert_eq!(count_jobs(pool, &other, None).await, 0);
+
+        // --- purge: needs a status flag and --confirm; scoped by queue and age
+        assert!(run(&["purge", "-Q", &q]).await.is_err());
+        run(&["purge", "-Q", &q, "--completed"]).await.unwrap(); // no --confirm
+        assert_eq!(count_jobs(pool, &q, None).await, 1);
+        run(&[
+            "purge",
+            "-Q",
+            &q,
+            "--completed",
+            "--older-than-days",
+            "1",
+            "--confirm",
+        ])
+        .await
+        .unwrap();
+        assert_eq!(count_jobs(pool, &q, None).await, 1, "too recent to purge");
+        let dead_old = seed(pool, &SeedJob::new(&q, "Dead")).await;
+        backdate(pool, &dead_old, "created_at", 3).await;
+        run(&[
+            "purge",
+            "-Q",
+            &q,
+            "--dead",
+            "--older-than-days",
+            "1",
+            "--confirm",
+        ])
+        .await
+        .unwrap();
+        assert!(job_column(pool, &dead_old, "status").await.is_none());
+        run(&["purge", "-Q", &q, "--completed", "--failed", "--confirm"])
+            .await
+            .unwrap();
+        assert_eq!(count_jobs(pool, &q, None).await, 0);
+
+        // --- requeue-stale: a stale job with attempts left goes back to Pending, an exhausted one dies
+        let mut stale = SeedJob::new(&q, "Running");
+        stale.started_long_ago = true;
+        let retryable = seed(pool, &stale).await;
+        let exhausted = seed(pool, &stale).await;
+        exec_sql(
+            pool,
+            &format!("UPDATE hammerwork_jobs SET attempts = max_attempts WHERE id = '{exhausted}'"),
+        )
+        .await;
+        let fresh = seed(pool, &SeedJob::new(&q, "Running")).await;
+        backdate(pool, &fresh, "started_at", 0).await;
+        run(&["requeue-stale", "--older-than-secs", "3600"])
+            .await
+            .unwrap();
+        assert_eq!(job_status(pool, &retryable).await, "Pending");
+        assert_eq!(job_status(pool, &exhausted).await, "Dead");
+        assert_eq!(job_status(pool, &fresh).await, "Running");
+        run(&["requeue-stale"]).await.unwrap();
+
+        assert!(table_exists(pool).await);
+        db.drop_db().await;
+    }
+
+    async fn fetch_job_ids(pool: &DatabasePool, queue: &str) -> Vec<String> {
+        let mut params = SqlParams::new(pool.backend());
+        let sql = format!(
+            "SELECT {} AS id FROM hammerwork_jobs WHERE queue_name = {} ORDER BY priority DESC, id",
+            match pool.backend() {
+                Backend::Postgres => "CAST(id AS TEXT)",
+                Backend::MySql => "id",
+            },
+            params.text(queue)
+        );
+        column_strings(pool, &sql, params.binds(), "id").await
+    }
+
+    async fn fetch_i64_sql(pool: &DatabasePool, sql: &str) -> i64 {
+        fetch_i64(pool, sql, &[], "count").await.unwrap()
+    }
+
+    db_tests!(
+        job_commands,
+        test_job_commands_postgres,
+        test_job_commands_mysql
+    );
 }

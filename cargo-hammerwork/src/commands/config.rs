@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Subcommand;
+use std::path::Path;
 use tracing::info;
 
 use crate::config::Config;
@@ -31,21 +32,26 @@ pub enum ConfigCommand {
 
 impl ConfigCommand {
     pub async fn execute(&self, config: &mut Config) -> Result<()> {
+        self.execute_at(config, &Config::config_file_path()?).await
+    }
+
+    /// Run the command against the config file at `path`.
+    pub async fn execute_at(&self, config: &mut Config, path: &Path) -> Result<()> {
         match self {
             ConfigCommand::Show => {
                 show_config(config).await?;
             }
             ConfigCommand::Set { key, value } => {
-                set_config_value(config, key, value).await?;
+                set_config_value(config, key, value, path).await?;
             }
             ConfigCommand::Get { key } => {
                 get_config_value(config, key).await?;
             }
             ConfigCommand::Reset { confirm } => {
-                reset_config(config, *confirm).await?;
+                reset_config(config, *confirm, path).await?;
             }
             ConfigCommand::Path => {
-                show_config_path().await?;
+                show_config_path(path).await?;
             }
         }
         Ok(())
@@ -99,7 +105,7 @@ async fn show_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<()> {
+async fn set_config_value(config: &mut Config, key: &str, value: &str, path: &Path) -> Result<()> {
     match key {
         "database_url" => {
             crate::utils::validation::validate_database_url(value)?;
@@ -148,7 +154,7 @@ async fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result
     }
 
     // Save the updated configuration
-    config.save()?;
+    config.save_to(path)?;
     println!("💾 Configuration saved");
 
     Ok(())
@@ -173,14 +179,14 @@ async fn get_config_value(config: &Config, key: &str) -> Result<()> {
     Ok(())
 }
 
-async fn reset_config(config: &mut Config, confirm: bool) -> Result<()> {
+async fn reset_config(config: &mut Config, confirm: bool, path: &Path) -> Result<()> {
     if !confirm {
         println!("⚠️  This will reset all configuration to defaults. Use --confirm to proceed.");
         return Ok(());
     }
 
     *config = Config::default();
-    config.save()?;
+    config.save_to(path)?;
 
     println!("🔄 Configuration reset to defaults");
     info!("Configuration has been reset to defaults");
@@ -188,13 +194,7 @@ async fn reset_config(config: &mut Config, confirm: bool) -> Result<()> {
     Ok(())
 }
 
-async fn show_config_path() -> Result<()> {
-    let config_dir = dirs::config_dir()
-        .or_else(dirs::home_dir)
-        .ok_or_else(|| anyhow::anyhow!("Cannot find config directory"))?;
-
-    let config_path = config_dir.join("hammerwork").join("config.toml");
-
+async fn show_config_path(config_path: &Path) -> Result<()> {
     println!("📁 Configuration file path:");
     println!("{}", config_path.display());
 
@@ -202,7 +202,7 @@ async fn show_config_path() -> Result<()> {
         println!("✅ File exists");
 
         // Show file size and modification time
-        let metadata = std::fs::metadata(&config_path)?;
+        let metadata = std::fs::metadata(config_path)?;
         let size = metadata.len();
         let modified = metadata.modified()?;
         let modified_time = chrono::DateTime::<chrono::Utc>::from(modified);
@@ -221,79 +221,178 @@ async fn show_config_path() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use clap::Parser;
 
-    #[test]
-    fn test_config_command_structure() {
-        let commands = vec!["show", "set", "get", "reset", "path"];
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    }
 
-        for cmd in commands {
-            assert!(!cmd.is_empty());
-            assert!(cmd.chars().all(|c| c.is_ascii_lowercase()));
-        }
+    fn parse(args: &[&str]) -> ConfigCommand {
+        let mut argv = vec!["test"];
+        argv.extend_from_slice(args);
+        TestCli::try_parse_from(argv).unwrap().command
+    }
+
+    async fn run(args: &[&str], config: &mut Config, path: &Path) -> Result<()> {
+        parse(args).execute_at(config, path).await
     }
 
     #[test]
-    fn test_config_key_validation() {
-        let valid_keys = vec![
+    fn parses_every_subcommand_and_flag() {
+        assert!(matches!(parse(&["show"]), ConfigCommand::Show));
+        assert!(matches!(parse(&["path"]), ConfigCommand::Path));
+        match parse(&["set", "default_limit", "9"]) {
+            ConfigCommand::Set { key, value } => {
+                assert_eq!((key.as_str(), value.as_str()), ("default_limit", "9"));
+            }
+            _ => panic!("expected Set"),
+        }
+        match parse(&["get", "log_level"]) {
+            ConfigCommand::Get { key } => assert_eq!(key, "log_level"),
+            _ => panic!("expected Get"),
+        }
+        assert!(matches!(
+            parse(&["reset"]),
+            ConfigCommand::Reset { confirm: false }
+        ));
+        assert!(matches!(
+            parse(&["reset", "--confirm"]),
+            ConfigCommand::Reset { confirm: true }
+        ));
+        // set needs both arguments
+        assert!(TestCli::try_parse_from(["test", "set", "only_key"]).is_err());
+        assert!(TestCli::try_parse_from(["test", "frobnicate"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn set_persists_each_valid_key_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+
+        run(
+            &["set", "database_url", "postgres://u@h/db"],
+            &mut config,
+            &path,
+        )
+        .await
+        .unwrap();
+        run(&["set", "default_queue", "emails"], &mut config, &path)
+            .await
+            .unwrap();
+        run(&["set", "default_limit", "25"], &mut config, &path)
+            .await
+            .unwrap();
+        run(&["set", "log_level", "DEBUG"], &mut config, &path)
+            .await
+            .unwrap();
+        run(&["set", "connection_pool_size", "8"], &mut config, &path)
+            .await
+            .unwrap();
+
+        let saved = Config::load_from_path(&path).unwrap();
+        assert_eq!(saved.get_database_url(), Some("postgres://u@h/db"));
+        assert_eq!(saved.get_default_queue(), Some("emails"));
+        assert_eq!(saved.get_default_limit(), 25);
+        assert_eq!(saved.get_log_level(), "debug", "log level is normalised");
+        assert_eq!(saved.get_connection_pool_size(), 8);
+        assert_eq!(config.get_default_limit(), 25, "in-memory config updated");
+    }
+
+    #[tokio::test]
+    async fn set_rejects_invalid_values_without_touching_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+
+        for (key, value, expected) in [
+            ("database_url", "http://nope", "Invalid database URL"),
+            ("default_limit", "many", "positive integer"),
+            ("log_level", "loud", "log_level must be one of"),
+            ("connection_pool_size", "0", "between 1 and 100"),
+            ("connection_pool_size", "101", "between 1 and 100"),
+            ("connection_pool_size", "x", "positive integer"),
+            ("no_such_key", "1", "Unknown configuration key: no_such_key"),
+        ] {
+            let err = run(&["set", key, value], &mut config, &path)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{key}={value}: {err}");
+        }
+        assert!(!path.exists(), "nothing was saved");
+        assert_eq!(config.get_default_limit(), 50);
+        assert_eq!(config.get_database_url(), None);
+    }
+
+    #[tokio::test]
+    async fn get_reads_known_keys_and_rejects_unknown_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config {
+            database_url: Some("mysql://h/db".into()),
+            ..Config::default()
+        };
+        for key in [
             "database_url",
             "default_queue",
             "default_limit",
             "log_level",
             "connection_pool_size",
-        ];
-
-        for key in valid_keys {
-            assert!(is_valid_config_key(key));
+        ] {
+            run(&["get", key], &mut config, &path).await.unwrap();
         }
-
-        let invalid_keys = vec!["", "invalid_key", "key with spaces", "key/with/slashes"];
-
-        for key in invalid_keys {
-            assert!(!is_valid_config_key(key));
-        }
+        let err = run(&["get", "bogus"], &mut config, &path)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unknown configuration key: bogus"), "{err}");
     }
 
-    #[test]
-    fn test_config_value_validation() {
-        // Test database URL values
-        assert!(is_valid_config_value(
-            "database_url",
-            "postgres://localhost/db"
-        ));
-        assert!(!is_valid_config_value("database_url", "invalid_url"));
+    #[tokio::test]
+    async fn reset_requires_confirmation_then_restores_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        run(&["set", "default_limit", "77"], &mut config, &path)
+            .await
+            .unwrap();
 
-        // Test log level values
-        assert!(is_valid_config_value("log_level", "info"));
-        assert!(is_valid_config_value("log_level", "debug"));
-        assert!(!is_valid_config_value("log_level", "invalid"));
+        run(&["reset"], &mut config, &path).await.unwrap();
+        assert_eq!(
+            config.get_default_limit(),
+            77,
+            "no change without --confirm"
+        );
+        assert_eq!(
+            Config::load_from_path(&path).unwrap().get_default_limit(),
+            77
+        );
 
-        // Test numeric values
-        assert!(is_valid_config_value("default_limit", "100"));
-        assert!(is_valid_config_value("connection_pool_size", "5"));
-        assert!(!is_valid_config_value("default_limit", "not_a_number"));
+        run(&["reset", "--confirm"], &mut config, &path)
+            .await
+            .unwrap();
+        assert_eq!(config.get_default_limit(), 50);
+        assert_eq!(
+            Config::load_from_path(&path).unwrap().get_default_limit(),
+            50
+        );
     }
 
-    fn is_valid_config_key(key: &str) -> bool {
-        matches!(
-            key,
-            "database_url"
-                | "default_queue"
-                | "default_limit"
-                | "log_level"
-                | "connection_pool_size"
-        )
-    }
-
-    fn is_valid_config_value(key: &str, value: &str) -> bool {
-        match key {
-            "database_url" => {
-                !value.is_empty()
-                    && (value.starts_with("postgres://") || value.starts_with("mysql://"))
-            }
-            "log_level" => matches!(value, "error" | "warn" | "info" | "debug" | "trace"),
-            "default_limit" | "connection_pool_size" => value.parse::<u32>().is_ok(),
-            "default_queue" => !value.is_empty() && !value.contains(' '),
-            _ => false,
-        }
+    #[tokio::test]
+    async fn show_and_path_work_with_and_without_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        run(&["show"], &mut config, &path).await.unwrap();
+        run(&["path"], &mut config, &path).await.unwrap(); // file missing
+        run(&["set", "default_queue", "q"], &mut config, &path)
+            .await
+            .unwrap();
+        run(&["path"], &mut config, &path).await.unwrap(); // file exists
+        run(&["show"], &mut config, &path).await.unwrap();
     }
 }

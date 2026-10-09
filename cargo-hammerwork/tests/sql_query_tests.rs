@@ -254,7 +254,7 @@ mod error_handling_tests {
 mod builder_tests {
     use super::*;
     use cargo_hammerwork::commands::backup::build_backup_query;
-    use cargo_hammerwork::commands::cron::{build_cron_count_query, build_next_executions_query};
+    use cargo_hammerwork::commands::cron::build_cron_select_query;
     use cargo_hammerwork::commands::job::{build_list_jobs_query, build_purge_query};
     use cargo_hammerwork::commands::maintenance::{VacuumKind, build_vacuum_query};
     use cargo_hammerwork::commands::monitor::{
@@ -282,10 +282,18 @@ mod builder_tests {
         let mut add = |name: &'static str, (sql, binds): (String, Vec<Bind>)| {
             out.push((name, sql, binds));
         };
-        add("cron_count", build_cron_count_query(backend, q, true));
         add(
-            "cron_next",
-            build_next_executions_query(backend, q, Some(now)),
+            "cron_select",
+            build_cron_select_query(backend, q, true, None),
+        );
+        add(
+            "cron_select_by_id",
+            build_cron_select_query(
+                backend,
+                q,
+                false,
+                Some("11111111-1111-1111-1111-111111111111"),
+            ),
         );
         add("status_counts", build_status_counts_query(backend, q));
         add("recent_jobs", build_recent_jobs_query(backend, q));

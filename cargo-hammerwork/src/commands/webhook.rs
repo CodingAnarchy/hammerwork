@@ -604,23 +604,28 @@ fn create_webhook_config(
     let auth = if let Some(token) = auth_token {
         Some(WebhookAuth::Bearer { token })
     } else if let Some(basic) = basic_auth {
-        let parts: Vec<&str> = basic.split(':').collect();
-        if parts.len() != 2 {
-            return Err(anyhow::anyhow!(
-                "Basic auth must be in format username:password"
-            ));
-        }
+        // Only the first ':' separates the user from the password, which may contain more.
+        let (username, password) = basic
+            .split_once(':')
+            .filter(|(user, _)| !user.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Basic auth must be in format username:password"))?;
         Some(WebhookAuth::Basic {
-            username: parts[0].to_string(),
-            password: parts[1].to_string(),
-        })
-    } else if let (Some(header), Some(key)) = (api_key_header, api_key) {
-        Some(WebhookAuth::ApiKey {
-            header_name: header,
-            api_key: key,
+            username: username.to_string(),
+            password: password.to_string(),
         })
     } else {
-        None
+        match (api_key_header, api_key) {
+            (Some(header_name), Some(api_key)) => Some(WebhookAuth::ApiKey {
+                header_name,
+                api_key,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "--api-key-header and --api-key must be given together"
+                ));
+            }
+        }
     };
 
     // Create event filter
@@ -677,7 +682,7 @@ fn parse_event_types(events_str: &str) -> Result<Vec<hammerwork::events::JobLife
 
     for event in events_str.split(',') {
         let event = event.trim();
-        let event_type = match event {
+        let event_type = match event.to_lowercase().as_str() {
             "enqueued" => JobLifecycleEventType::Enqueued,
             "started" => JobLifecycleEventType::Started,
             "completed" => JobLifecycleEventType::Completed,
@@ -697,23 +702,10 @@ fn parse_event_types(events_str: &str) -> Result<Vec<hammerwork::events::JobLife
 }
 
 fn parse_priorities(priorities_str: &str) -> Result<Vec<hammerwork::priority::JobPriority>> {
-    use hammerwork::priority::JobPriority;
-    let mut result = Vec::new();
-
-    for priority in priorities_str.split(',') {
-        let priority = priority.trim();
-        let job_priority = match priority {
-            "Background" => JobPriority::Background,
-            "Low" => JobPriority::Low,
-            "Normal" => JobPriority::Normal,
-            "High" => JobPriority::High,
-            "Critical" => JobPriority::Critical,
-            _ => return Err(anyhow::anyhow!("Invalid priority: {}", priority)),
-        };
-        result.push(job_priority);
-    }
-
-    Ok(result)
+    priorities_str
+        .split(',')
+        .map(|priority| crate::utils::validation::validate_priority(priority.trim()))
+        .collect()
 }
 
 fn parse_comma_separated(input: &str) -> Vec<String> {
@@ -724,14 +716,13 @@ fn parse_headers(headers_str: &str) -> Result<HashMap<String, String>> {
     let mut headers = HashMap::new();
 
     for header in headers_str.split(',') {
-        let parts: Vec<&str> = header.split('=').collect();
-        if parts.len() != 2 {
-            return Err(anyhow::anyhow!(
-                "Header must be in format key=value: {}",
-                header
-            ));
-        }
-        headers.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
+        // Values such as base64 tokens may end in '=', so split at the first one only.
+        let (key, value) = header
+            .split_once('=')
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .filter(|(k, _)| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Header must be in format key=value: {}", header))?;
+        headers.insert(key.to_string(), value.to_string());
     }
 
     Ok(headers)
@@ -976,5 +967,510 @@ mod tests {
         let hook = sample(&url);
         let event = build_test_event(&hook, "completed", Uuid::new_v4(), "q").unwrap();
         assert!(send_test_event(&hook, &event).await.is_err());
+    }
+
+    fn parse(args: &[&str]) -> WebhookCommand {
+        let mut argv = vec!["test"];
+        argv.extend_from_slice(args);
+        TestCli::try_parse_from(argv).unwrap().command
+    }
+
+    #[test]
+    fn parses_every_subcommand_with_its_flags_and_defaults() {
+        assert!(matches!(
+            parse(&["list"]),
+            WebhookCommand::List { detailed: false }
+        ));
+        assert!(matches!(
+            parse(&["list", "-d"]),
+            WebhookCommand::List { detailed: true }
+        ));
+        match parse(&["add", "-n", "ci", "-u", "http://h/x"]) {
+            WebhookCommand::Add {
+                name,
+                url,
+                method,
+                timeout,
+                max_retries,
+                include_payload,
+                events,
+                ..
+            } => {
+                assert_eq!((name.as_str(), url.as_str()), ("ci", "http://h/x"));
+                assert_eq!(method, "POST");
+                assert_eq!((timeout, max_retries), (30, 3));
+                assert!(!include_payload && events.is_none());
+            }
+            _ => panic!("expected Add"),
+        }
+        match parse(&[
+            "add",
+            "-n",
+            "ci",
+            "-u",
+            "http://h/x",
+            "-m",
+            "put",
+            "--events",
+            "failed,dead",
+            "--queues",
+            "a,b",
+            "--priorities",
+            "high",
+            "--headers",
+            "A=1",
+            "--auth-token",
+            "t",
+            "--basic-auth",
+            "u:p",
+            "--api-key-header",
+            "X-Key",
+            "--api-key",
+            "k",
+            "--secret",
+            "s",
+            "--timeout",
+            "9",
+            "--max-retries",
+            "1",
+            "--include-payload",
+        ]) {
+            WebhookCommand::Add {
+                method,
+                events,
+                queues,
+                priorities,
+                headers,
+                auth_token,
+                basic_auth,
+                api_key_header,
+                api_key,
+                secret,
+                timeout,
+                max_retries,
+                include_payload,
+                ..
+            } => {
+                assert_eq!(method, "put");
+                assert_eq!(events.as_deref(), Some("failed,dead"));
+                assert_eq!(queues.as_deref(), Some("a,b"));
+                assert_eq!(priorities.as_deref(), Some("high"));
+                assert_eq!(headers.as_deref(), Some("A=1"));
+                assert_eq!(auth_token.as_deref(), Some("t"));
+                assert_eq!(basic_auth.as_deref(), Some("u:p"));
+                assert_eq!(
+                    (api_key_header.as_deref(), api_key.as_deref()),
+                    (Some("X-Key"), Some("k"))
+                );
+                assert_eq!(secret.as_deref(), Some("s"));
+                assert_eq!((timeout, max_retries, include_payload), (9, 1, true));
+            }
+            _ => panic!("expected Add"),
+        }
+        assert!(matches!(
+            parse(&["remove", "-w", "ci", "--confirm"]),
+            WebhookCommand::Remove { confirm: true, .. }
+        ));
+        match parse(&["test", "-w", "ci"]) {
+            WebhookCommand::Test {
+                event_type,
+                queue,
+                job_id,
+                ..
+            } => assert_eq!(
+                (event_type.as_str(), queue.as_str(), job_id),
+                ("completed", "test", None)
+            ),
+            _ => panic!("expected Test"),
+        }
+        assert!(matches!(
+            parse(&["toggle", "-w", "ci", "--enable"]),
+            WebhookCommand::Toggle { enable: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["toggle", "-w", "ci"]),
+            WebhookCommand::Toggle { enable: false, .. }
+        ));
+        match parse(&[
+            "update",
+            "-w",
+            "ci",
+            "-n",
+            "new",
+            "-u",
+            "http://n",
+            "-m",
+            "PATCH",
+            "--events",
+            "failed",
+            "--queues",
+            "q",
+            "--priorities",
+            "low",
+            "--headers",
+            "k=v",
+            "--timeout",
+            "4",
+            "--max-retries",
+            "0",
+        ]) {
+            WebhookCommand::Update {
+                name,
+                url,
+                method,
+                timeout,
+                max_retries,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("new"));
+                assert_eq!(url.as_deref(), Some("http://n"));
+                assert_eq!(method.as_deref(), Some("PATCH"));
+                assert_eq!((timeout, max_retries), (Some(4), Some(0)));
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn headers_keep_equals_signs_in_values() {
+        let headers = parse_headers("Authorization=Basic dXNlcjpwYXNz==, X-Env = prod").unwrap();
+        assert_eq!(headers["Authorization"], "Basic dXNlcjpwYXNz==");
+        assert_eq!(headers["X-Env"], "prod");
+        for bad in ["novalue", "=v", "a=1,broken"] {
+            let err = parse_headers(bad).unwrap_err().to_string();
+            assert!(err.contains("key=value"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn event_types_and_priorities_are_case_insensitive() {
+        use hammerwork::events::JobLifecycleEventType as E;
+        use hammerwork::priority::JobPriority as P;
+        assert_eq!(
+            parse_event_types("Failed, DEAD,timed_out").unwrap(),
+            vec![E::Failed, E::Dead, E::TimedOut]
+        );
+        for (name, expected) in [
+            ("enqueued", E::Enqueued),
+            ("started", E::Started),
+            ("completed", E::Completed),
+            ("retried", E::Retried),
+            ("cancelled", E::Cancelled),
+            ("archived", E::Archived),
+            ("restored", E::Restored),
+        ] {
+            assert_eq!(parse_event_types(name).unwrap(), vec![expected]);
+        }
+        let err = parse_event_types("exploded").unwrap_err().to_string();
+        assert!(err.contains("Invalid event type: exploded"), "{err}");
+
+        // `high` (the spelling every other command takes) and `High` both work.
+        assert_eq!(
+            parse_priorities("high, Critical,low").unwrap(),
+            vec![P::High, P::Critical, P::Low]
+        );
+        assert!(parse_priorities("urgent").is_err());
+    }
+
+    #[test]
+    fn methods_and_lists_parse() {
+        use hammerwork::HttpMethod;
+        assert!(matches!(
+            parse_http_method("post").unwrap(),
+            HttpMethod::Post
+        ));
+        assert!(matches!(parse_http_method("Put").unwrap(), HttpMethod::Put));
+        assert!(matches!(
+            parse_http_method("PATCH").unwrap(),
+            HttpMethod::Patch
+        ));
+        assert!(parse_http_method("GET").is_err());
+        assert_eq!(parse_comma_separated("a, b ,c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn auth_options_build_the_matching_credentials() {
+        use hammerwork::webhooks::WebhookAuth;
+        let build =
+            |token: Option<&str>, basic: Option<&str>, header: Option<&str>, key: Option<&str>| {
+                create_webhook_config(
+                    "w".into(),
+                    "http://h/x".into(),
+                    "POST".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    token.map(String::from),
+                    basic.map(String::from),
+                    header.map(String::from),
+                    key.map(String::from),
+                    None,
+                    30,
+                    3,
+                    false,
+                )
+            };
+        assert!(matches!(
+            build(Some("tok"), None, None, None).unwrap().auth,
+            Some(WebhookAuth::Bearer { token }) if token == "tok"
+        ));
+        match build(None, Some("user:pa:ss"), None, None).unwrap().auth {
+            Some(WebhookAuth::Basic { username, password }) => {
+                assert_eq!((username.as_str(), password.as_str()), ("user", "pa:ss"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            build(None, None, Some("X-Key"), Some("v")).unwrap().auth,
+            Some(WebhookAuth::ApiKey { header_name, api_key }) if header_name == "X-Key" && api_key == "v"
+        ));
+        assert!(build(None, None, None, None).unwrap().auth.is_none());
+        for bad in [
+            build(None, Some("nocolon"), None, None),
+            build(None, Some(":nopassuser"), None, None),
+            build(None, None, Some("X-Key"), None),
+            build(None, None, None, Some("v")),
+        ] {
+            assert!(bad.is_err());
+        }
+        let config = build(None, None, None, None).unwrap();
+        assert!(
+            config.enabled && config.retry_policy.max_attempts == 3 && config.timeout_secs == 30
+        );
+        assert!(!config.filter.include_payload && config.filter.event_types.is_empty());
+    }
+
+    async fn run(config: &Config, args: &[&str]) -> Result<()> {
+        handle_webhook_command(parse(args), config).await
+    }
+
+    #[tokio::test]
+    async fn webhook_lifecycle_through_the_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hooks.json");
+        let _env = crate::utils::test_support::ScopedEnv::set(&[(
+            "HAMMERWORK_WEBHOOKS_FILE",
+            file.to_str().unwrap(),
+        )])
+        .await;
+        let config = Config::default();
+
+        // empty registry
+        run(&config, &["list"]).await.unwrap();
+        run(&config, &["list", "--detailed"]).await.unwrap();
+
+        // add: everything is persisted, duplicates and bad input are refused
+        run(
+            &config,
+            &[
+                "add",
+                "-n",
+                "ci",
+                "-u",
+                "http://localhost:9/hook",
+                "-m",
+                "put",
+                "--events",
+                "failed,dead",
+                "--queues",
+                "a, b",
+                "--priorities",
+                "high",
+                "--headers",
+                "X-Env=prod,X-Token=abc==",
+                "--auth-token",
+                "t",
+                "--secret",
+                "s",
+                "--timeout",
+                "7",
+                "--max-retries",
+                "5",
+                "--include-payload",
+            ],
+        )
+        .await
+        .unwrap();
+        let hooks = read_webhooks(&file).unwrap();
+        assert_eq!(hooks.len(), 1);
+        let hook = &hooks[0];
+        assert_eq!(hook.name, "ci");
+        assert!(matches!(hook.method, hammerwork::HttpMethod::Put));
+        assert_eq!(hook.filter.queue_names, vec!["a", "b"]);
+        assert_eq!(hook.filter.event_types.len(), 2);
+        assert_eq!(hook.headers["X-Token"], "abc==");
+        assert_eq!((hook.timeout_secs, hook.retry_policy.max_attempts), (7, 5));
+        assert!(hook.filter.include_payload && hook.enabled);
+        let id = hook.id.to_string();
+
+        let err = run(&config, &["add", "-n", "ci", "-u", "http://other/"])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        for args in [
+            vec!["add", "-n", "x", "-u", "http://h/", "-m", "GET"],
+            vec!["add", "-n", "x", "-u", "http://h/", "--events", "bogus"],
+            vec!["add", "-n", "x", "-u", "http://h/", "--priorities", "bogus"],
+            vec!["add", "-n", "x", "-u", "http://h/", "--headers", "broken"],
+        ] {
+            assert!(run(&config, &args).await.is_err(), "{args:?}");
+        }
+        assert_eq!(read_webhooks(&file).unwrap().len(), 1);
+        run(
+            &config,
+            &["add", "-n", "plain", "-u", "http://localhost:9/plain"],
+        )
+        .await
+        .unwrap();
+        run(&config, &["list"]).await.unwrap();
+        run(&config, &["list", "-d"]).await.unwrap();
+
+        // toggle by name and by id
+        run(&config, &["toggle", "-w", "ci"]).await.unwrap();
+        assert!(!read_webhooks(&file).unwrap()[0].enabled);
+        run(&config, &["toggle", "-w", &id, "--enable"])
+            .await
+            .unwrap();
+        assert!(read_webhooks(&file).unwrap()[0].enabled);
+        assert!(run(&config, &["toggle", "-w", "missing"]).await.is_err());
+
+        // update changes only what is given
+        run(
+            &config,
+            &[
+                "update",
+                "-w",
+                "ci",
+                "-n",
+                "ci2",
+                "-u",
+                "http://localhost:9/new",
+                "-m",
+                "patch",
+                "--events",
+                "completed",
+                "--queues",
+                "z",
+                "--priorities",
+                "low,critical",
+                "--headers",
+                "K=V",
+                "--timeout",
+                "2",
+                "--max-retries",
+                "0",
+            ],
+        )
+        .await
+        .unwrap();
+        let hooks = read_webhooks(&file).unwrap();
+        let hook = hooks.iter().find(|h| h.id.to_string() == id).unwrap();
+        assert_eq!(hook.name, "ci2");
+        assert_eq!(hook.url, "http://localhost:9/new");
+        assert!(matches!(hook.method, hammerwork::HttpMethod::Patch));
+        assert_eq!(hook.filter.queue_names, vec!["z"]);
+        assert_eq!(hook.filter.priorities.len(), 2);
+        assert_eq!(hook.headers.len(), 1);
+        assert_eq!((hook.timeout_secs, hook.retry_policy.max_attempts), (2, 0));
+        assert_eq!(hook.secret.as_deref(), Some("s"), "untouched fields stay");
+        run(&config, &["update", "-w", "plain"]).await.unwrap(); // nothing to change is fine
+        assert!(
+            run(&config, &["update", "-w", "missing", "-n", "x"])
+                .await
+                .is_err()
+        );
+        assert!(
+            run(&config, &["update", "-w", "ci2", "-m", "GET"])
+                .await
+                .is_err()
+        );
+        assert!(
+            run(&config, &["update", "-w", "ci2", "--events", "bogus"])
+                .await
+                .is_err()
+        );
+
+        // test: delivers a real request; a failing endpoint is an error
+        let (url, server) = one_shot_server(200).await;
+        run(&config, &["update", "-w", "ci2", "-u", &url, "-m", "post"])
+            .await
+            .unwrap();
+        run(
+            &config,
+            &[
+                "test",
+                "-w",
+                "ci2",
+                "--event-type",
+                "failed",
+                "--queue",
+                "orders",
+            ],
+        )
+        .await
+        .unwrap();
+        let raw = server.await.unwrap();
+        let (_, body) = raw.split_once("\r\n\r\n").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(sent["queue_name"], "orders");
+        assert_eq!(sent["event_type"], "failed");
+
+        let (url, _server) = one_shot_server(503).await;
+        run(&config, &["update", "-w", "plain", "-u", &url])
+            .await
+            .unwrap();
+        let err = run(
+            &config,
+            &[
+                "test",
+                "-w",
+                "plain",
+                "--job-id",
+                &Uuid::new_v4().to_string(),
+            ],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("HTTP 503"), "{err}");
+        run(&config, &["toggle", "-w", "plain"]).await.unwrap();
+        let (url, _server) = one_shot_server(200).await;
+        run(&config, &["update", "-w", "plain", "-u", &url])
+            .await
+            .unwrap();
+        run(&config, &["test", "-w", "plain"]).await.unwrap(); // disabled webhooks can still be tested
+        assert!(run(&config, &["test", "-w", "missing"]).await.is_err());
+        assert!(
+            run(&config, &["test", "-w", "plain", "--job-id", "nope"])
+                .await
+                .is_err()
+        );
+        assert!(
+            run(&config, &["test", "-w", "plain", "--event-type", "bogus"])
+                .await
+                .is_err()
+        );
+
+        // remove needs --confirm; removes by name or id
+        let err = run(&config, &["remove", "-w", "ci2"])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--confirm"), "{err}");
+        assert_eq!(read_webhooks(&file).unwrap().len(), 2);
+        run(&config, &["remove", "-w", &id, "--confirm"])
+            .await
+            .unwrap();
+        run(&config, &["remove", "-w", "plain", "--confirm"])
+            .await
+            .unwrap();
+        assert!(read_webhooks(&file).unwrap().is_empty());
+        assert!(
+            run(&config, &["remove", "-w", "plain", "--confirm"])
+                .await
+                .is_err()
+        );
     }
 }

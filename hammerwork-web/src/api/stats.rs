@@ -61,6 +61,7 @@
 //!     time_range: Some(time_range),
 //!     queues: Some(vec!["email".to_string(), "notifications".to_string()]),
 //!     granularity: Some("hour".to_string()),
+//!     hours: None,
 //! };
 //!
 //! assert!(query.time_range.is_some());
@@ -236,6 +237,8 @@ pub struct StatsQuery {
     pub time_range: Option<TimeRange>,
     pub queues: Option<Vec<String>>,
     pub granularity: Option<String>, // "hour", "day", "week"
+    /// The last N hours (alternative to `time_range`, which a query string cannot carry).
+    pub hours: Option<u32>,
 }
 
 /// Create statistics routes
@@ -443,6 +446,15 @@ fn resolve_range(
     query: &StatsQuery,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), String> {
+    if let Some(hours) = query.hours {
+        if hours == 0 || i64::from(hours) > MAX_BUCKETS {
+            return Err(format!("hours must be between 1 and {}", MAX_BUCKETS));
+        }
+        return Ok((
+            hour_floor(now) - chrono::Duration::hours(i64::from(hours) - 1),
+            now,
+        ));
+    }
     match &query.time_range {
         Some(range) => {
             if range.start >= range.end {

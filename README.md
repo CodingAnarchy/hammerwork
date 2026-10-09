@@ -77,8 +77,8 @@ hammerwork-web = { version = "1.15", features = ["postgres"] }
 Start the dashboard:
 
 ```bash
-hammerwork-web --database-url postgresql://localhost/hammerwork
-# Dashboard available at http://localhost:8080
+hammerwork-web --database-url postgresql://localhost/hammerwork --no-auth
+# Dashboard available at http://localhost:8080 (use --auth with --password-file outside local development)
 ```
 
 ## Quick Start
@@ -440,8 +440,8 @@ See [Job Encryption & PII Protection](docs/encryption.md) for details.
 Start the real-time web dashboard for monitoring and managing your job queues:
 
 ```bash
-# Start with PostgreSQL
-hammerwork-web --database-url postgresql://localhost/hammerwork
+# Start with PostgreSQL, without authentication (local development only)
+hammerwork-web --database-url postgresql://localhost/hammerwork --no-auth
 
 # Start with authentication
 hammerwork-web \
@@ -483,7 +483,7 @@ cargo hammerwork migrate --database-url postgresql://localhost/hammerwork
 cargo hammerwork status --database-url postgresql://localhost/hammerwork
 
 # Start the web dashboard after migrations
-hammerwork-web --database-url postgresql://localhost/hammerwork
+hammerwork-web --database-url postgresql://localhost/hammerwork --no-auth
 ```
 
 ### Application Usage
