@@ -157,7 +157,7 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:16-alpine
+        image: public.ecr.aws/docker/library/postgres:16-alpine
         env:
           POSTGRES_DB: hammerwork_test
           POSTGRES_USER: postgres
@@ -195,7 +195,7 @@ jobs:
     timeout-minutes: 60
     services:
       mysql:
-        image: mysql:8.0
+        image: public.ecr.aws/docker/library/mysql:8.0
         env:
           MYSQL_DATABASE: hammerwork_test
           MYSQL_ROOT_PASSWORD: password
@@ -237,7 +237,7 @@ jobs:
     timeout-minutes: 90
     services:
       postgres:
-        image: postgres:16-alpine
+        image: public.ecr.aws/docker/library/postgres:16-alpine
         env:
           POSTGRES_DB: hammerwork_test
           POSTGRES_USER: postgres
@@ -250,7 +250,7 @@ jobs:
         ports:
           - 5432:5432
       mysql:
-        image: mysql:8.0
+        image: public.ecr.aws/docker/library/mysql:8.0
         env:
           MYSQL_DATABASE: hammerwork_test
           MYSQL_ROOT_PASSWORD: password
