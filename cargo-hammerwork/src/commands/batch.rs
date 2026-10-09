@@ -27,7 +27,7 @@ pub enum BatchCommand {
             short = 'n',
             short_alias = 'Q',
             long,
-            help = "Queue to enqueue the jobs into (required)"
+            help = "Queue for jobs whose line has no \"queue\" of its own (required)"
         )]
         queue: String,
         #[arg(short = 'r', long, help = "Default priority")]

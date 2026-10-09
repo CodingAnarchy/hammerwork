@@ -78,7 +78,7 @@ Every command group and subcommand below exists in the CLI; run
 
 - **Global flags**: `-v/--verbose` and `-q/--quiet` are accepted by every command.
 - **Database URL**: every command that touches the database accepts `--database-url`
-  (short form `-u`, except `queue` commands where it is `-d`). When the flag is omitted the
+  (short form `-u`; `queue` commands also still accept the old `-d`). When the flag is omitted the
   URL comes from the `DATABASE_URL` environment variable, then from `database_url` in the
   config file (see [Configuration System](#configuration-system)). If none is set the
   command fails with `Database URL is required`. The `config`, `webhook` and
@@ -89,8 +89,12 @@ Every command group and subcommand below exists in the CLI; run
   `maintenance purge-encrypted`, `archive purge`, `backup restore`, `cron delete`,
   `webhook remove`, `config reset`) refuse to run without `--confirm`. Where a command has
   `--dry-run`, that previews the change without `--confirm`.
-- **Job IDs** are passed as `--job-id <job-id>` on `job retry` / `job cancel`, and as a
-  positional argument on `job show`, `cron enable|disable|update|delete`,
+- **Queue filter**: `-n/--queue` on every command that takes one (`-Q` and
+  `archive --queue-name` remain as aliases).
+- **Connect timeout**: connecting to an unreachable database fails after 10 seconds. Change
+  it with `connect_timeout_secs` in the config file, `config set connect_timeout_secs N`
+  (1-600) or the `HAMMERWORK_CONNECT_TIMEOUT` environment variable.
+- **Job IDs** are positional arguments on `job show`, `job retry`, `job cancel`, `cron enable|disable|update|delete`,
   `workflow dependencies`, `archive restore` and `spawn tree|lineage`.
 - **Statuses** are `pending`, `running`, `completed`, `failed`, `dead`, `retrying`,
   `timed_out`. **Priorities** are `background`, `low`, `normal`, `high`, `critical`.
@@ -120,9 +124,9 @@ cargo hammerwork config reset --confirm         # Back to defaults
 ```
 
 Valid keys for `set` and `get` are `database_url`, `default_queue`, `default_limit`,
-`log_level` and `connection_pool_size`. `set` validates the value (the database URL must
+`log_level`, `connection_pool_size` and `connect_timeout_secs`. `set` validates the value (the database URL must
 start with `postgres://`, `postgresql://` or `mysql://`, `log_level` must be one of
-`trace`, `debug`, `info`, `warn`, `error`, and `connection_pool_size` must be 1-100).
+`trace`, `debug`, `info`, `warn`, `error`, and `connection_pool_size` must be 1-100, `connect_timeout_secs` 1-600).
 
 ### Job Management Commands
 
@@ -138,11 +142,11 @@ cargo hammerwork job show <job-id>                # Detailed job information
 cargo hammerwork job enqueue --queue emails --payload '{"to": "a@example.com"}'
 cargo hammerwork job enqueue --queue emails --payload '{"n": 1}' --priority high --delay 60 --max-attempts 5 --timeout 30
 
-cargo hammerwork job retry --job-id <job-id>      # Retry one job
+cargo hammerwork job retry <job-id>                 # Retry one job (--job-id also works)
 cargo hammerwork job retry --queue emails         # Retry every failed job in a queue
 cargo hammerwork job retry --all                  # Retry every failed job
 
-cargo hammerwork job cancel --job-id <job-id>     # Cancel one pending job
+cargo hammerwork job cancel <job-id>                # Cancel one pending job
 cargo hammerwork job cancel --queue emails        # Cancel the pending jobs of a queue
 cargo hammerwork job cancel --all-pending
 
@@ -154,11 +158,11 @@ cargo hammerwork job requeue-stale --older-than-secs 3600
 
 - `job enqueue` requires `--queue` and `--payload`; `--payload` must be valid JSON,
   `--delay` and `--timeout` are in seconds.
-- `job retry` and `job cancel` need one of `--job-id`, `--queue` or the `--all` /
+- `job retry` and `job cancel` need one of a job ID (positional or `--job-id`), `--queue` or the `--all` /
   `--all-pending` flag. Only failed, dead and timed-out jobs are retried and only pending jobs are
   cancelled. There is no `job delete`.
 - `job purge` needs at least one of `--completed`, `--dead`, `--failed`, optionally
-  narrowed with `--queue` (short form `-Q`) and `--older-than-days`, plus `--confirm`.
+  narrowed with `--queue` and `--older-than-days`, plus `--confirm`.
 - `job requeue-stale` moves `Running` jobs whose lease has expired (their worker crashed
   or was killed) back to `Pending`, or to `Dead` when they have no attempts left. Jobs
   that never recorded a lease are reclaimed once they started more than
@@ -185,8 +189,7 @@ with `job requeue-stale`. `--jobs` also lists every running job. Needs migration
 
 ### Queue Management Commands
 
-Inspect and control queues. Note that `queue` commands take `-d` as the short form of
-`--database-url`.
+Inspect and control queues.
 
 ```bash
 cargo hammerwork queue list
@@ -228,7 +231,7 @@ Operate on many jobs at once.
 ```bash
 # Enqueue from a JSON-lines file, or from stdin when --file is omitted
 cargo hammerwork batch enqueue --file jobs.jsonl --queue emails
-cargo hammerwork batch enqueue --queue emails --priority low --continue-on-error --batch-size 500
+cargo hammerwork batch enqueue --queue emails --priority low --continue-on-error --progress-every 500
 
 # Retry or cancel by criteria (preview first with --dry-run)
 cargo hammerwork batch retry --queue emails --status failed --dry-run
@@ -243,8 +246,8 @@ cargo hammerwork batch export --output jobs.csv --format csv --include-payload -
 - `batch enqueue` requires `--queue`, the default for lines without their own. Each line
   is a JSON object: `{"queue": "emails", "payload": {"to": "a@example.com"}, "priority": "high"}`.
   `payload` is required, `queue` and `priority` are optional. A bad line stops the run
-  unless `--continue-on-error` is given; `--batch-size` only controls how often progress
-  is printed.
+  unless `--continue-on-error` is given; `--progress-every` (alias `--batch-size`) only controls how
+  often progress is printed.
 - `batch retry` takes `--status failed` or `--status dead`; `batch cancel` takes
   `--status pending` or `--status running`. Both refuse to run without `--confirm` or
   `--dry-run`. There is no `batch create` or `batch status`, and jobs are selected by
@@ -356,8 +359,7 @@ cargo hammerwork spawn monitor --queue emails --interval 5
 ```
 
 `spawn tree --format` is `text`, `json` or `mermaid`; `--full` shows the tree both up and
-down from the job. `spawn list`, `stats`, `pending` and `monitor` filter by queue (`--queue`
-or `-Q`, depending on the command; check `--help`).
+down from the job. `spawn list`, `stats`, `pending` and `monitor` filter by `-n/--queue`.
 
 ### Archive Commands
 
@@ -365,10 +367,10 @@ Archival and retention of finished jobs.
 
 ```bash
 cargo hammerwork archive run --dry-run
-cargo hammerwork archive run --queue-name emails --completed-after-days 7 --failed-after-days 30 --reason "monthly cleanup"
-cargo hammerwork archive run --compress false --batch-size 500
+cargo hammerwork archive run --queue emails --completed-after-days 7 --failed-after-days 30 --reason "monthly cleanup"
+cargo hammerwork archive run --no-compress --batch-size 500
 
-cargo hammerwork archive list --queue-name emails --limit 50 --offset 0 --format json
+cargo hammerwork archive list --queue emails --limit 50 --offset 0 --format json
 cargo hammerwork archive stats --format json
 cargo hammerwork archive restore <job-id>
 cargo hammerwork archive purge --older-than-days 365 --dry-run
