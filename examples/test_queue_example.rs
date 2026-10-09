@@ -506,7 +506,10 @@ async fn error_handling_example() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n🔄 Attempt 1:");
         match email_handler(job.clone()).await {
             Err(e) => {
-                queue.fail_job(job.id, &e.to_string()).await?;
+                // Like a worker: retry while the job has attempts left.
+                assert!(job.attempts < job.max_attempts);
+                let retry_at = clock.now() + Duration::minutes(5);
+                queue.retry_job(job.id, retry_at).await?;
                 println!("   ❌ Failed: {}", e);
 
                 let job_state = queue.get_job(job.id).await?.unwrap();
@@ -519,9 +522,6 @@ async fn error_handling_example() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Schedule retry
-    let retry_at = clock.now() + Duration::minutes(5);
-    queue.retry_job(job_id, retry_at).await?;
     println!("⏳ Scheduled retry in 5 minutes");
 
     // Advance time and retry
@@ -532,7 +532,8 @@ async fn error_handling_example() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n🔄 Attempt 2:");
         match email_handler(job.clone()).await {
             Err(e) => {
-                queue.fail_job(job.id, &e.to_string()).await?;
+                assert!(job.attempts < job.max_attempts);
+                queue.retry_job(job.id, clock.now()).await?;
                 println!("   ❌ Failed again: {}", e);
 
                 let job_state = queue.get_job(job.id).await?.unwrap();
@@ -546,13 +547,13 @@ async fn error_handling_example() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Attempt 3 (final)
-    queue.retry_job(job_id, clock.now()).await?;
-
     if let Some(job) = queue.dequeue("email_queue").await? {
         println!("\n🔄 Attempt 3 (final):");
         match email_handler(job.clone()).await {
             Err(e) => {
-                queue.fail_job(job.id, &e.to_string()).await?;
+                // The last attempt failed: the job is dead.
+                assert_eq!(job.attempts, job.max_attempts);
+                queue.mark_job_dead(job.id, &e.to_string()).await?;
                 println!("   ❌ Failed permanently: {}", e);
 
                 let job_state = queue.get_job(job.id).await?.unwrap();

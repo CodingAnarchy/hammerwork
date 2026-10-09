@@ -92,14 +92,25 @@ impl WorkflowStatus {
 }
 
 /// Policy for handling failures in workflows.
+///
+/// It applies when a job of the workflow fails terminally (`Failed`, `Dead` or
+/// `TimedOut`), not when a failed run is retried. See
+/// [`DatabaseQueue::fail_job_dependencies`](crate::queue::DatabaseQueue::fail_job_dependencies).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FailurePolicy {
-    /// Stop the entire workflow when any job fails
+    /// Stop the entire workflow when any job fails: its `Pending` and `Retrying` jobs
+    /// (and any job depending on the failed one) become `Failed`, and the workflow
+    /// `Failed`. Jobs already running finish their run.
     #[default]
     FailFast,
-    /// Continue executing jobs that don't depend on failed jobs
+    /// Continue executing jobs that don't depend on failed jobs. The jobs that
+    /// (transitively) depend on a failed job become `Failed`; the workflow becomes
+    /// `Failed` once all its jobs have finished.
     ContinueOnFailure,
-    /// Require manual intervention to decide how to handle failures
+    /// Require manual intervention to decide how to handle failures. Nothing is failed
+    /// automatically: the dependents of a failed job keep waiting, and the workflow
+    /// stays `Running`, until an operator retries the failed job (its completion then
+    /// releases them) or cancels the workflow.
     Manual,
 }
 
