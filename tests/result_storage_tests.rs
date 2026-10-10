@@ -256,24 +256,30 @@ mod postgres_tests {
                 .unwrap();
         }
 
-        // Clean up expired results
-        // Other tests share the table and may leave expired results behind
-        // concurrently, so the count is a lower bound; the per-job checks below
-        // verify exactly which of our results were removed.
-        let cleaned_count = queue.cleanup_expired_results().await.unwrap();
-        assert!(
-            cleaned_count >= 3,
-            "expected at least 3 expired results cleaned, got {}",
-            cleaned_count
-        );
+        // Clean up expired results. Worker pools in other tests clean expired results on
+        // their own schedule too, so the count returned here is not ours alone; check the
+        // stored rows instead. (Expired results are hidden by `get_job_result` either way,
+        // so only the row shows whether cleanup removed them.)
+        queue.cleanup_expired_results().await.unwrap();
 
-        // Verify only non-expired results remain
         for (i, job_id) in job_ids.iter().enumerate() {
+            let stored = queue.get_job(*job_id).await.unwrap().unwrap().result_data;
             let result = queue.get_job_result(*job_id).await.unwrap();
             if i < 3 {
-                assert!(result.is_none(), "Job {} result should be expired", i);
+                assert!(
+                    stored.is_none(),
+                    "job {i}: the expired result is still stored"
+                );
+                assert!(
+                    result.is_none(),
+                    "job {i}: the expired result is still readable"
+                );
             } else {
-                assert!(result.is_some(), "Job {} result should still exist", i);
+                assert!(stored.is_some(), "job {i}: an unexpired result was removed");
+                assert!(
+                    result.is_some(),
+                    "job {i}: an unexpired result is not readable"
+                );
             }
         }
     }

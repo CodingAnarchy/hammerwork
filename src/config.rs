@@ -532,6 +532,30 @@ pub struct WorkerConfig {
 
     /// Maximum number of workers (for autoscaling)
     pub max_workers: usize,
+
+    /// Whether a pool built with
+    /// [`WorkerPool::from_hammerwork_config`](crate::WorkerPool::from_hammerwork_config)
+    /// clears expired job results every `result_cleanup_interval` (default `true`; see
+    /// [`WorkerPool::with_result_cleanup`](crate::WorkerPool::with_result_cleanup)).
+    /// Expired results are never returned, so clearing them only frees space.
+    #[serde(default = "default_result_cleanup_enabled")]
+    pub result_cleanup_enabled: bool,
+
+    /// How often expired job results are cleared ("5m", "1h", ...; default 5 minutes).
+    /// Must be greater than zero when `result_cleanup_enabled`.
+    #[serde(default = "default_result_cleanup_interval", with = "serde_duration")]
+    pub result_cleanup_interval: StdDuration,
+}
+
+/// Default [`WorkerConfig::result_cleanup_interval`]: five minutes.
+pub const DEFAULT_RESULT_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(300);
+
+fn default_result_cleanup_enabled() -> bool {
+    true
+}
+
+fn default_result_cleanup_interval() -> StdDuration {
+    DEFAULT_RESULT_CLEANUP_INTERVAL
 }
 
 impl Default for WorkerConfig {
@@ -549,14 +573,17 @@ impl Default for WorkerConfig {
             autoscaling_enabled: false,
             min_workers: 1,
             max_workers: 16,
+            result_cleanup_enabled: true,
+            result_cleanup_interval: DEFAULT_RESULT_CLEANUP_INTERVAL,
         }
     }
 }
 
 impl WorkerConfig {
     /// Reject settings that cannot work: a zero `polling_interval` (idle workers would
-    /// poll in a tight loop) or a zero `job_timeout` (every job would time out before
-    /// its handler ran). Called when a configuration is loaded
+    /// poll in a tight loop), a zero `job_timeout` (every job would time out before
+    /// its handler ran) or a zero `result_cleanup_interval` with result cleanup enabled
+    /// (the pool would clean up in a tight loop). Called when a configuration is loaded
     /// ([`HammerworkConfig::from_file`], [`HammerworkConfig::from_env`]) and by
     /// [`WorkerPool::from_hammerwork_config`](crate::WorkerPool::from_hammerwork_config).
     pub fn validate(&self) -> crate::Result<()> {
@@ -568,6 +595,11 @@ impl WorkerConfig {
         if self.job_timeout.is_zero() {
             return Err(crate::HammerworkError::Config(
                 "worker.job_timeout must be greater than zero".to_string(),
+            ));
+        }
+        if self.result_cleanup_enabled && self.result_cleanup_interval.is_zero() {
+            return Err(crate::HammerworkError::Config(
+                "worker.result_cleanup_interval must be greater than zero".to_string(),
             ));
         }
         Ok(())
@@ -1113,6 +1145,11 @@ impl std::fmt::Display for KeySourceRef {
 ///
 /// [encryption.decryption_keys]   # decrypt-only keys of earlier key ids
 /// "key-2026-04" = "env://HAMMERWORK_ENCRYPTION_KEY_2026_04"
+///
+/// [encryption.key_rotation]   # rotate KeyManager keys as they fall due
+/// enabled = true
+/// master_key_source = "env://HAMMERWORK_MASTER_KEY"
+/// check_interval_secs = 3600
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1146,6 +1183,70 @@ pub struct PayloadEncryptionConfig {
 
     /// Decrypt-only keys by key id, for payloads encrypted under earlier key ids.
     pub decryption_keys: std::collections::BTreeMap<String, KeySourceRef>,
+
+    /// Automatic rotation of the keys stored by
+    /// [`KeyManager`](crate::encryption::KeyManager) (`[encryption.key_rotation]`, off by
+    /// default). Independent of `enabled`.
+    pub key_rotation: KeyRotationConfig,
+}
+
+/// Automatic rotation of [`KeyManager`](crate::encryption::KeyManager) keys
+/// (`[encryption.key_rotation]`).
+///
+/// When `enabled`, a pool built with
+/// [`WorkerPool::from_hammerwork_config`](crate::WorkerPool::from_hammerwork_config)
+/// creates a `KeyManager` on the pool's database with `master_key_source` when it starts,
+/// and every `check_interval_secs` rotates the keys whose `next_rotation_at` has passed
+/// (see [`WorkerPool::with_key_rotation`](crate::WorkerPool::with_key_rotation)). Keys are
+/// due according to their own rotation interval, set when they are generated or with
+/// `KeyManager::update_key_rotation_schedule`. Needs the `encryption` feature.
+///
+/// Several processes can rotate at once: each due key gets exactly one new version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyRotationConfig {
+    /// Whether the worker pool rotates due keys (default `false`).
+    pub enabled: bool,
+
+    /// Master key of the `KeyManager` (default `env://HAMMERWORK_MASTER_KEY`), the key
+    /// that encrypts the stored keys.
+    pub master_key_source: KeySourceRef,
+
+    /// How often to look for due keys, in seconds (default 3600). Must be greater than
+    /// zero.
+    pub check_interval_secs: u64,
+
+    /// Versions of each key kept after a rotation (default 10; 0 keeps all of them).
+    pub max_key_versions: u32,
+}
+
+impl Default for KeyRotationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            master_key_source: KeySourceRef("env://HAMMERWORK_MASTER_KEY".to_string()),
+            check_interval_secs: 3600,
+            max_key_versions: 10,
+        }
+    }
+}
+
+impl KeyRotationConfig {
+    /// How often the pool looks for keys due for rotation.
+    pub fn check_interval(&self) -> StdDuration {
+        StdDuration::from_secs(self.check_interval_secs)
+    }
+
+    /// The [`KeyManagerConfig`](crate::encryption::KeyManagerConfig) the pool creates its
+    /// `KeyManager` with: `master_key_source`, `max_key_versions`, and automatic rotation
+    /// on.
+    #[cfg(feature = "encryption")]
+    pub fn key_manager_config(&self) -> crate::encryption::KeyManagerConfig {
+        crate::encryption::KeyManagerConfig::new()
+            .with_master_key_source(self.master_key_source.key_source())
+            .with_auto_rotation_enabled(true)
+            .with_max_key_versions(self.max_key_versions)
+    }
 }
 
 impl PayloadEncryptionConfig {
@@ -1157,6 +1258,9 @@ impl PayloadEncryptionConfig {
         // expire), and a zero interval would run it in a tight loop.
         if self.purge_interval_secs == Some(0) {
             return error("encryption.purge_interval_secs must be greater than zero");
+        }
+        if self.key_rotation.enabled && self.key_rotation.check_interval_secs == 0 {
+            return error("encryption.key_rotation.check_interval_secs must be greater than zero");
         }
         if !self.enabled {
             if !self.encrypted_queues.is_empty() {
@@ -1272,8 +1376,9 @@ impl PayloadEncryptionConfig {
     ///
     /// `HAMMERWORK_ENCRYPTION_ENABLED`, `_ALGORITHM`, `_KEY_SOURCE`, `_KEY_ID`,
     /// `_COMPRESSION`, `_DEFAULT_RETENTION_SECS`, `_PURGE_INTERVAL_SECS`,
-    /// `_ENCRYPTED_QUEUES` (comma-separated) and `_DECRYPTION_KEYS`
-    /// (`id=source,id=source`). An invalid value is an error rather than ignored, so a
+    /// `_ENCRYPTED_QUEUES` (comma-separated), `_DECRYPTION_KEYS`
+    /// (`id=source,id=source`), and for `key_rotation` `_KEY_ROTATION_ENABLED`,
+    /// `_KEY_ROTATION_MASTER_KEY_SOURCE` and `_KEY_ROTATION_CHECK_INTERVAL_SECS`. An invalid value is an error rather than ignored, so a
     /// typo cannot silently disable encryption. (`HAMMERWORK_ENCRYPTION_KEY` is the
     /// default key source, the key itself, not a setting.)
     pub fn apply_env(&mut self) -> crate::Result<()> {
@@ -1301,6 +1406,8 @@ impl PayloadEncryptionConfig {
         const RETENTION: &str = "HAMMERWORK_ENCRYPTION_DEFAULT_RETENTION_SECS";
         const PURGE: &str = "HAMMERWORK_ENCRYPTION_PURGE_INTERVAL_SECS";
         const DECRYPTION_KEYS: &str = "HAMMERWORK_ENCRYPTION_DECRYPTION_KEYS";
+        const ROTATION_ENABLED: &str = "HAMMERWORK_ENCRYPTION_KEY_ROTATION_ENABLED";
+        const ROTATION_INTERVAL: &str = "HAMMERWORK_ENCRYPTION_KEY_ROTATION_CHECK_INTERVAL_SECS";
 
         if let Some(value) = var(ENABLED) {
             self.enabled = parse_bool(ENABLED, &value)?;
@@ -1343,6 +1450,15 @@ impl PayloadEncryptionConfig {
                 );
             }
             self.decryption_keys = keys;
+        }
+        if let Some(value) = var(ROTATION_ENABLED) {
+            self.key_rotation.enabled = parse_bool(ROTATION_ENABLED, &value)?;
+        }
+        if let Some(value) = var("HAMMERWORK_ENCRYPTION_KEY_ROTATION_MASTER_KEY_SOURCE") {
+            self.key_rotation.master_key_source = KeySourceRef::parse(value.trim())?;
+        }
+        if let Some(value) = var(ROTATION_INTERVAL) {
+            self.key_rotation.check_interval_secs = parse_secs(ROTATION_INTERVAL, &value)?;
         }
         Ok(())
     }
@@ -2407,5 +2523,168 @@ service_name = "hammerwork"
         std::fs::write(&path, "[encryption]\nenabled = \"yes\"\n").unwrap();
         let err = PayloadEncryptionConfig::load(Some(&path)).unwrap_err();
         assert!(err.to_string().contains("hammerwork.toml"), "{err}");
+    }
+
+    /// A `[worker]` section written before 2.1 (without the result cleanup keys) loads
+    /// with result cleanup on every 5 minutes; the keys round-trip and are validated.
+    #[test]
+    fn test_worker_result_cleanup_settings() {
+        let old = r#"
+pool_size = 4
+polling_interval = "1s"
+job_timeout = "5m"
+autoscaling_enabled = false
+min_workers = 1
+max_workers = 10
+priority_weights = { strict_priority = false, weights = { Normal = 5 } }
+retry_strategy = { type = "Fixed", duration_ms = 1000 }
+"#;
+        let worker: WorkerConfig = toml::from_str(old).unwrap();
+        assert!(worker.result_cleanup_enabled);
+        assert_eq!(worker.result_cleanup_interval, StdDuration::from_secs(300));
+        assert_eq!(
+            WorkerConfig::default().result_cleanup_interval,
+            DEFAULT_RESULT_CLEANUP_INTERVAL
+        );
+
+        let custom: WorkerConfig = toml::from_str(&format!(
+            "{old}result_cleanup_enabled = false\nresult_cleanup_interval = \"30s\"\n"
+        ))
+        .unwrap();
+        assert!(!custom.result_cleanup_enabled);
+        assert_eq!(custom.result_cleanup_interval, StdDuration::from_secs(30));
+        let round_trip: WorkerConfig = toml::from_str(&toml::to_string(&custom).unwrap()).unwrap();
+        assert!(!round_trip.result_cleanup_enabled);
+        assert_eq!(
+            round_trip.result_cleanup_interval,
+            StdDuration::from_secs(30)
+        );
+
+        let zero = WorkerConfig {
+            result_cleanup_interval: StdDuration::ZERO,
+            ..WorkerConfig::default()
+        };
+        let err = zero.validate().unwrap_err().to_string();
+        assert!(err.contains("result_cleanup_interval"), "{err}");
+        // A zero interval is fine while cleanup is off.
+        assert!(
+            WorkerConfig {
+                result_cleanup_enabled: false,
+                ..zero
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_encryption_key_rotation_section() {
+        // Absent: off, with the documented defaults.
+        let section: PayloadEncryptionConfig = toml::from_str(encryption_toml()).unwrap();
+        assert_eq!(section.key_rotation, KeyRotationConfig::default());
+        assert!(!section.key_rotation.enabled);
+        assert_eq!(
+            section.key_rotation.master_key_source.as_str(),
+            "env://HAMMERWORK_MASTER_KEY"
+        );
+        assert_eq!(
+            section.key_rotation.check_interval(),
+            StdDuration::from_secs(3600)
+        );
+        assert_eq!(section.key_rotation.max_key_versions, 10);
+
+        let section: PayloadEncryptionConfig = toml::from_str(
+            "[key_rotation]\nenabled = true\nmaster_key_source = \"env://MY_MASTER\"\n\
+             check_interval_secs = 60\nmax_key_versions = 3\n",
+        )
+        .unwrap();
+        assert!(section.key_rotation.enabled);
+        assert!(!section.enabled, "independent of payload encryption");
+        assert_eq!(
+            section.key_rotation.check_interval(),
+            StdDuration::from_secs(60)
+        );
+        section.validate().unwrap();
+        let round_trip: PayloadEncryptionConfig =
+            toml::from_str(&toml::to_string(&section).unwrap()).unwrap();
+        assert_eq!(round_trip, section);
+
+        // Typos, inline keys and a zero interval are rejected.
+        assert!(
+            toml::from_str::<PayloadEncryptionConfig>("[key_rotation]\nenabeld = true\n").is_err()
+        );
+        assert!(
+            toml::from_str::<PayloadEncryptionConfig>(
+                "[key_rotation]\nmaster_key_source = \"QUFBQQ==\"\n"
+            )
+            .is_err()
+        );
+        let zero = PayloadEncryptionConfig {
+            key_rotation: KeyRotationConfig {
+                enabled: true,
+                check_interval_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = zero.validate().unwrap_err().to_string();
+        assert!(err.contains("key_rotation.check_interval_secs"), "{err}");
+
+        // Environment variables
+        let mut section = PayloadEncryptionConfig::default();
+        section
+            .apply_vars(|name| {
+                match name {
+                    "HAMMERWORK_ENCRYPTION_KEY_ROTATION_ENABLED" => Some("on"),
+                    "HAMMERWORK_ENCRYPTION_KEY_ROTATION_MASTER_KEY_SOURCE" => {
+                        Some("env://ROTATION_MASTER")
+                    }
+                    "HAMMERWORK_ENCRYPTION_KEY_ROTATION_CHECK_INTERVAL_SECS" => Some("120"),
+                    _ => None,
+                }
+                .map(str::to_string)
+            })
+            .unwrap();
+        assert!(section.key_rotation.enabled);
+        assert_eq!(
+            section.key_rotation.master_key_source.as_str(),
+            "env://ROTATION_MASTER"
+        );
+        assert_eq!(section.key_rotation.check_interval_secs, 120);
+        for (name, value) in [
+            ("HAMMERWORK_ENCRYPTION_KEY_ROTATION_ENABLED", "maybe"),
+            (
+                "HAMMERWORK_ENCRYPTION_KEY_ROTATION_CHECK_INTERVAL_SECS",
+                "1h",
+            ),
+            (
+                "HAMMERWORK_ENCRYPTION_KEY_ROTATION_MASTER_KEY_SOURCE",
+                "QUFBQQ==",
+            ),
+        ] {
+            let mut section = PayloadEncryptionConfig::default();
+            let result = section.apply_vars(|n| (n == name).then(|| value.to_string()));
+            assert!(result.is_err(), "{name}={value}");
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn test_key_rotation_key_manager_config() {
+        use crate::encryption::KeySource;
+
+        let rotation = KeyRotationConfig {
+            enabled: true,
+            master_key_source: KeySourceRef::parse("env://ROTATION_MASTER").unwrap(),
+            check_interval_secs: 30,
+            max_key_versions: 4,
+        };
+        let config = rotation.key_manager_config();
+        assert!(config.auto_rotation_enabled);
+        assert_eq!(config.max_key_versions, 4);
+        assert_eq!(
+            config.master_key_source,
+            KeySource::Environment("ROTATION_MASTER".to_string())
+        );
     }
 }

@@ -347,7 +347,7 @@ pub struct KeyAuditRecord {
 }
 
 /// Types of key operations that can be audited
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum KeyOperation {
     /// Key was created
     Create,
@@ -363,6 +363,103 @@ pub enum KeyOperation {
     Delete,
     /// Key metadata was updated
     Update,
+}
+
+/// Default number of records [`KeyManager::audit_log`] returns.
+pub const DEFAULT_AUDIT_LOG_LIMIT: u32 = 100;
+
+/// Which records of `hammerwork_key_audit_log` [`KeyManager::audit_log`] returns.
+///
+/// Every criterion is optional; records must match all that are set. Results are
+/// newest first, `limit` at a time (default [`DEFAULT_AUDIT_LOG_LIMIT`]) after skipping
+/// `offset`.
+///
+/// ```rust
+/// # #[cfg(feature = "encryption")]
+/// # {
+/// use hammerwork::encryption::{KeyAuditFilter, KeyOperation};
+/// use chrono::{Duration, Utc};
+///
+/// // Failed rotations of one key in the last week, 20 per page
+/// let filter = KeyAuditFilter::new()
+///     .with_key_id("payment-key")
+///     .with_operation(KeyOperation::Rotate)
+///     .with_success(false)
+///     .with_since(Utc::now() - Duration::days(7))
+///     .with_limit(20);
+/// let second_page = filter.clone().with_offset(20);
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyAuditFilter {
+    /// Only records of this key
+    pub key_id: Option<String>,
+    /// Only records of this operation
+    pub operation: Option<KeyOperation>,
+    /// Only records at or after this time
+    pub since: Option<DateTime<Utc>>,
+    /// Only records before this time
+    pub until: Option<DateTime<Utc>>,
+    /// Only successful (`true`) or failed (`false`) operations
+    pub success: Option<bool>,
+    /// Maximum number of records (`None`: [`DEFAULT_AUDIT_LOG_LIMIT`])
+    pub limit: Option<u32>,
+    /// Number of matching records to skip, newest first
+    pub offset: u64,
+}
+
+impl KeyAuditFilter {
+    /// A filter matching every record (the newest [`DEFAULT_AUDIT_LOG_LIMIT`]).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Only records of `key_id`.
+    pub fn with_key_id(mut self, key_id: impl Into<String>) -> Self {
+        self.key_id = Some(key_id.into());
+        self
+    }
+
+    /// Only records of `operation`.
+    pub fn with_operation(mut self, operation: KeyOperation) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    /// Only records at or after `since`.
+    pub fn with_since(mut self, since: DateTime<Utc>) -> Self {
+        self.since = Some(since);
+        self
+    }
+
+    /// Only records before `until`.
+    pub fn with_until(mut self, until: DateTime<Utc>) -> Self {
+        self.until = Some(until);
+        self
+    }
+
+    /// Only successful (`true`) or failed (`false`) operations.
+    pub fn with_success(mut self, success: bool) -> Self {
+        self.success = Some(success);
+        self
+    }
+
+    /// Return at most `limit` records.
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Skip the first `offset` matching records (newest first).
+    pub fn with_offset(mut self, offset: u64) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// The number of records to return.
+    pub fn effective_limit(&self) -> u32 {
+        self.limit.unwrap_or(DEFAULT_AUDIT_LOG_LIMIT)
+    }
 }
 
 /// Statistics about key management operations
@@ -709,6 +806,30 @@ pub trait KeyManagerBackend: Database + sealed::Sealed {
         key: &EncryptionKey,
         previous_version: u32,
     ) -> Result<(), EncryptionError>;
+
+    /// Rotate a key to `key` (the new version), in one transaction, only if
+    /// `previous_version` is still its active version and, when `only_if_due`, its
+    /// `next_rotation_at` has passed. Returns `false`, changing nothing, otherwise
+    /// (another process rotated it first).
+    ///
+    /// The previous version is retired first with a conditional update, which locks its
+    /// row: a concurrent rotation of the same key waits for this one to commit, then
+    /// finds the version retired and does nothing. So each rotation creates exactly one
+    /// new active version, however many processes rotate at once.
+    #[doc(hidden)]
+    async fn rotate_key_if_current(
+        pool: &Pool<Self>,
+        key: &EncryptionKey,
+        previous_version: u32,
+        only_if_due: bool,
+    ) -> Result<bool, EncryptionError>;
+
+    /// Records of the key audit log matching `filter`, newest first.
+    #[doc(hidden)]
+    async fn audit_log(
+        pool: &Pool<Self>,
+        filter: &KeyAuditFilter,
+    ) -> Result<Vec<KeyAuditRecord>, EncryptionError>;
 
     /// Retire every active key-encryption key and insert `key` as the active one,
     /// in one transaction.
@@ -1276,7 +1397,32 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
     /// # }
     /// # }
     /// ```
+    ///
+    /// # Concurrency
+    ///
+    /// Rotating the same key from several processes at once is safe: one rotation
+    /// creates the next version and the others fail with
+    /// [`EncryptionError::KeyManagement`] ("rotated concurrently") without creating
+    /// another one, so the key never has two active versions.
     pub async fn rotate_key(&mut self, key_id: &str) -> Result<u32, EncryptionError> {
+        self.rotate_key_guarded(key_id, false)
+            .await?
+            .ok_or_else(|| {
+                EncryptionError::KeyManagement(format!(
+                    "Key {} was rotated concurrently by another process; not rotated again",
+                    key_id
+                ))
+            })
+    }
+
+    /// Rotate `key_id` unless another process rotated it since its newest version was
+    /// loaded or, with `only_if_due`, it is no longer due. Returns the new version, or
+    /// `None` when it was not rotated for one of these reasons.
+    async fn rotate_key_guarded(
+        &mut self,
+        key_id: &str,
+        only_if_due: bool,
+    ) -> Result<Option<u32>, EncryptionError> {
         info!("Rotating encryption key: {}", key_id);
 
         let current_key = self.load_key(key_id).await?;
@@ -1316,8 +1462,22 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
             usage_count: 0,
         };
 
-        // Store the new version and retire the old one atomically
-        DB::insert_rotated_key(&self.pool, &new_key_record, current_key.version).await?;
+        // Store the new version and retire the old one atomically, unless another
+        // process rotated the key first
+        if !DB::rotate_key_if_current(
+            &self.pool,
+            &new_key_record,
+            current_key.version,
+            only_if_due,
+        )
+        .await?
+        {
+            info!(
+                "Key {} was already rotated past version {} by another process; skipping",
+                key_id, current_key.version
+            );
+            return Ok(None);
+        }
 
         self.cache_key(key_id, new_key_material);
         self.cleanup_old_key_versions(key_id).await?;
@@ -1333,7 +1493,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
             "Successfully rotated key {} to version {}",
             key_id, new_version
         );
-        Ok(new_version)
+        Ok(Some(new_version))
     }
 
     /// Rotate every key whose `next_rotation_at` has passed
@@ -1341,6 +1501,11 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
     /// Returns the IDs of the rotated keys. Does nothing when automatic rotation is
     /// disabled. Every due key is attempted; if any rotation fails, the error lists the
     /// keys that could not be rotated (the others stay rotated).
+    ///
+    /// Safe to run from several processes at once: a key is rotated only if it is
+    /// still due when its new version is written, so each due key gets exactly one new
+    /// version. Keys another process rotated first are skipped (not returned, not
+    /// errors).
     pub async fn perform_automatic_rotation(&mut self) -> Result<Vec<String>, EncryptionError> {
         if !self.config.auto_rotation_enabled {
             return Ok(vec![]);
@@ -1351,8 +1516,9 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         let mut failures = Vec::new();
 
         for key_id in due_keys {
-            match self.rotate_key(&key_id).await {
-                Ok(_) => rotated.push(key_id),
+            match self.rotate_key_guarded(&key_id, true).await {
+                Ok(Some(_)) => rotated.push(key_id),
+                Ok(None) => {}
                 Err(e) => {
                     error!("Automatic rotation of key {} failed: {}", key_id, e);
                     failures.push(format!("{}: {}", key_id, e));
@@ -1374,6 +1540,16 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
 
     /// Start automated key rotation service that runs in the background
     /// Returns a future that should be spawned as a background task
+    ///
+    /// The service calls [`KeyManager::perform_automatic_rotation`] every
+    /// `check_interval` (first right away). Each pass runs in a task of its own, so
+    /// dropping or aborting the service never interrupts a rotation part-way through its
+    /// transaction. Several services, in one process or many, can run at once (see
+    /// [`KeyManager::perform_automatic_rotation`]).
+    ///
+    /// A [`WorkerPool`](crate::WorkerPool) can run this for you and stop it on shutdown:
+    /// see [`WorkerPool::with_key_rotation`](crate::WorkerPool::with_key_rotation) and
+    /// `[encryption.key_rotation]` in the configuration.
     pub async fn start_rotation_service(
         &self,
         check_interval: Duration,
@@ -1394,32 +1570,78 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
                 )
             })?;
 
-        let mut rotation_manager = self.clone();
+        let rotation_manager = self.clone();
 
         let rotation_service = async move {
             let mut interval_timer = tokio::time::interval(period);
+            interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 interval_timer.tick().await;
-
-                match rotation_manager.perform_automatic_rotation().await {
-                    Ok(rotated_keys) => {
-                        if !rotated_keys.is_empty() {
-                            info!(
-                                "Background rotation service rotated {} keys: {:?}",
-                                rotated_keys.len(),
-                                rotated_keys
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        error!("Background rotation service failed: {:?}", e);
-                    }
+                let pass = tokio::spawn(rotation_manager.clone().rotation_pass());
+                if let Err(e) = pass.await
+                    && e.is_panic()
+                {
+                    error!("Background rotation pass panicked: {}", e);
                 }
             }
         };
 
         Ok(rotation_service)
+    }
+
+    /// One pass of the rotation service: rotate the due keys and log the outcome.
+    pub(crate) async fn rotation_pass(mut self) {
+        match self.perform_automatic_rotation().await {
+            Ok(rotated_keys) if !rotated_keys.is_empty() => info!(
+                "Key rotation rotated {} keys: {:?}",
+                rotated_keys.len(),
+                rotated_keys
+            ),
+            Ok(_) => debug!("Key rotation found no keys due for rotation"),
+            Err(e) => error!("Key rotation failed: {}", e),
+        }
+    }
+
+    /// Whether [`KeyManager::perform_automatic_rotation`] rotates keys (automatic
+    /// rotation is enabled in the configuration).
+    pub fn auto_rotation_enabled(&self) -> bool {
+        self.config.auto_rotation_enabled
+    }
+
+    /// Read the key audit log (`hammerwork_key_audit_log`): the records matching
+    /// `filter`, newest first.
+    ///
+    /// Key creation, access and rotation are recorded when
+    /// [`KeyManagerConfig::audit_enabled`] is on (the default). Reading the log needs no
+    /// key and records nothing. `cargo hammerwork encryption audit` shows the same
+    /// records from the command line.
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(all(feature = "encryption", feature = "postgres"))]
+    /// # {
+    /// use hammerwork::encryption::{KeyAuditFilter, KeyManager, KeyOperation};
+    ///
+    /// # async fn example(key_manager: KeyManager<sqlx::Postgres>) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rotations = key_manager
+    ///     .audit_log(
+    ///         &KeyAuditFilter::new()
+    ///             .with_key_id("payment-key")
+    ///             .with_operation(KeyOperation::Rotate),
+    ///     )
+    ///     .await?;
+    /// for record in rotations {
+    ///     println!("{} {} {}", record.timestamp, record.operation, record.success);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    pub async fn audit_log(
+        &self,
+        filter: &KeyAuditFilter,
+    ) -> Result<Vec<KeyAuditRecord>, EncryptionError> {
+        DB::audit_log(&self.pool, filter).await
     }
 
     /// Get current key management statistics
@@ -1958,6 +2180,31 @@ fn db_error(context: &str) -> impl FnOnce(sqlx::Error) -> EncryptionError + '_ {
     move |e| EncryptionError::DatabaseError(format!("{}: {}", context, e))
 }
 
+/// Whether `error` is a unique constraint violation (a duplicate key version).
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|e| e.is_unique_violation())
+}
+
+/// The optional client details of an audit record, as its `context`.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn audit_context(
+    client_ip: Option<String>,
+    user_agent: Option<String>,
+    session_id: Option<String>,
+) -> HashMap<String, String> {
+    [
+        ("client_ip", client_ip),
+        ("user_agent", user_agent),
+        ("session_id", session_id),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| (name.to_string(), value)))
+    .collect()
+}
+
 fn column<'r, R, T>(row: &'r R, name: &str) -> Result<T, EncryptionError>
 where
     R: Row,
@@ -2166,7 +2413,18 @@ mod postgres_backend {
         executor: E,
         key: &EncryptionKey,
     ) -> Result<(), EncryptionError> {
-        sqlx::query(
+        try_insert(executor, key)
+            .await?
+            .map_err(db_error("Failed to store key"))
+    }
+
+    /// Insert a key row, returning the database error as is (so a caller can tell a
+    /// duplicate version from other failures).
+    async fn try_insert<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        key: &EncryptionKey,
+    ) -> Result<Result<(), sqlx::Error>, EncryptionError> {
+        Ok(sqlx::query(
             r#"
             INSERT INTO hammerwork_encryption_keys (
                 id, key_id, key_version, algorithm, key_material, key_derivation_salt,
@@ -2201,8 +2459,24 @@ mod postgres_backend {
         .bind(i64::try_from(key.usage_count).unwrap_or(i64::MAX))
         .execute(executor)
         .await
-        .map_err(db_error("Failed to store key"))?;
-        Ok(())
+        .map(|_| ()))
+    }
+
+    fn audit_record(row: &PgRow) -> Result<KeyAuditRecord, EncryptionError> {
+        Ok(KeyAuditRecord {
+            id: column(row, "id")?,
+            key_id: column(row, "key_id")?,
+            operation: parse_key_operation(&column::<_, String>(row, "operation")?)?,
+            timestamp: column(row, "timestamp")?,
+            actor: column(row, "user_id")?,
+            context: audit_context(
+                column(row, "client_ip")?,
+                column(row, "user_agent")?,
+                column(row, "session_id")?,
+            ),
+            success: column(row, "success")?,
+            error_message: column(row, "error_message")?,
+        })
     }
 
     async fn insert_kms_wrapped_key<'e, E: sqlx::PgExecutor<'e>>(
@@ -2266,6 +2540,99 @@ mod postgres_backend {
             tx.commit()
                 .await
                 .map_err(db_error("Failed to commit key rotation"))
+        }
+
+        async fn rotate_key_if_current(
+            pool: &Pool<Self>,
+            key: &EncryptionKey,
+            previous_version: u32,
+            only_if_due: bool,
+        ) -> Result<bool, EncryptionError> {
+            let previous = to_i32(previous_version, "key version")?;
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(db_error("Failed to start transaction"))?;
+            if only_if_due {
+                let due: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT COUNT(*) FROM hammerwork_encryption_keys
+                    WHERE key_id = $1 AND key_version = $2 AND status = 'Active'
+                      AND next_rotation_at IS NOT NULL AND next_rotation_at <= NOW()
+                    "#,
+                )
+                .bind(&key.key_id)
+                .bind(previous)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_error("Failed to check rotation status"))?;
+                if due == 0 {
+                    return Ok(false);
+                }
+            }
+            // The unique (key_id, key_version) index serializes concurrent rotations
+            // from the same version: the second insert waits for the first transaction
+            // and then fails as a duplicate.
+            match try_insert(&mut *tx, key).await? {
+                Ok(()) => {}
+                Err(e) if is_unique_violation(&e) => return Ok(false),
+                Err(e) => return Err(db_error("Failed to store key")(e)),
+            }
+            sqlx::query(
+                r#"
+                UPDATE hammerwork_encryption_keys
+                SET status = 'Retired', retired_at = NOW()
+                WHERE key_id = $1 AND key_version = $2 AND status = 'Active'
+                "#,
+            )
+            .bind(&key.key_id)
+            .bind(previous)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error("Failed to retire key version"))?;
+            tx.commit()
+                .await
+                .map_err(db_error("Failed to commit key rotation"))?;
+            Ok(true)
+        }
+
+        async fn audit_log(
+            pool: &Pool<Self>,
+            filter: &KeyAuditFilter,
+        ) -> Result<Vec<KeyAuditRecord>, EncryptionError> {
+            let mut query = sqlx::QueryBuilder::<Postgres>::new(
+                "SELECT id, key_id, operation, success, error_message, timestamp, user_id, \
+                 host(client_ip) AS client_ip, user_agent, session_id \
+                 FROM hammerwork_key_audit_log WHERE TRUE",
+            );
+            if let Some(key_id) = &filter.key_id {
+                query.push(" AND key_id = ").push_bind(key_id.clone());
+            }
+            if let Some(operation) = filter.operation {
+                query
+                    .push(" AND operation = ")
+                    .push_bind(operation.to_string());
+            }
+            if let Some(since) = filter.since {
+                query.push(" AND timestamp >= ").push_bind(since);
+            }
+            if let Some(until) = filter.until {
+                query.push(" AND timestamp < ").push_bind(until);
+            }
+            if let Some(success) = filter.success {
+                query.push(" AND success = ").push_bind(success);
+            }
+            query
+                .push(" ORDER BY timestamp DESC, id DESC LIMIT ")
+                .push_bind(i64::from(filter.effective_limit()))
+                .push(" OFFSET ")
+                .push_bind(i64::try_from(filter.offset).unwrap_or(i64::MAX));
+            let rows = query
+                .build()
+                .fetch_all(pool)
+                .await
+                .map_err(db_error("Failed to read the key audit log"))?;
+            rows.iter().map(audit_record).collect()
         }
 
         async fn insert_master_key(
@@ -2703,7 +3070,18 @@ mod mysql_backend {
         executor: E,
         key: &EncryptionKey,
     ) -> Result<(), EncryptionError> {
-        sqlx::query(
+        try_insert(executor, key)
+            .await?
+            .map_err(db_error("Failed to store key"))
+    }
+
+    /// Insert a key row, returning the database error as is (so a caller can tell a
+    /// duplicate version from other failures).
+    async fn try_insert<'e, E: sqlx::MySqlExecutor<'e>>(
+        executor: E,
+        key: &EncryptionKey,
+    ) -> Result<Result<(), sqlx::Error>, EncryptionError> {
+        Ok(sqlx::query(
             r#"
             INSERT INTO hammerwork_encryption_keys (
                 id, key_id, key_version, algorithm, key_material, key_derivation_salt,
@@ -2735,8 +3113,24 @@ mod mysql_backend {
         .bind(i64::try_from(key.usage_count).unwrap_or(i64::MAX))
         .execute(executor)
         .await
-        .map_err(db_error("Failed to store key"))?;
-        Ok(())
+        .map(|_| ()))
+    }
+
+    fn audit_record(row: &MySqlRow) -> Result<KeyAuditRecord, EncryptionError> {
+        Ok(KeyAuditRecord {
+            id: parse_uuid(&column::<_, String>(row, "id")?, "audit record")?,
+            key_id: column(row, "key_id")?,
+            operation: parse_key_operation(&column::<_, String>(row, "operation")?)?,
+            timestamp: column(row, "timestamp")?,
+            actor: column(row, "user_id")?,
+            context: audit_context(
+                column(row, "client_ip")?,
+                column(row, "user_agent")?,
+                column(row, "session_id")?,
+            ),
+            success: column(row, "success")?,
+            error_message: column(row, "error_message")?,
+        })
     }
 
     async fn insert_kms_wrapped_key<'e, E: sqlx::MySqlExecutor<'e>>(
@@ -2798,6 +3192,98 @@ mod mysql_backend {
             tx.commit()
                 .await
                 .map_err(db_error("Failed to commit key rotation"))
+        }
+
+        async fn rotate_key_if_current(
+            pool: &Pool<Self>,
+            key: &EncryptionKey,
+            previous_version: u32,
+            only_if_due: bool,
+        ) -> Result<bool, EncryptionError> {
+            let previous = to_i32(previous_version, "key version")?;
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(db_error("Failed to start transaction"))?;
+            if only_if_due {
+                let due: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT COUNT(*) FROM hammerwork_encryption_keys
+                    WHERE key_id = ? AND key_version = ? AND status = 'Active'
+                      AND next_rotation_at IS NOT NULL AND next_rotation_at <= NOW(6)
+                    "#,
+                )
+                .bind(&key.key_id)
+                .bind(previous)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_error("Failed to check rotation status"))?;
+                if due == 0 {
+                    return Ok(false);
+                }
+            }
+            // The unique (key_id, key_version) index serializes concurrent rotations
+            // from the same version: the second insert waits for the first transaction
+            // and then fails as a duplicate.
+            match try_insert(&mut *tx, key).await? {
+                Ok(()) => {}
+                Err(e) if is_unique_violation(&e) => return Ok(false),
+                Err(e) => return Err(db_error("Failed to store key")(e)),
+            }
+            sqlx::query(
+                r#"
+                UPDATE hammerwork_encryption_keys
+                SET status = 'Retired', retired_at = NOW(6)
+                WHERE key_id = ? AND key_version = ? AND status = 'Active'
+                "#,
+            )
+            .bind(&key.key_id)
+            .bind(previous)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error("Failed to retire key version"))?;
+            tx.commit()
+                .await
+                .map_err(db_error("Failed to commit key rotation"))?;
+            Ok(true)
+        }
+
+        async fn audit_log(
+            pool: &Pool<Self>,
+            filter: &KeyAuditFilter,
+        ) -> Result<Vec<KeyAuditRecord>, EncryptionError> {
+            let mut query = sqlx::QueryBuilder::<MySql>::new(
+                "SELECT id, key_id, operation, success, error_message, timestamp, user_id, \
+                 client_ip, user_agent, session_id FROM hammerwork_key_audit_log WHERE TRUE",
+            );
+            if let Some(key_id) = &filter.key_id {
+                query.push(" AND key_id = ").push_bind(key_id.clone());
+            }
+            if let Some(operation) = filter.operation {
+                query
+                    .push(" AND operation = ")
+                    .push_bind(operation.to_string());
+            }
+            if let Some(since) = filter.since {
+                query.push(" AND timestamp >= ").push_bind(since);
+            }
+            if let Some(until) = filter.until {
+                query.push(" AND timestamp < ").push_bind(until);
+            }
+            if let Some(success) = filter.success {
+                query.push(" AND success = ").push_bind(success);
+            }
+            query
+                .push(" ORDER BY timestamp DESC, id DESC LIMIT ")
+                .push_bind(i64::from(filter.effective_limit()))
+                .push(" OFFSET ")
+                .push_bind(i64::try_from(filter.offset).unwrap_or(i64::MAX));
+            let rows = query
+                .build()
+                .fetch_all(pool)
+                .await
+                .map_err(db_error("Failed to read the key audit log"))?;
+            rows.iter().map(audit_record).collect()
         }
 
         async fn insert_master_key(
@@ -3274,6 +3760,36 @@ pub fn parse_key_purpose(s: &str) -> Result<KeyPurpose, EncryptionError> {
             "Unknown key purpose: {}",
             s
         ))),
+    }
+}
+
+/// Parse a [`KeyOperation`] from its name as stored in the audit log (`Create`,
+/// `Access`, `Rotate`, `Retire`, `Revoke`, `Delete`, `Update`; case-insensitive).
+pub fn parse_key_operation(s: &str) -> Result<KeyOperation, EncryptionError> {
+    KeyOperation::ALL
+        .into_iter()
+        .find(|operation| operation.to_string().eq_ignore_ascii_case(s.trim()))
+        .ok_or_else(|| EncryptionError::KeyManagement(format!("Unknown key operation: {}", s)))
+}
+
+impl KeyOperation {
+    /// Every operation, in declaration order.
+    pub const ALL: [KeyOperation; 7] = [
+        KeyOperation::Create,
+        KeyOperation::Access,
+        KeyOperation::Rotate,
+        KeyOperation::Retire,
+        KeyOperation::Revoke,
+        KeyOperation::Delete,
+        KeyOperation::Update,
+    ];
+}
+
+impl std::str::FromStr for KeyOperation {
+    type Err = EncryptionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_key_operation(s)
     }
 }
 
@@ -5123,5 +5639,435 @@ mod tests {
     async fn test_rotation_service_rotates_due_keys_mysql() {
         let (_db_guard, pool) = mysql_test_pool().await;
         rotation_service_rotates_due_keys(pool).await;
+    }
+
+    /// Versions of `key_id` that are active, and whether versions 1..=newest all exist.
+    async fn version_summary<DB: KeyManagerBackend>(
+        manager: &KeyManager<DB>,
+        key_id: &str,
+    ) -> (u32, u32) {
+        let newest = manager.load_key(key_id).await.unwrap().version;
+        let mut active = 0;
+        for version in 1..=newest {
+            let key = DB::load_key_version(&manager.pool, key_id, version)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("version {version} of {key_id} is missing"));
+            if key.status == KeyStatus::Active {
+                active += 1;
+            }
+        }
+        (newest, active)
+    }
+
+    /// Rotating one key from several key managers at once (as several processes
+    /// would) never creates two active versions or skips a version: a rotation that
+    /// loses the race does nothing, and an automatic one only rotates a key that is
+    /// still due.
+    async fn concurrent_rotation_creates_one_version<DB: KeyManagerBackend>(pool: Pool<DB>) {
+        let config = test_config().with_auto_rotation_enabled(true);
+        let mut first = KeyManager::new(config.clone(), pool.clone()).await.unwrap();
+        let mut second = KeyManager::new(config, pool.clone()).await.unwrap();
+        let key_id = format!("concurrent-{}", Uuid::new_v4().simple());
+        first
+            .generate_key(&key_id, EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        // New versions are due in 30 days, so one rotation per round.
+        first
+            .update_key_rotation_schedule(&key_id, Some(Duration::days(30)))
+            .await
+            .unwrap();
+
+        // The guard itself: a second rotation from the same version does nothing.
+        let current = first.load_key(&key_id).await.unwrap();
+        let next = EncryptionKey {
+            id: Uuid::new_v4(),
+            version: current.version + 1,
+            ..current.clone()
+        };
+        assert!(
+            !DB::rotate_key_if_current(&pool, &next, current.version, true)
+                .await
+                .unwrap(),
+            "not due yet"
+        );
+        assert!(
+            DB::rotate_key_if_current(&pool, &next, current.version, false)
+                .await
+                .unwrap()
+        );
+        let duplicate = EncryptionKey {
+            id: Uuid::new_v4(),
+            ..next.clone()
+        };
+        assert!(
+            !DB::rotate_key_if_current(&pool, &duplicate, current.version, false)
+                .await
+                .unwrap(),
+            "the version already exists"
+        );
+        assert_eq!(version_summary(&first, &key_id).await, (2, 1));
+
+        // Automatic rotation by two managers at once: exactly one rotates each round.
+        for round in 1..=5u32 {
+            first
+                .schedule_key_rotation(&key_id, Utc::now() - Duration::minutes(1))
+                .await
+                .unwrap();
+            let (a, b) = tokio::join!(
+                first.perform_automatic_rotation(),
+                second.perform_automatic_rotation()
+            );
+            let rotations = a
+                .unwrap()
+                .iter()
+                .chain(b.unwrap().iter())
+                .filter(|rotated| **rotated == key_id)
+                .count();
+            assert_eq!(rotations, 1, "round {round}: one manager rotated the key");
+            assert_eq!(
+                version_summary(&first, &key_id).await,
+                (round + 2, 1),
+                "round {round}: one new version, one active version"
+            );
+        }
+
+        // Manual rotations at once: each succeeds with its own version or reports
+        // that the key was rotated concurrently.
+        let before = first.load_key(&key_id).await.unwrap().version;
+        let (a, b) = tokio::join!(first.rotate_key(&key_id), second.rotate_key(&key_id));
+        let mut versions = Vec::new();
+        for result in [a, b] {
+            match result {
+                Ok(version) => versions.push(version),
+                Err(e) => assert!(e.to_string().contains("rotated concurrently"), "{e}"),
+            }
+        }
+        assert!(!versions.is_empty());
+        let (newest, active) = version_summary(&first, &key_id).await;
+        assert_eq!(newest, before + versions.len() as u32);
+        assert_eq!(active, 1);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_concurrent_rotation_creates_one_version_postgres() {
+        let (_db_guard, pool) = postgres_test_pool().await;
+        concurrent_rotation_creates_one_version(pool).await;
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_concurrent_rotation_creates_one_version_mysql() {
+        let (_db_guard, pool) = mysql_test_pool().await;
+        concurrent_rotation_creates_one_version(pool).await;
+    }
+
+    /// Two rotation services running side by side rotate a due key once per time it
+    /// falls due.
+    async fn concurrent_rotation_services<DB: KeyManagerBackend>(pool: Pool<DB>) {
+        let config = test_config().with_auto_rotation_enabled(true);
+        let mut manager = KeyManager::new(config.clone(), pool.clone()).await.unwrap();
+        let other = KeyManager::new(config, pool).await.unwrap();
+        let key_id = format!("services-{}", Uuid::new_v4().simple());
+        manager
+            .generate_key(&key_id, EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        manager
+            .update_key_rotation_schedule(&key_id, Some(Duration::days(30)))
+            .await
+            .unwrap();
+        let services = [
+            tokio::spawn(
+                manager
+                    .start_rotation_service(Duration::milliseconds(5))
+                    .await
+                    .unwrap(),
+            ),
+            tokio::spawn(
+                other
+                    .start_rotation_service(Duration::milliseconds(5))
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        for round in 1..=3u32 {
+            manager
+                .schedule_key_rotation(&key_id, Utc::now() - Duration::minutes(1))
+                .await
+                .unwrap();
+            let mut rotated = false;
+            for _ in 0..200 {
+                if manager.load_key(&key_id).await.unwrap().version > round {
+                    rotated = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(rotated, "round {round}: the key was rotated");
+            // Give the other service time to (wrongly) rotate again.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                version_summary(&manager, &key_id).await,
+                (round + 1, 1),
+                "round {round}: exactly one new active version"
+            );
+        }
+        for service in services {
+            service.abort();
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_concurrent_rotation_services_postgres() {
+        let (_db_guard, pool) = postgres_test_pool().await;
+        concurrent_rotation_services(pool).await;
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_concurrent_rotation_services_mysql() {
+        let (_db_guard, pool) = mysql_test_pool().await;
+        concurrent_rotation_services(pool).await;
+    }
+
+    /// `audit_log` filters by key, operation, outcome and time, pages newest first,
+    /// and reads the client details of a record into `actor` and `context`.
+    /// `client_key` has one record with client details, written by the caller.
+    async fn audit_log_filters<DB: KeyManagerBackend>(pool: Pool<DB>, client_key: &str) {
+        let mut manager = KeyManager::new(test_config(), pool.clone()).await.unwrap();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let a = format!("audit-a-{suffix}");
+        let b = format!("audit-b-{suffix}");
+        let pause = || tokio::time::sleep(std::time::Duration::from_millis(20));
+
+        let start = Utc::now() - Duration::seconds(1);
+        manager
+            .generate_key(&a, EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        pause().await;
+        // A key manager that has not cached the key records the access.
+        let mut reader = KeyManager::new(test_config(), pool.clone()).await.unwrap();
+        reader.get_key(&a).await.unwrap();
+        pause().await;
+        manager.rotate_key(&a).await.unwrap();
+        pause().await;
+        manager
+            .generate_key(&b, EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        pause().await;
+        DB::record_audit_event(&pool, &b, &KeyOperation::Rotate, false, Some("boom"))
+            .await
+            .unwrap();
+
+        let ops = |records: &[KeyAuditRecord]| -> Vec<(String, KeyOperation, bool)> {
+            records
+                .iter()
+                .map(|r| (r.key_id.clone(), r.operation, r.success))
+                .collect()
+        };
+        let query = |filter: KeyAuditFilter| {
+            let manager = manager.clone();
+            async move { manager.audit_log(&filter).await.unwrap() }
+        };
+
+        let for_a = query(KeyAuditFilter::new().with_key_id(&a)).await;
+        assert_eq!(
+            ops(&for_a),
+            vec![
+                (a.clone(), KeyOperation::Rotate, true),
+                (a.clone(), KeyOperation::Access, true),
+                (a.clone(), KeyOperation::Create, true),
+            ],
+            "newest first"
+        );
+        assert!(for_a.windows(2).all(|w| w[0].timestamp >= w[1].timestamp));
+        assert!(for_a.iter().all(|r| r.error_message.is_none()));
+
+        let creates = query(
+            KeyAuditFilter::new()
+                .with_operation(KeyOperation::Create)
+                .with_since(start),
+        )
+        .await;
+        let created: Vec<&str> = creates.iter().map(|r| r.key_id.as_str()).collect();
+        assert!(created.contains(&a.as_str()) && created.contains(&b.as_str()));
+        assert!(creates.iter().all(|r| r.operation == KeyOperation::Create));
+
+        let failed = query(KeyAuditFilter::new().with_key_id(&b).with_success(false)).await;
+        assert_eq!(ops(&failed), vec![(b.clone(), KeyOperation::Rotate, false)]);
+        assert_eq!(failed[0].error_message.as_deref(), Some("boom"));
+        let succeeded = query(KeyAuditFilter::new().with_key_id(&b).with_success(true)).await;
+        assert_eq!(
+            ops(&succeeded),
+            vec![(b.clone(), KeyOperation::Create, true)]
+        );
+
+        // Time range: `since` is inclusive, `until` exclusive.
+        let access_at = for_a[1].timestamp;
+        let around = query(
+            KeyAuditFilter::new()
+                .with_key_id(&a)
+                .with_since(access_at)
+                .with_until(for_a[0].timestamp),
+        )
+        .await;
+        assert_eq!(ops(&around), vec![(a.clone(), KeyOperation::Access, true)]);
+        assert!(
+            query(KeyAuditFilter::new().with_key_id(&a).with_until(start))
+                .await
+                .is_empty()
+        );
+        assert!(
+            query(
+                KeyAuditFilter::new()
+                    .with_key_id(&a)
+                    .with_since(Utc::now() + Duration::hours(1))
+            )
+            .await
+            .is_empty()
+        );
+
+        // Pagination
+        let page = |offset| {
+            query(
+                KeyAuditFilter::new()
+                    .with_key_id(&a)
+                    .with_limit(2)
+                    .with_offset(offset),
+            )
+        };
+        let first_page = page(0).await;
+        let second_page = page(2).await;
+        assert_eq!(ops(&first_page), ops(&for_a[..2]));
+        assert_eq!(ops(&second_page), ops(&for_a[2..]));
+        assert!(page(3).await.is_empty());
+        assert_eq!(
+            query(KeyAuditFilter::new().with_key_id(&a).with_limit(0))
+                .await
+                .len(),
+            0
+        );
+
+        // Combined criteria, and nothing for an unknown key
+        let combined = query(
+            KeyAuditFilter::new()
+                .with_key_id(&a)
+                .with_operation(KeyOperation::Rotate)
+                .with_success(true)
+                .with_since(start),
+        )
+        .await;
+        assert_eq!(
+            ops(&combined),
+            vec![(a.clone(), KeyOperation::Rotate, true)]
+        );
+        assert!(
+            query(KeyAuditFilter::new().with_key_id(format!("missing-{suffix}")))
+                .await
+                .is_empty()
+        );
+
+        // Client details
+        let client = query(KeyAuditFilter::new().with_key_id(client_key)).await;
+        assert_eq!(client.len(), 1);
+        assert_eq!(client[0].actor.as_deref(), Some("alice"));
+        assert_eq!(client[0].context["client_ip"], "10.0.0.1");
+        assert_eq!(client[0].context["user_agent"], "audit-test");
+        assert_eq!(client[0].context["session_id"], "session-1");
+        assert!(for_a[0].context.is_empty() && for_a[0].actor.is_none());
+
+        // The default limit
+        assert_eq!(
+            KeyAuditFilter::new().effective_limit(),
+            DEFAULT_AUDIT_LOG_LIMIT
+        );
+    }
+
+    /// Insert an audit record with client details for `key_id` (written by hand: the
+    /// key manager records none).
+    const CLIENT_AUDIT_RECORD: &str = "INSERT INTO hammerwork_key_audit_log \
+        (key_id, operation, success, user_id, client_ip, user_agent, session_id) \
+        VALUES ('client-audit-key', 'Access', TRUE, 'alice', '10.0.0.1', 'audit-test', \
+        'session-1')";
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_audit_log_filters_postgres() {
+        let (_db_guard, pool) = postgres_test_pool().await;
+        sqlx::query(CLIENT_AUDIT_RECORD)
+            .execute(&pool)
+            .await
+            .unwrap();
+        audit_log_filters(pool, "client-audit-key").await;
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_audit_log_filters_mysql() {
+        let (_db_guard, pool) = mysql_test_pool().await;
+        sqlx::query(CLIENT_AUDIT_RECORD)
+            .execute(&pool)
+            .await
+            .unwrap();
+        audit_log_filters(pool, "client-audit-key").await;
+    }
+
+    #[test]
+    fn test_key_operation_parse_and_filter_builders() {
+        for operation in KeyOperation::ALL {
+            assert_eq!(
+                parse_key_operation(&operation.to_string()).unwrap(),
+                operation
+            );
+            assert_eq!(
+                operation
+                    .to_string()
+                    .to_lowercase()
+                    .parse::<KeyOperation>()
+                    .unwrap(),
+                operation
+            );
+        }
+        assert!(parse_key_operation("Explode").is_err());
+
+        let since = Utc::now();
+        let filter = KeyAuditFilter::new()
+            .with_key_id("k")
+            .with_operation(KeyOperation::Revoke)
+            .with_since(since)
+            .with_until(since + Duration::hours(1))
+            .with_success(true)
+            .with_limit(5)
+            .with_offset(10);
+        assert_eq!(filter.key_id.as_deref(), Some("k"));
+        assert_eq!(filter.operation, Some(KeyOperation::Revoke));
+        assert_eq!(filter.since, Some(since));
+        assert_eq!(filter.until, Some(since + Duration::hours(1)));
+        assert_eq!(filter.success, Some(true));
+        assert_eq!(filter.effective_limit(), 5);
+        assert_eq!(filter.offset, 10);
+        assert_eq!(KeyAuditFilter::default(), KeyAuditFilter::new());
+    }
+
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    #[test]
+    fn test_audit_context_keeps_only_present_details() {
+        let context = audit_context(Some("10.0.0.1".into()), None, Some("s".into()));
+        assert_eq!(context.len(), 2);
+        assert_eq!(context["client_ip"], "10.0.0.1");
+        assert_eq!(context["session_id"], "s");
+        assert!(audit_context(None, None, None).is_empty());
     }
 }

@@ -79,6 +79,12 @@ enum Commands {
         command: CronCommand,
     },
 
+    #[command(about = "Encryption key operations (key audit log)")]
+    Encryption {
+        #[command(subcommand)]
+        command: EncryptionCommand,
+    },
+
     #[command(about = "Database maintenance operations")]
     Maintenance {
         #[command(subcommand)]
@@ -201,6 +207,9 @@ async fn execute_command(command: &Commands, config: &mut Config) -> Result<()> 
             command.execute(config).await?;
         }
         Commands::Cron { command } => {
+            command.execute(config).await?;
+        }
+        Commands::Encryption { command } => {
             command.execute(config).await?;
         }
         Commands::Maintenance { command } => {
