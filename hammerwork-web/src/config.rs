@@ -407,12 +407,14 @@ pub struct AuthConfig {
 
     /// Upper bound on how long a successful credential check is remembered (at most
     /// [`crate::auth::VERIFIED_CREDENTIALS_TTL`]); zero re-verifies every request.
+    #[serde(with = "hammerwork::config::serde_duration")]
     pub session_timeout: Duration,
 
     /// Failed attempts from one client address before it is locked out
     pub max_failed_attempts: u32,
 
     /// How long a locked-out client is refused. A failure older than this no longer counts.
+    #[serde(with = "hammerwork::config::serde_duration")]
     pub lockout_duration: Duration,
 }
 
@@ -433,6 +435,7 @@ impl Default for AuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketConfig {
     /// Ping interval to keep connections alive
+    #[serde(with = "hammerwork::config::serde_duration")]
     pub ping_interval: Duration,
 
     /// Maximum number of concurrent WebSocket connections
@@ -449,7 +452,10 @@ pub struct WebSocketConfig {
     /// statistics to push to connected clients (`JobUpdate` and `QueueUpdate` messages).
     /// Polling only happens while at least one client is connected. Zero disables live
     /// updates. Optional in configuration files (default 2 seconds).
-    #[serde(default = "default_live_update_interval")]
+    #[serde(
+        default = "default_live_update_interval",
+        with = "hammerwork::config::serde_duration"
+    )]
     pub live_update_interval: Duration,
 
     /// The most changed jobs one poll reads and pushes; further changes in the same
@@ -539,6 +545,41 @@ mod debug_redaction_tests {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The configuration file example in the README must load as written.
+    #[test]
+    fn readme_configuration_example_loads() {
+        let readme = include_str!("../README.md");
+        let start = readme
+            .find("```toml\nbind_address")
+            .expect("README has a configuration example");
+        let body = &readme[start + "```toml\n".len()..];
+        let example = &body[..body.find("```").unwrap()];
+        let config: DashboardConfig = toml::from_str(example).unwrap();
+        assert_eq!(config.auth.session_timeout, Duration::from_secs(8 * 3600));
+        assert_eq!(config.auth.lockout_duration, Duration::from_secs(15 * 60));
+        assert_eq!(config.websocket.ping_interval, Duration::from_secs(30));
+        assert_eq!(
+            config.websocket.live_update_interval,
+            Duration::from_secs(2)
+        );
+    }
+
+    /// Files written before durations became strings (serde's `{ secs, nanos }` tables)
+    /// still load, and saved files use the readable form.
+    #[test]
+    fn durations_accept_the_old_table_form_and_save_as_strings() {
+        let mut value = toml::Value::try_from(DashboardConfig::new()).unwrap();
+        value["websocket"]["ping_interval"] =
+            toml::from_str::<toml::Table>("v = { secs = 45, nanos = 0 }").unwrap()["v"].clone();
+        let config: DashboardConfig = toml::from_str(&toml::to_string(&value).unwrap()).unwrap();
+        assert_eq!(config.websocket.ping_interval, Duration::from_secs(45));
+
+        let saved = toml::to_string(&DashboardConfig::new()).unwrap();
+        assert!(saved.contains("ping_interval = \"30s\""), "{saved}");
+        let reloaded: DashboardConfig = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.auth.session_timeout, Duration::from_secs(8 * 3600));
+    }
 
     /// The defaults, with authentication only where this build can verify passwords.
     fn defaults() -> DashboardConfig {
