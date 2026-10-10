@@ -1101,7 +1101,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|row| row.into_job()).collect()
+        Ok(super::decodable_rows(
+            "dead jobs",
+            rows.into_iter()
+                .map(|row| (row.id.to_string(), row.into_job())),
+        ))
     }
 
     async fn get_dead_jobs_by_queue(
@@ -1125,7 +1129,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|row| row.into_job()).collect()
+        Ok(super::decodable_rows(
+            "dead jobs",
+            rows.into_iter()
+                .map(|row| (row.id.to_string(), row.into_job())),
+        ))
     }
 
     async fn retry_dead_job(&self, job_id: JobId) -> Result<()> {
@@ -1549,7 +1557,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|row| row.into_job()).collect()
+        Ok(super::decodable_rows(
+            "recurring jobs",
+            rows.into_iter()
+                .map(|row| (row.id.to_string(), row.into_job())),
+        ))
     }
 
     async fn disable_recurring_job(&self, job_id: JobId) -> Result<()> {
@@ -1831,7 +1843,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|row| row.into_job()).collect()
+        Ok(super::decodable_rows(
+            "ready jobs",
+            rows.into_iter()
+                .map(|row| (row.id.to_string(), row.into_job())),
+        ))
     }
 
     async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>> {
@@ -1883,224 +1899,18 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         reason: crate::archive::ArchivalReason,
         archived_by: Option<&str>,
     ) -> Result<crate::archive::ArchivalStats> {
-        use crate::archive::ArchivalStats;
-
-        if !policy.enabled {
-            return Ok(ArchivalStats::default());
-        }
-
-        let start_time = Utc::now();
-        let mut jobs_archived = 0u64;
-        let mut bytes_archived = 0u64;
-        let mut total_compression_ratio = 0.0;
-
-        // One condition per job status the policy archives, each with its own age threshold.
-        let now = Utc::now();
-        let mut thresholds = Vec::new();
-        let mut status_conditions = Vec::new();
-        for (after, status, column) in crate::archive::archival_candidates(policy) {
-            if let Some(after) = after {
-                status_conditions.push(format!(
-                    "(status = '{status}' AND {column} IS NOT NULL AND {column} <= ?)"
-                ));
-                thresholds.push(now - after);
-            }
-        }
-        if status_conditions.is_empty() || policy.batch_size == 0 {
-            return Ok(ArchivalStats::default());
-        }
-
-        // Lock the candidate rows so concurrent archivers (and workers) skip them
-        // instead of archiving the same job twice (SKIP LOCKED needs MySQL 8.0+).
-        let select = format!(
-            "SELECT {} FROM hammerwork_jobs WHERE archived_at IS NULL{} AND ({}) \
-             ORDER BY created_at ASC LIMIT {} FOR UPDATE SKIP LOCKED",
-            JOB_SELECT_FIELDS,
-            if queue_name.is_some() {
-                " AND queue_name = ?"
-            } else {
-                ""
-            },
-            status_conditions.join(" OR "),
-            policy.batch_size
-        );
-
-        // Archiving a job moves its row: insert into the archive table and delete from
-        // the main table in the same transaction.
-        let mut tx = self.pool.begin().await?;
-
-        let mut query = sqlx::query_as::<_, JobRow>(&select);
-        if let Some(queue) = queue_name {
-            query = query.bind(queue);
-        }
-        for threshold in thresholds {
-            query = query.bind(threshold);
-        }
-        let jobs_to_archive = query.fetch_all(&mut *tx).await?;
-
-        let archived_at = Utc::now();
-        for job_row in jobs_to_archive {
-            let job = job_row.into_job()?;
-            let (final_payload, is_compressed, original_size) =
-                crate::archive::encode_archived_payload(&job.payload, policy, config)?;
-            if is_compressed {
-                total_compression_ratio += original_size as f64 / final_payload.len() as f64;
-            }
-
-            sqlx::query(
-                r#"
-                INSERT INTO hammerwork_jobs_archive (
-                    id, queue_name, payload, payload_compressed, original_payload_size,
-                    status, priority, attempts, max_attempts, created_at, scheduled_at,
-                    started_at, completed_at, failed_at, timed_out_at, archived_at,
-                    error_message, result, result_ttl, retry_strategy, timeout_seconds,
-                    priority_weight, cron_schedule, next_run_at, recurring, timezone,
-                    batch_id, depends_on, dependency_status, result_config,
-                    trace_id, correlation_id, parent_span_id, span_context,
-                    archival_reason, archived_by, original_table
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?
-                )
-            "#,
-            )
-            .bind(job.id.to_string())
-            .bind(&job.queue_name)
-            .bind(&final_payload)
-            .bind(is_compressed)
-            .bind(original_size as i32)
-            .bind(job.status)
-            .bind(job.priority.to_string())
-            .bind(job.attempts)
-            .bind(job.max_attempts)
-            .bind(job.created_at)
-            .bind(job.scheduled_at)
-            .bind(job.started_at)
-            .bind(job.completed_at)
-            .bind(job.failed_at)
-            .bind(job.timed_out_at)
-            .bind(archived_at)
-            .bind(job.error_message)
-            .bind(job.result_data)
-            .bind(job.result_expires_at)
-            .bind(
-                job.retry_strategy
-                    .map(|rs| serde_json::to_string(&rs))
-                    .transpose()?,
-            )
-            .bind(super::timeout_db_seconds(job.timeout))
-            .bind(job.priority.weight() as i32)
-            .bind(job.cron_schedule)
-            .bind(job.next_run_at)
-            .bind(job.recurring)
-            .bind(job.timezone)
-            .bind(job.batch_id.map(|id| id.to_string()))
-            .bind(if job.depends_on.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_value(&job.depends_on)?)
-            })
-            .bind(job.dependency_status.as_str())
-            .bind(serde_json::to_value(&job.result_config)?)
-            .bind(job.trace_id)
-            .bind(job.correlation_id)
-            .bind(job.parent_span_id)
-            .bind(job.span_context)
-            .bind(reason.as_str())
-            .bind(archived_by)
-            .bind("hammerwork_jobs")
-            .execute(&mut *tx)
-            .await?;
-
-            // Move an encrypted payload as it is, without decrypting it
-            if job.is_encrypted || !job.pii_fields.is_empty() {
-                copy_encryption_columns(
-                    &mut tx,
-                    "hammerwork_jobs",
-                    "hammerwork_jobs_archive",
-                    job.id,
-                )
-                .await?;
-            }
-
-            sqlx::query("DELETE FROM hammerwork_jobs WHERE id = ?")
-                .bind(job.id.to_string())
-                .execute(&mut *tx)
-                .await?;
-
-            jobs_archived += 1;
-            bytes_archived += final_payload.len() as u64;
-        }
-
-        tx.commit().await?;
-
-        let operation_duration = Utc::now() - start_time;
-        let compression_ratio = if jobs_archived > 0 && total_compression_ratio > 0.0 {
-            total_compression_ratio / jobs_archived as f64
-        } else {
-            1.0
-        };
-
-        Ok(ArchivalStats {
-            jobs_archived,
-            jobs_purged: 0,
-            bytes_archived,
-            bytes_purged: 0,
-            compression_ratio,
-            operation_duration: operation_duration.to_std().unwrap_or_default(),
-            last_run_at: Utc::now(),
+        // Archiving moves rows between tables under row locks; a concurrent archive,
+        // restore or job transition can make the database abort it as a deadlock victim.
+        // The aborted transaction was rolled back, so it is run again.
+        super::retry_on_conflict(|| {
+            self.archive_jobs_once(queue_name, policy, config, reason.clone(), archived_by)
         })
+        .await
     }
 
     async fn restore_archived_job(&self, job_id: JobId) -> Result<Job> {
-        let mut tx = self.pool.begin().await?;
-
-        // Lock the archived row so two concurrent restores cannot both re-insert it.
-        let archived_row = sqlx::query(&format!(
-            "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive WHERE id = ? FOR UPDATE"
-        ))
-        .bind(job_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| crate::HammerworkError::JobNotFound {
-            id: job_id.to_string(),
-        })?;
-
-        let job = crate::archive::reset_for_restore(archived_job_from_row(&archived_row)?);
-
-        // Older versions archived a job without deleting its row from hammerwork_jobs
-        // (they only set archived_at). Drop such a leftover so the restore does not
-        // collide with it.
-        sqlx::query("DELETE FROM hammerwork_jobs WHERE id = ? AND archived_at IS NOT NULL")
-            .bind(job_id.to_string())
-            .execute(&mut *tx)
-            .await?;
-
-        // Insert back into main table. An encrypted payload is copied back as it is,
-        // without decrypting it.
-        let mut row = job.clone();
-        row.is_encrypted = false;
-        self.enqueue_with_tx(&mut tx, row).await?;
-        if job.is_encrypted || !job.pii_fields.is_empty() {
-            copy_encryption_columns(
-                &mut tx,
-                "hammerwork_jobs_archive",
-                "hammerwork_jobs",
-                job_id,
-            )
-            .await?;
-        }
-
-        // Remove from archive table
-        sqlx::query("DELETE FROM hammerwork_jobs_archive WHERE id = ?")
-            .bind(job_id.to_string())
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-
-        Ok(job)
+        // See `archive_jobs`: a deadlock victim is rolled back and run again.
+        super::retry_on_conflict(|| self.restore_archived_job_once(job_id)).await
     }
 
     async fn list_archived_jobs(
@@ -2141,9 +1951,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         let rows = sql_query.fetch_all(&self.pool).await?;
 
-        let mut archived_jobs = Vec::new();
-        for row in rows {
-            archived_jobs.push(ArchivedJob {
+        let decode = |row: &sqlx::mysql::MySqlRow| -> Result<ArchivedJob> {
+            Ok(ArchivedJob {
                 id: uuid::Uuid::parse_str(&row.try_get::<String, _>("id")?)?,
                 queue_name: row.try_get("queue_name")?,
                 status: crate::archive::parse_archived_status(&row.try_get::<String, _>("status")?),
@@ -2159,10 +1968,15 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                     .transpose()?,
                 payload_compressed: row.try_get("payload_compressed")?,
                 archived_by: row.try_get("archived_by")?,
-            });
-        }
-
-        Ok(archived_jobs)
+            })
+        };
+        Ok(super::decodable_rows(
+            "archived jobs",
+            rows.iter().map(|row| {
+                let id = row.try_get::<String, _>("id").unwrap_or_default();
+                (id, decode(row))
+            }),
+        ))
     }
 
     async fn purge_archived_jobs(&self, older_than: DateTime<Utc>) -> Result<u64> {
@@ -3518,5 +3332,237 @@ impl crate::queue::JobQueue<MySql> {
         }
         .await;
         super::end_transaction(tx, result).await
+    }
+}
+
+impl crate::queue::JobQueue<MySql> {
+    /// One attempt of [`DatabaseQueue::archive_jobs`], in one transaction.
+    async fn archive_jobs_once(
+        &self,
+        queue_name: Option<&str>,
+        policy: &crate::archive::ArchivalPolicy,
+        config: &crate::archive::ArchivalConfig,
+        reason: crate::archive::ArchivalReason,
+        archived_by: Option<&str>,
+    ) -> Result<crate::archive::ArchivalStats> {
+        use crate::archive::ArchivalStats;
+
+        if !policy.enabled {
+            return Ok(ArchivalStats::default());
+        }
+
+        let start_time = Utc::now();
+        let mut jobs_archived = 0u64;
+        let mut bytes_archived = 0u64;
+        let mut total_compression_ratio = 0.0;
+
+        // One condition per job status the policy archives, each with its own age threshold.
+        let now = Utc::now();
+        let mut thresholds = Vec::new();
+        let mut status_conditions = Vec::new();
+        for (after, status, column) in crate::archive::archival_candidates(policy) {
+            if let Some(after) = after {
+                status_conditions.push(format!(
+                    "(status = '{status}' AND {column} IS NOT NULL AND {column} <= ?)"
+                ));
+                thresholds.push(now - after);
+            }
+        }
+        if status_conditions.is_empty() || policy.batch_size == 0 {
+            return Ok(ArchivalStats::default());
+        }
+
+        // Lock the candidate rows so concurrent archivers (and workers) skip them
+        // instead of archiving the same job twice (SKIP LOCKED needs MySQL 8.0+).
+        let select = format!(
+            "SELECT {} FROM hammerwork_jobs WHERE archived_at IS NULL{} AND ({}) \
+             ORDER BY created_at ASC LIMIT {} FOR UPDATE SKIP LOCKED",
+            JOB_SELECT_FIELDS,
+            if queue_name.is_some() {
+                " AND queue_name = ?"
+            } else {
+                ""
+            },
+            status_conditions.join(" OR "),
+            policy.batch_size
+        );
+
+        // Archiving a job moves its row: insert into the archive table and delete from
+        // the main table in the same transaction.
+        let mut tx = self.pool.begin().await?;
+
+        let mut query = sqlx::query_as::<_, JobRow>(&select);
+        if let Some(queue) = queue_name {
+            query = query.bind(queue);
+        }
+        for threshold in thresholds {
+            query = query.bind(threshold);
+        }
+        let jobs_to_archive = query.fetch_all(&mut *tx).await?;
+
+        let archived_at = Utc::now();
+        for job_row in jobs_to_archive {
+            let job = job_row.into_job()?;
+            let (final_payload, is_compressed, original_size) =
+                crate::archive::encode_archived_payload(&job.payload, policy, config)?;
+            if is_compressed {
+                total_compression_ratio += original_size as f64 / final_payload.len() as f64;
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO hammerwork_jobs_archive (
+                    id, queue_name, payload, payload_compressed, original_payload_size,
+                    status, priority, attempts, max_attempts, created_at, scheduled_at,
+                    started_at, completed_at, failed_at, timed_out_at, archived_at,
+                    error_message, result, result_ttl, retry_strategy, timeout_seconds,
+                    priority_weight, cron_schedule, next_run_at, recurring, timezone,
+                    batch_id, depends_on, dependency_status, result_config,
+                    trace_id, correlation_id, parent_span_id, span_context,
+                    archival_reason, archived_by, original_table
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?
+                )
+            "#,
+            )
+            .bind(job.id.to_string())
+            .bind(&job.queue_name)
+            .bind(&final_payload)
+            .bind(is_compressed)
+            .bind(original_size as i32)
+            .bind(job.status)
+            .bind(job.priority.to_string())
+            .bind(job.attempts)
+            .bind(job.max_attempts)
+            .bind(job.created_at)
+            .bind(job.scheduled_at)
+            .bind(job.started_at)
+            .bind(job.completed_at)
+            .bind(job.failed_at)
+            .bind(job.timed_out_at)
+            .bind(archived_at)
+            .bind(job.error_message)
+            .bind(job.result_data)
+            .bind(job.result_expires_at)
+            .bind(
+                job.retry_strategy
+                    .map(|rs| serde_json::to_string(&rs))
+                    .transpose()?,
+            )
+            .bind(super::timeout_db_seconds(job.timeout))
+            .bind(job.priority.weight() as i32)
+            .bind(job.cron_schedule)
+            .bind(job.next_run_at)
+            .bind(job.recurring)
+            .bind(job.timezone)
+            .bind(job.batch_id.map(|id| id.to_string()))
+            .bind(if job.depends_on.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&job.depends_on)?)
+            })
+            .bind(job.dependency_status.as_str())
+            .bind(serde_json::to_value(&job.result_config)?)
+            .bind(job.trace_id)
+            .bind(job.correlation_id)
+            .bind(job.parent_span_id)
+            .bind(job.span_context)
+            .bind(reason.as_str())
+            .bind(archived_by)
+            .bind("hammerwork_jobs")
+            .execute(&mut *tx)
+            .await?;
+
+            // Move an encrypted payload as it is, without decrypting it
+            if job.is_encrypted || !job.pii_fields.is_empty() {
+                copy_encryption_columns(
+                    &mut tx,
+                    "hammerwork_jobs",
+                    "hammerwork_jobs_archive",
+                    job.id,
+                )
+                .await?;
+            }
+
+            sqlx::query("DELETE FROM hammerwork_jobs WHERE id = ?")
+                .bind(job.id.to_string())
+                .execute(&mut *tx)
+                .await?;
+
+            jobs_archived += 1;
+            bytes_archived += final_payload.len() as u64;
+        }
+
+        tx.commit().await?;
+
+        let operation_duration = Utc::now() - start_time;
+        let compression_ratio = if jobs_archived > 0 && total_compression_ratio > 0.0 {
+            total_compression_ratio / jobs_archived as f64
+        } else {
+            1.0
+        };
+
+        Ok(ArchivalStats {
+            jobs_archived,
+            jobs_purged: 0,
+            bytes_archived,
+            bytes_purged: 0,
+            compression_ratio,
+            operation_duration: operation_duration.to_std().unwrap_or_default(),
+            last_run_at: Utc::now(),
+        })
+    }
+
+    /// One attempt of [`DatabaseQueue::restore_archived_job`], in one transaction.
+    async fn restore_archived_job_once(&self, job_id: JobId) -> Result<Job> {
+        let mut tx = self.pool.begin().await?;
+
+        // Lock the archived row so two concurrent restores cannot both re-insert it.
+        let archived_row = sqlx::query(&format!(
+            "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive WHERE id = ? FOR UPDATE"
+        ))
+        .bind(job_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| crate::HammerworkError::JobNotFound {
+            id: job_id.to_string(),
+        })?;
+
+        let job = crate::archive::reset_for_restore(archived_job_from_row(&archived_row)?);
+
+        // Older versions archived a job without deleting its row from hammerwork_jobs
+        // (they only set archived_at). Drop such a leftover so the restore does not
+        // collide with it.
+        sqlx::query("DELETE FROM hammerwork_jobs WHERE id = ? AND archived_at IS NOT NULL")
+            .bind(job_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        // Insert back into main table. An encrypted payload is copied back as it is,
+        // without decrypting it.
+        let mut row = job.clone();
+        row.is_encrypted = false;
+        self.enqueue_with_tx(&mut tx, row).await?;
+        if job.is_encrypted || !job.pii_fields.is_empty() {
+            copy_encryption_columns(
+                &mut tx,
+                "hammerwork_jobs_archive",
+                "hammerwork_jobs",
+                job_id,
+            )
+            .await?;
+        }
+
+        // Remove from archive table
+        sqlx::query("DELETE FROM hammerwork_jobs_archive WHERE id = ?")
+            .bind(job_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(job)
     }
 }

@@ -55,7 +55,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 // We need to use a real sqlx Database type for the trait bound
 // This is just a marker - TestQueue doesn't actually use SQL
@@ -322,6 +321,32 @@ impl TestStorage {
         } else {
             Err(transition.rejected(job_id, status))
         }
+    }
+
+    /// Put a recurring job back to `Pending` for its run at `next_run_at`, in place (the
+    /// same id), like the database backends. With `keep_failure` the last run's error and
+    /// failure time stay visible until the next run; otherwise they are cleared.
+    fn reschedule_in_place(
+        &mut self,
+        job_id: JobId,
+        next_run_at: DateTime<Utc>,
+        keep_failure: bool,
+    ) -> Result<()> {
+        self.update_job_status(job_id, JobStatus::Pending)?;
+        self.leases.remove(&job_id);
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.scheduled_at = next_run_at;
+            job.next_run_at = Some(next_run_at);
+            job.attempts = 0;
+            job.started_at = None;
+            job.completed_at = None;
+            if !keep_failure {
+                job.failed_at = None;
+                job.timed_out_at = None;
+                job.error_message = None;
+            }
+        }
+        Ok(())
     }
 
     /// Update a job's status
@@ -1112,31 +1137,9 @@ impl DatabaseQueue for TestQueue {
 
         let now = storage.clock.now();
         if let Some(job) = storage.jobs.get_mut(&job_id) {
+            // Like the database backends, completing a job by hand does not reschedule a
+            // recurring job; `finish_job_run` does that for a finished run.
             job.completed_at = Some(now);
-
-            // Handle cron jobs
-            let schedule = if job.recurring {
-                job.cron_schedule
-                    .as_deref()
-                    .and_then(|expr| expr.parse::<cron::Schedule>().ok())
-            } else {
-                None
-            };
-            {
-                // Calculate next run time
-                if let Some(schedule) = schedule {
-                    let timezone = job
-                        .timezone
-                        .as_ref()
-                        .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
-                        .unwrap_or(chrono_tz::UTC);
-
-                    let now_in_tz = now.with_timezone(&timezone);
-                    if let Some(next) = schedule.after(&now_in_tz).next() {
-                        job.next_run_at = Some(next.with_timezone(&Utc));
-                    }
-                }
-            }
         }
 
         // Resolve dependencies
@@ -1469,7 +1472,13 @@ impl DatabaseQueue for TestQueue {
             }
         };
         if let Some(next) = next_run_at {
-            self.reschedule_cron_job(run.id, next).await?;
+            // The same job (same id) runs again, as on the database backends; a failed
+            // run's error stays visible until the next run.
+            let keep_failure = recorded.status != JobStatus::Completed;
+            self.storage
+                .write()
+                .await
+                .reschedule_in_place(run.id, next, keep_failure)?;
             recorded.status = JobStatus::Pending;
             recorded.next_run_at = Some(next);
         } else if recorded.status == JobStatus::Completed {
@@ -1980,9 +1989,10 @@ impl DatabaseQueue for TestQueue {
             .jobs
             .values()
             .filter(|job| {
+                // Like the database backends: a recurring job waiting for its next run
                 job.recurring
-                    && job.status == JobStatus::Completed
-                    && job.next_run_at.map(|next| next <= now).unwrap_or(false)
+                    && job.status == JobStatus::Pending
+                    && job.next_run_at.is_none_or(|next| next <= now)
                     && (queue_name.is_none() || job.queue_name == queue_name.unwrap())
             })
             .cloned()
@@ -1993,39 +2003,14 @@ impl DatabaseQueue for TestQueue {
 
     async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()> {
         let mut storage = self.storage.write().await;
-
-        let job = storage
-            .jobs
-            .get_mut(&job_id)
-            .ok_or_else(|| HammerworkError::JobNotFound {
-                id: job_id.to_string(),
-            })?;
-
-        if !job.recurring {
+        storage.check_transition(job_id, crate::queue::JobTransition::RescheduleCron)?;
+        if !storage.jobs.get(&job_id).is_some_and(|job| job.recurring) {
             return Err(HammerworkError::Queue {
-                message: "Job is not a recurring job".to_string(),
+                message: format!("Job {job_id} is not a recurring job"),
             });
         }
-
-        job.next_run_at = Some(next_run_at);
-
-        // Create a new job instance for the next run
-        let mut new_job = job.clone();
-        new_job.id = Uuid::new_v4();
-        new_job.status = JobStatus::Pending;
-        new_job.attempts = 0;
-        new_job.created_at = storage.clock.now();
-        new_job.scheduled_at = next_run_at;
-        new_job.started_at = None;
-        new_job.completed_at = None;
-        new_job.failed_at = None;
-        new_job.timed_out_at = None;
-        new_job.error_message = None;
-
-        storage.jobs.insert(new_job.id, new_job.clone());
-        storage.add_job_to_queue(&new_job);
-
-        Ok(())
+        // The job itself is rescheduled (same id), like on the database backends.
+        storage.reschedule_in_place(job_id, next_run_at, false)
     }
 
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
@@ -3097,13 +3082,20 @@ mod tests {
         clock.advance(chrono::Duration::hours(1));
 
         // Now the job should be available for dequeue
-        let dequeued = queue.dequeue("cron_queue").await.unwrap();
-        assert!(dequeued.is_some());
-        queue.complete_job(job_id).await.unwrap();
+        let run = queue.dequeue("cron_queue").await.unwrap().unwrap();
+        let recorded = queue
+            .finish_job_run(&run, crate::queue::JobOutcome::Completed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.status, JobStatus::Pending);
 
-        // Job should have next_run_at updated
+        // The same job is rescheduled for its next run
         let job = queue.get_job(job_id).await.unwrap().unwrap();
-        assert!(job.next_run_at.is_some());
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.next_run_at, recorded.next_run_at);
+        assert_eq!(Some(job.scheduled_at), job.next_run_at);
+        assert_eq!(job.attempts, 0);
 
         // Advance time to next run
         clock.advance(chrono::Duration::hours(2));
@@ -3117,11 +3109,13 @@ mod tests {
         let next_run = clock.now() + chrono::Duration::hours(1);
         queue.reschedule_cron_job(job_id, next_run).await.unwrap();
 
-        // Should have created a new job instance
+        // Still one job, rescheduled in place
         assert_eq!(
             queue.get_job_count("cron_queue", &JobStatus::Pending).await,
             1
         );
+        let job = queue.get_job(job_id).await.unwrap().unwrap();
+        assert_eq!(job.scheduled_at, next_run);
     }
 
     #[tokio::test]

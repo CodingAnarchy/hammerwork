@@ -447,7 +447,11 @@ async fn test_cron_job_scheduling() {
     clock.advance(Duration::hours(1));
     let dequeued = queue.dequeue("cron_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.id, job_id);
-    queue.complete_job(job_id).await.unwrap();
+    queue
+        .finish_job_run(&dequeued, hammerwork::queue::JobOutcome::Completed)
+        .await
+        .unwrap()
+        .expect("current run");
 
     // Check for due cron jobs
     clock.advance(Duration::hours(1));
@@ -459,11 +463,14 @@ async fn test_cron_job_scheduling() {
     let next_run = clock.now() + Duration::hours(1);
     queue.reschedule_cron_job(job_id, next_run).await.unwrap();
 
-    // Should have created a new job instance
+    // The same job is rescheduled; no new job instance is created
     assert_eq!(
         queue.get_job_count("cron_queue", &JobStatus::Pending).await,
         1
     );
+    let job = queue.get_job(job_id).await.unwrap().unwrap();
+    assert_eq!(job.scheduled_at, next_run);
+    assert_eq!(job.next_run_at, Some(next_run));
 
     // Disable the recurring job
     queue.disable_recurring_job(job_id).await.unwrap();

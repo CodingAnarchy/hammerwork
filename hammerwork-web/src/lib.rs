@@ -104,6 +104,7 @@ compile_error!(
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod live;
 pub mod security;
 pub mod server;
 pub mod websocket;

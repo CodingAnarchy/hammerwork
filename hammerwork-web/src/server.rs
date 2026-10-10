@@ -127,6 +127,7 @@ pub struct WebDashboard {
     auth_state: AuthState,
     websocket_state: Arc<RwLock<WebSocketState>>,
     allowed_origins: AllowedOrigins,
+    event_manager: Option<Arc<hammerwork::events::EventManager>>,
 }
 
 impl WebDashboard {
@@ -165,7 +166,23 @@ impl WebDashboard {
             auth_state,
             websocket_state,
             allowed_origins,
+            event_manager: None,
         })
+    }
+
+    /// Also forward the job lifecycle events of `event_manager` to connected clients as
+    /// they happen.
+    ///
+    /// For a dashboard embedded in the same process as the workers that publish to
+    /// `event_manager`. Without it (and in the standalone binary) the dashboard still
+    /// pushes job and queue changes, by polling the database every
+    /// `websocket.live_update_interval`; see [`crate::live`].
+    pub fn with_event_manager(
+        mut self,
+        event_manager: Arc<hammerwork::events::EventManager>,
+    ) -> Self {
+        self.event_manager = Some(event_manager);
+        self
     }
 
     /// Start the web server.
@@ -218,6 +235,23 @@ impl WebDashboard {
             database_type.to_string(),
             self.config.pool_size,
         )));
+
+        // Push job and queue changes to WebSocket clients
+        let live_interval = self.config.websocket.live_update_interval;
+        if !live_interval.is_zero() {
+            crate::live::LiveUpdates::new(
+                queue.clone(),
+                self.websocket_state.clone(),
+                self.config.websocket.live_update_max_jobs,
+            )
+            .spawn(live_interval);
+        }
+        if let Some(event_manager) = &self.event_manager {
+            let subscription = event_manager
+                .subscribe(hammerwork::events::EventFilter::new())
+                .await?;
+            crate::live::forward_job_events(self.websocket_state.clone(), subscription);
+        }
 
         // API, WebSocket and static file routes
         let routes = app_routes(

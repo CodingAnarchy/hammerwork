@@ -454,15 +454,21 @@ class HammerworkDashboard {
     handleWebSocketMessage(message) {
         console.log('WebSocket message received:', message);
         
+        // Message types are the server's `ServerMessage` variants (websocket.rs).
         switch (message.type) {
-            case 'stats_update':
-                this.updateOverviewCards(message.data);
+            case 'JobUpdate':
+                // A job changed state: reload the job list and the overview counts.
+                this.scheduleLiveRefresh('jobs');
+                this.scheduleLiveRefresh('overview');
                 break;
-            case 'job_update':
-                this.refreshJobsIfVisible();
+            case 'QueueUpdate':
+                this.scheduleLiveRefresh('queues');
+                this.scheduleLiveRefresh('overview');
                 break;
-            case 'queue_update':
-                this.refreshQueuesIfVisible();
+            case 'SystemAlert':
+                this.showNotification(message.message, 'error');
+                break;
+            case 'Pong':
                 break;
             case 'JobArchived':
                 this.handleJobArchived(message);
@@ -481,12 +487,6 @@ class HammerworkDashboard {
                 break;
             case 'JobsPurged':
                 this.handleJobsPurged(message);
-                break;
-            case 'ping':
-                // Respond to ping
-                if (this.websocket.readyState === WebSocket.OPEN) {
-                    this.websocket.send(JSON.stringify({ type: 'pong' }));
-                }
                 break;
             default:
                 console.log('Unknown WebSocket message type:', message.type);
@@ -530,6 +530,30 @@ class HammerworkDashboard {
     async refreshAllData() {
         console.log('Refreshing all data...');
         await this.loadInitialData();
+    }
+
+    // Live updates arrive in bursts (one message per changed job), so reloads are
+    // coalesced: each part of the page is reloaded at most once per second.
+    scheduleLiveRefresh(part) {
+        this.pendingRefreshes = this.pendingRefreshes || new Set();
+        this.pendingRefreshes.add(part);
+        if (this.liveRefreshTimer) {
+            return;
+        }
+        this.liveRefreshTimer = setTimeout(() => {
+            const parts = this.pendingRefreshes;
+            this.pendingRefreshes = new Set();
+            this.liveRefreshTimer = null;
+            if (parts.has('overview')) {
+                this.loadSystemOverview();
+            }
+            if (parts.has('jobs')) {
+                this.refreshJobsIfVisible();
+            }
+            if (parts.has('queues')) {
+                this.refreshQueuesIfVisible();
+            }
+        }, 1000);
     }
 
     refreshJobsIfVisible() {
@@ -880,13 +904,17 @@ class HammerworkDashboard {
         return div.innerHTML;
     }
 
+    // Whether any part of `el` is on screen (a tall section is never fully visible).
     isElementInViewport(el) {
+        if (!el) {
+            return false;
+        }
         const rect = el.getBoundingClientRect();
         return (
-            rect.top >= 0 &&
-            rect.left >= 0 &&
-            rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
-            rect.right <= (window.innerWidth || document.documentElement.clientWidth)
+            rect.bottom > 0 &&
+            rect.right > 0 &&
+            rect.top < (window.innerHeight || document.documentElement.clientHeight) &&
+            rect.left < (window.innerWidth || document.documentElement.clientWidth)
         );
     }
 

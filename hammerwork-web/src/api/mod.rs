@@ -479,3 +479,175 @@ mod tests {
         assert_eq!(body["data"], 5);
     }
 }
+
+/// #71: the listing endpoints skip rows they cannot decode instead of failing the whole
+/// page with a 500; reading the corrupt job itself still fails. The corrupt rows are
+/// written with raw SQL and removed at the end.
+#[cfg(test)]
+mod undecodable_row_tests {
+    use super::history::JobHistory;
+    use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason};
+    use hammerwork::{Job, JobId};
+    use serde_json::{Value, json};
+    use std::future::Future;
+    use std::sync::Arc;
+    use warp::Filter;
+
+    /// The ids listed in a paginated response, sorted.
+    fn listed(body: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = body["data"]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no items: {body}"))
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// `sql` runs one statement. `corrupt_archive_id` makes the archived row undecodable
+    /// by giving it an id that is not a UUID (possible on MySQL, where the id is text).
+    async fn listings_skip_undecodable_rows<Q, S, F>(
+        queue: Arc<Q>,
+        sql: S,
+        corrupt_archive_id: bool,
+    ) where
+        Q: JobHistory + 'static,
+        S: Fn(String) -> F,
+        F: Future<Output = ()>,
+    {
+        let routes = super::jobs::routes(queue.clone())
+            .or(super::queues::routes(queue.clone()))
+            .or(super::archive::archive_routes(queue.clone()));
+        let get = |path: String| {
+            let routes = routes.clone();
+            async move {
+                let response = warp::test::request().path(&path).reply(&routes).await;
+                let body: Value = serde_json::from_slice(response.body()).unwrap();
+                (response.status().as_u16(), body)
+            }
+        };
+
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("undecodable_{tag}");
+        let archive_name = format!("undecodable_archive_{tag}");
+        let enqueue = |queue_name: &str| queue.enqueue(Job::new(queue_name.to_string(), json!({})));
+        let break_timeout = |id: JobId| {
+            sql(format!(
+                "UPDATE hammerwork_jobs SET timeout_seconds = -1 WHERE id = '{id}'"
+            ))
+        };
+
+        let ready = enqueue(&name).await.unwrap();
+        let bad_ready = enqueue(&name).await.unwrap();
+        break_timeout(bad_ready).await;
+        let dead = enqueue(&name).await.unwrap();
+        let bad_dead = enqueue(&name).await.unwrap();
+        for id in [dead, bad_dead] {
+            queue.mark_job_dead(id, "gone").await.unwrap();
+        }
+        break_timeout(bad_dead).await;
+        let mut healthy = vec![ready.to_string(), dead.to_string()];
+        healthy.sort();
+
+        // Job list, queue jobs and search: the healthy jobs, without a 500.
+        for path in [
+            format!("/jobs?queue={name}&limit=100"),
+            format!("/queues/{name}/jobs?limit=100"),
+        ] {
+            let (status, body) = get(path.clone()).await;
+            assert_eq!(status, 200, "{path}: {body}");
+            assert_eq!(listed(&body), healthy, "{path}");
+        }
+        let response = warp::test::request()
+            .method("POST")
+            .path("/jobs/search?limit=100")
+            .json(&json!({"query": "", "queues": [name]}))
+            .reply(&routes)
+            .await;
+        let body: Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(response.status(), 200, "{body}");
+        assert_eq!(listed(&body), healthy, "search");
+
+        // The corrupt job itself still reports the error.
+        let (status, body) = get(format!("/jobs/{bad_ready}")).await;
+        assert_eq!(status, 500, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("timeout_seconds"),
+            "{body}"
+        );
+
+        // Archived jobs
+        let archived = enqueue(&archive_name).await.unwrap();
+        let bad_archived = enqueue(&archive_name).await.unwrap();
+        for id in [archived, bad_archived] {
+            queue.mark_job_dead(id, "gone").await.unwrap();
+        }
+        let policy = ArchivalPolicy::new()
+            .archive_dead_after(chrono::Duration::seconds(0))
+            .enabled(true);
+        queue
+            .archive_jobs(
+                Some(&archive_name),
+                &policy,
+                &ArchivalConfig::new(),
+                ArchivalReason::Manual,
+                None,
+            )
+            .await
+            .unwrap();
+        if corrupt_archive_id {
+            sql(format!(
+                "UPDATE hammerwork_jobs_archive SET id = 'not-a-uuid' WHERE id = '{bad_archived}'"
+            ))
+            .await;
+        }
+        let (status, body) = get(format!("/archive/jobs?queue={archive_name}")).await;
+        assert_eq!(status, 200, "{body}");
+        let ids = listed(&body);
+        assert!(ids.contains(&archived.to_string()), "{body}");
+        if corrupt_archive_id {
+            assert_eq!(ids, [archived.to_string()], "{body}");
+        }
+
+        for (table, queue_name) in [
+            ("hammerwork_jobs", &name),
+            ("hammerwork_jobs_archive", &archive_name),
+        ] {
+            sql(format!(
+                "DELETE FROM {table} WHERE queue_name = '{queue_name}'"
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn postgres_listings_skip_undecodable_rows() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let queue = Arc::new(hammerwork::JobQueue::new(pool.clone()));
+        let sql = |statement: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(&statement).execute(&pool).await.unwrap();
+            }
+        };
+        listings_skip_undecodable_rows(queue, sql, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MYSQL_DATABASE_URL"]
+    async fn mysql_listings_skip_undecodable_rows() {
+        let url = std::env::var("MYSQL_DATABASE_URL").expect("MYSQL_DATABASE_URL");
+        let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+        let queue = Arc::new(hammerwork::JobQueue::new(pool.clone()));
+        let sql = |statement: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(&statement).execute(&pool).await.unwrap();
+            }
+        };
+        listings_skip_undecodable_rows(queue, sql, true).await;
+    }
+}
