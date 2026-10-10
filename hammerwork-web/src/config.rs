@@ -311,7 +311,8 @@ impl DashboardConfig {
     ///   bcrypt password hashes;
     /// - an entry of `allowed_origins` that is not an origin, or `enable_cors` without any;
     /// - a zero `websocket.ping_interval` (`tokio::time::interval` panics on a zero period),
-    ///   `websocket.message_buffer_size` or `websocket.max_message_size`.
+    ///   `websocket.message_buffer_size` or `websocket.max_message_size`;
+    /// - a zero `websocket.live_update_max_jobs` while live updates are enabled.
     pub fn validate(&self) -> crate::Result<()> {
         if self.auth.enabled && !cfg!(feature = "auth") {
             anyhow::bail!(
@@ -335,6 +336,14 @@ impl DashboardConfig {
         }
         if self.websocket.max_message_size == 0 {
             anyhow::bail!("websocket.max_message_size must be greater than zero");
+        }
+        if !self.websocket.live_update_interval.is_zero()
+            && self.websocket.live_update_max_jobs == 0
+        {
+            anyhow::bail!(
+                "websocket.live_update_max_jobs must be greater than zero (set \
+                 websocket.live_update_interval to zero to disable live updates)"
+            );
         }
         Ok(())
     }
@@ -435,6 +444,27 @@ pub struct WebSocketConfig {
 
     /// Maximum size in bytes of a message (and of a frame) received from a client
     pub max_message_size: usize,
+
+    /// How often the dashboard polls the database for job state changes and queue
+    /// statistics to push to connected clients (`JobUpdate` and `QueueUpdate` messages).
+    /// Polling only happens while at least one client is connected. Zero disables live
+    /// updates. Optional in configuration files (default 2 seconds).
+    #[serde(default = "default_live_update_interval")]
+    pub live_update_interval: Duration,
+
+    /// The most changed jobs one poll reads and pushes; further changes in the same
+    /// interval are not pushed individually (the queue statistics still reflect them).
+    /// Optional in configuration files (default 100).
+    #[serde(default = "default_live_update_max_jobs")]
+    pub live_update_max_jobs: u32,
+}
+
+fn default_live_update_interval() -> Duration {
+    Duration::from_secs(2)
+}
+
+fn default_live_update_max_jobs() -> u32 {
+    100
 }
 
 impl Default for WebSocketConfig {
@@ -444,6 +474,8 @@ impl Default for WebSocketConfig {
             max_connections: 100,
             message_buffer_size: 1024,
             max_message_size: 64 * 1024, // 64KB
+            live_update_interval: default_live_update_interval(),
+            live_update_max_jobs: default_live_update_max_jobs(),
         }
     }
 }
@@ -646,5 +678,30 @@ mod tests {
         assert_eq!(ws_config.ping_interval, Duration::from_secs(30));
         assert_eq!(ws_config.max_connections, 100);
         assert_eq!(ws_config.max_message_size, 64 * 1024);
+        assert_eq!(ws_config.live_update_interval, Duration::from_secs(2));
+        assert_eq!(ws_config.live_update_max_jobs, 100);
+    }
+
+    #[test]
+    fn test_live_update_settings_are_optional_and_validated() {
+        // A configuration written before live updates existed still loads.
+        let toml = r#"
+            ping_interval = { secs = 30, nanos = 0 }
+            max_connections = 10
+            message_buffer_size = 16
+            max_message_size = 1024
+        "#;
+        let ws: WebSocketConfig = toml::from_str(toml).unwrap();
+        assert_eq!(ws.live_update_interval, Duration::from_secs(2));
+        assert_eq!(ws.live_update_max_jobs, 100);
+
+        let mut config = DashboardConfig::new();
+        config.auth.enabled = false;
+        config.websocket.live_update_max_jobs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("live_update_max_jobs"), "{err}");
+        // Disabled live updates do not need a limit.
+        config.websocket.live_update_interval = Duration::ZERO;
+        assert!(config.validate().is_ok());
     }
 }

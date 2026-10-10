@@ -21,6 +21,8 @@ use sqlx::Row;
 use std::collections::BTreeMap;
 use std::future::Future;
 
+use crate::websocket::JobUpdate;
+
 /// Completed/failed activity in one UTC hour.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HourBucket {
@@ -151,6 +153,60 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
         limit: u32,
         offset: u32,
     ) -> impl Future<Output = Result<(Vec<ArchivedJob>, u64)>> + Send;
+
+    /// The database's current time, the clock the job state timestamps are written with.
+    fn database_now(&self) -> impl Future<Output = Result<DateTime<Utc>>> + Send;
+
+    /// Jobs whose state changed after `since`, newest first, at most `limit`: jobs that
+    /// were created, started, completed, failed or timed out since then. Each is reported
+    /// with the time of its latest such change. Rows that cannot be decoded are skipped.
+    fn recent_job_changes(
+        &self,
+        since: DateTime<Utc>,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send;
+}
+
+/// The job timestamps that mark a change of state, newest first in
+/// [`JobHistory::recent_job_changes`].
+const CHANGE_COLUMNS: [&str; 5] = [
+    "created_at",
+    "started_at",
+    "completed_at",
+    "failed_at",
+    "timed_out_at",
+];
+
+/// `WHERE` clause of [`JobHistory::recent_job_changes`]: any change column after the
+/// cutoff. Each comparison can use an index on its column.
+fn changed_since_filter(postgres: bool) -> String {
+    let placeholder = if postgres { "$1" } else { "?" };
+    CHANGE_COLUMNS
+        .iter()
+        .map(|column| format!("{column} > {placeholder}"))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// A changed job as sent to dashboard clients.
+fn job_change(
+    id: String,
+    queue_name: String,
+    status: &str,
+    priority: i32,
+    attempts: i32,
+    changed_at: DateTime<Utc>,
+) -> JobUpdate {
+    JobUpdate {
+        id,
+        queue_name,
+        status: status.trim_matches('"').to_string(),
+        priority: hammerwork::JobPriority::from_i32(priority)
+            .unwrap_or_default()
+            .to_string(),
+        attempts,
+        updated_at: changed_at,
+    }
 }
 
 /// A value bound to an archive filter placeholder.
@@ -246,6 +302,21 @@ fn archived_status(value: &str) -> JobStatus {
     .into_iter()
     .find(|status| status.as_str() == value)
     .unwrap_or(JobStatus::Dead)
+}
+
+/// The rows of a dashboard listing that could be decoded. A row that cannot be decoded
+/// is skipped with a warning naming its id, so one corrupt row does not turn the whole
+/// page into an error.
+pub(crate) fn decodable<T>(rows: impl IntoIterator<Item = (String, Result<T>)>) -> Vec<T> {
+    rows.into_iter()
+        .filter_map(|(id, decoded)| match decoded {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(job_id = %id, error = %error, "Skipping an undecodable row");
+                None
+            }
+        })
+        .collect()
 }
 
 /// An archived job from a row of [`ARCHIVED_JOB_COLUMNS`], with the id already decoded.
@@ -447,11 +518,51 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             .bind(i64::from(offset))
             .fetch_all(&self.pool)
             .await?;
-        let jobs = rows
-            .iter()
-            .map(|row| archived_job(row, row.try_get::<uuid::Uuid, _>("id")?))
-            .collect::<Result<Vec<_>>>()?;
+        let jobs = decodable(rows.iter().map(|row| {
+            let id = row.try_get::<uuid::Uuid, _>("id");
+            let label = id.as_ref().map(|id| id.to_string()).unwrap_or_default();
+            (
+                label,
+                id.map_err(Into::into).and_then(|id| archived_job(row, id)),
+            )
+        }));
         Ok((jobs, to_u64(total)))
+    }
+
+    async fn database_now(&self) -> Result<DateTime<Utc>> {
+        Ok(sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    async fn recent_job_changes(&self, since: DateTime<Utc>, limit: u32) -> Result<Vec<JobUpdate>> {
+        // GREATEST ignores NULLs on PostgreSQL.
+        let sql = format!(
+            "SELECT id, queue_name, status, priority, attempts, GREATEST({}) AS changed_at \
+             FROM hammerwork_jobs WHERE {} ORDER BY changed_at DESC LIMIT $2",
+            CHANGE_COLUMNS.join(", "),
+            changed_since_filter(true)
+        );
+        let rows = sqlx::query(&sql)
+            .bind(since)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(decodable(rows.iter().map(|row| {
+            let id = row.try_get::<uuid::Uuid, _>("id");
+            let label = id.as_ref().map(|id| id.to_string()).unwrap_or_default();
+            let change = id.map_err(Into::into).and_then(|id| {
+                Ok(job_change(
+                    id.to_string(),
+                    row.try_get("queue_name")?,
+                    &row.try_get::<String, _>("status")?,
+                    row.try_get("priority")?,
+                    row.try_get("attempts")?,
+                    row.try_get("changed_at")?,
+                ))
+            });
+            (label, change)
+        })))
     }
 }
 
@@ -604,16 +715,55 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             .bind(i64::from(offset))
             .fetch_all(&self.pool)
             .await?;
-        let jobs = rows
-            .iter()
-            .map(|row| {
-                archived_job(
-                    row,
-                    uuid::Uuid::parse_str(&row.try_get::<String, _>("id")?)?,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let jobs = decodable(rows.iter().map(|row| {
+            let label = row.try_get::<String, _>("id").unwrap_or_default();
+            let job = uuid::Uuid::parse_str(&label)
+                .map_err(Into::into)
+                .and_then(|id| archived_job(row, id));
+            (label, job)
+        }));
         Ok((jobs, to_u64(total)))
+    }
+
+    async fn database_now(&self) -> Result<DateTime<Utc>> {
+        Ok(sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    async fn recent_job_changes(&self, since: DateTime<Utc>, limit: u32) -> Result<Vec<JobUpdate>> {
+        // GREATEST is NULL if any argument is on MySQL, so missing timestamps fall back to
+        // `created_at`.
+        let latest = CHANGE_COLUMNS
+            .iter()
+            .map(|column| format!("COALESCE({column}, created_at)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, queue_name, status, priority, attempts, \
+             CAST(GREATEST({latest}) AS DATETIME(6)) AS changed_at \
+             FROM hammerwork_jobs WHERE {} ORDER BY changed_at DESC LIMIT ?",
+            changed_since_filter(false)
+        );
+        let mut query = sqlx::query(&sql);
+        for _ in CHANGE_COLUMNS {
+            query = query.bind(since);
+        }
+        let rows = query.bind(i64::from(limit)).fetch_all(&self.pool).await?;
+        Ok(decodable(rows.iter().map(|row| {
+            let label = row.try_get::<String, _>("id").unwrap_or_default();
+            let change = (|| {
+                Ok(job_change(
+                    row.try_get("id")?,
+                    row.try_get("queue_name")?,
+                    &row.try_get::<String, _>("status")?,
+                    row.try_get("priority")?,
+                    row.try_get("attempts")?,
+                    row.try_get("changed_at")?,
+                ))
+            })();
+            (label, change)
+        })))
     }
 }
 
@@ -629,6 +779,34 @@ mod tests {
 
     fn at(h: u32, m: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 1, 2, h, m, 0).unwrap()
+    }
+
+    /// #71: a dashboard listing skips the rows it cannot decode.
+    #[test]
+    fn undecodable_rows_are_skipped() {
+        let bad: Result<u8> = Err(hammerwork::HammerworkError::Processing("bad".into()));
+        let rows = vec![("a".to_string(), Ok(1u8)), ("b".to_string(), bad)];
+        assert_eq!(decodable(rows), [1]);
+    }
+
+    #[test]
+    fn job_changes_normalise_status_and_priority() {
+        let at = Utc::now();
+        let change = job_change("id".into(), "q".into(), "\"Running\"", 3, 2, at);
+        assert_eq!(change.status, "Running");
+        assert_eq!(change.priority, "high");
+        assert_eq!(change.attempts, 2);
+        assert_eq!(change.updated_at, at);
+        assert_eq!(
+            job_change("id".into(), "q".into(), "Pending", 99, 0, at).priority,
+            "normal"
+        );
+        assert_eq!(
+            changed_since_filter(true),
+            "created_at > $1 OR started_at > $1 OR completed_at > $1 OR failed_at > $1 \
+             OR timed_out_at > $1"
+        );
+        assert!(changed_since_filter(false).starts_with("created_at > ? OR started_at > ?"));
     }
 
     #[test]

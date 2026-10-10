@@ -95,6 +95,9 @@ ping_interval = "30s"
 max_connections = 100
 message_buffer_size = 1024    # outgoing messages queued per connection
 max_message_size = 65536      # largest message a client may send
+# Live updates: poll the database for job/queue changes while clients are connected
+live_update_interval = { secs = 2, nanos = 0 }   # zero disables live updates
+live_update_max_jobs = 100    # changed jobs read and pushed per poll
 ```
 
 Then start with:
@@ -228,6 +231,44 @@ ws.onmessage = (event) => {
     const message = JSON.parse(event.data);
     console.log('Received:', message);
 };
+```
+
+A new connection receives every event type until it sends its first `Subscribe` or
+`Unsubscribe`. Each message has a `type`:
+
+| `type` | Event type | Contents |
+|---|---|---|
+| `JobUpdate` | `job_updates` | `job`: `id`, `queue_name`, `status`, `priority`, `attempts`, `updated_at` |
+| `QueueUpdate` | `queue_updates` | `queue_name`, `stats` (pending, running, completed, failed and dead counts, throughput, error rate) |
+| `SystemAlert` | `system_alerts` | `message`, `severity` |
+| `JobArchived`, `JobRestored`, `BulkArchive*`, `JobsPurged` | `archive_events` | archive operation details |
+| `Pong` | | the answer to a client `{"type": "Ping"}` |
+
+#### Live updates
+
+The dashboard usually runs in its own process, apart from the workers, so it cannot see
+the job events a worker publishes in its own process. Instead, while at least one client
+is connected, it polls the database every `websocket.live_update_interval` (default 2
+seconds) and pushes:
+
+- a `JobUpdate` for each job created, started, completed, failed or timed out since the
+  previous poll (at most `websocket.live_update_max_jobs` per poll, newest first);
+- a `QueueUpdate` for each queue whose counts changed.
+
+Each poll runs two small queries plus the queue statistics query. Nothing is polled
+while no client is connected; set `live_update_interval` to zero to turn polling off.
+Changes that leave no timestamp (a retry back to `Pending`, a deleted job) show up only
+in the queue statistics.
+
+An application that embeds the dashboard in the same process as its workers can also
+forward their events as they happen:
+
+```rust
+// `events` is the Arc<EventManager> the workers were given with `with_event_manager`.
+let dashboard = WebDashboard::new(config)
+    .await?
+    .with_event_manager(events.clone());
+dashboard.start().await?;
 ```
 
 ## Development

@@ -236,6 +236,7 @@ mod tests {
             max_connections: 50,
             message_buffer_size: 512,
             max_message_size: 32 * 1024,
+            ..Default::default()
         };
 
         assert_eq!(ws_config.ping_interval, Duration::from_secs(10));
@@ -423,6 +424,7 @@ mod websocket_archive_tests {
             ping_interval: Duration::from_secs(30),
             message_buffer_size: 1024,
             max_message_size: 64 * 1024,
+            ..Default::default()
         };
 
         let ws_state = WebSocketState::new(config);
