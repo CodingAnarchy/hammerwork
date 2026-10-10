@@ -298,8 +298,9 @@ pub use archive::{
 };
 pub use batch::{BatchId, BatchResult, BatchStatus, JobBatch, PartialFailureMode};
 pub use config::{
-    ArchiveConfig, DatabaseConfig, HammerworkConfig, KeySourceRef, LoggingConfig,
-    PayloadEncryptionAlgorithm, PayloadEncryptionConfig, RateLimitingConfig, WorkerConfig,
+    ArchiveConfig, DatabaseConfig, HammerworkConfig, KeyRotationConfig, KeySourceRef,
+    LoggingConfig, PayloadEncryptionAlgorithm, PayloadEncryptionConfig, RateLimitingConfig,
+    WorkerConfig,
 };
 
 #[cfg(any(
@@ -323,9 +324,9 @@ pub use cron::{CronError, CronSchedule};
 #[cfg(feature = "encryption")]
 pub use encryption::{
     EncryptedPayload, EncryptionAlgorithm, EncryptionConfig, EncryptionEngine, EncryptionError,
-    EncryptionKey, EncryptionMetadata, EncryptionStats, ExternalKmsConfig, KeyAuditRecord,
-    KeyDerivationConfig, KeyManager, KeyManagerConfig, KeyManagerStats, KeyOperation, KeyPurpose,
-    KeySource, KeyStatus, RetentionPolicy, generate_deterministic_key,
+    EncryptionKey, EncryptionMetadata, EncryptionStats, ExternalKmsConfig, KeyAuditFilter,
+    KeyAuditRecord, KeyDerivationConfig, KeyManager, KeyManagerConfig, KeyManagerStats,
+    KeyOperation, KeyPurpose, KeySource, KeyStatus, RetentionPolicy, generate_deterministic_key,
     generate_deterministic_key_with_size,
 };
 pub use error::HammerworkError;

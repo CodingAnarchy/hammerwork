@@ -65,9 +65,10 @@ mod kms;
 pub use engine::EncryptionEngine;
 pub use job_payload::{REDACTED_FIELD_VALUE, encrypted_payload_placeholder};
 pub use key_manager::{
-    EncryptionKey, ExternalKmsConfig, KeyAuditRecord, KeyDerivationConfig, KeyManager,
-    KeyManagerBackend, KeyManagerConfig, KeyManagerStats, KeyOperation, KeyPurpose, KeyStatus,
-    parse_algorithm, parse_key_purpose, parse_key_source, parse_key_status,
+    DEFAULT_AUDIT_LOG_LIMIT, EncryptionKey, ExternalKmsConfig, KeyAuditFilter, KeyAuditRecord,
+    KeyDerivationConfig, KeyManager, KeyManagerBackend, KeyManagerConfig, KeyManagerStats,
+    KeyOperation, KeyPurpose, KeyStatus, parse_algorithm, parse_key_operation, parse_key_purpose,
+    parse_key_source, parse_key_status,
 };
 
 use chrono::{DateTime, Utc};
