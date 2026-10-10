@@ -2177,22 +2177,31 @@ where
 
         // Store the result before recording the completion, so that anyone who sees the
         // job as Completed can also read its result.
-        if let Some(result_data) = job_result.data
-            && let crate::job::ResultStorage::Database = job.result_config.storage
-        {
+        if let Some(result_data) = job_result.data {
             let expires_at = job
                 .result_config
                 .ttl
                 .map(|ttl| crate::queue::saturating_add_to(Utc::now(), ttl));
 
-            if let Err(e) = self
-                .queue
-                .store_job_result(job_id, result_data, expires_at)
-                .await
-            {
-                error!("Failed to store result for job {}: {}", job_id, e);
-            } else {
-                debug!("Stored result for job {}", job_id);
+            match job.result_config.storage {
+                crate::job::ResultStorage::Database => {
+                    if let Err(e) = self
+                        .queue
+                        .store_job_result(job_id, result_data, expires_at)
+                        .await
+                    {
+                        error!("Failed to store result for job {}: {}", job_id, e);
+                    } else {
+                        debug!("Stored result for job {}", job_id);
+                    }
+                }
+                crate::job::ResultStorage::Memory => {
+                    self.queue
+                        .memory_results
+                        .store(job_id, result_data, expires_at);
+                    debug!("Stored result for job {} in memory", job_id);
+                }
+                crate::job::ResultStorage::None => {}
             }
         }
 

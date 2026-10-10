@@ -33,6 +33,10 @@ pub mod test;
 mod payload_encryption;
 pub(crate) use payload_encryption::PayloadEncryption;
 
+mod memory_results;
+pub use memory_results::DEFAULT_MEMORY_RESULT_CAPACITY;
+pub(crate) use memory_results::MemoryResultStore;
+
 /// Information about a queue's pause state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuePauseInfo {
@@ -335,6 +339,11 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// Returns the result data if it exists and hasn't expired, otherwise returns `None`.
     ///
+    /// On a [`JobQueue`], this first looks in the queue's in-memory store, which holds
+    /// the results of jobs configured with
+    /// [`ResultStorage::Memory`](crate::job::ResultStorage::Memory) that workers on this
+    /// queue (or its clones) completed in this process, and then in the database.
+    ///
     /// # Arguments
     ///
     /// * `job_id` - The unique identifier of the job
@@ -357,7 +366,8 @@ pub trait DatabaseQueue: Send + Sync {
 
     /// Delete the stored result data for a job.
     ///
-    /// This is useful for manual cleanup or when results are no longer needed.
+    /// This is useful for manual cleanup or when results are no longer needed. On a
+    /// [`JobQueue`], this removes the result from the in-memory store too.
     ///
     /// # Arguments
     ///
@@ -379,6 +389,8 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// This method removes all job results that have passed their expiration time.
     /// It should be called periodically to prevent the database from growing indefinitely.
+    /// On a [`JobQueue`], expired in-memory results are removed and counted too (they are
+    /// also pruned as new results are stored).
     ///
     /// # Returns
     ///
@@ -1545,6 +1557,9 @@ pub struct JobQueue<DB: Database> {
     pub(crate) throttle_configs: Arc<RwLock<HashMap<String, ThrottleConfig>>>,
     /// Encrypts and decrypts job payloads (see [`JobQueue::with_encryption`])
     pub(crate) encryption: PayloadEncryption,
+    /// Results of jobs with `ResultStorage::Memory`, shared by all clones of this queue
+    /// (see [`JobQueue::with_memory_result_capacity`])
+    pub(crate) memory_results: Arc<MemoryResultStore>,
 }
 
 impl<DB: Database> Clone for JobQueue<DB> {
@@ -1554,6 +1569,7 @@ impl<DB: Database> Clone for JobQueue<DB> {
             _phantom: PhantomData,
             throttle_configs: self.throttle_configs.clone(),
             encryption: self.encryption.clone(),
+            memory_results: self.memory_results.clone(),
         }
     }
 }
@@ -1586,7 +1602,44 @@ impl<DB: Database> JobQueue<DB> {
             _phantom: PhantomData,
             throttle_configs: Arc::new(RwLock::new(HashMap::new())),
             encryption: PayloadEncryption::default(),
+            memory_results: Arc::new(MemoryResultStore::default()),
         }
+    }
+
+    /// Sets how many results of jobs configured with
+    /// [`ResultStorage::Memory`](crate::job::ResultStorage::Memory) this queue keeps in
+    /// memory. The default is [`DEFAULT_MEMORY_RESULT_CAPACITY`] (10,000); 0 keeps none.
+    ///
+    /// Workers store such results in the queue's in-memory store instead of the
+    /// database, and [`get_job_result`](DatabaseQueue::get_job_result) reads them from
+    /// there. The store is shared by every clone of the queue (and so by every worker
+    /// given the same `Arc<JobQueue>`), but not by queues created separately with
+    /// [`JobQueue::new`]. Results expire at their TTL
+    /// ([`Job::with_result_ttl`](crate::Job::with_result_ttl)). When the store is full,
+    /// storing a result evicts the one that expires soonest, or the oldest if none
+    /// expire.
+    ///
+    /// In-memory results are local to this process: other processes, such as
+    /// `cargo hammerwork` or the web dashboard, don't see them, and they are lost when
+    /// the process exits. Use [`ResultStorage::Database`](crate::job::ResultStorage::Database)
+    /// for results that must be shared or survive a restart.
+    ///
+    /// This replaces the store, dropping the results it held, so call it when building
+    /// the queue, before cloning it or starting workers.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "postgres")]
+    /// # async fn example(pool: sqlx::PgPool) {
+    /// use hammerwork::JobQueue;
+    ///
+    /// let queue = JobQueue::new(pool).with_memory_result_capacity(50_000);
+    /// # }
+    /// ```
+    pub fn with_memory_result_capacity(mut self, capacity: usize) -> Self {
+        self.memory_results = Arc::new(MemoryResultStore::with_capacity(capacity));
+        self
     }
 
     /// Encrypts job payloads at rest with `engine`.

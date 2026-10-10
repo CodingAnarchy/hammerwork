@@ -64,6 +64,86 @@ async fn assert_result_survives_job_completion<Q: DatabaseQueue>(queue: &Q) {
     );
 }
 
+/// A worker stores a `Memory` job's result in the queue's in-memory store: the queue
+/// reads it back, it expires at its TTL, it can be deleted, and it is never written to
+/// the database (a queue with its own store, like another process, doesn't see it).
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+async fn assert_worker_stores_memory_result<DB>(queue: Arc<hammerwork::JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    hammerwork::JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let queue_name = test_utils::unique_queue("memory_result");
+    let handler: JobHandlerWithResult = Arc::new(|job| {
+        Box::pin(async move { Ok(JobResult::with_data(json!({ "echo": job.payload["n"] }))) })
+    });
+
+    let ttl = Duration::from_secs(2);
+    let expiring = Job::new(queue_name.clone(), json!({"n": 1}))
+        .with_result_storage(ResultStorage::Memory)
+        .with_result_ttl(ttl);
+    let lasting =
+        Job::new(queue_name.clone(), json!({"n": 2})).with_result_storage(ResultStorage::Memory);
+    let expiring_id = queue.enqueue(expiring).await.unwrap();
+    let lasting_id = queue.enqueue(lasting).await.unwrap();
+
+    let worker = Worker::new_with_result_handler(queue.clone(), queue_name, handler)
+        .with_poll_interval(Duration::from_millis(10));
+    let mut pool = WorkerPool::new();
+    pool.add_worker(worker);
+    // The results are stored after this, so they expire no earlier than `started + ttl`.
+    let started = tokio::time::Instant::now();
+    let pool_task = tokio::spawn(async move { pool.start().await });
+
+    for id in [expiring_id, lasting_id] {
+        assert!(
+            wait_for_completion(queue.as_ref(), id, Duration::from_secs(20)).await,
+            "job {id} did not complete"
+        );
+    }
+    // Measured after completion, so the results expire no later than `completed_at + ttl`.
+    let completed_at = tokio::time::Instant::now();
+    pool_task.abort();
+
+    assert_eq!(
+        queue.get_job_result(lasting_id).await.unwrap(),
+        Some(json!({"echo": 2}))
+    );
+    if started.elapsed() < ttl {
+        assert_eq!(
+            queue.get_job_result(expiring_id).await.unwrap(),
+            Some(json!({"echo": 1}))
+        );
+    }
+
+    // Nothing was written to the result columns.
+    for id in [expiring_id, lasting_id] {
+        let job = queue.get_job(id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(
+            job.result_data, None,
+            "job {id} result written to the database"
+        );
+        assert_eq!(job.result_stored_at, None);
+    }
+    let other_process = hammerwork::JobQueue::<DB>::new(queue.get_pool().clone());
+    assert_eq!(
+        other_process.get_job_result(lasting_id).await.unwrap(),
+        None
+    );
+
+    // The result with a TTL expires; the one without stays until it is deleted.
+    tokio::time::sleep_until(completed_at + ttl + Duration::from_millis(200)).await;
+    assert_eq!(queue.get_job_result(expiring_id).await.unwrap(), None);
+    assert!(queue.get_job_result(lasting_id).await.unwrap().is_some());
+    queue.delete_job_result(lasting_id).await.unwrap();
+    assert_eq!(queue.get_job_result(lasting_id).await.unwrap(), None);
+
+    for id in [expiring_id, lasting_id] {
+        queue.delete_job(id).await.unwrap();
+    }
+}
+
 #[cfg(feature = "postgres")]
 mod postgres_tests {
     use super::*;
@@ -73,6 +153,12 @@ mod postgres_tests {
     async fn test_postgres_result_survives_job_completion() {
         let queue = test_utils::setup_postgres_queue().await;
         assert_result_survives_job_completion(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_worker_stores_memory_result() {
+        assert_worker_stores_memory_result(test_utils::setup_postgres_queue().await).await;
     }
 
     #[tokio::test]
@@ -346,6 +432,12 @@ mod mysql_tests {
     async fn test_mysql_result_survives_job_completion() {
         let queue = test_utils::setup_mysql_queue().await;
         assert_result_survives_job_completion(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_worker_stores_memory_result() {
+        assert_worker_stores_memory_result(test_utils::setup_mysql_queue().await).await;
     }
 
     #[tokio::test]

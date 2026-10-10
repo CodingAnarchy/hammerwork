@@ -736,6 +736,13 @@ impl TestStorage {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// ## Job results
+///
+/// `TestQueue` keeps every stored result in memory, whatever the job's
+/// [`ResultStorage`](crate::job::ResultStorage): `store_job_result` and
+/// `get_job_result` behave the same for `Database` and `Memory` jobs, and results expire
+/// at their `expires_at` by the [`MockClock`]. Deleting a job deletes its result.
 #[derive(Clone)]
 pub struct TestQueue {
     storage: Arc<RwLock<TestStorage>>,
@@ -1236,6 +1243,8 @@ impl DatabaseQueue for TestQueue {
             {
                 batch_jobs.retain(|id| *id != job_id);
             }
+
+            storage.job_results.remove(&job_id);
 
             // Clean up dependencies
             storage.dependencies.remove(&job_id);
@@ -3149,6 +3158,45 @@ mod tests {
         // Cleanup expired results
         let cleaned = queue.cleanup_expired_results().await.unwrap();
         assert_eq!(cleaned, 1);
+    }
+
+    #[tokio::test]
+    async fn test_memory_result_storage_follows_ttl_and_delete() {
+        use crate::job::ResultStorage;
+
+        let queue = TestQueue::new();
+        let clock = queue.clock();
+
+        let job = Job::new("memory_results".to_string(), json!({}))
+            .with_result_storage(ResultStorage::Memory)
+            .with_result_ttl(std::time::Duration::from_secs(60));
+        let ttl = job.result_config.ttl.unwrap();
+        let job_id = queue.enqueue(job).await.unwrap();
+        queue.dequeue("memory_results").await.unwrap().unwrap();
+
+        // What a worker does: store the result with its TTL, then complete the job.
+        let expires_at = crate::queue::saturating_add_to(clock.now(), ttl);
+        queue
+            .store_job_result(job_id, json!({"n": 1}), Some(expires_at))
+            .await
+            .unwrap();
+        queue.complete_job(job_id).await.unwrap();
+
+        assert_eq!(
+            queue.get_job_result(job_id).await.unwrap(),
+            Some(json!({"n": 1}))
+        );
+        clock.advance(chrono::Duration::seconds(61));
+        assert_eq!(queue.get_job_result(job_id).await.unwrap(), None);
+
+        // Deleting a job deletes its result.
+        queue
+            .store_job_result(job_id, json!({"n": 2}), None)
+            .await
+            .unwrap();
+        queue.delete_job(job_id).await.unwrap();
+        assert_eq!(queue.get_job_result(job_id).await.unwrap(), None);
+        assert_eq!(queue.cleanup_expired_results().await.unwrap(), 0);
     }
 
     #[tokio::test]

@@ -765,6 +765,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .execute(&self.pool)
             .await?;
 
+        self.memory_results.remove(job_id);
         Ok(())
     }
 
@@ -1530,6 +1531,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn get_job_result(&self, job_id: JobId) -> Result<Option<serde_json::Value>> {
+        if let Some(result) = self.memory_results.get(job_id) {
+            return Ok(Some(result));
+        }
         let row = sqlx::query(
             "SELECT result_data FROM hammerwork_jobs WHERE id = $1 AND result_data IS NOT NULL AND (result_expires_at IS NULL OR result_expires_at > now())"
         )
@@ -1544,6 +1548,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn delete_job_result(&self, job_id: JobId) -> Result<()> {
+        self.memory_results.remove(job_id);
         sqlx::query(
             "UPDATE hammerwork_jobs SET result_data = NULL, result_stored_at = NULL, result_expires_at = NULL WHERE id = $1"
         )
@@ -1561,7 +1566,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .execute(&self.pool)
         .await?;
 
-        Ok(result.rows_affected())
+        Ok(result.rows_affected() + self.memory_results.cleanup_expired())
     }
 
     // Workflow and dependency management methods
