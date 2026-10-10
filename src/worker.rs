@@ -80,9 +80,10 @@ pub const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Floor on the heartbeat interval derived from the lease duration.
 const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Default number of jobs a worker in batch mode claims per poll
-/// ([`Worker::with_batch_size`]).
-pub const DEFAULT_BATCH_SIZE: usize = 10;
+/// Default number of jobs a worker in batch mode claims per poll: one, so
+/// `with_batch_processing_enabled(true)` alone keeps claiming one job at a time (as before
+/// 2.1) and only adds batch statistics. Set a larger size with [`Worker::with_batch_size`].
+pub const DEFAULT_BATCH_SIZE: usize = 1;
 
 /// Default number of claimed jobs a worker in batch mode runs at once
 /// ([`Worker::with_batch_concurrency`]): one, so batch mode changes how jobs are claimed
@@ -1546,7 +1547,8 @@ where
     /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
-    /// // Claim up to 10 jobs (the default batch size) per poll, run them one at a time.
+    /// // Keep statistics for job batches; jobs are still claimed one at a time. Use
+    /// // `with_batch_size` to claim several jobs per poll.
     /// let worker = Worker::new(queue, "batch_queue".to_string(), handler)
     ///     .with_batch_processing_enabled(true);
     /// # Ok(())
@@ -1560,7 +1562,7 @@ where
     /// Claim up to `size` jobs per poll, and enable batch processing (see
     /// [`with_batch_processing_enabled`](Self::with_batch_processing_enabled)).
     ///
-    /// Defaults to [`DEFAULT_BATCH_SIZE`] (10). Values below 1 are raised to 1, and the
+    /// Defaults to [`DEFAULT_BATCH_SIZE`] (1). Values below 1 are raised to 1, and the
     /// built-in backends claim at most
     /// [`MAX_DEQUEUE_BATCH_SIZE`](crate::queue::MAX_DEQUEUE_BATCH_SIZE) jobs at once.
     ///
@@ -5310,7 +5312,7 @@ mod tests {
         assert_eq!(worker.batch_size(), DEFAULT_BATCH_SIZE);
         assert_eq!(worker.batch_concurrency(), DEFAULT_BATCH_CONCURRENCY);
 
-        // The old builder alone enables batch claims of the default size.
+        // The old builder alone enables batch mode with the default size of one job.
         let enabled = lazy_worker("batch").with_batch_processing_enabled(true);
         assert!(enabled.is_batch_processing_enabled());
         assert_eq!(enabled.batch_size(), DEFAULT_BATCH_SIZE);

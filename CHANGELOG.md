@@ -40,9 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `queue::MAX_DEQUEUE_BATCH_SIZE` (1000) jobs per call.
 - **`DatabaseQueue::release_job_run`** hands a claimed job that never ran back to
   `Pending`, taking back the claim's attempt, so it can run elsewhere at once.
-- **Batch-mode workers.** `Worker::with_batch_size(n)` (or
-  `with_batch_processing_enabled(true)`, which now claims batches of
-  `worker::DEFAULT_BATCH_SIZE` = 10) makes a worker claim up to `n` jobs per poll, and
+- **Batch-mode workers.** `Worker::with_batch_size(n)` makes a worker claim up to `n` jobs
+  per poll (`with_batch_processing_enabled(true)` alone keeps `worker::DEFAULT_BATCH_SIZE`
+  = 1, so existing workers still claim one job at a time), and
   `Worker::with_batch_concurrency(m)` runs up to `m` of them at once (default 1). Each job
   is processed exactly as in single-job mode (timeouts, retries, hooks, events, spawning,
   result storage, encryption, statistics). Jobs waiting for their turn have their leases
@@ -53,12 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   processing claim one job at a time as before. New getters: `is_batch_processing_enabled`,
   `batch_size`, `batch_concurrency`. In a local benchmark, batch claims of 50 were 5-6x
   faster than single claims on PostgreSQL and MySQL.
-
-### Changed
-
-- `Worker::with_batch_processing_enabled(true)` used to only keep statistics for jobs of a
-  `JobBatch`; it now also switches the worker to batch claims (batch size 10, one job
-  running at a time). Leave it off to keep claiming one job per poll.
 
 ## [2.0.0] - 2026-10-09
 

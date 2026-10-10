@@ -263,7 +263,8 @@ for (job_id, error) in &result.job_errors {
 A worker in batch mode claims up to `batch_size` jobs per poll in one round trip instead
 of one job per round trip, then runs them `batch_concurrency` at a time (one at a time by
 default). `with_batch_size(n)` enables batch mode; `with_batch_processing_enabled(true)`
-alone enables it with the default batch size of 10:
+alone keeps the default batch size of 1, so it claims one job per poll as before and only
+adds batch statistics:
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
