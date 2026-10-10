@@ -5448,6 +5448,7 @@ mod tests {
         assert!(held.lock().unwrap().waiting.is_empty());
     }
 
+    #[cfg(feature = "postgres")]
     #[test]
     fn held_job_renewed_too_long_ago_is_renewed_before_it_starts() {
         // Its running heartbeat only fires an interval after it starts; together with
