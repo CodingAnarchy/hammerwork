@@ -12,8 +12,10 @@ use hammerwork::{
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 
-async fn result_is_stored_before_completion_is_visible<DB>(queue: Arc<JobQueue<DB>>)
-where
+async fn result_is_stored_before_completion_is_visible<DB>(
+    queue: Arc<JobQueue<DB>>,
+    storage: ResultStorage,
+) where
     DB: sqlx::Database + Send + Sync + 'static,
     JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
 {
@@ -25,7 +27,7 @@ where
     let mut job_ids = Vec::new();
     for n in 0..20 {
         let job = Job::new(queue_name.clone(), json!({ "n": n }))
-            .with_result_storage(ResultStorage::Database)
+            .with_result_storage(storage.clone())
             .with_result_ttl(Duration::from_secs(3600));
         job_ids.push(queue.enqueue(job).await.unwrap());
     }
@@ -74,8 +76,21 @@ mod postgres_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_result_is_stored_before_completion_is_visible() {
-        result_is_stored_before_completion_is_visible(test_utils::setup_postgres_queue().await)
-            .await;
+        result_is_stored_before_completion_is_visible(
+            test_utils::setup_postgres_queue().await,
+            ResultStorage::Database,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_memory_result_is_stored_before_completion_is_visible() {
+        result_is_stored_before_completion_is_visible(
+            test_utils::setup_postgres_queue().await,
+            ResultStorage::Memory,
+        )
+        .await;
     }
 }
 
@@ -86,6 +101,20 @@ mod mysql_tests {
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_mysql_result_is_stored_before_completion_is_visible() {
-        result_is_stored_before_completion_is_visible(test_utils::setup_mysql_queue().await).await;
+        result_is_stored_before_completion_is_visible(
+            test_utils::setup_mysql_queue().await,
+            ResultStorage::Database,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_memory_result_is_stored_before_completion_is_visible() {
+        result_is_stored_before_completion_is_visible(
+            test_utils::setup_mysql_queue().await,
+            ResultStorage::Memory,
+        )
+        .await;
     }
 }

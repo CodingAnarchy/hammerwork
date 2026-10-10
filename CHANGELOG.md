@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **In-memory result storage works.** A job configured with `ResultStorage::Memory` had
+  its result silently discarded: workers only stored `ResultStorage::Database` results.
+  Workers now store them in an in-memory store owned by the `JobQueue` and shared by its
+  clones, before the job is marked Completed, and `get_job_result`, `delete_job_result`,
+  `cleanup_expired_results` and `delete_job` use it. Results expire at their TTL (checked
+  on read and pruned as results are stored), and the store holds at most 10,000 results
+  by default (`queue::DEFAULT_MEMORY_RESULT_CAPACITY`), evicting the one that expires
+  soonest, or the oldest; set the limit with the new
+  `JobQueue::with_memory_result_capacity`. In-memory results are per process: other
+  processes, including `cargo hammerwork` and the web dashboard, don't see them, and
+  they are lost on restart. See [Job Results](docs/job-types.md#job-results).
+  `TestQueue::delete_job` now also deletes the job's result.
+
 ## [2.0.0] - 2026-10-09
 
 A hardening release ([#7](https://github.com/CodingAnarchy/hammerwork/issues/7)). It fixes

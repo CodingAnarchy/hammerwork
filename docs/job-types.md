@@ -211,6 +211,76 @@ let handler: JobHandler = Arc::new(|job: Job| {
 });
 ```
 
+## Job Results
+
+A handler created with `Worker::new_with_result_handler` can return data with
+`JobResult::with_data`. The job's result configuration decides what happens to it:
+
+| `ResultStorage` | Where the result goes | Who can read it |
+|---|---|---|
+| `None` (default) | Discarded | Nobody |
+| `Database` | The job's row in `hammerwork_jobs` | Any process with database access |
+| `Memory` | The `JobQueue`'s in-memory store | Only this process, through the same `JobQueue` (or its clones) |
+
+The worker stores the result before it marks the job Completed, so whoever sees the job as
+Completed can read its result with `get_job_result`. `Job::with_result_ttl` sets how long
+the result is kept; without a TTL it is kept until it is deleted (`delete_job_result`,
+or deleting the job). `cleanup_expired_results` removes expired results from the
+database and from the in-memory store.
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, queue::*, worker::*};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_imports)] use std::sync::Arc;
+# #[allow(unused_variables)]
+# async fn doc(pool: sqlx::PgPool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{Job, JobQueue, ResultStorage, Worker, WorkerPool};
+use hammerwork::worker::{JobHandlerWithResult, JobResult};
+use std::time::Duration;
+
+// Keep up to 50,000 in-memory results (the default is 10,000).
+let queue = Arc::new(JobQueue::new(pool).with_memory_result_capacity(50_000));
+
+let handler: JobHandlerWithResult = Arc::new(|job: Job| {
+    Box::pin(async move { Ok(JobResult::with_data(json!({"total": job.payload["n"]}))) })
+});
+let mut pool = WorkerPool::new();
+pool.add_worker(Worker::new_with_result_handler(queue.clone(), "reports".to_string(), handler));
+
+let job = Job::new("reports".to_string(), json!({"n": 42}))
+    .with_result_storage(ResultStorage::Memory)
+    .with_result_ttl(Duration::from_secs(600));
+let job_id = queue.enqueue(job).await?;
+
+// ...once the job has completed, in the same process:
+if let Some(result) = queue.get_job_result(job_id).await? {
+    println!("total = {}", result["total"]);
+}
+# Ok(())
+# }
+```
+
+In-memory results are faster to store than database results, but:
+
+- **They are per process.** A worker in one process stores them in its own `JobQueue`.
+  Another process (another worker host, `cargo hammerwork`, the web dashboard) reads
+  only the database, so for it the job has no stored result. A separately created
+  `JobQueue` in the same process has its own store too: share one `Arc<JobQueue>`.
+- **They are lost when the process exits.**
+- **They are bounded.** Each `JobQueue` keeps at most `DEFAULT_MEMORY_RESULT_CAPACITY`
+  (10,000) results, or the number set with `JobQueue::with_memory_result_capacity`. When
+  it is full, storing a result evicts the one that expires soonest, or the oldest if
+  none expire. Expired results are removed when read and pruned as new results are
+  stored.
+- They don't appear in `Job::result_data` (from `get_job`), which reflects the database
+  columns; read them with `get_job_result`.
+
+`ResultConfig::with_max_size` is recorded with the job but not enforced, for database
+and in-memory results alike.
+
+The `TestQueue` (feature `test`) keeps all results in memory regardless of
+`ResultStorage`, expiring them by its mock clock.
+
 ## Error Handling
 
 Jobs can fail and be retried automatically:

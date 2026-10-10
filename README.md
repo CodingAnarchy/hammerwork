@@ -17,7 +17,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 - **Multi-database support**: PostgreSQL and MySQL backends with optimized dependency queries
 - **Advanced retry strategies**: Exponential backoff, linear, Fibonacci, and custom retry patterns with jitter
 - **Job prioritization**: Five priority levels with weighted and strict scheduling algorithms
-- **Result storage**: Database and in-memory result storage with TTL and automatic cleanup
+- **Result storage**: Database and in-memory (per-process, bounded) result storage with TTL and automatic cleanup ([Job Results](docs/job-types.md#job-results))
 - **Worker autoscaling**: Dynamic worker pool scaling based on queue depth and configurable thresholds
 - **Batch operations**: High-performance bulk job enqueuing with optimized worker processing
 - **Cron scheduling**: Full cron expression support with timezone awareness
