@@ -213,6 +213,18 @@ Values the dashboard cannot measure are reported as `null` (for example memory u
 - `DELETE /api/archive/purge` - Permanently purge old archived jobs
 - `GET /api/archive/stats?queue=email` - Get archive statistics and metrics
 
+#### System
+- `GET /api/system/info`, `GET /api/system/config`, `GET /api/system/metrics`, `GET /api/version`
+- `POST /api/system/maintenance` - `{"operation": ..., "target": ..., "dry_run": ...}`:
+  - `cleanup` deletes dead jobs older than 7 days
+  - `vacuum`: `VACUUM (ANALYZE)` on PostgreSQL, `OPTIMIZE TABLE` on MySQL
+  - `reindex`: `REINDEX TABLE` on PostgreSQL, `OPTIMIZE TABLE` on MySQL (InnoDB rebuilds the indexes)
+  - `optimize`: `ANALYZE` on PostgreSQL, `OPTIMIZE TABLE` on MySQL
+
+  Table operations run on every Hammerwork table that exists (`hammerwork_jobs`,
+  `hammerwork_jobs_archive`, ...), or only on `target` when it names one of them; other
+  names are rejected. The response lists each statement that ran, or with `dry_run` would run.
+
 ### WebSocket API
 
 Connect to `ws://localhost:8080/ws` for real-time updates:

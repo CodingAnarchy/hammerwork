@@ -120,7 +120,7 @@
 //! assert_eq!(metrics_info.custom_metrics_count, Some(15));
 //! ```
 
-use super::history::{FinishedKind, JobHistory};
+use super::history::{FinishedKind, JobHistory, TableMaintenance, maintenance_tables};
 use super::{ApiResponse, error_reply, json_reply};
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
@@ -228,11 +228,19 @@ pub struct ConfigUpdateRequest {
     pub value: serde_json::Value,
 }
 
-/// Maintenance operation request
+/// Maintenance operation request.
+///
+/// - `cleanup`: deletes dead jobs older than 7 days.
+/// - `vacuum`, `reindex`, `optimize`: table maintenance on the Hammerwork tables, see
+///   [`TableMaintenance`] for the statements each runs per backend. `target` may name one
+///   Hammerwork table (e.g. `hammerwork_jobs`); any other name is rejected. The response
+///   lists the statements that ran, or with `dry_run` the ones that would run.
 #[derive(Debug, Deserialize)]
 pub struct MaintenanceRequest {
-    pub operation: String,      // "vacuum", "reindex", "cleanup", "optimize"
-    pub target: Option<String>, // table name or queue name
+    /// `"cleanup"`, `"vacuum"`, `"reindex"` or `"optimize"`.
+    pub operation: String,
+    /// For table maintenance, a single Hammerwork table name; all of them when absent.
+    pub target: Option<String>,
     pub dry_run: Option<bool>,
 }
 
@@ -428,31 +436,39 @@ where
                 }
             }
         }
-        "vacuum" => {
-            // Database vacuum operation (PostgreSQL specific)
-            Ok(error_reply(
-                StatusCode::NOT_IMPLEMENTED,
-                "Vacuum operation not yet implemented".to_string(),
-            ))
+        name => {
+            let Some(operation) = TableMaintenance::parse(name) else {
+                return Ok(error_reply(
+                    StatusCode::BAD_REQUEST,
+                    format!("Unknown maintenance operation: {}", request.operation),
+                ));
+            };
+            // `target` only selects among the fixed Hammerwork table names; it is never
+            // put into SQL.
+            let tables = match maintenance_tables(request.target.as_deref()) {
+                Ok(tables) => tables,
+                Err(message) => return Ok(error_reply(StatusCode::BAD_REQUEST, message)),
+            };
+            match queue.table_maintenance(operation, &tables, dry_run).await {
+                Ok(statements) => {
+                    let message = if dry_run {
+                        format!("Dry run: would run {} statements", statements.len())
+                    } else {
+                        format!("Ran {} on {} tables", name, statements.len())
+                    };
+                    Ok(json_reply(&ApiResponse::success(serde_json::json!({
+                        "operation": operation,
+                        "dry_run": dry_run,
+                        "message": message,
+                        "statements": statements,
+                    }))))
+                }
+                Err(e) => Ok(error_reply(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{} failed: {}", name, e),
+                )),
+            }
         }
-        "reindex" => {
-            // Database reindex operation
-            Ok(error_reply(
-                StatusCode::NOT_IMPLEMENTED,
-                "Reindex operation not yet implemented".to_string(),
-            ))
-        }
-        "optimize" => {
-            // General optimization operation
-            Ok(error_reply(
-                StatusCode::NOT_IMPLEMENTED,
-                "Optimize operation not yet implemented".to_string(),
-            ))
-        }
-        _ => Ok(error_reply(
-            StatusCode::BAD_REQUEST,
-            format!("Unknown maintenance operation: {}", request.operation),
-        )),
     }
 }
 
@@ -572,6 +588,34 @@ mod tests {
         .into_response();
         let (status, _) = crate::api::test_support::body_json(response).await;
         assert_eq!(status, 500);
+    }
+
+    async fn maintenance_status(operation: &str, target: Option<&str>) -> u16 {
+        let response = maintenance_handler(
+            crate::api::test_support::unreachable_queue(),
+            MaintenanceRequest {
+                operation: operation.to_string(),
+                target: target.map(str::to_string),
+                dry_run: Some(false),
+            },
+        )
+        .await
+        .unwrap()
+        .into_response();
+        crate::api::test_support::body_json(response).await.0
+    }
+
+    #[tokio::test]
+    async fn test_table_maintenance_rejects_foreign_tables_before_the_database() {
+        for operation in ["vacuum", "reindex", "optimize"] {
+            assert_eq!(maintenance_status(operation, Some("users")).await, 400);
+            // A Hammerwork table passes validation and then fails on the dead database.
+            assert_eq!(
+                maintenance_status(operation, Some("hammerwork_jobs")).await,
+                500
+            );
+        }
+        assert_eq!(maintenance_status("defrag", None).await, 400);
     }
 
     #[test]

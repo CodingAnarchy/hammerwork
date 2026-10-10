@@ -68,6 +68,97 @@ impl FinishedKind {
     }
 }
 
+/// A table maintenance operation run from the dashboard.
+///
+/// | Operation  | PostgreSQL               | MySQL            |
+/// |------------|--------------------------|------------------|
+/// | `vacuum`   | `VACUUM (ANALYZE) <t>`   | `OPTIMIZE TABLE` |
+/// | `reindex`  | `REINDEX TABLE <t>`      | `OPTIMIZE TABLE` |
+/// | `optimize` | `ANALYZE <t>`            | `OPTIMIZE TABLE` |
+///
+/// MySQL has neither `VACUUM` nor `REINDEX`. For InnoDB, `OPTIMIZE TABLE` rebuilds the
+/// table and its indexes, reclaims free space and refreshes the statistics, which covers
+/// all three operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TableMaintenance {
+    Vacuum,
+    Reindex,
+    Optimize,
+}
+
+impl TableMaintenance {
+    /// Parses an operation name (`vacuum`, `reindex`, `optimize`).
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "vacuum" => Some(Self::Vacuum),
+            "reindex" => Some(Self::Reindex),
+            "optimize" => Some(Self::Optimize),
+            _ => None,
+        }
+    }
+
+    /// The PostgreSQL statement for `table`, one of [`HAMMERWORK_TABLES`].
+    pub fn postgres_statement(self, table: &'static str) -> String {
+        match self {
+            Self::Vacuum => format!("VACUUM (ANALYZE) {table}"),
+            Self::Reindex => format!("REINDEX TABLE {table}"),
+            Self::Optimize => format!("ANALYZE {table}"),
+        }
+    }
+
+    /// The MySQL statement for `table`, one of [`HAMMERWORK_TABLES`].
+    pub fn mysql_statement(self, table: &'static str) -> String {
+        format!("OPTIMIZE TABLE {table}")
+    }
+}
+
+/// Every table Hammerwork owns. Table maintenance only ever names these fixed identifiers;
+/// the ones absent from the database (e.g. before a migration created them) are skipped.
+pub const HAMMERWORK_TABLES: &[&str] = &[
+    "hammerwork_jobs",
+    "hammerwork_jobs_archive",
+    "hammerwork_batches",
+    "hammerwork_workflows",
+    "hammerwork_queue_pause",
+    "hammerwork_encryption_keys",
+    "hammerwork_kms_data_keys",
+    "hammerwork_key_audit_log",
+    "hammerwork_migrations",
+];
+
+/// Resolves an optional table name to the matching entries of [`HAMMERWORK_TABLES`].
+/// `None` selects every table; a name that is not a Hammerwork table is an error.
+pub fn maintenance_tables(target: Option<&str>) -> std::result::Result<Vec<&'static str>, String> {
+    match target {
+        None => Ok(HAMMERWORK_TABLES.to_vec()),
+        Some(name) => HAMMERWORK_TABLES
+            .iter()
+            .find(|t| **t == name)
+            .map(|t| vec![*t])
+            .ok_or_else(|| format!("'{name}' is not a Hammerwork table")),
+    }
+}
+
+/// One statement a table maintenance operation ran (or, on a dry run, would run).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MaintenanceStatement {
+    pub table: &'static str,
+    pub statement: String,
+    /// What the database reported (MySQL `OPTIMIZE TABLE` result rows); empty otherwise.
+    pub messages: Vec<String>,
+}
+
+/// The entries of `candidates` whose names appear in `existing` (names from the catalog).
+/// Statements are built from the fixed `candidates`, never from catalog strings.
+fn present_tables(candidates: &[&'static str], existing: &[String]) -> Vec<&'static str> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|t| existing.iter().any(|e| e == t))
+        .collect()
+}
+
 /// Maximum number of hourly buckets a single request may span.
 pub const MAX_BUCKETS: i64 = 24 * 31;
 
@@ -165,6 +256,16 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
         since: DateTime<Utc>,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send;
+
+    /// Runs `operation` on each of `tables` (entries of [`HAMMERWORK_TABLES`]) that
+    /// exists, one statement per table, and returns what ran. With `dry_run` nothing is
+    /// executed and the statements that would run are returned.
+    fn table_maintenance(
+        &self,
+        operation: TableMaintenance,
+        tables: &[&'static str],
+        dry_run: bool,
+    ) -> impl Future<Output = Result<Vec<MaintenanceStatement>>> + Send;
 }
 
 /// The job timestamps that mark a change of state, newest first in
@@ -564,6 +665,36 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             (label, change)
         })))
     }
+
+    async fn table_maintenance(
+        &self,
+        operation: TableMaintenance,
+        tables: &[&'static str],
+        dry_run: bool,
+    ) -> Result<Vec<MaintenanceStatement>> {
+        let names: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+        let existing: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename::text FROM pg_tables \
+             WHERE schemaname = current_schema() AND tablename = ANY($1)",
+        )
+        .bind(&names)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut ran = Vec::new();
+        for table in present_tables(tables, &existing) {
+            let statement = operation.postgres_statement(table);
+            if !dry_run {
+                // Simple-query protocol: VACUUM may not run inside a transaction block.
+                sqlx::raw_sql(&statement).execute(&self.pool).await?;
+            }
+            ran.push(MaintenanceStatement {
+                table,
+                statement,
+                messages: Vec::new(),
+            });
+        }
+        Ok(ran)
+    }
 }
 
 impl JobHistory for JobQueue<sqlx::MySql> {
@@ -765,6 +896,60 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             (label, change)
         })))
     }
+    async fn table_maintenance(
+        &self,
+        operation: TableMaintenance,
+        tables: &[&'static str],
+        dry_run: bool,
+    ) -> Result<Vec<MaintenanceStatement>> {
+        if tables.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; tables.len()].join(", ");
+        let sql = format!(
+            "SELECT CAST(TABLE_NAME AS CHAR) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ({placeholders})"
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql);
+        for table in tables {
+            q = q.bind(*table);
+        }
+        let existing = q.fetch_all(&self.pool).await?;
+        let mut ran = Vec::new();
+        for table in present_tables(tables, &existing) {
+            let statement = operation.mysql_statement(table);
+            let mut messages = Vec::new();
+            if !dry_run {
+                // OPTIMIZE TABLE reports failures as result rows, not as SQL errors.
+                for row in sqlx::raw_sql(&statement).fetch_all(&self.pool).await? {
+                    let kind = text_column(&row, "Msg_type");
+                    let text = text_column(&row, "Msg_text");
+                    if kind.eq_ignore_ascii_case("error") {
+                        return Err(hammerwork::HammerworkError::Queue {
+                            message: format!("{statement} failed: {text}"),
+                        });
+                    }
+                    messages.push(format!("{kind}: {text}"));
+                }
+            }
+            ran.push(MaintenanceStatement {
+                table,
+                statement,
+                messages,
+            });
+        }
+        Ok(ran)
+    }
+}
+
+/// A text column of a MySQL admin statement's result, which may arrive as binary.
+fn text_column(row: &sqlx::mysql::MySqlRow, name: &str) -> String {
+    row.try_get::<String, _>(name)
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(name)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .unwrap_or_default()
 }
 
 fn parse_bucket(bucket: &str) -> Option<DateTime<Utc>> {
@@ -913,6 +1098,82 @@ mod tests {
             Some(Utc.with_ymd_and_hms(2026, 1, 2, 5, 0, 0).unwrap())
         );
         assert_eq!(parse_bucket("garbage"), None);
+    }
+
+    #[test]
+    fn test_table_maintenance_statements() {
+        assert_eq!(
+            TableMaintenance::parse("vacuum"),
+            Some(TableMaintenance::Vacuum)
+        );
+        assert_eq!(
+            TableMaintenance::parse("reindex"),
+            Some(TableMaintenance::Reindex)
+        );
+        assert_eq!(
+            TableMaintenance::parse("optimize"),
+            Some(TableMaintenance::Optimize)
+        );
+        assert_eq!(TableMaintenance::parse("VACUUM"), None);
+        assert_eq!(TableMaintenance::parse("cleanup"), None);
+
+        let t = "hammerwork_jobs";
+        assert_eq!(
+            TableMaintenance::Vacuum.postgres_statement(t),
+            "VACUUM (ANALYZE) hammerwork_jobs"
+        );
+        assert_eq!(
+            TableMaintenance::Reindex.postgres_statement(t),
+            "REINDEX TABLE hammerwork_jobs"
+        );
+        assert_eq!(
+            TableMaintenance::Optimize.postgres_statement(t),
+            "ANALYZE hammerwork_jobs"
+        );
+        for op in [
+            TableMaintenance::Vacuum,
+            TableMaintenance::Reindex,
+            TableMaintenance::Optimize,
+        ] {
+            assert_eq!(op.mysql_statement(t), "OPTIMIZE TABLE hammerwork_jobs");
+        }
+        assert_eq!(
+            serde_json::to_value(TableMaintenance::Reindex).unwrap(),
+            "reindex"
+        );
+    }
+
+    #[test]
+    fn test_maintenance_tables_only_hammerwork_tables() {
+        assert_eq!(maintenance_tables(None).unwrap(), HAMMERWORK_TABLES);
+        assert_eq!(
+            maintenance_tables(Some("hammerwork_jobs_archive")).unwrap(),
+            vec!["hammerwork_jobs_archive"]
+        );
+        for bad in [
+            "users",
+            "hammerwork_jobs; DROP TABLE x",
+            "HAMMERWORK_JOBS",
+            "",
+        ] {
+            assert!(maintenance_tables(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(
+            HAMMERWORK_TABLES
+                .iter()
+                .all(|t| t.starts_with("hammerwork_")
+                    && t.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        );
+    }
+
+    #[test]
+    fn test_present_tables_keeps_fixed_names_in_order() {
+        let existing = vec!["hammerwork_batches".to_string(), "other".to_string()];
+        assert_eq!(
+            present_tables(&["hammerwork_jobs", "hammerwork_batches"], &existing),
+            vec!["hammerwork_batches"]
+        );
+        assert!(present_tables(&["hammerwork_jobs"], &[]).is_empty());
     }
 }
 
