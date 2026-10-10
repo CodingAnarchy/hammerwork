@@ -408,6 +408,59 @@ If a lease expires while the handler is still running (for example after a long
 stop-the-world pause), the job can be reclaimed and run again elsewhere, so handlers
 should be idempotent. The worker logs a warning when it notices it lost a lease.
 
+### Maintenance Tasks
+
+Besides its workers, a pool runs periodic maintenance tasks. Each pass runs in a task
+of its own, so workers never wait for it; the first pass runs when the pool starts, and
+`shutdown` stops the schedule without interrupting a pass part-way through its
+transaction. Every task is safe to run in several pools or processes at once.
+
+| Task | Default | Builder | Configuration (`from_hammerwork_config`) |
+|------|---------|---------|------------------------------------------|
+| Stale job reaper | every 60s | `with_stale_job_reaper` / `without_stale_job_reaper` | always on |
+| Expired result cleanup | every 5 minutes | `with_result_cleanup` / `without_result_cleanup` | `[worker] result_cleanup_enabled`, `result_cleanup_interval` |
+| Encrypted job retention purge | off | `with_encrypted_job_purge` | `[encryption] purge_interval_secs` |
+| Archival | off | `with_archival` | `[archive] enabled`, `check_interval` |
+| Key rotation (`encryption` feature) | off | `with_key_rotation` | `[encryption.key_rotation]` |
+
+**Expired result cleanup.** Results stored with a TTL (`Job::with_result_ttl`) stop being
+returned by `get_job_result` once they expire, but stay in `hammerwork_jobs` (and in
+`Job::result_data` from `get_job`) until something removes them. The pool calls
+`DatabaseQueue::cleanup_expired_results` every 5 minutes to clear them, and logs how many
+it cleared at `info` level. It is on by default because expired results are already
+unreadable through the result API: clearing them only frees space. Turn it off, or change
+the interval, in code or in `[worker]`:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, job: hammerwork::Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::WorkerPool;
+use std::time::Duration;
+
+let pool: WorkerPool<sqlx::Postgres> = WorkerPool::new()
+    .with_result_cleanup(Duration::from_secs(60)); // every minute
+
+// Or leave it to another process:
+let pool: WorkerPool<sqlx::Postgres> = WorkerPool::new().without_result_cleanup();
+# Ok(())
+# }
+```
+
+```toml
+[worker]
+# ...
+result_cleanup_enabled = true      # default
+result_cleanup_interval = "5m"     # default; must be greater than zero
+```
+
+Configuration files without these keys keep loading and get the defaults.
+
+**Key rotation.** With the `encryption` feature, `with_key_rotation(key_manager,
+interval)` rotates the keys of a `KeyManager` as they fall due, and
+`[encryption.key_rotation] enabled = true` does the same for a pool built from
+configuration. See [Automatic Rotation in a Worker Pool](encryption.md#automatic-rotation-in-a-worker-pool).
+
 ### Mixed Configuration Pools
 
 ```rust,no_run

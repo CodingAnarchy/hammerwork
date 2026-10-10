@@ -29,6 +29,7 @@ The `cargo-hammerwork` crate provides a modular CLI for managing Hammerwork-base
 - 📦 **Batch Operations** - Bulk job processing and management
 - ⏰ **Cron Management** - Recurring job scheduling and management
 - 🔧 **Database Maintenance** - Cleanup, optimization, and integrity checks
+- 🔑 **Encryption Key Audit** - Read the key audit log (creation, access, rotation)
 - 🔄 **Workflow Management** - Job dependencies and complex pipelines
 - 🚀 **Spawn Operations** - Dynamic job spawning, parent-child relationships, and tree visualization
 - 💾 **Backup & Restore** - Export and restore job data
@@ -333,6 +334,36 @@ cargo hammerwork maintenance purge-encrypted --confirm
 - There is no `maintenance cleanup` or `maintenance health`; use `vacuum` and `check`
   (or `monitor health`).
 
+### Encryption Commands
+
+Read the key audit log (`hammerwork_key_audit_log`), where the library's `KeyManager`
+records key creation, access and rotation. Needs no encryption key.
+
+```bash
+# The newest 50 records
+cargo hammerwork encryption audit
+
+# One key's records from the last 7 days
+cargo hammerwork encryption audit --key-id payment-key --since 7d
+
+# Failed rotations between two times, as JSON
+cargo hammerwork encryption audit --operation rotate --failed \
+  --since 2026-10-01T00:00:00Z --until 2026-10-08T00:00:00Z --format json
+
+# Page through older records
+cargo hammerwork encryption audit --limit 20 --offset 20
+```
+
+- Records are listed newest first. `--key-id`, `--operation` (`create`, `access`,
+  `rotate`, `retire`, `revoke`, `delete`, `update`), `--success` / `--failed`,
+  `--since` (inclusive) and `--until` (exclusive) combine.
+- `--since` and `--until` take an RFC 3339 timestamp or a time ago (`30m`, `24h`, `7d`,
+  `2w`).
+- `--limit` (default 50) and `--offset` page through the records; the table says when
+  more may follow. `--format json` prints every column, including the optional user,
+  client IP, user agent and session id.
+- The same records are available in code with `KeyManager::audit_log`.
+
 ### Workflow Commands
 
 Job dependencies and pipelines.
@@ -474,7 +505,7 @@ cargo-hammerwork/
 ├── src/
 │   ├── commands/           # One module per command group
 │   │   ├── migration.rs, config.rs, job.rs, queue.rs, worker.rs, monitor.rs
-│   │   ├── batch.rs, cron.rs, maintenance.rs, workflow.rs, spawn.rs
+│   │   ├── batch.rs, cron.rs, encryption.rs, maintenance.rs, workflow.rs, spawn.rs
 │   │   └── archive.rs, backup.rs, webhook.rs
 │   ├── config/            # Config loading and management
 │   │   └── mod.rs

@@ -17,7 +17,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 - **Multi-database support**: PostgreSQL and MySQL backends with optimized dependency queries
 - **Advanced retry strategies**: Exponential backoff, linear, Fibonacci, and custom retry patterns with jitter
 - **Job prioritization**: Five priority levels with weighted and strict scheduling algorithms
-- **Result storage**: Database and in-memory (per-process, bounded) result storage with TTL and automatic cleanup ([Job Results](docs/job-types.md#job-results))
+- **Result storage**: Database and in-memory (per-process, bounded) result storage with TTL; worker pools clear expired results automatically, every 5 minutes by default ([Job Results](docs/job-types.md#job-results))
 - **Worker autoscaling**: Dynamic worker pool scaling based on queue depth and configurable thresholds
 - **Batch operations**: Bulk job enqueuing in one transaction, and batch claims: workers can claim many jobs per round trip (`Worker::with_batch_size`), each with its own lease
 - **Cron scheduling**: Full cron expression support with timezone awareness
@@ -439,7 +439,7 @@ What you get:
 - **Fail closed**: enqueueing a job with an encryption config on a queue without an engine is an error; a worker that cannot decrypt a job (no engine, unknown key, tampered data) fails it without running the handler.
 - **Decryption only for the handler**: `dequeue`, `get_job`, the web dashboard and the CLI show the stored, redacted payload. Call `JobQueue::decrypt_job` to read the plaintext.
 - **Retention**: `DatabaseQueue::purge_expired_encrypted_jobs` deletes finished encrypted jobs past their retention time. Archiving and restoring move the ciphertext without decrypting it.
-- **Key management**: decrypt-only keys for rotated key ids (`EncryptionEngine::with_decryption_key`), KMS-wrapped data keys (AWS, GCP) that every process picks up after a rotation, Vault and Azure Key Vault sources (keys of exactly 32 bytes), and the `KeyManager` for stored keys and audit trails. Key material is wiped from memory when dropped.
+- **Key management**: decrypt-only keys for rotated key ids (`EncryptionEngine::with_decryption_key`), KMS-wrapped data keys (AWS, GCP) that every process picks up after a rotation, Vault and Azure Key Vault sources (keys of exactly 32 bytes), and the `KeyManager` for stored keys and audit trails. Worker pools can rotate `KeyManager` keys as they fall due (`WorkerPool::with_key_rotation`, or `[encryption.key_rotation]` in the configuration; safe to run in every process), and `KeyManager::audit_log` / `cargo hammerwork encryption audit` read the key audit log. Key material is wiped from memory when dropped.
 - **CLI and dashboard**: `cargo hammerwork` and `hammerwork-web` read the application's `[encryption]` settings, encrypt the jobs they create like the application, and never write a plaintext job to a queue that holds encrypted jobs. `cargo hammerwork backup create` / `restore` keep encrypted payloads (and every other column) intact.
 
 See [Job Encryption & PII Protection](docs/encryption.md) for details.

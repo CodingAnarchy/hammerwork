@@ -36,6 +36,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   processing claim one job at a time as before. New getters: `is_batch_processing_enabled`,
   `batch_size`, `batch_concurrency`. In a local benchmark, batch claims of 50 were 5-6x
   faster than single claims on PostgreSQL and MySQL.
+- **Automatic cleanup of expired job results.** `WorkerPool` now clears expired job
+  results (`DatabaseQueue::cleanup_expired_results`) every 5 minutes in a background task,
+  as the README promised. Configure it with `WorkerPool::with_result_cleanup(interval)` /
+  `without_result_cleanup()`, or with the new `[worker]` settings
+  `result_cleanup_enabled` (default `true`) and `result_cleanup_interval` (default `"5m"`),
+  which `WorkerPool::from_config` and `from_hammerwork_config` apply. It is on by default
+  because expired results are already unreadable through `get_job_result`; clearing them
+  only frees space (and removes them from `Job::result_data`). Configuration files without
+  the new keys keep loading.
+- **Key rotation from configuration.** `WorkerPool::with_key_rotation(key_manager,
+  interval)` rotates `KeyManager` keys as they fall due and stops on shutdown. The new
+  `[encryption.key_rotation]` section (`enabled`, default `false`; `master_key_source`,
+  `check_interval_secs`, `max_key_versions`, and the matching
+  `HAMMERWORK_ENCRYPTION_KEY_ROTATION_*` variables) turns it on for pools built with
+  `from_hammerwork_config`, with a `KeyManager` on the pool's database.
+- **Key audit log API.** `KeyManager::audit_log(&KeyAuditFilter)` reads
+  `hammerwork_key_audit_log`, newest first, filtered by key, operation, outcome and time
+  range, with `limit`/`offset` paging, on PostgreSQL and MySQL. Also new:
+  `KeyOperation::ALL`, `parse_key_operation` and `FromStr`/`Copy`/`PartialEq` for
+  `KeyOperation`.
+- **`cargo hammerwork encryption audit`** shows the key audit log as a table or JSON, with
+  `--key-id`, `--operation`, `--since`/`--until` (RFC 3339 or `30m`/`24h`/`7d`),
+  `--success`/`--failed`, `--limit` and `--offset`.
+
+### Fixed
+
+- **Concurrent key rotation.** Rotating the same key from several processes at once could
+  fail with a duplicate-key error, and an automatic rotation could rotate a key that another
+  process had just rotated. A rotation now writes its version only if the key is still at
+  the version it read (and, for automatic rotation, still due), in one transaction; the
+  unique `(key_id, key_version)` index decides between simultaneous writers. Automatic
+  rotation skips keys rotated elsewhere, and `rotate_key` reports "rotated concurrently"
+  without writing anything. A key never has two active versions.
+- `KeyManager::start_rotation_service` runs each pass in its own task, so dropping or
+  aborting the service no longer cancels a rotation part-way through its transaction.
 
 ## [2.0.1] - 2026-10-10
 

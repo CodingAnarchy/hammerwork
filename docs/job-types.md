@@ -226,7 +226,9 @@ The worker stores the result before it marks the job Completed, so whoever sees 
 Completed can read its result with `get_job_result`. `Job::with_result_ttl` sets how long
 the result is kept; without a TTL it is kept until it is deleted (`delete_job_result`,
 or deleting the job). `cleanup_expired_results` removes expired results from the
-database and from the in-memory store.
+database and from the in-memory store; a `WorkerPool` calls it every 5 minutes by default
+(`WorkerPool::with_result_cleanup`, see
+[Maintenance Tasks](worker-configuration.md#maintenance-tasks)).
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::{*, queue::*, worker::*};

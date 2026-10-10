@@ -385,6 +385,12 @@ encrypted_queues = ["payments"]                  # encrypt these queues' jobs ("
 
 [encryption.decryption_keys]                     # decrypt-only keys of earlier key ids
 "payments-2026" = "env://HAMMERWORK_KEY_2026"
+
+[encryption.key_rotation]                        # rotate KeyManager keys (off by default)
+enabled = true
+master_key_source = "env://HAMMERWORK_MASTER_KEY"
+check_interval_secs = 3600
+max_key_versions = 10
 ```
 
 ```rust,no_run
@@ -550,6 +556,67 @@ for key_id in rotated_keys {
 # }
 ```
 
+Rotating the same key from several processes at once is safe. Each rotation writes the
+next version number, and `(key_id, key_version)` is unique, so only one of two
+concurrent rotations from the same version succeeds: `rotate_key` in the other returns
+`EncryptionError::KeyManagement` ("rotated concurrently") without writing anything.
+`perform_automatic_rotation` also checks, in the rotation's transaction, that the key is
+still due, and skips keys another process has rotated. A key never has two active
+versions.
+
+### Automatic Rotation in a Worker Pool
+
+`perform_automatic_rotation` rotates the keys whose `next_rotation_at` has passed. Keys
+fall due according to their own rotation interval, set with
+`generate_key_with_options` or `update_key_rotation_schedule`. A `WorkerPool` can run it
+on a schedule and stop it when the pool shuts down:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+let key_manager = KeyManager::new(
+    KeyManagerConfig::new()
+        .with_master_key_env("HAMMERWORK_MASTER_KEY")
+        .with_auto_rotation_enabled(true),
+    pool.clone(),
+)
+.await?;
+
+let mut worker_pool = WorkerPool::new()
+    .with_key_rotation(key_manager, Duration::from_secs(3600)); // check hourly
+worker_pool.add_worker(worker);
+worker_pool.start().await?;
+# Ok(())
+# }
+```
+
+With a configuration file, `[encryption.key_rotation]` does the same for a pool built
+with `WorkerPool::from_hammerwork_config`:
+
+```toml
+[encryption.key_rotation]
+enabled = true                                   # default false
+master_key_source = "env://HAMMERWORK_MASTER_KEY" # the KeyManager's master key (default)
+check_interval_secs = 3600                       # how often to look for due keys (default)
+max_key_versions = 10                            # versions kept per key (default; 0: all)
+```
+
+The pool creates a `KeyManager` on the worker's database (PostgreSQL or MySQL) when it
+starts, and `WorkerPool::start` returns an error if its master key cannot be loaded. The
+first pass runs at start-up, then one every `check_interval_secs`; each pass runs in its
+own task, so workers never wait for it, and shutdown never interrupts a rotation
+part-way. Rotated keys are logged at `info` level, failures at `error`. The section is
+independent of `[encryption] enabled`, needs the `encryption` feature, and can also be
+set with `HAMMERWORK_ENCRYPTION_KEY_ROTATION_ENABLED`,
+`HAMMERWORK_ENCRYPTION_KEY_ROTATION_MASTER_KEY_SOURCE` and
+`HAMMERWORK_ENCRYPTION_KEY_ROTATION_CHECK_INTERVAL_SECS`. Every process may enable it:
+concurrent passes rotate each due key once (see above).
+
+`KeyManager::start_rotation_service` returns the same loop as a future to spawn yourself.
+
 ### Key Storage and Master Keys
 
 `KeyManager` stores every key version in `hammerwork_encryption_keys` (PostgreSQL and MySQL). Key material is encrypted with AES-256-GCM under a master key before it is written; plaintext key material and the configured master key are never stored. The `key_source` column holds only a label (`Generated`, `Environment`, ...).
@@ -576,13 +643,45 @@ println!("Rotations performed: {}", stats.rotations_performed);
 
 With `audit_enabled` (the default), creating, reading and rotating keys writes a row to
 `hammerwork_key_audit_log` (`key_id`, `operation`, `success`, `error_message`,
-`timestamp`). `KeyManager` has no method to query it; read the table directly:
+`timestamp`). `KeyManager::audit_log` reads it, newest first. A `KeyAuditFilter` narrows
+the records by key, operation, outcome and time (`since` inclusive, `until` exclusive)
+and pages through them with `limit` (default 100) and `offset`:
 
-```sql
-SELECT timestamp, operation, success, error_message
-FROM hammerwork_key_audit_log
-WHERE key_id = 'payment-encryption'
-ORDER BY timestamp DESC;
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
+# #[allow(unused_imports)] use std::{result::Result, sync::Arc, time::Duration};
+# #[allow(unused_imports)] use serde_json::json;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(pool: sqlx::PgPool, queue: Arc<JobQueue<sqlx::Postgres>>, config: EncryptionConfig, encryption_config: EncryptionConfig, job_id: JobId, mut key_manager: KeyManager<sqlx::Postgres>, handler: JobHandler, payload: serde_json::Value, user_data: serde_json::Value, patient_data: serde_json::Value, payment_data: serde_json::Value, financial_data: serde_json::Value, worker: Worker<sqlx::Postgres>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+let failed_rotations = key_manager
+    .audit_log(
+        &KeyAuditFilter::new()
+            .with_key_id("payment-encryption")
+            .with_operation(KeyOperation::Rotate)
+            .with_success(false)
+            .with_since(chrono::Utc::now() - chrono::Duration::days(30))
+            .with_limit(20),
+    )
+    .await?;
+for record in &failed_rotations {
+    println!(
+        "{} {} {:?}",
+        record.timestamp, record.operation, record.error_message
+    );
+}
+# Ok(())
+# }
+```
+
+Each `KeyAuditRecord` also carries the optional `user_id` (as `actor`) and the client IP
+address, user agent and session id (in `context`). Reading the log needs no key and is
+not itself audited. From the command line, `cargo hammerwork encryption audit` shows the
+same records as a table or JSON:
+
+```bash
+cargo hammerwork encryption audit --key-id payment-encryption --since 7d
+cargo hammerwork encryption audit --operation rotate --failed --format json
+cargo hammerwork encryption audit --limit 20 --offset 20
 ```
 
 ## Retention Policies
