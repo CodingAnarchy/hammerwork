@@ -333,7 +333,15 @@ let config = ArchivalConfig::new()
     .with_compression_level(6)                      // Balanced compression
     .with_compression_verification(true);           // Verify compression integrity
 
-// Run archival (typically scheduled as a cron job)
+// Archive and purge automatically: a worker pool runs a pass every hour
+// (or set `[archive] enabled = true` and use `WorkerPool::from_hammerwork_config`)
+let pool = hammerwork::WorkerPool::<sqlx::Postgres>::new().with_archival(
+    policy.clone(),
+    config.clone(),
+    std::time::Duration::from_secs(3600),
+);
+
+// Or run one archival pass yourself
 let stats = queue.archive_jobs(
     Some("payment_queue"),                          // Optional: archive specific queue
     &policy,

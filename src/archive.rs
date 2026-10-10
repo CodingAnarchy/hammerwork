@@ -465,17 +465,16 @@ impl ArchivalPolicy {
 pub struct ArchivalConfig {
     /// Default compression level (0-9, where 9 is maximum compression).
     pub compression_level: u32,
-    /// Maximum size in bytes for uncompressed payloads before archiving.
-    pub max_payload_size: usize,
-    /// Whether to validate compressed data integrity.
+    /// Whether to check every compressed payload before storing it: the compressed bytes
+    /// are decompressed and compared with the original, and a mismatch fails the archival
+    /// batch (its transaction is rolled back, so no job is moved).
     pub verify_compression: bool,
 }
 
 impl Default for ArchivalConfig {
     fn default() -> Self {
         Self {
-            compression_level: 6,          // Balanced compression/speed
-            max_payload_size: 1024 * 1024, // 1MB
+            compression_level: 6, // Balanced compression/speed
             verify_compression: true,
         }
     }
@@ -491,7 +490,6 @@ impl ArchivalConfig {
     ///
     /// let config = ArchivalConfig::new();
     /// assert_eq!(config.compression_level, 6);
-    /// assert_eq!(config.max_payload_size, 1024 * 1024);
     /// assert!(config.verify_compression);
     /// ```
     pub fn new() -> Self {
@@ -523,23 +521,8 @@ impl ArchivalConfig {
         self
     }
 
-    /// Sets the maximum payload size before archiving is required.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use hammerwork::archive::ArchivalConfig;
-    ///
-    /// let config = ArchivalConfig::new()
-    ///     .with_max_payload_size(2048);
-    /// assert_eq!(config.max_payload_size, 2048);
-    /// ```
-    pub fn with_max_payload_size(mut self, size: usize) -> Self {
-        self.max_payload_size = size;
-        self
-    }
-
-    /// Sets whether to verify compression integrity.
+    /// Sets whether to verify each compressed payload round-trips before it is stored
+    /// (see [`ArchivalConfig::verify_compression`]).
     ///
     /// # Examples
     ///
@@ -697,8 +680,21 @@ where
     pool: sqlx::Pool<DB>,
     /// Archival policies by queue name.
     policies: HashMap<String, ArchivalPolicy>,
+    /// Policy for queues without one of their own, and for operations over all queues.
+    default_policy: ArchivalPolicy,
     /// Global archival configuration.
     config: ArchivalConfig,
+}
+
+/// Result of one [`JobArchiver::run_scheduled_pass`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduledArchivalPass {
+    /// Jobs moved to the archive table.
+    pub jobs_archived: u64,
+    /// Archived jobs deleted because they were older than `purge_archived_after`.
+    pub jobs_purged: u64,
+    /// Whether the pass stopped early because `should_stop` returned `true`.
+    pub stopped_early: bool,
 }
 
 impl<DB> JobArchiver<DB>
@@ -766,8 +762,86 @@ where
         Self {
             pool,
             policies: HashMap::new(),
+            default_policy: ArchivalPolicy::default(),
             config: ArchivalConfig::default(),
         }
+    }
+
+    /// Sets the policy used for queues without a policy of their own and for operations
+    /// over all queues (`queue_name: None`). Defaults to [`ArchivalPolicy::default`].
+    pub fn set_default_policy(&mut self, policy: ArchivalPolicy) {
+        self.default_policy = policy;
+    }
+
+    /// Builder form of [`set_default_policy`](Self::set_default_policy).
+    pub fn with_default_policy(mut self, policy: ArchivalPolicy) -> Self {
+        self.default_policy = policy;
+        self
+    }
+
+    /// Builder form of [`set_config`](Self::set_config).
+    pub fn with_config(mut self, config: ArchivalConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// The policy used for queues without one of their own.
+    pub fn default_policy(&self) -> &ArchivalPolicy {
+        &self.default_policy
+    }
+
+    /// One scheduled archival pass over every queue with the
+    /// [default policy](Self::set_default_policy): archives eligible jobs batch by batch
+    /// with [`ArchivalReason::Automatic`], then, when the policy sets
+    /// `purge_archived_after`, deletes archived jobs older than that. This is what
+    /// [`WorkerPool::with_archival`](crate::WorkerPool::with_archival) runs on its
+    /// interval. Does nothing when the policy is disabled.
+    ///
+    /// `should_stop` is checked before each batch and before the purge; when it returns
+    /// `true` the pass returns early with `stopped_early` set. A batch that has started
+    /// always commits or rolls back as a whole.
+    ///
+    /// Safe to run from several processes at once: each batch locks its rows with
+    /// `FOR UPDATE SKIP LOCKED` and moves them in one transaction, so a job is archived
+    /// exactly once, and purging is an idempotent delete.
+    pub async fn run_scheduled_pass<Q, S>(
+        &self,
+        queue: &Q,
+        archived_by: Option<&str>,
+        should_stop: S,
+    ) -> Result<ScheduledArchivalPass>
+    where
+        Q: crate::queue::DatabaseQueue,
+        S: Fn() -> bool,
+    {
+        let policy = &self.default_policy;
+        let mut pass = ScheduledArchivalPass::default();
+        if !policy.enabled {
+            return Ok(pass);
+        }
+
+        let (stats, stopped) = self
+            .archive_in_batches(
+                queue,
+                None,
+                policy,
+                ArchivalReason::Automatic,
+                archived_by,
+                |_| {},
+                &should_stop,
+            )
+            .await?;
+        pass.jobs_archived = stats.jobs_archived;
+
+        if let Some(after) = policy.purge_archived_after {
+            if stopped || should_stop() {
+                pass.stopped_early = true;
+                return Ok(pass);
+            }
+            pass.jobs_purged = queue.purge_archived_jobs(Utc::now() - after).await?;
+        }
+        pass.stopped_early = stopped;
+        Ok(pass)
     }
 
     /// Sets the archival policy for a specific queue.
@@ -892,7 +966,7 @@ where
             callback(0, estimated_jobs);
         }
 
-        let stats = self
+        let (stats, _) = self
             .archive_in_batches(
                 queue,
                 queue_name,
@@ -904,6 +978,7 @@ where
                         callback(processed, estimated_jobs.max(processed));
                     }
                 },
+                &|| false,
             )
             .await?;
 
@@ -964,7 +1039,7 @@ where
         // Report progress between batches. The final batch is reported by the
         // completion event, so a single-batch run publishes only started + completed.
         let mut pending_progress: Option<u64> = None;
-        let stats = self
+        let (stats, _) = self
             .archive_in_batches(
                 queue,
                 queue_name,
@@ -980,6 +1055,7 @@ where
                         });
                     }
                 },
+                &|| false,
             )
             .await?;
 
@@ -993,20 +1069,22 @@ where
 
     /// The policy for `queue_name`, or the default policy when none is configured.
     fn policy_for(&self, queue_name: Option<&str>) -> &ArchivalPolicy {
-        static DEFAULT_POLICY: std::sync::OnceLock<ArchivalPolicy> = std::sync::OnceLock::new();
         queue_name
             .and_then(|name| self.policies.get(name))
-            .unwrap_or_else(|| DEFAULT_POLICY.get_or_init(ArchivalPolicy::default))
+            .unwrap_or(&self.default_policy)
     }
 
     /// Runs `archive_jobs` repeatedly, one `policy.batch_size` batch at a time, until no
-    /// more jobs are eligible, and returns the accumulated statistics.
+    /// more jobs are eligible, and returns the accumulated statistics and whether
+    /// `should_stop` ended the loop.
     ///
     /// `on_batch` is called after every batch that archived at least one job, with the
     /// total number of jobs archived so far. The loop stops when a batch archives fewer
-    /// than `batch_size` jobs, or after [`MAX_ARCHIVAL_BATCHES_PER_OPERATION`] batches so
-    /// that a queue that keeps producing eligible jobs cannot keep one call running forever.
-    async fn archive_in_batches<Q, F>(
+    /// than `batch_size` jobs, when `should_stop` (checked before each batch) returns
+    /// `true`, or after [`MAX_ARCHIVAL_BATCHES_PER_OPERATION`] batches so that a queue
+    /// that keeps producing eligible jobs cannot keep one call running forever.
+    #[allow(clippy::too_many_arguments)]
+    async fn archive_in_batches<Q, F, S>(
         &self,
         queue: &Q,
         queue_name: Option<&str>,
@@ -1014,16 +1092,23 @@ where
         reason: ArchivalReason,
         archived_by: Option<&str>,
         mut on_batch: F,
-    ) -> Result<ArchivalStats>
+        should_stop: &S,
+    ) -> Result<(ArchivalStats, bool)>
     where
         Q: crate::queue::DatabaseQueue,
         F: FnMut(u64),
+        S: Fn() -> bool,
     {
         let started = std::time::Instant::now();
         let mut total = ArchivalStats::default();
         let mut weighted_ratio = 0.0;
+        let mut stopped = false;
 
         for _ in 0..MAX_ARCHIVAL_BATCHES_PER_OPERATION {
+            if should_stop() {
+                stopped = true;
+                break;
+            }
             let batch = queue
                 .archive_jobs(
                     queue_name,
@@ -1053,7 +1138,7 @@ where
             total.compression_ratio = weighted_ratio / total.jobs_archived as f64;
         }
         total.operation_duration = started.elapsed();
-        Ok(total)
+        Ok((total, stopped))
     }
 
     /// Estimate the number of jobs that would be archived by a policy.
@@ -1221,9 +1306,34 @@ pub(crate) fn encode_archived_payload(
     encoder.write_all(&payload_json)?;
     let compressed = encoder.finish()?;
     if compressed.len() < original_size {
+        if config.verify_compression {
+            verify_compressed_payload(&compressed, &payload_json)?;
+        }
         Ok((compressed, true, original_size))
     } else {
         Ok((payload_json, false, original_size))
+    }
+}
+
+/// Checks that `compressed` decompresses to exactly `original`.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+fn verify_compressed_payload(compressed: &[u8], original: &[u8]) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let mut decompressed = Vec::with_capacity(original.len());
+    let round_trips = GzDecoder::new(compressed)
+        .read_to_end(&mut decompressed)
+        .is_ok()
+        && decompressed == original;
+    if round_trips {
+        Ok(())
+    } else {
+        Err(crate::HammerworkError::Archive {
+            message: "compressed payload failed verification: it does not decompress to the \
+                      original payload"
+                .to_string(),
+        })
     }
 }
 
@@ -1441,7 +1551,6 @@ mod tests {
     fn test_archival_config_default() {
         let config = ArchivalConfig::default();
         assert_eq!(config.compression_level, 6);
-        assert_eq!(config.max_payload_size, 1024 * 1024);
         assert!(config.verify_compression);
     }
 
@@ -1449,12 +1558,47 @@ mod tests {
     fn test_archival_config_builder() {
         let config = ArchivalConfig::new()
             .with_compression_level(9)
-            .with_max_payload_size(2048)
             .with_compression_verification(false);
 
         assert_eq!(config.compression_level, 9);
-        assert_eq!(config.max_payload_size, 2048);
         assert!(!config.verify_compression);
+    }
+
+    #[test]
+    fn test_archival_config_ignores_removed_max_payload_size() {
+        let config: ArchivalConfig = serde_json::from_value(serde_json::json!({
+            "compression_level": 3,
+            "max_payload_size": 1024,
+            "verify_compression": false
+        }))
+        .unwrap();
+        assert_eq!(config.compression_level, 3);
+        assert!(!config.verify_compression);
+    }
+
+    #[test]
+    fn test_verify_compressed_payload() {
+        let original = serde_json::to_vec(&serde_json::json!({"data": "y".repeat(300)})).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let policy = ArchivalPolicy::new().compress_archived_payloads(true);
+        for verify in [true, false] {
+            let config = ArchivalConfig::new().with_compression_verification(verify);
+            let (stored, compressed, _) =
+                encode_archived_payload(&payload, &policy, &config).unwrap();
+            assert!(compressed);
+            assert!(verify_compressed_payload(&stored, &original).is_ok());
+        }
+
+        let (stored, _, _) =
+            encode_archived_payload(&payload, &policy, &ArchivalConfig::new()).unwrap();
+        // Corrupt data, truncated data and data of another payload all fail.
+        let mut corrupt = stored.clone();
+        let middle = corrupt.len() / 2;
+        corrupt[middle] ^= 0xff;
+        assert!(verify_compressed_payload(&corrupt, &original).is_err());
+        assert!(verify_compressed_payload(&stored[..stored.len() - 4], &original).is_err());
+        let err = verify_compressed_payload(&stored, b"{}").unwrap_err();
+        assert!(err.to_string().contains("failed verification"), "{err}");
     }
 
     #[test]

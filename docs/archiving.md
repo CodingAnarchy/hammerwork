@@ -45,7 +45,7 @@ let policy = ArchivalPolicy::new()
     .archive_failed_after(Duration::days(30))     // Keep failed jobs for debugging
     .archive_dead_after(Duration::days(14))       // Archive dead jobs after 2 weeks
     .archive_timed_out_after(Duration::days(21))  // Archive timed out jobs after 3 weeks
-    .purge_archived_after(Duration::days(365))    // Retention hint for purging (see below)
+    .purge_archived_after(Duration::days(365))    // Purge archived jobs after a year (see below)
     .compress_archived_payloads(true)             // Gzip payloads
     .with_batch_size(1000)                        // At most 1000 jobs per archival pass
     .enabled(true);
@@ -78,7 +78,7 @@ assert!(!policy.should_archive(&JobStatus::Pending, Duration::days(100)));
 # }
 ```
 
-`purge_archived_after` is stored on the policy, but archiving does not purge on its own; call `purge_archived_jobs` (below) with the cutoff you want, for example from a scheduled job.
+`purge_archived_after` is applied by [automatic archival](#automatic-archival-in-the-worker-pool) (`WorkerPool::with_archival`, `JobArchiver::run_scheduled_pass`), which deletes archived jobs older than it after each pass. `archive_jobs` itself never purges; call `purge_archived_jobs` (below) for a one-off purge.
 
 ### Compression Configuration
 
@@ -99,11 +99,21 @@ assert_eq!(high_compression.compression_level, 9);
 # }
 ```
 
-`ArchivalConfig` also has `max_payload_size` and `verify_compression` fields (with builders), but the built-in queue implementations do not currently read them. What matters in practice is the compression level, and the policy's `compress_payloads` switch: with compression off, payloads are stored as plain JSON. With compression on, a payload is stored compressed only if that is actually smaller.
+The policy's `compress_payloads` switch decides whether payloads are compressed at all: with compression off, payloads are stored as plain JSON. With compression on, a payload is stored compressed only if that is actually smaller.
+
+`verify_compression` (on by default, `with_compression_verification(false)` turns it off) decompresses every compressed payload and compares it with the original before it is stored. A payload that does not round-trip fails the archival batch with `HammerworkError::Archive`, and the batch's transaction is rolled back, so no job is moved.
+
+```rust
+use hammerwork::archive::ArchivalConfig;
+
+let config = ArchivalConfig::new();
+assert!(config.verify_compression);
+assert!(!config.with_compression_verification(false).verify_compression);
+```
 
 ### Per-Queue Policies
 
-`JobArchiver` keeps a policy per queue plus a global configuration, and runs archival with a progress callback or an event stream. A queue without its own policy uses `ArchivalPolicy::default()`.
+`JobArchiver` keeps a policy per queue plus a global configuration, and runs archival with a progress callback or an event stream. A queue without its own policy, and an operation over all queues (`None`), uses the archiver's default policy: `ArchivalPolicy::default()` unless changed with `set_default_policy` / `with_default_policy`.
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
@@ -201,9 +211,49 @@ let batch_stats = queue
 # }
 ```
 
-### Scheduled Archival
+### Automatic Archival in the Worker Pool
 
-Run archival on a schedule with a recurring job whose handler calls `archive_jobs`:
+`WorkerPool::with_archival(policy, config, interval)` archives and purges on its own. Every `interval` it runs `JobArchiver::run_scheduled_pass`: it archives the jobs of every queue that `policy` makes eligible, batch after batch, with reason `Automatic` and `archived_by` `"worker_pool"`, then deletes archived jobs older than `policy.purge_archived_after` (when set). The results are logged. The first pass runs when the pool starts.
+
+```rust,no_run
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use chrono::Duration;
+use hammerwork::archive::{ArchivalConfig, ArchivalPolicy};
+use hammerwork::{Worker, WorkerPool};
+
+let policy = ArchivalPolicy::new()
+    .archive_completed_after(Duration::days(7))
+    .archive_failed_after(Duration::days(30))
+    .purge_archived_after(Duration::days(365));
+
+let mut pool = WorkerPool::new().with_archival(
+    policy,
+    ArchivalConfig::new(),
+    std::time::Duration::from_secs(60 * 60), // every hour
+);
+pool.add_worker(Worker::new(queue.clone(), "emails".to_string(), handler));
+pool.start().await?;
+# Ok(())
+# }
+```
+
+With a configuration file, `WorkerPool::from_hammerwork_config` does the same when the `[archive]` section is enabled. `archive_after` applies to completed, failed, dead and timed-out jobs, `delete_after` becomes `purge_archived_after`, and `check_interval` (default `"1h"`) is the interval:
+
+```toml
+[archive]
+enabled = true
+compression_level = 6
+archive_after = "30d"
+delete_after = "365d"
+check_interval = "1h"
+```
+
+Archival never blocks workers: each pass runs in its own task. On shutdown the pool starts no new pass, and a running pass stops before its next batch (a batch that has started commits or rolls back as a whole). Several pools or processes can archive at the same time: each batch claims its rows with `FOR UPDATE SKIP LOCKED` and moves them in one transaction, so every job is archived exactly once, and the purge is an idempotent delete.
+
+### Archival as a Scheduled Job
+
+You can also run archival from a recurring job whose handler calls `archive_jobs`:
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
@@ -464,7 +514,7 @@ let policy = ArchivalPolicy::new()
     .archive_completed_after(Duration::days(7))   // Quick archival for completed jobs
     .archive_failed_after(Duration::days(30))     // Longer retention for debugging
     .archive_dead_after(Duration::days(14))       // Medium retention for analysis
-    .purge_archived_after(Duration::days(365));   // Retention for the purge job you schedule
+    .purge_archived_after(Duration::days(365));   // Purged by the pool's automatic archival
 # Ok(())
 # }
 ```

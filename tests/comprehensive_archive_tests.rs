@@ -576,7 +576,6 @@ async fn test_jobarchiver_configuration_comprehensive() {
     // Test configuration management
     let config = ArchivalConfig::new()
         .with_compression_level(9)
-        .with_max_payload_size(2048)
         .with_compression_verification(true);
 
     archiver.set_config(config);
@@ -610,6 +609,5 @@ async fn test_jobarchiver_configuration_comprehensive() {
 
     let retrieved_config = archiver.get_config();
     assert_eq!(retrieved_config.compression_level, 9);
-    assert_eq!(retrieved_config.max_payload_size, 2048);
     assert!(retrieved_config.verify_compression);
 }

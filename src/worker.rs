@@ -2900,6 +2900,8 @@ pub struct WorkerPool<DB: Database> {
     reaper_older_than: Option<Duration>,
     /// How often encrypted jobs whose retention ended are purged (`None`: never)
     encrypted_job_purge_interval: Option<Duration>,
+    /// Automatic archival and purge of archived jobs (`None`: off)
+    archival: Option<PoolArchival>,
     stats_collector: Option<Arc<dyn StatisticsCollector>>,
     /// Worker template for creating new workers during autoscaling
     worker_template: Option<Worker<DB>>,
@@ -2927,6 +2929,7 @@ where
             reaper_interval: Some(DEFAULT_STALE_JOB_REAPER_INTERVAL),
             reaper_older_than: None,
             encrypted_job_purge_interval: None,
+            archival: None,
             stats_collector: None,
             worker_template: None,
             autoscale_config: AutoscaleConfig::disabled(),
@@ -2957,15 +2960,27 @@ where
     ///
     /// Like [`WorkerPool::from_config`] with `config.worker`, and also schedules the
     /// encrypted job retention purge every `encryption.purge_interval_secs`, when set
-    /// ([`WorkerPool::with_encrypted_job_purge`]). Validates the `encryption` section.
+    /// ([`WorkerPool::with_encrypted_job_purge`]), and automatic archival every
+    /// `archive.check_interval` when `archive.enabled` ([`WorkerPool::with_archival`]
+    /// with [`ArchiveConfig::archival_policy`](crate::config::ArchiveConfig::archival_policy)
+    /// and [`ArchiveConfig::archival_config`](crate::config::ArchiveConfig::archival_config)).
+    /// Validates the `encryption`, `worker` and `archive` sections.
     pub fn from_hammerwork_config(
         worker: Worker<DB>,
         config: &crate::config::HammerworkConfig,
     ) -> Result<Self> {
         config.encryption.validate()?;
         config.worker.validate()?;
+        config.archive.validate()?;
         let mut pool = Self::from_config(worker, &config.worker);
         pool.encrypted_job_purge_interval = config.encryption.purge_interval();
+        if config.archive.enabled {
+            pool = pool.with_archival(
+                config.archive.archival_policy(),
+                config.archive.archival_config(),
+                config.archive.check_interval,
+            );
+        }
         Ok(pool)
     }
 
@@ -3043,6 +3058,40 @@ where
         self
     }
 
+    /// Archive finished jobs, and purge old archived jobs, every `interval`.
+    ///
+    /// Each pass runs [`JobArchiver::run_scheduled_pass`](crate::archive::JobArchiver::run_scheduled_pass)
+    /// with `policy` as the policy for every queue and `config` for compression: it
+    /// moves completed, failed, dead and timed out jobs older than the policy's
+    /// thresholds to `hammerwork_jobs_archive` (reason `Automatic`, archived by
+    /// `"worker_pool"`), then deletes archived jobs older than `purge_archived_after`,
+    /// when set. Results are logged. Off by default; a disabled `policy` does nothing.
+    ///
+    /// The first pass runs when the pool starts. Passes run in their own task, so
+    /// workers are never blocked by them. On shutdown no new pass starts, and a running
+    /// pass stops before its next batch; a batch that has started commits or rolls back
+    /// as a whole. Running archival in several pools or processes at once is safe: rows
+    /// are claimed with `FOR UPDATE SKIP LOCKED`, so each job is archived once.
+    pub fn with_archival(
+        mut self,
+        policy: crate::archive::ArchivalPolicy,
+        config: crate::archive::ArchivalConfig,
+        interval: Duration,
+    ) -> Self {
+        self.archival = Some(PoolArchival {
+            policy,
+            config,
+            interval,
+        });
+        self
+    }
+
+    /// Disable automatic archival (the default).
+    pub fn without_archival(mut self) -> Self {
+        self.archival = None;
+        self
+    }
+
     /// Set a worker template for autoscaling
     /// This worker will be cloned when creating new workers
     pub fn with_worker_template(mut self, worker: Worker<DB>) -> Self {
@@ -3086,6 +3135,7 @@ where
         let maintenance: Vec<tokio::task::JoinHandle<()>> = [
             self.start_stale_job_reaper(&workers, signal_rx.clone()),
             self.start_encrypted_job_purge(&workers, signal_rx.clone()),
+            self.start_archival(&workers, signal_rx.clone()),
         ]
         .into_iter()
         .flatten()
@@ -3343,6 +3393,49 @@ where
         }))
     }
 
+    /// Spawn the periodic archival pass, if enabled.
+    fn start_archival(
+        &self,
+        workers: &[Worker<DB>],
+        signal_rx: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let archival = self.archival.clone()?;
+        let queue = Arc::clone(&workers.first()?.queue);
+        if !archival.policy.enabled {
+            info!("Automatic archival is configured with a disabled policy; not starting it");
+            return None;
+        }
+        let archiver = Arc::new(
+            crate::archive::JobArchiver::new(queue.pool.clone())
+                .with_default_policy(archival.policy)
+                .with_config(archival.config),
+        );
+        let stop_rx = signal_rx.clone();
+        Some(spawn_periodic(archival.interval, signal_rx, move || {
+            let (queue, archiver, stop_rx) =
+                (Arc::clone(&queue), Arc::clone(&archiver), stop_rx.clone());
+            async move {
+                let pass = archiver
+                    .run_scheduled_pass(queue.as_ref(), Some("worker_pool"), || *stop_rx.borrow())
+                    .await;
+                match pass {
+                    Ok(pass) if pass.jobs_archived > 0 || pass.jobs_purged > 0 => info!(
+                        "Archival archived {} jobs and purged {} archived jobs{}",
+                        pass.jobs_archived,
+                        pass.jobs_purged,
+                        if pass.stopped_early {
+                            " (stopped early for shutdown)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Ok(_) => debug!("Archival found nothing to archive or purge"),
+                    Err(e) => warn!("Archival failed: {}", e),
+                }
+            }
+        }))
+    }
+
     /// Start the autoscaling background task.
     ///
     /// Returns the worker template and a channel carrying the desired worker count,
@@ -3564,6 +3657,14 @@ fn apply_queue_depth(
     m.active_workers = new_count;
     m.last_scale_time = Some(now);
     Some(new_count)
+}
+
+/// Automatic archival settings of a [`WorkerPool`] ([`WorkerPool::with_archival`]).
+#[derive(Debug, Clone)]
+struct PoolArchival {
+    policy: crate::archive::ArchivalPolicy,
+    config: crate::archive::ArchivalConfig,
+    interval: Duration,
 }
 
 /// Spawn a task that calls `run` every `interval` (first right away) until shutdown is
@@ -4283,6 +4384,29 @@ mod tests {
                 .encrypted_job_purge_interval,
             None
         );
+    }
+
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    #[test]
+    fn archival_is_opt_in() {
+        #[cfg(feature = "postgres")]
+        type Db = sqlx::Postgres;
+        #[cfg(all(feature = "mysql", not(feature = "postgres")))]
+        type Db = sqlx::MySql;
+
+        let pool = WorkerPool::<Db>::new();
+        assert!(pool.archival.is_none());
+        let policy = crate::archive::ArchivalPolicy::new().with_batch_size(7);
+        let pool = pool.with_archival(
+            policy,
+            crate::archive::ArchivalConfig::new().with_compression_level(2),
+            Duration::from_secs(90),
+        );
+        let archival = pool.archival.as_ref().unwrap();
+        assert_eq!(archival.interval, Duration::from_secs(90));
+        assert_eq!(archival.policy.batch_size, 7);
+        assert_eq!(archival.config.compression_level, 2);
+        assert!(pool.without_archival().archival.is_none());
     }
 
     #[test]
