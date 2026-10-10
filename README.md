@@ -19,7 +19,7 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 - **Job prioritization**: Five priority levels with weighted and strict scheduling algorithms
 - **Result storage**: Database and in-memory (per-process, bounded) result storage with TTL and automatic cleanup ([Job Results](docs/job-types.md#job-results))
 - **Worker autoscaling**: Dynamic worker pool scaling based on queue depth and configurable thresholds
-- **Batch operations**: High-performance bulk job enqueuing with optimized worker processing
+- **Batch operations**: Bulk job enqueuing in one transaction, and batch claims: workers can claim many jobs per round trip (`Worker::with_batch_size`), each with its own lease
 - **Cron scheduling**: Full cron expression support with timezone awareness
 - **Rate limiting**: Token bucket rate limiting with configurable burst limits
 - **Monitoring**: Prometheus metrics and advanced alerting (enabled by default)

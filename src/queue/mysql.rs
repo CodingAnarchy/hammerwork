@@ -688,6 +688,86 @@ impl crate::queue::JobQueue<MySql> {
         super::end_transaction(tx, result).await
     }
 
+    /// One attempt at claiming up to `limit` runnable jobs of `queue_name` (of
+    /// `priority` when given), highest priority and oldest first, like
+    /// [`claim_attempt`](Self::claim_attempt): one transaction locks the rows with
+    /// `SELECT ... FOR UPDATE SKIP LOCKED LIMIT n`, so concurrent claimers each get
+    /// different rows, and one `UPDATE ... WHERE id IN (...)` claims them all with their
+    /// leases. Returns the jobs in claim order.
+    async fn claim_batch_attempt(
+        &self,
+        queue_name: &str,
+        priority: Option<JobPriority>,
+        lease: i64,
+        limit: usize,
+    ) -> Result<Vec<Job>> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = Self::begin_claim_transaction(&mut conn).await?;
+        let result = async {
+            let query = format!(
+                "SELECT {JOB_SELECT_FIELDS}, UTC_TIMESTAMP(6) AS claimed_at \
+                 FROM hammerwork_jobs j WHERE {RUNNABLE_IN_QUEUE_SQL}{} \
+                 ORDER BY j.priority DESC, j.scheduled_at ASC LIMIT ? FOR UPDATE SKIP LOCKED",
+                if priority.is_some() {
+                    " AND j.priority = ?"
+                } else {
+                    ""
+                }
+            );
+            let mut select = sqlx::query(&query).bind(queue_name).bind(queue_name);
+            if let Some(priority) = priority {
+                select = select.bind(priority.as_i32());
+            }
+            let rows = select.bind(limit as u64).fetch_all(&mut *tx).await?;
+            let Some(first) = rows.first() else {
+                return Ok(Vec::new());
+            };
+            // One claim time for the whole batch, from the database clock.
+            let started_at: DateTime<Utc> = first.try_get("claimed_at")?;
+            // A row that cannot be decoded is not claimed: it stays Pending (its lock is
+            // released at commit) instead of failing the healthy jobs claimed with it.
+            let mut jobs = super::decodable_rows(
+                "claimed jobs",
+                rows.iter().map(|row| {
+                    let id: String = row.try_get("id").unwrap_or_default();
+                    let job = JobRow::from_row(row)
+                        .map_err(crate::HammerworkError::from)
+                        .and_then(JobRow::into_job);
+                    (id, job)
+                }),
+            );
+            if jobs.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let placeholders = vec!["?"; jobs.len()].join(", ");
+            let sql = format!(
+                "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1, \
+                 last_heartbeat_at = ?, lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
+                 CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id IN ({placeholders})"
+            );
+            let mut update = sqlx::query(&sql)
+                .bind(JobStatus::Running)
+                .bind(started_at)
+                .bind(started_at)
+                .bind(started_at)
+                .bind(lease);
+            for job in &jobs {
+                update = update.bind(job.id.to_string());
+            }
+            update.execute(&mut *tx).await?;
+
+            for job in &mut jobs {
+                job.status = JobStatus::Running;
+                job.attempts += 1;
+                job.started_at = Some(started_at);
+            }
+            Ok(jobs)
+        }
+        .await;
+        super::end_transaction(tx, result).await
+    }
+
     async fn dequeue_with_priority_weights_inner(
         &self,
         queue_name: &str,
@@ -804,6 +884,87 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             }
             _ => retry_on_deadlock(|| self.claim_attempt(queue_name, None, lease)).await,
         }
+    }
+
+    async fn dequeue_batch_leased(
+        &self,
+        queue_name: &str,
+        weights: Option<&crate::priority::PriorityWeights>,
+        lease: std::time::Duration,
+        max_jobs: usize,
+    ) -> Result<Vec<Job>> {
+        let max_jobs = max_jobs.min(super::MAX_DEQUEUE_BATCH_SIZE);
+        if max_jobs == 0 {
+            return Ok(Vec::new());
+        }
+        let lease = lease_micros(lease);
+        let weights = match weights {
+            Some(weights) if !weights.is_strict() => weights,
+            // Strict priority: highest priority first, then the oldest jobs.
+            _ => {
+                return retry_on_deadlock(|| {
+                    self.claim_batch_attempt(queue_name, None, lease, max_jobs)
+                })
+                .await;
+            }
+        };
+
+        // Which priority levels have a runnable job (see `dequeue_leased`).
+        let levels: Vec<i64> =
+            sqlx::query_scalar(&super::runnable_priorities_sql(RUNNABLE_IN_QUEUE_SQL))
+                .bind(queue_name)
+                .bind(queue_name)
+                .fetch_all(&self.pool)
+                .await?;
+        let mut candidates: Vec<JobPriority> = levels
+            .into_iter()
+            .filter_map(|level| i32::try_from(level).ok())
+            .filter_map(|level| JobPriority::from_i32(level).ok())
+            .collect();
+
+        // Pick a level by weight and fill the batch with its oldest runnable jobs. If it
+        // runs out first, pick another of the remaining levels by weight for the rest.
+        let mut jobs = Vec::with_capacity(max_jobs);
+        let mut attempt = 0;
+        while jobs.len() < max_jobs
+            && let Some(priority) = super::pick_weighted_priority(
+                &candidates,
+                weights,
+                super::weighted_seed(queue_name, attempt),
+            )
+        {
+            let room = max_jobs - jobs.len();
+            let claimed = retry_on_deadlock(|| {
+                self.claim_batch_attempt(queue_name, Some(priority), lease, room)
+            })
+            .await?;
+            jobs.extend(claimed);
+            candidates.retain(|candidate| *candidate != priority);
+            attempt += 1;
+        }
+        Ok(jobs)
+    }
+
+    async fn release_job_run(&self, run: &Job) -> Result<bool> {
+        // Undo this run's claim only: a job reclaimed and claimed again is left alone.
+        let started = super::run_started_range(run);
+        let result = sqlx::query(
+            "UPDATE hammerwork_jobs SET status = ?, started_at = NULL, \
+             attempts = GREATEST(attempts - 1, 0), last_heartbeat_at = NULL, \
+             lease_expires_at = NULL WHERE id = ? AND status = ? AND attempts = ? \
+             AND (? IS NULL OR (started_at > ? AND started_at < ?))",
+        )
+        .bind(JobStatus::Pending)
+        .bind(run.id.to_string())
+        .bind(JobStatus::Running)
+        .bind(run.attempts)
+        .bind(started.map(|(from, _)| from))
+        .bind(started.map(|(from, _)| from))
+        .bind(started.map(|(_, to)| to))
+        .execute(&self.pool)
+        .await?;
+        // The status always changes, so "rows changed" is "rows matched" here.
+        Ok(result.rows_affected() > 0)
     }
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {

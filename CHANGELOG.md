@@ -24,6 +24,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they are lost on restart. See [Job Results](docs/job-types.md#job-results).
   `TestQueue::delete_job` now also deletes the job's result.
 
+### Added
+
+- **Batch claims.** `DatabaseQueue::dequeue_batch(queue, n)` and
+  `dequeue_batch_leased(queue, weights, lease, n)` claim up to `n` runnable jobs in one
+  round trip, with the same guarantees as a single claim: each job's lease is written by
+  the claiming statement, `attempts` is incremented, paused queues, unfinished
+  dependencies and disabled recurring jobs are honoured, jobs come back in
+  `priority DESC, scheduled_at ASC` order, and concurrent claimers never get the same job.
+  PostgreSQL claims with one `UPDATE ... WHERE id IN (SELECT ... LIMIT n FOR UPDATE SKIP
+  LOCKED) RETURNING ...`; MySQL with `SELECT ... FOR UPDATE SKIP LOCKED LIMIT n` and one
+  `UPDATE` in the claim transaction (READ COMMITTED, retried on deadlock); `TestQueue`
+  matches them. Strict priority fills a batch in strict order; weighted priorities pick a
+  level by weight per batch, fill from it and top up from other levels. At most
+  `queue::MAX_DEQUEUE_BATCH_SIZE` (1000) jobs per call.
+- **`DatabaseQueue::release_job_run`** hands a claimed job that never ran back to
+  `Pending`, taking back the claim's attempt, so it can run elsewhere at once.
+- **Batch-mode workers.** `Worker::with_batch_size(n)` (or
+  `with_batch_processing_enabled(true)`, which now claims batches of
+  `worker::DEFAULT_BATCH_SIZE` = 10) makes a worker claim up to `n` jobs per poll, and
+  `Worker::with_batch_concurrency(m)` runs up to `m` of them at once (default 1). Each job
+  is processed exactly as in single-job mode (timeouts, retries, hooks, events, spawning,
+  result storage, encryption, statistics). Jobs waiting for their turn have their leases
+  renewed by heartbeats, so the stale job reaper never reclaims them while the worker is
+  alive. A throttle's `max_concurrent` permit is held per claimed job, and a batch claims
+  no more jobs than it has rate limit tokens (unused tokens are refunded). On shutdown,
+  claimed jobs that have not started are released at once. Workers without batch
+  processing claim one job at a time as before. New getters: `is_batch_processing_enabled`,
+  `batch_size`, `batch_concurrency`. In a local benchmark, batch claims of 50 were 5-6x
+  faster than single claims on PostgreSQL and MySQL.
+
+### Changed
+
+- `Worker::with_batch_processing_enabled(true)` used to only keep statistics for jobs of a
+  `JobBatch`; it now also switches the worker to batch claims (batch size 10, one job
+  running at a time). Leave it off to keep claiming one job per poll.
+
 ## [2.0.0] - 2026-10-09
 
 A hardening release ([#7](https://github.com/CodingAnarchy/hammerwork/issues/7)). It fixes

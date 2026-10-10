@@ -661,6 +661,88 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         Ok(None)
     }
 
+    async fn dequeue_batch_leased(
+        &self,
+        queue_name: &str,
+        weights: Option<&crate::priority::PriorityWeights>,
+        lease: std::time::Duration,
+        max_jobs: usize,
+    ) -> Result<Vec<Job>> {
+        let max_jobs = max_jobs.min(super::MAX_DEQUEUE_BATCH_SIZE);
+        if max_jobs == 0 {
+            return Ok(Vec::new());
+        }
+        let lease = super::lease_interval(lease);
+        let weights = match weights {
+            Some(weights) if !weights.is_strict() => weights,
+            // Strict priority: highest priority first, then the oldest jobs.
+            _ => {
+                let rows = sqlx::query_as::<_, JobRow>(&claim_batch_sql(false))
+                    .bind(queue_name)
+                    .bind(lease)
+                    .bind(max_jobs as i64)
+                    .fetch_all(&self.pool)
+                    .await?;
+                return Ok(claimed_jobs(rows));
+            }
+        };
+
+        // Which priority levels have a runnable job (see `dequeue_leased`).
+        let levels: Vec<i32> =
+            sqlx::query_scalar(&super::runnable_priorities_sql(RUNNABLE_IN_QUEUE_SQL))
+                .bind(queue_name)
+                .fetch_all(&self.pool)
+                .await?;
+        let mut candidates: Vec<JobPriority> = levels
+            .into_iter()
+            .filter_map(|level| JobPriority::from_i32(level).ok())
+            .collect();
+
+        // Pick a level by weight and fill the batch with its oldest runnable jobs. If it
+        // runs out first, pick another of the remaining levels by weight for the rest.
+        let mut jobs = Vec::with_capacity(max_jobs);
+        let mut attempt = 0;
+        while jobs.len() < max_jobs
+            && let Some(priority) = super::pick_weighted_priority(
+                &candidates,
+                weights,
+                super::weighted_seed(queue_name, attempt),
+            )
+        {
+            let rows = sqlx::query_as::<_, JobRow>(&claim_batch_sql(true))
+                .bind(queue_name)
+                .bind(lease)
+                .bind((max_jobs - jobs.len()) as i64)
+                .bind(priority.as_i32())
+                .fetch_all(&self.pool)
+                .await?;
+            jobs.extend(claimed_jobs(rows));
+            candidates.retain(|candidate| *candidate != priority);
+            attempt += 1;
+        }
+        Ok(jobs)
+    }
+
+    async fn release_job_run(&self, run: &Job) -> Result<bool> {
+        // Undo this run's claim only: a job reclaimed and claimed again is left alone.
+        let started = super::run_started_range(run);
+        let result = sqlx::query(
+            "UPDATE hammerwork_jobs SET status = $1, started_at = NULL, \
+             attempts = GREATEST(attempts - 1, 0), last_heartbeat_at = NULL, \
+             lease_expires_at = NULL WHERE id = $2 AND status = $3 AND attempts = $4 \
+             AND ($5::timestamptz IS NULL OR (started_at > $5 AND started_at < $6))",
+        )
+        .bind(JobStatus::Pending)
+        .bind(run.id)
+        .bind(JobStatus::Running)
+        .bind(run.attempts)
+        .bind(started.map(|(from, _)| from))
+        .bind(started.map(|(_, to)| to))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
         let transition = JobTransition::Complete;
         self.transition_job(job_id, Guard::Manual(transition), &Target::Completed, false)
@@ -2289,6 +2371,41 @@ fn claim_sql(by_priority: bool) -> String {
             ""
         }
     )
+}
+
+/// Claims up to `$3` runnable jobs of queue `$1` (of priority `$4` when `by_priority`)
+/// in one statement, like [`claim_sql`]: the subquery locks the highest-priority, oldest
+/// runnable rows that no other transaction holds (`FOR UPDATE SKIP LOCKED`, so
+/// concurrent claimers each get different rows), and the update claims all of them,
+/// each with a lease of `$2`. A subquery with `LIMIT` is never flattened into a join,
+/// so it runs once. `RETURNING` does not keep the subquery's order; callers sort.
+fn claim_batch_sql(by_priority: bool) -> String {
+    format!(
+        "UPDATE hammerwork_jobs SET status = 'Running', started_at = now(), \
+         attempts = attempts + 1, last_heartbeat_at = now(), lease_expires_at = now() + $2 \
+         WHERE id IN (SELECT j.id FROM hammerwork_jobs j WHERE {RUNNABLE_IN_QUEUE_SQL}{} \
+         ORDER BY j.priority DESC, j.scheduled_at ASC LIMIT $3 FOR UPDATE SKIP LOCKED) \
+         RETURNING {JOB_SELECT_FIELDS}",
+        if by_priority {
+            " AND j.priority = $4"
+        } else {
+            ""
+        }
+    )
+}
+
+/// The jobs of a batch claim, in claim order. A row that cannot be decoded is skipped
+/// and logged rather than failing the batch, which would lose the healthy jobs claimed
+/// with it; it stays `Running` until its lease expires, like a single claim that fails
+/// to decode.
+fn claimed_jobs(rows: Vec<JobRow>) -> Vec<Job> {
+    let mut jobs = super::decodable_rows(
+        "claimed jobs",
+        rows.into_iter()
+            .map(|row| (row.id.to_string(), row.into_job())),
+    );
+    super::sort_in_claim_order(&mut jobs);
+    jobs
 }
 
 /// Insert `jobs`, settling the dependency state of those that depend on jobs that
