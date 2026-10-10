@@ -380,8 +380,9 @@ where
     }
 }
 
-/// #31: the next run of a recurring job is computed from the run's slot. Missed slots
-/// are coalesced into one immediate catch-up run, then the schedule continues.
+/// #31: the next run of a recurring job is computed from its slot, and a run that starts
+/// after missed slots (workers were down) is itself the catch-up: it runs once, then the
+/// job is back on its regular schedule with no second, immediate run.
 async fn cron_catches_up_missed_slots_once<DB>(queue: Arc<JobQueue<DB>>)
 where
     DB: sqlx::Database + Send + Sync + 'static,
@@ -399,30 +400,21 @@ where
     daily.scheduled_at = today - ChronoDuration::days(3);
     let id = queue.enqueue(daily).await.unwrap();
 
-    // The late run is followed by one catch-up run for the missed slots, due now...
+    // The late run is the catch-up run...
     let run = queue.dequeue(&queue_name).await.unwrap().expect("due");
     let recorded = queue
         .finish_job_run(&run, JobOutcome::Completed)
         .await
         .unwrap()
         .expect("recorded");
+    // ...so the job goes straight back to its regular schedule.
     assert_eq!(recorded.status, JobStatus::Pending);
-    assert_eq!(recorded.next_run_at, Some(today));
-    let job = queue.get_job(id).await.unwrap().unwrap();
-    assert_eq!((job.scheduled_at, job.next_run_at), (today, Some(today)));
-
-    // ...and after it, the job is back on schedule.
-    let run = queue
-        .dequeue(&queue_name)
-        .await
-        .unwrap()
-        .expect("catch-up run");
-    let recorded = queue
-        .finish_job_run(&run, JobOutcome::Completed)
-        .await
-        .unwrap()
-        .expect("recorded");
     assert_eq!(recorded.next_run_at, Some(tomorrow));
+    let job = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(
+        (job.scheduled_at, job.next_run_at),
+        (tomorrow, Some(tomorrow))
+    );
     assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
 
     queue.delete_job(id).await.unwrap();
