@@ -667,6 +667,10 @@ impl Job {
     /// automatically terminated and marked as timed out. Job-level timeouts
     /// take precedence over worker-level default timeouts.
     ///
+    /// The PostgreSQL and MySQL backends store the timeout in whole seconds, rounding a
+    /// fractional timeout up (`200ms` is stored as one second). `Duration::ZERO` means no
+    /// job-level timeout, so the worker's default applies.
+    ///
     /// # Arguments
     ///
     /// * `timeout` - Maximum duration the job is allowed to run

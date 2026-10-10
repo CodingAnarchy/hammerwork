@@ -1989,7 +1989,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                     .map(|rs| serde_json::to_string(&rs))
                     .transpose()?,
             )
-            .bind(job.timeout.map(|t| t.as_secs() as i32))
+            .bind(super::timeout_db_seconds(job.timeout))
             .bind(job.priority.weight() as i32)
             .bind(job.cron_schedule)
             .bind(job.next_run_at)
@@ -2528,7 +2528,7 @@ async fn insert_jobs(conn: &mut sqlx::MySqlConnection, jobs: &[Job]) -> Result<(
                     .push_bind(job.priority.as_i32())
                     .push_bind(job.attempts)
                     .push_bind(job.max_attempts)
-                    .push_bind(job.timeout.map(|d| d.as_secs() as i32))
+                    .push_bind(super::timeout_db_seconds(job.timeout))
                     .push_bind(job.created_at)
                     .push_bind(job.scheduled_at)
                     .push_bind(job.started_at)

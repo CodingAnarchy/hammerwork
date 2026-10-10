@@ -1284,6 +1284,18 @@ pub(crate) fn retry_strategy_from_json(
     Ok(value.map(serde_json::from_value).transpose()?)
 }
 
+/// The stored `timeout_seconds` for a job timeout. The column holds whole seconds, so a
+/// sub-second timeout is rounded up (never stored as an immediate zero) and an enormous one
+/// saturates at `i32::MAX` instead of wrapping negative. A zero timeout is stored as none.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn timeout_db_seconds(timeout: Option<std::time::Duration>) -> Option<i32> {
+    let timeout = timeout.filter(|timeout| !timeout.is_zero())?;
+    let seconds = timeout
+        .as_secs()
+        .saturating_add(u64::from(timeout.subsec_nanos() > 0));
+    Some(i32::try_from(seconds).unwrap_or(i32::MAX))
+}
+
 /// Convert an integer read from the database into the type the API exposes (e.g. a
 /// `COUNT(*)` `i64` into `u64`), failing instead of wrapping on out-of-range values.
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
@@ -1951,6 +1963,27 @@ impl JobQueue<sqlx::MySql> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timeout_db_seconds_rounds_up_saturates_and_drops_zero() {
+        use std::time::Duration;
+        assert_eq!(timeout_db_seconds(None), None);
+        assert_eq!(timeout_db_seconds(Some(Duration::ZERO)), None);
+        assert_eq!(
+            timeout_db_seconds(Some(Duration::from_millis(200))),
+            Some(1)
+        );
+        assert_eq!(
+            timeout_db_seconds(Some(Duration::from_millis(1500))),
+            Some(2)
+        );
+        assert_eq!(timeout_db_seconds(Some(Duration::from_secs(30))), Some(30));
+        assert_eq!(timeout_db_seconds(Some(Duration::MAX)), Some(i32::MAX));
+        assert_eq!(
+            timeout_db_seconds(Some(Duration::from_secs(u64::from(u32::MAX)))),
+            Some(i32::MAX)
+        );
+    }
+
     use super::*;
 
     /// Test that the pool field is publicly accessible

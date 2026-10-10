@@ -2125,10 +2125,12 @@ where
         // here.
         let spawn_parent = self.spawn_manager.is_some().then(|| handler_job.clone());
 
-        // Determine timeout duration (job-specific or default). A zero worker default
-        // means no default (see `with_default_timeout`).
+        // Determine timeout duration (job-specific or default). A zero timeout, on the job
+        // or as the worker default, means none (see `Job::with_timeout` and
+        // `with_default_timeout`).
         let timeout_duration = job
             .timeout
+            .filter(|timeout| !timeout.is_zero())
             .or(self.default_timeout.filter(|timeout| !timeout.is_zero()));
 
         // Ok(handler result), or Err(timeout) when the handler ran out of time.
