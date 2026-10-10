@@ -579,7 +579,9 @@ where
 
 /// Job timeouts are stored in whole seconds: a sub-second timeout is rounded up instead of
 /// becoming an immediate zero, a zero timeout is stored as none, and a huge one saturates
-/// instead of wrapping into a negative value that later reads would reject.
+/// instead of wrapping into a negative value that later reads would reject. Only the
+/// database backends store whole seconds, so `TestQueue` does not run this scenario.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 async fn job_timeout_storage<Q>(queue: Arc<Q>)
 where
     Q: DatabaseQueue + Send + Sync + 'static,
