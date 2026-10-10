@@ -33,8 +33,14 @@ use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration as StdDuration};
 
-/// Module for serializing std::time::Duration as human-readable strings
-mod duration_secs {
+/// Serde support for [`std::time::Duration`] as human-readable strings, for use with
+/// `#[serde(with = "hammerwork::config::serde_duration")]`.
+///
+/// Durations are written as `"500ms"`, `"30s"`, `"5m"` or `"1h"`. Reading accepts those
+/// forms plus `"2d"`, a bare number of seconds (`90` or `"90"`), and serde's default
+/// `{ secs = 30, nanos = 0 }` table, so files written before a field switched to this
+/// format still load.
+pub mod serde_duration {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
@@ -65,8 +71,30 @@ mod duration_secs {
     {
         use serde::de::Error;
 
-        let s = String::deserialize(deserializer)?;
-        parse_duration(&s).map_err(D::Error::custom)
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            Seconds(u64),
+            Table { secs: u64, nanos: u32 },
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Text(s) => parse_duration(&s).map_err(D::Error::custom),
+            Repr::Seconds(secs) => Ok(Duration::from_secs(secs)),
+            Repr::Table { secs, nanos } => {
+                if nanos >= 1_000_000_000 {
+                    return Err(D::Error::custom("nanos must be below 1000000000"));
+                }
+                Ok(Duration::new(secs, nanos))
+            }
+        }
+    }
+
+    fn checked_secs(num: u64, unit: u64) -> Result<Duration, String> {
+        num.checked_mul(unit)
+            .map(Duration::from_secs)
+            .ok_or_else(|| format!("Duration too large: {num} x {unit}s"))
     }
 
     /// Parse a duration string like "500ms", "30s", "5m", "1h", "90", etc.
@@ -98,9 +126,9 @@ mod duration_secs {
 
         match suffix {
             "s" => Ok(Duration::from_secs(num)),
-            "m" => Ok(Duration::from_secs(num * 60)),
-            "h" => Ok(Duration::from_secs(num * 3600)),
-            "d" => Ok(Duration::from_secs(num * 86400)),
+            "m" => checked_secs(num, 60),
+            "h" => checked_secs(num, 3600),
+            "d" => checked_secs(num, 86400),
             _ => Err(format!(
                 "Invalid duration suffix: {}. Use s, m, h, or d",
                 suffix
@@ -491,13 +519,13 @@ pub struct WorkerConfig {
 
     /// Polling interval for checking new jobs. Must be greater than zero (see
     /// [`WorkerConfig::validate`]).
-    #[serde(with = "duration_secs")]
+    #[serde(with = "serde_duration")]
     pub polling_interval: StdDuration,
 
     /// Default job timeout, applied by [`Worker::with_config`](crate::Worker::with_config)
     /// to every job that has no timeout of its own (default 5 minutes). Must be greater
     /// than zero (see [`WorkerConfig::validate`]).
-    #[serde(with = "duration_secs")]
+    #[serde(with = "serde_duration")]
     pub job_timeout: StdDuration,
 
     /// Priority weights for job selection
@@ -1403,6 +1431,36 @@ mod tests {
     ))]
     use crate::streaming::StreamBackend;
     use tempfile::tempdir;
+
+    #[test]
+    fn serde_duration_reads_every_documented_form() {
+        #[derive(Deserialize)]
+        struct T {
+            #[serde(with = "serde_duration")]
+            d: StdDuration,
+        }
+        let read = |toml: &str| toml::from_str::<T>(toml).map(|t| t.d);
+        assert_eq!(
+            read(r#"d = "500ms""#).unwrap(),
+            StdDuration::from_millis(500)
+        );
+        assert_eq!(read(r#"d = "30s""#).unwrap(), StdDuration::from_secs(30));
+        assert_eq!(read(r#"d = "5m""#).unwrap(), StdDuration::from_secs(300));
+        assert_eq!(read(r#"d = "1h""#).unwrap(), StdDuration::from_secs(3600));
+        assert_eq!(
+            read(r#"d = "2d""#).unwrap(),
+            StdDuration::from_secs(172_800)
+        );
+        assert_eq!(read(r#"d = "90""#).unwrap(), StdDuration::from_secs(90));
+        assert_eq!(read("d = 90").unwrap(), StdDuration::from_secs(90));
+        assert_eq!(
+            read("d = { secs = 1, nanos = 500000000 }").unwrap(),
+            StdDuration::from_millis(1500)
+        );
+        assert!(read("d = { secs = 1, nanos = 1000000000 }").is_err());
+        assert!(read(r#"d = "5x""#).is_err());
+        assert!(read(&format!(r#"d = "{}d""#, u64::MAX)).is_err());
+    }
 
     #[test]
     fn test_config_creation() {

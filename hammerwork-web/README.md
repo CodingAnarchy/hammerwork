@@ -96,7 +96,7 @@ max_connections = 100
 message_buffer_size = 1024    # outgoing messages queued per connection
 max_message_size = 65536      # largest message a client may send
 # Live updates: poll the database for job/queue changes while clients are connected
-live_update_interval = { secs = 2, nanos = 0 }   # zero disables live updates
+live_update_interval = "2s"     # zero disables live updates
 live_update_max_jobs = 100    # changed jobs read and pushed per poll
 ```
 
