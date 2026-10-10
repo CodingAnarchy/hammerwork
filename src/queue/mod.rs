@@ -170,9 +170,17 @@ pub trait DatabaseQueue: Send + Sync {
     async fn mark_job_timed_out(&self, job_id: JobId, error_message: &str) -> Result<()>;
 
     /// Get all dead jobs with optional pagination
+    ///
+    /// A listing skips rows it cannot decode (logging a warning with the job id), so one
+    /// corrupt row does not hide the others; [`get_job`](Self::get_job) still returns
+    /// the error for such a row.
     async fn get_dead_jobs(&self, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>>;
 
     /// Get dead jobs for a specific queue
+    ///
+    /// A listing skips rows it cannot decode (logging a warning with the job id), so one
+    /// corrupt row does not hide the others; [`get_job`](Self::get_job) still returns
+    /// the error for such a row.
     async fn get_dead_jobs_by_queue(
         &self,
         queue_name: &str,
@@ -243,6 +251,10 @@ pub trait DatabaseQueue: Send + Sync {
     async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()>;
 
     /// Get all recurring jobs for a queue
+    ///
+    /// A listing skips rows it cannot decode (logging a warning with the job id), so one
+    /// corrupt row does not hide the others; [`get_job`](Self::get_job) still returns
+    /// the error for such a row.
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>>;
 
     /// Disable a recurring job: it does not run again until it is enabled.
@@ -411,6 +423,10 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// This method returns jobs that have either no dependencies or all dependencies
     /// have been satisfied (completed successfully).
+    ///
+    /// A listing skips rows it cannot decode (logging a warning with the job id), so one
+    /// corrupt row does not hide the others; [`get_job`](Self::get_job) still returns
+    /// the error for such a row.
     async fn get_ready_jobs(&self, queue_name: &str, limit: u32) -> Result<Vec<Job>>;
 
     /// Apply the failure of `failed_job_id` to the jobs that can no longer run because
@@ -543,7 +559,8 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// # Returns
     ///
-    /// List of archived job information including archival metadata.
+    /// List of archived job information including archival metadata. Rows that cannot be
+    /// decoded are skipped with a warning, so one corrupt row does not hide the others.
     ///
     /// # Examples
     ///
@@ -1296,6 +1313,33 @@ pub(crate) fn timeout_db_seconds(timeout: Option<std::time::Duration>) -> Option
     Some(i32::try_from(seconds).unwrap_or(i32::MAX))
 }
 
+/// The decoded rows of a listing (dead jobs, ready jobs, archived jobs, ...), skipping and
+/// logging the rows that cannot be decoded.
+///
+/// One corrupt row (say a negative `timeout_seconds` written by an older version) must
+/// not make every listing that includes it fail, which would hide all the healthy jobs
+/// around it from the dashboard and the CLI. Each item is the row's id (for the log) and
+/// its decoding result. Reads of a single job keep returning the error.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn decodable_rows<T>(
+    listing: &str,
+    rows: impl IntoIterator<Item = (String, Result<T>)>,
+) -> Vec<T> {
+    rows.into_iter()
+        .filter_map(|(id, decoded)| match decoded {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %id,
+                    error = %error,
+                    "Skipping a row that cannot be decoded while listing {listing}"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// Convert an integer read from the database into the type the API exposes (e.g. a
 /// `COUNT(*)` `i64` into `u64`), failing instead of wrapping on out-of-range values.
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
@@ -1985,6 +2029,21 @@ mod tests {
     }
 
     use super::*;
+
+    /// #71: a listing keeps the rows it can decode and drops the others.
+    #[test]
+    fn decodable_rows_skips_rows_that_fail_to_decode() {
+        let rows = vec![
+            ("a".to_string(), Ok(1)),
+            (
+                "b".to_string(),
+                db_seconds(-1i32, "timeout_seconds").map(|_| 2),
+            ),
+            ("c".to_string(), Ok(3)),
+        ];
+        assert_eq!(decodable_rows("test rows", rows), [1, 3]);
+        assert!(decodable_rows::<u8>("nothing", Vec::new()).is_empty());
+    }
 
     /// Test that the pool field is publicly accessible
     #[cfg(feature = "postgres")]
