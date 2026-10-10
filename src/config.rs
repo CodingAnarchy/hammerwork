@@ -594,6 +594,26 @@ pub struct WebhookGlobalSettings {
 
     /// User agent string for requests
     pub user_agent: String,
+
+    /// Timeout in seconds for webhooks that do not set `timeout_secs` (or set it to 0).
+    /// See [`WebhookManagerConfig::default_timeout_secs`](crate::webhooks::WebhookManagerConfig::default_timeout_secs).
+    #[serde(default = "default_webhook_timeout_secs")]
+    pub default_timeout_secs: u64,
+
+    /// Maximum deliveries pending per webhook before its listener waits. See
+    /// [`WebhookManagerConfig::max_pending_deliveries`](crate::webhooks::WebhookManagerConfig::max_pending_deliveries).
+    #[serde(default = "default_max_pending_deliveries")]
+    pub max_pending_deliveries: usize,
+}
+
+#[cfg(feature = "webhooks")]
+fn default_webhook_timeout_secs() -> u64 {
+    30
+}
+
+#[cfg(feature = "webhooks")]
+fn default_max_pending_deliveries() -> usize {
+    1_000
 }
 
 #[cfg(feature = "webhooks")]
@@ -604,6 +624,8 @@ impl Default for WebhookGlobalSettings {
             max_response_body_size: 64 * 1024, // 64KB
             log_deliveries: true,
             user_agent: format!("hammerwork-webhooks/{}", env!("CARGO_PKG_VERSION")),
+            default_timeout_secs: default_webhook_timeout_secs(),
+            max_pending_deliveries: default_max_pending_deliveries(),
         }
     }
 }
@@ -771,10 +793,20 @@ impl RateLimitingConfig {
     }
 }
 
-/// Logging and tracing configuration
+/// The subscriber [`LoggingConfig`] layers its outputs on: the registry with the level filter.
+type LoggingSubscriber =
+    tracing_subscriber::layer::Layered<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
+/// Logging and tracing configuration (`[logging]`).
+///
+/// A library does not install a global logger on its own: call
+/// [`LoggingConfig::try_init`] (for example `config.logging.try_init()?`) once at
+/// startup to apply this section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
-    /// Log level (trace, debug, info, warn, error)
+    /// Log filter: a level (trace, debug, info, warn, error) or any
+    /// [`EnvFilter`](tracing_subscriber::EnvFilter) directive, such as
+    /// `"info,hammerwork=debug"`.
     pub level: String,
 
     /// Whether to enable structured JSON logging
@@ -783,14 +815,85 @@ pub struct LoggingConfig {
     /// Whether to include file and line information
     pub include_location: bool,
 
-    /// Whether to enable OpenTelemetry tracing
+    /// Whether to export spans with OpenTelemetry (requires the `tracing` feature)
     pub enable_tracing: bool,
 
-    /// OpenTelemetry endpoint URL
+    /// OpenTelemetry (OTLP/gRPC) endpoint URL. Without one, spans are not exported.
     pub tracing_endpoint: Option<String>,
 
     /// Service name for tracing
     pub service_name: String,
+}
+
+impl LoggingConfig {
+    /// Install a global `tracing` subscriber configured by this section: log lines on
+    /// stdout filtered by `level`, as JSON when `json_format` is set and with file and
+    /// line numbers when `include_location` is set. With `enable_tracing`, spans are
+    /// also exported over OTLP to `tracing_endpoint` under `service_name` (call
+    /// [`shutdown_tracing`](crate::tracing::shutdown_tracing) before exiting to flush
+    /// them); this needs the `tracing` feature and must be called inside a Tokio runtime.
+    ///
+    /// Fails with a configuration error for an invalid `level`, or when
+    /// `enable_tracing` is set in a build without the `tracing` feature, and with a
+    /// tracing error when a global subscriber is already installed.
+    pub fn try_init(&self) -> crate::Result<()> {
+        use tracing_subscriber::util::SubscriberInitExt;
+        self.subscriber()?
+            .try_init()
+            .map_err(|e| crate::HammerworkError::Tracing {
+                message: format!("Failed to initialize tracing subscriber: {e}"),
+            })
+    }
+
+    /// The subscriber [`try_init`](Self::try_init) installs.
+    fn subscriber(&self) -> crate::Result<impl tracing::Subscriber + Send + Sync + 'static> {
+        use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt};
+
+        let filter = EnvFilter::try_new(&self.level).map_err(|e| {
+            crate::HammerworkError::Config(format!("invalid logging.level '{}': {e}", self.level))
+        })?;
+
+        let mut layers: Vec<Box<dyn Layer<LoggingSubscriber> + Send + Sync>> = Vec::new();
+        let fmt = tracing_subscriber::fmt::layer()
+            .with_file(self.include_location)
+            .with_line_number(self.include_location);
+        if self.json_format {
+            layers.push(fmt.json().boxed());
+        } else {
+            layers.push(fmt.boxed());
+        }
+        if self.enable_tracing {
+            layers.push(self.telemetry_layer()?);
+        }
+
+        Ok(tracing_subscriber::registry().with(filter).with(layers))
+    }
+
+    #[cfg(feature = "tracing")]
+    fn telemetry_layer(
+        &self,
+    ) -> crate::Result<Box<dyn tracing_subscriber::Layer<LoggingSubscriber> + Send + Sync>> {
+        use opentelemetry::trace::TracerProvider;
+        use tracing_subscriber::Layer;
+        let config = crate::tracing::TracingConfig {
+            service_name: self.service_name.clone(),
+            otlp_endpoint: self.tracing_endpoint.clone(),
+            ..crate::tracing::TracingConfig::new()
+        };
+        let provider = crate::tracing::install_tracer_provider(&config)?;
+        Ok(tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("hammerwork"))
+            .boxed())
+    }
+
+    #[cfg(not(feature = "tracing"))]
+    fn telemetry_layer(
+        &self,
+    ) -> crate::Result<Box<dyn tracing_subscriber::Layer<LoggingSubscriber> + Send + Sync>> {
+        Err(crate::HammerworkError::Config(
+            "logging.enable_tracing requires the `tracing` feature".to_string(),
+        ))
+    }
 }
 
 impl Default for LoggingConfig {
@@ -1627,6 +1730,46 @@ service_name = "hammerwork"
         let logging_config = LoggingConfig::default();
         assert_eq!(logging_config.level, "info");
         assert!(!logging_config.json_format);
+    }
+
+    /// M4: the `[logging]` section builds a working subscriber (plain or JSON, with or
+    /// without locations) and rejects what it cannot apply.
+    #[test]
+    fn test_logging_config_builds_its_subscriber() {
+        for (json_format, include_location) in [(false, false), (true, true)] {
+            let config = LoggingConfig {
+                level: "warn,hammerwork=debug".to_string(),
+                json_format,
+                include_location,
+                ..Default::default()
+            };
+            let subscriber = config.subscriber().unwrap();
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(tracing::enabled!(target: "hammerwork::worker", tracing::Level::DEBUG));
+                assert!(!tracing::enabled!(target: "other", tracing::Level::INFO));
+                tracing::warn!("logging config test");
+            });
+        }
+
+        let invalid = LoggingConfig {
+            level: "hammerwork=loud".to_string(),
+            ..Default::default()
+        };
+        let err = invalid.subscriber().err().expect("invalid level");
+        assert!(err.to_string().contains("logging.level"), "{err}");
+
+        #[cfg(not(feature = "tracing"))]
+        {
+            let tracing_without_feature = LoggingConfig {
+                enable_tracing: true,
+                ..Default::default()
+            };
+            let err = tracing_without_feature
+                .subscriber()
+                .err()
+                .expect("no feature");
+            assert!(err.to_string().contains("`tracing` feature"), "{err}");
+        }
     }
 
     #[test]

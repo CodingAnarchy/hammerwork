@@ -62,7 +62,6 @@ mod tests {
             },
             enable_cors: true,
             allowed_origins: vec!["https://ops.example.com".to_string()],
-            request_timeout: Duration::from_secs(30),
             ..Default::default()
         };
 
@@ -116,7 +115,6 @@ mod tests {
                 ..Default::default()
             },
             enable_cors: false,
-            request_timeout: Duration::from_secs(30),
             ..Default::default()
         };
 

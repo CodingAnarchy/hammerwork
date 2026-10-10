@@ -32,6 +32,49 @@ Without a template, the request body is the `JobLifecycleEvent` as JSON. When a
 `secret` is set, `X-Hammerwork-Signature: sha256=<hex>` is the HMAC-SHA256 of the body
 that was actually sent (the rendered template, if one is configured).
 
+## Delivery
+
+`add_webhook` subscribes before it returns, so an event published right after the
+call is delivered. Each webhook has one listener, which starts a delivery (with
+retries per its `RetryPolicy`) for every matching event.
+
+- **Updating.** `update_webhook` swaps the configuration in place: the next event
+  uses the new URL, filter, headers and so on, statistics are kept, and no event is
+  missed or sent twice. Removing a webhook, or calling `add_webhook` again with the
+  same id, stops its old listener immediately.
+- **Timeout.** `timeout_secs` covers the whole attempt: connecting, sending, the
+  response headers and the response body. When the status arrived in time but the
+  body did not, the attempt counts by its status and the body is not recorded.
+  `timeout_secs = 0` (or leaving it out of a configuration file) uses the manager's
+  `default_timeout_secs` (30 s by default).
+- **Response bodies.** At most `max_response_body_size` bytes are read (64 KiB by
+  default); the rest of a longer body is not downloaded.
+- **Concurrency.** `max_concurrent_deliveries` limits the requests in flight across
+  all webhooks. A delivery waiting out a retry delay does not hold a slot.
+- **Backlog limit.** At most `max_pending_deliveries` deliveries per webhook (1000 by
+  default) are pending: waiting for a slot, in flight, or waiting to retry. When a
+  webhook reaches the limit, for example because its endpoint is down, its listener
+  stops taking events until a delivery finishes. Events keep arriving in the event
+  manager's broadcast buffer (`EventConfig::max_buffer_size`); once that is full the
+  oldest are dropped for this webhook, a warning is logged, and
+  `WebhookStats::dropped_events` counts them. Memory use stays bounded however long
+  the endpoint is down.
+
+```rust
+use hammerwork::webhooks::WebhookManagerConfig;
+
+let config = WebhookManagerConfig {
+    max_concurrent_deliveries: 50,
+    default_timeout_secs: 10,
+    max_pending_deliveries: 500,
+    ..Default::default()
+};
+assert_eq!(config.max_response_body_size, 64 * 1024);
+```
+
+In `hammerwork.toml`, `[webhooks.global_settings]` accepts the same
+`default_timeout_secs` and `max_pending_deliveries` keys; both are optional.
+
 ## Payload templates
 
 Set `payload_template` (or call `WebhookConfig::with_payload_template`) to send the JSON

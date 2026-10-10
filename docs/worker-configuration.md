@@ -90,8 +90,7 @@ let priority_weights = PriorityWeights::new()
     .with_weight(JobPriority::High, 20)
     .with_weight(JobPriority::Normal, 10)
     .with_weight(JobPriority::Low, 5)
-    .with_weight(JobPriority::Background, 1)
-    .with_fairness_factor(0.1); // 10% chance for lower priorities
+    .with_weight(JobPriority::Background, 1);
 
 let worker = Worker::new(queue, "priority_queue".to_string(), handler)
     .with_priority_weights(priority_weights);

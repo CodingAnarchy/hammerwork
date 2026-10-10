@@ -61,12 +61,10 @@ fn test_priority_weights_configuration() {
     // Test custom weights
     let custom_weights = PriorityWeights::new()
         .with_weight(JobPriority::Critical, 100)
-        .with_weight(JobPriority::High, 50)
-        .with_fairness_factor(0.3);
+        .with_weight(JobPriority::High, 50);
 
     assert_eq!(custom_weights.get_weight(JobPriority::Critical), 100);
     assert_eq!(custom_weights.get_weight(JobPriority::High), 50);
-    assert_eq!(custom_weights.fairness_factor(), 0.3);
 }
 
 /// Test priority statistics calculation
@@ -101,13 +99,10 @@ fn test_priority_statistics() {
 #[test]
 fn test_worker_priority_configuration() {
     // Test that priority configuration works properly
-    let custom_weights = PriorityWeights::new()
-        .with_weight(JobPriority::Critical, 50)
-        .with_fairness_factor(0.2);
+    let custom_weights = PriorityWeights::new().with_weight(JobPriority::Critical, 50);
 
     // Test that worker would be able to use these weights
     assert_eq!(custom_weights.get_weight(JobPriority::Critical), 50);
-    assert_eq!(custom_weights.fairness_factor(), 0.2);
 
     // Test strict mode configuration
     let strict_weights = PriorityWeights::strict();
@@ -267,13 +262,6 @@ fn test_priority_weight_edge_cases() {
             priority
         );
     }
-
-    // Test fairness factor bounds
-    let clamped_weights = PriorityWeights::new().with_fairness_factor(2.0); // Should clamp to 1.0
-    assert_eq!(clamped_weights.fairness_factor(), 1.0);
-
-    let negative_weights = PriorityWeights::new().with_fairness_factor(-0.5); // Should clamp to 0.0
-    assert_eq!(negative_weights.fairness_factor(), 0.0);
 }
 
 /// Test that all priority levels are covered

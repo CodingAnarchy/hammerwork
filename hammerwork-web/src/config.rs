@@ -128,11 +128,22 @@ pub struct DashboardConfig {
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 
-    /// Request timeout duration
+    /// Unused: the dashboard does not apply a request timeout. Optional in
+    /// configuration files.
+    #[deprecated(
+        since = "1.15.6",
+        note = "never applied; put a reverse proxy with a timeout in front of the dashboard"
+    )]
+    #[serde(default = "default_request_timeout")]
     pub request_timeout: Duration,
 }
 
+fn default_request_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
 impl Default for DashboardConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             bind_address: "127.0.0.1".to_string(),
@@ -144,7 +155,7 @@ impl Default for DashboardConfig {
             websocket: WebSocketConfig::default(),
             enable_cors: false,
             allowed_origins: Vec::new(),
-            request_timeout: Duration::from_secs(30),
+            request_timeout: default_request_timeout(),
         }
     }
 }
@@ -438,6 +449,7 @@ impl Default for WebSocketConfig {
 }
 
 impl std::fmt::Debug for DashboardConfig {
+    #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DashboardConfig")
             .field("bind_address", &self.bind_address)

@@ -159,10 +159,49 @@ check.
 
 Workers automatically start a background monitoring task that:
 
-- Updates queue depth metrics every 30 seconds
+- Updates queue depth metrics
 - Checks for worker starvation
 - Monitors statistical thresholds
 - Triggers alerts when thresholds are exceeded
+
+It runs every `MetricsConfig::update_interval` (15 seconds by default, at least one
+second) when the worker has a metrics collector, and every 30 seconds otherwise.
+
+## Statistics Collector
+
+`InMemoryStatsCollector` keeps recent job events for the statistics that alert
+thresholds and dashboards read. Recording an event is constant time; queries read only
+the events inside their window. `StatsConfig` bounds what is kept:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `max_events` | 100,000 | events kept; the oldest are dropped first |
+| `max_event_age_secs` | 3600 | events older than this are pruned whenever an event is recorded (and not recorded at all) |
+| `collect_timing` | `true` | keep processing times; when `false`, timing statistics stay at zero |
+| `cleanup_interval_secs` | 300 | deprecated and ignored: pruning happens on every insert |
+
+`AlertingConfig::custom_thresholds` (and `with_custom_threshold`) are deprecated: no
+alert ever read them. Configuration files that set them still load.
+
+## Logging
+
+The `[logging]` section of `hammerwork.toml` is applied by
+`config.logging.try_init()`, which installs a global `tracing` subscriber: `level` is an
+`EnvFilter` directive (`"info"`, `"warn,hammerwork=debug"`), `json_format` switches to
+JSON lines, and `include_location` adds file and line numbers. With
+`enable_tracing = true` (and the `tracing` feature), spans are also exported over OTLP
+to `tracing_endpoint` as `service_name`; call `hammerwork::tracing::shutdown_tracing()`
+before exiting to flush them.
+
+```rust
+let logging = hammerwork::config::LoggingConfig {
+    level: "warn,hammerwork=debug".to_string(),
+    json_format: true,
+    ..Default::default()
+};
+# let _ = &logging;
+// logging.try_init()?;
+```
 
 ## Custom Metrics
 

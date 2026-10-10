@@ -55,6 +55,11 @@ use prometheus::{CounterVec, Encoder, GaugeVec, HistogramVec, Registry, TextEnco
 #[cfg(feature = "metrics")]
 use warp::Filter;
 
+/// The shortest monitoring interval [`PrometheusMetricsCollector::update_interval`]
+/// returns (a zero interval would make the monitoring task spin).
+#[cfg(feature = "metrics")]
+const MIN_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Configuration for metrics collection
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MetricsConfig {
@@ -76,7 +81,10 @@ pub struct MetricsConfig {
     pub custom_gauges: Vec<String>,
     /// Custom histogram metric names to track
     pub custom_histograms: Vec<String>,
-    /// Update interval for gauge metrics (in seconds)
+    /// How often each worker's monitoring task refreshes gauge metrics (queue depth)
+    /// and runs its queue depth and starvation alert checks (in seconds). Values below
+    /// one second are raised to one second. Without a metrics collector, workers
+    /// monitor every 30 seconds.
     #[serde(
         serialize_with = "serialize_duration_secs",
         deserialize_with = "deserialize_duration_secs"
@@ -287,6 +295,12 @@ impl PrometheusMetricsCollector {
         collector.register_custom_metrics()?;
 
         Ok(collector)
+    }
+
+    /// How often workers using this collector run their monitoring task:
+    /// [`MetricsConfig::update_interval`], but at least one second.
+    pub fn update_interval(&self) -> Duration {
+        self.config.update_interval.max(MIN_UPDATE_INTERVAL)
     }
 
     /// Start the Prometheus HTTP exposition server.

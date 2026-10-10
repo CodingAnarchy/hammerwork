@@ -29,11 +29,18 @@ pub struct AlertingConfig {
     pub cooldown_period: Duration,
     /// Whether alerting is enabled
     pub enabled: bool,
-    /// Custom alert thresholds
+    /// Unused: no alert reads these thresholds (there are no named custom metrics to
+    /// compare them with). Optional in configuration files.
+    #[deprecated(
+        since = "1.15.6",
+        note = "never applied; no alert reads custom thresholds"
+    )]
+    #[serde(default)]
     pub custom_thresholds: HashMap<String, f64>,
 }
 
 impl Default for AlertingConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             error_rate_threshold: None,
@@ -139,7 +146,12 @@ impl AlertingConfig {
         self
     }
 
-    /// Add custom threshold
+    /// Unused; see [`AlertingConfig::custom_thresholds`].
+    #[deprecated(
+        since = "1.15.6",
+        note = "never applied; no alert reads custom thresholds"
+    )]
+    #[allow(deprecated)]
     pub fn with_custom_threshold(mut self, name: String, threshold: f64) -> Self {
         self.custom_thresholds.insert(name, threshold);
         self
@@ -1167,6 +1179,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_custom_thresholds() {
         let config = AlertingConfig::new()
             .with_custom_threshold("memory_usage".to_string(), 80.0)

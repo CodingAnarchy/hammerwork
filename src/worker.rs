@@ -348,11 +348,17 @@ pub struct AutoscaleConfig {
     pub scale_step: usize,
     /// Time window for queue depth averaging
     pub evaluation_window: Duration,
-    /// Minimum worker idle time before considering scale-down
+    /// Unused: scale-down is decided from the queue depth averaged over
+    /// `evaluation_window` and limited by `cooldown_period`.
+    #[deprecated(
+        since = "1.15.6",
+        note = "never applied; use `evaluation_window` and `cooldown_period` to slow scale-down"
+    )]
     pub idle_timeout: Duration,
 }
 
 impl Default for AutoscaleConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             enabled: true,
@@ -368,6 +374,7 @@ impl Default for AutoscaleConfig {
     }
 }
 
+#[allow(deprecated)]
 impl AutoscaleConfig {
     /// Create a new autoscale configuration with default values
     pub fn new() -> Self {
@@ -422,7 +429,11 @@ impl AutoscaleConfig {
         self
     }
 
-    /// Set the minimum idle time before considering scale-down
+    /// Unused; see [`AutoscaleConfig::idle_timeout`].
+    #[deprecated(
+        since = "1.15.6",
+        note = "never applied; use `evaluation_window` and `cooldown_period` to slow scale-down"
+    )]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
         self
@@ -791,8 +802,9 @@ pub struct Worker<DB: Database> {
     shutdown_grace_period: Duration,
     /// Lease held on a running job, renewed by heartbeats
     lease_duration: Duration,
-    /// How often the monitoring task updates metrics and checks alerts
-    monitoring_interval: Duration,
+    /// How often the monitoring task updates metrics and checks alerts, when set
+    /// explicitly (otherwise the metrics collector's update interval, or 30 seconds)
+    monitoring_interval: Option<Duration>,
 }
 
 impl<DB: Database + Send + Sync + 'static> Clone for Worker<DB>
@@ -915,7 +927,7 @@ where
             event_manager: None,
             shutdown_grace_period: DEFAULT_SHUTDOWN_GRACE_PERIOD,
             lease_duration: DEFAULT_LEASE_DURATION,
-            monitoring_interval: DEFAULT_MONITORING_INTERVAL,
+            monitoring_interval: None,
         }
     }
 
@@ -991,7 +1003,7 @@ where
             event_manager: None,
             shutdown_grace_period: DEFAULT_SHUTDOWN_GRACE_PERIOD,
             lease_duration: DEFAULT_LEASE_DURATION,
-            monitoring_interval: DEFAULT_MONITORING_INTERVAL,
+            monitoring_interval: None,
         }
     }
 
@@ -1271,8 +1283,10 @@ where
         self
     }
 
-    /// Set how often the worker's monitoring task runs (default
-    /// [`DEFAULT_MONITORING_INTERVAL`], 30 seconds).
+    /// Set how often the worker's monitoring task runs. Without this, it runs at the
+    /// [metrics collector](Self::with_metrics_collector)'s update interval
+    /// (`MetricsConfig::update_interval`), or every [`DEFAULT_MONITORING_INTERVAL`]
+    /// (30 seconds) without one.
     ///
     /// With a [metrics collector](Self::with_metrics_collector) or alerting configured,
     /// a background task updates the queue depth metric and checks the alert thresholds
@@ -1281,7 +1295,7 @@ where
     /// loop, so a slow alert target or the queue depth `COUNT(*)` never delays
     /// dequeuing. Values below 10ms are raised to 10ms.
     pub fn with_monitoring_interval(mut self, interval: Duration) -> Self {
-        self.monitoring_interval = interval;
+        self.monitoring_interval = Some(interval);
         self
     }
 
@@ -2738,7 +2752,6 @@ where
     #[cfg(any(feature = "metrics", feature = "alerting"))]
     fn start_monitoring_task(&self) -> tokio::task::JoinHandle<()> {
         let queue_name = self.queue_name.clone();
-        let monitoring_interval = self.monitoring_interval;
 
         let queue = Arc::clone(&self.queue);
 
@@ -2754,10 +2767,19 @@ where
         #[cfg(feature = "alerting")]
         let stats_collector = self.stats_collector.clone();
 
+        // An explicit interval wins, then the metrics collector's update interval.
+        #[cfg(feature = "metrics")]
+        let collector_interval = metrics_collector.as_ref().map(|m| m.update_interval());
+        #[cfg(not(feature = "metrics"))]
+        let collector_interval: Option<Duration> = None;
+        let monitor_every = self
+            .monitoring_interval
+            .or(collector_interval)
+            .unwrap_or(DEFAULT_MONITORING_INTERVAL);
+
         tokio::spawn(async move {
             // `interval` panics on a zero period.
-            let mut interval =
-                tokio::time::interval(monitoring_interval.max(MIN_MONITORING_INTERVAL));
+            let mut interval = tokio::time::interval(monitor_every.max(MIN_MONITORING_INTERVAL));
 
             loop {
                 interval.tick().await;
@@ -3819,7 +3841,6 @@ mod tests {
         assert_eq!(config.cooldown_period, Duration::from_secs(60));
         assert_eq!(config.scale_step, 1);
         assert_eq!(config.evaluation_window, Duration::from_secs(30));
-        assert_eq!(config.idle_timeout, Duration::from_secs(300));
     }
 
     #[test]
@@ -3831,8 +3852,7 @@ mod tests {
             .with_scale_down_threshold(1)
             .with_cooldown_period(Duration::from_secs(120))
             .with_scale_step(2)
-            .with_evaluation_window(Duration::from_secs(45))
-            .with_idle_timeout(Duration::from_secs(600));
+            .with_evaluation_window(Duration::from_secs(45));
 
         assert_eq!(config.min_workers, 2);
         assert_eq!(config.max_workers, 20);
@@ -3841,7 +3861,6 @@ mod tests {
         assert_eq!(config.cooldown_period, Duration::from_secs(120));
         assert_eq!(config.scale_step, 2);
         assert_eq!(config.evaluation_window, Duration::from_secs(45));
-        assert_eq!(config.idle_timeout, Duration::from_secs(600));
     }
 
     #[test]

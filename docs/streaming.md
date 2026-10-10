@@ -41,11 +41,28 @@ streams.shutdown(Duration::from_secs(10)).await;
 ## Delivery
 
 Each stream has a listener that buffers matching events and flushes a batch when it
-holds `buffer_config.batch_size` events, when `max_buffer_time_secs` has passed, or when
-it holds `max_events`. A batch is serialized with the stream's `serialization` format
-and handed to the backend processor's `send_batch`, which reports a result per event.
-The bytes produced by the serialization format are what the backend receives, for
-every backend.
+holds `buffer_config.batch_size` events, when it holds `max_events`, or when its oldest
+event has waited `max_buffer_time_secs` (capped by the manager's
+`global_flush_interval_secs`, so no stream buffers an event longer than that). A batch
+is serialized with the stream's `serialization` format and handed to the backend
+processor's `send_batch`, which reports a result per event. The bytes produced by the
+serialization format are what the backend receives, for every backend.
+
+The stream subscribes to events before `add_stream` returns, so an event published
+right after that call is streamed. Removing a stream, or adding one with the same id
+again, stops its previous listener immediately: an event is never streamed twice
+because a stream was re-added.
+
+### Backlog limit
+
+At most `buffer_config.max_events` events of a stream are in batches at once (being
+sent, or waiting to retry). When a stream reaches that limit, for example because the
+backend is down, its listener stops reading events until a batch finishes. Events keep
+arriving in the event manager's broadcast buffer (`EventConfig::max_buffer_size`);
+once that is full the oldest are dropped for this stream, a warning is logged, and
+`dropped_events` counts them. So memory use stays bounded however long the backend is
+unavailable. `max_concurrent_processors` limits how many batches are being sent at
+once across all streams; a batch waiting out a retry delay does not hold a slot.
 
 ### Retries
 
@@ -82,6 +99,7 @@ actually happened. They are updated once per batch, after its retries:
 | `avg_delivery_time_ms` | average delivery time of acknowledged events |
 | `last_success_at`, `last_failure_at` | when the last batch with a success / failure finished |
 | `last_error` | the error behind the most recent failure |
+| `dropped_events` | events skipped because the listener fell behind (see [Backlog limit](#backlog-limit)) |
 
 ## Health checks
 
