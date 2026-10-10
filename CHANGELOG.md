@@ -7,23 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.0.1] - 2026-10-10
-
-### Fixed
-
-- **In-memory result storage works.** A job configured with `ResultStorage::Memory` had
-  its result silently discarded: workers only stored `ResultStorage::Database` results.
-  Workers now store them in an in-memory store owned by the `JobQueue` and shared by its
-  clones, before the job is marked Completed, and `get_job_result`, `delete_job_result`,
-  `cleanup_expired_results` and `delete_job` use it. Results expire at their TTL (checked
-  on read and pruned as results are stored), and the store holds at most 10,000 results
-  by default (`queue::DEFAULT_MEMORY_RESULT_CAPACITY`), evicting the one that expires
-  soonest, or the oldest; set the limit with the new
-  `JobQueue::with_memory_result_capacity`. In-memory results are per process: other
-  processes, including `cargo hammerwork` and the web dashboard, don't see them, and
-  they are lost on restart. See [Job Results](docs/job-types.md#job-results).
-  `TestQueue::delete_job` now also deletes the job's result.
-
 ### Added
 
 - **Batch claims.** `DatabaseQueue::dequeue_batch(queue, n)` and
@@ -53,6 +36,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   processing claim one job at a time as before. New getters: `is_batch_processing_enabled`,
   `batch_size`, `batch_concurrency`. In a local benchmark, batch claims of 50 were 5-6x
   faster than single claims on PostgreSQL and MySQL.
+
+## [2.0.1] - 2026-10-10
+
+### Fixed
+
+- **In-memory result storage works.** A job configured with `ResultStorage::Memory` had
+  its result silently discarded: workers only stored `ResultStorage::Database` results.
+  Workers now store them in an in-memory store owned by the `JobQueue` and shared by its
+  clones, before the job is marked Completed, and `get_job_result`, `delete_job_result`,
+  `cleanup_expired_results` and `delete_job` use it. Results expire at their TTL (checked
+  on read and pruned as results are stored), and the store holds at most 10,000 results
+  by default (`queue::DEFAULT_MEMORY_RESULT_CAPACITY`), evicting the one that expires
+  soonest, or the oldest; set the limit with the new
+  `JobQueue::with_memory_result_capacity`. In-memory results are per process: other
+  processes, including `cargo hammerwork` and the web dashboard, don't see them, and
+  they are lost on restart. See [Job Results](docs/job-types.md#job-results).
+  `TestQueue::delete_job` now also deletes the job's result.
 
 ## [2.0.0] - 2026-10-09
 
