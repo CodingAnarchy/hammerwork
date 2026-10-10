@@ -756,7 +756,7 @@ pub struct ArchiveConfig {
 
     /// How often the worker pool archives and purges ("30m", "1h", ...; default 1 hour).
     /// Must be greater than zero.
-    #[serde(default = "default_archive_check_interval", with = "duration_secs")]
+    #[serde(default = "default_archive_check_interval", with = "serde_duration")]
     pub check_interval: StdDuration,
 }
 
