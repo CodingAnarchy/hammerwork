@@ -127,23 +127,9 @@ pub struct DashboardConfig {
     /// are refused (see [`crate::security`]).
     #[serde(default)]
     pub allowed_origins: Vec<String>,
-
-    /// Unused: the dashboard does not apply a request timeout. Optional in
-    /// configuration files.
-    #[deprecated(
-        since = "1.15.6",
-        note = "never applied; put a reverse proxy with a timeout in front of the dashboard"
-    )]
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout: Duration,
-}
-
-fn default_request_timeout() -> Duration {
-    Duration::from_secs(30)
 }
 
 impl Default for DashboardConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             bind_address: "127.0.0.1".to_string(),
@@ -155,7 +141,6 @@ impl Default for DashboardConfig {
             websocket: WebSocketConfig::default(),
             enable_cors: false,
             allowed_origins: Vec::new(),
-            request_timeout: default_request_timeout(),
         }
     }
 }
@@ -487,7 +472,6 @@ impl Default for WebSocketConfig {
 }
 
 impl std::fmt::Debug for DashboardConfig {
-    #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DashboardConfig")
             .field("bind_address", &self.bind_address)
@@ -501,7 +485,6 @@ impl std::fmt::Debug for DashboardConfig {
             .field("auth", &self.auth)
             .field("websocket", &self.websocket)
             .field("enable_cors", &self.enable_cors)
-            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -694,6 +677,18 @@ mod tests {
             .join("\n");
         let config: DashboardConfig = toml::from_str(&text).unwrap();
         assert!(config.allowed_origins.is_empty());
+    }
+
+    /// `request_timeout` was removed in 2.0; files that still set it (as 1.x wrote it)
+    /// load and ignore it.
+    #[test]
+    fn config_files_with_removed_request_timeout_still_load() {
+        let text = format!(
+            "{}\n[request_timeout]\nsecs = 30\nnanos = 0\n",
+            toml::to_string(&DashboardConfig::new()).unwrap()
+        );
+        let config: DashboardConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.port, DashboardConfig::new().port);
     }
 
     #[cfg(feature = "auth")]

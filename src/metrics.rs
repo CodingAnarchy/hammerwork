@@ -63,8 +63,6 @@ const MIN_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 /// Configuration for metrics collection
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MetricsConfig {
-    /// Prometheus registry name
-    pub registry_name: String,
     /// HTTP server address for metrics exposition (as string)
     #[serde(
         serialize_with = "serialize_socket_addr",
@@ -95,7 +93,6 @@ pub struct MetricsConfig {
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
-            registry_name: "hammerwork".to_string(),
             exposition_addr: None,
             custom_labels: HashMap::new(),
             collect_histograms: true,
@@ -687,7 +684,6 @@ mod tests {
     #[test]
     fn test_metrics_config_defaults() {
         let config = MetricsConfig::default();
-        assert_eq!(config.registry_name, "hammerwork");
         assert!(config.exposition_addr.is_none());
         assert!(config.collect_histograms);
         assert_eq!(config.update_interval, Duration::from_secs(15));

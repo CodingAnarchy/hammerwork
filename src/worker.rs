@@ -348,17 +348,9 @@ pub struct AutoscaleConfig {
     pub scale_step: usize,
     /// Time window for queue depth averaging
     pub evaluation_window: Duration,
-    /// Unused: scale-down is decided from the queue depth averaged over
-    /// `evaluation_window` and limited by `cooldown_period`.
-    #[deprecated(
-        since = "1.15.6",
-        note = "never applied; use `evaluation_window` and `cooldown_period` to slow scale-down"
-    )]
-    pub idle_timeout: Duration,
 }
 
 impl Default for AutoscaleConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             enabled: true,
@@ -369,12 +361,10 @@ impl Default for AutoscaleConfig {
             cooldown_period: Duration::from_secs(60),
             scale_step: 1,
             evaluation_window: Duration::from_secs(30),
-            idle_timeout: Duration::from_secs(300),
         }
     }
 }
 
-#[allow(deprecated)]
 impl AutoscaleConfig {
     /// Create a new autoscale configuration with default values
     pub fn new() -> Self {
@@ -429,16 +419,6 @@ impl AutoscaleConfig {
         self
     }
 
-    /// Unused; see [`AutoscaleConfig::idle_timeout`].
-    #[deprecated(
-        since = "1.15.6",
-        note = "never applied; use `evaluation_window` and `cooldown_period` to slow scale-down"
-    )]
-    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = timeout;
-        self
-    }
-
     /// Create a conservative autoscaling configuration
     pub fn conservative() -> Self {
         Self {
@@ -450,7 +430,6 @@ impl AutoscaleConfig {
             cooldown_period: Duration::from_secs(300), // 5 mins
             scale_step: 1,
             evaluation_window: Duration::from_secs(60),
-            idle_timeout: Duration::from_secs(600), // 10 mins
         }
     }
 
@@ -465,7 +444,6 @@ impl AutoscaleConfig {
             cooldown_period: Duration::from_secs(30),
             scale_step: 2,
             evaluation_window: Duration::from_secs(15),
-            idle_timeout: Duration::from_secs(120), // 2 mins
         }
     }
 

@@ -540,7 +540,7 @@ server {
 
 - **Connection Pooling**: Tune `pool_size` based on concurrent users
 - **WebSocket Limits**: Configure `max_connections` for your use case  
-- **Request Timeouts**: The dashboard applies none of its own (`request_timeout` is deprecated and ignored); set them on a reverse proxy in front of it
+- **Request Timeouts**: The dashboard applies none of its own (`request_timeout` was removed in 2.0; files that still set it load); set them on a reverse proxy in front of it
 - **Database Indexes**: Ensure proper indexes on hammerwork_jobs table
 - **Static Assets**: Use a CDN for production deployments
 - **Monitoring**: Enable structured logging and metrics collection

@@ -159,12 +159,6 @@ pub struct InMemoryStatsCollector {
 pub struct StatsConfig {
     /// Maximum number of events to keep in memory; the oldest are dropped first.
     pub max_events: usize,
-    /// Unused: old events are now pruned whenever an event is recorded.
-    #[deprecated(
-        since = "1.15.6",
-        note = "old events are pruned whenever an event is recorded; this value is ignored"
-    )]
-    pub cleanup_interval_secs: u64,
     /// Maximum age of events to keep (in seconds). Older events are pruned whenever an
     /// event is recorded, and events older than this are not recorded at all.
     pub max_event_age_secs: u64,
@@ -175,12 +169,10 @@ pub struct StatsConfig {
 }
 
 impl Default for StatsConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             max_events: 100_000,
-            cleanup_interval_secs: 300, // 5 minutes
-            max_event_age_secs: 3600,   // 1 hour
+            max_event_age_secs: 3600, // 1 hour
             collect_timing: true,
         }
     }
@@ -572,11 +564,9 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_stats_config_default() {
         let config = StatsConfig::default();
         assert_eq!(config.max_events, 100_000);
-        assert_eq!(config.cleanup_interval_secs, 300);
         assert_eq!(config.max_event_age_secs, 3600);
         assert!(config.collect_timing);
     }

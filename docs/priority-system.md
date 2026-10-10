@@ -48,7 +48,7 @@ Ensures high-priority jobs are processed more frequently while preventing starva
 
 Each time a worker polls, it picks one of the priorities that currently have a runnable job, with probability `weight / (sum of the weights of those priorities)`, and takes the oldest job of that priority. A priority with a non-zero weight is therefore picked regularly however many higher-priority jobs are queued: with the weights below and Critical, Normal and Background jobs all waiting, Background is picked 1 time in 61. To give a priority a bigger share, raise its weight. A weight of `0` means "only when nothing with a weight is runnable".
 
-`PriorityWeights::with_fairness_factor` is deprecated: it was documented as a fairness knob but never applied, and the weighted pick above already prevents starvation. Configuration files that set `fairness_factor` still load; the value is ignored.
+There is no separate fairness setting (`PriorityWeights::with_fairness_factor` was removed in 2.0 because it was never applied): the weighted pick above already prevents starvation. Configuration files that still set `fairness_factor` load; the key is ignored.
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::{*, priority::*, queue::*, worker::*, stats::*};

@@ -411,24 +411,15 @@ pub struct DatabaseConfig {
     /// Whether to run migrations automatically when connecting with
     /// [`JobQueue::from_config`](crate::JobQueue)
     pub auto_migrate: bool,
-
-    /// Unused. Tables are created by the migration system; set `auto_migrate` instead.
-    #[deprecated(
-        since = "1.15.6",
-        note = "tables are created by the migration system; use `auto_migrate`"
-    )]
-    pub create_tables: bool,
 }
 
 impl std::fmt::Debug for DatabaseConfig {
-    #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabaseConfig")
             .field("url", &redact_url(&self.url))
             .field("pool_size", &self.pool_size)
             .field("connection_timeout_secs", &self.connection_timeout_secs)
             .field("auto_migrate", &self.auto_migrate)
-            .field("create_tables", &self.create_tables)
             .finish()
     }
 }
@@ -500,14 +491,12 @@ impl DatabaseConfig {
 }
 
 impl Default for DatabaseConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             url: "postgresql://localhost/hammerwork".to_string(),
             pool_size: 10,
             connection_timeout_secs: 30,
             auto_migrate: false,
-            create_tables: true,
         }
     }
 }
@@ -1760,6 +1749,58 @@ service_name = "hammerwork"
                 duration_str
             );
         }
+    }
+
+    /// Configuration files written for 1.x keep loading in 2.0: keys of removed settings
+    /// (`database.create_tables`, `worker.priority_weights.fairness_factor`,
+    /// `alerting.custom_thresholds`, `metrics.registry_name`) are ignored.
+    #[test]
+    fn test_config_file_with_removed_keys_still_loads() {
+        let mut doc: toml::Table =
+            toml::from_str(&toml::to_string(&HammerworkConfig::default()).unwrap()).unwrap();
+        let table = |doc: &mut toml::Table, path: &[&str]| -> toml::Table {
+            let mut current = doc.clone();
+            for key in path {
+                current = current[*key].as_table().unwrap().clone();
+            }
+            current
+        };
+        let mut database = table(&mut doc, &["database"]);
+        database.insert("create_tables".into(), toml::Value::Boolean(true));
+        doc.insert("database".into(), database.into());
+
+        let mut worker = table(&mut doc, &["worker"]);
+        let mut weights = table(&mut doc, &["worker", "priority_weights"]);
+        weights.insert("fairness_factor".into(), toml::Value::Float(0.1));
+        worker.insert("priority_weights".into(), weights.into());
+        doc.insert("worker".into(), worker.into());
+
+        if doc.contains_key("alerting") {
+            let mut alerting = table(&mut doc, &["alerting"]);
+            let mut thresholds = toml::Table::new();
+            thresholds.insert("cpu_usage".into(), toml::Value::Float(90.0));
+            alerting.insert("custom_thresholds".into(), thresholds.into());
+            doc.insert("alerting".into(), alerting.into());
+        }
+        if doc.contains_key("metrics") {
+            let mut metrics = table(&mut doc, &["metrics"]);
+            metrics.insert(
+                "registry_name".into(),
+                toml::Value::String("hammerwork".into()),
+            );
+            doc.insert("metrics".into(), metrics.into());
+        }
+
+        let text = toml::to_string(&doc).unwrap();
+        assert!(text.contains("create_tables") && text.contains("fairness_factor"));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &text).unwrap();
+        let config = HammerworkConfig::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            config.database.pool_size,
+            DatabaseConfig::default().pool_size
+        );
+        assert!(!config.worker.priority_weights.is_strict());
     }
 
     #[cfg(feature = "webhooks")]

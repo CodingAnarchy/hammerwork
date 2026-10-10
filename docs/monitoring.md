@@ -178,10 +178,9 @@ the events inside their window. `StatsConfig` bounds what is kept:
 | `max_events` | 100,000 | events kept; the oldest are dropped first |
 | `max_event_age_secs` | 3600 | events older than this are pruned whenever an event is recorded (and not recorded at all) |
 | `collect_timing` | `true` | keep processing times; when `false`, timing statistics stay at zero |
-| `cleanup_interval_secs` | 300 | deprecated and ignored: pruning happens on every insert |
 
-`AlertingConfig::custom_thresholds` (and `with_custom_threshold`) are deprecated: no
-alert ever read them. Configuration files that set them still load.
+`AlertingConfig::custom_thresholds` (and `with_custom_threshold`) were removed in 2.0: no
+alert ever read them. Configuration files that still set them load; the key is ignored.
 
 ## Logging
 

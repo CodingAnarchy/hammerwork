@@ -29,18 +29,9 @@ pub struct AlertingConfig {
     pub cooldown_period: Duration,
     /// Whether alerting is enabled
     pub enabled: bool,
-    /// Unused: no alert reads these thresholds (there are no named custom metrics to
-    /// compare them with). Optional in configuration files.
-    #[deprecated(
-        since = "1.15.6",
-        note = "never applied; no alert reads custom thresholds"
-    )]
-    #[serde(default)]
-    pub custom_thresholds: HashMap<String, f64>,
 }
 
 impl Default for AlertingConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             error_rate_threshold: None,
@@ -50,7 +41,6 @@ impl Default for AlertingConfig {
             targets: Vec::new(),
             cooldown_period: Duration::from_secs(300),
             enabled: true,
-            custom_thresholds: HashMap::new(),
         }
     }
 }
@@ -107,7 +97,10 @@ impl AlertingConfig {
     ///
     /// Such a target cannot send anything: [`validate`](Self::validate) and
     /// [`AlertManager::try_new`] reject it. Use [`email_via_smtp`](Self::email_via_smtp).
-    #[deprecated(note = "email targets need SMTP settings; use `email_via_smtp`")]
+    #[deprecated(
+        since = "2.0.0",
+        note = "email targets need SMTP settings; use `email_via_smtp`"
+    )]
     pub fn email(mut self, recipient: &str) -> Self {
         self.targets.push(AlertTarget::Email {
             recipient: recipient.to_string(),
@@ -143,17 +136,6 @@ impl AlertingConfig {
     /// Enable or disable alerting
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
-        self
-    }
-
-    /// Unused; see [`AlertingConfig::custom_thresholds`].
-    #[deprecated(
-        since = "1.15.6",
-        note = "never applied; no alert reads custom thresholds"
-    )]
-    #[allow(deprecated)]
-    pub fn with_custom_threshold(mut self, name: String, threshold: f64) -> Self {
-        self.custom_thresholds.insert(name, threshold);
         self
     }
 
@@ -1176,17 +1158,6 @@ mod tests {
 
         let config = AlertingConfig::new().alert_on_high_error_rate(-0.1); // Invalid rate < 0.0
         assert_eq!(config.error_rate_threshold, Some(0.0)); // Should be clamped
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn test_custom_thresholds() {
-        let config = AlertingConfig::new()
-            .with_custom_threshold("memory_usage".to_string(), 80.0)
-            .with_custom_threshold("cpu_usage".to_string(), 90.0);
-
-        assert_eq!(config.custom_thresholds.get("memory_usage"), Some(&80.0));
-        assert_eq!(config.custom_thresholds.get("cpu_usage"), Some(&90.0));
     }
 
     /// What a fake SMTP server saw during one session.
