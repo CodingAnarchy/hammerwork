@@ -1,6 +1,6 @@
 # Database Migrations
 
-Hammerwork provides a comprehensive migration system that allows you to progressively update your database schema while maintaining backward compatibility. This system replaces the old `create_tables()` method with a more robust, version-controlled approach.
+Hammerwork provides a comprehensive migration system that allows you to progressively update your database schema while maintaining backward compatibility. Tables are created only by migrations.
 
 ## Overview
 
@@ -148,7 +148,6 @@ CREATE TABLE hammerwork_migrations (
 ### Backward Compatibility
 
 - All existing databases will work without changes
-- The old `create_tables()` method is still available but deprecated
 - New installations should use the migration system
 - Migrations add features incrementally without breaking existing functionality
 

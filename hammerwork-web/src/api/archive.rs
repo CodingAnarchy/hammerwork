@@ -202,32 +202,6 @@ impl From<ArchivedJob> for ArchivedJobInfo {
     }
 }
 
-/// Archival policy configuration request
-#[derive(Debug, Deserialize)]
-pub struct PolicyRequest {
-    /// Policy name/identifier
-    pub name: String,
-    /// Archival policy configuration
-    pub policy: ArchivalPolicy,
-    /// Whether this policy is active
-    pub active: bool,
-}
-
-/// Archival policy response
-#[derive(Debug, Serialize)]
-pub struct PolicyResponse {
-    /// Policy name/identifier
-    pub name: String,
-    /// Archival policy configuration
-    pub policy: ArchivalPolicy,
-    /// Whether this policy is active
-    pub active: bool,
-    /// When the policy was created
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    /// When the policy was last modified
-    pub modified_at: chrono::DateTime<chrono::Utc>,
-}
-
 /// Archive statistics response
 #[derive(Debug, Serialize)]
 pub struct StatsResponse {

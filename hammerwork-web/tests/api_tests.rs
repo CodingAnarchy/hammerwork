@@ -849,16 +849,74 @@ async fn system_endpoints<Q: JobHistory + 'static>(app: &App<Q>, database_type: 
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["data"]["dry_run"], false);
     assert!(body["data"]["deletions"].is_u64());
-    for operation in ["vacuum", "reindex", "optimize"] {
+    for (operation, postgres_statement) in [
+        ("vacuum", "VACUUM (ANALYZE) hammerwork_jobs"),
+        ("reindex", "REINDEX TABLE hammerwork_jobs"),
+        ("optimize", "ANALYZE hammerwork_jobs"),
+    ] {
+        let expected = if database_type == "PostgreSQL" {
+            postgres_statement
+        } else {
+            "OPTIMIZE TABLE hammerwork_jobs"
+        };
+        // Every Hammerwork table that exists, one statement each.
         let (status, body) = app
             .post("/api/system/maintenance", json!({"operation": operation}))
             .await;
-        assert_eq!(status, 501, "{operation}");
+        assert_eq!(status, 200, "{operation}: {body}");
+        assert_eq!(body["data"]["operation"], operation);
+        assert_eq!(body["data"]["dry_run"], false);
+        let statements = body["data"]["statements"].as_array().unwrap();
+        let tables: Vec<&str> = statements
+            .iter()
+            .map(|s| s["table"].as_str().unwrap())
+            .collect();
+        for table in ["hammerwork_jobs", "hammerwork_jobs_archive"] {
+            assert!(tables.contains(&table), "{operation}: {tables:?}");
+        }
+        assert!(tables.iter().all(|t| t.starts_with("hammerwork_")));
+        assert!(
+            statements
+                .iter()
+                .any(|s| s["statement"] == expected && s["table"] == "hammerwork_jobs"),
+            "{operation}: {body}"
+        );
+        if database_type == "MySQL" {
+            assert!(
+                statements
+                    .iter()
+                    .all(|s| !s["messages"].as_array().unwrap().is_empty()),
+                "{body}"
+            );
+        }
+
+        // One table, as a dry run: nothing runs.
+        let (status, body) = app
+            .post(
+                "/api/system/maintenance",
+                json!({"operation": operation, "target": "hammerwork_jobs", "dry_run": true}),
+            )
+            .await;
+        assert_eq!(status, 200, "{operation}: {body}");
+        assert_eq!(body["data"]["dry_run"], true);
+        assert_eq!(
+            body["data"]["statements"],
+            json!([{"table": "hammerwork_jobs", "statement": expected, "messages": []}])
+        );
+
+        // Anything that is not a Hammerwork table is refused.
+        let (status, body) = app
+            .post(
+                "/api/system/maintenance",
+                json!({"operation": operation, "target": "hammerwork_jobs; DROP TABLE x"}),
+            )
+            .await;
+        assert_eq!(status, 400, "{operation}: {body}");
         assert!(
             body["error"]
                 .as_str()
                 .unwrap()
-                .contains("not yet implemented")
+                .contains("not a Hammerwork table")
         );
     }
     let (status, body) = app
@@ -1612,6 +1670,11 @@ async fn test_http_api_reports_a_dead_database() {
             "POST",
             "/api/system/maintenance",
             json!({"operation": "cleanup"}),
+        ),
+        (
+            "POST",
+            "/api/system/maintenance",
+            json!({"operation": "vacuum"}),
         ),
         (
             "POST",

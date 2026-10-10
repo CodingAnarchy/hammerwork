@@ -20,15 +20,6 @@ pub struct SpawnNode {
     pub workflow_name: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct SpawnOperation {
-    pub parent_job_id: String,
-    pub spawned_jobs: Vec<String>,
-    pub spawned_at: String,
-    pub operation_id: Option<String>,
-    pub config: Option<Value>,
-}
-
 /// The `WHERE` condition that marks a parent job as having a spawn config.
 fn spawn_config_condition(backend: Backend, column: &str) -> String {
     match backend {

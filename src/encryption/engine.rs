@@ -5,14 +5,13 @@
 
 use super::envelope::{self, DbStore, EnvelopeKey, KmsKeyWrapper, PoolStore, WrappedKeyStore};
 #[cfg(feature = "encryption")]
-use super::key_manager::KeyManager;
 use super::key_manager::KeyManagerBackend;
 use super::{
     EncryptedPayload, EncryptionAlgorithm, EncryptionConfig, EncryptionError, EncryptionMetadata,
     EncryptionStats, KeySource, RetentionPolicy, SecretBytes, kms,
 };
 use serde_json::Value;
-use sqlx::{Database, Pool};
+use sqlx::Pool;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1123,16 +1122,6 @@ impl EncryptionEngine {
                 // If lock is poisoned, return default stats
                 EncryptionStats::new()
             })
-    }
-
-    /// Formerly attached a [`KeyManager`] to the engine. The engine never used it, so
-    /// this does nothing.
-    #[deprecated(
-        since = "1.16.0",
-        note = "the engine never used the key manager; this method has no effect"
-    )]
-    pub fn set_key_manager<DB: Database>(&mut self, key_manager: Arc<Mutex<KeyManager<DB>>>) {
-        let _ = key_manager;
     }
 
     /// Cleans up expired encrypted data based on retention policies.

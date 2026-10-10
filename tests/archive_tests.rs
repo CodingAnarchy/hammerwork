@@ -852,11 +852,9 @@ async fn test_archival_policy_builder() {
 async fn test_archival_config_builder() {
     let config = ArchivalConfig::new()
         .with_compression_level(9)
-        .with_max_payload_size(2048)
         .with_compression_verification(false);
 
     assert_eq!(config.compression_level, 9);
-    assert_eq!(config.max_payload_size, 2048);
     assert!(!config.verify_compression);
 }
 

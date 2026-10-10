@@ -334,6 +334,7 @@ impl HammerworkConfig {
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
         config.worker.validate()?;
+        config.archive.validate()?;
         config.validate_delivery_targets()?;
         Ok(config)
     }
@@ -410,24 +411,15 @@ pub struct DatabaseConfig {
     /// Whether to run migrations automatically when connecting with
     /// [`JobQueue::from_config`](crate::JobQueue)
     pub auto_migrate: bool,
-
-    /// Unused. Tables are created by the migration system; set `auto_migrate` instead.
-    #[deprecated(
-        since = "1.15.6",
-        note = "tables are created by the migration system; use `auto_migrate`"
-    )]
-    pub create_tables: bool,
 }
 
 impl std::fmt::Debug for DatabaseConfig {
-    #[allow(deprecated)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabaseConfig")
             .field("url", &redact_url(&self.url))
             .field("pool_size", &self.pool_size)
             .field("connection_timeout_secs", &self.connection_timeout_secs)
             .field("auto_migrate", &self.auto_migrate)
-            .field("create_tables", &self.create_tables)
             .finish()
     }
 }
@@ -499,14 +491,12 @@ impl DatabaseConfig {
 }
 
 impl Default for DatabaseConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             url: "postgresql://localhost/hammerwork".to_string(),
             pool_size: 10,
             connection_timeout_secs: 30,
             auto_migrate: false,
-            create_tables: true,
         }
     }
 }
@@ -734,25 +724,55 @@ impl Default for StreamingGlobalSettings {
     }
 }
 
-/// Archive configuration
+/// Default [`ArchiveConfig::check_interval`]: one hour.
+pub const DEFAULT_ARCHIVE_CHECK_INTERVAL: StdDuration = StdDuration::from_secs(3600);
+
+fn default_archive_check_interval() -> StdDuration {
+    DEFAULT_ARCHIVE_CHECK_INTERVAL
+}
+
+/// Archive configuration (`[archive]`).
+///
+/// When `enabled`, a pool built with
+/// [`WorkerPool::from_hammerwork_config`](crate::WorkerPool::from_hammerwork_config)
+/// archives finished jobs older than `archive_after` and purges archived jobs older than
+/// `delete_after`, every `check_interval` (see
+/// [`WorkerPool::with_archival`](crate::WorkerPool::with_archival)).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveConfig {
-    /// Whether archiving is enabled
+    /// Whether automatic archiving is enabled
     pub enabled: bool,
 
     /// Compression level (0-9, 0=no compression)
     pub compression_level: u32,
 
-    /// Archive jobs older than this duration
+    /// Archive completed, failed, dead and timed out jobs older than this duration
     #[serde(with = "chrono_duration_days")]
     pub archive_after: Duration,
 
-    /// Purge archived jobs older than this duration
+    /// Purge archived jobs older than this duration (`None`: keep them)
     #[serde(with = "chrono_duration_days_option")]
     pub delete_after: Option<Duration>,
+
+    /// How often the worker pool archives and purges ("30m", "1h", ...; default 1 hour).
+    /// Must be greater than zero.
+    #[serde(default = "default_archive_check_interval", with = "serde_duration")]
+    pub check_interval: StdDuration,
 }
 
 impl ArchiveConfig {
+    /// Reject a zero `check_interval` when archiving is enabled (the pool would archive
+    /// in a tight loop). Called when a configuration is loaded and by
+    /// [`WorkerPool::from_hammerwork_config`](crate::WorkerPool::from_hammerwork_config).
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.enabled && self.check_interval.is_zero() {
+            return Err(crate::HammerworkError::Config(
+                "archive.check_interval must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Build the [`ArchivalPolicy`] described by this configuration.
     ///
     /// `archive_after` applies to completed, failed, dead and timed out jobs, and
@@ -787,6 +807,7 @@ impl Default for ArchiveConfig {
             compression_level: 6,
             archive_after: Duration::days(30),
             delete_after: Some(Duration::days(365)),
+            check_interval: DEFAULT_ARCHIVE_CHECK_INTERVAL,
         }
     }
 }
@@ -1730,6 +1751,58 @@ service_name = "hammerwork"
         }
     }
 
+    /// Configuration files written for 1.x keep loading in 2.0: keys of removed settings
+    /// (`database.create_tables`, `worker.priority_weights.fairness_factor`,
+    /// `alerting.custom_thresholds`, `metrics.registry_name`) are ignored.
+    #[test]
+    fn test_config_file_with_removed_keys_still_loads() {
+        let mut doc: toml::Table =
+            toml::from_str(&toml::to_string(&HammerworkConfig::default()).unwrap()).unwrap();
+        let table = |doc: &mut toml::Table, path: &[&str]| -> toml::Table {
+            let mut current = doc.clone();
+            for key in path {
+                current = current[*key].as_table().unwrap().clone();
+            }
+            current
+        };
+        let mut database = table(&mut doc, &["database"]);
+        database.insert("create_tables".into(), toml::Value::Boolean(true));
+        doc.insert("database".into(), database.into());
+
+        let mut worker = table(&mut doc, &["worker"]);
+        let mut weights = table(&mut doc, &["worker", "priority_weights"]);
+        weights.insert("fairness_factor".into(), toml::Value::Float(0.1));
+        worker.insert("priority_weights".into(), weights.into());
+        doc.insert("worker".into(), worker.into());
+
+        if doc.contains_key("alerting") {
+            let mut alerting = table(&mut doc, &["alerting"]);
+            let mut thresholds = toml::Table::new();
+            thresholds.insert("cpu_usage".into(), toml::Value::Float(90.0));
+            alerting.insert("custom_thresholds".into(), thresholds.into());
+            doc.insert("alerting".into(), alerting.into());
+        }
+        if doc.contains_key("metrics") {
+            let mut metrics = table(&mut doc, &["metrics"]);
+            metrics.insert(
+                "registry_name".into(),
+                toml::Value::String("hammerwork".into()),
+            );
+            doc.insert("metrics".into(), metrics.into());
+        }
+
+        let text = toml::to_string(&doc).unwrap();
+        assert!(text.contains("create_tables") && text.contains("fairness_factor"));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &text).unwrap();
+        let config = HammerworkConfig::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            config.database.pool_size,
+            DatabaseConfig::default().pool_size
+        );
+        assert!(!config.worker.priority_weights.is_strict());
+    }
+
     #[cfg(feature = "webhooks")]
     #[test]
     fn test_webhook_config() {
@@ -1893,6 +1966,7 @@ service_name = "hammerwork"
             compression_level: 0,
             archive_after: Duration::days(7),
             delete_after: None,
+            check_interval: StdDuration::from_secs(60),
         };
 
         let policy = config.archival_policy();
@@ -1923,6 +1997,40 @@ service_name = "hammerwork"
         assert!(config.enabled);
         assert_eq!(config.compression_level, 3);
         assert_eq!(config.archive_after, Duration::days(10));
+        // Files written before check_interval existed get the default.
+        assert_eq!(config.check_interval, DEFAULT_ARCHIVE_CHECK_INTERVAL);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_archive_check_interval() {
+        let config: ArchiveConfig = toml::from_str(
+            r#"
+            enabled = true
+            compression_level = 6
+            archive_after = "30d"
+            delete_after = "90d"
+            check_interval = "15m"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.check_interval, StdDuration::from_secs(15 * 60));
+        assert_eq!(config.delete_after, Some(Duration::days(90)));
+        let round_trip: ArchiveConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(round_trip.check_interval, config.check_interval);
+
+        let zero = ArchiveConfig {
+            check_interval: StdDuration::ZERO,
+            ..config.clone()
+        };
+        let err = zero.validate().unwrap_err().to_string();
+        assert!(err.contains("archive.check_interval"), "{err}");
+        // A disabled section is not checked.
+        let disabled = ArchiveConfig {
+            enabled: false,
+            ..zero
+        };
+        assert!(disabled.validate().is_ok());
     }
 
     fn encryption_toml() -> &'static str {

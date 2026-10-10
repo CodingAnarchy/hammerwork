@@ -302,10 +302,6 @@ pub struct PriorityWeights {
     weights: HashMap<JobPriority, u32>,
     /// Whether to use strict priority (always process highest priority first)
     strict_priority: bool,
-    /// Deprecated and ignored (see [`with_fairness_factor`](Self::with_fairness_factor)).
-    /// Kept, and optional, so existing configuration files still parse.
-    #[serde(default)]
-    fairness_factor: f32,
 }
 
 impl PriorityWeights {
@@ -343,7 +339,6 @@ impl PriorityWeights {
         Self {
             weights,
             strict_priority: false,
-            fairness_factor: 0.1, // deprecated and unused; kept for the getter
         }
     }
 
@@ -368,7 +363,6 @@ impl PriorityWeights {
         Self {
             weights: HashMap::new(), // Weights don't matter in strict mode
             strict_priority: true,
-            fairness_factor: 0.0,
         }
     }
 
@@ -390,22 +384,6 @@ impl PriorityWeights {
         self
     }
 
-    /// Formerly documented as a fairness factor (0.0 = no fairness, 1.0 = round-robin).
-    ///
-    /// It was never applied, and is now deprecated: weighted selection already gives
-    /// every priority with runnable jobs a share proportional to its weight, so lower
-    /// priorities are not starved (see [Starvation](PriorityWeights#starvation)). Raise
-    /// a priority's weight to give it a bigger share. The value is stored (clamped to
-    /// `0.0..=1.0`) but has no effect.
-    #[deprecated(
-        since = "1.15.6",
-        note = "never applied; weighted selection already prevents starvation, adjust the weights instead"
-    )]
-    pub fn with_fairness_factor(mut self, factor: f32) -> Self {
-        self.fairness_factor = factor.clamp(0.0, 1.0);
-        self
-    }
-
     /// Get the weight for a specific priority level
     pub fn get_weight(&self, priority: JobPriority) -> u32 {
         if self.strict_priority {
@@ -419,16 +397,6 @@ impl PriorityWeights {
     /// Check if strict priority mode is enabled
     pub fn is_strict(&self) -> bool {
         self.strict_priority
-    }
-
-    /// The value set with the deprecated [`with_fairness_factor`](Self::with_fairness_factor).
-    /// It has no effect on job selection.
-    #[deprecated(
-        since = "1.15.6",
-        note = "the fairness factor is not applied; weighted selection already prevents starvation"
-    )]
-    pub fn fairness_factor(&self) -> f32 {
-        self.fairness_factor
     }
 
     /// Calculate the total weight across all priorities
@@ -607,26 +575,20 @@ mod tests {
         assert_eq!(weights.get_weight(JobPriority::High), 15);
     }
 
-    /// M3: the deprecated fairness factor is still accepted (builder and configuration
-    /// files, with or without the field) but does not change the weights.
+    /// The removed `fairness_factor` key is still accepted in serialized weights (and so
+    /// in configuration files) and ignored.
     #[test]
-    #[allow(deprecated)]
-    fn test_deprecated_fairness_factor_is_accepted_and_ignored() {
-        let weights = PriorityWeights::new().with_fairness_factor(2.0);
-        assert_eq!(weights.fairness_factor(), 1.0);
-        assert_eq!(weights.weights(), PriorityWeights::new().weights());
-
+    fn test_removed_fairness_factor_is_ignored_when_parsing() {
         let with_field: PriorityWeights = serde_json::from_value(serde_json::json!({
             "weights": {}, "strict_priority": false, "fairness_factor": 0.3
         }))
         .unwrap();
-        assert_eq!(with_field.fairness_factor(), 0.3);
+        assert!(!with_field.is_strict());
         let without_field: PriorityWeights = serde_json::from_value(serde_json::json!({
             "weights": {}, "strict_priority": true
         }))
         .unwrap();
         assert!(without_field.is_strict());
-        assert_eq!(without_field.fairness_factor(), 0.0);
     }
 
     #[test]

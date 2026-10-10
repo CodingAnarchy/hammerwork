@@ -218,14 +218,12 @@ async fn test_jobarchiver_config_management_with_public_pool() {
     // Test setting custom configuration
     let custom_config = ArchivalConfig::new()
         .with_compression_level(9)
-        .with_max_payload_size(2048)
         .with_compression_verification(false);
 
     archiver.set_config(custom_config);
 
     let updated_config = archiver.get_config();
     assert_eq!(updated_config.compression_level, 9);
-    assert_eq!(updated_config.max_payload_size, 2048);
     assert!(!updated_config.verify_compression);
 }
 
