@@ -209,6 +209,20 @@ fn next_finished<'r, 'a>(
 struct HeldJobs {
     waiting: Vec<Job>,
     lost: std::collections::HashSet<crate::job::JobId>,
+    /// When each waiting job's lease was last written (by the claim or a heartbeat).
+    renewed: std::collections::HashMap<crate::job::JobId, std::time::Instant>,
+}
+
+/// What to do with a held job when its turn comes.
+#[derive(Debug, PartialEq, Eq)]
+enum HeldStart {
+    /// Its lease was lost while it waited: do not run it.
+    Lost,
+    /// Run it; its lease was renewed recently enough for the running heartbeat to take over.
+    Run,
+    /// Renew its lease first: the running heartbeat only fires after a full interval, and
+    /// together with the time since the last renewal that could outlast the lease.
+    RenewThenRun,
 }
 
 /// Whether shutdown was requested (or the shutdown sender was dropped), without waiting.
@@ -2242,7 +2256,15 @@ where
                 })
                 .collect(),
             lost: Default::default(),
+            renewed: {
+                let claimed_at = std::time::Instant::now();
+                batch
+                    .iter()
+                    .map(|claimed| (claimed.job.id, claimed_at))
+                    .collect()
+            },
         });
+        let renew_after = self.held_renewal_interval();
         let lease_keeper = self.maintain_held_leases(&held);
         tokio::pin!(lease_keeper);
 
@@ -2256,7 +2278,8 @@ where
             while running.len() < concurrency
                 && let Some(ClaimedJob { job, permit }) = queued.pop_front()
             {
-                if !Self::start_held(&held, job.id) {
+                let start = Self::start_held(&held, job.id, renew_after);
+                if start == HeldStart::Lost {
                     warn!(
                         "Skipping job {} of a claimed batch: it lost its lease while waiting \
                          (it is no longer Running this run)",
@@ -2268,6 +2291,22 @@ where
                     // The job's throttle permit is held until it is done.
                     let _permit = permit;
                     let job_id = job.id;
+                    if start == HeldStart::RenewThenRun {
+                        match self.queue.heartbeat_job(&job, self.lease_duration).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(
+                                    "Skipping job {} of a claimed batch: it lost its lease \
+                                     while waiting (it is no longer Running this run)",
+                                    job_id
+                                );
+                                return (job_id, Ok(()));
+                            }
+                            Err(e) => {
+                                warn!("Failed to renew the lease on job {}: {}", job_id, e)
+                            }
+                        }
+                    }
                     (job_id, self.process_job(job).await)
                 }));
             }
@@ -2323,12 +2362,29 @@ where
         (first_error.map_or(Ok(()), Err), shutting_down)
     }
 
-    /// Take `job_id` off the waiting list of a batch as it starts. `false` when its
-    /// lease was lost while it waited, so it must not run.
-    fn start_held(held: &std::sync::Mutex<HeldJobs>, job_id: crate::job::JobId) -> bool {
+    /// How often held and running jobs renew their leases: a third of the lease.
+    fn held_renewal_interval(&self) -> Duration {
+        (self.lease_duration / 3).max(MIN_HEARTBEAT_INTERVAL)
+    }
+
+    /// Take `job_id` off the waiting list of a batch as it starts, and say whether it may
+    /// run and whether its lease needs renewing first (its last renewal is older than
+    /// `renew_after`, the heartbeat interval).
+    fn start_held(
+        held: &std::sync::Mutex<HeldJobs>,
+        job_id: crate::job::JobId,
+        renew_after: Duration,
+    ) -> HeldStart {
         let mut held = held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         held.waiting.retain(|run| run.id != job_id);
-        !held.lost.contains(&job_id)
+        let renewed = held.renewed.remove(&job_id);
+        if held.lost.contains(&job_id) {
+            HeldStart::Lost
+        } else if renewed.is_some_and(|at| at.elapsed() < renew_after) {
+            HeldStart::Run
+        } else {
+            HeldStart::RenewThenRun
+        }
     }
 
     /// Renew the leases of a batch's jobs that are waiting for their turn, every third
@@ -2339,7 +2395,7 @@ where
         if self.lease_duration.is_zero() {
             return std::future::pending().await;
         }
-        let interval = (self.lease_duration / 3).max(MIN_HEARTBEAT_INTERVAL);
+        let interval = self.held_renewal_interval();
         loop {
             sleep(interval).await;
             let waiting = held
@@ -2348,7 +2404,13 @@ where
                 .unwrap_or_default();
             for run in waiting {
                 match self.queue.heartbeat_job(&run, self.lease_duration).await {
-                    Ok(true) => debug!("Renewed lease on waiting job {}", run.id),
+                    Ok(true) => {
+                        debug!("Renewed lease on waiting job {}", run.id);
+                        let mut held = held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if held.waiting.iter().any(|waiting| waiting.id == run.id) {
+                            held.renewed.insert(run.id, std::time::Instant::now());
+                        }
+                    }
                     Ok(false) => {
                         warn!(
                             "Lost the lease on job {} while it waited in a claimed batch; it \
@@ -5368,12 +5430,38 @@ mod tests {
     fn held_job_with_a_lost_lease_is_not_started() {
         let kept = Job::new("held".to_string(), serde_json::json!({}));
         let lost = Job::new("held".to_string(), serde_json::json!({}));
+        let now = std::time::Instant::now();
         let held = std::sync::Mutex::new(HeldJobs {
             waiting: vec![kept.clone(), lost.clone()],
             lost: std::collections::HashSet::from([lost.id]),
+            renewed: std::collections::HashMap::from([(kept.id, now), (lost.id, now)]),
         });
-        assert!(Worker::<sqlx::Postgres>::start_held(&held, kept.id));
-        assert!(!Worker::<sqlx::Postgres>::start_held(&held, lost.id));
+        let interval = Duration::from_secs(60);
+        assert_eq!(
+            Worker::<sqlx::Postgres>::start_held(&held, kept.id, interval),
+            HeldStart::Run
+        );
+        assert_eq!(
+            Worker::<sqlx::Postgres>::start_held(&held, lost.id, interval),
+            HeldStart::Lost
+        );
         assert!(held.lock().unwrap().waiting.is_empty());
+    }
+
+    #[test]
+    fn held_job_renewed_too_long_ago_is_renewed_before_it_starts() {
+        // Its running heartbeat only fires an interval after it starts; together with
+        // the time since its last renewal that could outlast the lease.
+        let job = Job::new("held".to_string(), serde_json::json!({}));
+        let held = std::sync::Mutex::new(HeldJobs {
+            waiting: vec![job.clone()],
+            lost: Default::default(),
+            renewed: std::collections::HashMap::from([(job.id, std::time::Instant::now())]),
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            Worker::<sqlx::Postgres>::start_held(&held, job.id, Duration::from_millis(10)),
+            HeldStart::RenewThenRun
+        );
     }
 }

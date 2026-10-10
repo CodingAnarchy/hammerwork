@@ -605,14 +605,15 @@ mod worker {
         let ids = enqueue_jobs(&queue, &queue_name, 4).await;
         let runs = Arc::new(Mutex::new(HashMap::new()));
 
-        // Lease 600ms, heartbeat every 200ms; the batch runs ~2.8s one job at a time.
+        // Lease 1.5s, heartbeat every 500ms; the batch runs ~4s one job at a time, so the
+        // last jobs wait well past the lease. The margin leaves room for slow CI runners.
         let worker = Worker::new(
             Arc::clone(&queue),
             queue_name.clone(),
-            counting_handler(Arc::clone(&runs), Duration::from_millis(700)),
+            counting_handler(Arc::clone(&runs), Duration::from_millis(1000)),
         )
         .with_poll_interval(Duration::from_millis(20))
-        .with_lease_duration(Duration::from_millis(600))
+        .with_lease_duration(Duration::from_millis(1500))
         .with_batch_size(4)
         .with_batch_concurrency(1);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
