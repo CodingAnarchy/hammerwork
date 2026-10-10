@@ -54,6 +54,8 @@ configuration. It is a major version because of the breaking changes listed belo
    - `WorkerPool::new()` no longer autoscales.
    - A spawn failure now fails (and retries) the parent.
    - A disabled recurring job's pending run is held.
+   - A recurring job that starts late after an outage runs once and then follows its
+     schedule; it no longer runs a second, immediate catch-up.
    - Zero `polling_interval` / `job_timeout` values are rejected.
    - `WorkerPool::from_hammerwork_config` archives and purges on a schedule when
      `[archive] enabled = true`.
