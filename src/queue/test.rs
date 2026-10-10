@@ -533,22 +533,94 @@ impl TestStorage {
     }
 
     /// Get the next job to dequeue based on priority and scheduled time
-    fn get_next_job(&self, queue_name: &str, weights: Option<&PriorityWeights>) -> Option<JobId> {
+    /// The jobs of `queue_name` that can be dequeued now: pending, due and not a
+    /// disabled recurring job's held occurrence. None while the queue is paused.
+    fn eligible_jobs(&self, queue_name: &str) -> Vec<&Job> {
         // Like the database backends, a paused queue hands out no jobs.
         if self.paused_queues.contains_key(queue_name) {
-            return None;
+            return Vec::new();
         }
-        let queue_jobs = self.queues.get(queue_name)?;
-        let pending_jobs = queue_jobs.get(&JobStatus::Pending)?;
+        let Some(pending_jobs) = self
+            .queues
+            .get(queue_name)
+            .and_then(|queue_jobs| queue_jobs.get(&JobStatus::Pending))
+        else {
+            return Vec::new();
+        };
 
         let now = self.clock.now();
-        let eligible_jobs: Vec<&Job> = pending_jobs
+        pending_jobs
             .iter()
             .filter_map(|id| self.jobs.get(id))
             .filter(|job| job.scheduled_at <= now)
             // A disabled recurring job's pending occurrence is held.
             .filter(|job| job.recurring || job.cron_schedule.is_none())
-            .collect();
+            .collect()
+    }
+
+    /// Up to `max_jobs` jobs to claim at once, in claim order, chosen like the database
+    /// backends' `dequeue_batch_leased`: in strict priority order, or with weighted
+    /// `weights` filled from a level picked by weight, then from the other levels.
+    fn get_next_jobs(
+        &self,
+        queue_name: &str,
+        weights: Option<&PriorityWeights>,
+        max_jobs: usize,
+    ) -> Vec<JobId> {
+        let mut eligible = self.eligible_jobs(queue_name);
+        eligible.sort_by_key(|job| {
+            (
+                std::cmp::Reverse(job.priority.as_i32()),
+                job.scheduled_at,
+                job.created_at,
+            )
+        });
+        let weights = match weights {
+            Some(weights) if !weights.is_strict() => weights,
+            _ => {
+                return eligible
+                    .into_iter()
+                    .take(max_jobs)
+                    .map(|job| job.id)
+                    .collect();
+            }
+        };
+
+        let mut candidates: Vec<JobPriority> = Vec::new();
+        for job in &eligible {
+            if !candidates.contains(&job.priority) {
+                candidates.push(job.priority);
+            }
+        }
+        let mut claimed = Vec::new();
+        let mut attempt: u64 = 0;
+        while claimed.len() < max_jobs {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            queue_name.hash(&mut hasher);
+            self.clock.now().timestamp_millis().hash(&mut hasher);
+            attempt.hash(&mut hasher);
+            let Some(priority) =
+                super::pick_weighted_priority(&candidates, weights, hasher.finish())
+            else {
+                break;
+            };
+            let room = max_jobs - claimed.len();
+            claimed.extend(
+                eligible
+                    .iter()
+                    .filter(|job| job.priority == priority)
+                    .take(room)
+                    .map(|job| job.id),
+            );
+            candidates.retain(|candidate| *candidate != priority);
+            attempt += 1;
+        }
+        claimed
+    }
+
+    fn get_next_job(&self, queue_name: &str, weights: Option<&PriorityWeights>) -> Option<JobId> {
+        let eligible_jobs = self.eligible_jobs(queue_name);
 
         if eligible_jobs.is_empty() {
             return None;
@@ -1134,6 +1206,52 @@ impl DatabaseQueue for TestQueue {
             job.attempts += 1;
             job.clone()
         }))
+    }
+
+    async fn dequeue_batch_leased(
+        &self,
+        queue_name: &str,
+        weights: Option<&PriorityWeights>,
+        lease: std::time::Duration,
+        max_jobs: usize,
+    ) -> Result<Vec<Job>> {
+        // One lock for the whole batch: concurrent callers never see the same job as
+        // claimable, like `FOR UPDATE SKIP LOCKED` on the database backends.
+        let mut storage = self.storage.write().await;
+        let max_jobs = max_jobs.min(super::MAX_DEQUEUE_BATCH_SIZE);
+        let ids = storage.get_next_jobs(queue_name, weights, max_jobs);
+        let now = storage.clock.now();
+        let mut jobs = Vec::with_capacity(ids.len());
+        for job_id in ids {
+            storage.update_job_status(job_id, JobStatus::Running)?;
+            storage
+                .leases
+                .insert(job_id, (now, lease_expiry(now, lease)));
+            if let Some(job) = storage.jobs.get_mut(&job_id) {
+                job.started_at = Some(now);
+                job.attempts += 1;
+                jobs.push(job.clone());
+            }
+        }
+        Ok(jobs)
+    }
+
+    async fn release_job_run(&self, run: &Job) -> Result<bool> {
+        let mut storage = self.storage.write().await;
+        // Only the run that was dequeued is released, as on the database backends.
+        let same_run = storage.jobs.get(&run.id).is_some_and(|job| {
+            job.status == JobStatus::Running && lifecycle::is_same_run(job, run)
+        });
+        if !same_run {
+            return Ok(false);
+        }
+        storage.update_job_status(run.id, JobStatus::Pending)?;
+        storage.leases.remove(&run.id);
+        if let Some(job) = storage.jobs.get_mut(&run.id) {
+            job.started_at = None;
+            job.attempts = (job.attempts - 1).max(0);
+        }
+        Ok(true)
     }
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
@@ -2835,6 +2953,60 @@ impl DatabaseQueue for TestQueue {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn dequeue_batch_claims_in_order_with_leases() {
+        let queue = TestQueue::new();
+        let low = queue
+            .enqueue(Job::new("batch".to_string(), json!({})).as_low_priority())
+            .await
+            .unwrap();
+        let high = queue
+            .enqueue(Job::new("batch".to_string(), json!({})).as_high_priority())
+            .await
+            .unwrap();
+        let normal = queue
+            .enqueue(Job::new("batch".to_string(), json!({})))
+            .await
+            .unwrap();
+
+        let claimed = queue.dequeue_batch("batch", 2).await.unwrap();
+        let ids: Vec<JobId> = claimed.iter().map(|job| job.id).collect();
+        assert_eq!(ids, [high, normal]);
+        assert!(claimed.iter().all(|job| job.attempts == 1));
+        assert_eq!(queue.get_job_count("batch", &JobStatus::Running).await, 2);
+        // Leased: a reaper with any window leaves them alone.
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(recovery.is_empty());
+
+        // Paused queues hand out nothing.
+        queue.pause_queue("batch", None).await.unwrap();
+        assert!(queue.dequeue_batch("batch", 5).await.unwrap().is_empty());
+        queue.resume_queue("batch", None).await.unwrap();
+        let rest = queue.dequeue_batch("batch", 5).await.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, low);
+    }
+
+    #[tokio::test]
+    async fn release_job_run_returns_the_job_unclaimed() {
+        let queue = TestQueue::new();
+        let id = queue
+            .enqueue(Job::new("release".to_string(), json!({})))
+            .await
+            .unwrap();
+        let run = queue.dequeue_batch("release", 1).await.unwrap().remove(0);
+        assert!(queue.release_job_run(&run).await.unwrap());
+        let job = queue.get_job(id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.attempts, 0);
+        assert_eq!(job.started_at, None);
+        assert!(!queue.release_job_run(&run).await.unwrap());
+        assert_eq!(queue.dequeue_batch("release", 1).await.unwrap().len(), 1);
+    }
 
     #[tokio::test]
     async fn test_basic_enqueue_dequeue() {

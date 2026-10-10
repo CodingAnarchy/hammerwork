@@ -21,7 +21,7 @@ Batch operations provide:
 - **Atomic enqueue**: a batch is stored completely or not at all
 - **Progress tracking**: `get_batch_status` reports pending, completed and failed counts
 - **Flexible failure handling**: choose what happens when a job of the batch fails
-- **Worker statistics**: workers can keep per-batch processing statistics
+- **Batch claims**: workers can claim many jobs per round trip and keep per-batch processing statistics
 
 A batch holds up to 10,000 jobs, all on the **same queue**.
 
@@ -258,9 +258,13 @@ for (job_id, error) in &result.job_errors {
 
 ## Worker Batch Processing
 
-### Enable Batch Processing
+### Batch Claims
 
-Enabling batch processing on a worker makes it keep statistics for jobs that belong to a batch:
+A worker in batch mode claims up to `batch_size` jobs per poll in one round trip instead
+of one job per round trip, then runs them `batch_concurrency` at a time (one at a time by
+default). `with_batch_size(n)` enables batch mode; `with_batch_processing_enabled(true)`
+alone keeps the default batch size of 1, so it claims one job per poll as before and only
+adds batch statistics:
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
@@ -276,14 +280,94 @@ let handler: JobHandler = Arc::new(|job: Job| {
     })
 });
 
+// Claim up to 50 jobs per poll and run up to 8 of them at once.
 let worker = Worker::new(queue, "batch_queue".to_string(), handler)
-    .with_batch_processing_enabled(true)
+    .with_batch_size(50)
+    .with_batch_concurrency(8)
     .with_poll_interval(Duration::from_millis(100));
+assert!(worker.is_batch_processing_enabled());
 # Ok(())
 # }
 ```
 
+Every claimed job gets the same guarantees as a job claimed on its own:
+
+- **One statement per claim.** PostgreSQL claims the batch with a single
+  `UPDATE ... WHERE id IN (SELECT ... ORDER BY priority DESC, scheduled_at ASC LIMIT n FOR UPDATE SKIP LOCKED) RETURNING ...`;
+  MySQL locks the rows with `SELECT ... FOR UPDATE SKIP LOCKED LIMIT n` and claims them
+  with one `UPDATE` in the same READ COMMITTED transaction (retried on deadlock).
+  Concurrent workers never claim the same job.
+- **Same eligibility.** Paused queues, unfinished dependencies and disabled recurring jobs
+  are honoured, and each job's `attempts` is incremented.
+- **A lease per job, from the claim.** Each job's lease is written by the claiming
+  statement. While a job waits for its turn in the batch, the worker renews its lease
+  with heartbeats every third of the lease duration, as it does for running jobs, so the
+  stale job reaper never reclaims a held job while its worker is alive, however long the
+  jobs ahead of it take. (Sizing the lease to cover the whole batch would not work: the
+  worker cannot know how long the jobs ahead will run.)
+- **Per-job processing.** Timeouts, retries, hooks, events, spawning, result storage,
+  encrypted payloads and statistics work exactly as for single jobs.
+- **Throttle and rate limit.** With `ThrottleConfig::max_concurrent`, every claimed job
+  holds a permit until it finishes, so a worker claims no more jobs than there are free
+  permits. With a rate limit, a batch claims no more jobs than there are tokens, and
+  tokens for jobs it did not get are handed back.
+- **Shutdown.** Claimed jobs that have not started are released back to `Pending` at once
+  (`DatabaseQueue::release_job_run`, which also takes back the claim's attempt), so other
+  workers can run them right away. Running jobs get the shutdown grace period.
+
+#### Priorities
+
+Without priority weights, or with `PriorityWeights::strict()`, a batch is filled in strict
+priority order: highest priority first, then oldest. With weighted priorities, a priority
+level is picked by weight (as a single weighted claim picks one) and the batch is filled
+with that level's oldest jobs; if the level runs out first, another level is picked by
+weight among the remaining ones to fill the rest. Over many batches each level gets
+batches in proportion to its weight, and no batch comes back short while other levels
+have runnable jobs.
+
+#### Choosing a batch size
+
+Batch claims save database round trips, so they help most when jobs are short. A worker
+holds the jobs it claimed until it gets to them, so idle workers cannot take them: keep
+`batch_size` small relative to the queue depth when jobs are slow, or raise
+`batch_concurrency` so held jobs start sooner. In a local benchmark (PostgreSQL 16 and
+MySQL 8 on the same machine, no-op handler, 2,000 jobs) claiming in batches of 50 was
+about 5-6x faster than claiming one job at a time, and a single batch-mode worker with
+batch size 50 and concurrency 10 processed 3-4x more jobs per second than a single-job
+worker. Run `HAMMERWORK_BENCH=1 cargo test --all-features --test batch_dequeue_tests -- --include-ignored --nocapture throughput`
+to measure your own setup.
+
+### Claiming Batches Directly
+
+The queue API claims batches too, for custom consumers:
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{JobOutcome, queue::DatabaseQueue};
+use std::time::Duration;
+
+// Up to 20 jobs, strict priority order, each leased for 2 minutes.
+let jobs = queue
+    .dequeue_batch_leased("emails", None, Duration::from_secs(120), 20)
+    .await?;
+for job in jobs {
+    let run = job.clone();
+    let job = queue.decrypt_job(job).await?; // a no-op for unencrypted jobs
+    // ... run it, renewing its lease with `heartbeat_job` while it runs or waits ...
+    queue.finish_job_run(&run, JobOutcome::Completed).await?;
+}
+# Ok(())
+# }
+```
+
+Jobs you claimed but will not run go back with `queue.release_job_run(&job)`.
+
 ### Access Batch Statistics
+
+Workers with batch processing enabled also keep statistics for jobs that belong to a
+`JobBatch`:
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;

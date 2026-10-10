@@ -158,7 +158,8 @@ async fn batch_worker_demo(
 
     // Create worker with batch processing enabled
     let worker = Worker::new(queue.clone(), "batch_processing_queue".to_string(), handler)
-        .with_batch_processing_enabled(true) // Enable batch processing features
+        .with_batch_size(10) // Claim up to 10 jobs per poll (enables batch processing)
+        .with_batch_concurrency(4) // and run up to 4 of them at once
         .with_poll_interval(Duration::from_millis(100))
         .with_max_retries(3)
         .with_stats_collector(stats_collector.clone())

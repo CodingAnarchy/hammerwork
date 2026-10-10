@@ -576,6 +576,45 @@ let worker = Worker::new(queue, "high_volume".to_string(), handler)
 # }
 ```
 
+### Batch Claims
+
+For many short jobs, a worker can claim several jobs per database round trip. With
+`with_batch_size(n)` the worker claims up to `n` jobs per poll in one statement and runs
+them `with_batch_concurrency(m)` at a time (default 1, so the worker still runs one handler
+at a time unless you raise it):
+
+```rust,no_run
+# #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
+# #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
+# async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, job: hammerwork::Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
+use hammerwork::{ThrottleConfig, Worker};
+use std::time::Duration;
+
+let worker = Worker::new(queue, "notifications".to_string(), handler)
+    .with_batch_size(20)                    // Claim up to 20 jobs per poll
+    .with_batch_concurrency(5)              // Run up to 5 of them at once
+    .with_lease_duration(Duration::from_secs(60))
+    .with_throttle_config(ThrottleConfig::new().max_concurrent(50));
+assert_eq!(worker.batch_size(), 20);
+# Ok(())
+# }
+```
+
+- Each claimed job holds its own lease from the moment it is claimed. Jobs waiting for
+  their turn have their leases renewed every third of the lease duration, like running
+  jobs, so a short lease is safe even for large batches of slow jobs.
+- With a throttle, each claimed job holds one `max_concurrent` permit until it finishes:
+  a worker never claims more jobs than there are free permits. With a rate limit, a batch
+  claims no more jobs than there are tokens, and unused tokens are handed back.
+- On shutdown, jobs that were claimed but not started go straight back to `Pending` (their
+  attempt is not counted); running jobs get the shutdown grace period.
+- Weighted priorities pick one level by weight per batch and fill the batch from it
+  (topping up from other levels); strict priority fills in strict order. See
+  [Batch Operations](batch-operations.md#worker-batch-processing).
+
+A worker holds the jobs it claimed until it gets to them, so other workers cannot take
+them meanwhile. Prefer small batches for slow jobs, or raise the batch concurrency.
+
 ### Resource-Intensive Jobs
 
 ```rust,no_run

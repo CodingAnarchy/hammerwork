@@ -1341,6 +1341,76 @@ where
     assert!(children.iter().all(|c| c.depends_on == vec![id]));
 }
 
+/// Jobs claimed in a batch come back in their stored (encrypted) form, like a single
+/// dequeue, and a batch-mode worker hands each handler the plaintext.
+async fn batch_claims_round_trip<DB>(plain: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let queue = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
+    let queue_name = test_utils::unique_queue("enc_batch");
+    let mut payloads = Vec::new();
+    for i in 0..3 {
+        let payload = json!({ "card": secret("card"), "i": i });
+        queue
+            .enqueue(
+                Job::new(queue_name.clone(), payload.clone())
+                    .with_encryption(config("k1"))
+                    .with_retention_policy(long_retention()),
+            )
+            .await
+            .unwrap();
+        payloads.push(payload);
+    }
+
+    let claimed = queue.dequeue_batch(&queue_name, 10).await.unwrap();
+    assert_eq!(claimed.len(), 3);
+    let mut decrypted = Vec::new();
+    for job in claimed {
+        assert!(job.is_encrypted);
+        assert_eq!(job.payload, json!({"encrypted": true}));
+        let run = job.clone();
+        decrypted.push(queue.decrypt_job(job).await.unwrap().payload);
+        // Hand it back for the worker below.
+        assert!(queue.release_job_run(&run).await.unwrap());
+    }
+    decrypted.sort_by_key(|payload| payload["i"].as_i64());
+    assert_eq!(decrypted, payloads);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let handler: JobHandler = {
+        let seen = Arc::clone(&seen);
+        Arc::new(move |job: Job| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                seen.lock().unwrap().push(job.payload.clone());
+                Ok(())
+            })
+        })
+    };
+    let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+        .with_poll_interval(Duration::from_millis(50))
+        .with_batch_size(5)
+        .with_batch_concurrency(2);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while seen.lock().unwrap().len() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the batch worker did not run the jobs"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    shutdown_tx.send(()).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort_by_key(|payload| payload["i"].as_i64());
+    assert_eq!(seen, payloads, "the handlers see the plaintext");
+}
+
 #[cfg(feature = "postgres")]
 mod postgres {
     use super::*;
@@ -1349,6 +1419,12 @@ mod postgres {
     #[ignore] // Requires database connection
     async fn test_postgres_whole_payload_round_trip() {
         whole_payload_round_trip(test_utils::setup_postgres_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_postgres_batch_claims_round_trip() {
+        batch_claims_round_trip(test_utils::setup_postgres_queue().await).await;
     }
 
     #[tokio::test]
@@ -1460,6 +1536,12 @@ mod mysql {
     #[ignore] // Requires database connection
     async fn test_mysql_whole_payload_round_trip() {
         whole_payload_round_trip(test_utils::setup_mysql_queue().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires database connection
+    async fn test_mysql_batch_claims_round_trip() {
+        batch_claims_round_trip(test_utils::setup_mysql_queue().await).await;
     }
 
     #[tokio::test]

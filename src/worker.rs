@@ -80,6 +80,16 @@ pub const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Floor on the heartbeat interval derived from the lease duration.
 const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Default number of jobs a worker in batch mode claims per poll: one, so
+/// `with_batch_processing_enabled(true)` alone keeps claiming one job at a time (as before
+/// 2.1) and only adds batch statistics. Set a larger size with [`Worker::with_batch_size`].
+pub const DEFAULT_BATCH_SIZE: usize = 1;
+
+/// Default number of claimed jobs a worker in batch mode runs at once
+/// ([`Worker::with_batch_concurrency`]): one, so batch mode changes how jobs are claimed
+/// but not how many handlers a worker runs at a time.
+pub const DEFAULT_BATCH_CONCURRENCY: usize = 1;
+
 /// Delay before a [`WorkerPool`] restarts a worker that died unexpectedly.
 const WORKER_RESTART_DELAY: Duration = Duration::from_secs(1);
 
@@ -157,6 +167,48 @@ enum Acquired {
     Job(Box<Job>),
     Idle,
     Shutdown,
+}
+
+/// What a batch-mode worker got from one poll.
+enum AcquiredBatch {
+    Jobs(Vec<ClaimedJob>),
+    Idle,
+    Shutdown,
+}
+
+/// A job claimed in a batch, with the throttle permit it holds until it finishes.
+struct ClaimedJob {
+    job: Job,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// One job of a batch being processed; resolves to its id and processing outcome.
+type BatchRun<'a> = Pin<Box<dyn Future<Output = (crate::job::JobId, Result<()>)> + Send + 'a>>;
+
+/// Wait for the next of `runs` to finish and remove it, or `None` when there are none.
+fn next_finished<'r, 'a>(
+    runs: &'r mut Vec<BatchRun<'a>>,
+) -> impl Future<Output = Option<(crate::job::JobId, Result<()>)>> + Send + 'r {
+    std::future::poll_fn(move |cx| {
+        if runs.is_empty() {
+            return Poll::Ready(None);
+        }
+        for index in 0..runs.len() {
+            if let Poll::Ready(finished) = runs[index].as_mut().poll(cx) {
+                drop(runs.swap_remove(index));
+                return Poll::Ready(Some(finished));
+            }
+        }
+        Poll::Pending
+    })
+}
+
+/// The claimed jobs of a batch that have not started yet, whose leases the worker
+/// renews while they wait, and those whose lease was found lost.
+#[derive(Default)]
+struct HeldJobs {
+    waiting: Vec<Job>,
+    lost: std::collections::HashSet<crate::job::JobId>,
 }
 
 /// Whether shutdown was requested (or the shutdown sender was dropped), without waiting.
@@ -765,8 +817,12 @@ pub struct Worker<DB: Database> {
     alert_manager: Option<Arc<AlertManager>>,
     /// Timestamp of the last processed job (for starvation detection)
     last_job_time: Arc<std::sync::RwLock<DateTime<Utc>>>,
-    /// Enable optimized batch job processing
+    /// Claim jobs in batches (and track statistics of jobs that belong to a `JobBatch`)
     batch_processing_enabled: bool,
+    /// Most jobs claimed per poll in batch mode
+    batch_size: usize,
+    /// Most claimed jobs run at once in batch mode
+    batch_concurrency: usize,
     /// Track batch processing statistics
     batch_stats: Arc<std::sync::RwLock<BatchProcessingStats>>,
     /// Job lifecycle event hooks
@@ -811,6 +867,8 @@ where
             // Create new instances for per-worker state
             last_job_time: Arc::new(std::sync::RwLock::new(Utc::now())),
             batch_processing_enabled: self.batch_processing_enabled,
+            batch_size: self.batch_size,
+            batch_concurrency: self.batch_concurrency,
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
             event_hooks: self.event_hooks.clone(),
             spawn_manager: self.spawn_manager.clone(),
@@ -898,6 +956,8 @@ where
             alert_manager: None,
             last_job_time: Arc::new(std::sync::RwLock::new(Utc::now())),
             batch_processing_enabled: false,
+            batch_size: DEFAULT_BATCH_SIZE,
+            batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
             event_hooks: JobEventHooks::default(),
             spawn_manager: None,
@@ -974,6 +1034,8 @@ where
             alert_manager: None,
             last_job_time: Arc::new(std::sync::RwLock::new(Utc::now())),
             batch_processing_enabled: false,
+            batch_size: DEFAULT_BATCH_SIZE,
+            batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
             event_hooks: JobEventHooks::default(),
             spawn_manager: None,
@@ -1442,14 +1504,37 @@ where
         self
     }
 
-    /// Enable optimized batch job processing.
+    /// Enable batch processing: claim jobs in batches, and track statistics of jobs that
+    /// belong to a [`JobBatch`](crate::batch::JobBatch) ([`get_batch_stats`](Self::get_batch_stats)).
     ///
-    /// When enabled, the worker will detect when jobs belong to batches and provide
-    /// enhanced monitoring, statistics, and error handling for batch operations.
+    /// In batch mode the worker claims up to [`batch_size`](Self::with_batch_size) jobs
+    /// per poll in one round trip ([`DatabaseQueue::dequeue_batch_leased`]) and runs them
+    /// [`batch_concurrency`](Self::with_batch_concurrency) at a time, one at a time by
+    /// default. Every claimed job goes through the same path as a single claim: its own
+    /// timeout, retries, hooks, events, spawning, result storage and statistics.
     ///
-    /// # Arguments
+    /// - **Leases.** Each claimed job holds its own lease from the moment it is claimed.
+    ///   While a job waits for its turn, the worker renews its lease with heartbeats
+    ///   every third of the [lease duration](Self::with_lease_duration), as it does for
+    ///   a running job, so a waiting job is never reclaimed by the stale job reaper
+    ///   while the worker is alive, however long the jobs ahead of it take. If a
+    ///   waiting job's lease is lost anyway (an operator changed it, or heartbeats
+    ///   failed for longer than the lease), the worker skips it.
+    /// - **Throttle and rate limit.** With a throttle's `max_concurrent`, every claimed
+    ///   job holds one of its permits until it finishes, so the worker never claims more
+    ///   jobs than there are free permits (it waits for at least one). With a rate limit,
+    ///   it claims no more jobs than it can take tokens for and hands back the tokens of
+    ///   jobs it did not get.
+    /// - **Shutdown.** Claimed jobs that have not started are handed back to the queue
+    ///   at once ([`DatabaseQueue::release_job_run`]), without counting an attempt, so
+    ///   other workers can run them instead of waiting for their leases to expire. Jobs
+    ///   already running get the [shutdown grace period](Self::with_shutdown_grace_period),
+    ///   as in single-job mode.
     ///
-    /// * `enabled` - Whether to enable batch processing optimizations
+    /// Batch claims cut the database round trips per job; holding jobs a worker has not
+    /// started yet keeps them from idle workers, so keep batches small relative to the
+    /// queue when jobs are slow. With batch processing off (the default), the worker
+    /// claims and runs one job at a time.
     ///
     /// # Examples
     ///
@@ -1462,6 +1547,8 @@ where
     /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
     /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
     ///
+    /// // Keep statistics for job batches; jobs are still claimed one at a time. Use
+    /// // `with_batch_size` to claim several jobs per poll.
     /// let worker = Worker::new(queue, "batch_queue".to_string(), handler)
     ///     .with_batch_processing_enabled(true);
     /// # Ok(())
@@ -1470,6 +1557,67 @@ where
     pub fn with_batch_processing_enabled(mut self, enabled: bool) -> Self {
         self.batch_processing_enabled = enabled;
         self
+    }
+
+    /// Claim up to `size` jobs per poll, and enable batch processing (see
+    /// [`with_batch_processing_enabled`](Self::with_batch_processing_enabled)).
+    ///
+    /// Defaults to [`DEFAULT_BATCH_SIZE`] (1). Values below 1 are raised to 1, and the
+    /// built-in backends claim at most
+    /// [`MAX_DEQUEUE_BATCH_SIZE`](crate::queue::MAX_DEQUEUE_BATCH_SIZE) jobs at once.
+    ///
+    /// # Examples
+    ///
+    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
+    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
+    /// use hammerwork::Worker;
+    /// # use std::sync::Arc;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
+    /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
+    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
+    ///
+    /// // Claim up to 50 jobs per poll and run up to 8 of them at once.
+    /// let worker = Worker::new(queue, "emails".to_string(), handler)
+    ///     .with_batch_size(50)
+    ///     .with_batch_concurrency(8);
+    /// assert!(worker.is_batch_processing_enabled());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_batch_size(mut self, size: usize) -> Self {
+        self.batch_size = size.max(1);
+        self.batch_processing_enabled = true;
+        self
+    }
+
+    /// Run up to `concurrency` of a claimed batch's jobs at once (batch mode only).
+    ///
+    /// Defaults to [`DEFAULT_BATCH_CONCURRENCY`] (1: the jobs of a batch run one after
+    /// another). The jobs run concurrently on the worker's task, so a handler that blocks
+    /// its thread holds up the others; use `tokio::task::spawn_blocking` for blocking
+    /// work. Values below 1 are raised to 1. A throttle's `max_concurrent` still applies.
+    pub fn with_batch_concurrency(mut self, concurrency: usize) -> Self {
+        self.batch_concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Whether batch processing is enabled (see
+    /// [`with_batch_processing_enabled`](Self::with_batch_processing_enabled)).
+    pub fn is_batch_processing_enabled(&self) -> bool {
+        self.batch_processing_enabled
+    }
+
+    /// The most jobs this worker claims per poll in batch mode. See
+    /// [`with_batch_size`](Self::with_batch_size).
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// The most claimed jobs this worker runs at once in batch mode. See
+    /// [`with_batch_concurrency`](Self::with_batch_concurrency).
+    pub fn batch_concurrency(&self) -> usize {
+        self.batch_concurrency
     }
 
     /// Set the job lifecycle event hooks for this worker.
@@ -1751,32 +1899,53 @@ where
                 info!("Worker shutting down for queue: {}", self.queue_name);
                 break;
             }
-            // Held until this iteration's job is done, so at most `max_concurrent`
-            // workers sharing this throttle dequeue or run jobs at once.
-            let _permit = match &self.concurrency_limit {
-                Some(limit) => tokio::select! {
-                    biased;
-                    _ = shutdown_rx.recv() => {
+
+            // Single-job mode: a throttle permit held until this iteration is over.
+            let _permit;
+            let (outcome, shutting_down) = if self.batch_processing_enabled {
+                // Each claimed job holds its own throttle permit (see `acquire_batch`).
+                match self.acquire_batch(&mut shutdown_rx).await {
+                    Ok(AcquiredBatch::Shutdown) => {
                         info!("Worker shutting down for queue: {}", self.queue_name);
                         break;
                     }
-                    // The semaphore is never closed, so this is always a permit.
-                    permit = Arc::clone(limit).acquire_owned() => permit.ok(),
-                },
-                None => None,
-            };
-            let acquired = self.acquire_job(&mut shutdown_rx).await;
-
-            let (outcome, shutting_down) = match acquired {
-                Ok(Acquired::Shutdown) => {
-                    info!("Worker shutting down for queue: {}", self.queue_name);
-                    break;
+                    Ok(AcquiredBatch::Jobs(batch)) => {
+                        self.run_batch_until_done(batch, &mut shutdown_rx).await
+                    }
+                    Ok(AcquiredBatch::Idle) => (Ok(()), false),
+                    Err(e) => {
+                        error!("Error dequeuing jobs from queue {}: {}", self.queue_name, e);
+                        (Err(e), false)
+                    }
                 }
-                Ok(Acquired::Job(job)) => self.run_job_until_done(*job, &mut shutdown_rx).await,
-                Ok(Acquired::Idle) => (Ok(()), false),
-                Err(e) => {
-                    error!("Error dequeuing job from queue {}: {}", self.queue_name, e);
-                    (Err(e), false)
+            } else {
+                // Held until this iteration's job is done, so at most `max_concurrent`
+                // workers sharing this throttle dequeue or run jobs at once.
+                _permit = match &self.concurrency_limit {
+                    Some(limit) => tokio::select! {
+                        biased;
+                        _ = shutdown_rx.recv() => {
+                            info!("Worker shutting down for queue: {}", self.queue_name);
+                            break;
+                        }
+                        // The semaphore is never closed, so this is always a permit.
+                        permit = Arc::clone(limit).acquire_owned() => permit.ok(),
+                    },
+                    None => None,
+                };
+                let acquired = self.acquire_job(&mut shutdown_rx).await;
+
+                match acquired {
+                    Ok(Acquired::Shutdown) => {
+                        info!("Worker shutting down for queue: {}", self.queue_name);
+                        break;
+                    }
+                    Ok(Acquired::Job(job)) => self.run_job_until_done(*job, &mut shutdown_rx).await,
+                    Ok(Acquired::Idle) => (Ok(()), false),
+                    Err(e) => {
+                        error!("Error dequeuing job from queue {}: {}", self.queue_name, e);
+                        (Err(e), false)
+                    }
                 }
             };
 
@@ -1918,20 +2087,8 @@ where
 
     /// Claim the next job of this worker's queue, with this worker's lease.
     async fn claim_job(&self) -> Result<Option<Job>> {
-        // Check if the queue is paused
-        match self.queue.is_queue_paused(&self.queue_name).await {
-            Ok(true) => {
-                debug!(
-                    "Queue '{}' is paused, skipping job dequeue",
-                    self.queue_name
-                );
-                return Ok(None);
-            }
-            Ok(false) => {}
-            Err(e) => {
-                // The dequeue checks the pause itself, so carry on.
-                warn!("Failed to check queue pause status: {}", e);
-            }
+        if self.queue_is_paused().await {
+            return Ok(None);
         }
 
         self.queue
@@ -1941,6 +2098,303 @@ where
                 self.lease_duration,
             )
             .await
+    }
+
+    /// Whether this worker's queue is paused, so the dequeue can be skipped. A failed
+    /// check counts as not paused: the dequeue checks the pause itself.
+    async fn queue_is_paused(&self) -> bool {
+        match self.queue.is_queue_paused(&self.queue_name).await {
+            Ok(true) => {
+                debug!(
+                    "Queue '{}' is paused, skipping job dequeue",
+                    self.queue_name
+                );
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                warn!("Failed to check queue pause status: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Batch mode: wait for capacity, then claim up to `batch_size` jobs in one call.
+    ///
+    /// Each claimed job needs a throttle permit (with `max_concurrent`) and a rate limit
+    /// token (with a rate limit): the worker waits for the first of each, takes as many
+    /// more as are free right now, up to the batch size, and claims no more jobs than
+    /// that. Tokens for jobs it did not get are handed back; permits it did not need are
+    /// dropped.
+    async fn acquire_batch(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> Result<AcquiredBatch> {
+        let mut capacity = self.batch_size.max(1);
+
+        let mut permits = Vec::new();
+        if let Some(limit) = &self.concurrency_limit {
+            let first = tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => return Ok(AcquiredBatch::Shutdown),
+                // The semaphore is never closed, so this is always a permit.
+                permit = Arc::clone(limit).acquire_owned() => permit.ok(),
+            };
+            permits.extend(first);
+            while permits.len() < capacity {
+                match Arc::clone(limit).try_acquire_owned() {
+                    Ok(permit) => permits.push(permit),
+                    Err(_) => break,
+                }
+            }
+            capacity = permits.len();
+            if capacity == 0 {
+                return Ok(self.idle_wait_batch(shutdown_rx).await);
+            }
+        }
+
+        let mut tokens = 0;
+        if let Some(rate_limiter) = &self.rate_limiter {
+            let permit = tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => return Ok(AcquiredBatch::Shutdown),
+                permit = rate_limiter.acquire() => permit,
+            };
+            if let Err(e) = permit {
+                warn!("Rate limiter error: {}", e);
+                return Ok(self.idle_wait_batch(shutdown_rx).await);
+            }
+            tokens = 1;
+            while tokens < capacity && rate_limiter.try_acquire() {
+                tokens += 1;
+            }
+            capacity = tokens;
+        }
+
+        let claimed = if self.queue_is_paused().await {
+            Ok(Vec::new())
+        } else {
+            self.queue
+                .dequeue_batch_leased(
+                    &self.queue_name,
+                    self.priority_weights.as_ref(),
+                    self.lease_duration,
+                    capacity,
+                )
+                .await
+        };
+        if let Some(rate_limiter) = &self.rate_limiter {
+            let used = claimed.as_ref().map_or(0, Vec::len);
+            for _ in used..tokens {
+                rate_limiter.refund();
+            }
+        }
+
+        let jobs = claimed?;
+        if jobs.is_empty() {
+            // No job available (or the queue is paused): wait before polling again.
+            return Ok(self.idle_wait_batch(shutdown_rx).await);
+        }
+        debug!(
+            "Claimed {} job(s) from queue {}",
+            jobs.len(),
+            self.queue_name
+        );
+        let mut permits = permits.into_iter();
+        Ok(AcquiredBatch::Jobs(
+            jobs.into_iter()
+                .map(|job| ClaimedJob {
+                    job,
+                    permit: permits.next(),
+                })
+                .collect(),
+        ))
+    }
+
+    /// [`idle_wait`](Self::idle_wait) for batch mode.
+    async fn idle_wait_batch(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> AcquiredBatch {
+        match self.idle_wait(shutdown_rx).await {
+            Acquired::Shutdown => AcquiredBatch::Shutdown,
+            _ => AcquiredBatch::Idle,
+        }
+    }
+
+    /// Process the jobs of a claimed batch, up to `batch_concurrency` at a time, while
+    /// renewing the leases of the ones still waiting for their turn.
+    ///
+    /// If shutdown is requested meanwhile, the jobs that have not started are released
+    /// back to the queue at once, and the running ones get up to the shutdown grace
+    /// period to finish before they are cancelled (as in
+    /// [`run_job_until_done`](Self::run_job_until_done)).
+    ///
+    /// Returns the first error recording a job's outcome (the other jobs are still
+    /// processed) and whether shutdown was requested.
+    async fn run_batch_until_done(
+        &self,
+        batch: Vec<ClaimedJob>,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> (Result<()>, bool) {
+        // The runs whose leases are renewed while they wait: the jobs as claimed (same
+        // id, attempts and started_at), without their payloads.
+        let held = std::sync::Mutex::new(HeldJobs {
+            waiting: batch
+                .iter()
+                .map(|claimed| Job {
+                    payload: serde_json::Value::Null,
+                    ..claimed.job.clone()
+                })
+                .collect(),
+            lost: Default::default(),
+        });
+        let lease_keeper = self.maintain_held_leases(&held);
+        tokio::pin!(lease_keeper);
+
+        let concurrency = self.batch_concurrency.max(1);
+        let mut queued: std::collections::VecDeque<ClaimedJob> = batch.into();
+        let mut running: Vec<BatchRun<'_>> = Vec::new();
+        let mut first_error = None;
+        let mut shutting_down = false;
+
+        loop {
+            while running.len() < concurrency
+                && let Some(ClaimedJob { job, permit }) = queued.pop_front()
+            {
+                if !Self::start_held(&held, job.id) {
+                    warn!(
+                        "Skipping job {} of a claimed batch: it lost its lease while waiting \
+                         (it is no longer Running this run)",
+                        job.id
+                    );
+                    continue;
+                }
+                running.push(Box::pin(async move {
+                    // The job's throttle permit is held until it is done.
+                    let _permit = permit;
+                    let job_id = job.id;
+                    (job_id, self.process_job(job).await)
+                }));
+            }
+
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => {
+                    shutting_down = true;
+                    break;
+                }
+                finished = next_finished(&mut running) => match finished {
+                    Some((job_id, outcome)) => {
+                        if let Err(e) = self.log_process_outcome(job_id, outcome) {
+                            first_error.get_or_insert(e);
+                        }
+                    }
+                    None => break,
+                },
+                () = &mut lease_keeper => {}
+            }
+        }
+
+        if shutting_down {
+            self.release_unstarted(queued.drain(..).map(|claimed| claimed.job))
+                .await;
+            if !running.is_empty() {
+                info!(
+                    "Shutdown requested while {} job(s) of a batch are running; waiting up to \
+                     {:?} for them to finish",
+                    running.len(),
+                    self.shutdown_grace_period
+                );
+                let drained = tokio::time::timeout(self.shutdown_grace_period, async {
+                    while let Some((job_id, outcome)) = next_finished(&mut running).await {
+                        if let Err(e) = self.log_process_outcome(job_id, outcome) {
+                            first_error.get_or_insert(e);
+                        }
+                    }
+                })
+                .await;
+                if drained.is_err() {
+                    warn!(
+                        "{} job(s) of a batch did not finish within the {:?} shutdown grace \
+                         period and were cancelled; they stay Running until their leases \
+                         expire and the stale job reaper reclaims them",
+                        running.len(),
+                        self.shutdown_grace_period
+                    );
+                }
+            }
+        }
+
+        (first_error.map_or(Ok(()), Err), shutting_down)
+    }
+
+    /// Take `job_id` off the waiting list of a batch as it starts. `false` when its
+    /// lease was lost while it waited, so it must not run.
+    fn start_held(held: &std::sync::Mutex<HeldJobs>, job_id: crate::job::JobId) -> bool {
+        let mut held = held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.waiting.retain(|run| run.id != job_id);
+        !held.lost.contains(&job_id)
+    }
+
+    /// Renew the leases of a batch's jobs that are waiting for their turn, every third
+    /// of the lease duration (like [`maintain_lease`](Self::maintain_lease) for a running
+    /// job, which takes over once a job starts). A job whose lease is found lost is
+    /// marked so it is not run. Never completes.
+    async fn maintain_held_leases(&self, held: &std::sync::Mutex<HeldJobs>) {
+        if self.lease_duration.is_zero() {
+            return std::future::pending().await;
+        }
+        let interval = (self.lease_duration / 3).max(MIN_HEARTBEAT_INTERVAL);
+        loop {
+            sleep(interval).await;
+            let waiting = held
+                .lock()
+                .map(|held| held.waiting.clone())
+                .unwrap_or_default();
+            for run in waiting {
+                match self.queue.heartbeat_job(&run, self.lease_duration).await {
+                    Ok(true) => debug!("Renewed lease on waiting job {}", run.id),
+                    Ok(false) => {
+                        warn!(
+                            "Lost the lease on job {} while it waited in a claimed batch; it \
+                             will not be run by this worker",
+                            run.id
+                        );
+                        let mut held = held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        held.waiting.retain(|waiting| waiting.id != run.id);
+                        held.lost.insert(run.id);
+                    }
+                    Err(e) => warn!("Failed to renew the lease on waiting job {}: {}", run.id, e),
+                }
+            }
+        }
+    }
+
+    /// Hand claimed jobs that never started back to the queue
+    /// ([`DatabaseQueue::release_job_run`]) and refund their rate limit tokens. A job
+    /// that cannot be released stays `Running` until its lease expires.
+    async fn release_unstarted(&self, jobs: impl IntoIterator<Item = Job>) {
+        let mut released = 0;
+        for job in jobs {
+            match self.queue.release_job_run(&job).await {
+                Ok(true) => {
+                    released += 1;
+                    if let Some(rate_limiter) = &self.rate_limiter {
+                        rate_limiter.refund();
+                    }
+                }
+                Ok(false) => debug!(
+                    "Job {} was no longer Running this run; nothing to release",
+                    job.id
+                ),
+                Err(e) => warn!(
+                    "Failed to release unstarted job {}; it stays Running until its lease \
+                     expires: {}",
+                    job.id, e
+                ),
+            }
+        }
+        if released > 0 {
+            info!(
+                "Released {} claimed job(s) that had not started back to queue {}",
+                released, self.queue_name
+            );
+        }
     }
 
     /// Sleep for the poll interval (at least [`MIN_POLL_INTERVAL`]), returning early
@@ -4848,5 +5302,78 @@ mod tests {
             ));
         }
         assert!(started.elapsed() >= MIN_POLL_INTERVAL * 5);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn batch_builders_set_size_concurrency_and_mode() {
+        let worker = lazy_worker("batch");
+        assert!(!worker.is_batch_processing_enabled());
+        assert_eq!(worker.batch_size(), DEFAULT_BATCH_SIZE);
+        assert_eq!(worker.batch_concurrency(), DEFAULT_BATCH_CONCURRENCY);
+
+        // The old builder alone enables batch mode with the default size of one job.
+        let enabled = lazy_worker("batch").with_batch_processing_enabled(true);
+        assert!(enabled.is_batch_processing_enabled());
+        assert_eq!(enabled.batch_size(), DEFAULT_BATCH_SIZE);
+
+        // `with_batch_size` enables batch mode; zero values are raised to one.
+        let sized = lazy_worker("batch")
+            .with_batch_size(0)
+            .with_batch_concurrency(0);
+        assert!(sized.is_batch_processing_enabled());
+        assert_eq!(sized.batch_size(), 1);
+        assert_eq!(sized.batch_concurrency(), 1);
+
+        let worker = lazy_worker("batch")
+            .with_batch_size(25)
+            .with_batch_concurrency(5);
+        let clone = worker.clone();
+        assert_eq!(clone.batch_size(), 25);
+        assert_eq!(clone.batch_concurrency(), 5);
+        assert!(clone.is_batch_processing_enabled());
+        // Batch mode can still be switched off afterwards.
+        assert!(
+            !worker
+                .with_batch_processing_enabled(false)
+                .is_batch_processing_enabled()
+        );
+    }
+
+    #[tokio::test]
+    async fn next_finished_yields_runs_as_they_finish() {
+        let mut runs: Vec<BatchRun<'_>> = Vec::new();
+        assert!(next_finished(&mut runs).await.is_none());
+
+        let ids: Vec<crate::job::JobId> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+        for (index, id) in ids.iter().copied().enumerate() {
+            // The first-pushed run finishes last.
+            let delay = Duration::from_millis(60 - 20 * index as u64);
+            runs.push(Box::pin(async move {
+                sleep(delay).await;
+                (id, Ok(()))
+            }));
+        }
+        let mut order = Vec::new();
+        while let Some((id, outcome)) = next_finished(&mut runs).await {
+            assert!(outcome.is_ok());
+            order.push(id);
+        }
+        assert_eq!(order, [ids[2], ids[1], ids[0]]);
+        assert!(runs.is_empty());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn held_job_with_a_lost_lease_is_not_started() {
+        let kept = Job::new("held".to_string(), serde_json::json!({}));
+        let lost = Job::new("held".to_string(), serde_json::json!({}));
+        let held = std::sync::Mutex::new(HeldJobs {
+            waiting: vec![kept.clone(), lost.clone()],
+            lost: std::collections::HashSet::from([lost.id]),
+        });
+        assert!(Worker::<sqlx::Postgres>::start_held(&held, kept.id));
+        assert!(!Worker::<sqlx::Postgres>::start_held(&held, lost.id));
+        assert!(held.lock().unwrap().waiting.is_empty());
     }
 }
