@@ -821,9 +821,15 @@ mod worker {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let counts = queue.get_job_counts_by_status(&queue_name).await.unwrap();
+        // Tokens refill one every 333ms, so by the time the counts are read (late on a
+        // slow runner) a few more claims may be legitimate.
+        let refilled = (began.elapsed().as_millis() / 333) as usize;
+        let allowed = (3 + refilled).min(JOBS);
         assert!(
-            counts.get("Pending").copied().unwrap_or(0) >= (JOBS - 3) as u64,
-            "a batch claimed more jobs than it had rate limit tokens: {counts:?}"
+            counts.get("Pending").copied().unwrap_or(0) >= (JOBS - allowed) as u64,
+            "a batch claimed more jobs than it had rate limit tokens \
+             ({allowed} allowed after {:?}): {counts:?}",
+            began.elapsed()
         );
 
         wait_for_status(
