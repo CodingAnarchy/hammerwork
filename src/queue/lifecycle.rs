@@ -430,10 +430,14 @@ const CRON_CATCH_UP_SCAN_LIMIT: usize = 10_000;
 /// ends late does not skip the following slot. Catch-up semantics:
 ///
 /// - the next occurrence after the slot is still in the future: run then;
-/// - it has already passed (the run overran, or workers were down): the missed
-///   occurrences are coalesced into **one** run, scheduled at the latest missed
-///   occurrence, so it is due immediately. After that run, the job is back on its
-///   regular schedule. Missed occurrences never pile up into a burst of runs.
+/// - it has already passed because the run overran: the occurrences that passed while
+///   it ran are coalesced into **one** run, scheduled at the latest of them, so it is due
+///   immediately. After that run, the job is back on its regular schedule. Missed
+///   occurrences never pile up into a burst of runs.
+///
+/// Occurrences that had already passed when the run *started* (workers were down, or
+/// the queue was paused) are covered by that run: it is itself the catch-up run, so the
+/// next run is the first occurrence after it started, not another immediate one.
 ///
 /// Returns `None` when the job has no valid cron schedule or no next occurrence.
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
@@ -444,7 +448,13 @@ pub(crate) fn next_cron_run(job: &Job, now: DateTime<Utc>) -> Option<DateTime<Ut
     let slot = job
         .next_run_at
         .map_or(job.scheduled_at, |slot| slot.min(job.scheduled_at));
-    let next = schedule.next_execution(slot)?;
+    // A run that started after its slot already covers the occurrences missed before it
+    // started; count from the start so they do not trigger a second, immediate run.
+    let from = job
+        .started_at
+        .filter(|started| *started > slot)
+        .unwrap_or(slot);
+    let next = schedule.next_execution(from)?;
     if next > now {
         return Some(next);
     }
@@ -719,7 +729,8 @@ mod tests {
             next_cron_run(&job, at("2026-03-11T00:30:00Z")),
             Some(at("2026-03-11T00:00:00Z"))
         );
-        // Days behind: one catch-up run at the latest missed slot, no pile-up
+        // Days behind with no recorded start: one catch-up run at the latest missed
+        // slot, no pile-up (a worker's run always has a start; see below)
         assert_eq!(
             next_cron_run(&job, at("2026-03-15T12:00:00Z")),
             Some(at("2026-03-15T00:00:00Z"))
@@ -749,6 +760,40 @@ mod tests {
         let mut job = daily_job(at("2026-03-10T00:00:00Z"));
         job.cron_schedule = None;
         assert_eq!(next_cron_run(&job, at("2026-03-10T00:05:00Z")), None);
+    }
+
+    #[test]
+    fn a_late_run_is_the_catch_up_run() {
+        // Workers were down for days; the run for the stale slot starts late and is the
+        // catch-up, so the next run is the next regular slot, not another one at once.
+        let mut job = daily_job(at("2026-03-10T00:00:00Z"));
+        job.started_at = Some(at("2026-03-15T12:00:00Z"));
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-15T12:00:01Z")),
+            Some(at("2026-03-16T00:00:00Z"))
+        );
+        // A per-five-seconds schedule picked up 30 seconds late runs once, then resumes.
+        let mut job = daily_job(at("2026-03-10T00:00:00Z"));
+        job.cron_schedule = Some("*/5 * * * * *".to_string());
+        job.started_at = Some(at("2026-03-10T00:00:30.950Z"));
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-10T00:00:30.960Z")),
+            Some(at("2026-03-10T00:00:35Z"))
+        );
+        // An occurrence that passes while the run is still going still gets its run.
+        let mut job = daily_job(at("2026-03-10T00:00:00Z"));
+        job.started_at = Some(at("2026-03-10T00:00:01Z"));
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-11T00:30:00Z")),
+            Some(at("2026-03-11T00:00:00Z"))
+        );
+        // A run that starts on time behaves as before.
+        let mut job = daily_job(at("2026-03-10T00:00:00Z"));
+        job.started_at = Some(at("2026-03-10T00:00:00.040Z"));
+        assert_eq!(
+            next_cron_run(&job, at("2026-03-10T00:05:00Z")),
+            Some(at("2026-03-11T00:00:00Z"))
+        );
     }
 
     #[test]

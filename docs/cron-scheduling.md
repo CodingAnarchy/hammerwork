@@ -388,16 +388,18 @@ the time the run ended, using the database clock:
 
 - If the next occurrence after the slot is still ahead, the job runs then. A run that
   takes a while does not push the schedule back.
-- If it has already passed (the run overran into the next slot, or no worker ran the
-  job for a while), the missed occurrences are coalesced into **one** catch-up run,
-  scheduled at the latest missed occurrence and therefore due immediately. After it,
-  the job is back on its regular schedule. Slots are never skipped silently and never
-  pile up into a burst of runs.
+- If it has already passed because the run overran into the next slot, the
+  occurrences that passed while it ran are coalesced into **one** catch-up run,
+  scheduled at the latest of them and therefore due immediately. After it, the job is
+  back on its regular schedule.
+- If no worker ran the job for a while (workers were down, or the queue was paused), the
+  late run is itself the catch-up: it runs once, and the next run is the first
+  occurrence after it started. Slots never pile up into a burst of runs.
 
 For example, a daily job (`0 0 0 * * *`) whose 2026-03-10 run ends at 00:05 runs
-next at 2026-03-11 00:00. If that run starts days late, on 2026-03-15 at 12:00, it is
-followed by one catch-up run due immediately (slot 2026-03-15 00:00) and then by the
-2026-03-16 00:00 run.
+next at 2026-03-11 00:00. If that run instead starts days late, on 2026-03-15 at 12:00,
+it runs once and the next run is 2026-03-16 00:00. If a run that started on time takes
+until 2026-03-11 00:30, the 2026-03-11 00:00 slot runs immediately after it.
 
 ## Monitoring Cron Jobs
 
