@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-09
+
+A hardening release ([#7](https://github.com/CodingAnarchy/hammerwork/issues/7)). It fixes
+jobs that could run twice, lost spawned jobs, concurrent migrations crashing, data loss in
+CLI backups, plaintext writes to encrypted queues, SQL injection in the CLI and several
+dashboard authentication flaws. It also finishes features that were stubs or ignored their
+configuration. It is a major version because of the breaking changes listed below.
+
+### Upgrading from 1.x
+
+1. **Run the migrations before starting 2.0 workers**: `cargo hammerwork migration run
+   --database-url <url>`, or `auto_migrate`. 2.0 reads new columns on every job query.
+   Migrations are idempotent and serialized by a database lock, so several replicas can
+   run them at once. On MySQL 8, 2.0 also completes schemas that 1.15's migrations left
+   half-applied.
+2. **Encryption** (`encryption` feature):
+   - Upgrade every process that *decrypts* before any process *encrypts* with 2.0; older
+     versions can't verify the new payload hash.
+   - `vault://` and `azure://` keys must be exactly 32 bytes; padding is no longer applied.
+   - AWS and GCP KMS deployments store a data key on their first start.
+3. **Dashboard** (`hammerwork-web`):
+   - It refuses to start with authentication enabled and no password. Configure a
+     password hash, or pass `--no-auth` to run open explicitly.
+   - `--cors` needs at least one `--allowed-origin`.
+   - API clients must send `Content-Type: application/json` and `Content-Length` with
+     request bodies.
+   - The `auth` feature (bcrypt) is on by default.
+4. **CLI** (`cargo-hammerwork`):
+   - `--database-url` is `-u` and the queue flag is `-n/--queue` everywhere; the old
+     spellings still work.
+   - `backup create` writes format `2.0`; 1.x backups still restore.
+   - `workflow create` needs `--jobs-file`, and the `archive *-policy` commands are gone.
+   - Connections time out after 10 s (`connect_timeout_secs`).
+5. **API**:
+   - Settings and methods that never had any effect are removed (see Removed). Old
+     configuration files that still contain them keep loading.
+   - Signatures changed:
+     - `DatabaseQueue::heartbeat_job` takes the dequeued `&Job`.
+     - `JobSpawnExt::with_spawn_config` / `with_spawning` return `Result`.
+     - `RetryStrategy::Custom` holds an `Arc`.
+     - `hammerwork_web::server::app_routes` takes the allowed origins.
+   - Several config and stats structs gained fields. Build them with
+     `..Default::default()`.
+6. **Behaviour**:
+   - `WorkerPool::new()` no longer autoscales.
+   - A spawn failure now fails (and retries) the parent.
+   - A disabled recurring job's pending run is held.
+   - Zero `polling_interval` / `job_timeout` values are rejected.
+   - `WorkerPool::from_hammerwork_config` archives and purges on a schedule when
+     `[archive] enabled = true`.
+
+
 ### Added
 - **Live dashboard updates** ([#71](https://github.com/CodingAnarchy/hammerwork/issues/71)). Connected WebSocket clients now receive `JobUpdate` messages when jobs are created, started, completed, failed or timed out, and `QueueUpdate` messages when a queue's counts change, filtered by each client's subscriptions. Nothing published them before, so the dashboard's live updates never fired. The standalone dashboard runs apart from the workers and cannot see their in-process events, so it polls the database while at least one client is connected: every `websocket.live_update_interval` (default 2 s, zero disables), at most `websocket.live_update_max_jobs` changed jobs per poll (default 100). Both settings are optional in configuration files. A dashboard embedded in the workers' process can also forward their `EventManager` events as they happen with `WebDashboard::with_event_manager`. New `hammerwork_web::live` module (`LiveUpdates`, `forward_job_events`) and `JobHistory::database_now` / `recent_job_changes`.
 - **Automatic archival** (`[archive] enabled = true` used to do nothing at runtime, and `purge_archived_after` / `delete_after` were never applied):

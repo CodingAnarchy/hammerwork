@@ -123,9 +123,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hammerwork-web = { version = "1.15", features = ["postgres"] }
+hammerwork-web = { version = "2.0", features = ["postgres"] }
 # or for MySQL:
-# hammerwork-web = { version = "1.15", features = ["mysql"] }
+# hammerwork-web = { version = "2.0", features = ["mysql"] }
 ```
 
 ### Programmatic Usage

@@ -35,30 +35,30 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 ```toml
 [dependencies]
 # Default features include metrics and alerting
-hammerwork = { version = "1.15", features = ["postgres"] }
+hammerwork = { version = "2.0", features = ["postgres"] }
 # or
-hammerwork = { version = "1.15", features = ["mysql"] }
+hammerwork = { version = "2.0", features = ["mysql"] }
 
 # With encryption for PII protection
-hammerwork = { version = "1.15", features = ["postgres", "encryption"] }
+hammerwork = { version = "2.0", features = ["postgres", "encryption"] }
 
 # With AWS KMS integration for enterprise key management
-hammerwork = { version = "1.15", features = ["postgres", "encryption", "aws-kms"] }
+hammerwork = { version = "2.0", features = ["postgres", "encryption", "aws-kms"] }
 
 # With Google Cloud KMS integration for enterprise key management
-hammerwork = { version = "1.15", features = ["postgres", "encryption", "gcp-kms"] }
+hammerwork = { version = "2.0", features = ["postgres", "encryption", "gcp-kms"] }
 
 # With HashiCorp Vault KMS integration for enterprise key management
-hammerwork = { version = "1.15", features = ["postgres", "encryption", "vault-kms"] }
+hammerwork = { version = "2.0", features = ["postgres", "encryption", "vault-kms"] }
 
 # With distributed tracing
-hammerwork = { version = "1.15", features = ["postgres", "tracing"] }
+hammerwork = { version = "2.0", features = ["postgres", "tracing"] }
 
 # Full feature set
-hammerwork = { version = "1.15", features = ["postgres", "encryption", "aws-kms", "gcp-kms", "vault-kms", "tracing"] }
+hammerwork = { version = "2.0", features = ["postgres", "encryption", "aws-kms", "gcp-kms", "vault-kms", "tracing"] }
 
 # Minimal installation
-hammerwork = { version = "1.15", features = ["postgres"], default-features = false }
+hammerwork = { version = "2.0", features = ["postgres"], default-features = false }
 ```
 
 **Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `encryption` (optional), `aws-kms` (optional), `gcp-kms` (optional), `vault-kms` (optional), `tracing` (optional), `test` (for TestQueue)
@@ -71,7 +71,7 @@ cargo install hammerwork-web --features postgres
 
 # Or add to your project
 [dependencies]
-hammerwork-web = { version = "1.15", features = ["postgres"] }
+hammerwork-web = { version = "2.0", features = ["postgres"] }
 ```
 
 Start the dashboard:
