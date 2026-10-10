@@ -1,7 +1,8 @@
 //! `DatabaseQueue` operations not covered elsewhere, on both backends and on
 //! `TestQueue` (so the in-memory queue is held to the same behaviour): dead job
 //! management, statistics queries, recurring jobs, throttle configuration, pause
-//! information and workflow dependency helpers.
+//! information, workflow dependency helpers and the in-place rescheduling of recurring
+//! jobs.
 
 #![cfg(any(feature = "postgres", feature = "mysql", feature = "test"))]
 
@@ -328,6 +329,97 @@ where
     queue.delete_job(plain).await.unwrap();
 }
 
+/// #71: a recurring job that ran is rescheduled in place (the same id) on every backend,
+/// whether the run succeeded or failed, and `reschedule_cron_job` moves the same job.
+async fn recurring_jobs_reschedule_in_place<Q>(queue: Arc<Q>)
+where
+    Q: DatabaseQueue + Send + Sync + 'static,
+{
+    use hammerwork::queue::JobOutcome;
+
+    let queue_name = test_utils::unique_queue("recurring_in_place");
+    let hourly = CronSchedule::new("0 0 * * * *").unwrap();
+    let mut job = Job::new(queue_name.clone(), json!({"n": 1}))
+        .with_cron(hourly)
+        .unwrap();
+    // Due now (an hour ago, so it is due on TestQueue's mock clock too).
+    job.scheduled_at = Utc::now() - Duration::hours(1);
+    job.next_run_at = Some(job.scheduled_at);
+    let id = queue.enqueue(job).await.unwrap();
+    let only_this_job = |jobs: Vec<Job>| jobs.iter().map(|j| j.id).collect::<Vec<_>>() == [id];
+
+    // A successful run: the same job goes back to Pending for its next slot.
+    let run = queue.dequeue(&queue_name).await.unwrap().expect("due job");
+    assert_eq!(run.id, id);
+    let recorded = queue
+        .finish_job_run(&run, JobOutcome::Completed)
+        .await
+        .unwrap()
+        .expect("current run");
+    assert_eq!(recorded.status, JobStatus::Pending);
+    let next = recorded.next_run_at.expect("next run");
+    let job = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Pending, "{job:?}");
+    assert!(job.recurring);
+    assert_eq!(job.attempts, 0);
+    assert_eq!(job.next_run_at, Some(next));
+    assert_eq!(job.scheduled_at, next);
+    assert!(job.started_at.is_none() && job.completed_at.is_none());
+    assert!(
+        only_this_job(queue.get_recurring_jobs(&queue_name).await.unwrap()),
+        "no new job was created for the next run"
+    );
+
+    // `reschedule_cron_job` moves the same job; a due job is listed as due.
+    let due_at = Utc::now() - Duration::minutes(1);
+    queue.reschedule_cron_job(id, due_at).await.unwrap();
+    let job = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Pending);
+    assert_eq!(
+        job.next_run_at.map(|t| t.timestamp()),
+        Some(due_at.timestamp())
+    );
+    assert!(only_this_job(
+        queue.get_due_cron_jobs(Some(&queue_name)).await.unwrap()
+    ));
+
+    // A failed run: also rescheduled in place, keeping the error until the next run.
+    let run = queue.dequeue(&queue_name).await.unwrap().expect("due job");
+    assert_eq!(run.id, id);
+    let recorded = queue
+        .finish_job_run(
+            &run,
+            JobOutcome::Dead {
+                error: "boom".to_string(),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("current run");
+    assert_eq!(recorded.status, JobStatus::Pending);
+    let job = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Pending, "{job:?}");
+    assert_eq!(job.error_message.as_deref(), Some("boom"));
+    assert_eq!(job.next_run_at, recorded.next_run_at);
+    assert!(only_this_job(
+        queue.get_recurring_jobs(&queue_name).await.unwrap()
+    ));
+
+    // Errors: a missing job, and a job that is not recurring.
+    assert!(matches!(
+        queue
+            .reschedule_cron_job(uuid::Uuid::new_v4(), due_at)
+            .await,
+        Err(hammerwork::HammerworkError::JobNotFound { .. })
+    ));
+    let plain = enqueue(&queue, &queue_name).await;
+    let err = queue.reschedule_cron_job(plain, due_at).await.unwrap_err();
+    assert!(err.to_string().contains("not a recurring job"), "{err}");
+
+    queue.delete_job(plain).await.unwrap();
+    queue.delete_job(id).await.unwrap();
+}
+
 /// The `DatabaseQueue` throttle methods use the queue's throttle registry.
 async fn throttle_configuration<Q>(queue: Arc<Q>)
 where
@@ -549,6 +641,7 @@ backend_tests!(
         statistics_queries,
         recurring_jobs,
         disable_and_enable_recurring_jobs,
+        recurring_jobs_reschedule_in_place,
         throttle_configuration,
         pause_information,
         workflow_dependency_helpers,
@@ -566,6 +659,7 @@ backend_tests!(
         statistics_queries,
         recurring_jobs,
         disable_and_enable_recurring_jobs,
+        recurring_jobs_reschedule_in_place,
         throttle_configuration,
         pause_information,
         workflow_dependency_helpers,
@@ -588,6 +682,7 @@ backend_tests!(
         statistics_queries,
         recurring_jobs,
         disable_and_enable_recurring_jobs,
+        recurring_jobs_reschedule_in_place,
         throttle_configuration,
         pause_information,
         workflow_dependency_helpers,

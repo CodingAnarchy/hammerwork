@@ -236,24 +236,34 @@ async fn test_cron_job_scheduling() {
     let queue = TestQueue::with_clock(clock.clone());
     
     // Create hourly cron job (every hour at minute 0)
-    let cron_job = Job::new("cron_queue".to_string(), json!({"task": "hourly_report"}))
-        .with_cron_schedule("0 0 * * * *".to_string()) // 6-field format with seconds
-        .with_timezone("UTC".to_string());
-    
-    queue.enqueue(cron_job).await.unwrap();
-    
-    // Process the first occurrence
+    let schedule = CronSchedule::new("0 0 * * * *").unwrap(); // 6-field format with seconds
+    let cron_job = Job::with_cron_schedule(
+        "cron_queue".to_string(),
+        json!({"task": "hourly_report"}),
+        schedule,
+    )
+    .unwrap();
+    let job_id = queue.enqueue_cron_job(cron_job).await.unwrap();
+
+    // Process the first occurrence, as a worker does
+    clock.advance(Duration::hours(1));
     let first_run = queue.dequeue("cron_queue").await.unwrap().unwrap();
-    queue.complete_job(first_run.id).await.unwrap();
-    
-    // Advance time by 59 minutes - next occurrence shouldn't be ready
-    clock.advance(Duration::minutes(59));
-    assert!(queue.dequeue("cron_queue").await.unwrap().is_none());
-    
-    // Advance to the next hour - next occurrence should be ready
-    clock.advance(Duration::minutes(2));
-    let second_run = queue.dequeue("cron_queue").await.unwrap();
-    assert!(second_run.is_some());
+    let recorded = queue
+        .finish_job_run(&first_run, JobOutcome::Completed)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The same job (same id) is rescheduled for the next occurrence, as on PostgreSQL
+    // and MySQL; no new job is created
+    let job = queue.get_job(job_id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Pending);
+    assert_eq!(job.next_run_at, recorded.next_run_at);
+
+    // The next occurrence runs once its time comes
+    clock.advance(Duration::hours(1));
+    let second_run = queue.dequeue("cron_queue").await.unwrap().unwrap();
+    assert_eq!(second_run.id, job_id);
 }
 ```
 
