@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-hammerwork"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "hammerwork"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "aes-gcm",
  "apache-avro",
@@ -2013,7 +2013,7 @@ dependencies = [
 
 [[package]]
 name = "hammerwork-web"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2849,7 +2849,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "mysql-integration"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "hammerwork",
@@ -3339,7 +3339,7 @@ checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "postgres-integration"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "hammerwork",

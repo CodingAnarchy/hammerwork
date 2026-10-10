@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-10
+
+### Upgrading from 2.0
+
+- **Struct literals.** `WorkerConfig` gained `result_cleanup_enabled` and
+  `result_cleanup_interval`, and `PayloadEncryptionConfig` gained `key_rotation`. Code
+  that builds these structs with a full struct literal must add the new fields or end
+  with `..Default::default()`. Configuration files, `from_file`, `Default` and the
+  builders are unaffected. ([#81](https://github.com/CodingAnarchy/hammerwork/issues/81)
+  will make such structs `#[non_exhaustive]` in 3.0.)
+- **Result cleanup is on by default.** Worker pools now delete expired job results every
+  5 minutes. Expired results were already unreadable through `get_job_result`, but
+  `Job::result_data` from `get_job` no longer shows them once cleaned. Set
+  `result_cleanup_enabled = false` or call `without_result_cleanup()` to opt out.
+- **Batch claims are opt-in.** `with_batch_processing_enabled(true)` alone still claims one
+  job at a time; use `with_batch_size(n)` to claim several per poll.
+
 ### Added
 
 - **Batch claims.** `DatabaseQueue::dequeue_batch(queue, n)` and
