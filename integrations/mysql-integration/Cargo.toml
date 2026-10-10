@@ -2,6 +2,7 @@
 name = "mysql-integration"
 description = "MySQL integration tests for Hammerwork job queue"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
