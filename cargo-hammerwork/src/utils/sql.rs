@@ -38,6 +38,7 @@ pub enum Bind {
     Text(String),
     Int(i64),
     Time(DateTime<Utc>),
+    Bool(bool),
 }
 
 /// Time units supported by [`SqlParams::ago`]. A closed enum so the unit keyword in the SQL
@@ -86,6 +87,10 @@ impl SqlParams {
 
     pub fn time(&mut self, value: DateTime<Utc>) -> String {
         self.bind(Bind::Time(value))
+    }
+
+    pub fn boolean(&mut self, value: bool) -> String {
+        self.bind(Bind::Bool(value))
     }
 
     /// A text id bound against a UUID column. PostgreSQL needs the `::uuid` cast (it will not
@@ -141,6 +146,7 @@ pub fn bind_pg<'q>(
             Bind::Text(s) => query.bind(s.as_str()),
             Bind::Int(i) => query.bind(*i),
             Bind::Time(t) => query.bind(*t),
+            Bind::Bool(b) => query.bind(*b),
         };
     }
     query
@@ -156,6 +162,7 @@ pub fn bind_mysql<'q>(
             Bind::Text(s) => query.bind(s.as_str()),
             Bind::Int(i) => query.bind(*i),
             Bind::Time(t) => query.bind(*t),
+            Bind::Bool(b) => query.bind(*b),
         };
     }
     query
@@ -222,6 +229,15 @@ mod tests {
         assert_eq!(p.binds().len(), 4);
         assert_eq!(p.binds()[0], Bind::Text("a".into()));
         assert_eq!(p.binds()[3], Bind::Int(2));
+    }
+
+    #[test]
+    fn booleans_are_bound() {
+        let mut p = SqlParams::new(Backend::Postgres);
+        assert_eq!(p.boolean(true), "$1");
+        let mut m = SqlParams::new(Backend::MySql);
+        assert_eq!(m.boolean(false), "?");
+        assert_eq!(m.into_binds(), vec![Bind::Bool(false)]);
     }
 
     #[test]
