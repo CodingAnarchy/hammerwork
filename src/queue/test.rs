@@ -349,6 +349,15 @@ impl TestStorage {
         Ok(())
     }
 
+    /// Move a job being enqueued onto the mock clock: `created_at` becomes `now` and
+    /// `scheduled_at` keeps its delay from the original `created_at` (an immediate
+    /// job, scheduled at its creation time, is scheduled at `now`).
+    fn stamp_enqueued(job: &mut Job, now: DateTime<Utc>) {
+        let delay = job.scheduled_at - job.created_at;
+        job.scheduled_at = now.checked_add_signed(delay).unwrap_or(job.scheduled_at);
+        job.created_at = now;
+    }
+
     /// Update a job's status
     fn update_job_status(&mut self, job_id: JobId, new_status: JobStatus) -> Result<()> {
         // Get old status first
@@ -1288,24 +1297,8 @@ impl DatabaseQueue for TestQueue {
         self.encryption.seal(std::slice::from_mut(&mut job)).await?;
         let mut storage = self.storage.write().await;
 
-        // Set timestamps using the mock clock
         let now = storage.clock.now();
-        let original_scheduled_at = job.scheduled_at;
-        let original_created_at = job.created_at;
-
-        // Calculate the delay from the original creation
-        let delay = original_scheduled_at - original_created_at;
-
-        job.created_at = now;
-
-        // For immediate jobs (where scheduled_at was set to created_at in Job::new()),
-        // update scheduled_at to use the mock clock time
-        if original_scheduled_at == original_created_at {
-            job.scheduled_at = now;
-        } else {
-            // For delayed jobs, preserve the delay but use mock clock time as base
-            job.scheduled_at = now + delay;
-        }
+        TestStorage::stamp_enqueued(&mut job, now);
         storage.settle_new_dependents(std::slice::from_mut(&mut job), now);
 
         // Store the job
@@ -1511,31 +1504,13 @@ impl DatabaseQueue for TestQueue {
         let batch_id = batch.id;
 
         // Enqueue all jobs in the batch
+        let now = storage.clock.now();
         let mut jobs = Vec::with_capacity(batch.jobs.len());
         for mut job in batch.jobs.iter().cloned() {
             job.batch_id = Some(batch_id);
-
-            // Apply the same timestamp logic as regular enqueue
-            let now = storage.clock.now();
-            let original_scheduled_at = job.scheduled_at;
-            let original_created_at = job.created_at;
-
-            // Calculate the delay from the original creation
-            let delay = original_scheduled_at - original_created_at;
-
-            job.created_at = now;
-
-            // For immediate jobs (where scheduled_at was set to created_at in Job::new()),
-            // update scheduled_at to use the mock clock time
-            if original_scheduled_at == original_created_at {
-                job.scheduled_at = now;
-            } else {
-                // For delayed jobs, preserve the delay but use mock clock time as base
-                job.scheduled_at = now + delay;
-            }
+            TestStorage::stamp_enqueued(&mut job, now);
             jobs.push(job);
         }
-        let now = storage.clock.now();
         storage.settle_new_dependents(&mut jobs, now);
         let mut job_ids = Vec::with_capacity(jobs.len());
         for job in jobs {
@@ -1568,61 +1543,43 @@ impl DatabaseQueue for TestQueue {
                     id: batch_id.to_string(),
                 })?;
 
-        let mut completed_jobs = 0;
-        let mut failed_jobs = 0;
-        let mut pending_jobs = 0;
+        // Like the database backends: tally the batch's jobs, archived ones with the
+        // status they were archived with, and collect the errors of its live jobs.
+        let mut counts: HashMap<String, i64> = HashMap::new();
         let mut job_errors = HashMap::new();
-
         for job_id in job_ids {
-            if let Some(job) = storage.jobs.get(job_id) {
-                match &job.status {
-                    JobStatus::Completed => completed_jobs += 1,
-                    JobStatus::Failed | JobStatus::Dead | JobStatus::TimedOut => {
-                        failed_jobs += 1;
-                        if let Some(error) = &job.error_message {
-                            job_errors.insert(job.id, error.clone());
-                        }
-                    }
-                    JobStatus::Pending | JobStatus::Retrying => pending_jobs += 1,
-                    JobStatus::Running => pending_jobs += 1, // Count running as pending
-                    JobStatus::Archived => {} // Archived jobs don't count in workflow stats
-                }
+            if let Some(status) = storage.status_with_archived(*job_id) {
+                *counts.entry(format!("{status:?}")).or_default() += 1;
+            }
+            if let Some(job) = storage.jobs.get(job_id)
+                && job.status != JobStatus::Archived
+                && let Some(error) = &job.error_message
+            {
+                job_errors.insert(job.id, error.clone());
             }
         }
 
-        let total_jobs = job_ids.len() as u32;
-        let status = if failed_jobs > 0
-            && batch.failure_mode == crate::batch::PartialFailureMode::FailFast
-        {
-            BatchStatus::Failed
-        } else if completed_jobs == total_jobs {
-            BatchStatus::Completed
-        } else if completed_jobs + failed_jobs == total_jobs {
-            BatchStatus::PartiallyFailed
-        } else {
-            BatchStatus::Processing
-        };
-
-        let completed_at = if status == BatchStatus::Completed || status == BatchStatus::Failed {
-            Some(storage.clock.now())
-        } else {
-            None
-        };
+        let total_jobs = u32::try_from(job_ids.len()).unwrap_or(u32::MAX);
+        let progress = crate::batch::BatchProgress::from_status_counts(
+            counts,
+            total_jobs,
+            &batch.failure_mode,
+        );
+        // The backends stamp `completed_at` once nothing in the batch is left to run.
+        let completed_at = (progress.pending == 0 && progress.status != BatchStatus::Pending)
+            .then(|| storage.clock.now());
 
         Ok(BatchResult {
             batch_id,
             total_jobs,
-            completed_jobs,
-            failed_jobs,
-            pending_jobs,
-            status,
+            completed_jobs: progress.completed,
+            failed_jobs: progress.failed,
+            pending_jobs: progress.pending,
+            status: progress.status,
             created_at: batch.created_at,
             completed_at,
-            error_summary: if !job_errors.is_empty() {
-                Some(format!("{} jobs failed", job_errors.len()))
-            } else {
-                None
-            },
+            error_summary: (progress.failed > 0)
+                .then(|| format!("{} of {} jobs failed", progress.failed, total_jobs)),
             job_errors,
         })
     }
@@ -2520,40 +2477,21 @@ impl DatabaseQueue for TestQueue {
         }
 
         // Enqueue all jobs
+        let now = storage.clock.now();
         let mut jobs = Vec::with_capacity(workflow.jobs.len());
         for mut job in workflow.jobs.iter().cloned() {
-            // Apply the same timestamp logic as regular enqueue
-            let now = storage.clock.now();
-            let original_scheduled_at = job.scheduled_at;
-            let original_created_at = job.created_at;
+            TestStorage::stamp_enqueued(&mut job, now);
 
-            // Calculate the delay from the original creation
-            let delay = original_scheduled_at - original_created_at;
-
-            job.created_at = now;
-
-            // Check if job has dependencies
+            // A job with dependencies is not available until they complete.
             let has_deps = workflow
                 .dependencies
                 .get(&job.id)
-                .map(|deps| !deps.is_empty())
-                .unwrap_or(false);
-
-            // If job has dependencies, don't make it immediately available
+                .is_some_and(|deps| !deps.is_empty());
             if has_deps {
                 job.scheduled_at = DateTime::<Utc>::MAX_UTC; // Far future
-            } else {
-                // For jobs without dependencies, apply normal timestamp logic
-                if original_scheduled_at == original_created_at {
-                    job.scheduled_at = now;
-                } else {
-                    // For delayed jobs, preserve the delay but use mock clock time as base
-                    job.scheduled_at = now + delay;
-                }
             }
             jobs.push(job);
         }
-        let now = storage.clock.now();
         storage.settle_new_dependents(&mut jobs, now);
         for job in jobs {
             let mut job = job;
@@ -2623,25 +2561,29 @@ impl DatabaseQueue for TestQueue {
         let storage = self.storage.read().await;
         let now = storage.clock.now();
 
-        let ready_jobs: Vec<Job> = storage
+        // As the database backends: pending, due jobs whose dependencies do not hold
+        // them back, by priority and then schedule.
+        let mut ready_jobs: Vec<Job> = storage
             .jobs
             .values()
             .filter(|job| {
-                job.queue_name == queue_name &&
-                job.status == JobStatus::Pending &&
-                job.scheduled_at <= now &&
-                // Check that all dependencies are satisfied
-                storage.dependencies.get(&job.id)
-                    .map(|deps| deps.is_empty() || deps.iter().all(|dep_id| {
-                        storage.jobs.get(dep_id)
-                            .map(|j| j.status == JobStatus::Completed)
-                            .unwrap_or(false)
-                    }))
-                    .unwrap_or(true)
+                job.queue_name == queue_name
+                    && job.status == JobStatus::Pending
+                    && matches!(
+                        job.dependency_status,
+                        DependencyStatus::None | DependencyStatus::Satisfied
+                    )
+                    && job.scheduled_at <= now
             })
-            .take(limit as usize)
             .cloned()
             .collect();
+        ready_jobs.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.scheduled_at.cmp(&b.scheduled_at))
+                .then(a.created_at.cmp(&b.created_at))
+        });
+        ready_jobs.truncate(limit as usize);
 
         Ok(ready_jobs)
     }
@@ -2683,24 +2625,37 @@ impl DatabaseQueue for TestQueue {
             })?
             .clone();
 
-        // Cancel all pending jobs
+        // As the database backends' `cancel_workflow_in_tx`: its unfinished jobs
+        // (pending, retrying and running) fail with "Workflow cancelled", and a
+        // workflow already failed keeps its `failed_at`.
         let now = storage.clock.now();
-        for job in &workflow.jobs {
-            if let Some(j) = storage.jobs.get(&job.id)
-                && (j.status == JobStatus::Pending || j.status == JobStatus::Running)
-            {
-                storage.update_job_status(job.id, JobStatus::Failed).ok();
-                if let Some(j) = storage.jobs.get_mut(&job.id) {
-                    j.error_message = Some("Workflow cancelled".to_string());
-                    j.failed_at = Some(now);
-                }
+        let mut job_ids: Vec<JobId> = workflow.jobs.iter().map(|job| job.id).collect();
+        let joined: Vec<JobId> = storage
+            .jobs
+            .values()
+            .filter(|job| job.workflow_id == Some(workflow_id) && !job_ids.contains(&job.id))
+            .map(|job| job.id)
+            .collect();
+        job_ids.extend(joined);
+        for job_id in job_ids {
+            let unfinished = storage.jobs.get(&job_id).is_some_and(|job| {
+                matches!(
+                    job.status,
+                    JobStatus::Pending | JobStatus::Running | JobStatus::Retrying
+                )
+            });
+            if unfinished {
+                storage.fail_as_side_effect(
+                    job_id,
+                    lifecycle::WORKFLOW_CANCELLED_MESSAGE.to_string(),
+                    now,
+                );
             }
         }
 
-        // Update workflow status
         if let Some(workflow) = storage.workflows.get_mut(&workflow_id) {
             workflow.status = WorkflowStatus::Cancelled;
-            workflow.failed_at = Some(now);
+            workflow.failed_at.get_or_insert(now);
         }
 
         Ok(())
@@ -2806,6 +2761,7 @@ impl DatabaseQueue for TestQueue {
 
     async fn restore_archived_job(&self, job_id: JobId) -> Result<Job> {
         let mut storage = self.storage.write().await;
+        let now = storage.clock.now();
 
         // Its dependencies may have finished (or failed) since it was archived.
         let dependency_status = match storage.jobs.get(&job_id) {
@@ -2825,8 +2781,10 @@ impl DatabaseQueue for TestQueue {
                 }
                 let queue_name = job.queue_name.clone(); // Clone to avoid borrow checker issues
 
-                // Restore job to pending status
-                job.status = JobStatus::Pending;
+                // Reset it as the database backends do, on the mock clock.
+                let mut restored = crate::archive::reset_for_restore(job.clone());
+                restored.scheduled_at = now;
+                *job = restored;
                 let restored_job = job.clone();
 
                 // Update queue structure
@@ -3413,7 +3371,7 @@ mod tests {
         let status = queue.get_batch_status(batch_id).await.unwrap();
         assert_eq!(status.total_jobs, 3);
         assert_eq!(status.pending_jobs, 3);
-        assert_eq!(status.status, BatchStatus::Processing);
+        assert_eq!(status.status, BatchStatus::Pending);
 
         // Process all jobs
         for _ in 0..3 {
@@ -4528,5 +4486,77 @@ mod tests {
             queue.retry_dead_job(id).await,
             Err(HammerworkError::InvalidJobTransition { .. })
         ));
+    }
+
+    /// `cancel_workflow` also fails `Retrying` jobs (a status only older versions
+    /// wrote), and a workflow that already failed keeps its `failed_at`, as the
+    /// database backends' `COALESCE` does.
+    #[tokio::test]
+    async fn cancel_workflow_fails_retrying_jobs_and_keeps_failed_at() {
+        let queue = TestQueue::new();
+        let retrying = Job::new("cancel_retrying".to_string(), json!({}));
+        let retrying_id = retrying.id;
+        let workflow_id = queue
+            .enqueue_workflow(JobGroup::new("cancel_retrying").add_job(retrying))
+            .await
+            .unwrap();
+        let failed_at = queue.clock().now() - chrono::Duration::hours(1);
+        {
+            let mut storage = queue.storage.write().await;
+            storage
+                .update_job_status(retrying_id, JobStatus::Retrying)
+                .unwrap();
+            storage.workflows.get_mut(&workflow_id).unwrap().failed_at = Some(failed_at);
+        }
+
+        queue.cancel_workflow(workflow_id).await.unwrap();
+
+        let job = queue.get_job(retrying_id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(
+            job.error_message.as_deref(),
+            Some(lifecycle::WORKFLOW_CANCELLED_MESSAGE)
+        );
+        let workflow = queue
+            .get_workflow_status(workflow_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workflow.status, WorkflowStatus::Cancelled);
+        assert_eq!(workflow.failed_at, Some(failed_at));
+    }
+
+    /// A restored job is scheduled on the mock clock, not the wall clock.
+    #[tokio::test]
+    async fn restored_job_is_scheduled_on_the_mock_clock() {
+        let clock = MockClock::new();
+        clock.set_time(Utc::now() - chrono::Duration::days(1));
+        let queue = TestQueue::with_clock(clock.clone());
+        let id = queue
+            .enqueue(Job::new("restore_clock".to_string(), json!({})))
+            .await
+            .unwrap();
+        queue.complete_job(id).await.unwrap();
+        let policy = crate::archive::ArchivalPolicy::new()
+            .archive_completed_after(chrono::Duration::zero())
+            .enabled(true);
+        let archived = queue
+            .archive_jobs(
+                None,
+                &policy,
+                &crate::archive::ArchivalConfig::new(),
+                crate::archive::ArchivalReason::Manual,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(archived.jobs_archived, 1);
+
+        let restored = queue.restore_archived_job(id).await.unwrap();
+        assert_eq!(restored.scheduled_at, clock.now());
+        assert_eq!(
+            queue.dequeue("restore_clock").await.unwrap().map(|j| j.id),
+            Some(id)
+        );
     }
 }
