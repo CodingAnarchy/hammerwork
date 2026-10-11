@@ -4,14 +4,10 @@ use chrono::Utc;
 use hammerwork::archive::{ArchivalReason, ArchiveEvent};
 use uuid::Uuid;
 
-#[cfg(feature = "postgres")]
 use chrono::Duration;
+use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, JobArchiver};
 #[cfg(feature = "postgres")]
-use hammerwork::{
-    Job,
-    archive::{ArchivalConfig, ArchivalPolicy, JobArchiver},
-    queue::DatabaseQueue,
-};
+use hammerwork::{Job, queue::DatabaseQueue};
 #[cfg(feature = "postgres")]
 use serde_json::json;
 #[cfg(feature = "postgres")]

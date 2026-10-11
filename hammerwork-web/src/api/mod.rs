@@ -595,7 +595,10 @@ mod tests {
             .enabled(true);
         assert_eq!(queue.count_archivable(Some("h"), &policy).await.unwrap(), 1);
         assert_eq!(
-            queue.count_archivable(Some("other"), &policy).await.unwrap(),
+            queue
+                .count_archivable(Some("other"), &policy)
+                .await
+                .unwrap(),
             0
         );
         assert_eq!(
