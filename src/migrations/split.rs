@@ -288,4 +288,73 @@ mod tests {
             }
         }
     }
+
+    /// Every bundled migration script: `(file name, contents)`.
+    fn bundled_migrations(suffix: &str) -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations");
+        let mut files: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("migrations directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.to_string_lossy().ends_with(suffix))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (
+                    name,
+                    std::fs::read_to_string(&path).expect("migration file"),
+                )
+            })
+            .collect();
+        files.sort();
+        assert!(!files.is_empty());
+        files
+    }
+
+    /// The text of `statement` without `--` line comments.
+    fn without_line_comments(statement: &str) -> String {
+        statement
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn postgres_migrations_do_not_manage_their_own_transaction() {
+        // The runner executes each migration in a transaction; a `COMMIT` inside the
+        // script would end it early and leave the rest of the migration outside it.
+        for (name, sql) in bundled_migrations(".postgres.sql") {
+            for statement in pg(&sql) {
+                let code = without_line_comments(&statement).trim().to_uppercase();
+                assert!(
+                    !matches!(
+                        code.as_str(),
+                        "BEGIN" | "COMMIT" | "ROLLBACK" | "START TRANSACTION"
+                    ),
+                    "{name} contains a top-level {code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_migrations_use_single_quoted_string_literals() {
+        // With sql_mode ANSI_QUOTES, "..." is an identifier, not a string.
+        for (name, sql) in bundled_migrations(".mysql.sql") {
+            for statement in my(&sql) {
+                let code = without_line_comments(&statement);
+                assert!(!code.contains('"'), "{name} uses a double quote: {code}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_bundled_migration_is_registered() {
+        let registry = include_str!("mod.rs");
+        for (name, _) in bundled_migrations(".sql") {
+            assert!(
+                registry.contains(&format!("include_str!(\"{name}\")")),
+                "{name} is not registered in migrations/mod.rs"
+            );
+        }
+    }
 }

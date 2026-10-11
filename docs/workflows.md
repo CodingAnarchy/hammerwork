@@ -235,7 +235,10 @@ will be retried do not trigger it. Dependency resolution and the policy run in t
 transaction as the job's status change, and the workflow's `completed_jobs`,
 `failed_jobs` and `status` are updated with it. A workflow is `completed` when every
 job completed, and `failed` as soon as a job fails under `FailFast`, or once every job
-has finished with at least one failure under the other policies.
+has finished with at least one failure under the other policies. Jobs that were
+archived (`hammerwork_jobs_archive`, see the [archiving guide](archiving.md)) still count,
+with the status they were archived with, so archiving a finished job never keeps its
+workflow from completing.
 
 ### FailFast (Default)
 
@@ -368,7 +371,13 @@ heartbeats stop extending its lease. Side effects the handler performed are not 
 
 ### Workflow Progress
 
-The `JobGroup` returned by `get_workflow_status` carries the counters:
+The `JobGroup` returned by `get_workflow_status` carries the counters. They, and its
+`status`, are computed from the workflow's jobs when it is read, archived jobs included,
+the same way every terminal transition computes them. `get_workflow_jobs` (and the
+`jobs` of the `JobGroup`) lists archived members too, with status `Archived`, as
+`get_job` reports them. Children spawned by a workflow job (see
+[job spawning](job-spawning.md)) join its workflow and raise its `total_jobs`, so the
+workflow completes only after they do, and fails if they fail.
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
@@ -566,6 +575,11 @@ let workflow = JobGroup::new("traced_workflow")
 ## Best Practices
 
 ### 1. Keep Dependencies Simple
+
+A job can depend on at most 1000 jobs (`hammerwork::job::MAX_JOB_DEPENDENCIES`) on every
+backend. Enqueueing a job with more fails with `HammerworkError::Workflow` before anything
+is written (`Job::validate_dependencies` runs the same check). For a larger fan-in, add
+intermediate jobs that each depend on a share of the parents.
 
 Prefer linear chains and simple fan-out/fan-in over dense dependency webs:
 

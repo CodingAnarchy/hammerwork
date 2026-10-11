@@ -49,6 +49,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like `JobQueue::from_config`.
 - **Streaming `Hash` partitioner** uses a stable FNV-1a hash, so partition keys change
   (they were a character sum, which collided for anagrams).
+- **`RetryStrategy::Linear` starts at `base`.** The first retry (`calculate_delay(1)`)
+  now waits `base`, then `base + increment`, `base + 2 × increment` and so on
+  (`base + (attempt - 1) × increment`), like `Fixed`, `Exponential` and `Fibonacci`
+  since 2.3.0 and as the variant's documentation said. It used to wait
+  `base + increment` first, so every linear delay is now one `increment` shorter.
+- **A job can depend on at most 1000 jobs on every backend.** `enqueue`,
+  `enqueue_batch`, `enqueue_workflow`, `enqueue_cron_job` and spawned children
+  (`complete_job_run_with_children`) refuse a job with more (or with more than 10000
+  cached `dependents`) with `HammerworkError::Workflow`, before writing anything.
+  PostgreSQL already refused them through a `CHECK` constraint (with a database error);
+  MySQL and `TestQueue` accepted them. `JobBatch::validate` and `JobGroup::validate`
+  run the same check; it is public as `Job::validate_dependencies`, with the limits in
+  `job::MAX_JOB_DEPENDENCIES` and `job::MAX_JOB_DEPENDENTS`.
+- **`get_workflow_status` computes `completed_jobs`, `failed_jobs` and `status` from the
+  workflow's jobs** (archived ones included) when it is read, as `get_batch_status`
+  does, instead of returning the stored counters. A workflow left `running` by the
+  archive bug below reads as finished. `get_workflow_jobs` (and `JobGroup::jobs`)
+  also lists archived members, with status `Archived`.
+- **Spawned children count towards their workflow.** A workflow whose job spawns
+  children now has a larger `total_jobs` and completes after them (see Fixed).
+- **`JobArchiver::run_scheduled_pass` applies per-queue policies** (`set_policy`): each
+  queue is archived and purged with its own policy, every other queue with the default
+  one, and a disabled policy leaves its queues alone. A pass with per-queue policies
+  works through the queues one at a time, using the new (defaulted) `DatabaseQueue`
+  methods `list_queue_names` and `purge_archived_jobs_in_queue`.
+  `WorkerPool::with_archival` (a single policy) is unchanged.
+
+### Database
+
+- **Migration 020 (`020_archive_retry_strategy_and_workflow_index`)** indexes
+  `hammerwork_jobs_archive(workflow_id)` on PostgreSQL and MySQL. On MySQL it also
+  widens `hammerwork_jobs_archive.retry_strategy` from `VARCHAR(50)` to `TEXT` and turns
+  the archive's timestamps into `TIMESTAMP(6)`, like `hammerwork_jobs`. It is idempotent.
+  Run it before upgrading: on MySQL, archiving a job with a retry strategy needs it.
+- Migration 012 (PostgreSQL) no longer runs its own `BEGIN;`/`COMMIT;`: the runner
+  already wraps each migration in a transaction, and the script's `COMMIT` ended it
+  early. MySQL migrations 010, 018 and 019 no longer use double-quoted string literals,
+  which `ANSI_QUOTES` reads as identifiers. Re-running them is unaffected.
 
 ### Fixed
 
@@ -73,6 +111,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Concurrent checks of the same alert reserve the cooldown under the write lock, so the
   alert is sent once instead of once per concurrent caller.
 - The streaming `Hash` partitioner no longer panics on overflow in debug builds.
+- **MySQL archival stopped for good on jobs with a retry strategy.** The archive's
+  `retry_strategy VARCHAR(50)` column was too short for nearly every serialized
+  strategy, so strict MySQL rejected the insert (error 1406), the batch rolled back, and
+  since candidates are taken oldest first every later pass, including
+  `WorkerPool::with_archival`, failed on the same jobs. Migration 020 widens it. (#111)
+- **MySQL archive timestamps were rounded to the second.** (#111)
+- **A workflow never completed once one of its finished jobs was archived**: its
+  progress counted only `hammerwork_jobs`. Workflow counters and status (every terminal
+  transition, `get_workflow_status`) now count archived member jobs with the status they
+  were archived with, on PostgreSQL, MySQL and `TestQueue`. (#111)
+- **Children spawned by a workflow job joined the workflow without raising its
+  `total_jobs`**, so the workflow could complete before they ran, and a child's later
+  failure never failed it. `complete_job_run_with_children` now raises the total of each
+  workflow its children join, in the same transaction, on both backends and
+  `TestQueue`. (#111)
+- **The dependency limit differed between backends** (see the behaviour change
+  above). (#111)
+- **`JobArchiver::run_scheduled_pass` ignored per-queue policies** although
+  `set_default_policy` documents that the default applies only to queues without a
+  policy of their own. (#111)
+- **`RetryStrategy::Linear` documentation and behaviour disagreed** (see the behaviour
+  change above). (#111)
+- Cleanups: `JobStatus::Retrying` is documented as never written by Hammerwork, the
+  batch-counter comment in both backends is accurate again, `get_priority_stats` decodes
+  priorities with `JobPriority::from_i32`, and a worker no longer reads a batch's status
+  twice after a job's final failure. (#111)
+
 
 ## [2.4.0] - 2026-10-11
 

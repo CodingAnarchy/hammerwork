@@ -354,6 +354,8 @@ impl JobBatch {
             });
         }
 
+        crate::job::validate_dependency_limits(&self.jobs)?;
+
         // Validate that all jobs have the same queue name
         if let Some(first_queue) = self.jobs.first().map(|j| &j.queue_name) {
             for (i, job) in self.jobs.iter().enumerate() {
@@ -655,6 +657,21 @@ mod tests {
         let result = batch.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("same queue name"));
+    }
+
+    #[test]
+    fn test_batch_validation_dependency_limit() {
+        let parents: Vec<uuid::Uuid> = (0..=crate::job::MAX_JOB_DEPENDENCIES)
+            .map(|_| uuid::Uuid::new_v4())
+            .collect();
+        let job = Job::new("queue1".to_string(), json!({})).depends_on_jobs(&parents);
+        let batch = JobBatch::new("fan_in").with_jobs(vec![job]);
+
+        let error = batch.validate().unwrap_err();
+        assert!(
+            matches!(&error, crate::HammerworkError::Workflow { message } if message.contains("at most 1000")),
+            "{error}"
+        );
     }
 
     #[test]

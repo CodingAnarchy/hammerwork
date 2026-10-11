@@ -26,6 +26,25 @@ use sqlx::MySql;
 /// throughout its lifecycle.
 pub type JobId = Uuid;
 
+/// The most jobs a single job can depend on (its `depends_on` list).
+///
+/// Enforced by every queue backend when a job is enqueued (see
+/// [`Job::validate_dependencies`]); PostgreSQL also has a `CHECK` constraint with the
+/// same limit. For a larger fan-in, add intermediate jobs that each depend on a share
+/// of the parents.
+pub const MAX_JOB_DEPENDENCIES: usize = 1000;
+
+/// The most job ids a job's cached `dependents` list can hold.
+///
+/// Enforced with [`MAX_JOB_DEPENDENCIES`] by [`Job::validate_dependencies`]; PostgreSQL
+/// also has a `CHECK` constraint with the same limit.
+pub const MAX_JOB_DEPENDENTS: usize = 10_000;
+
+/// Check [`Job::validate_dependencies`] for every job in `jobs`.
+pub(crate) fn validate_dependency_limits(jobs: &[Job]) -> crate::Result<()> {
+    jobs.iter().try_for_each(Job::validate_dependencies)
+}
+
 /// The current status of a job in its lifecycle.
 ///
 /// Jobs progress through various states from creation to completion or failure.
@@ -56,6 +75,11 @@ pub enum JobStatus {
     /// Job was terminated due to exceeding its timeout duration.
     TimedOut,
     /// Job failed but is scheduled for retry.
+    ///
+    /// Hammerwork itself never stores this status: a retry puts the job back to
+    /// `Pending` with a later `scheduled_at`. It is still read (and treated as an
+    /// unfinished job, like `Pending`) for rows written by older versions or by
+    /// external tools.
     Retrying,
     /// Job has been archived for long-term storage.
     Archived,
@@ -1544,6 +1568,55 @@ impl Job {
         self.depends_on.len()
     }
 
+    /// Checks that the job's dependency lists fit the limits every queue backend
+    /// enforces: at most [`MAX_JOB_DEPENDENCIES`] entries in `depends_on` and at most
+    /// [`MAX_JOB_DEPENDENTS`] in `dependents`.
+    ///
+    /// Enqueueing (`enqueue`, `enqueue_batch`, `enqueue_workflow`, `enqueue_cron_job`
+    /// and spawned children) runs this check before anything is written, so a job over
+    /// the limit is refused with
+    /// [`HammerworkError::Workflow`](crate::HammerworkError::Workflow) on PostgreSQL,
+    /// MySQL and the in-memory `TestQueue` alike.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use hammerwork::{Job, job::MAX_JOB_DEPENDENCIES};
+    /// use serde_json::json;
+    /// use uuid::Uuid;
+    ///
+    /// let parents: Vec<Uuid> = (0..MAX_JOB_DEPENDENCIES).map(|_| Uuid::new_v4()).collect();
+    /// let job = Job::new("fan_in".to_string(), json!({})).depends_on_jobs(&parents);
+    /// assert!(job.validate_dependencies().is_ok());
+    ///
+    /// let job = job.depends_on(&Uuid::new_v4());
+    /// assert!(job.validate_dependencies().is_err());
+    /// ```
+    pub fn validate_dependencies(&self) -> crate::Result<()> {
+        if self.depends_on.len() > MAX_JOB_DEPENDENCIES {
+            return Err(crate::HammerworkError::Workflow {
+                message: format!(
+                    "Job {} depends on {} jobs; a job can depend on at most {} jobs \
+                     (add intermediate jobs for a larger fan-in)",
+                    self.id,
+                    self.depends_on.len(),
+                    MAX_JOB_DEPENDENCIES
+                ),
+            });
+        }
+        if self.dependents.len() > MAX_JOB_DEPENDENTS {
+            return Err(crate::HammerworkError::Workflow {
+                message: format!(
+                    "Job {} lists {} dependents; at most {} are allowed",
+                    self.id,
+                    self.dependents.len(),
+                    MAX_JOB_DEPENDENTS
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Gets the number of jobs that depend on this job.
     ///
     /// # Examples
@@ -2498,8 +2571,8 @@ mod tests {
         );
         assert_eq!(
             job.retry_strategy.as_ref().unwrap().calculate_delay(3),
-            Duration::from_secs(7),
-            "base + 3 * increment"
+            Duration::from_secs(5),
+            "base + (3 - 1) * increment"
         );
         let job = Job::new("q".to_string(), json!({}))
             .with_fibonacci_backoff(Duration::from_secs(1), Some(Duration::from_secs(4)));
@@ -2624,5 +2697,31 @@ mod tests {
             kept.get_retention_policy(),
             Some(&RetentionPolicy::KeepIndefinitely)
         );
+    }
+
+    #[test]
+    fn dependency_limits_match_the_postgres_constraints() {
+        let ids = |n: usize| (0..n).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let job = Job::new("q".to_string(), json!({}));
+        assert!(job.validate_dependencies().is_ok());
+
+        let at_limit = job.clone().depends_on_jobs(&ids(MAX_JOB_DEPENDENCIES));
+        assert!(at_limit.validate_dependencies().is_ok());
+        let over = at_limit.depends_on(&Uuid::new_v4());
+        match over.validate_dependencies() {
+            Err(crate::HammerworkError::Workflow { message }) => {
+                assert!(message.contains("depends on 1001 jobs"), "{message}");
+                assert!(message.contains("at most 1000"), "{message}");
+            }
+            other => panic!("expected a workflow error, got {other:?}"),
+        }
+
+        let mut many_dependents = job.clone();
+        many_dependents.dependents = ids(MAX_JOB_DEPENDENTS);
+        assert!(many_dependents.validate_dependencies().is_ok());
+        many_dependents.dependents.push(Uuid::new_v4());
+        assert!(many_dependents.validate_dependencies().is_err());
+
+        assert!(validate_dependency_limits(&[job, over]).is_err());
     }
 }

@@ -9,7 +9,7 @@ SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'workflow_id') = 0,
     'ALTER TABLE hammerwork_jobs_archive ADD COLUMN workflow_id CHAR(36) NULL',
-    'SELECT "workflow_id column already exists"'
+    'SELECT 1'
 );
 PREPARE stmt FROM @sql;
 EXECUTE stmt;
@@ -19,7 +19,7 @@ SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive' AND column_name = 'workflow_name') = 0,
     'ALTER TABLE hammerwork_jobs_archive ADD COLUMN workflow_name VARCHAR(255) NULL',
-    'SELECT "workflow_name column already exists"'
+    'SELECT 1'
 );
 PREPARE stmt FROM @sql;
 EXECUTE stmt;

@@ -348,6 +348,11 @@ pub(crate) fn count_map(rows: Vec<(String, i64)>, column: &str) -> Result<HashMa
         .collect()
 }
 
+/// The priority stored as `value`; unknown values count as `Normal` in statistics.
+pub(crate) fn priority_or_normal(value: i32) -> crate::priority::JobPriority {
+    crate::priority::JobPriority::from_i32(value).unwrap_or(crate::priority::JobPriority::Normal)
+}
+
 /// The priorities a weighted dequeue tries.
 pub(crate) const ALL_PRIORITIES: [crate::priority::JobPriority; 5] = [
     crate::priority::JobPriority::Critical,
@@ -504,4 +509,21 @@ pub(crate) fn run_started_range(run: &Job) -> Option<(DateTime<Utc>, DateTime<Ut
 pub(crate) fn clamp_interval(duration: std::time::Duration) -> chrono::Duration {
     const MAX: std::time::Duration = std::time::Duration::from_secs(100 * 365 * 24 * 3600);
     saturating_chrono_duration(duration.min(MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::priority::JobPriority;
+
+    #[test]
+    fn stored_priorities_decode_with_a_normal_fallback() {
+        assert_eq!(priority_or_normal(0), JobPriority::Background);
+        assert_eq!(priority_or_normal(1), JobPriority::Low);
+        assert_eq!(priority_or_normal(2), JobPriority::Normal);
+        assert_eq!(priority_or_normal(3), JobPriority::High);
+        assert_eq!(priority_or_normal(4), JobPriority::Critical);
+        assert_eq!(priority_or_normal(-1), JobPriority::Normal);
+        assert_eq!(priority_or_normal(99), JobPriority::Normal);
+    }
 }

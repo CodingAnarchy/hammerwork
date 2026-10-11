@@ -115,6 +115,8 @@ assert!(!config.with_compression_verification(false).verify_compression);
 
 `JobArchiver` keeps a policy per queue plus a global configuration, and runs archival with a progress callback or an event stream. A queue without its own policy, and an operation over all queues (`None`), uses the archiver's default policy: `ArchivalPolicy::default()` unless changed with `set_default_policy` / `with_default_policy`.
 
+`JobArchiver::run_scheduled_pass` applies these policies too: each queue with a policy of its own is archived and purged (`purge_archived_after`) with that policy, and every other queue with the default policy. A disabled policy leaves its queue alone, so a disabled default policy with per-queue policies archives only those queues. Without per-queue policies the pass covers all queues in one go; with them it lists the queues (`DatabaseQueue::list_queue_names`, queues with live or archived jobs) and works through them one at a time, purging each with `DatabaseQueue::purge_archived_jobs_in_queue`.
+
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
 # #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
@@ -459,7 +461,7 @@ println!("Permanently purged {} archived jobs", purged_count);
 # }
 ```
 
-There is no per-queue or per-status purge and no purge preview in the library API. The CLI
+`purge_archived_jobs_in_queue(queue_name, older_than)` purges a single queue's archived jobs. There is no per-status purge and no purge preview in the library API. The CLI
 (`archive purge --dry-run`) can show what a purge would delete.
 
 ## CLI Archival Commands

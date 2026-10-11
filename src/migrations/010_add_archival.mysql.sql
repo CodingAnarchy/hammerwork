@@ -77,7 +77,7 @@ SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns 
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'archived_at') = 0,
     'ALTER TABLE hammerwork_jobs ADD COLUMN archived_at TIMESTAMP NULL',
-    'SELECT "archived_at column already exists"'
+    'SELECT 1'
 );
 PREPARE stmt FROM @sql;
 EXECUTE stmt;
@@ -87,7 +87,7 @@ SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns 
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'archival_reason') = 0,
     'ALTER TABLE hammerwork_jobs ADD COLUMN archival_reason VARCHAR(50) NULL',
-    'SELECT "archival_reason column already exists"'
+    'SELECT 1'
 );
 PREPARE stmt FROM @sql;
 EXECUTE stmt;
@@ -97,7 +97,7 @@ SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns 
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'archival_policy_applied') = 0,
     'ALTER TABLE hammerwork_jobs ADD COLUMN archival_policy_applied VARCHAR(100) NULL',
-    'SELECT "archival_policy_applied column already exists"'
+    'SELECT 1'
 );
 PREPARE stmt FROM @sql;
 EXECUTE stmt;

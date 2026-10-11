@@ -523,5 +523,21 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("019_add_archive_workflow.postgres.sql").to_string(),
             include_str!("019_add_archive_workflow.mysql.sql").to_string(),
         );
+
+        // Migration 020: Widen archived retry strategies (MySQL), index archived jobs by
+        // workflow, keep microseconds in MySQL archive timestamps
+        self.register_migration(
+            Migration {
+                id: "020_archive_retry_strategy_and_workflow_index".to_string(),
+                description: "Widen archived retry_strategy and index archived jobs by workflow"
+                    .to_string(),
+                version: 20,
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-10-11T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("020_archive_retry_strategy_and_workflow_index.postgres.sql").to_string(),
+            include_str!("020_archive_retry_strategy_and_workflow_index.mysql.sql").to_string(),
+        );
     }
 }

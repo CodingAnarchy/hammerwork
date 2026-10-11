@@ -1,8 +1,6 @@
 -- Migration 012: Optimize job dependencies using native PostgreSQL arrays
 -- Converts JSONB dependency arrays to native UUID[] arrays for better performance
--- This migration is wrapped in a transaction for safety
-
-BEGIN;
+-- The migration runner executes the whole migration in one transaction.
 
 -- Steps 1-7 convert the JSONB columns to UUID[] and are only run while depends_on is still
 -- JSONB. Re-running the migration after it has been applied (e.g. when its record in
@@ -101,5 +99,3 @@ DROP CONSTRAINT IF EXISTS chk_dependents_size;
 ALTER TABLE hammerwork_jobs 
 ADD CONSTRAINT chk_dependents_size 
 CHECK (array_length(dependents, 1) IS NULL OR array_length(dependents, 1) <= 10000);
-
-COMMIT;

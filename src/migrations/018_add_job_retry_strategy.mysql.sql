@@ -8,7 +8,7 @@ SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND column_name = 'retry_strategy') = 0,
     'ALTER TABLE hammerwork_jobs ADD COLUMN retry_strategy JSON NULL',
-    'SELECT "retry_strategy column already exists"'
+    'SELECT 1'
 );
 PREPARE stmt FROM @sql;
 EXECUTE stmt;
@@ -20,7 +20,7 @@ SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.statistics
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs' AND index_name = 'idx_hammerwork_jobs_batch_status') = 0,
     'CREATE INDEX idx_hammerwork_jobs_batch_status ON hammerwork_jobs (batch_id, status)',
-    'SELECT "idx_hammerwork_jobs_batch_status already exists"'
+    'SELECT 1'
 );
 PREPARE stmt FROM @sql;
 EXECUTE stmt;

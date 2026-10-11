@@ -790,16 +790,24 @@ where
         &self.default_policy
     }
 
-    /// One scheduled archival pass over every queue with the
-    /// [default policy](Self::set_default_policy): archives eligible jobs batch by batch
-    /// with [`ArchivalReason::Automatic`], then, when the policy sets
-    /// `purge_archived_after`, deletes archived jobs older than that. This is what
+    /// One scheduled archival pass over every queue: archives eligible jobs batch by
+    /// batch with [`ArchivalReason::Automatic`], then deletes archived jobs older than
+    /// the policy's `purge_archived_after`, when it sets one. This is what
     /// [`WorkerPool::with_archival`](crate::WorkerPool::with_archival) runs on its
-    /// interval. Does nothing when the policy is disabled.
+    /// interval.
     ///
-    /// `should_stop` is checked before each batch and before the purge; when it returns
-    /// `true` the pass returns early with `stopped_early` set. A batch that has started
-    /// always commits or rolls back as a whole.
+    /// Each queue follows its own policy ([`set_policy`](Self::set_policy)) and every
+    /// other queue the [default policy](Self::set_default_policy); a disabled policy
+    /// leaves its queues alone. Without per-queue policies the pass runs over all queues
+    /// at once. With them, the queues without a policy are listed with
+    /// [`DatabaseQueue::list_queue_names`](crate::queue::DatabaseQueue::list_queue_names)
+    /// and purged with
+    /// [`DatabaseQueue::purge_archived_jobs_in_queue`](crate::queue::DatabaseQueue::purge_archived_jobs_in_queue),
+    /// one queue at a time.
+    ///
+    /// `should_stop` is checked before each batch, before each queue and before each
+    /// purge; when it returns `true` the pass returns early with `stopped_early` set. A
+    /// batch that has started always commits or rolls back as a whole.
     ///
     /// Safe to run from several processes at once: each batch locks its rows with
     /// `FOR UPDATE SKIP LOCKED` and moves them in one transaction, so a job is archived
@@ -814,36 +822,100 @@ where
         Q: crate::queue::DatabaseQueue,
         S: Fn() -> bool,
     {
-        let policy = &self.default_policy;
         let mut pass = ScheduledArchivalPass::default();
-        if !policy.enabled {
+        if self.policies.is_empty() {
+            // Every queue follows the default policy: one pass over all of them.
+            let policy = &self.default_policy;
+            if policy.enabled {
+                self.scheduled_pass_for(queue, None, policy, archived_by, &should_stop, &mut pass)
+                    .await?;
+            }
             return Ok(pass);
         }
 
+        // Queues with their own policy, then (when the default policy is enabled) every
+        // other queue that has jobs or archived jobs.
+        let mut plan: Vec<(String, &ArchivalPolicy)> = self
+            .policies
+            .iter()
+            .map(|(name, policy)| (name.clone(), policy))
+            .collect();
+        if self.default_policy.enabled {
+            for name in queue.list_queue_names().await? {
+                if !self.policies.contains_key(&name) {
+                    plan.push((name, &self.default_policy));
+                }
+            }
+        }
+        plan.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, policy) in plan {
+            if !policy.enabled {
+                continue;
+            }
+            if should_stop() {
+                pass.stopped_early = true;
+                break;
+            }
+            self.scheduled_pass_for(
+                queue,
+                Some(&name),
+                policy,
+                archived_by,
+                &should_stop,
+                &mut pass,
+            )
+            .await?;
+            if pass.stopped_early {
+                break;
+            }
+        }
+        Ok(pass)
+    }
+
+    /// The scheduled pass for one queue (`queue_name`), or for all queues (`None`),
+    /// with `policy`: archive, then purge. Adds to `pass` and sets `stopped_early` when
+    /// `should_stop` ended it.
+    async fn scheduled_pass_for<Q, S>(
+        &self,
+        queue: &Q,
+        queue_name: Option<&str>,
+        policy: &ArchivalPolicy,
+        archived_by: Option<&str>,
+        should_stop: &S,
+        pass: &mut ScheduledArchivalPass,
+    ) -> Result<()>
+    where
+        Q: crate::queue::DatabaseQueue,
+        S: Fn() -> bool,
+    {
         let (stats, stopped) = self
             .archive_in_batches(
                 queue,
-                None,
+                queue_name,
                 policy,
                 ArchivalReason::Automatic,
                 archived_by,
                 |_| {},
-                &should_stop,
+                should_stop,
             )
             .await?;
-        pass.jobs_archived = stats.jobs_archived;
+        pass.jobs_archived += stats.jobs_archived;
 
         if let Some(after) = policy.purge_archived_after {
             if stopped || should_stop() {
                 pass.stopped_early = true;
-                return Ok(pass);
+                return Ok(());
             }
             if let Some(older_than) = age_threshold(Utc::now(), after) {
-                pass.jobs_purged = queue.purge_archived_jobs(older_than).await?;
+                pass.jobs_purged += match queue_name {
+                    Some(name) => queue.purge_archived_jobs_in_queue(name, older_than).await?,
+                    None => queue.purge_archived_jobs(older_than).await?,
+                };
             }
         }
-        pass.stopped_early = stopped;
-        Ok(pass)
+        pass.stopped_early |= stopped;
+        Ok(())
     }
 
     /// Sets the archival policy for a specific queue.
