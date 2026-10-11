@@ -176,6 +176,11 @@ pub fn metrics_period_hours(period: &str) -> u32 {
     }
 }
 
+/// The statuses of jobs that failed: `Failed` (a failed dependency, a fail-fast batch or
+/// workflow, `fail_job`), `Dead` (out of retries) and `TimedOut`. A `TimedOut` job has
+/// `timed_out_at` and no `failed_at`.
+const FAILURE_STATUSES: &str = "('Failed', 'Dead', 'TimedOut')";
+
 /// Job counts by outcome within the last `hours`. The window is evaluated first and the
 /// optional queue filter last, matching the bind order.
 pub fn build_throughput_query(
@@ -193,7 +198,7 @@ pub fn build_throughput_query(
         format!(
             "SELECT COUNT(*) as total_jobs, \
              COUNT(CASE WHEN status = 'Completed' THEN 1 END) as completed_jobs, \
-             COUNT(CASE WHEN status = 'Failed' THEN 1 END) as failed_jobs \
+             COUNT(CASE WHEN status IN {FAILURE_STATUSES} THEN 1 END) as failed_jobs \
              FROM hammerwork_jobs WHERE created_at > {since}{queue_filter}"
         ),
         params.into_binds(),
@@ -320,7 +325,7 @@ pub enum HealthCount {
     Stuck,
     /// Jobs created in the last hour.
     RecentJobs,
-    /// Jobs that failed in the last hour.
+    /// Jobs that failed (`Failed`, `Dead` or `TimedOut`) in the last hour.
     RecentFailures,
 }
 
@@ -332,7 +337,9 @@ pub fn build_health_count_query(backend: Backend, which: HealthCount) -> (String
     let condition = match which {
         HealthCount::Stuck => format!("status = 'Running' AND started_at < {hour_ago}"),
         HealthCount::RecentJobs => format!("created_at > {hour_ago}"),
-        HealthCount::RecentFailures => format!("status = 'Failed' AND failed_at > {hour_ago}"),
+        HealthCount::RecentFailures => format!(
+            "status IN {FAILURE_STATUSES} AND COALESCE(failed_at, timed_out_at) > {hour_ago}"
+        ),
     };
     (
         format!("SELECT COUNT(*) as count FROM hammerwork_jobs WHERE {condition}"),
@@ -672,10 +679,19 @@ mod tests {
         done.started_long_ago = true;
         seed(&pool, &done).await;
         seed(&pool, &SeedJob::new(&other, "Pending")).await;
+        // Jobs out of retries end Dead, not Failed: they are failures too.
+        let mut dead = SeedJob::new(&hostile, "Dead");
+        dead.failed_now = true;
+        seed(&pool, &dead).await;
+        seed(&pool, &SeedJob::new(&hostile, "TimedOut")).await;
 
         let (sql, binds) = build_throughput_query(pool.backend(), 1, Some(&hostile));
         assert_eq!(
             fetch_i64(&pool, &sql, &binds, "total_jobs").await.unwrap(),
+            4
+        );
+        assert_eq!(
+            fetch_i64(&pool, &sql, &binds, "failed_jobs").await.unwrap(),
             2
         );
         assert_eq!(
@@ -686,10 +702,10 @@ mod tests {
         );
         let (sql, binds) = build_status_counts_query(pool.backend(), Some(&hostile));
         let statuses = column_strings(&pool, &sql, &binds, "status").await;
-        assert_eq!(statuses, vec!["Completed", "Pending"]);
+        assert_eq!(statuses, vec!["Completed", "Dead", "Pending", "TimedOut"]);
         let (sql, binds) = build_recent_jobs_query(pool.backend(), Some(&hostile));
         let queues = column_strings(&pool, &sql, &binds, "queue_name").await;
-        assert_eq!(queues, vec![hostile.clone(), hostile.clone()]);
+        assert_eq!(queues, vec![hostile.clone(); 4]);
 
         display_dashboard_data(&pool, &Some(hostile.clone()))
             .await
@@ -787,8 +803,14 @@ mod tests {
             sql.ends_with("created_at > DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? HOUR)"),
             "{sql}"
         );
-        let (sql, _) = build_health_count_query(Backend::MySql, HealthCount::RecentFailures);
-        assert!(sql.contains("status = 'Failed' AND failed_at > DATE_SUB(UTC_TIMESTAMP(6)"));
+        let (sql, binds) = build_health_count_query(Backend::MySql, HealthCount::RecentFailures);
+        assert!(
+            sql.ends_with(
+                "status IN ('Failed', 'Dead', 'TimedOut') AND COALESCE(failed_at, timed_out_at) > DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? HOUR)"
+            ),
+            "{sql}"
+        );
+        assert_eq!(binds, vec![Bind::Int(1)]);
     }
 
     #[test]

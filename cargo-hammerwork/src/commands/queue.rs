@@ -319,6 +319,20 @@ async fn show_queue_stats(pool: DatabasePool, queue: Option<String>, detailed: b
     }
 }
 
+/// The icon `queue stats` shows beside a job status.
+fn status_icon(status: &str) -> &'static str {
+    match status.to_lowercase().as_str() {
+        "pending" => "🟡",
+        "running" => "🔵",
+        "completed" => "🟢",
+        "failed" => "🔴",
+        "dead" => "💀",
+        "retrying" => "🟠",
+        "timedout" | "timed_out" => "⏰",
+        _ => "❓",
+    }
+}
+
 async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<()> {
     let (base_query, base_binds) = build_status_counts_query(pool.backend(), queue.as_deref());
 
@@ -329,18 +343,8 @@ async fn show_basic_stats(pool: DatabasePool, queue: Option<String>) -> Result<(
         let status: String = row.try_get("status")?;
         let count: i64 = row.try_get("count")?;
 
-        let status_icon = match status.to_lowercase().as_str() {
-            "pending" => "🟡",
-            "running" => "🔵",
-            "completed" => "🟢",
-            "failed" => "🔴",
-            "dead" => "💀",
-            "retrying" => "🟠",
-            _ => "❓",
-        };
-
         table.add_row(vec![
-            format!("{} {}", status_icon, status),
+            format!("{} {}", status_icon(&status), status),
             count.to_string(),
         ]);
     });
@@ -532,6 +536,22 @@ async fn list_paused_queues(pool: DatabasePool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_job_status_has_a_stats_icon() {
+        for status in [
+            "Pending",
+            "Running",
+            "Completed",
+            "Failed",
+            "Dead",
+            "Retrying",
+            "TimedOut",
+        ] {
+            assert_ne!(status_icon(status), "❓", "{status}");
+        }
+        assert_eq!(status_icon("Archived?"), "❓");
+    }
     use crate::utils::test_support::*;
 
     #[test]

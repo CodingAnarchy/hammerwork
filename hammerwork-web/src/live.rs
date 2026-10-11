@@ -42,9 +42,9 @@ pub const POLL_OVERLAP: chrono::Duration = chrono::Duration::seconds(5);
 /// What a job looked like when it was last pushed: its status, attempts and change time.
 type SentState = (String, i32, DateTime<Utc>);
 
-/// The queue statistics last pushed for a queue: pending, running, completed, dead and
-/// timed out counts.
-type QueueCounts = [u64; 5];
+/// The queue statistics last pushed for a queue: pending, running, completed, failed,
+/// dead and timed out counts.
+type QueueCounts = [u64; 6];
 
 /// Polls the database for job and queue changes and pushes them to WebSocket clients.
 pub struct LiveUpdates<Q> {
@@ -244,19 +244,21 @@ impl<Q: JobHistory + 'static> LiveUpdates<Q> {
                 queue.pending_count,
                 queue.running_count,
                 queue.completed_count,
+                queue.statistics.failed,
                 queue.dead_count,
                 queue.timed_out_count,
             ];
             if self.queues.insert(queue.queue_name.clone(), counts) == Some(counts) {
                 continue;
             }
+            let failed_count = crate::api::failed_job_count(&queue);
             changed.push((
                 queue.queue_name,
                 QueueStats {
                     pending_count: queue.pending_count,
                     running_count: queue.running_count,
                     completed_count: queue.completed_count,
-                    failed_count: queue.statistics.failed,
+                    failed_count,
                     dead_count: queue.dead_count,
                     throughput_per_minute: queue.statistics.throughput_per_minute,
                     avg_processing_time_ms: queue.statistics.avg_processing_time_ms,
@@ -538,6 +540,20 @@ mod tests {
         // A queue that disappears is forgotten.
         live.changed_queues(vec![stats("a", 1)]);
         assert_eq!(live.queues.len(), 1);
+
+        // A change in the `Failed` jobs alone is pushed, and `failed_count` counts every
+        // failed job (`Failed`, `Dead` and `TimedOut`), as the REST API does.
+        let mut failing = stats("a", 1);
+        failing.statistics.failed = 2;
+        failing.dead_count = 3;
+        failing.timed_out_count = 4;
+        live.changed_queues(vec![failing.clone()]);
+        let mut more_failed = failing.clone();
+        more_failed.statistics.failed = 5;
+        let changed = live.changed_queues(vec![more_failed]);
+        assert_eq!(changed.len(), 1, "a change in Failed jobs is pushed");
+        assert_eq!(changed[0].1.failed_count, 5 + 3 + 4);
+        assert_eq!(changed[0].1.dead_count, 3);
     }
 
     /// Without connected clients the poller does not touch the database (the queue here

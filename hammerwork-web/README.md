@@ -188,7 +188,7 @@ curl -u admin:password http://localhost:8080/api/stats/overview
 - `GET /health` - Health check (no auth required)
 - `GET /api/stats/overview` - System overview statistics
 - `GET /api/stats/detailed` - Per-queue statistics, hourly trends, error patterns and performance metrics
-- `GET /api/stats/trends` - Completed/failed jobs per hour from the database (last 24 hours, or a `time_range` of up to 31 days)
+- `GET /api/stats/trends` - Completed/failed jobs per hour from the database (last 24 hours, or the last `?hours=N` hours, up to 31 days)
 - `GET /api/stats/health` - Health assessment
 
 Values the dashboard cannot measure are reported as `null` (for example memory usage on macOS, worker counts, CPU, and the metrics count), never as made-up numbers. "Failed" in trends and error patterns means jobs currently in `Failed`, `Dead` or `TimedOut`, counted at the hour they failed.
@@ -203,8 +203,9 @@ Values the dashboard cannot measure are reported as `null` (for example memory u
 - `GET /api/jobs?status=failed&limit=50` - List jobs with filters
 - `GET /api/jobs/{id}` - Get job details
 - `POST /api/jobs` - Create new job
-- `POST /api/jobs/{id}/retry` - Retry failed job
-- `DELETE /api/jobs/{id}` - Delete job
+- `POST /api/jobs/{id}/actions` - `{"action": "retry" | "cancel" | "delete"}`; `retry` re-queues the job, `cancel` and `delete` delete it
+- `POST /api/jobs/bulk` - `{"job_ids": [...], "action": ...}`, the same actions for several jobs
+- `POST /api/jobs/search` - Search jobs (`{"query": ..., "queues": [...], "statuses": [...], ...}`)
 
 #### Archive Management
 - `GET /api/archive/jobs?queue=email&limit=50` - List archived jobs with filters

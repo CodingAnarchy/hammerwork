@@ -348,7 +348,7 @@ where
                     pending: stats.pending_count,
                     running: stats.running_count,
                     completed_total: stats.completed_count,
-                    failed_total: stats.dead_count + stats.timed_out_count,
+                    failed_total: super::failed_job_count(stats),
                     dead_total: stats.dead_count,
                     throughput_per_minute: stats.statistics.throughput_per_minute,
                     avg_processing_time_ms: stats.statistics.avg_processing_time_ms,
@@ -555,7 +555,7 @@ fn generate_overview_from_stats(
         total_pending += stat.pending_count;
         total_running += stat.running_count;
         total_completed += stat.completed_count;
-        total_failed += stat.dead_count + stat.timed_out_count;
+        total_failed += super::failed_job_count(stat);
         total_dead += stat.dead_count;
         total_throughput += stat.statistics.throughput_per_minute;
         total_processing_time += stat.statistics.avg_processing_time_ms;
@@ -804,6 +804,26 @@ fn extract_error_type(error_msg: &str) -> String {
 mod tests {
     use super::*;
     use crate::api::test_support::{body_json, unreachable_queue};
+
+    #[test]
+    fn test_overview_counts_failed_dead_and_timed_out_jobs_as_failed() {
+        let mut stats = hammerwork::stats::QueueStats {
+            queue_name: "q".to_string(),
+            pending_count: 1,
+            running_count: 0,
+            dead_count: 2,
+            timed_out_count: 3,
+            completed_count: 4,
+            statistics: Default::default(),
+        };
+        // Jobs in status `Failed` (a failed dependency, a fail-fast batch, `fail_job`)
+        stats.statistics.failed = 5;
+        let overview = generate_overview_from_stats(&[stats], 0);
+        assert_eq!(overview.failed_jobs, 5 + 2 + 3);
+        assert_eq!(overview.dead_jobs, 2);
+        assert_eq!(overview.total_jobs, 1 + 4 + 10);
+        assert!((overview.overall_error_rate - 10.0 / 15.0).abs() < 1e-9);
+    }
 
     fn state() -> Arc<tokio::sync::RwLock<crate::api::system::SystemState>> {
         Arc::new(tokio::sync::RwLock::new(
