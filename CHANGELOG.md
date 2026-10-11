@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Docs: `docs/integration-testing.md` now describes the real CI workflow and queue module paths.
+
 ## [2.2.0] - 2026-10-11
 
 A fix and cleanup release. It is a minor version because it adds public API with default
