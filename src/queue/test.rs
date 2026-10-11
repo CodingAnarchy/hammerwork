@@ -586,17 +586,34 @@ impl TestStorage {
     /// stand in for the status the database backends keep in the archive.
     fn dependency_states(&self, ids: &[JobId]) -> HashMap<JobId, JobStatus> {
         ids.iter()
-            .filter_map(|id| {
-                let job = self.jobs.get(id)?;
-                let status = match job.status {
-                    JobStatus::Archived if job.completed_at.is_some() => JobStatus::Completed,
-                    JobStatus::Archived if job.timed_out_at.is_some() => JobStatus::TimedOut,
-                    JobStatus::Archived if job.failed_at.is_some() => JobStatus::Failed,
-                    status => status,
-                };
-                Some((*id, status))
-            })
+            .filter_map(|id| Some((*id, self.status_with_archived(*id)?)))
             .collect()
+    }
+
+    /// The status of `job_id`; an archived job reports the status it was archived with,
+    /// as the database backends read it from the archive (its times stand in for it).
+    fn status_with_archived(&self, job_id: JobId) -> Option<JobStatus> {
+        let job = self.jobs.get(&job_id)?;
+        Some(match job.status {
+            JobStatus::Archived if job.completed_at.is_some() => JobStatus::Completed,
+            JobStatus::Archived if job.timed_out_at.is_some() => JobStatus::TimedOut,
+            JobStatus::Archived if job.failed_at.is_some() => JobStatus::Failed,
+            status => status,
+        })
+    }
+
+    /// Add the spawned job `job_id` to its workflow `workflow_id`, raising the
+    /// workflow's job count, as the database backends do for spawned children.
+    fn join_workflow(&mut self, workflow_id: WorkflowId, job_id: JobId) {
+        let Some(job) = self.jobs.get(&job_id).cloned() else {
+            return;
+        };
+        if let Some(workflow) = self.workflows.get_mut(&workflow_id)
+            && !workflow.jobs.iter().any(|j| j.id == job_id)
+        {
+            workflow.jobs.push(job);
+            workflow.total_jobs += 1;
+        }
     }
 
     /// Whether the dependency `job_id` completed (archived jobs keep their times).
@@ -1267,6 +1284,7 @@ impl DatabaseQueue for TestQueue {
     type Database = TestDatabaseType;
 
     async fn enqueue(&self, mut job: Job) -> Result<JobId> {
+        job.validate_dependencies()?;
         self.encryption.seal(std::slice::from_mut(&mut job)).await?;
         let mut storage = self.storage.write().await;
 
@@ -1485,6 +1503,7 @@ impl DatabaseQueue for TestQueue {
 
     // Batch operations
     async fn enqueue_batch(&self, mut batch: JobBatch) -> Result<BatchId> {
+        crate::job::validate_dependency_limits(&batch.jobs)?;
         self.encryption.seal(&mut batch.jobs).await?;
         let mut storage = self.storage.write().await;
 
@@ -1656,6 +1675,39 @@ impl DatabaseQueue for TestQueue {
         self.end_with_failure(job_id, JobStatus::TimedOut, error_message, true)
             .await?;
         Ok(())
+    }
+
+    async fn complete_job_run_with_children(
+        &self,
+        run: &Job,
+        children: Vec<Job>,
+    ) -> Result<Option<crate::queue::RecordedOutcome>> {
+        crate::job::validate_dependency_limits(&children)?;
+        {
+            let storage = self.storage.read().await;
+            match storage.jobs.get(&run.id) {
+                Some(current) if lifecycle::Guard::Run(run).admits(current) => {}
+                _ => return Ok(None),
+            }
+        }
+        // Like the database backends, children that join a workflow raise its job
+        // count, so the workflow does not complete before they finish.
+        let mut spawned = Vec::with_capacity(children.len());
+        for child in children {
+            let workflow_id = child.workflow_id;
+            let id = self.enqueue(child).await?;
+            if let Some(workflow_id) = workflow_id {
+                self.storage.write().await.join_workflow(workflow_id, id);
+            }
+            spawned.push(id);
+        }
+        let recorded = self
+            .finish_job_run(run, crate::queue::JobOutcome::Completed)
+            .await?;
+        Ok(recorded.map(|mut recorded| {
+            recorded.spawned = spawned;
+            recorded
+        }))
     }
 
     async fn finish_job_run(
@@ -2439,6 +2491,7 @@ impl DatabaseQueue for TestQueue {
 
     // Workflow and dependency management
     async fn enqueue_workflow(&self, mut workflow: JobGroup) -> Result<WorkflowId> {
+        crate::job::validate_dependency_limits(&workflow.jobs)?;
         self.encryption.seal(&mut workflow.jobs).await?;
         let mut storage = self.storage.write().await;
 
@@ -2524,16 +2577,15 @@ impl DatabaseQueue for TestQueue {
         if let Some(mut workflow) = storage.workflows.get(&workflow_id).cloned() {
             // Workflow counters and status from its jobs, as the database backends
             // compute them on every terminal transition.
+            // Archived jobs count with the status they were archived with.
             let mut progress = WorkflowProgress::default();
             for job_id in workflow.jobs.iter().map(|j| j.id) {
-                if let Some(job) = storage.jobs.get(&job_id) {
-                    match &job.status {
-                        JobStatus::Completed => progress.completed += 1,
-                        JobStatus::Failed | JobStatus::Dead | JobStatus::TimedOut => {
-                            progress.failed += 1
-                        }
-                        _ => {}
+                match storage.status_with_archived(job_id) {
+                    Some(JobStatus::Completed) => progress.completed += 1,
+                    Some(JobStatus::Failed | JobStatus::Dead | JobStatus::TimedOut) => {
+                        progress.failed += 1
                     }
+                    _ => {}
                 }
             }
 
@@ -2887,6 +2939,46 @@ impl DatabaseQueue for TestQueue {
         }
 
         Ok(purged_count)
+    }
+
+    async fn purge_archived_jobs_in_queue(
+        &self,
+        queue_name: &str,
+        older_than: DateTime<Utc>,
+    ) -> Result<u64> {
+        let mut storage = self.storage.write().await;
+        // Like `purge_archived_jobs`, created_at stands in for archived_at.
+        let jobs_to_purge: Vec<JobId> = storage
+            .jobs
+            .values()
+            .filter(|job| {
+                job.status == JobStatus::Archived
+                    && job.queue_name == queue_name
+                    && job.created_at < older_than
+            })
+            .map(|job| job.id)
+            .collect();
+        for job_id in &jobs_to_purge {
+            storage.jobs.remove(job_id);
+            if let Some(queue_jobs) = storage.queues.get_mut(queue_name) {
+                for jobs_list in queue_jobs.values_mut() {
+                    jobs_list.retain(|id| id != job_id);
+                }
+            }
+        }
+        Ok(jobs_to_purge.len() as u64)
+    }
+
+    async fn list_queue_names(&self) -> Result<Vec<String>> {
+        let storage = self.storage.read().await;
+        let mut names: Vec<String> = storage
+            .jobs
+            .values()
+            .map(|job| job.queue_name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     async fn get_archival_stats(

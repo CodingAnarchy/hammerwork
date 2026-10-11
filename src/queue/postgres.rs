@@ -308,6 +308,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     type Database = Postgres;
 
     async fn enqueue(&self, mut job: Job) -> Result<JobId> {
+        job.validate_dependencies()?;
         self.seal_for_insert(std::slice::from_mut(&mut job)).await?;
         if job.depends_on.is_empty() {
             let mut conn = self.pool.acquire().await?;
@@ -514,6 +515,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         run: &Job,
         mut children: Vec<Job>,
     ) -> Result<Option<RecordedOutcome>> {
+        crate::job::validate_dependency_limits(&children)?;
         // Encrypt before anything is written, so a child that cannot be encrypted fails
         // the whole completion.
         self.seal_jobs(&mut children).await?;
@@ -534,6 +536,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 // Children depending on the parent see it Completed in this transaction.
                 let mut jobs = children.clone();
                 insert_dependent_jobs(&mut tx, &mut jobs).await?;
+                lifecycle::add_spawned_to_workflows::<Self>(&mut tx, &jobs).await?;
                 recorded.spawned = jobs.iter().map(|job| job.id).collect();
                 Ok(Some(recorded))
             }
@@ -647,8 +650,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let failure_mode =
             crate::batch::parse_failure_mode(&batch_row.try_get::<String, _>("failure_mode")?);
 
-        // The counters in hammerwork_batches are never updated after enqueue; tally the
-        // batch's jobs (including archived ones) instead.
+        // The counters in hammerwork_batches are only written when the batch finishes
+        // (see `apply_batch_outcome`); tally the batch's jobs (including archived ones)
+        // so a batch in progress reports current counts.
         let status_counts: Vec<(String, i64)> = sqlx::query_as(
             "SELECT status, COUNT(*) FROM (
                 SELECT status FROM hammerwork_jobs WHERE batch_id = $1
@@ -961,14 +965,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let mut stats = crate::priority::PriorityStats::new();
 
         for (priority_num, count) in priority_counts {
-            let priority = match priority_num {
-                0 => crate::priority::JobPriority::Background,
-                1 => crate::priority::JobPriority::Low,
-                2 => crate::priority::JobPriority::Normal,
-                3 => crate::priority::JobPriority::High,
-                4 => crate::priority::JobPriority::Critical,
-                _ => crate::priority::JobPriority::Normal, // Default fallback
-            };
+            let priority = super::priority_or_normal(priority_num);
 
             *stats.job_counts.entry(priority).or_insert(0) = super::db_int(count, "job count")?;
         }
@@ -991,14 +988,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             std::collections::HashMap::new();
 
         for (priority_num, processing_ms) in processing_times {
-            let priority = match priority_num {
-                0 => crate::priority::JobPriority::Background,
-                1 => crate::priority::JobPriority::Low,
-                2 => crate::priority::JobPriority::Normal,
-                3 => crate::priority::JobPriority::High,
-                4 => crate::priority::JobPriority::Critical,
-                _ => crate::priority::JobPriority::Normal,
-            };
+            let priority = super::priority_or_normal(priority_num);
 
             priority_times
                 .entry(priority)
@@ -1442,6 +1432,23 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             // Get all jobs in the workflow
             let jobs = self.get_workflow_jobs(workflow_id).await?;
 
+            // Counters and status from the workflow's jobs (archived ones included), as
+            // every terminal transition computes them, so they are current even for a
+            // workflow whose stored counters fell behind.
+            let mut conn = self.pool.acquire().await?;
+            let progress = WorkflowProgress::from_status_counts(
+                workflow_status_counts(&mut conn, workflow_id).await?,
+            );
+            drop(conn);
+            let total_jobs: usize =
+                super::db_int(row.try_get::<i32, _>("total_jobs")?, "total_jobs")?;
+            let failure_policy = FailurePolicy::parse_from_db(row.try_get("failure_policy")?)?;
+            let status = progress.status(
+                total_jobs,
+                &failure_policy,
+                &WorkflowStatus::parse_from_db(row.try_get("status")?)?,
+            );
+
             // Build dependencies map
             let mut dependencies = std::collections::HashMap::new();
             for job in &jobs {
@@ -1453,19 +1460,16 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             let workflow = JobGroup {
                 id: row.try_get("id")?,
                 name: row.try_get("name")?,
-                status: WorkflowStatus::parse_from_db(row.try_get("status")?)?,
+                status,
                 created_at: row.try_get("created_at")?,
                 completed_at: row.try_get("completed_at")?,
                 failed_at: row.try_get("failed_at")?,
-                failure_policy: FailurePolicy::parse_from_db(row.try_get("failure_policy")?)?,
+                failure_policy,
                 jobs,
                 dependencies,
-                total_jobs: super::db_int(row.try_get::<i32, _>("total_jobs")?, "total_jobs")?,
-                completed_jobs: super::db_int(
-                    row.try_get::<i32, _>("completed_jobs")?,
-                    "completed_jobs",
-                )?,
-                failed_jobs: super::db_int(row.try_get::<i32, _>("failed_jobs")?, "failed_jobs")?,
+                total_jobs,
+                completed_jobs: progress.completed,
+                failed_jobs: progress.failed,
                 metadata: row.try_get("metadata")?,
             };
 
@@ -1535,8 +1539,32 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .bind(workflow_id)
         .fetch_all(&self.pool)
         .await?;
+        let mut jobs = rows
+            .into_iter()
+            .map(|row| row.into_job())
+            .collect::<Result<Vec<_>>>()?;
 
-        rows.into_iter().map(|row| row.into_job()).collect()
+        // Archived members, with status `Archived` (as `get_job` reports them).
+        let archived = sqlx::query(&format!(
+            "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive a \
+             WHERE a.workflow_id = $1 \
+             AND NOT EXISTS (SELECT 1 FROM hammerwork_jobs j WHERE j.id = a.id)"
+        ))
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await?;
+        jobs.extend(super::decodable_rows(
+            "archived workflow jobs",
+            archived.iter().map(|row| {
+                let id = row
+                    .try_get::<uuid::Uuid, _>("id")
+                    .map(|id| id.to_string())
+                    .unwrap_or_default();
+                (id, archived_job_from_row(row))
+            }),
+        ));
+        jobs.sort_by_key(|job| job.created_at);
+        Ok(jobs)
     }
 
     async fn cancel_workflow(&self, workflow_id: crate::workflow::WorkflowId) -> Result<()> {
@@ -1661,6 +1689,31 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .await?;
 
         Ok(result.rows_affected())
+    }
+
+    async fn purge_archived_jobs_in_queue(
+        &self,
+        queue_name: &str,
+        older_than: DateTime<Utc>,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM hammerwork_jobs_archive WHERE queue_name = $1 AND archived_at <= $2",
+        )
+        .bind(queue_name)
+        .bind(older_than)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn list_queue_names(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT queue_name FROM hammerwork_jobs \
+             UNION SELECT queue_name FROM hammerwork_jobs_archive ORDER BY 1",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     async fn get_archival_stats(
@@ -2166,6 +2219,40 @@ fn claimed_jobs(rows: Vec<JobRow>) -> Vec<Job> {
     jobs
 }
 
+/// `(status, count)` rows for the jobs of workflow `workflow_id`, archived ones included
+/// with the status they were archived with (read like [`TransitionStore::dependency_states`]
+/// reads them). A job that older versions left in `hammerwork_jobs` when archiving it is
+/// counted once, from `hammerwork_jobs`.
+async fn workflow_status_counts(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: uuid::Uuid,
+) -> Result<Vec<(String, i64)>> {
+    let mut counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE workflow_id = $1 GROUP BY status",
+    )
+    .bind(workflow_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let archived: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT a.status, COUNT(*) FROM hammerwork_jobs_archive a \
+         WHERE a.workflow_id = $1 \
+         AND NOT EXISTS (SELECT 1 FROM hammerwork_jobs j WHERE j.id = a.id) \
+         GROUP BY a.status",
+    )
+    .bind(workflow_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    counts.extend(archived.into_iter().map(|(status, count)| {
+        (
+            crate::archive::parse_archived_status(&status)
+                .as_str()
+                .to_string(),
+            count,
+        )
+    }));
+    Ok(counts)
+}
+
 /// Insert `jobs`, settling the dependency state of those that depend on jobs that
 /// already finished (see [`lifecycle::settle_new_dependents`]).
 ///
@@ -2523,18 +2610,29 @@ impl TransitionStore for crate::queue::JobQueue<Postgres> {
         .await?)
     }
 
+    async fn raise_workflow_total(
+        conn: &mut sqlx::PgConnection,
+        workflow_id: uuid::Uuid,
+        added: usize,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE hammerwork_workflows SET total_jobs = total_jobs + $2, completed_at = NULL \
+             WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .bind(i32::try_from(added).unwrap_or(i32::MAX))
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     /// Recompute a workflow's counters and status from its jobs.
     async fn refresh_workflow(
         conn: &mut sqlx::PgConnection,
         workflow: &LockedWorkflow,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let counts: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT status, COUNT(*) FROM hammerwork_jobs WHERE workflow_id = $1 GROUP BY status",
-        )
-        .bind(workflow.id)
-        .fetch_all(&mut *conn)
-        .await?;
+        let counts = workflow_status_counts(conn, workflow.id).await?;
         let progress = WorkflowProgress::from_status_counts(counts);
         let status = progress.status(workflow.total_jobs, &workflow.policy, &workflow.status);
 

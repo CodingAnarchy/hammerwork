@@ -265,7 +265,7 @@ impl<'de> Deserialize<'de> for JitterType {
 /// // Simple fixed delay
 /// let fixed = RetryStrategy::Fixed(Duration::from_secs(30));
 ///
-/// // Linear backoff (base + attempt × increment): 20s, 30s, 40s...
+/// // Linear backoff (base + (attempt - 1) × increment): 10s, 20s, 30s...
 /// let linear = RetryStrategy::Linear {
 ///     base: Duration::from_secs(10),
 ///     increment: Duration::from_secs(10),
@@ -306,8 +306,9 @@ pub enum RetryStrategy {
 
     /// Linear backoff with configurable increment and optional maximum delay.
     ///
-    /// Each retry waits longer than the previous by a fixed increment.
-    /// Formula: `base + (attempt * increment)`
+    /// The first retry waits `base`; each later retry waits `increment` longer than the
+    /// previous one. Formula: `base + (attempt - 1) * increment`, so attempt 1 (the first
+    /// retry) waits `base`, as with the other strategies.
     ///
     /// # Use Cases
     /// - When you want gradual backoff without explosive growth
@@ -325,16 +326,18 @@ pub enum RetryStrategy {
     ///     max_delay: Some(Duration::from_secs(2 * 60)),
     /// };
     ///
-    /// // Delays: 5s, 15s, 25s, 35s, 45s, 55s, 65s, 75s, 85s, 95s, 120s (capped)...
-    /// assert_eq!(strategy.calculate_delay(1), Duration::from_secs(15));
-    /// assert_eq!(strategy.calculate_delay(10), Duration::from_secs(105));
+    /// // Delays: 5s, 15s, 25s, 35s, ..., 115s, then 120s (capped)...
+    /// assert_eq!(strategy.calculate_delay(1), Duration::from_secs(5));
+    /// assert_eq!(strategy.calculate_delay(2), Duration::from_secs(15));
+    /// assert_eq!(strategy.calculate_delay(10), Duration::from_secs(95));
+    /// assert_eq!(strategy.calculate_delay(13), Duration::from_secs(120));
     /// ```
     Linear {
         /// Base delay for the first retry attempt
         base: Duration,
         /// Amount to add for each subsequent attempt
         increment: Duration,
-        /// Optional maximum delay to cap exponential growth
+        /// Optional maximum delay to cap linear growth
         max_delay: Option<Duration>,
     },
 
@@ -488,7 +491,10 @@ impl RetryStrategy {
                 increment,
                 max_delay,
             } => {
-                let step = increment.checked_mul(attempt).unwrap_or(Duration::MAX);
+                // The first retry (attempt 1) waits `base`.
+                let step = increment
+                    .checked_mul(attempt.saturating_sub(1))
+                    .unwrap_or(Duration::MAX);
                 cap_delay(base.saturating_add(step), *max_delay)
             }
 
@@ -1157,10 +1163,12 @@ mod tests {
             max_delay: Some(Duration::from_secs(40)),
         };
 
-        assert_eq!(strategy.calculate_delay(1), Duration::from_secs(15)); // 10 + (1 * 5)
-        assert_eq!(strategy.calculate_delay(2), Duration::from_secs(20)); // 10 + (2 * 5)
-        assert_eq!(strategy.calculate_delay(3), Duration::from_secs(25)); // 10 + (3 * 5)
-        assert_eq!(strategy.calculate_delay(6), Duration::from_secs(40)); // Capped at max_delay
+        // The first retry waits `base`, like Fixed, Exponential and Fibonacci.
+        assert_eq!(strategy.calculate_delay(1), Duration::from_secs(10)); // 10 + (0 * 5)
+        assert_eq!(strategy.calculate_delay(2), Duration::from_secs(15)); // 10 + (1 * 5)
+        assert_eq!(strategy.calculate_delay(3), Duration::from_secs(20)); // 10 + (2 * 5)
+        assert_eq!(strategy.calculate_delay(7), Duration::from_secs(40)); // 10 + (6 * 5)
+        assert_eq!(strategy.calculate_delay(8), Duration::from_secs(40)); // Capped at max_delay
         assert_eq!(strategy.calculate_delay(10), Duration::from_secs(40)); // Still capped
     }
 
@@ -1271,7 +1279,7 @@ mod tests {
             Duration::from_secs(10),
             Some(Duration::from_secs(120)),
         );
-        assert_eq!(linear.calculate_delay(1), Duration::from_secs(15));
+        assert_eq!(linear.calculate_delay(1), Duration::from_secs(5));
 
         let exponential =
             RetryStrategy::exponential(Duration::from_secs(1), 2.0, Some(Duration::from_secs(600)));

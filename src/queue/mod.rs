@@ -533,6 +533,11 @@ pub trait DatabaseQueue: Send + Sync {
     ) -> Result<crate::workflow::WorkflowId>;
 
     /// Get workflow status and statistics.
+    ///
+    /// `completed_jobs`, `failed_jobs` and `status` are computed from the workflow's
+    /// jobs when it is read, archived jobs included (with the status they were archived
+    /// with), the same way every terminal transition computes them. `jobs` is
+    /// [`get_workflow_jobs`](Self::get_workflow_jobs).
     async fn get_workflow_status(
         &self,
         workflow_id: crate::workflow::WorkflowId,
@@ -581,7 +586,9 @@ pub trait DatabaseQueue: Send + Sync {
     /// calling this afterwards changes nothing and returns an empty list.
     async fn fail_job_dependencies(&self, failed_job_id: JobId) -> Result<Vec<JobId>>;
 
-    /// Get all jobs in a workflow.
+    /// Get all jobs in a workflow, oldest first. Archived members are included with
+    /// status [`JobStatus::Archived`](crate::job::JobStatus::Archived), as
+    /// [`get_job`](Self::get_job) reports them.
     async fn get_workflow_jobs(&self, workflow_id: crate::workflow::WorkflowId)
     -> Result<Vec<Job>>;
 
@@ -747,6 +754,45 @@ pub trait DatabaseQueue: Send + Sync {
     /// # }
     /// ```
     async fn purge_archived_jobs(&self, older_than: DateTime<Utc>) -> Result<u64>;
+
+    /// Permanently delete the archived jobs of queue `queue_name` that were archived at
+    /// or before `older_than`, like [`purge_archived_jobs`](Self::purge_archived_jobs)
+    /// for a single queue.
+    ///
+    /// [`JobArchiver::run_scheduled_pass`](crate::archive::JobArchiver::run_scheduled_pass)
+    /// uses it to apply each queue's own `purge_archived_after`. The default
+    /// implementation returns an error, for backends that predate per-queue purging.
+    async fn purge_archived_jobs_in_queue(
+        &self,
+        queue_name: &str,
+        older_than: DateTime<Utc>,
+    ) -> Result<u64> {
+        let _ = (queue_name, older_than);
+        Err(crate::HammerworkError::Queue {
+            message: "purging the archive of a single queue is not supported by this queue \
+                      backend"
+                .to_string(),
+        })
+    }
+
+    /// The names of the queues that have jobs, in `hammerwork_jobs` or in the archive,
+    /// sorted.
+    ///
+    /// [`JobArchiver::run_scheduled_pass`](crate::archive::JobArchiver::run_scheduled_pass)
+    /// uses it to apply the default archival policy to every queue without a policy of
+    /// its own. The default implementation lists the queues of
+    /// [`get_all_queue_stats`](Self::get_all_queue_stats) (live jobs only).
+    async fn list_queue_names(&self) -> Result<Vec<String>> {
+        let mut names: Vec<String> = self
+            .get_all_queue_stats()
+            .await?
+            .into_iter()
+            .map(|stats| stats.queue_name)
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
 
     /// Get statistics about archived jobs.
     ///
@@ -991,10 +1037,16 @@ pub trait DatabaseQueue: Send + Sync {
     /// Workers call this for jobs whose [`SpawnManager`](crate::spawn::SpawnManager)
     /// handler produced children.
     ///
+    /// Children that belong to a workflow (spawned children join their parent's) raise
+    /// that workflow's `total_jobs` in the same transaction, so it completes only once
+    /// they have finished. Each child is checked against the dependency limits
+    /// ([`Job::validate_dependencies`](crate::Job::validate_dependencies)) before
+    /// anything is written.
+    ///
     /// The default implementation, for backends without transactions, enqueues the
     /// children first and then records the completion, so a failure part-way leaves the
     /// parent `Running` (to be retried) rather than completed without its children; a
-    /// retry may then enqueue the children again.
+    /// retry may then enqueue the children again. It does not change workflow totals.
     async fn complete_job_run_with_children(
         &self,
         run: &Job,

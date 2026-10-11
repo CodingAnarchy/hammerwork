@@ -408,6 +408,8 @@ impl JobGroup {
     /// assert!(workflow.validate().is_ok());
     /// ```
     pub fn validate(&self) -> Result<()> {
+        crate::job::validate_dependency_limits(&self.jobs)?;
+
         let job_ids: HashSet<JobId> = self.jobs.iter().map(|j| j.id).collect();
 
         // Check that all dependency references are valid
@@ -811,6 +813,20 @@ mod tests {
         let workflow = JobGroup::new("valid_workflow").add_job(job1).then(job2);
 
         assert!(workflow.validate().is_ok());
+    }
+
+    #[test]
+    fn test_workflow_validation_dependency_limit() {
+        let roots: Vec<Job> = (0..=crate::job::MAX_JOB_DEPENDENCIES)
+            .map(|i| Job::new("root".to_string(), json!({ "i": i })))
+            .collect();
+        let root_ids: Vec<JobId> = roots.iter().map(|j| j.id).collect();
+        let workflow = JobGroup::new("fan_in")
+            .add_parallel_jobs(roots)
+            .add_job(Job::new("join".to_string(), json!({})).depends_on_jobs(&root_ids));
+
+        let error = workflow.validate().unwrap_err();
+        assert!(error.to_string().contains("at most 1000"), "{error}");
     }
 
     #[test]

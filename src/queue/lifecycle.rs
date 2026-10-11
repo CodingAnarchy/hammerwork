@@ -752,7 +752,16 @@ pub(crate) trait TransitionStore: Sync {
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<Vec<JobId>>> + Send;
 
-    /// Recompute a workflow's counters and status from its jobs.
+    /// Add `added` jobs to workflow `workflow_id`'s `total_jobs` (spawned children
+    /// joining it). Clears `completed_at`: the workflow has unfinished jobs again.
+    fn raise_workflow_total(
+        conn: &mut Self::Conn,
+        workflow_id: crate::workflow::WorkflowId,
+        added: usize,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Recompute a workflow's counters and status from its jobs, archived ones included
+    /// (with the status they were archived with).
     fn refresh_workflow(
         conn: &mut Self::Conn,
         workflow: &LockedWorkflow,
@@ -918,6 +927,36 @@ async fn apply_failure_policy<S: TransitionStore>(
         }
         _ => S::fail_dependents(conn, failed_job_id, now).await,
     }
+}
+
+/// Count spawned `children` (already inserted, in the caller's transaction) in the
+/// workflows they joined: each workflow's `total_jobs` grows by its number of children
+/// and its counters and status are recomputed. Without this a workflow whose last job
+/// spawned children would complete before they ran, and a failing child could no
+/// longer fail it.
+///
+/// Runs after the parent's terminal transition, which already locked the parent's
+/// workflow, so the lock order (job, then workflow) matches every other transition.
+pub(crate) async fn add_spawned_to_workflows<S: TransitionStore>(
+    conn: &mut S::Conn,
+    children: &[Job],
+) -> Result<()> {
+    let mut added: std::collections::BTreeMap<crate::workflow::WorkflowId, usize> =
+        std::collections::BTreeMap::new();
+    for workflow_id in children.iter().filter_map(|child| child.workflow_id) {
+        *added.entry(workflow_id).or_default() += 1;
+    }
+    if added.is_empty() {
+        return Ok(());
+    }
+    let now = S::db_now(conn).await?;
+    for (workflow_id, count) in added {
+        S::raise_workflow_total(conn, workflow_id, count).await?;
+        if let Some(workflow) = S::lock_workflow(conn, workflow_id).await? {
+            S::refresh_workflow(conn, &workflow, now).await?;
+        }
+    }
+    Ok(())
 }
 
 /// [`DatabaseQueue::fail_job_dependencies`] inside the caller's transaction, once the

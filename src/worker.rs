@@ -2721,7 +2721,7 @@ where
                 stats.update_average_processing_time();
             });
 
-            if let Err(e) = self.check_and_update_batch_status(batch_id).await {
+            if let Err(e) = self.check_and_update_batch_status(batch_id, None).await {
                 warn!(
                     "Failed to update batch status for batch {}: {}",
                     batch_id, e
@@ -2931,15 +2931,9 @@ where
             return;
         }
         if let Err(e) = self
-            .handle_batch_job_failure(batch_id, job.id, error_message)
+            .check_and_update_batch_status(batch_id, Some((job.id, error_message)))
             .await
         {
-            warn!(
-                "Failed to handle batch job failure for batch {}: {}",
-                batch_id, e
-            );
-        }
-        if let Err(e) = self.check_and_update_batch_status(batch_id).await {
             warn!(
                 "Failed to update batch status for batch {}: {}",
                 batch_id, e
@@ -3089,9 +3083,25 @@ where
     }
 
     /// Check and update the status of a batch after job completion
-    async fn check_and_update_batch_status(&self, batch_id: BatchId) -> Result<()> {
+    ///
+    /// `failed_job` is the job (and its error) whose final failure triggered the check;
+    /// it is logged with the batch's progress. The batch's `PartialFailureMode` (e.g.
+    /// `FailFast` failing the remaining jobs) was already applied by
+    /// `DatabaseQueue::finish_job_run`, in the transaction that ended the job.
+    async fn check_and_update_batch_status(
+        &self,
+        batch_id: BatchId,
+        failed_job: Option<(uuid::Uuid, &str)>,
+    ) -> Result<()> {
         // Get current batch status
         let batch_result = self.queue.get_batch_status(batch_id).await?;
+
+        if let Some((job_id, error_message)) = failed_job {
+            warn!(
+                "Job {} in batch {} failed: {}. Batch status: {}/{} jobs remaining",
+                job_id, batch_id, error_message, batch_result.pending_jobs, batch_result.total_jobs
+            );
+        }
 
         // If batch is complete, log success metrics
         if batch_result.pending_jobs == 0 {
@@ -3133,28 +3143,6 @@ where
             Ok(mut finished) => finished.insert(batch_id),
             Err(_) => false,
         }
-    }
-
-    /// Handle job failure within a batch context
-    async fn handle_batch_job_failure(
-        &self,
-        batch_id: BatchId,
-        job_id: uuid::Uuid,
-        error_message: &str,
-    ) -> Result<()> {
-        // Get batch status to understand failure handling mode
-        let batch_result = self.queue.get_batch_status(batch_id).await?;
-
-        // Log batch-specific failure information
-        warn!(
-            "Job {} in batch {} failed: {}. Batch status: {}/{} jobs remaining",
-            job_id, batch_id, error_message, batch_result.pending_jobs, batch_result.total_jobs
-        );
-
-        // PartialFailureMode (e.g. FailFast failing the remaining jobs) was already
-        // applied by DatabaseQueue::finish_job_run, in the transaction that ended the job.
-
-        Ok(())
     }
 
     /// Get current batch processing statistics
