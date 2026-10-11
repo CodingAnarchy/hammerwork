@@ -253,24 +253,24 @@ mod error_handling_tests {
 #[cfg(test)]
 mod builder_tests {
     use super::*;
-    use cargo_hammerwork::commands::archive::build_archive_candidates_query;
-    use cargo_hammerwork::commands::backup::build_backup_query;
-    use cargo_hammerwork::commands::cron::build_cron_select_query;
-    use cargo_hammerwork::commands::job::{build_list_jobs_query, build_purge_query};
-    use cargo_hammerwork::commands::maintenance::{VacuumKind, build_vacuum_query};
-    use cargo_hammerwork::commands::monitor::{
+    use crate::commands::archive::build_archive_candidates_query;
+    use crate::commands::backup::build_backup_query;
+    use crate::commands::cron::build_cron_select_query;
+    use crate::commands::job::{build_list_jobs_query, build_purge_query};
+    use crate::commands::maintenance::{VacuumKind, build_vacuum_query};
+    use crate::commands::monitor::{
         build_avg_time_query, build_recent_jobs_query, build_status_counts_query,
         build_throughput_query,
     };
-    use cargo_hammerwork::commands::queue::{
+    use crate::commands::queue::{
         HealthMetric, build_detailed_stats_query, build_health_query, build_queue_total_query,
     };
-    use cargo_hammerwork::commands::spawn::{
+    use crate::commands::spawn::{
         build_pending_spawns_query, build_spawn_list_query, build_spawn_stats_breakdown_query,
         build_spawn_stats_total_query,
     };
-    use cargo_hammerwork::utils::job_ops::{JobSelector, StaleRunning};
-    use cargo_hammerwork::utils::sql::{Backend, Bind, FAILURE_STATUSES_SQL, bind_mysql, bind_pg};
+    use crate::utils::job_ops::{JobSelector, StaleRunning};
+    use crate::utils::sql::{Backend, Bind, FAILURE_STATUSES_SQL, bind_mysql, bind_pg};
     use hammerwork::{JobPriority, JobStatus};
 
     const HOSTILE: &str = "it's; DROP TABLE hammerwork_jobs --";
@@ -467,8 +467,8 @@ mod builder_tests {
 
     #[test]
     fn test_failure_statuses_include_timed_out_everywhere() {
-        use cargo_hammerwork::commands::monitor::{HealthCount, build_health_count_query};
-        use cargo_hammerwork::commands::queue::{HealthMetric, build_health_query};
+        use crate::commands::monitor::{HealthCount, build_health_count_query};
+        use crate::commands::queue::{HealthMetric, build_health_query};
 
         for backend in [Backend::Postgres, Backend::MySql] {
             let (sql, _) = build_health_query(backend, HealthMetric::RecentFailures, None);

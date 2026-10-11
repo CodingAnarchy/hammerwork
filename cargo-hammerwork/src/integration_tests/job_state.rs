@@ -3,12 +3,12 @@
 //! they fail if a command writes statuses the library does not recognise.
 //!
 //! Run with `DATABASE_URL` (Postgres) / `MYSQL_DATABASE_URL` (MySQL) pointing at a
-//! migrated database: `cargo test -p cargo-hammerwork --test job_state_tests -- --ignored`.
+//! migrated database: `cargo test -p cargo-hammerwork job_state -- --ignored`.
 
-use cargo_hammerwork::commands::batch::BatchCommand;
-use cargo_hammerwork::commands::job::JobCommand;
-use cargo_hammerwork::config::Config;
-use cargo_hammerwork::utils::database::{DatabasePool, JobQueueWrapper};
+use crate::commands::batch::BatchCommand;
+use crate::commands::job::JobCommand;
+use crate::config::Config;
+use crate::utils::database::{DatabasePool, JobQueueWrapper};
 use hammerwork::queue::DatabaseQueue;
 use hammerwork::{Job, JobId, JobStatus};
 use serde_json::json;

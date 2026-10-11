@@ -143,3 +143,45 @@ hammerwork = { version = "3", features = ["test-queue"] }
 A compile error such as `unresolved import hammerwork::metrics`, `hammerwork::alerting` or `hammerwork::webhooks`, or a missing `TestQueue`, means a feature is not enabled. `cargo-hammerwork` and `hammerwork-web` already enable the features they need.
 
 If you gate your own code with `cfg(feature = "...")` on features that you forward to hammerwork, rename them in the same way.
+
+## cargo-hammerwork and hammerwork-web as libraries
+
+In 2.x both companion crates exported their internals as library API. In 3.0 they do not,
+so their modules can change without a semver break.
+
+### cargo-hammerwork
+
+`cargo-hammerwork` is a binary only. The `cargo_hammerwork::commands`,
+`cargo_hammerwork::config` and `cargo_hammerwork::utils` modules (and the glob re-exports
+of them at the crate root) no longer exist, and the crate has no library target to depend
+on. Use the CLI through the `cargo hammerwork` executable. If you need job, queue or
+migration operations from Rust code, use the `hammerwork` crate (`DatabaseQueue`,
+`JobQueue`) directly.
+
+### hammerwork-web
+
+The public API is `WebDashboard`, `DashboardConfig`, `AuthConfig` and `WebSocketConfig`,
+all re-exported at the crate root. The `api`, `auth`, `config`, `live`, `security`,
+`server` and `websocket` modules are private, including `server::app_routes`, which needed
+other private types (`AuthState`, `SystemState`, `WebSocketState`, `AllowedOrigins`) to call.
+
+To embed the dashboard in your own process, build a `DashboardConfig` and run a
+`WebDashboard` (optionally `with_event_manager` to forward worker events):
+
+```rust
+use hammerwork_web::{DashboardConfig, WebDashboard};
+
+let config = DashboardConfig::new()
+    .with_database_url("postgresql://localhost/hammerwork");
+WebDashboard::new(config).await?.start().await?;
+```
+
+Migrate imports as follows:
+
+| 2.x path | 3.0 |
+| --- | --- |
+| `hammerwork_web::config::DashboardConfig` | `hammerwork_web::DashboardConfig` |
+| `hammerwork_web::config::AuthConfig` | `hammerwork_web::AuthConfig` |
+| `hammerwork_web::config::WebSocketConfig` | `hammerwork_web::WebSocketConfig` |
+| `hammerwork_web::server::WebDashboard` | `hammerwork_web::WebDashboard` |
+| `hammerwork_web::server::app_routes`, `api::*`, `auth::*`, `security::*`, `websocket::*`, `live::*` | removed; mount the dashboard with `WebDashboard` |

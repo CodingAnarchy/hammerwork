@@ -168,6 +168,7 @@ impl DatabasePool {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg(test)]
     pub async fn connect(database_url: &str, pool_size: u32) -> Result<Self> {
         Self::connect_with_timeout(
             database_url,
@@ -177,7 +178,7 @@ impl DatabasePool {
         .await
     }
 
-    /// Like [`connect`](Self::connect), but fails with an error if no connection
+    /// Like `connect`, but fails with an error if no connection
     /// can be established within `connect_timeout`, instead of hanging on an
     /// unreachable host.
     pub async fn connect_with_timeout(

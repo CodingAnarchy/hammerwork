@@ -25,8 +25,8 @@
 //! ## Basic Authentication Setup
 //!
 //! ```rust
-//! use hammerwork_web::auth::AuthState;
-//! use hammerwork_web::config::AuthConfig;
+//! use hammerwork_web::__private::auth::AuthState;
+//! use hammerwork_web::__private::config::AuthConfig;
 //!
 //! let auth_config = AuthConfig {
 //!     enabled: true,
@@ -43,7 +43,7 @@
 //! ## Extracting Basic Auth Credentials
 //!
 //! ```rust
-//! use hammerwork_web::auth::extract_basic_auth;
+//! use hammerwork_web::__private::auth::extract_basic_auth;
 //!
 //! // "admin:password" in base64 is "YWRtaW46cGFzc3dvcmQ="
 //! let auth_header = "Basic YWRtaW46cGFzc3dvcmQ=";
@@ -387,7 +387,7 @@ impl AuthState {
 /// # Examples
 ///
 /// ```rust
-/// use hammerwork_web::auth::extract_basic_auth;
+/// use hammerwork_web::__private::auth::extract_basic_auth;
 ///
 /// // Valid basic auth header
 /// let auth_header = "Basic YWRtaW46cGFzc3dvcmQ="; // admin:password

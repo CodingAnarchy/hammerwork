@@ -15,7 +15,7 @@
 //! ## System Overview
 //!
 //! ```rust
-//! use hammerwork_web::api::stats::{SystemOverview, SystemHealth, SystemAlert};
+//! use hammerwork_web::__private::api::stats::{SystemOverview, SystemHealth, SystemAlert};
 //! use chrono::Utc;
 //!
 //! let overview = SystemOverview {
@@ -49,7 +49,7 @@
 //! ## Statistics Queries
 //!
 //! ```rust
-//! use hammerwork_web::api::stats::{StatsQuery, TimeRange};
+//! use hammerwork_web::__private::api::stats::{StatsQuery, TimeRange};
 //! use chrono::{Utc, Duration};
 //!
 //! let time_range = TimeRange {
@@ -72,7 +72,7 @@
 //! ## System Alerts
 //!
 //! ```rust
-//! use hammerwork_web::api::stats::SystemAlert;
+//! use hammerwork_web::__private::api::stats::SystemAlert;
 //! use chrono::Utc;
 //!
 //! let alert = SystemAlert {
@@ -93,7 +93,7 @@
 //! ## Performance Metrics
 //!
 //! ```rust
-//! use hammerwork_web::api::stats::PerformanceMetrics;
+//! use hammerwork_web::__private::api::stats::PerformanceMetrics;
 //!
 //! let metrics = PerformanceMetrics {
 //!     database_response_time_ms: Some(5.2),

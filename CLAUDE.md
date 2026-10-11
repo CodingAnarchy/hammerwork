@@ -287,7 +287,7 @@ The `cargo-hammerwork` crate uses **dynamic SQL queries** with `sqlx::query()` r
 - Database-agnostic queries (PostgreSQL and MySQL)
 - Runtime query building for CLI flexibility
 
-**Security**: All queries use parameterized statements to prevent SQL injection. Comprehensive tests in `tests/sql_query_tests.rs` validate query correctness.
+**Security**: All queries use parameterized statements to prevent SQL injection. Comprehensive tests in `cargo-hammerwork/src/integration_tests/sql_query.rs` validate query correctness.
 
 ### Feature Integration with CLI Tooling
 
@@ -309,7 +309,7 @@ The `cargo-hammerwork` crate uses **dynamic SQL queries** with `sqlx::query()` r
 
 3. **CLI Testing Requirements**
    - **Unit tests for command modules**: Each command module must have inline `#[cfg(test)]` modules
-   - **SQL Query Validation**: Comprehensive tests in `tests/sql_query_tests.rs` validate all dynamic SQL queries
+   - **SQL Query Validation**: Comprehensive tests in `cargo-hammerwork/src/integration_tests/sql_query.rs` validate all dynamic SQL queries
    - **Integration tests**: Database-backed tests with `#[ignore]` attribute for optional execution
    - **CLI argument parsing tests**: Validate clap command structure and argument validation
    - **Configuration loading tests**: Test config file loading, environment variable precedence

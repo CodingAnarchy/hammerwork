@@ -16,7 +16,7 @@
 //! ## System Information
 //!
 //! ```rust
-//! use hammerwork_web::api::system::{SystemInfo, BuildInfo, RuntimeInfo, DatabaseInfo};
+//! use hammerwork_web::__private::api::system::{SystemInfo, BuildInfo, RuntimeInfo, DatabaseInfo};
 //! use chrono::Utc;
 //!
 //! let build_info = BuildInfo {
@@ -62,7 +62,7 @@
 //! ## Maintenance Operations
 //!
 //! ```rust
-//! use hammerwork_web::api::system::MaintenanceRequest;
+//! use hammerwork_web::__private::api::system::MaintenanceRequest;
 //! use serde_json::json;
 //!
 //! let cleanup_request = MaintenanceRequest {
@@ -85,7 +85,7 @@
 //! ## Server Configuration
 //!
 //! ```rust
-//! use hammerwork_web::api::system::ServerConfig;
+//! use hammerwork_web::__private::api::system::ServerConfig;
 //!
 //! let config = ServerConfig {
 //!     bind_address: "0.0.0.0".to_string(),
@@ -105,7 +105,7 @@
 //! ## Metrics Information
 //!
 //! ```rust
-//! use hammerwork_web::api::system::MetricsInfo;
+//! use hammerwork_web::__private::api::system::MetricsInfo;
 //! use chrono::Utc;
 //!
 //! let metrics_info = MetricsInfo {

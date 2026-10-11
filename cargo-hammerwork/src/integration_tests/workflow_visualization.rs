@@ -1,4 +1,4 @@
-use cargo_hammerwork::commands::workflow::{JobNode, WorkflowCommand};
+use crate::commands::workflow::{JobNode, WorkflowCommand};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -196,7 +196,7 @@ fn test_job_node_status_variations() {
 
 #[test]
 fn test_workflow_command_database_url_priority() {
-    use cargo_hammerwork::config::Config;
+    use crate::config::Config;
 
     let config_with_url = Config {
         database_url: Some("postgres://config/db".to_string()),

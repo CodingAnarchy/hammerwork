@@ -9,7 +9,7 @@
 //! All API endpoints return responses in a consistent format:
 //!
 //! ```rust
-//! use hammerwork_web::api::ApiResponse;
+//! use hammerwork_web::__private::api::ApiResponse;
 //! use serde_json::json;
 //!
 //! // Success response
@@ -30,7 +30,7 @@
 //! Many endpoints support pagination using query parameters:
 //!
 //! ```rust
-//! use hammerwork_web::api::{PaginationParams, PaginationMeta};
+//! use hammerwork_web::__private::api::{PaginationParams, PaginationMeta};
 //!
 //! let params = PaginationParams {
 //!     page: Some(2),

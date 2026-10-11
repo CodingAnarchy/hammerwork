@@ -145,7 +145,7 @@ fn quoted(backend: Backend, name: &str) -> String {
     }
 }
 
-/// The `SELECT` list reading `columns` in the form [`row_to_json`] decodes.
+/// The `SELECT` list reading `columns` in the form `row_to_json` decodes.
 pub fn select_list(backend: Backend, columns: &[Column]) -> String {
     columns
         .iter()

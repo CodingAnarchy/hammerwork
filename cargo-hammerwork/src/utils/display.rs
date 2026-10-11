@@ -263,6 +263,7 @@ impl fmt::Display for StatsTable {
 /// assert_eq!(format_duration(Some(7200)), "2h 0m");
 /// assert_eq!(format_duration(None), "N/A");
 /// ```
+#[cfg(test)]
 pub fn format_duration(seconds: Option<i64>) -> String {
     match seconds {
         Some(secs) if secs < 60 => format!("{}s", secs),
@@ -286,6 +287,7 @@ pub fn format_duration(seconds: Option<i64>) -> String {
 /// assert_eq!(format_size(Some(1073741824)), "1.0GB");
 /// assert_eq!(format_size(None), "N/A");
 /// ```
+#[cfg(test)]
 pub fn format_size(bytes: Option<i64>) -> String {
     match bytes {
         Some(b) if b < 1024 => format!("{}B", b),

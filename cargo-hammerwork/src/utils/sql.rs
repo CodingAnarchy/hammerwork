@@ -76,10 +76,6 @@ impl SqlParams {
         }
     }
 
-    pub fn backend(&self) -> Backend {
-        self.backend
-    }
-
     /// Record `value` and return its placeholder.
     pub fn bind(&mut self, value: Bind) -> String {
         self.binds.push(value);
@@ -265,28 +261,16 @@ pub(crate) use fetch_rows;
 pub trait IdText {
     /// The id in column `column`, as text.
     fn id_text(&self, column: &str) -> Result<String>;
-    /// The nullable id in column `column`, as text.
-    fn opt_id_text(&self, column: &str) -> Result<Option<String>>;
 }
 
 impl IdText for sqlx::postgres::PgRow {
     fn id_text(&self, column: &str) -> Result<String> {
         Ok(self.try_get::<uuid::Uuid, _>(column)?.to_string())
     }
-
-    fn opt_id_text(&self, column: &str) -> Result<Option<String>> {
-        Ok(self
-            .try_get::<Option<uuid::Uuid>, _>(column)?
-            .map(|id| id.to_string()))
-    }
 }
 
 impl IdText for sqlx::mysql::MySqlRow {
     fn id_text(&self, column: &str) -> Result<String> {
-        Ok(self.try_get(column)?)
-    }
-
-    fn opt_id_text(&self, column: &str) -> Result<Option<String>> {
         Ok(self.try_get(column)?)
     }
 }

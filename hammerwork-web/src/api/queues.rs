@@ -15,7 +15,7 @@
 //! ## Queue Information Structure
 //!
 //! ```rust
-//! use hammerwork_web::api::queues::QueueInfo;
+//! use hammerwork_web::__private::api::queues::QueueInfo;
 //! use chrono::Utc;
 //!
 //! let queue_info = QueueInfo {
@@ -43,7 +43,7 @@
 //! ## Queue Actions
 //!
 //! ```rust
-//! use hammerwork_web::api::queues::QueueActionRequest;
+//! use hammerwork_web::__private::api::queues::QueueActionRequest;
 //!
 //! let clear_dead_request = QueueActionRequest {
 //!     action: "clear_dead".to_string(),
@@ -62,7 +62,7 @@
 //! ## Detailed Queue Statistics
 //!
 //! ```rust
-//! use hammerwork_web::api::queues::{DetailedQueueStats, QueueInfo, HourlyThroughput, RecentError};
+//! use hammerwork_web::__private::api::queues::{DetailedQueueStats, QueueInfo, HourlyThroughput, RecentError};
 //! use std::collections::HashMap;
 //! use chrono::Utc;
 //!

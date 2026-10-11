@@ -1,4 +1,4 @@
-use cargo_hammerwork::commands::workflow::{JobNode, WorkflowCommand};
+use crate::commands::workflow::{JobNode, WorkflowCommand};
 
 /// Create a simple workflow command for testing output formats
 fn create_test_command() -> WorkflowCommand {

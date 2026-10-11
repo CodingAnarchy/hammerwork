@@ -9,7 +9,7 @@
 //! The WebSocket API supports several message types for different events:
 //!
 //! ```rust
-//! use hammerwork_web::websocket::{ClientMessage, ServerMessage, AlertSeverity};
+//! use hammerwork_web::__private::websocket::{ClientMessage, ServerMessage, AlertSeverity};
 //! use serde_json::json;
 //!
 //! // Client messages (sent from browser to server)
@@ -31,8 +31,8 @@
 //! # Connection Management
 //!
 //! ```rust
-//! use hammerwork_web::websocket::WebSocketState;
-//! use hammerwork_web::config::WebSocketConfig;
+//! use hammerwork_web::__private::websocket::WebSocketState;
+//! use hammerwork_web::__private::config::WebSocketConfig;
 //!
 //! let config = WebSocketConfig::default();
 //! let ws_state = WebSocketState::new(config);

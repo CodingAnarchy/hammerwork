@@ -1,5 +1,6 @@
 use anyhow::Result;
 use hammerwork::JobPriority;
+#[cfg(test)]
 use std::str::FromStr;
 
 pub fn validate_priority(priority: &str) -> Result<JobPriority> {
@@ -51,6 +52,7 @@ pub fn redact_url(url: &str) -> String {
     hammerwork::config::redact_url(url)
 }
 
+#[cfg(test)]
 pub fn validate_cron_expression(cron: &str) -> Result<()> {
     cron::Schedule::from_str(cron)
         .map_err(|e| anyhow::anyhow!("Invalid cron expression '{}': {}", cron, e))?;
