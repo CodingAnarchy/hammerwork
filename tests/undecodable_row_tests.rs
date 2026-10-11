@@ -343,25 +343,34 @@ where
     F: Future<Output = ()>,
 {
     let name = test_utils::unique_queue("undecodable_archiver");
-    // The corrupt job is the oldest, so it comes first in the archiver's batch.
-    let bad = queue
-        .enqueue(Job::new(name.clone(), json!({})))
-        .await
-        .unwrap();
+    // The corrupt jobs are the oldest and fill a whole batch, so they come first.
+    let mut bad = Vec::new();
+    for _ in 0..3 {
+        bad.push(
+            queue
+                .enqueue(Job::new(name.clone(), json!({})))
+                .await
+                .unwrap(),
+        );
+    }
     let healthy = queue
         .enqueue(Job::new(name.clone(), json!({})))
         .await
         .unwrap();
-    for id in [bad, healthy] {
-        queue.complete_job(id).await.unwrap();
+    for id in bad.iter().chain([&healthy]) {
+        queue.complete_job(*id).await.unwrap();
     }
-    sql(format!(
-        "UPDATE hammerwork_jobs SET timeout_seconds = -1 WHERE id = '{bad}'"
-    ))
-    .await;
+    for id in &bad {
+        sql(format!(
+            "UPDATE hammerwork_jobs SET timeout_seconds = -1 WHERE id = '{id}'"
+        ))
+        .await;
+    }
 
+    // One batch: the undecodable rows are skipped and the batch topped up.
     let policy = ArchivalPolicy::new()
         .archive_completed_after(Duration::seconds(0))
+        .with_batch_size(2)
         .enabled(true);
     let stats = queue
         .archive_jobs(

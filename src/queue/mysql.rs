@@ -3192,49 +3192,75 @@ impl crate::queue::JobQueue<MySql> {
         }
 
         // Lock the candidate rows so concurrent archivers (and workers) skip them
-        // instead of archiving the same job twice (SKIP LOCKED needs MySQL 8.0+).
-        let select = format!(
-            "SELECT {} FROM hammerwork_jobs WHERE archived_at IS NULL{} AND ({}) \
-             ORDER BY created_at ASC LIMIT {} FOR UPDATE SKIP LOCKED",
-            JOB_SELECT_FIELDS,
-            if queue_name.is_some() {
-                " AND queue_name = ?"
-            } else {
-                ""
-            },
-            status_conditions.join(" OR "),
-            policy.batch_size
-        );
+        // instead of archiving the same job twice (SKIP LOCKED needs MySQL 8.0+). Rows
+        // already examined by this batch are excluded, so a batch can be topped up after
+        // skipping undecodable rows.
+        let select = |limit: usize, excluded: usize| {
+            format!(
+                "SELECT {} FROM hammerwork_jobs WHERE archived_at IS NULL{} AND ({}){} \
+                 ORDER BY created_at ASC LIMIT {limit} FOR UPDATE SKIP LOCKED",
+                JOB_SELECT_FIELDS,
+                if queue_name.is_some() {
+                    " AND queue_name = ?"
+                } else {
+                    ""
+                },
+                status_conditions.join(" OR "),
+                if excluded == 0 {
+                    String::new()
+                } else {
+                    format!(" AND id NOT IN ({})", vec!["?"; excluded].join(", "))
+                },
+            )
+        };
 
         // Archiving a job moves its row: insert into the archive table and delete from
         // the main table in the same transaction.
         let mut tx = self.pool.begin().await?;
 
-        let mut query = sqlx::query_as::<_, JobRow>(&select);
-        if let Some(queue) = queue_name {
-            query = query.bind(queue);
+        // A row that cannot be decoded is skipped and left where it is, and the batch is
+        // topped up with the rows after it: failing would roll back every pass, and a
+        // short batch would end the pass early, stopping archival for every queue.
+        let mut jobs_to_archive = Vec::new();
+        let mut examined: Vec<String> = Vec::new();
+        while jobs_to_archive.len() < policy.batch_size {
+            let wanted = policy.batch_size - jobs_to_archive.len();
+            let select = select(wanted, examined.len());
+            let mut query = sqlx::query_as::<_, JobRow>(&select);
+            if let Some(queue) = queue_name {
+                query = query.bind(queue);
+            }
+            for threshold in &thresholds {
+                query = query.bind(*threshold);
+            }
+            for id in &examined {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&mut *tx).await?;
+            let fetched = rows.len();
+            let mut skipped = false;
+            for row in rows {
+                examined.push(row.id.clone());
+                let id = row.id.clone();
+                match row.into_job() {
+                    Ok(job) => jobs_to_archive.push(job),
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = %id,
+                            error = %error,
+                            "Skipping a job that cannot be decoded while archiving"
+                        );
+                        skipped = true;
+                    }
+                }
+            }
+            if !skipped || fetched < wanted {
+                break;
+            }
         }
-        for threshold in thresholds {
-            query = query.bind(threshold);
-        }
-        let jobs_to_archive = query.fetch_all(&mut *tx).await?;
 
         let archived_at = Utc::now();
-        for job_row in jobs_to_archive {
-            // A row that cannot be decoded is left where it is: failing here would roll
-            // back the whole pass, every time, and stop archival for every queue.
-            let job_id = job_row.id.to_string();
-            let job = match job_row.into_job() {
-                Ok(job) => job,
-                Err(error) => {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        error = %error,
-                        "Skipping a job that cannot be decoded while archiving"
-                    );
-                    continue;
-                }
-            };
+        for job in jobs_to_archive {
             let (final_payload, is_compressed, original_size) =
                 crate::archive::encode_archived_payload(&job.payload, policy, config)?;
             // original size / stored size: a payload stored uncompressed counts as 1.
