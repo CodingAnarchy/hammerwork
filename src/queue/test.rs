@@ -1923,13 +1923,13 @@ impl DatabaseQueue for TestQueue {
             .count() as f64;
 
         let total_processed = completed_count + dead_count + timed_out_count;
+        // `Failed` jobs only, as on the database backends: dead jobs are in `dead`.
         let failed_count = queue_jobs
             .get(&JobStatus::Failed)
             .map(|j| j.len())
-            .unwrap_or(0) as u64
-            + dead_count;
+            .unwrap_or(0) as u64;
         let error_rate = if total_processed > 0 {
-            (failed_count + timed_out_count) as f64 / total_processed as f64
+            (failed_count + dead_count + timed_out_count) as f64 / total_processed as f64
         } else {
             0.0
         };
@@ -4179,6 +4179,29 @@ mod tests {
         assert_eq!(job.attempts, 0);
         assert!(job.next_run_at.is_some_and(|next| next > clock.now()));
         assert_eq!(Some(job.scheduled_at), job.next_run_at);
+    }
+
+    /// `QueueStats::statistics.failed` counts `Failed` jobs only, as on the database
+    /// backends; dead jobs are in `dead` (counting them in both made the dashboard count
+    /// them twice).
+    #[tokio::test]
+    async fn queue_stats_failed_counts_failed_jobs_only() {
+        let queue = TestQueue::new();
+        let failed = queue
+            .enqueue(Job::new("stats_q".to_string(), json!({"n": 1})))
+            .await
+            .unwrap();
+        queue.fail_job(failed, "nope").await.unwrap();
+        let dead = queue
+            .enqueue(Job::new("stats_q".to_string(), json!({"n": 2})))
+            .await
+            .unwrap();
+        queue.mark_job_dead(dead, "broken").await.unwrap();
+
+        let stats = queue.get_queue_stats("stats_q").await.unwrap();
+        assert_eq!(stats.statistics.failed, 1);
+        assert_eq!(stats.statistics.dead, 1);
+        assert_eq!(stats.dead_count, 1);
     }
 
     /// Only `Dead` jobs are dead jobs: timed-out jobs are not listed, counted or purged
