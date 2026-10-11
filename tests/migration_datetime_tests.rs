@@ -184,6 +184,13 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO hammerwork_workflows (id, name, created_at, completed_at)
+             VALUES ('00000000-0000-0000-0000-0000000000f1', 'old', '2023-04-05 06:07:08', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let values_before = value_snapshot(&pool).await;
         assert!(values_before.len() > 15, "{values_before:?}");
 
@@ -207,7 +214,7 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
         let mut converted = 0;
         for (before, after) in before_columns.iter().zip(&after_columns) {
             assert_eq!((&before.0, &before.1), (&after.0, &after.1));
-            if before.2 == "timestamp" {
+            if before.2 == "timestamp" || (after.0 == "hammerwork_workflows" && before.2 == "datetime") {
                 converted += 1;
                 assert_eq!(after.2, "datetime", "{} {}", after.0, after.1);
                 assert_eq!(before.3, after.3, "nullability of {} {}", after.0, after.1);
@@ -222,12 +229,12 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
                 assert_eq!(before, after);
             }
         }
-        assert_eq!(converted, 39, "converted columns");
+        assert_eq!(converted, 42, "converted columns (39 TIMESTAMP + 3 workflow DATETIME)");
         assert!(after_columns.iter().all(|c| c.2 != "timestamp"));
         let precisions: Vec<i64> = sqlx::query_scalar(
             "SELECT CAST(datetime_precision AS SIGNED) FROM information_schema.columns
              WHERE table_schema = DATABASE() AND data_type = 'datetime'
-               AND table_name <> 'hammerwork_workflows'",
+",
         )
         .fetch_all(&pool)
         .await
@@ -236,6 +243,35 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
         println!("converted {converted} TIMESTAMP columns");
 
         assert_eq!(value_snapshot(&pool).await, values_before);
+
+        // Workflow times keep microseconds when written after the migration
+        sqlx::query(
+            "INSERT INTO hammerwork_workflows (id, name, created_at, completed_at, failed_at)
+             VALUES ('00000000-0000-0000-0000-0000000000f2', 'new',
+                     '2100-01-02 03:04:05.678901', '2100-01-02 03:04:06.123456', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let workflow_times: Vec<String> = sqlx::query_scalar(
+            "SELECT CONCAT_WS('|', DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f'),
+                    DATE_FORMAT(completed_at, '%Y-%m-%d %H:%i:%s.%f'))
+             FROM hammerwork_workflows ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            workflow_times,
+            [
+                "2023-04-05 06:07:08.000000".to_string(),
+                "2100-01-02 03:04:05.678901|2100-01-02 03:04:06.123456".to_string()
+            ]
+        );
+        sqlx::query("DELETE FROM hammerwork_workflows WHERE id LIKE '%f2'")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // The library reads the converted rows, and a job beyond 2038 is stored
         let read = queue.get_job(scheduled_id).await.unwrap().unwrap();

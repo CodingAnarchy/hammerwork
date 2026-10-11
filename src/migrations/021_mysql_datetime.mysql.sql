@@ -12,6 +12,9 @@
 -- there is one ALTER per table, and the big ones are hammerwork_jobs and
 -- hammerwork_jobs_archive. Run it off-peak; see docs/upgrading-to-3.0.md.
 --
+-- hammerwork_workflows was DATETIME (no fractional seconds) already; it becomes DATETIME(6)
+-- too, so every MySQL time keeps microseconds.
+--
 -- Nullability and defaults are kept; CURRENT_TIMESTAMP defaults become
 -- CURRENT_TIMESTAMP(6) (DATETIME(6) requires the precision to match). The only ON UPDATE
 -- clause is hammerwork_queue_pause.updated_at, which keeps it. Each ALTER runs only
@@ -143,6 +146,20 @@ SET @sql = IF(
        AND data_type = 'timestamp') > 0,
     'ALTER TABLE hammerwork_migrations
         MODIFY COLUMN `executed_at` DATETIME(6) NOT NULL',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @sql = IF(
+    (SELECT COUNT(*) FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = 'hammerwork_workflows'
+       AND column_name = 'created_at' AND data_type = 'datetime' AND datetime_precision = 0) > 0,
+    'ALTER TABLE hammerwork_workflows
+        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        MODIFY COLUMN `completed_at` DATETIME(6) NULL,
+        MODIFY COLUMN `failed_at` DATETIME(6) NULL',
     'SELECT 1'
 );
 PREPARE stmt FROM @sql;

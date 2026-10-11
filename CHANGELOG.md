@@ -46,7 +46,7 @@ See [Upgrading from 2.x to 3.0](docs/upgrading-to-3.0.md) for what to change.
 
 ### Database
 
-- Migration `021_mysql_datetime` (#91): on MySQL, converts all 39 `TIMESTAMP` / `TIMESTAMP(6)` columns of `hammerwork_jobs`, `hammerwork_jobs_archive`, `hammerwork_batches`, `hammerwork_encryption_keys`, `hammerwork_key_audit_log`, `hammerwork_kms_data_keys`, `hammerwork_queue_pause` and `hammerwork_migrations` to `DATETIME(6)`, keeping nullability, values and defaults (`CURRENT_TIMESTAMP` defaults become `CURRENT_TIMESTAMP(6)`; `hammerwork_queue_pause.updated_at` keeps `ON UPDATE`). One `ALTER TABLE` per table, run under a UTC session `time_zone`, safe to re-run. A no-op on PostgreSQL. `hammerwork_workflows`, already `DATETIME`, is unchanged.
+- Migration `021_mysql_datetime` (#91): on MySQL, converts all 39 `TIMESTAMP` / `TIMESTAMP(6)` columns of `hammerwork_jobs`, `hammerwork_jobs_archive`, `hammerwork_batches`, `hammerwork_encryption_keys`, `hammerwork_key_audit_log`, `hammerwork_kms_data_keys`, `hammerwork_queue_pause` and `hammerwork_migrations`, and the 3 second-precision `DATETIME` columns of `hammerwork_workflows` (`created_at`, `completed_at`, `failed_at`), to `DATETIME(6)`, keeping nullability, values and defaults (`CURRENT_TIMESTAMP` defaults become `CURRENT_TIMESTAMP(6)`; `hammerwork_queue_pause.updated_at` keeps `ON UPDATE`). One `ALTER TABLE` per table, run under a UTC session `time_zone`, safe to re-run. A no-op on PostgreSQL.
 
 ## [2.5.0] - 2026-10-11
 

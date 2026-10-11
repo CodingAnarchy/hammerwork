@@ -344,7 +344,10 @@ after that. Migration `021_mysql_datetime` converts every `TIMESTAMP` and `TIMES
 column of every Hammerwork table (39 columns in `hammerwork_jobs`,
 `hammerwork_jobs_archive`, `hammerwork_batches`, `hammerwork_encryption_keys`,
 `hammerwork_key_audit_log`, `hammerwork_kms_data_keys`, `hammerwork_queue_pause` and
-`hammerwork_migrations`) to `DATETIME(6)`, which holds years 1000 to 9999. The 2038 checks
+`hammerwork_migrations`) to `DATETIME(6)`, which holds years 1000 to 9999. The three
+second-precision `DATETIME` columns of `hammerwork_workflows` (`created_at`,
+`completed_at`, `failed_at`) also become `DATETIME(6)`, so every MySQL time keeps
+microseconds. The 2038 checks
 are gone, and a new install gets the same schema by running all migrations.
 
 What the migration keeps:
@@ -357,7 +360,7 @@ What the migration keeps:
 - **`NULL` / `NOT NULL` and defaults.** `CURRENT_TIMESTAMP` defaults become
   `CURRENT_TIMESTAMP(6)`, as `DATETIME(6)` requires. The one `ON UPDATE` clause,
   `hammerwork_queue_pause.updated_at`, is kept.
-- Second-precision columns (the queue pause table, and `hammerwork_jobs.archived_at`) now
+- Second-precision columns (the queue pause table, `hammerwork_workflows`, and `hammerwork_jobs.archived_at`) now
   carry microseconds.
 
 ### Cost: it rewrites every table
