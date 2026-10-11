@@ -2,6 +2,8 @@
 
 The `TestQueue` provides a complete in-memory implementation of the `DatabaseQueue` trait, enabling fast, deterministic unit testing without requiring database connections. It includes time manipulation capabilities through `MockClock` for testing time-dependent features like delayed jobs, cron schedules, and timeouts.
 
+`TestQueue` is the supported way to test code that uses a queue without a database. `DatabaseQueue` is sealed: the PostgreSQL and MySQL `JobQueue`s and `TestQueue` are its only implementations, so you cannot write your own mock queue. Write the code under test against `impl DatabaseQueue` (or a generic `Q: DatabaseQueue`) and pass it a `TestQueue` in tests.
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)

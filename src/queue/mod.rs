@@ -42,6 +42,22 @@ mod memory_results;
 pub use memory_results::DEFAULT_MEMORY_RESULT_CAPACITY;
 pub(crate) use memory_results::MemoryResultStore;
 
+/// Seals [`DatabaseQueue`]: only types in this crate can implement [`private::Sealed`],
+/// so only they can implement the trait.
+mod private {
+    /// The supertrait that seals [`DatabaseQueue`](super::DatabaseQueue).
+    pub trait Sealed {}
+
+    #[cfg(feature = "postgres")]
+    impl Sealed for super::JobQueue<sqlx::Postgres> {}
+
+    #[cfg(feature = "mysql")]
+    impl Sealed for super::JobQueue<sqlx::MySql> {}
+
+    #[cfg(feature = "test-queue")]
+    impl Sealed for super::test::TestQueue {}
+}
+
 /// Information about a queue's pause state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuePauseInfo {
@@ -61,8 +77,21 @@ pub struct QueuePauseInfo {
 /// including job management, batch operations, statistics, and result storage.
 /// Each database backend implements this trait with optimizations specific to
 /// that database system.
+///
+/// # Sealed
+///
+/// This trait is sealed: it is implemented by [`JobQueue<Postgres>`](JobQueue) (feature
+/// `postgres`), [`JobQueue<MySql>`](JobQueue) (feature `mysql`) and
+/// [`TestQueue`](crate::queue::test::TestQueue) (feature `test-queue`), and cannot be
+/// implemented outside Hammerwork. New methods can therefore be added in minor
+/// releases. Use it as a bound (`Q: DatabaseQueue`, `&impl DatabaseQueue`) to write
+/// code that works with any of these queues.
+///
+/// To test code that uses a queue without a database, use
+/// [`TestQueue`](crate::queue::test::TestQueue), an in-memory implementation with the
+/// same behaviour as the database backends and a mock clock (see `docs/testing.md`).
 #[async_trait]
-pub trait DatabaseQueue: Send + Sync {
+pub trait DatabaseQueue: private::Sealed + Send + Sync {
     type Database: Database;
 
     // Core job operations
@@ -110,23 +139,12 @@ pub trait DatabaseQueue: Send + Sync {
     /// A zero `lease` never expires: the reaper never reclaims the job, even if its
     /// worker dies, so an operator has to (see
     /// [`Worker::with_lease_duration`](crate::worker::Worker::with_lease_duration)).
-    ///
-    /// The default implementation ignores `lease`, for backends that predate leases.
     async fn dequeue_leased(
         &self,
         queue_name: &str,
         weights: Option<&crate::priority::PriorityWeights>,
         lease: std::time::Duration,
-    ) -> Result<Option<Job>> {
-        let _ = lease;
-        match weights {
-            Some(weights) => {
-                self.dequeue_with_priority_weights(queue_name, weights)
-                    .await
-            }
-            None => self.dequeue(queue_name).await,
-        }
-    }
+    ) -> Result<Option<Job>>;
 
     /// Claim up to `max_jobs` runnable jobs of `queue_name` at once, highest priority
     /// first, then oldest, each with a lease of [`DEFAULT_LEASE_DURATION`].
@@ -172,37 +190,16 @@ pub trait DatabaseQueue: Send + Sync {
     /// their stored, encrypted payload); decrypt them with
     /// [`JobQueue::decrypt_job`](crate::queue::JobQueue::decrypt_job) before running.
     ///
-    /// The default implementation claims the jobs one at a time with
-    /// [`dequeue_leased`](Self::dequeue_leased) (so with weights each job picks its own
-    /// level), for backends that predate batch claims. If a claim fails after some
-    /// jobs were claimed, it returns those jobs rather than the error, so no claimed
-    /// job is lost to the caller.
+    /// A weighted claim commits each level's jobs before it claims the next level's, so
+    /// if a later claim fails after some jobs were claimed, it returns those jobs rather
+    /// than the error, and no claimed job is lost to the caller.
     async fn dequeue_batch_leased(
         &self,
         queue_name: &str,
         weights: Option<&crate::priority::PriorityWeights>,
         lease: std::time::Duration,
         max_jobs: usize,
-    ) -> Result<Vec<Job>> {
-        let mut jobs = Vec::new();
-        while jobs.len() < max_jobs {
-            match self.dequeue_leased(queue_name, weights, lease).await {
-                Ok(Some(job)) => jobs.push(job),
-                Ok(None) => break,
-                Err(error) if jobs.is_empty() => return Err(error),
-                Err(error) => {
-                    tracing::warn!(
-                        "claiming a job of queue {} failed after {} were claimed: {}",
-                        queue_name,
-                        jobs.len(),
-                        error
-                    );
-                    break;
-                }
-            }
-        }
-        Ok(jobs)
-    }
+    ) -> Result<Vec<Job>>;
 
     /// Hand a claimed job that was never run back to its queue.
     ///
@@ -216,18 +213,7 @@ pub trait DatabaseQueue: Send + Sync {
     /// Workers in batch mode ([`Worker::with_batch_size`](crate::worker::Worker::with_batch_size))
     /// call this on shutdown for the claimed jobs they have not started, so those jobs
     /// can run elsewhere at once instead of waiting for their leases to expire.
-    ///
-    /// The default implementation records a retry due now through
-    /// [`finish_job_run`](Self::finish_job_run), for backends that predate this method:
-    /// the job is runnable again at once, but the claim still counts as an attempt.
-    async fn release_job_run(&self, run: &Job) -> Result<bool> {
-        let outcome = JobOutcome::Retry {
-            retry_at: Utc::now(),
-            error: RELEASED_JOB_MESSAGE.to_string(),
-            timed_out: false,
-        };
-        Ok(self.finish_job_run(run, outcome).await?.is_some())
-    }
+    async fn release_job_run(&self, run: &Job) -> Result<bool>;
 
     /// Manually mark a job `Completed`.
     ///
@@ -760,39 +746,20 @@ pub trait DatabaseQueue: Send + Sync {
     /// for a single queue.
     ///
     /// [`JobArchiver::run_scheduled_pass`](crate::archive::JobArchiver::run_scheduled_pass)
-    /// uses it to apply each queue's own `purge_archived_after`. The default
-    /// implementation returns an error, for backends that predate per-queue purging.
+    /// uses it to apply each queue's own `purge_archived_after`.
     async fn purge_archived_jobs_in_queue(
         &self,
         queue_name: &str,
         older_than: DateTime<Utc>,
-    ) -> Result<u64> {
-        let _ = (queue_name, older_than);
-        Err(crate::HammerworkError::Queue {
-            message: "purging the archive of a single queue is not supported by this queue \
-                      backend"
-                .to_string(),
-        })
-    }
+    ) -> Result<u64>;
 
     /// The names of the queues that have jobs, in `hammerwork_jobs` or in the archive,
     /// sorted.
     ///
     /// [`JobArchiver::run_scheduled_pass`](crate::archive::JobArchiver::run_scheduled_pass)
     /// uses it to apply the default archival policy to every queue without a policy of
-    /// its own. The default implementation lists the queues of
-    /// [`get_all_queue_stats`](Self::get_all_queue_stats) (live jobs only).
-    async fn list_queue_names(&self) -> Result<Vec<String>> {
-        let mut names: Vec<String> = self
-            .get_all_queue_stats()
-            .await?
-            .into_iter()
-            .map(|stats| stats.queue_name)
-            .collect();
-        names.sort();
-        names.dedup();
-        Ok(names)
-    }
+    /// its own.
+    async fn list_queue_names(&self) -> Result<Vec<String>>;
 
     /// Get statistics about archived jobs.
     ///
@@ -973,55 +940,11 @@ pub trait DatabaseQueue: Send + Sync {
     ///   this one, `Manual` leaves them waiting) and a `FailFast` batch fails its
     ///   pending jobs;
     /// - workflow counters and status, and batch status, are updated.
-    ///
-    /// The default implementation composes the manual methods without a transaction,
-    /// for backends that predate this method.
     async fn finish_job_run(
         &self,
         run: &Job,
         outcome: JobOutcome,
-    ) -> Result<Option<RecordedOutcome>> {
-        let Some(current) = self.get_job(run.id).await? else {
-            return Ok(None);
-        };
-        if !lifecycle::Guard::Run(run).admits(&current) {
-            return Ok(None);
-        }
-        let next_run_at = match outcome.terminal_status() {
-            Some(_) if current.recurring => lifecycle::next_cron_run(&current, Utc::now()),
-            _ => None,
-        };
-        let mut recorded = match outcome {
-            JobOutcome::Completed => {
-                if next_run_at.is_none() {
-                    self.complete_job(run.id).await?;
-                }
-                RecordedOutcome::new(crate::job::JobStatus::Completed)
-            }
-            JobOutcome::Retry { retry_at, .. } => {
-                self.retry_job(run.id, retry_at).await?;
-                RecordedOutcome::new(crate::job::JobStatus::Pending)
-            }
-            JobOutcome::Dead { error } => {
-                self.mark_job_dead(run.id, &error).await?;
-                RecordedOutcome::new(crate::job::JobStatus::Dead)
-            }
-            JobOutcome::TimedOut { error } => {
-                self.mark_job_timed_out(run.id, &error).await?;
-                RecordedOutcome::new(crate::job::JobStatus::TimedOut)
-            }
-        };
-        if let Some(next) = next_run_at {
-            self.reschedule_cron_job(run.id, next).await?;
-            recorded.status = crate::job::JobStatus::Pending;
-            recorded.next_run_at = Some(next);
-        } else if recorded.status == crate::job::JobStatus::Completed {
-            recorded.unblocked = self.resolve_job_dependencies(run.id).await?;
-        } else if recorded.status != crate::job::JobStatus::Pending {
-            recorded.cancelled = self.fail_job_dependencies(run.id).await?;
-        }
-        Ok(Some(recorded))
-    }
+    ) -> Result<Option<RecordedOutcome>>;
 
     /// Record that a run completed and enqueue the child jobs it spawned, as one unit.
     ///
@@ -1042,32 +965,11 @@ pub trait DatabaseQueue: Send + Sync {
     /// they have finished. Each child is checked against the dependency limits
     /// ([`Job::validate_dependencies`](crate::Job::validate_dependencies)) before
     /// anything is written.
-    ///
-    /// The default implementation, for backends without transactions, enqueues the
-    /// children first and then records the completion, so a failure part-way leaves the
-    /// parent `Running` (to be retried) rather than completed without its children; a
-    /// retry may then enqueue the children again. It does not change workflow totals.
     async fn complete_job_run_with_children(
         &self,
         run: &Job,
         children: Vec<Job>,
-    ) -> Result<Option<RecordedOutcome>> {
-        let Some(current) = self.get_job(run.id).await? else {
-            return Ok(None);
-        };
-        if !lifecycle::Guard::Run(run).admits(&current) {
-            return Ok(None);
-        }
-        let mut spawned = Vec::with_capacity(children.len());
-        for child in children {
-            spawned.push(self.enqueue(child).await?);
-        }
-        let recorded = self.finish_job_run(run, JobOutcome::Completed).await?;
-        Ok(recorded.map(|mut recorded| {
-            recorded.spawned = spawned;
-            recorded
-        }))
-    }
+    ) -> Result<Option<RecordedOutcome>>;
 
     // Lease / stale job recovery
 
@@ -1085,13 +987,7 @@ pub trait DatabaseQueue: Send + Sync {
     /// worker is running it again: the caller has lost its lease, and its heartbeat does
     /// not extend the new run's lease.
     ///
-    /// The default implementation returns an error, for backends that predate leases.
-    async fn heartbeat_job(&self, run: &Job, lease: std::time::Duration) -> Result<bool> {
-        let _ = (run, lease);
-        Err(crate::HammerworkError::Queue {
-            message: "job leases are not supported by this queue backend".to_string(),
-        })
-    }
+    async fn heartbeat_job(&self, run: &Job, lease: std::time::Duration) -> Result<bool>;
 
     /// Record that a claimed run is starting now, after it waited for its turn.
     ///
@@ -1106,13 +1002,7 @@ pub trait DatabaseQueue: Send + Sync {
     /// `Running` that run.
     ///
     /// Workers in batch mode call this for a held job when it starts.
-    ///
-    /// The default implementation only renews the lease with
-    /// [`heartbeat_job`](Self::heartbeat_job) and leaves `started_at` at the claim time,
-    /// for backends that predate this method.
-    async fn start_claimed_run(&self, run: &mut Job, lease: std::time::Duration) -> Result<bool> {
-        self.heartbeat_job(run, lease).await
-    }
+    async fn start_claimed_run(&self, run: &mut Job, lease: std::time::Duration) -> Result<bool>;
 
     /// Reclaim jobs left in `Running` by workers that crashed or were killed.
     ///
@@ -1150,17 +1040,8 @@ pub trait DatabaseQueue: Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// The default implementation returns an error, for backends that predate leases.
-    async fn requeue_stale_jobs(
-        &self,
-        older_than: std::time::Duration,
-    ) -> Result<StaleJobRecovery> {
-        let _ = older_than;
-        Err(crate::HammerworkError::Queue {
-            message: "stale job recovery is not supported by this queue backend".to_string(),
-        })
-    }
+    async fn requeue_stale_jobs(&self, older_than: std::time::Duration)
+    -> Result<StaleJobRecovery>;
 
     /// Enforces the retention policies of encrypted jobs: deletes finished encrypted jobs
     /// whose retention period has ended.
@@ -1176,14 +1057,7 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// Run it periodically, e.g. from a cron job or with
     /// `cargo hammerwork maintenance purge-encrypted`. It needs no encryption key.
-    ///
-    /// The default implementation returns an error, for backends without encryption
-    /// support.
-    async fn purge_expired_encrypted_jobs(&self) -> Result<EncryptedJobPurge> {
-        Err(crate::HammerworkError::Queue {
-            message: "encrypted job retention is not supported by this queue backend".to_string(),
-        })
-    }
+    async fn purge_expired_encrypted_jobs(&self) -> Result<EncryptedJobPurge>;
 }
 
 /// The outcome of [`DatabaseQueue::purge_expired_encrypted_jobs`].
@@ -1226,11 +1100,6 @@ impl StaleJobRecovery {
 /// Error message recorded on a job reclaimed by [`DatabaseQueue::requeue_stale_jobs`].
 pub const STALE_JOB_ERROR_MESSAGE: &str =
     "Job lease expired while Running; the worker is presumed dead and the job was reclaimed";
-
-/// Error message recorded on a job handed back by the default
-/// [`DatabaseQueue::release_job_run`] (the built-in backends release a job without one).
-pub const RELEASED_JOB_MESSAGE: &str =
-    "Job was claimed but not started; released back to its queue";
 
 /// The most jobs one [`DatabaseQueue::dequeue_batch_leased`] call claims on the built-in
 /// backends; larger requests are capped at this. Keeps the claim statement (and, on

@@ -185,3 +185,59 @@ Migrate imports as follows:
 | `hammerwork_web::config::WebSocketConfig` | `hammerwork_web::WebSocketConfig` |
 | `hammerwork_web::server::WebDashboard` | `hammerwork_web::WebDashboard` |
 | `hammerwork_web::server::app_routes`, `api::*`, `auth::*`, `security::*`, `websocket::*`, `live::*` | removed; mount the dashboard with `WebDashboard` |
+
+## DatabaseQueue is sealed
+
+`DatabaseQueue` is now a sealed trait (#87): only Hammerwork can implement it. Its
+implementations are `JobQueue<Postgres>` (feature `postgres`), `JobQueue<MySql>`
+(feature `mysql`) and the in-memory `TestQueue` (feature `test-queue`). Because no
+other implementations exist, new methods can be added in minor releases without
+default bodies, and the defaults that existed only for implementations outside the
+crate are gone. The built-in queues behave as before.
+
+Code that only *uses* a queue is unaffected: `DatabaseQueue` is still the bound for
+generic code and the trait to import for its methods.
+
+```rust
+use hammerwork::queue::DatabaseQueue;
+
+// Still works: generic over any built-in queue.
+async fn pending_count(queue: &impl DatabaseQueue, name: &str) -> hammerwork::Result<u64> {
+    Ok(queue.get_queue_stats(name).await?.pending_count)
+}
+```
+
+### What to change
+
+If you implemented `DatabaseQueue` yourself, usually as a mock for tests, that no
+longer compiles (`the trait bound ...: Sealed is not satisfied`). Use `TestQueue`
+instead. It implements the whole trait in memory, with the same claim, lease, retry,
+workflow and archive behaviour as the database backends, and a `MockClock` for
+delayed and cron jobs (see [Testing](testing.md)):
+
+```toml
+[dev-dependencies]
+hammerwork = { version = "3", features = ["test-queue"] }
+```
+
+```rust
+// Before (2.x): a hand-written mock
+// struct MockQueue { /* ... */ }
+// #[async_trait] impl DatabaseQueue for MockQueue { /* ... */ }
+
+// After (3.0)
+use hammerwork::queue::{DatabaseQueue, test::TestQueue};
+
+# async fn example() -> hammerwork::Result<()> {
+let queue = TestQueue::new();
+let id = queue
+    .enqueue(hammerwork::Job::new("emails".into(), serde_json::json!({})))
+    .await?;
+assert!(queue.get_job(id).await?.is_some());
+# Ok(())
+# }
+```
+
+`hammerwork::queue::RELEASED_JOB_MESSAGE` is removed: it was the error message of the
+`release_job_run` fallback for queues outside the crate. The built-in queues release
+a job without recording an error.
