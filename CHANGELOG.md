@@ -11,6 +11,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Docs: `docs/integration-testing.md` now describes the real CI workflow and queue module paths.
 
+### Fixed
+
+- **`CronSchedule::every_weekday_at_9am` and `every_monday_at_noon` (and the matching
+  `cron::presets`) fire on the right days.** They used numeric weekdays (`1-5`, `1`), but
+  the `cron` crate numbers days of the week from Sunday = 1, so the "weekday" preset ran
+  Sunday to Thursday and the "Monday" preset ran on Sundays. They now use `Mon-Fri` and
+  `Mon`.
+- **`CronSchedule::matches` is true whenever the schedule fires during the given
+  minute.** It only looked at the first fire after the minute before, so schedules that
+  fire several times a minute (`* * * * * *`, `0,30 * * * * *`) or later in the minute
+  (`30 * * * * *`) did not match.
+- **The `cron_example` example runs.** It used five-field cron expressions, which
+  `CronSchedule::new` rejects (Hammerwork's expressions have a seconds field), so it
+  stopped at its first schedule.
+- **`list_archived_jobs` with an offset and no limit works on MySQL.** MySQL has no
+  `OFFSET` without `LIMIT`, so the query was a syntax error.
+- **A job with a huge result TTL or result size limit stays readable.** `insert_jobs`
+  wrapped values above `i64::MAX` (e.g. `with_result_ttl(Duration::MAX)`) to negative
+  numbers, and every later read or claim of the job failed to decode it. They are now
+  stored as `i64::MAX`, as job timeouts already saturate.
+- **One job row that cannot be decoded no longer stops archival.** `archive_jobs`
+  failed and rolled back the whole batch on such a row, and since candidates are taken
+  oldest first, every later pass failed on it too, for every queue. The row is now
+  skipped (with a warning, and left in `hammerwork_jobs`) and the batch is filled with
+  the jobs after it, so the pass archives everything else.
+- **An archival or purge age too large to subtract from now no longer panics.**
+  `archive_*_after` or `purge_archived_after` set to something like
+  `chrono::Duration::MAX` (an easy way to say "never") panicked in `archive_jobs` and
+  `JobArchiver::run_scheduled_pass`. Such an age now matches nothing, and a zero or
+  negative age matches everything finished so far, as before.
+- **`ArchivalStats::compression_ratio` counts payloads stored uncompressed as 1.**
+  They counted as 0, so a batch in which a few payloads compressed reported a ratio
+  below 1, as if archiving had grown the data.
+- **A job cancelled by a fail-fast workflow or batch on MySQL keeps its satisfied
+  dependencies.** MySQL marked them `failed`, unlike PostgreSQL, so retrying such a job
+  with `retry_job` left it `Pending` forever. Jobs failed because a dependency failed
+  still have their dependencies marked failed on both backends.
+- **`KeyManager::get_key` refuses a key that has expired while cached.** Keys are cached
+  for up to an hour, and the cache did not check the key's expiry, so an expired key
+  could still be used for up to an hour after it expired.
+
 ## [2.2.0] - 2026-10-11
 
 A fix and cleanup release. It is a minor version because it adds public API with default
