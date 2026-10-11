@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-10-11
+
+A bug-fix release from a third bug hunt (#111 to #114, #118). It is a minor version
+because it adds a database migration (020; run it before upgrading workers or archivers,
+and off-peak on MySQL, where it rebuilds the archive table) and new public items
+(`job::MAX_JOB_DEPENDENCIES`, `job::MAX_JOB_DEPENDENTS`, `Job::validate_dependencies`,
+and the defaulted `DatabaseQueue::list_queue_names` and
+`DatabaseQueue::purge_archived_jobs_in_queue`), and because several fixes change
+observable behaviour (see below). No public signatures change.
+
 ### Behaviour changes to check when upgrading
 
 - **`cargo hammerwork batch cancel`** cancels only `Pending` jobs by default. It used
