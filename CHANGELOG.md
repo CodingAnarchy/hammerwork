@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-10-11
+
+A bug-fix release for #100 to #106. It is a minor version because it adds a database
+migration (019, run it before upgrading workers or archivers) and new public items
+(`JobHistory::jobs_with_status`, `EventManager::delivers_payload` and
+`EventManager::payload_wanted`), and because several fixes change observable behaviour
+(see below). The one signature change is `hammerwork-web`'s `jobs::routes`, which now
+needs `T: JobHistory`.
+
 ### Behaviour changes to check when upgrading
 
 - **`maintenance vacuum` and `backup create`** treat "failed" as `Failed`, `Dead` or
