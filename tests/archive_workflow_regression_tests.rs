@@ -310,6 +310,9 @@ async fn spawned_children_raise_workflow_total<Q>(queue: Arc<Q>)
 where
     Q: DatabaseQueue + StoredWorkflow + Send + Sync + 'static,
 {
+    // Serialized with the archiving tests: on MySQL a concurrent dequeue's
+    // `FOR UPDATE` can lock rows they need, which their `SKIP LOCKED` then skips.
+    let _serial = test_utils::serial().await;
     let name = test_utils::unique_queue("spawned_workflow");
     let children_queue = format!("{name}_children");
     let workflow = JobGroup::new("spawned_workflow")
@@ -396,6 +399,9 @@ async fn dependency_limit_is_enforced<Q>(queue: Arc<Q>)
 where
     Q: DatabaseQueue + Send + Sync + 'static,
 {
+    // Serialized with the archiving tests: on MySQL a concurrent dequeue's
+    // `FOR UPDATE` can lock rows they need, which their `SKIP LOCKED` then skips.
+    let _serial = test_utils::serial().await;
     let name = test_utils::unique_queue("dependency_limit");
     let parents: Vec<JobId> = (0..=MAX_JOB_DEPENDENCIES)
         .map(|_| uuid::Uuid::new_v4())
