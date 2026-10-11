@@ -280,43 +280,10 @@ impl JobRow {
     }
 }
 
-/// Number of attempts for a job claim that keeps hitting InnoDB deadlocks.
-const CLAIM_DEADLOCK_ATTEMPTS: u32 = 5;
-
-/// Whether an error is an InnoDB deadlock (SQLSTATE 40001, error 1213), which is safe to retry.
-fn is_deadlock(error: &crate::HammerworkError) -> bool {
-    matches!(
-        error,
-        crate::HammerworkError::Database(sqlx::Error::Database(db_error))
-            if db_error.code().as_deref() == Some("40001")
-    )
-}
-
 /// Whether MySQL refused to change transaction characteristics because the session is
 /// still inside a transaction (ER_CANT_CHANGE_TX_CHARACTERISTICS, 1568 / SQLSTATE 25001).
 fn is_open_transaction_error(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(db_error) if db_error.code().as_deref() == Some("25001"))
-}
-
-/// Runs a job claim, retrying with a short backoff when InnoDB aborts it as a deadlock
-/// victim. Concurrent `SELECT ... FOR UPDATE SKIP LOCKED` + `UPDATE` claims can still
-/// deadlock on secondary index locks; the aborted transaction has been rolled back, so
-/// retrying is safe.
-async fn retry_on_deadlock<F, Fut, T>(mut claim: F) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let mut attempt = 1;
-    loop {
-        match claim().await {
-            Err(error) if attempt < CLAIM_DEADLOCK_ATTEMPTS && is_deadlock(&error) => {
-                tokio::time::sleep(Duration::from_millis(5 * u64::from(attempt))).await;
-                attempt += 1;
-            }
-            result => return result,
-        }
-    }
 }
 
 impl crate::queue::JobQueue<MySql> {
@@ -528,7 +495,8 @@ impl crate::queue::JobQueue<MySql> {
             super::weighted_seed(queue_name, attempt),
         ) {
             if let Some(job) =
-                retry_on_deadlock(|| self.claim_attempt(queue_name, Some(priority), lease)).await?
+                super::retry_on_conflict(|| self.claim_attempt(queue_name, Some(priority), lease))
+                    .await?
             {
                 return Ok(Some(job));
             }
@@ -613,7 +581,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 self.dequeue_with_priority_weights_inner(queue_name, weights, lease)
                     .await
             }
-            _ => retry_on_deadlock(|| self.claim_attempt(queue_name, None, lease)).await,
+            _ => super::retry_on_conflict(|| self.claim_attempt(queue_name, None, lease)).await,
         }
     }
 
@@ -633,7 +601,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             Some(weights) if !weights.is_strict() => weights,
             // Strict priority: highest priority first, then the oldest jobs.
             _ => {
-                return retry_on_deadlock(|| {
+                return super::retry_on_conflict(|| {
                     self.claim_batch_attempt(queue_name, None, lease, max_jobs)
                 })
                 .await;
@@ -661,7 +629,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             weights,
             max_jobs,
             |priority, room| {
-                retry_on_deadlock(move || {
+                super::retry_on_conflict(move || {
                     self.claim_batch_attempt(queue_name, Some(priority), lease, room)
                 })
             },
@@ -2236,8 +2204,8 @@ async fn insert_jobs(conn: &mut sqlx::MySqlConnection, jobs: &[Job]) -> Result<(
             chunk.iter().zip(encoded),
             |mut row, (job, (strategy, depends_on, dependents, encryption, pii_fields))| {
                 row.push_bind(job.id.to_string())
-                    .push_bind(job.queue_name.clone())
-                    .push_bind(job.payload.clone())
+                    .push_bind(&job.queue_name)
+                    .push_bind(&job.payload)
                     .push_bind(job.status)
                     .push_bind(job.priority.as_i32())
                     .push_bind(job.attempts)
@@ -2249,34 +2217,34 @@ async fn insert_jobs(conn: &mut sqlx::MySqlConnection, jobs: &[Job]) -> Result<(
                     .push_bind(job.completed_at)
                     .push_bind(job.failed_at)
                     .push_bind(job.timed_out_at)
-                    .push_bind(job.error_message.clone())
-                    .push_bind(job.cron_schedule.clone())
+                    .push_bind(&job.error_message)
+                    .push_bind(&job.cron_schedule)
                     .push_bind(job.next_run_at)
                     .push_bind(job.recurring)
-                    .push_bind(job.timezone.clone())
+                    .push_bind(&job.timezone)
                     .push_bind(job.batch_id.map(|id| id.to_string()))
                     .push_bind(result_storage_str(&job.result_config.storage))
                     .push_bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
                     .push_bind(job.result_config.max_size_bytes.map(|s| s as i64))
-                    .push_bind(strategy.clone())
-                    .push_bind(depends_on.clone())
-                    .push_bind(dependents.clone())
+                    .push_bind(strategy)
+                    .push_bind(depends_on)
+                    .push_bind(dependents)
                     .push_bind(job.dependency_status.as_str())
                     .push_bind(job.workflow_id.map(|id| id.to_string()))
-                    .push_bind(job.workflow_name.clone())
-                    .push_bind(job.trace_id.clone())
-                    .push_bind(job.correlation_id.clone())
-                    .push_bind(job.parent_span_id.clone())
-                    .push_bind(job.span_context.clone())
+                    .push_bind(&job.workflow_name)
+                    .push_bind(&job.trace_id)
+                    .push_bind(&job.correlation_id)
+                    .push_bind(&job.parent_span_id)
+                    .push_bind(&job.span_context)
                     .push_bind(encryption.is_encrypted)
-                    .push_bind(encryption.key_id.clone())
+                    .push_bind(&encryption.key_id)
                     .push_bind(encryption.algorithm)
-                    .push_bind(encryption.ciphertext.clone())
-                    .push_bind(encryption.nonce.clone())
-                    .push_bind(encryption.tag.clone())
-                    .push_bind(encryption.metadata.clone())
-                    .push_bind(encryption.payload_hash.clone())
-                    .push_bind(pii_fields.clone())
+                    .push_bind(&encryption.ciphertext)
+                    .push_bind(&encryption.nonce)
+                    .push_bind(&encryption.tag)
+                    .push_bind(&encryption.metadata)
+                    .push_bind(&encryption.payload_hash)
+                    .push_bind(pii_fields)
                     .push_bind(encryption.retention_policy)
                     .push_bind(encryption.retention_delete_at)
                     .push_bind(encryption.encrypted_at);
