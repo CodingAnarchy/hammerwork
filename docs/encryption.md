@@ -808,8 +808,8 @@ Migration `011_add_encryption` adds these columns to `hammerwork_jobs` and `hamm
 | `payload_hash` | `VARCHAR` | `VARCHAR(255)` | Keyed integrity hash of the plaintext (`hmac-sha256:<hex>`) |
 | `pii_fields` | `TEXT[]` | `JSON` | Field names listed with `with_pii_fields` |
 | `retention_policy` | `VARCHAR` | `VARCHAR(50)` | `DeleteAfter`, `DeleteAt`, `KeepIndefinitely`, `DeleteImmediately` or `UseDefault` |
-| `retention_delete_at` | `TIMESTAMPTZ` | `TIMESTAMP(6)` | When the job may be purged |
-| `encrypted_at` | `TIMESTAMPTZ` | `TIMESTAMP(6)` | When the payload was encrypted |
+| `retention_delete_at` | `TIMESTAMPTZ` | `DATETIME(6)` | When the job may be purged |
+| `encrypted_at` | `TIMESTAMPTZ` | `DATETIME(6)` | When the payload was encrypted |
 
 A CHECK constraint requires `encrypted_payload`, `encryption_nonce`, `encryption_tag` and `encryption_key_id` whenever `is_encrypted` is true. Archiving and restoring copy these columns between the two tables as they are; the payload is never decrypted on the way.
 

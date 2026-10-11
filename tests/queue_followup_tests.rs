@@ -712,20 +712,30 @@ mod mysql_tests {
         }
     }
 
-    /// #31 M7: MySQL `TIMESTAMP` columns end at 2038-01-19 03:14:07 UTC. Times beyond
-    /// it are rejected with a clear error instead of a database error.
+    /// #91: the MySQL columns are `DATETIME(6)`, so times after 2038-01-19 03:14:07 UTC
+    /// (the end of `TIMESTAMP`) are stored. Only times outside years 1000 to 9999 are
+    /// rejected, with a clear error instead of a database error.
     #[tokio::test]
     #[ignore] // Requires database connection
-    async fn test_mysql_times_after_2038_are_rejected() {
+    async fn test_mysql_times_after_2038_are_stored() {
         let queue = test_utils::setup_mysql_queue().await;
         let queue_name = test_utils::unique_queue("y2038");
-        let after_2038: DateTime<Utc> = "2040-01-01T00:00:00Z".parse().unwrap();
+        let after_2038: DateTime<Utc> = "2100-06-15T12:30:45.123456Z".parse().unwrap();
 
         let mut late = job(&queue_name, "late");
         late.scheduled_at = after_2038;
-        match queue.enqueue(late).await {
+        let late_id = queue.enqueue(late).await.unwrap();
+        let stored = queue.get_job(late_id).await.unwrap().unwrap();
+        assert_eq!(stored.scheduled_at, after_2038);
+        // Not due yet, so it is not dequeued
+        assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+
+        let too_late = DateTime::from_timestamp(253_402_300_800, 0).unwrap(); // year 10000
+        let mut beyond = job(&queue_name, "beyond");
+        beyond.scheduled_at = too_late;
+        match queue.enqueue(beyond).await {
             Err(HammerworkError::InvalidJobPayload { message }) => {
-                assert!(message.contains("2038"), "{message}")
+                assert!(message.contains("DATETIME"), "{message}")
             }
             other => panic!("expected InvalidJobPayload, got {other:?}"),
         }
@@ -733,23 +743,25 @@ mod mysql_tests {
         let id = queue.enqueue(job(&queue_name, "on time")).await.unwrap();
         let run = queue.dequeue_one(&queue_name).await.unwrap().expect("job");
         assert!(matches!(
-            queue.retry_job(id, after_2038).await,
+            queue.retry_job(id, too_late).await,
             Err(HammerworkError::InvalidJobPayload { .. })
         ));
         assert!(matches!(
-            queue
-                .store_job_result(id, json!({}), Some(after_2038))
-                .await,
+            queue.store_job_result(id, json!({}), Some(too_late)).await,
             Err(HammerworkError::InvalidJobPayload { .. })
         ));
-        // A lease longer than the column can hold is capped, not an error
+        queue
+            .store_job_result(id, json!({}), Some(after_2038))
+            .await
+            .unwrap();
+        // The longest lease (100 years) fits
         assert!(queue.heartbeat_job(&run, Duration::MAX).await.unwrap());
-        // A worker's retry far in the future is capped at the latest storable time
+        // A worker's retry beyond the column is capped at the latest storable time
         queue
             .finish_job_run(
                 &run,
                 JobOutcome::Retry {
-                    retry_at: after_2038,
+                    retry_at: too_late,
                     error: "later".to_string(),
                     timed_out: false,
                 },
@@ -758,10 +770,11 @@ mod mysql_tests {
             .unwrap()
             .expect("recorded");
         let job = queue.get_job(id).await.unwrap().unwrap();
-        assert!(job.scheduled_at < after_2038);
-        assert!(job.scheduled_at > "2038-01-19T03:14:06Z".parse::<DateTime<Utc>>().unwrap());
+        assert!(job.scheduled_at < too_late);
+        assert!(job.scheduled_at > "9999-12-31T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
 
         queue.delete_job(id).await.unwrap();
+        queue.delete_job(late_id).await.unwrap();
     }
 
     /// Times are UTC whatever the session `time_zone`: written and compared with

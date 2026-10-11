@@ -323,9 +323,8 @@ impl crate::queue::JobQueue<MySql> {
     /// concurrent workers move past rows another worker is claiming instead of
     /// blocking on them. The claim time comes from the database clock.
     ///
-    /// The lease (`lease` microseconds, capped at the latest time a TIMESTAMP column
-    /// holds) is written by the claiming UPDATE, so the stale job reaper never sees this
-    /// run without one (`last_heartbeat_at = started_at` marks it as this run's lease).
+    /// The lease (`lease` microseconds) is written by the claiming UPDATE, so the stale
+    /// job reaper never sees this run without one (`last_heartbeat_at = started_at` marks it as this run's lease).
     async fn claim_attempt(
         &self,
         queue_name: &str,
@@ -345,7 +344,9 @@ impl crate::queue::JobQueue<MySql> {
                     ""
                 }
             );
-            let mut select = sqlx::query(AssertSqlSafe(query)).bind(queue_name).bind(queue_name);
+            let mut select = sqlx::query(AssertSqlSafe(query))
+                .bind(queue_name)
+                .bind(queue_name);
             if let Some(priority) = priority {
                 select = select.bind(priority.as_i32());
             }
@@ -362,11 +363,11 @@ impl crate::queue::JobQueue<MySql> {
                 .map_err(crate::HammerworkError::from)
                 .and_then(JobRow::into_job);
 
-            sqlx::query(AssertSqlSafe(format!(
+            sqlx::query(
                 "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1, \
-                 last_heartbeat_at = ?, lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
-                 CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ?"
-            )))
+                 last_heartbeat_at = ?, lease_expires_at = DATE_ADD(?, INTERVAL ? MICROSECOND) \
+                 WHERE id = ?",
+            )
             .bind(JobStatus::Running)
             .bind(started_at)
             .bind(started_at)
@@ -413,7 +414,9 @@ impl crate::queue::JobQueue<MySql> {
                     ""
                 }
             );
-            let mut select = sqlx::query(AssertSqlSafe(query)).bind(queue_name).bind(queue_name);
+            let mut select = sqlx::query(AssertSqlSafe(query))
+                .bind(queue_name)
+                .bind(queue_name);
             if let Some(priority) = priority {
                 select = select.bind(priority.as_i32());
             }
@@ -445,8 +448,8 @@ impl crate::queue::JobQueue<MySql> {
             let placeholders = vec!["?"; ids.len()].join(", ");
             let sql = format!(
                 "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1, \
-                 last_heartbeat_at = ?, lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
-                 CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id IN ({placeholders})"
+                 last_heartbeat_at = ?, lease_expires_at = DATE_ADD(?, INTERVAL ? MICROSECOND) \
+                 WHERE id IN ({placeholders})"
             );
             let mut update = sqlx::query(AssertSqlSafe(sql))
                 .bind(JobStatus::Running)
@@ -2018,16 +2021,16 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn heartbeat_job(&self, run: &Job, lease: std::time::Duration) -> Result<bool> {
         // The lease is measured on the database clock, like the reaper that checks it,
-        // and capped at the latest time a TIMESTAMP column holds. Only the run that was
+        // (a lease is at most 100 years, see `clamp_interval`). Only the run that was
         // dequeued is extended: a stale worker whose job was reclaimed and claimed again
         // must not keep the new run's lease alive.
         let started = super::run_started_range(run);
-        let result = sqlx::query(AssertSqlSafe(format!(
+        let result = sqlx::query(
             "UPDATE hammerwork_jobs SET last_heartbeat_at = UTC_TIMESTAMP(6), \
-             lease_expires_at = LEAST(DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? MICROSECOND), \
-             CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ? AND status = ? \
-             AND attempts = ? AND (? IS NULL OR (started_at > ? AND started_at < ?))"
-        )))
+             lease_expires_at = DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? MICROSECOND) \
+             WHERE id = ? AND status = ? \
+             AND attempts = ? AND (? IS NULL OR (started_at > ? AND started_at < ?))",
+        )
         .bind(lease_micros(lease))
         .bind(run.id.to_string())
         .bind(JobStatus::Running)
@@ -2050,12 +2053,12 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .fetch_one(&self.pool)
             .await?;
         let started = super::run_started_range(run);
-        let result = sqlx::query(AssertSqlSafe(format!(
+        let result = sqlx::query(
             "UPDATE hammerwork_jobs SET started_at = ?, last_heartbeat_at = ?, \
-             lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
-             CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ? AND status = ? \
-             AND attempts = ? AND (? IS NULL OR (started_at > ? AND started_at < ?))"
-        )))
+             lease_expires_at = DATE_ADD(?, INTERVAL ? MICROSECOND) \
+             WHERE id = ? AND status = ? \
+             AND attempts = ? AND (? IS NULL OR (started_at > ? AND started_at < ?))",
+        )
         .bind(now)
         .bind(now)
         .bind(now)
@@ -2361,39 +2364,33 @@ async fn insert_jobs(conn: &mut sqlx::MySqlConnection, jobs: &[Job]) -> Result<(
     Ok(())
 }
 
-/// The latest instant a MySQL `TIMESTAMP` column can hold, as SQL.
-const TIMESTAMP_MAX_SQL: &str = "2038-01-19 03:14:07.999999";
-
 /// A lease as the microseconds bound to `INTERVAL ? MICROSECOND` (a zero lease never
-/// expires; see [`super::lease_interval`]). Statements cap the resulting time at
-/// [`TIMESTAMP_MAX_SQL`].
+/// expires; see [`super::lease_interval`], which caps it at 100 years).
 fn lease_micros(lease: std::time::Duration) -> i64 {
     super::lease_interval(lease)
         .num_microseconds()
         .unwrap_or(i64::MAX)
 }
 
-/// The range of instants a MySQL `TIMESTAMP` column can hold:
-/// 1970-01-01 00:00:01 to 2038-01-19 03:14:07.999999 UTC.
+/// The range of instants a MySQL `DATETIME(6)` column can hold:
+/// 1000-01-01 00:00:00 to 9999-12-31 23:59:59.999999 UTC.
 fn timestamp_range() -> (DateTime<Utc>, DateTime<Utc>) {
     (
-        DateTime::from_timestamp(1, 0).unwrap_or(DateTime::<Utc>::MIN_UTC),
-        DateTime::from_timestamp(i64::from(i32::MAX), 999_999_000)
-            .unwrap_or(DateTime::<Utc>::MAX_UTC),
+        DateTime::from_timestamp(-30_610_224_000, 0).unwrap_or(DateTime::<Utc>::MIN_UTC),
+        DateTime::from_timestamp(253_402_300_799, 999_999_000).unwrap_or(DateTime::<Utc>::MAX_UTC),
     )
 }
 
-/// Reject a time that the MySQL schema's `TIMESTAMP` columns cannot store (after
-/// 2038-01-19 03:14:07 UTC, the "year 2038" limit), with an error naming the value,
-/// instead of letting MySQL reject the statement.
+/// Reject a time that the MySQL schema's `DATETIME(6)` columns cannot store (outside
+/// years 1000 to 9999), with an error naming the value, instead of letting MySQL
+/// reject the statement.
 fn check_timestamp(value: DateTime<Utc>, what: &str) -> Result<()> {
     let (min, max) = timestamp_range();
     if value < min || value > max {
         return Err(crate::HammerworkError::InvalidJobPayload {
             message: format!(
-                "{what} {value} is outside the range MySQL TIMESTAMP columns can store \
-                 ({min} to {max}); the MySQL backend cannot schedule jobs after \
-                 2038-01-19 03:14:07 UTC"
+                "{what} {value} is outside the range MySQL DATETIME columns can store \
+                 ({min} to {max})"
             ),
         });
     }
@@ -2603,7 +2600,7 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
         db_now(conn).await
     }
 
-    /// A next run after the `TIMESTAMP` range cannot be stored.
+    /// A next run outside the `DATETIME` range cannot be stored.
     fn can_schedule_at(next_run_at: DateTime<Utc>) -> bool {
         check_timestamp(next_run_at, "next run time").is_ok()
     }
@@ -2664,7 +2661,7 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
                  timed_out_at = COALESCE(?, timed_out_at), \
                  last_heartbeat_at = NULL, lease_expires_at = NULL WHERE id = ?",
             )
-            // A backoff beyond the TIMESTAMP range retries at the latest storable time.
+            // A backoff beyond the DATETIME range retries at the latest storable time.
             .bind((*retry_at).min(timestamp_range().1))
             .bind(error)
             .bind(timed_out.then_some(now))

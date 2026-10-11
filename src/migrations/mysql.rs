@@ -162,7 +162,7 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
             r#"
             CREATE TABLE IF NOT EXISTS hammerwork_migrations (
                 migration_id VARCHAR(255) NOT NULL PRIMARY KEY,
-                executed_at TIMESTAMP(6) NOT NULL,
+                executed_at DATETIME(6) NOT NULL,
                 execution_time_ms BIGINT NOT NULL
             )
             "#,

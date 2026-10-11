@@ -36,6 +36,7 @@ Migrations are organized chronologically and represent the evolution of Hammerwo
 18. **018_add_job_retry_strategy** - Add `retry_strategy` (JSON) so `Job::with_retry_strategy` is stored, and an index on `(batch_id, status)` for batch progress checks. Required: every job query reads the new column.
 19. **019_add_archive_workflow** - Add `workflow_id` and `workflow_name` to `hammerwork_jobs_archive`, so archived jobs keep their workflow and `restore_archived_job` puts it back. Required: archiving, restoring and reading archived jobs use the new columns.
 20. **020_archive_retry_strategy_and_workflow_index** - Index `hammerwork_jobs_archive(workflow_id)` (workflow progress counts archived member jobs). On MySQL also widen `hammerwork_jobs_archive.retry_strategy` from `VARCHAR(50)` to `TEXT` (archiving a job with a retry strategy failed on strict MySQL) and store archive timestamps with microseconds (`TIMESTAMP(6)`). Required on MySQL before archiving jobs that have a retry strategy.
+21. **021_mysql_datetime** - MySQL only (a no-op on PostgreSQL): convert every `TIMESTAMP` column to `DATETIME(6)` to lift the year-2038 limit. Rewrites every Hammerwork table, blocking writes while it runs; see [MySQL timestamps (migration 021)](upgrading-to-3.0.md#mysql-timestamps-migration-021).
 
 ## Running Migrations
 
@@ -142,7 +143,7 @@ CREATE TABLE hammerwork_migrations (
 -- MySQL  
 CREATE TABLE hammerwork_migrations (
     migration_id VARCHAR(255) NOT NULL PRIMARY KEY,
-    executed_at TIMESTAMP(6) NOT NULL,
+    executed_at DATETIME(6) NOT NULL,
     execution_time_ms BIGINT NOT NULL
 );
 ```
@@ -185,24 +186,17 @@ On MySQL every time is written and compared as UTC (`UTC_TIMESTAMP(6)`, never th
 session-local `NOW()`), so the session `time_zone` does not matter. sqlx sets it to
 `+00:00` by default.
 
-### MySQL `TIMESTAMP` Range (Year 2038)
+### MySQL `DATETIME(6)` Range
 
-The MySQL schema stores times in `TIMESTAMP(6)` columns, which hold
-1970-01-01 00:00:01 to **2038-01-19 03:14:07 UTC**. The MySQL backend rejects times
-outside that range with `HammerworkError::InvalidJobPayload` instead of a database
-error: enqueueing a job scheduled after it, `retry_job`, `reschedule_cron_job` and
-`store_job_result` with such a time. Times computed by the library are capped instead:
-a worker's retry backoff that would end after it retries at the latest storable time,
-a lease is capped, and a recurring job whose next occurrence falls after it is not
-rescheduled (it keeps its final status, with a warning). PostgreSQL (`TIMESTAMPTZ`) has
-no such limit.
-
-Converting the columns to `DATETIME(6)` would lift the limit, but MySQL performs that
-change by rebuilding each table (`ALTER TABLE ... MODIFY`, `ALGORITHM=COPY`), which
-blocks writes to `hammerwork_jobs` for the duration. Because migrations run
-automatically (`run_migrations`, `auto_migrate`), shipping it as a regular migration
-would turn an upgrade into an unplanned write outage on large queues, so Hammerwork
-does not do it.
+Since migration 021 the MySQL schema stores times in `DATETIME(6)` columns (before
+it, `TIMESTAMP(6)` columns, which ended at 2038-01-19 03:14:07 UTC). `DATETIME(6)` holds
+years 1000 to 9999; the MySQL backend rejects times outside that range with
+`HammerworkError::InvalidJobPayload` instead of a database error, and a worker's retry
+backoff beyond it retries at the latest storable time. Leases are at most 100 years.
+`DATETIME` stores the literal value without time zone conversion, which is why every
+time is written as UTC. See
+[MySQL timestamps (migration 021)](upgrading-to-3.0.md#mysql-timestamps-migration-021)
+for what the conversion does to an existing database.
 
 ## Migration Development
 
