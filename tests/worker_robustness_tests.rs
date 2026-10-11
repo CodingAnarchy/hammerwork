@@ -23,28 +23,6 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-/// Poll `get_job` until `predicate` holds or `timeout` elapses; returns the last job.
-async fn wait_for_job<DB, F>(
-    queue: &Arc<JobQueue<DB>>,
-    id: JobId,
-    timeout: Duration,
-    predicate: F,
-) -> Job
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
-    F: Fn(&Job) -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        let job = queue.get_job(id).await.unwrap().expect("job exists");
-        if predicate(&job) || Instant::now() >= deadline {
-            return job;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 /// A panicking handler must fail the job through the normal path (not leave it
 /// `Running`) and must not kill the worker.
 async fn handler_panic_fails_job_and_worker_survives<DB>(queue: Arc<JobQueue<DB>>)
@@ -75,7 +53,7 @@ where
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let worker_task = tokio::spawn(async move { worker.run(shutdown_rx).await });
 
-    let job = wait_for_job(&queue, panicking, Duration::from_secs(10), |job| {
+    let job = test_utils::wait_for_job(&queue, panicking, Duration::from_secs(10), |job| {
         job.status != JobStatus::Running && job.status != JobStatus::Pending
     })
     .await;
@@ -91,7 +69,7 @@ where
         .enqueue(Job::new(queue_name.clone(), json!({ "panic": false })))
         .await
         .unwrap();
-    let job = wait_for_job(&queue, healthy, Duration::from_secs(10), |job| {
+    let job = test_utils::wait_for_job(&queue, healthy, Duration::from_secs(10), |job| {
         job.status == JobStatus::Completed
     })
     .await;
@@ -132,7 +110,7 @@ where
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let worker_task = tokio::spawn(async move { worker.run(shutdown_rx).await });
 
-    let job = wait_for_job(&queue, id, Duration::from_secs(10), |job| {
+    let job = test_utils::wait_for_job(&queue, id, Duration::from_secs(10), |job| {
         job.attempts >= 1 && job.status == JobStatus::Pending
     })
     .await;
@@ -569,7 +547,7 @@ where
         result = async { tokio::join!(service_a.start(), service_b.start()) } => {
             panic!("pools stopped early: {result:?}")
         }
-        _ = wait_for_job(&queue, id, Duration::from_secs(10), |job| {
+        _ = test_utils::wait_for_job(&queue, id, Duration::from_secs(10), |job| {
             job.status == JobStatus::Completed
         }) => {}
     }
@@ -691,23 +669,8 @@ where
     queue.delete_job(id).await.unwrap();
 }
 
-macro_rules! backend_tests {
-    ($module:ident, $setup:path, $ignore:meta, [$($scenario:ident),* $(,)?]) => {
-        mod $module {
-            use super::*;
-            $(
-                #[tokio::test]
-                #[$ignore]
-                async fn $scenario() {
-                    super::$scenario($setup().await).await;
-                }
-            )*
-        }
-    };
-}
-
 #[cfg(feature = "postgres")]
-backend_tests!(
+crate::test_utils::backend_tests!(
     postgres_tests,
     test_utils::setup_postgres_queue,
     ignore = "requires PostgreSQL: DATABASE_URL",
@@ -726,7 +689,7 @@ backend_tests!(
 );
 
 #[cfg(feature = "mysql")]
-backend_tests!(
+crate::test_utils::backend_tests!(
     mysql_tests,
     test_utils::setup_mysql_queue,
     ignore = "requires MySQL: MYSQL_DATABASE_URL",

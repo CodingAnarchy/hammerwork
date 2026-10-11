@@ -28,11 +28,7 @@ impl MigrationCommand {
     pub async fn execute(&self, config: &Config) -> Result<()> {
         match self {
             MigrationCommand::Run { database_url, drop } => {
-                let db_url = database_url
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .or(config.get_database_url())
-                    .ok_or_else(|| anyhow::anyhow!("Database URL is required"))?;
+                let db_url = &config.resolve_database_url(database_url.as_deref())?;
 
                 info!("Running migrations for: {}", redact_url(db_url));
                 let pool = DatabasePool::connect_with_config(db_url, config).await?;
@@ -40,11 +36,7 @@ impl MigrationCommand {
                 info!("Migrations completed successfully");
             }
             MigrationCommand::Status { database_url } => {
-                let db_url = database_url
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .or(config.get_database_url())
-                    .ok_or_else(|| anyhow::anyhow!("Database URL is required"))?;
+                let db_url = &config.resolve_database_url(database_url.as_deref())?;
 
                 info!("Checking migration status for: {}", redact_url(db_url));
                 check_migration_status(db_url).await?;

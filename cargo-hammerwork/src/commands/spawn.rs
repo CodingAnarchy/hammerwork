@@ -333,12 +333,7 @@ impl SpawnCommand {
             SpawnCommand::Monitor { database_url, .. } => database_url,
         };
 
-        url_option
-            .as_ref()
-            .map(|s| s.as_str())
-            .or(config.get_database_url())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("Database URL is required"))
+        config.resolve_database_url(url_option.as_deref())
     }
 }
 

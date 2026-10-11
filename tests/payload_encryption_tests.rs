@@ -267,23 +267,6 @@ fn long_retention() -> RetentionPolicy {
     RetentionPolicy::DeleteAfter(Duration::from_secs(30 * 24 * 60 * 60))
 }
 
-/// Poll `get_job` until `predicate` holds or 15 seconds elapse; returns the last job.
-async fn wait_for_job<DB, F>(queue: &Arc<JobQueue<DB>>, id: JobId, predicate: F) -> Job
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
-    F: Fn(&Job) -> bool,
-{
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let job = queue.get_job(id).await.unwrap().expect("job exists");
-        if predicate(&job) || Instant::now() >= deadline {
-            return job;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 /// Runs a worker on `queue_name` until job `id` is no longer pending or running.
 /// Returns the job and the payloads the handler saw.
 async fn run_worker_until_done<DB>(
@@ -309,7 +292,7 @@ where
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
 
-    let job = wait_for_job(queue, id, |job| {
+    let job = test_utils::wait_for_job(queue, id, Duration::from_secs(15), |job| {
         !matches!(job.status, JobStatus::Pending | JobStatus::Running)
     })
     .await;
@@ -1320,7 +1303,7 @@ where
         .with_spawn_manager(Arc::new(manager));
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
-    let job = wait_for_job(&queue, id, |job| {
+    let job = test_utils::wait_for_job(&queue, id, Duration::from_secs(15), |job| {
         !matches!(job.status, JobStatus::Pending | JobStatus::Running)
     })
     .await;
@@ -1415,104 +1398,25 @@ where
 mod postgres {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_whole_payload_round_trip() {
-        whole_payload_round_trip(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_batch_claims_round_trip() {
-        batch_claims_round_trip(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_pii_fields_round_trip() {
-        pii_fields_round_trip(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_every_read_path_keeps_the_ciphertext() {
-        every_read_path_keeps_the_ciphertext(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_plaintext_guard_refuses_plaintext_on_encrypted_queues() {
-        plaintext_guard_refuses_plaintext_on_encrypted_queues(
-            test_utils::setup_postgres_queue().await,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_batch_and_workflow_are_encrypted() {
-        batch_and_workflow_are_encrypted(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_encrypted_job_spawns_children() {
-        encrypted_job_spawns_children(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_missing_engine_fails_closed() {
-        missing_engine_fails_closed(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_wrong_and_rotated_keys() {
-        wrong_and_rotated_keys(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_retention_purge() {
-        retention_purge(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_archive_and_restore_keep_ciphertext() {
-        archive_and_restore_keep_ciphertext(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_plain_jobs_unchanged() {
-        plain_jobs_unchanged(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_swapped_ciphertexts_do_not_decrypt() {
-        swapped_ciphertexts_do_not_decrypt(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_moved_job_does_not_decrypt() {
-        moved_job_does_not_decrypt(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_legacy_unbound_payload_decrypts() {
-        legacy_unbound_payload_decrypts(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_worker_pool_purges_expired_jobs() {
-        worker_pool_purges_expired_jobs(test_utils::setup_postgres_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_postgres_queue;
+        test_postgres_whole_payload_round_trip => whole_payload_round_trip,
+        test_postgres_batch_claims_round_trip => batch_claims_round_trip,
+        test_postgres_pii_fields_round_trip => pii_fields_round_trip,
+        test_postgres_every_read_path_keeps_the_ciphertext => every_read_path_keeps_the_ciphertext,
+        test_postgres_plaintext_guard_refuses_plaintext_on_encrypted_queues => plaintext_guard_refuses_plaintext_on_encrypted_queues,
+        test_postgres_batch_and_workflow_are_encrypted => batch_and_workflow_are_encrypted,
+        test_postgres_encrypted_job_spawns_children => encrypted_job_spawns_children,
+        test_postgres_missing_engine_fails_closed => missing_engine_fails_closed,
+        test_postgres_wrong_and_rotated_keys => wrong_and_rotated_keys,
+        test_postgres_retention_purge => retention_purge,
+        test_postgres_archive_and_restore_keep_ciphertext => archive_and_restore_keep_ciphertext,
+        test_postgres_plain_jobs_unchanged => plain_jobs_unchanged,
+        test_postgres_swapped_ciphertexts_do_not_decrypt => swapped_ciphertexts_do_not_decrypt,
+        test_postgres_moved_job_does_not_decrypt => moved_job_does_not_decrypt,
+        test_postgres_legacy_unbound_payload_decrypts => legacy_unbound_payload_decrypts,
+        test_postgres_worker_pool_purges_expired_jobs => worker_pool_purges_expired_jobs,
+    );
 
     #[tokio::test]
     #[ignore] // Requires database connection
@@ -1532,104 +1436,25 @@ mod postgres {
 mod mysql {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_whole_payload_round_trip() {
-        whole_payload_round_trip(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_batch_claims_round_trip() {
-        batch_claims_round_trip(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_pii_fields_round_trip() {
-        pii_fields_round_trip(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_every_read_path_keeps_the_ciphertext() {
-        every_read_path_keeps_the_ciphertext(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_plaintext_guard_refuses_plaintext_on_encrypted_queues() {
-        plaintext_guard_refuses_plaintext_on_encrypted_queues(
-            test_utils::setup_mysql_queue().await,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_batch_and_workflow_are_encrypted() {
-        batch_and_workflow_are_encrypted(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_encrypted_job_spawns_children() {
-        encrypted_job_spawns_children(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_missing_engine_fails_closed() {
-        missing_engine_fails_closed(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_wrong_and_rotated_keys() {
-        wrong_and_rotated_keys(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_retention_purge() {
-        retention_purge(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_archive_and_restore_keep_ciphertext() {
-        archive_and_restore_keep_ciphertext(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_plain_jobs_unchanged() {
-        plain_jobs_unchanged(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_swapped_ciphertexts_do_not_decrypt() {
-        swapped_ciphertexts_do_not_decrypt(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_moved_job_does_not_decrypt() {
-        moved_job_does_not_decrypt(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_legacy_unbound_payload_decrypts() {
-        legacy_unbound_payload_decrypts(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_worker_pool_purges_expired_jobs() {
-        worker_pool_purges_expired_jobs(test_utils::setup_mysql_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_mysql_queue;
+        test_mysql_whole_payload_round_trip => whole_payload_round_trip,
+        test_mysql_batch_claims_round_trip => batch_claims_round_trip,
+        test_mysql_pii_fields_round_trip => pii_fields_round_trip,
+        test_mysql_every_read_path_keeps_the_ciphertext => every_read_path_keeps_the_ciphertext,
+        test_mysql_plaintext_guard_refuses_plaintext_on_encrypted_queues => plaintext_guard_refuses_plaintext_on_encrypted_queues,
+        test_mysql_batch_and_workflow_are_encrypted => batch_and_workflow_are_encrypted,
+        test_mysql_encrypted_job_spawns_children => encrypted_job_spawns_children,
+        test_mysql_missing_engine_fails_closed => missing_engine_fails_closed,
+        test_mysql_wrong_and_rotated_keys => wrong_and_rotated_keys,
+        test_mysql_retention_purge => retention_purge,
+        test_mysql_archive_and_restore_keep_ciphertext => archive_and_restore_keep_ciphertext,
+        test_mysql_plain_jobs_unchanged => plain_jobs_unchanged,
+        test_mysql_swapped_ciphertexts_do_not_decrypt => swapped_ciphertexts_do_not_decrypt,
+        test_mysql_moved_job_does_not_decrypt => moved_job_does_not_decrypt,
+        test_mysql_legacy_unbound_payload_decrypts => legacy_unbound_payload_decrypts,
+        test_mysql_worker_pool_purges_expired_jobs => worker_pool_purges_expired_jobs,
+    );
 
     #[tokio::test]
     #[ignore] // Requires database connection

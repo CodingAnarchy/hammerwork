@@ -407,12 +407,23 @@ impl JobQueueWrapper {
     pub fn encryption_engine(
         &self,
     ) -> Option<&std::sync::Arc<hammerwork::encryption::EncryptionEngine>> {
-        match self {
-            JobQueueWrapper::Postgres(queue) => queue.encryption_engine(),
-            JobQueueWrapper::MySQL(queue) => queue.encryption_engine(),
-        }
+        with_queue!(self, |queue| queue.encryption_engine())
     }
 }
+
+/// Evaluate `$body` with `$queue` bound to the [`JobQueue`] a [`JobQueueWrapper`] holds,
+/// whichever database it is for: `with_queue!(wrapper, |queue| queue.enqueue(job).await?)`.
+///
+/// The body is compiled once per backend, so it can call any `DatabaseQueue` method.
+macro_rules! with_queue {
+    ($wrapper:expr, |$queue:ident| $body:expr) => {
+        match $wrapper {
+            $crate::utils::database::JobQueueWrapper::Postgres($queue) => $body,
+            $crate::utils::database::JobQueueWrapper::MySQL($queue) => $body,
+        }
+    };
+}
+pub(crate) use with_queue;
 
 #[cfg(test)]
 mod tests {

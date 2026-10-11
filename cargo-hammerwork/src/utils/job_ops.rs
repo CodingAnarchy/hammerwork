@@ -6,6 +6,7 @@
 //! CLI gets the same transition guards and side effects (dependencies, workflows,
 //! batches) as workers and application code.
 
+use crate::utils::database::with_queue;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use hammerwork::queue::DatabaseQueue;
@@ -81,16 +82,7 @@ impl JobSelector {
 
 /// The capitalized status name as stored in the database.
 pub fn status_name(status: &JobStatus) -> &'static str {
-    match status {
-        JobStatus::Pending => "Pending",
-        JobStatus::Running => "Running",
-        JobStatus::Completed => "Completed",
-        JobStatus::Failed => "Failed",
-        JobStatus::Dead => "Dead",
-        JobStatus::TimedOut => "TimedOut",
-        JobStatus::Retrying => "Retrying",
-        JobStatus::Archived => "Archived",
-    }
+    status.as_str()
 }
 
 /// Ids of the jobs matching `selector` (read-only).
@@ -162,10 +154,7 @@ pub async fn cancel_one<Q: DatabaseQueue + ?Sized>(
 pub async fn retry_many(queue: &JobQueueWrapper, ids: &[JobId]) -> BulkResult {
     let mut result = BulkResult::default();
     for &id in ids {
-        let outcome = match queue {
-            JobQueueWrapper::Postgres(q) => retry_one(q, id).await,
-            JobQueueWrapper::MySQL(q) => retry_one(q, id).await,
-        };
+        let outcome = with_queue!(queue, |q| retry_one(q, id).await);
         record(&mut result, id, outcome);
     }
     result
@@ -179,10 +168,7 @@ pub async fn cancel_many(
 ) -> BulkResult {
     let mut result = BulkResult::default();
     for &id in ids {
-        let outcome = match queue {
-            JobQueueWrapper::Postgres(q) => cancel_one(q, id, allowed).await,
-            JobQueueWrapper::MySQL(q) => cancel_one(q, id, allowed).await,
-        };
+        let outcome = with_queue!(queue, |q| cancel_one(q, id, allowed).await);
         record(&mut result, id, outcome);
     }
     result

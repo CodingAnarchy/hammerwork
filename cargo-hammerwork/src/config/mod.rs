@@ -332,6 +332,14 @@ impl Config {
         self.database_url.as_deref()
     }
 
+    /// The database URL to use: `flag` (a command's `--database-url`) if given,
+    /// otherwise the configured one. Errors when neither is set.
+    pub fn resolve_database_url(&self, flag: Option<&str>) -> Result<String> {
+        flag.or(self.get_database_url())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Database URL is required"))
+    }
+
     pub fn get_default_queue(&self) -> Option<&str> {
         self.default_queue.as_deref()
     }

@@ -1,3 +1,4 @@
+use crate::utils::database::with_queue;
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use hammerwork::queue::DatabaseQueue;
@@ -9,7 +10,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::utils::database::{DatabasePool, JobQueueWrapper};
+use crate::utils::database::DatabasePool;
 use crate::utils::sql::{SqlParams, bind_mysql, bind_pg};
 use crate::utils::validation::{validate_json_payload, validate_priority};
 
@@ -356,12 +357,7 @@ impl WorkflowCommand {
             WorkflowCommand::Graph { database_url, .. } => database_url,
         };
 
-        url_option
-            .as_ref()
-            .map(|s| s.as_str())
-            .or(config.get_database_url())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("Database URL is required"))
+        config.resolve_database_url(url_option.as_deref())
     }
 
     async fn list_workflows(
@@ -396,11 +392,8 @@ impl WorkflowCommand {
         let id = Uuid::parse_str(workflow_id)
             .map_err(|e| anyhow!("Invalid workflow ID '{}': {}", workflow_id, e))?;
         let queue = pool.clone().create_job_queue();
-        let workflow = match &queue {
-            JobQueueWrapper::Postgres(q) => q.get_workflow_status(id).await?,
-            JobQueueWrapper::MySQL(q) => q.get_workflow_status(id).await?,
-        }
-        .ok_or_else(|| anyhow!("Workflow not found: {}", workflow_id))?;
+        let workflow = with_queue!(&queue, |q| q.get_workflow_status(id).await?)
+            .ok_or_else(|| anyhow!("Workflow not found: {}", workflow_id))?;
         let jobs = self.get_workflow_jobs(&pool, workflow_id).await?;
 
         println!("{}", render_workflow_details(&workflow, &jobs));
@@ -451,10 +444,9 @@ impl WorkflowCommand {
         );
 
         // Encrypts like the application, and never writes plaintext to encrypted queues
-        match pool.create_enqueue_queue(encryption).await? {
-            JobQueueWrapper::Postgres(q) => q.enqueue_workflow(workflow).await?,
-            JobQueueWrapper::MySQL(q) => q.enqueue_workflow(workflow).await?,
-        };
+        with_queue!(pool.create_enqueue_queue(encryption).await?, |q| q
+            .enqueue_workflow(workflow)
+            .await?);
 
         println!("Workflow created:");
         println!("  ID: {}", id);
@@ -475,11 +467,8 @@ impl WorkflowCommand {
         let id = Uuid::parse_str(workflow_id)
             .map_err(|e| anyhow!("Invalid workflow ID '{}': {}", workflow_id, e))?;
         let queue = pool.clone().create_job_queue();
-        let workflow = match &queue {
-            JobQueueWrapper::Postgres(q) => q.get_workflow_status(id).await?,
-            JobQueueWrapper::MySQL(q) => q.get_workflow_status(id).await?,
-        }
-        .ok_or_else(|| anyhow!("Workflow not found: {}", workflow_id))?;
+        let workflow = with_queue!(&queue, |q| q.get_workflow_status(id).await?)
+            .ok_or_else(|| anyhow!("Workflow not found: {}", workflow_id))?;
 
         let jobs = self.get_workflow_jobs(&pool, workflow_id).await?;
         let running = jobs.iter().filter(|j| j.status == "Running").count();
@@ -491,10 +480,7 @@ impl WorkflowCommand {
             ));
         }
 
-        match &queue {
-            JobQueueWrapper::Postgres(q) => q.cancel_workflow(id).await?,
-            JobQueueWrapper::MySQL(q) => q.cancel_workflow(id).await?,
-        }
+        with_queue!(&queue, |q| q.cancel_workflow(id).await?);
         println!("Workflow '{}' ({}) cancelled", workflow.name, workflow_id);
         Ok(())
     }
@@ -621,7 +607,7 @@ impl WorkflowCommand {
 
         for job in jobs {
             if !visited.contains(&job.id) {
-                Self::calculate_job_level(job, &job_map, &mut levels, &mut visited, 0);
+                Self::calculate_job_level(job, &job_map, &mut levels, &mut visited);
             }
         }
 
@@ -646,7 +632,6 @@ impl WorkflowCommand {
         job_map: &HashMap<String, &JobNode>,
         levels: &mut HashMap<String, usize>,
         visited: &mut HashSet<String>,
-        _current_level: usize,
     ) {
         if visited.contains(&job.id) {
             return;
@@ -661,13 +646,7 @@ impl WorkflowCommand {
             .filter_map(|dep_id| {
                 if let Some(dep_job) = job_map.get(dep_id) {
                     if !visited.contains(dep_id) {
-                        Self::calculate_job_level(
-                            dep_job,
-                            job_map,
-                            levels,
-                            visited,
-                            _current_level,
-                        );
+                        Self::calculate_job_level(dep_job, job_map, levels, visited);
                     }
                     levels.get(dep_id).copied()
                 } else {

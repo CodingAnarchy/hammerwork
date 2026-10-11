@@ -1,3 +1,4 @@
+use crate::utils::database::with_queue;
 use anyhow::{Result, anyhow};
 use clap::Subcommand;
 use hammerwork::queue::DatabaseQueue;
@@ -7,7 +8,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use tracing::info;
 
-use crate::commands::backup::{CSV_HEADER, JOB_DATA_COLUMNS, JobData, csv_row, fetch_job_data};
+use crate::commands::backup::{
+    CSV_HEADER, JOB_DATA_COLUMNS, JobData, csv_fields, csv_row, fetch_job_data,
+};
 use crate::commands::job::status_db_value;
 use crate::config::Config;
 use crate::utils::database::{DatabasePool, JobQueueWrapper};
@@ -186,11 +189,7 @@ impl BatchCommand {
             BatchCommand::Export { database_url, .. } => database_url,
         };
 
-        url.as_ref()
-            .map(|s| s.as_str())
-            .or(config.get_database_url())
-            .ok_or_else(|| anyhow::anyhow!("Database URL is required"))
-            .map(|s| s.to_string())
+        config.resolve_database_url(url.as_deref())
     }
 }
 
@@ -255,11 +254,8 @@ pub async fn enqueue_lines(
         let number = line_num + 1;
 
         let outcome = match parse_job_line(&line, default_queue, default_priority) {
-            Ok(job) => match &queue {
-                JobQueueWrapper::Postgres(q) => q.enqueue(job).await.map(|_| ()),
-                JobQueueWrapper::MySQL(q) => q.enqueue(job).await.map(|_| ()),
-            }
-            .map_err(|e| anyhow!("enqueue failed - {}", e)),
+            Ok(job) => with_queue!(&queue, |q| q.enqueue(job).await.map(|_| ()))
+                .map_err(|e| anyhow!("enqueue failed - {}", e)),
             Err(e) => Err(e),
         };
         match outcome {
@@ -413,27 +409,7 @@ pub(crate) fn render_export(jobs: &[JobData], options: &ExportOptions<'_>) -> Re
                 lines.push(drop_payload(
                     CSV_HEADER.split(',').map(String::from).collect(),
                 ));
-                lines.extend(jobs.iter().map(|job| {
-                    let mut no_payload = JobData {
-                        id: job.id.clone(),
-                        queue_name: job.queue_name.clone(),
-                        payload: Value::Null,
-                        status: job.status.clone(),
-                        priority: job.priority.clone(),
-                        attempts: job.attempts,
-                        max_attempts: job.max_attempts,
-                        created_at: job.created_at,
-                        scheduled_at: job.scheduled_at,
-                        started_at: job.started_at,
-                        completed_at: job.completed_at,
-                        failed_at: job.failed_at,
-                        error_message: job.error_message.clone(),
-                    };
-                    no_payload.payload = Value::Null;
-                    // Re-split the row on its unquoted commas to drop the payload cell.
-                    let row = csv_row(&no_payload);
-                    drop_payload(split_csv_row(&row))
-                }));
+                lines.extend(jobs.iter().map(|job| drop_payload(csv_fields(job))));
             }
             lines.join("\n")
         }
@@ -444,25 +420,6 @@ pub(crate) fn render_export(jobs: &[JobData], options: &ExportOptions<'_>) -> Re
             ));
         }
     })
-}
-
-/// Split one CSV record into fields, keeping quoted fields (with their quotes) intact.
-fn split_csv_row(row: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for c in row.chars() {
-        match c {
-            '"' => {
-                quoted = !quoted;
-                current.push(c);
-            }
-            ',' if !quoted => fields.push(std::mem::take(&mut current)),
-            _ => current.push(c),
-        }
-    }
-    fields.push(current);
-    fields
 }
 
 /// Write the matching jobs to `output`; returns how many were exported.
@@ -996,6 +953,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Unknown export format 'xml'"), "{err}");
+    }
+
+    /// Split one CSV record into fields, keeping quoted fields (with their quotes) intact.
+    fn split_csv_row(row: &str) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut current = String::new();
+        let mut quoted = false;
+        for c in row.chars() {
+            match c {
+                '"' => {
+                    quoted = !quoted;
+                    current.push(c);
+                }
+                ',' if !quoted => fields.push(std::mem::take(&mut current)),
+                _ => current.push(c),
+            }
+        }
+        fields.push(current);
+        fields
     }
 
     #[test]

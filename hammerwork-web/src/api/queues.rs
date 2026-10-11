@@ -105,7 +105,7 @@ use super::{
     with_filters, with_pagination, with_sort,
 };
 use super::{error_reply, json_reply};
-use hammerwork::{JobPriority, queue::DatabaseQueue};
+use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use warp::http::StatusCode;
@@ -536,18 +536,10 @@ async fn get_priority_breakdown<T>(
 where
     T: DatabaseQueue + Send + Sync,
 {
-    // Use the new get_priority_stats method
     let priority_stats = queue.get_priority_stats(queue_name).await?;
     let mut breakdown = std::collections::HashMap::new();
     for (priority, count) in priority_stats.job_counts {
-        let priority_name = match priority {
-            JobPriority::Background => "background",
-            JobPriority::Low => "low",
-            JobPriority::Normal => "normal",
-            JobPriority::High => "high",
-            JobPriority::Critical => "critical",
-        };
-        breakdown.insert(priority_name.to_string(), count);
+        breakdown.insert(priority.to_string(), count);
     }
     Ok(breakdown)
 }

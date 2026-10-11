@@ -201,6 +201,70 @@ pub async fn execute_binds(pool: &DatabasePool, sql: &str, binds: &[Bind]) -> Re
     }
 }
 
+/// Run `$sql` with `$binds` on whichever database `$pool` (a `&DatabasePool`) is,
+/// and collect `$map` evaluated for each row bound to `$row`.
+///
+/// `$map` is compiled once per backend, so it can decode columns whose Rust type
+/// differs between the databases (see [`IdText`]); `?` in it returns from the
+/// enclosing function. `sqlx::Row` must be in scope for `try_get`.
+macro_rules! fetch_rows {
+    ($pool:expr, $sql:expr, $binds:expr, |$row:ident| $map:expr) => {
+        match $pool {
+            $crate::utils::database::DatabasePool::Postgres(pool) => {
+                let rows = $crate::utils::sql::bind_pg(sqlx::query($sql), $binds)
+                    .fetch_all(pool)
+                    .await?;
+                let mut mapped = Vec::with_capacity(rows.len());
+                for $row in rows {
+                    mapped.push($map);
+                }
+                mapped
+            }
+            $crate::utils::database::DatabasePool::MySQL(pool) => {
+                let rows = $crate::utils::sql::bind_mysql(sqlx::query($sql), $binds)
+                    .fetch_all(pool)
+                    .await?;
+                let mut mapped = Vec::with_capacity(rows.len());
+                for $row in rows {
+                    mapped.push($map);
+                }
+                mapped
+            }
+        }
+    };
+}
+pub(crate) use fetch_rows;
+
+/// Decode an id column as text: PostgreSQL stores ids as `uuid`, MySQL as `CHAR(36)`.
+pub trait IdText {
+    /// The id in column `column`, as text.
+    fn id_text(&self, column: &str) -> Result<String>;
+    /// The nullable id in column `column`, as text.
+    fn opt_id_text(&self, column: &str) -> Result<Option<String>>;
+}
+
+impl IdText for sqlx::postgres::PgRow {
+    fn id_text(&self, column: &str) -> Result<String> {
+        Ok(self.try_get::<uuid::Uuid, _>(column)?.to_string())
+    }
+
+    fn opt_id_text(&self, column: &str) -> Result<Option<String>> {
+        Ok(self
+            .try_get::<Option<uuid::Uuid>, _>(column)?
+            .map(|id| id.to_string()))
+    }
+}
+
+impl IdText for sqlx::mysql::MySqlRow {
+    fn id_text(&self, column: &str) -> Result<String> {
+        Ok(self.try_get(column)?)
+    }
+
+    fn opt_id_text(&self, column: &str) -> Result<Option<String>> {
+        Ok(self.try_get(column)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

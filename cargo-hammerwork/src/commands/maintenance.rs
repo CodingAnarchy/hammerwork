@@ -1,3 +1,4 @@
+use crate::utils::database::with_queue;
 use anyhow::Result;
 use clap::Subcommand;
 use hammerwork::JobStatus;
@@ -5,7 +6,7 @@ use hammerwork::queue::DatabaseQueue;
 use tracing::info;
 
 use crate::config::Config;
-use crate::utils::database::{DatabasePool, JobQueueWrapper};
+use crate::utils::database::DatabasePool;
 use crate::utils::job_ops::{JobSelector, retry_many, select_job_ids};
 use crate::utils::sql::{Backend, Bind, SqlParams, execute_binds, fetch_i64};
 
@@ -135,11 +136,7 @@ impl MaintenanceCommand {
             MaintenanceCommand::PurgeEncrypted { database_url, .. } => database_url,
         };
 
-        url.as_ref()
-            .map(|s| s.as_str())
-            .or(config.get_database_url())
-            .ok_or_else(|| anyhow::anyhow!("Database URL is required"))
-            .map(|s| s.to_string())
+        config.resolve_database_url(url.as_deref())
     }
 }
 
@@ -207,10 +204,9 @@ async fn purge_expired_encrypted_jobs(
         return Ok(());
     }
 
-    let purge = match pool.create_job_queue() {
-        JobQueueWrapper::Postgres(queue) => queue.purge_expired_encrypted_jobs().await?,
-        JobQueueWrapper::MySQL(queue) => queue.purge_expired_encrypted_jobs().await?,
-    };
+    let purge = with_queue!(pool.create_job_queue(), |queue| queue
+        .purge_expired_encrypted_jobs()
+        .await?);
     println!(
         "✅ Deleted {} encrypted jobs past their retention period ({} jobs, {} archived)",
         purge.total(),
@@ -372,24 +368,14 @@ async fn cleanup_dead_jobs(
     // Mark stale jobs as dead through the library's guarded transition.
     const REASON: &str = "Job marked as dead due to inactivity";
     let mut marked = 0usize;
-    match pool.clone().create_job_queue() {
-        JobQueueWrapper::Postgres(queue) => {
-            for id in &stale_ids {
-                match queue.mark_job_dead(*id, REASON).await {
-                    Ok(()) => marked += 1,
-                    Err(e) => tracing::warn!("Skipped job {}: {}", id, e),
-                }
+    with_queue!(pool.clone().create_job_queue(), |queue| {
+        for id in &stale_ids {
+            match queue.mark_job_dead(*id, REASON).await {
+                Ok(()) => marked += 1,
+                Err(e) => tracing::warn!("Skipped job {}: {}", id, e),
             }
         }
-        JobQueueWrapper::MySQL(queue) => {
-            for id in &stale_ids {
-                match queue.mark_job_dead(*id, REASON).await {
-                    Ok(()) => marked += 1,
-                    Err(e) => tracing::warn!("Skipped job {}: {}", id, e),
-                }
-            }
-        }
-    }
+    });
 
     println!("✅ Dead jobs cleanup completed");
     println!("   Marked {} jobs as dead", marked);

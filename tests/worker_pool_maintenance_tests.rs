@@ -10,47 +10,9 @@
 mod test_utils;
 
 use chrono::Utc;
-use hammerwork::{
-    HammerworkConfig, Job, JobId, JobQueue, Worker, WorkerPool, queue::DatabaseQueue,
-    worker::JobHandler,
-};
+use hammerwork::{HammerworkConfig, Job, JobId, JobQueue, WorkerPool, queue::DatabaseQueue};
 use serde_json::json;
-use std::{
-    future::Future,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-/// Polls `condition` every 50ms until it holds or 20 seconds pass.
-async fn eventually<F, Fut>(condition: F) -> bool
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if condition().await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    false
-}
-
-/// A worker on a queue of its own, so it never touches the jobs under test.
-fn idle_worker<DB>(queue: &Arc<JobQueue<DB>>) -> Worker<DB>
-where
-    DB: sqlx::Database + Send + Sync + 'static,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
-{
-    let handler: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
-    Worker::new(
-        Arc::clone(queue),
-        test_utils::unique_queue("maintenance_idle"),
-        handler,
-    )
-    .with_poll_interval(Duration::from_millis(50))
-}
+use std::{sync::Arc, time::Duration};
 
 /// A completed job with a stored result expiring at `expires_at`.
 async fn job_with_result<DB>(
@@ -109,7 +71,7 @@ where
         .without_autoscaling()
         .without_stale_job_reaper()
         .with_result_cleanup(Duration::from_millis(100));
-    pool.add_worker(idle_worker(&queue));
+    pool.add_worker(test_utils::idle_worker(&queue, "maintenance_idle"));
 
     // The first cleanup runs at start; a result that expires later is cleared by a
     // later one.
@@ -121,7 +83,7 @@ where
     .await;
     tokio::select! {
         result = pool.start() => panic!("pool stopped early: {result:?}"),
-        done = eventually(|| async {
+        done = test_utils::eventually(Duration::from_secs(20), || async {
             !has_result(&queue, expired).await && !has_result(&queue, later).await
         }) => assert!(done, "the pool cleared the expired results"),
     }
@@ -171,9 +133,12 @@ where
     config.worker.result_cleanup_interval = Duration::from_millis(100);
 
     let id = job_with_result(&queue, &queue_name, past).await;
-    let mut pool = WorkerPool::from_hammerwork_config(idle_worker(&queue), &config)
-        .unwrap()
-        .without_stale_job_reaper();
+    let mut pool = WorkerPool::from_hammerwork_config(
+        test_utils::idle_worker(&queue, "maintenance_idle"),
+        &config,
+    )
+    .unwrap()
+    .without_stale_job_reaper();
     tokio::select! {
         result = pool.start() => panic!("pool stopped early: {result:?}"),
         () = tokio::time::sleep(Duration::from_millis(500)) => {}
@@ -182,12 +147,15 @@ where
     assert!(has_result(&queue, id).await, "cleanup is off when disabled");
 
     config.worker.result_cleanup_enabled = true;
-    let mut pool = WorkerPool::from_hammerwork_config(idle_worker(&queue), &config)
-        .unwrap()
-        .without_stale_job_reaper();
+    let mut pool = WorkerPool::from_hammerwork_config(
+        test_utils::idle_worker(&queue, "maintenance_idle"),
+        &config,
+    )
+    .unwrap()
+    .without_stale_job_reaper();
     tokio::select! {
         result = pool.start() => panic!("pool stopped early: {result:?}"),
-        done = eventually(|| async { !has_result(&queue, id).await }) => {
+        done = test_utils::eventually(Duration::from_secs(20), || async { !has_result(&queue, id).await }) => {
             assert!(done, "the configured pool cleared the expired result");
         }
     }
@@ -282,9 +250,12 @@ mod key_rotation {
         let key_id = due_key(&mut manager).await;
         let mut off = rotation_config();
         off.encryption.key_rotation.enabled = false;
-        let mut pool = WorkerPool::from_hammerwork_config(idle_worker(&queue), &off)
-            .unwrap()
-            .without_stale_job_reaper();
+        let mut pool = WorkerPool::from_hammerwork_config(
+            test_utils::idle_worker(&queue, "maintenance_idle"),
+            &off,
+        )
+        .unwrap()
+        .without_stale_job_reaper();
         tokio::select! {
             result = pool.start() => panic!("pool stopped early: {result:?}"),
             () = tokio::time::sleep(Duration::from_millis(500)) => {}
@@ -294,17 +265,23 @@ mod key_rotation {
 
         // Two configured pools at once: the key gets exactly one new version.
         let config = rotation_config();
-        let mut first = WorkerPool::from_hammerwork_config(idle_worker(&queue), &config)
-            .unwrap()
-            .without_stale_job_reaper();
-        let mut second = WorkerPool::from_hammerwork_config(idle_worker(&queue), &config)
-            .unwrap()
-            .without_stale_job_reaper();
+        let mut first = WorkerPool::from_hammerwork_config(
+            test_utils::idle_worker(&queue, "maintenance_idle"),
+            &config,
+        )
+        .unwrap()
+        .without_stale_job_reaper();
+        let mut second = WorkerPool::from_hammerwork_config(
+            test_utils::idle_worker(&queue, "maintenance_idle"),
+            &config,
+        )
+        .unwrap()
+        .without_stale_job_reaper();
         tokio::select! {
             result = first.start() => panic!("pool stopped early: {result:?}"),
             result = second.start() => panic!("pool stopped early: {result:?}"),
             done = async {
-                let rotated = eventually(|| async { versions(key_id.clone()).await.0 >= 2 }).await;
+                let rotated = test_utils::eventually(Duration::from_secs(20), || async { versions(key_id.clone()).await.0 >= 2 }).await;
                 // Both pools run several passes meanwhile.
                 tokio::time::sleep(Duration::from_millis(2500)).await;
                 rotated
@@ -319,7 +296,12 @@ mod key_rotation {
         // Another due key while both pools keep running (dropping `start` does not
         // stop them): rotated once too.
         let second_key = due_key(&mut manager).await;
-        assert!(eventually(|| async { versions(second_key.clone()).await.0 >= 2 }).await);
+        assert!(
+            test_utils::eventually(Duration::from_secs(20), || async {
+                versions(second_key.clone()).await.0 >= 2
+            })
+            .await
+        );
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(versions(second_key.clone()).await, (2, 1));
         first.shutdown().await.unwrap();
@@ -364,10 +346,10 @@ mod key_rotation {
             .without_stale_job_reaper()
             .without_result_cleanup()
             .with_key_rotation(manager.clone(), Duration::from_millis(100));
-        pool.add_worker(idle_worker(&queue));
+        pool.add_worker(test_utils::idle_worker(&queue, "maintenance_idle"));
         tokio::select! {
             result = pool.start() => panic!("pool stopped early: {result:?}"),
-            done = eventually(|| async { versions(key_id.clone()).await.0 >= 2 }) => {
+            done = test_utils::eventually(Duration::from_secs(20), || async { versions(key_id.clone()).await.0 >= 2 }) => {
                 assert!(done, "the pool rotated the due key");
             }
         }
@@ -384,17 +366,11 @@ mod postgres_tests {
         test_utils::setup_postgres_queue().await
     }
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_pool_cleans_expired_results() {
-        pool_cleans_expired_results(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_configured_pool_cleans_results() {
-        configured_pool_cleans_results(queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        queue;
+        test_postgres_pool_cleans_expired_results => pool_cleans_expired_results,
+        test_postgres_configured_pool_cleans_results => configured_pool_cleans_results,
+    );
 
     #[cfg(feature = "encryption")]
     async fn versions(pool: sqlx::PgPool, key_id: String) -> (i64, i64) {
@@ -439,17 +415,11 @@ mod mysql_tests {
         test_utils::setup_mysql_queue().await
     }
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_pool_cleans_expired_results() {
-        pool_cleans_expired_results(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_configured_pool_cleans_results() {
-        configured_pool_cleans_results(queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        queue;
+        test_mysql_pool_cleans_expired_results => pool_cleans_expired_results,
+        test_mysql_configured_pool_cleans_results => configured_pool_cleans_results,
+    );
 
     #[cfg(feature = "encryption")]
     async fn versions(pool: sqlx::MySqlPool, key_id: String) -> (i64, i64) {

@@ -44,10 +44,7 @@ impl WorkerCommand {
                 queue,
                 jobs,
             } => {
-                let db_url = database_url
-                    .as_deref()
-                    .or(config.get_database_url())
-                    .ok_or_else(|| anyhow::anyhow!("Database URL is required"))?;
+                let db_url = &config.resolve_database_url(database_url.as_deref())?;
                 let pool = DatabasePool::connect_with_config(db_url, config).await?;
                 let (now, running) = fetch_running_jobs(&pool, queue.as_deref()).await?;
                 print!("{}", render_status(&running, now, *jobs));

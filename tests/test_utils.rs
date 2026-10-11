@@ -99,15 +99,107 @@ pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     SERIAL.lock().await
 }
 
-/// Whether to skip a test that is `#[ignore]`d because it exposes a known library bug.
-///
-/// CI runs the suite with `--include-ignored`, which would also run these tests.
-/// They return early unless `HAMMERWORK_TEST_KNOWN_BUGS` is set, so the bug can be
-/// reproduced with `HAMMERWORK_TEST_KNOWN_BUGS=1 cargo test ... -- --include-ignored`.
-pub fn skip_known_bug() -> bool {
-    if std::env::var_os("HAMMERWORK_TEST_KNOWN_BUGS").is_some() {
-        return false;
-    }
-    eprintln!("skipping known-bug test; set HAMMERWORK_TEST_KNOWN_BUGS=1 to run it");
-    true
+/// A fresh in-memory [`TestQueue`](hammerwork::queue::test::TestQueue).
+#[cfg(feature = "test")]
+pub async fn test_queue() -> std::sync::Arc<hammerwork::queue::test::TestQueue> {
+    std::sync::Arc::new(hammerwork::queue::test::TestQueue::new())
 }
+
+/// One test per scenario in module `$module`, each running `scenario($setup().await)`.
+///
+/// The test attribute defaults to `#[tokio::test]`; pass another one first, e.g.
+/// `backend_tests!(#[tokio::test(flavor = "multi_thread")] module, ...)`.
+#[allow(unused_macros)]
+macro_rules! backend_tests {
+    (#[$test:meta] $module:ident, $setup:path, $ignore:meta, [$($scenario:ident),* $(,)?]) => {
+        mod $module {
+            use super::*;
+            $(
+                #[$test]
+                #[$ignore]
+                async fn $scenario() {
+                    super::$scenario($setup().await).await;
+                }
+            )*
+        }
+    };
+    ($module:ident, $setup:path, $ignore:meta, [$($scenario:ident),* $(,)?]) => {
+        $crate::test_utils::backend_tests!(
+            #[tokio::test] $module, $setup, $ignore, [$($scenario),*]
+        );
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use backend_tests;
+
+/// Poll `get_job` until `predicate` holds or `timeout` elapses; returns the last job.
+pub async fn wait_for_job<Q, F>(
+    queue: &std::sync::Arc<Q>,
+    id: hammerwork::JobId,
+    timeout: std::time::Duration,
+    predicate: F,
+) -> hammerwork::Job
+where
+    Q: hammerwork::queue::DatabaseQueue + ?Sized,
+    F: Fn(&hammerwork::Job) -> bool,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let job = queue.get_job(id).await.unwrap().expect("job exists");
+        if predicate(&job) || std::time::Instant::now() >= deadline {
+            return job;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Poll `condition` until it holds or `timeout` elapses; returns whether it held.
+pub async fn eventually<F, Fut>(timeout: std::time::Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// A worker on a queue of its own (named after `prefix`), so it never touches the jobs
+/// under test.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+pub fn idle_worker<DB>(queue: &Arc<JobQueue<DB>>, prefix: &str) -> hammerwork::Worker<DB>
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: hammerwork::queue::DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let handler: hammerwork::worker::JobHandler =
+        Arc::new(|_job: hammerwork::Job| Box::pin(async { Ok(()) }));
+    hammerwork::Worker::new(Arc::clone(queue), unique_queue(prefix), handler)
+        .with_poll_interval(std::time::Duration::from_millis(50))
+}
+
+/// One ignored (it needs a database) `#[tokio::test]` per `name => scenario`, each
+/// running `scenario($setup().await)`. Attributes before a name (e.g. `#[cfg(...)]`)
+/// apply to that test.
+#[allow(unused_macros)]
+macro_rules! scenario_tests {
+    ($setup:path; $($(#[$attr:meta])* $name:ident => $scenario:path),* $(,)?) => {
+        $(
+            $(#[$attr])*
+            #[tokio::test]
+            #[ignore] // Requires database connection
+            async fn $name() {
+                $scenario($setup().await).await;
+            }
+        )*
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use scenario_tests;

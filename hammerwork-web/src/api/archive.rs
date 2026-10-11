@@ -368,10 +368,10 @@ where
     let limit = pagination.get_limit();
     let offset = pagination.get_offset();
 
-    let (page, total) = match queue.archived_jobs(&filters, limit, offset).await {
-        Ok(listing) => listing,
-        Err(e) => return Ok(internal_error("Failed to list archived jobs", &e)),
-    };
+    let (page, total) = try_api!(
+        queue.archived_jobs(&filters, limit, offset).await,
+        "Failed to list archived jobs"
+    );
 
     let response = PaginatedResponse {
         items: page.into_iter().map(ArchivedJobInfo::from).collect(),
@@ -427,10 +427,11 @@ where
             archived_before: Some(request.older_than),
             ..ArchiveFilterParams::default()
         };
-        let count = match queue.archived_jobs(&cutoff, 0, 0).await {
-            Ok((_, count)) => count,
-            Err(e) => return Ok(internal_error("Failed to count archived jobs", &e)),
-        };
+        let count = try_api!(
+            queue.archived_jobs(&cutoff, 0, 0).await,
+            "Failed to count archived jobs"
+        )
+        .1;
 
         let response = PurgeResponse {
             jobs_purged: count,
@@ -468,10 +469,10 @@ where
 
             if filters.queue.is_none() {
                 // Get queue list and collect stats for each
-                let queue_stats = match queue.get_all_queue_stats().await {
-                    Ok(queue_stats) => queue_stats,
-                    Err(e) => return Ok(internal_error("Failed to get queue stats", &e)),
-                };
+                let queue_stats = try_api!(
+                    queue.get_all_queue_stats().await,
+                    "Failed to get queue stats"
+                );
                 for queue_stat in queue_stats {
                     match queue.get_archival_stats(Some(&queue_stat.queue_name)).await {
                         Ok(queue_archival_stats) => {

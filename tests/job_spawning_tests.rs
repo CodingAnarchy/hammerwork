@@ -20,25 +20,9 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::mpsc;
-
-/// Poll `get_job` until `predicate` holds or 15 seconds pass; returns the last job.
-async fn wait_for_job<Q, F>(queue: &Arc<Q>, id: JobId, predicate: F) -> Job
-where
-    Q: DatabaseQueue + ?Sized,
-    F: Fn(&Job) -> bool,
-{
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let job = queue.get_job(id).await.unwrap().expect("job exists");
-        if predicate(&job) || Instant::now() >= deadline {
-            return job;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 /// Every job of `queue_name`, by claiming them all.
 async fn drain<Q: DatabaseQueue + ?Sized>(queue: &Arc<Q>, queue_name: &str) -> Vec<Job> {
@@ -69,7 +53,7 @@ where
         .with_spawn_manager(Arc::new(manager));
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
-    let job = wait_for_job(queue, id, done).await;
+    let job = test_utils::wait_for_job(queue, id, Duration::from_secs(15), done).await;
     shutdown_tx.send(()).await.unwrap();
     task.await.unwrap().unwrap();
     job
@@ -308,23 +292,8 @@ where
     queue.delete_job(id).await.unwrap();
 }
 
-macro_rules! backend_tests {
-    ($module:ident, $setup:path, $ignore:meta, [$($scenario:ident),* $(,)?]) => {
-        mod $module {
-            use super::*;
-            $(
-                #[tokio::test]
-                #[$ignore]
-                async fn $scenario() {
-                    super::$scenario($setup().await).await;
-                }
-            )*
-        }
-    };
-}
-
 #[cfg(feature = "postgres")]
-backend_tests!(
+crate::test_utils::backend_tests!(
     postgres_tests,
     test_utils::setup_postgres_queue,
     ignore = "requires PostgreSQL: DATABASE_URL",
@@ -337,7 +306,7 @@ backend_tests!(
 );
 
 #[cfg(feature = "mysql")]
-backend_tests!(
+crate::test_utils::backend_tests!(
     mysql_tests,
     test_utils::setup_mysql_queue,
     ignore = "requires MySQL: MYSQL_DATABASE_URL",

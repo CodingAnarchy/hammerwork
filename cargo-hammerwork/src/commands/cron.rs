@@ -1,3 +1,4 @@
+use crate::utils::database::with_queue;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use clap::Subcommand;
@@ -193,11 +194,7 @@ impl CronCommand {
             CronCommand::Delete { database_url, .. } => database_url,
         };
 
-        url.as_ref()
-            .map(|s| s.as_str())
-            .or(config.get_database_url())
-            .ok_or_else(|| anyhow!("Database URL is required"))
-            .map(|s| s.to_string())
+        config.resolve_database_url(url.as_deref())
     }
 }
 
@@ -380,10 +377,7 @@ async fn create_cron_job(
     let timezone = job.timezone.clone().unwrap_or_else(|| "UTC".to_string());
 
     info!("Creating cron job with schedule: {}", schedule);
-    let job_id = match job_queue {
-        JobQueueWrapper::Postgres(q) => q.enqueue_cron_job(job).await?,
-        JobQueueWrapper::MySQL(q) => q.enqueue_cron_job(job).await?,
-    };
+    let job_id = with_queue!(job_queue, |q| q.enqueue_cron_job(job).await?);
 
     println!("✅ Cron job created successfully");
     println!("   Job ID: {}", job_id);
