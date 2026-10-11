@@ -23,7 +23,7 @@ Add TestQueue to your test dependencies:
 
 ```toml
 [dependencies]
-hammerwork = { version = "2.2", features = ["test"] }
+hammerwork = { version = "2.3", features = ["test"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
