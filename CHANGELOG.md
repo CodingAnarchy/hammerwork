@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Pausing a queue stops batch-mode workers from starting the jobs they hold.** A worker
+  with `with_batch_size(n)` kept starting the claimed jobs of its current batch after the
+  queue was paused, up to `n` more jobs, contrary to "paused queues are honoured". Before
+  starting a held job it now checks the pause (at most once per poll interval) and, when
+  the queue is paused, hands the unstarted jobs back to `Pending` without counting an
+  attempt, as on shutdown. Running jobs finish.
 - **A weighted batch claim no longer loses jobs it already claimed.** With weighted
   priorities, `dequeue_batch_leased` claims level by level; when a later level's claim
   failed (a dropped connection, or a MySQL deadlock past its retries), the error was
