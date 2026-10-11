@@ -284,7 +284,12 @@ pub struct EventFilter {
     pub max_processing_time_ms: Option<u64>,
     /// Custom metadata filters (key-value pairs that must match)
     pub metadata_filters: HashMap<String, String>,
-    /// Include job payload data in events
+    /// Include job payload data in events.
+    ///
+    /// When set (or when the event manager's
+    /// [`EventConfig::include_payload_default`] is), events delivered for this filter
+    /// carry the job's payload; otherwise their `payload` is `None`. The payload of a job
+    /// with payload encryption is never included: its events always have `payload: None`.
     pub include_payload: bool,
 }
 
@@ -331,7 +336,7 @@ impl EventFilter {
         self
     }
 
-    /// Include job payload data in events
+    /// Include job payload data in events (see [`EventFilter::include_payload`](Self#structfield.include_payload)).
     pub fn include_payload(mut self) -> Self {
         self.include_payload = true;
         self
@@ -474,7 +479,10 @@ pub struct EventManager {
 pub struct EventConfig {
     /// Maximum number of events to buffer in broadcast channel
     pub max_buffer_size: usize,
-    /// Whether to include job payload data by default
+    /// Whether to include job payload data by default, for every subscriber.
+    ///
+    /// When false, only subscribers whose [`EventFilter::include_payload`] is set receive
+    /// payloads. The payload of a job with payload encryption is never included.
     pub include_payload_default: bool,
     /// Maximum payload size to include (in bytes)
     pub max_payload_size_bytes: usize,
@@ -524,8 +532,13 @@ impl EventManager {
     /// # Payload Handling
     ///
     /// The method applies payload filtering based on the manager's configuration:
-    /// - If `include_payload_default` is false, payload is stripped
+    /// - If neither `include_payload_default` nor any subscription's
+    ///   [`EventFilter::include_payload`] asks for payloads, the payload is stripped
     /// - If payload exceeds `max_payload_size_bytes`, it's stripped and a metadata entry is added
+    ///
+    /// All subscribers share one channel, so when one subscription asks for payloads the
+    /// others receive them too; use [`EventManager::delivers_payload`] (as the webhook
+    /// and streaming managers do) to strip it for a subscriber that did not ask for it.
     ///
     /// # Examples
     ///
@@ -561,7 +574,7 @@ impl EventManager {
         }
 
         // Apply payload filtering based on configuration
-        if !self.config.include_payload_default {
+        if event.payload.is_some() && !self.payload_wanted().await {
             event.payload = None;
         } else if let Some(ref payload) = event.payload {
             // Check payload size limit
@@ -603,12 +616,34 @@ impl EventManager {
         }
     }
 
+    /// Whether any subscriber receives job payloads: `include_payload_default` is set,
+    /// or a subscription's filter has [`EventFilter::include_payload`]. Publishers can
+    /// skip building a payload when this is false.
+    pub async fn payload_wanted(&self) -> bool {
+        if self.config.include_payload_default {
+            return true;
+        }
+        self.subscriptions
+            .read()
+            .await
+            .values()
+            .any(|filter| filter.include_payload)
+    }
+
+    /// Whether a subscriber with `filter` should receive event payloads: the filter asks
+    /// for them, or the manager includes them by default.
+    pub fn delivers_payload(&self, filter: &EventFilter) -> bool {
+        self.config.include_payload_default || filter.include_payload
+    }
+
     /// Subscribe to job lifecycle events with a filter.
     ///
     /// Creates a new subscription that will receive events matching the provided filter.
     /// The returned `EventSubscription` contains a broadcast receiver that will receive
     /// all published events. It's the subscriber's responsibility to apply the filter
-    /// when processing received events.
+    /// when processing received events, and to drop the payload of received events when
+    /// [`delivers_payload`](Self::delivers_payload) is false for it (another subscriber
+    /// may have asked for payloads).
     ///
     /// # Examples
     ///
@@ -1492,5 +1527,43 @@ mod tests {
             "{:?}",
             large.metadata
         );
+    }
+
+    /// A subscription whose filter asks for payloads receives them even when the manager
+    /// does not include them by default (#101); `delivers_payload` tells the others to
+    /// drop them.
+    #[tokio::test]
+    async fn filter_include_payload_keeps_payload() {
+        let manager = EventManager::new_default();
+        assert!(!manager.payload_wanted().await);
+        let plain = EventFilter::new();
+        let wants = EventFilter::new().include_payload();
+        let mut subscription = manager.subscribe(wants.clone()).await.unwrap();
+        assert!(manager.payload_wanted().await);
+        assert!(manager.delivers_payload(&wants));
+        assert!(!manager.delivers_payload(&plain));
+
+        let mut event =
+            JobLifecycleEvent::started(Uuid::new_v4(), "q".to_string(), JobPriority::Normal);
+        event.payload = Some(serde_json::json!({"a": 1}));
+        manager.publish_event(event).await.unwrap();
+        let received = subscription.receiver.recv().await.unwrap();
+        assert_eq!(received.payload, Some(serde_json::json!({"a": 1})));
+
+        // Once that subscriber leaves, payloads are stripped again.
+        let mut other = manager.subscribe(plain).await.unwrap();
+        manager.unsubscribe(subscription.id).await.unwrap();
+        let mut event =
+            JobLifecycleEvent::started(Uuid::new_v4(), "q".to_string(), JobPriority::Normal);
+        event.payload = Some(serde_json::json!({"a": 1}));
+        manager.publish_event(event).await.unwrap();
+        assert!(other.receiver.recv().await.unwrap().payload.is_none());
+
+        let defaulted = EventManager::new(EventConfig {
+            include_payload_default: true,
+            ..EventConfig::default()
+        });
+        assert!(defaulted.delivers_payload(&EventFilter::new()));
+        assert!(defaulted.payload_wanted().await);
     }
 }

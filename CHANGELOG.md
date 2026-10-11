@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TestQueue`: `get_queue_stats` on an unknown queue returns zero counts, and
   `get_batch_status` / `restore_archived_job` return `JobNotFound`, as the PostgreSQL and
   MySQL backends do.
+- **`retry_job` and `restore_archived_job` re-evaluate a job's dependencies.** A job
+  that depends on other jobs becomes runnable when they all completed and waits while
+  some are unfinished. When a dependency failed (`Failed`, `Dead` or `TimedOut`, which
+  includes the jobs of a cancelled workflow) or no longer exists, the call now returns
+  `HammerworkError::Workflow` and changes nothing; it used to succeed and leave the job
+  `Pending` forever. Retry or restore the dependency first. (#102)
+- **Events can carry job payloads.** `EventFilter::include_payload` and
+  `EventConfig::include_payload_default` now work (both stay off by default), so
+  webhooks and streams that ask for payloads receive them. (#101)
+
+### Database
+
+- **Migration 019 (`019_add_archive_workflow`)** adds `workflow_id` and
+  `workflow_name` to `hammerwork_jobs_archive`, on PostgreSQL and MySQL. It is
+  idempotent. Run it before upgrading workers or archivers: archiving, restoring and
+  reading archived jobs use the new columns. (#102)
 
 ### Fixed
 
@@ -36,6 +52,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `default_queue` / `HAMMERWORK_DEFAULT_QUEUE` is used as the fallback queue.
 - `TestQueue` (#106): a `Retry` outcome's `retry_at` is moved onto the mock clock, and
   the error types listed above match the database backends.
+- **A panicking event hook, statistics collector or spawn handler no longer kills the
+  worker.** Event hooks (`on_job_*`, `with_event_hooks`), `StatisticsCollector::record_event`
+  and spawn handlers run behind one panic guard each (sync hooks and async callbacks):
+  the panic is logged at error level, the job's outcome is recorded and the worker
+  keeps polling. A panicking spawn handler fails the parent's run, like a spawn error.
+  Previously the job stayed `Running` until its lease expired. (#100)
+- **`EventFilter::include_payload` and `EventConfig::include_payload_default` had no
+  effect**: worker events always had `payload: None`. Workers now include the job
+  payload when a subscriber asks for it, the event manager keeps it when the default or
+  any subscription's filter asks for it, and the webhook and stream managers drop it
+  for subscribers that did not ask (`EventManager::delivers_payload`,
+  `EventManager::payload_wanted`). The payload of a job with payload encryption is never
+  put into events, neither plaintext nor ciphertext. (#101)
+- **Archived jobs lost their workflow.** Archiving now copies `workflow_id` and
+  `workflow_name`, `restore_archived_job` puts them back, and `get_job` on an archived
+  job returns them. (#102)
+- **A job retried with `retry_job` or restored from the archive could stay `Pending`
+  forever** when a dependency had failed (its dependency status stayed `failed`). See
+  the behaviour change above; same behaviour on PostgreSQL and MySQL. (#102)
+- **A batch could be counted as completed twice** in `BatchProcessingStats` when its
+  last jobs finished at the same time on a worker with batch concurrency above one:
+  each saw the batch finished. A worker now counts each finished batch once. The
+  batch's own record was already updated once (its row lock serializes the jobs'
+  final transitions). (#105)
+- **`KeyManager` panicked on a huge rotation interval**: `generate_key_with_options`,
+  `rotate_key` and `update_key_rotation_schedule` computed `now + interval` without a
+  check. An interval whose next rotation time cannot be represented now returns
+  `EncryptionError::KeyManagement` and stores nothing. (#105)
+
 
 ## [2.3.0] - 2026-10-11
 

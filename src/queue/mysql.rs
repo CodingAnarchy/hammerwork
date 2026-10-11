@@ -169,8 +169,11 @@ fn archived_job_from_row(row: &sqlx::mysql::MySqlRow) -> Result<Job> {
             row.try_get::<Option<String>, _>("dependency_status")?
                 .as_deref(),
         ),
-        workflow_id: None,
-        workflow_name: None,
+        workflow_id: row
+            .try_get::<Option<String>, _>("workflow_id")?
+            .map(|s| uuid::Uuid::parse_str(&s))
+            .transpose()?,
+        workflow_name: row.try_get("workflow_name")?,
         trace_id: row.try_get("trace_id")?,
         correlation_id: row.try_get("correlation_id")?,
         parent_span_id: row.try_get("parent_span_id")?,
@@ -2613,6 +2616,59 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
         Ok(())
     }
 
+    async fn dependency_states(
+        conn: &mut sqlx::MySqlConnection,
+        ids: &[JobId],
+    ) -> Result<HashMap<JobId, JobStatus>> {
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut states = HashMap::new();
+        for chunk in sorted.chunks(ID_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let query = format!(
+                "SELECT id, status FROM hammerwork_jobs WHERE id IN ({placeholders}) \
+                 ORDER BY id FOR SHARE"
+            );
+            let mut select = sqlx::query_as::<_, (String, String)>(&query);
+            for id in chunk {
+                select = select.bind(id.to_string());
+            }
+            for (id, status) in select.fetch_all(&mut *conn).await? {
+                if let Some(status) = lifecycle::job_status_from_db(&status) {
+                    states.insert(uuid::Uuid::parse_str(&id)?, status);
+                }
+            }
+
+            let query = format!(
+                "SELECT id, status FROM hammerwork_jobs_archive WHERE id IN ({placeholders})"
+            );
+            let mut select = sqlx::query_as::<_, (String, String)>(&query);
+            for id in chunk {
+                select = select.bind(id.to_string());
+            }
+            for (id, status) in select.fetch_all(&mut *conn).await? {
+                states
+                    .entry(uuid::Uuid::parse_str(&id)?)
+                    .or_insert_with(|| crate::archive::parse_archived_status(&status));
+            }
+        }
+        Ok(states)
+    }
+
+    async fn write_dependency_status(
+        conn: &mut sqlx::MySqlConnection,
+        job_id: JobId,
+        status: crate::workflow::DependencyStatus,
+    ) -> Result<()> {
+        sqlx::query("UPDATE hammerwork_jobs SET dependency_status = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(job_id.to_string())
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
     async fn lock_workflow(
         conn: &mut sqlx::MySqlConnection,
         workflow_id: uuid::Uuid,
@@ -3280,11 +3336,12 @@ impl crate::queue::JobQueue<MySql> {
                     priority_weight, cron_schedule, next_run_at, recurring, timezone,
                     batch_id, depends_on, dependency_status, result_config,
                     trace_id, correlation_id, parent_span_id, span_context,
-                    archival_reason, archived_by, original_table
+                    archival_reason, archived_by, original_table,
+                    workflow_id, workflow_name
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
             "#,
             )
@@ -3333,6 +3390,8 @@ impl crate::queue::JobQueue<MySql> {
             .bind(reason.as_str())
             .bind(archived_by)
             .bind("hammerwork_jobs")
+            .bind(job.workflow_id.map(|id| id.to_string()))
+            .bind(job.workflow_name)
             .execute(&mut *tx)
             .await?;
 
@@ -3391,7 +3450,12 @@ impl crate::queue::JobQueue<MySql> {
             id: job_id.to_string(),
         })?;
 
-        let job = crate::archive::reset_for_restore(archived_job_from_row(&archived_row)?);
+        let mut job = crate::archive::reset_for_restore(archived_job_from_row(&archived_row)?);
+        // Its dependencies may have finished (or failed) since it was archived.
+        if !job.depends_on.is_empty() {
+            let states = Self::dependency_states(&mut tx, &job.depends_on).await?;
+            job.dependency_status = lifecycle::reevaluate_dependencies(&job, &states, "restored")?;
+        }
 
         // Older versions archived a job without deleting its row from hammerwork_jobs
         // (they only set archived_at). Drop such a leftover so the restore does not

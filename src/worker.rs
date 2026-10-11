@@ -132,6 +132,25 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Await `future`, which runs user-supplied code (a statistics collector or a spawn
+/// handler), containing a panic: it is logged at error level and returned as an error,
+/// so the worker still records the job's outcome and keeps polling.
+///
+/// Event hooks are synchronous and are guarded the same way by `JobEventHooks`.
+async fn contain_panic<T>(what: &str, future: impl Future<Output = Result<T>>) -> Result<T> {
+    let guarded = CatchUnwind {
+        inner: Box::pin(future),
+    };
+    match guarded.await {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = format!("{what} panicked: {}", panic_message(payload.as_ref()));
+            error!("{}", message);
+            Err(HammerworkError::Worker { message })
+        }
+    }
+}
+
 /// Build the error used when a job handler panics.
 fn handler_panic_error(payload: &(dyn std::any::Any + Send)) -> HammerworkError {
     HammerworkError::Worker {
@@ -249,6 +268,45 @@ fn job_event(
         processing_time_ms,
         error_message,
         timestamp,
+    }
+}
+
+/// The payload to put in a lifecycle event of `job`: `None` for a job with payload
+/// encryption, so that an encrypted job's payload (sealed or redacted as stored, or its
+/// plaintext) never reaches events, webhooks or streams.
+#[cfg(feature = "webhooks")]
+fn event_payload(job: &Job) -> Option<serde_json::Value> {
+    if job.is_encrypted || job.has_encryption() {
+        None
+    } else {
+        Some(job.payload.clone())
+    }
+}
+
+/// How many finished batches a worker remembers, to count each of them once.
+const FINISHED_BATCHES_REMEMBERED: usize = 10_000;
+
+/// The batches a worker has counted as finished, most recent last; bounded by
+/// [`FINISHED_BATCHES_REMEMBERED`].
+#[derive(Default)]
+struct FinishedBatches {
+    ids: std::collections::HashSet<BatchId>,
+    order: std::collections::VecDeque<BatchId>,
+}
+
+impl FinishedBatches {
+    /// Remember `batch_id`; `false` if it already was.
+    fn insert(&mut self, batch_id: BatchId) -> bool {
+        if !self.ids.insert(batch_id) {
+            return false;
+        }
+        self.order.push_back(batch_id);
+        if self.order.len() > FINISHED_BATCHES_REMEMBERED
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.ids.remove(&oldest);
+        }
+        true
     }
 }
 
@@ -532,6 +590,8 @@ pub struct Worker<DB: Database> {
     batch_concurrency: usize,
     /// Track batch processing statistics
     batch_stats: Arc<std::sync::RwLock<BatchProcessingStats>>,
+    /// Batches already counted in `batch_stats` as finished
+    finished_batches: Arc<std::sync::Mutex<FinishedBatches>>,
     /// Job lifecycle event hooks
     event_hooks: JobEventHooks,
     /// Spawn manager for dynamic job spawning
@@ -577,6 +637,7 @@ where
             batch_size: self.batch_size,
             batch_concurrency: self.batch_concurrency,
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
+            finished_batches: Default::default(),
             event_hooks: self.event_hooks.clone(),
             spawn_manager: self.spawn_manager.clone(),
             #[cfg(feature = "webhooks")]
@@ -666,6 +727,7 @@ where
             batch_size: DEFAULT_BATCH_SIZE,
             batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
+            finished_batches: Default::default(),
             event_hooks: JobEventHooks::default(),
             spawn_manager: None,
             #[cfg(feature = "webhooks")]
@@ -744,6 +806,7 @@ where
             batch_size: DEFAULT_BATCH_SIZE,
             batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
             batch_stats: Arc::new(std::sync::RwLock::new(BatchProcessingStats::default())),
+            finished_batches: Default::default(),
             event_hooks: JobEventHooks::default(),
             spawn_manager: None,
             #[cfg(feature = "webhooks")]
@@ -2469,13 +2532,10 @@ where
         self.event_hooks.fire_job_start(job.clone());
 
         // Record job started event
-        self.record_event(job_event(
+        self.record_event(
             &job,
-            JobEventType::Started,
-            None,
-            None,
-            start_time,
-        ))
+            job_event(&job, JobEventType::Started, None, None, start_time),
+        )
         .await;
 
         // The job's own max_attempts decides whether a failed run is retried.
@@ -2538,10 +2598,12 @@ where
         let Some(config) = crate::spawn::spawn_config_from_payload(&parent.payload)? else {
             return Ok(None);
         };
-        match spawn_manager
-            .prepare_spawn(parent, &config, self.queue.clone())
-            .await?
-        {
+        let prepared = contain_panic(
+            "Spawn handler",
+            spawn_manager.prepare_spawn(parent, &config, self.queue.clone()),
+        )
+        .await?;
+        match prepared {
             Some(children) => Ok(Some((children, config))),
             None => {
                 debug!(
@@ -2639,9 +2701,11 @@ where
                 spawn_result.spawned_jobs
             );
             let parent = spawn_parent.as_ref().unwrap_or(job);
-            if let Err(e) = spawn_manager
-                .notify_spawn_complete(parent, &spawn_result)
-                .await
+            if let Err(e) = contain_panic(
+                "Spawn completion callback",
+                spawn_manager.notify_spawn_complete(parent, &spawn_result),
+            )
+            .await
             {
                 warn!("Spawn completion callback for job {} failed: {}", job_id, e);
             }
@@ -2679,13 +2743,16 @@ where
             .fire_job_complete(job.clone(), processing_duration);
 
         // Record job completed event
-        self.record_event(job_event(
+        self.record_event(
             job,
-            JobEventType::Completed,
-            Some(processing_time_ms),
-            None,
-            Utc::now(),
-        ))
+            job_event(
+                job,
+                JobEventType::Completed,
+                Some(processing_time_ms),
+                None,
+                Utc::now(),
+            ),
+        )
         .await;
 
         Ok(())
@@ -2747,13 +2814,16 @@ where
             debug!("Job {} run ended with status {:?}", job_id, recorded.status);
             self.event_hooks
                 .fire_job_fail(job.clone(), error_message.clone());
-            self.record_event(job_event(
+            self.record_event(
                 job,
-                JobEventType::Dead,
-                None,
-                Some(error_message),
-                Utc::now(),
-            ))
+                job_event(
+                    job,
+                    JobEventType::Dead,
+                    None,
+                    Some(error_message),
+                    Utc::now(),
+                ),
+            )
             .await;
         }
 
@@ -2804,13 +2874,16 @@ where
         self.event_hooks.fire_job_timeout(job.clone(), timeout);
 
         // Record timeout event
-        self.record_event(job_event(
+        self.record_event(
             job,
-            JobEventType::TimedOut,
-            Some(timeout.as_millis() as u64),
-            Some(error_message.clone()),
-            Utc::now(),
-        ))
+            job_event(
+                job,
+                JobEventType::TimedOut,
+                Some(timeout.as_millis() as u64),
+                Some(error_message.clone()),
+                Utc::now(),
+            ),
+        )
         .await;
 
         if attempts_left {
@@ -2830,13 +2903,16 @@ where
     async fn announce_retry(&self, job: &Job, error_message: String) {
         self.event_hooks
             .fire_job_retry(job.clone(), error_message.clone());
-        self.record_event(job_event(
+        self.record_event(
             job,
-            JobEventType::Retried,
-            None,
-            Some(error_message),
-            Utc::now(),
-        ))
+            job_event(
+                job,
+                JobEventType::Retried,
+                None,
+                Some(error_message),
+                Utc::now(),
+            ),
+        )
         .await;
     }
 
@@ -2958,7 +3034,11 @@ where
 
     /// Convert a JobEvent to a JobLifecycleEvent for external publishing
     #[cfg(feature = "webhooks")]
-    fn convert_to_lifecycle_event(&self, event: &JobEvent) -> JobLifecycleEvent {
+    fn convert_to_lifecycle_event(
+        &self,
+        event: &JobEvent,
+        payload: Option<serde_json::Value>,
+    ) -> JobLifecycleEvent {
         use std::collections::HashMap;
 
         let event_type = match event.event_type {
@@ -3001,7 +3081,9 @@ where
             timestamp: event.timestamp,
             processing_time_ms: event.processing_time_ms,
             error,
-            payload: None, // Payload inclusion is controlled by EventFilter
+            // Only set when a subscriber asked for payloads (and never for an encrypted
+            // job); the event manager and each subscriber's filter decide who sees it.
+            payload,
             metadata,
         }
     }
@@ -3027,6 +3109,12 @@ where
                 );
             }
 
+            // Several jobs of the batch can finish at once (batch concurrency), and each
+            // then sees the batch finished: only the first counts it.
+            if !self.claim_finished_batch(batch_id) {
+                return Ok(());
+            }
+
             // Update batch completion statistics
             self.update_batch_stats(|stats| {
                 stats.batches_completed += 1;
@@ -3037,6 +3125,14 @@ where
         }
 
         Ok(())
+    }
+
+    /// Record that `batch_id` finished; `false` when it was already counted.
+    fn claim_finished_batch(&self, batch_id: BatchId) -> bool {
+        match self.finished_batches.lock() {
+            Ok(mut finished) => finished.insert(batch_id),
+            Err(_) => false,
+        }
     }
 
     /// Handle job failure within a batch context
@@ -3069,10 +3165,17 @@ where
             .unwrap_or_default()
     }
 
-    async fn record_event(&self, event: JobEvent) {
+    /// Record `event` of `job` (the job as stored, never a decrypted copy) with the
+    /// statistics and metrics collectors and publish it to the event manager.
+    #[cfg_attr(not(feature = "webhooks"), allow(unused_variables))]
+    async fn record_event(&self, job: &Job, event: JobEvent) {
         // Record to statistics collector
         if let Some(stats_collector) = &self.stats_collector
-            && let Err(e) = stats_collector.record_event(event.clone()).await
+            && let Err(e) = contain_panic(
+                "Statistics collector",
+                stats_collector.record_event(event.clone()),
+            )
+            .await
         {
             warn!("Failed to record statistics event: {}", e);
         }
@@ -3088,7 +3191,12 @@ where
         // Publish to event manager for external integrations
         #[cfg(feature = "webhooks")]
         if let Some(event_manager) = &self.event_manager {
-            let lifecycle_event = self.convert_to_lifecycle_event(&event);
+            let payload = if event_manager.payload_wanted().await {
+                event_payload(job)
+            } else {
+                None
+            };
+            let lifecycle_event = self.convert_to_lifecycle_event(&event, payload);
             if let Err(e) = event_manager.publish_event(lifecycle_event).await {
                 warn!("Failed to publish lifecycle event: {}", e);
             }
@@ -3653,6 +3761,42 @@ mod tests {
         ));
     }
 
+    /// #105: a finished batch is counted once, and the memory of finished batches is
+    /// bounded.
+    #[test]
+    fn finished_batches_are_counted_once() {
+        let mut finished = FinishedBatches::default();
+        let first = uuid::Uuid::new_v4();
+        assert!(finished.insert(first));
+        assert!(!finished.insert(first));
+        for _ in 0..FINISHED_BATCHES_REMEMBERED {
+            assert!(finished.insert(uuid::Uuid::new_v4()));
+        }
+        assert_eq!(finished.ids.len(), FINISHED_BATCHES_REMEMBERED);
+        assert_eq!(finished.order.len(), FINISHED_BATCHES_REMEMBERED);
+        assert!(finished.insert(first), "the oldest batch was forgotten");
+    }
+
+    /// #101: a plain job's events carry its payload; an encrypted job's never do.
+    #[cfg(feature = "webhooks")]
+    #[test]
+    fn event_payload_is_withheld_for_encrypted_jobs() {
+        let job = Job::new("events".to_string(), serde_json::json!({"a": 1}));
+        assert_eq!(event_payload(&job), Some(serde_json::json!({"a": 1})));
+
+        let mut sealed = job.clone();
+        sealed.is_encrypted = true;
+        assert_eq!(event_payload(&sealed), None);
+
+        #[cfg(feature = "encryption")]
+        {
+            let configured = job.with_encryption(crate::encryption::EncryptionConfig::new(
+                crate::encryption::EncryptionAlgorithm::AES256GCM,
+            ));
+            assert_eq!(event_payload(&configured), None);
+        }
+    }
+
     #[cfg(all(feature = "postgres", feature = "webhooks"))]
     #[tokio::test]
     async fn lifecycle_events_carry_the_job_event_details() {
@@ -3668,7 +3812,8 @@ mod tests {
             timestamp: Utc::now(),
         };
 
-        let completed = worker.convert_to_lifecycle_event(&event(JobEventType::Completed, None));
+        let completed =
+            worker.convert_to_lifecycle_event(&event(JobEventType::Completed, None), None);
         assert_eq!(completed.event_type, JobLifecycleEventType::Completed);
         assert_eq!(completed.job_id, job_id);
         assert_eq!(completed.priority, crate::priority::JobPriority::High);
@@ -3695,7 +3840,8 @@ mod tests {
             (JobEventType::Retried, JobLifecycleEventType::Retried, None),
             (JobEventType::Started, JobLifecycleEventType::Started, None),
         ] {
-            let converted = worker.convert_to_lifecycle_event(&event(event_type, Some("bad")));
+            let converted =
+                worker.convert_to_lifecycle_event(&event(event_type, Some("bad")), None);
             assert_eq!(converted.event_type, lifecycle);
             let error = converted.error.expect("the error message is kept");
             assert_eq!(error.message, "bad");
@@ -3921,26 +4067,26 @@ mod tests {
         *worker.last_job_time.write().unwrap() = long_ago;
         let job = Job::new("starvation".to_string(), serde_json::json!({}));
         worker
-            .record_event(job_event(
+            .record_event(
                 &job,
-                JobEventType::Retried,
-                None,
-                Some("boom".to_string()),
-                Utc::now(),
-            ))
+                job_event(
+                    &job,
+                    JobEventType::Retried,
+                    None,
+                    Some("boom".to_string()),
+                    Utc::now(),
+                ),
+            )
             .await;
         assert!(*worker.last_job_time.read().unwrap() > long_ago);
 
         // A start is not a finished run.
         *worker.last_job_time.write().unwrap() = long_ago;
         worker
-            .record_event(job_event(
+            .record_event(
                 &job,
-                JobEventType::Started,
-                None,
-                None,
-                Utc::now(),
-            ))
+                job_event(&job, JobEventType::Started, None, None, Utc::now()),
+            )
             .await;
         assert_eq!(*worker.last_job_time.read().unwrap(), long_ago);
     }

@@ -505,6 +505,56 @@ impl ParentState {
     }
 }
 
+/// The dependency status of a job that is put back to `Pending` by hand
+/// ([`retry_job`](super::DatabaseQueue::retry_job) or
+/// [`restore_archived_job`](super::DatabaseQueue::restore_archived_job); `action` is
+/// "retried" or "restored"), re-evaluated from the current statuses of its
+/// dependencies (`states`, from `hammerwork_jobs` or else the archive):
+///
+/// - no dependencies: `none`;
+/// - every dependency `Completed`: `satisfied`;
+/// - a dependency that failed terminally (`Failed`, `Dead`, `TimedOut`, which includes a
+///   cancelled workflow's jobs) or that no longer exists: an error, because the job
+///   could never run;
+/// - otherwise: `waiting`, released when the remaining dependencies complete.
+pub(crate) fn reevaluate_dependencies(
+    job: &Job,
+    states: &std::collections::HashMap<JobId, JobStatus>,
+    action: &str,
+) -> Result<crate::workflow::DependencyStatus> {
+    use crate::workflow::DependencyStatus;
+
+    if job.depends_on.is_empty() {
+        return Ok(DependencyStatus::None);
+    }
+    let mut all_completed = true;
+    for dependency in &job.depends_on {
+        let problem = match states.get(dependency) {
+            Some(JobStatus::Completed) => continue,
+            Some(status @ (JobStatus::Failed | JobStatus::Dead | JobStatus::TimedOut)) => {
+                format!("is {}", status.as_str())
+            }
+            Some(_) => {
+                all_completed = false;
+                continue;
+            }
+            None => "no longer exists".to_string(),
+        };
+        return Err(crate::HammerworkError::Workflow {
+            message: format!(
+                "Job {} cannot be {action}: its dependency {dependency} {problem}; retry or \
+                 restore the dependency first",
+                job.id
+            ),
+        });
+    }
+    Ok(if all_completed {
+        DependencyStatus::Satisfied
+    } else {
+        DependencyStatus::Waiting
+    })
+}
+
 /// The dependencies of `jobs` (about to be inserted) that are not themselves in `jobs`.
 pub(crate) fn external_dependencies(jobs: &[Job]) -> Vec<JobId> {
     let new: std::collections::HashSet<JobId> = jobs.iter().map(|job| job.id).collect();
@@ -654,6 +704,21 @@ pub(crate) trait TransitionStore: Sync {
         run_status: JobStatus,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// The statuses of the jobs `ids`, read from `hammerwork_jobs` (locked `FOR SHARE`)
+    /// or else from the archive (the status they were archived with). Missing jobs are
+    /// left out.
+    fn dependency_states(
+        conn: &mut Self::Conn,
+        ids: &[JobId],
+    ) -> impl Future<Output = Result<std::collections::HashMap<JobId, JobStatus>>> + Send;
+
+    /// Set the `dependency_status` of job `job_id`.
+    fn write_dependency_status(
+        conn: &mut Self::Conn,
+        job_id: JobId,
+        status: crate::workflow::DependencyStatus,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     /// Lock a workflow's row (`None` if it does not exist).
     fn lock_workflow(
         conn: &mut Self::Conn,
@@ -744,6 +809,19 @@ pub(crate) async fn transition_in_tx<S: TransitionStore>(
     };
     if !guard.admits(&job) {
         return Ok(TransitionResult::Rejected(job.status));
+    }
+
+    // A job retried by hand may have been failed because a dependency failed (its
+    // dependency status is then `failed` and it would never be dequeued again):
+    // re-evaluate its dependencies, refusing when one of them can no longer complete.
+    if let (Guard::Manual(_), Target::Retry { .. }) = (&guard, target)
+        && !job.depends_on.is_empty()
+    {
+        let states = S::dependency_states(conn, &job.depends_on).await?;
+        let status = reevaluate_dependencies(&job, &states, "retried")?;
+        if status != job.dependency_status {
+            S::write_dependency_status(conn, job_id, status).await?;
+        }
     }
 
     let now = S::db_now(conn).await?;
@@ -1082,6 +1160,54 @@ mod tests {
             ParentState::from_archived("\"Completed\""),
             ParentState::Completed
         );
+    }
+
+    /// #102: a job put back to `Pending` by hand gets its dependency status from its
+    /// dependencies' current statuses, and is refused when one can never complete.
+    #[test]
+    fn retried_jobs_reevaluate_their_dependencies() {
+        use crate::workflow::DependencyStatus;
+        use std::collections::HashMap;
+
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut job = job_in(JobStatus::Failed);
+        assert_eq!(
+            reevaluate_dependencies(&job, &HashMap::new(), "retried").unwrap(),
+            DependencyStatus::None
+        );
+
+        job.depends_on = vec![a, b];
+        job.dependency_status = DependencyStatus::Failed;
+        let states = |sa, sb| HashMap::from([(a, sa), (b, sb)]);
+        assert_eq!(
+            reevaluate_dependencies(
+                &job,
+                &states(JobStatus::Completed, JobStatus::Completed),
+                "retried"
+            )
+            .unwrap(),
+            DependencyStatus::Satisfied
+        );
+        for unfinished in [JobStatus::Pending, JobStatus::Running, JobStatus::Retrying] {
+            assert_eq!(
+                reevaluate_dependencies(&job, &states(JobStatus::Completed, unfinished), "x")
+                    .unwrap(),
+                DependencyStatus::Waiting
+            );
+        }
+        for failed in [JobStatus::Failed, JobStatus::Dead, JobStatus::TimedOut] {
+            let error =
+                reevaluate_dependencies(&job, &states(JobStatus::Pending, failed), "restored")
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("cannot be restored"), "{error}");
+            assert!(error.contains(&b.to_string()), "{error}");
+        }
+        let missing = HashMap::from([(a, JobStatus::Completed)]);
+        let error = reevaluate_dependencies(&job, &missing, "retried")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no longer exists"), "{error}");
     }
 
     #[test]

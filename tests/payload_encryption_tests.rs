@@ -303,6 +303,76 @@ where
     (job, seen)
 }
 
+/// Worker-published events carry the payload when a subscriber asks for it (#101),
+/// except for an encrypted job: its events never carry its payload, plaintext or not.
+#[cfg(feature = "webhooks")]
+async fn worker_events_never_carry_encrypted_payloads<DB>(plain: Arc<JobQueue<DB>>)
+where
+    DB: Inspect + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    use hammerwork::events::{EventFilter, EventManager, JobLifecycleEventType};
+
+    let queue = encrypted_queue(&plain, engine("k1", KEY_A).await).await;
+    let queue_name = test_utils::unique_queue("enc_events");
+    let card = secret("card");
+    let plain_payload = json!({"note": "visible"});
+    let plain_id = queue
+        .enqueue(Job::new(queue_name.clone(), plain_payload.clone()))
+        .await
+        .unwrap();
+    let encrypted_id = queue
+        .enqueue(
+            Job::new(queue_name.clone(), json!({"card": card}))
+                .with_encryption(config("k1"))
+                .with_retention_policy(long_retention()),
+        )
+        .await
+        .unwrap();
+
+    let events = Arc::new(EventManager::new_default());
+    let mut subscription = events
+        .subscribe(
+            EventFilter::new()
+                .with_event_types(vec![JobLifecycleEventType::Completed])
+                .include_payload(),
+        )
+        .await
+        .unwrap();
+
+    let handler: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
+    let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+        .with_poll_interval(Duration::from_millis(50))
+        .with_event_manager(Arc::clone(&events));
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+    let mut payloads = std::collections::HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while payloads.len() < 2 {
+        let event = tokio::time::timeout_at(deadline.into(), subscription.receiver.recv())
+            .await
+            .expect("completion events")
+            .unwrap();
+        if subscription.filter.matches(&event) {
+            let text = serde_json::to_string(&event).unwrap();
+            assert!(!text.contains(&card), "event leaked the plaintext: {text}");
+            payloads.insert(event.job_id, event.payload);
+        }
+    }
+    shutdown_tx.send(()).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    assert_eq!(payloads[&plain_id], Some(plain_payload));
+    assert_eq!(
+        payloads[&encrypted_id], None,
+        "encrypted payloads are never sent"
+    );
+
+    queue.delete_job(plain_id).await.unwrap();
+    queue.delete_job(encrypted_id).await.unwrap();
+}
+
 /// Whole-payload encryption: the row holds only ciphertext and a placeholder, and a
 /// real worker hands the plaintext to the handler.
 async fn whole_payload_round_trip<DB>(plain: Arc<JobQueue<DB>>)
@@ -1418,6 +1488,12 @@ mod postgres {
         test_postgres_worker_pool_purges_expired_jobs => worker_pool_purges_expired_jobs,
     );
 
+    #[cfg(feature = "webhooks")]
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_postgres_queue;
+        test_postgres_worker_events_never_carry_encrypted_payloads => worker_events_never_carry_encrypted_payloads,
+    );
+
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_configured_queue_encrypts() {
@@ -1454,6 +1530,12 @@ mod mysql {
         test_mysql_moved_job_does_not_decrypt => moved_job_does_not_decrypt,
         test_mysql_legacy_unbound_payload_decrypts => legacy_unbound_payload_decrypts,
         test_mysql_worker_pool_purges_expired_jobs => worker_pool_purges_expired_jobs,
+    );
+
+    #[cfg(feature = "webhooks")]
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_mysql_queue;
+        test_mysql_worker_events_never_carry_encrypted_payloads => worker_events_never_carry_encrypted_payloads,
     );
 
     #[tokio::test]

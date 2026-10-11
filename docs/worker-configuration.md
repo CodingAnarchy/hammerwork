@@ -332,6 +332,13 @@ a job handler never reaches this point: the worker catches it and fails the job
 with the error `Job handler panicked: <message>`, which then goes through the
 normal retry / dead-letter path.
 
+Panics in the other code you give a worker are contained too: event hooks
+(`on_job_start`, `on_job_complete`, `on_job_fail`, `on_job_timeout`, `on_job_retry`
+and `with_event_hooks`), a statistics collector (`with_stats_collector`) and spawn
+handlers. The panic is logged at error level, the job's outcome is still recorded
+and the worker keeps polling. A panicking spawn handler fails the parent's run like
+a spawn handler that returns an error.
+
 Errors in the worker loop itself (the database failing while a job is dequeued or
 its outcome recorded) are logged, and the worker backs off exponentially, starting
 at the throttle's `backoff_on_error` (or the poll interval, at least 100ms) and

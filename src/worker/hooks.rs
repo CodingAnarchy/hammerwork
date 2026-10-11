@@ -19,6 +19,9 @@ pub struct JobHookEvent {
 pub type JobHookHandler = Arc<dyn Fn(JobHookEvent) + Send + Sync>;
 
 /// Job lifecycle event hooks that can be registered with workers.
+///
+/// Hooks run on the worker's task. A hook that panics is contained: the panic is logged
+/// at error level, the job's outcome is recorded as usual and the worker keeps polling.
 #[derive(Clone, Default)]
 pub struct JobEventHooks {
     /// Called when a job starts processing
@@ -93,7 +96,7 @@ impl JobEventHooks {
                 duration: None,
                 error: None,
             };
-            handler(event);
+            run_hook("on_job_start", handler, event);
         }
     }
 
@@ -106,7 +109,7 @@ impl JobEventHooks {
                 duration: Some(duration),
                 error: None,
             };
-            handler(event);
+            run_hook("on_job_complete", handler, event);
         }
     }
 
@@ -119,7 +122,7 @@ impl JobEventHooks {
                 duration: None,
                 error: Some(error),
             };
-            handler(event);
+            run_hook("on_job_fail", handler, event);
         }
     }
 
@@ -132,7 +135,7 @@ impl JobEventHooks {
                 duration: Some(duration),
                 error: Some("Job timed out".to_string()),
             };
-            handler(event);
+            run_hook("on_job_timeout", handler, event);
         }
     }
 
@@ -145,8 +148,22 @@ impl JobEventHooks {
                 duration: None,
                 error: Some(error),
             };
-            handler(event);
+            run_hook("on_job_retry", handler, event);
         }
+    }
+}
+
+/// Run a user-supplied hook, containing a panic: it is logged at error level and the
+/// worker carries on, so the job's outcome is still recorded and the worker keeps polling.
+fn run_hook(name: &str, handler: &JobHookHandler, event: JobHookEvent) {
+    let job_id = event.job.id;
+    if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| handler(event))) {
+        error!(
+            "Job event hook {} panicked for job {}: {}",
+            name,
+            job_id,
+            panic_message(payload.as_ref())
+        );
     }
 }
 
@@ -359,6 +376,37 @@ mod tests {
                 "retry:test_queue:API rate limit exceeded"
             );
         }
+    }
+
+    /// A panicking hook is contained: firing it neither panics nor stops the other hooks
+    /// from running.
+    #[test]
+    fn panicking_hooks_are_contained() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = |calls: &Arc<AtomicUsize>| {
+            let calls = Arc::clone(calls);
+            move |_event: JobHookEvent| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("hook exploded");
+            }
+        };
+        let hooks = JobEventHooks::new()
+            .on_start(counted(&calls))
+            .on_complete(counted(&calls))
+            .on_fail(counted(&calls))
+            .on_timeout(counted(&calls))
+            .on_retry(counted(&calls));
+
+        let job = crate::Job::new("test".to_string(), serde_json::json!({}));
+        hooks.fire_job_start(job.clone());
+        hooks.fire_job_complete(job.clone(), Duration::from_millis(1));
+        hooks.fire_job_fail(job.clone(), "boom".to_string());
+        hooks.fire_job_timeout(job.clone(), Duration::from_secs(1));
+        hooks.fire_job_retry(job, "boom".to_string());
+
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
     }
 
     #[test]

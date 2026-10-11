@@ -250,6 +250,13 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// Only applies to `Running`, `Retrying`, `Failed` or `TimedOut` jobs. `Dead` jobs
     /// are re-run with [`retry_dead_job`](Self::retry_dead_job).
+    ///
+    /// A job with dependencies has its dependency status re-evaluated: `satisfied` when
+    /// every dependency completed, `waiting` while some are still unfinished. When a
+    /// dependency failed terminally (`Failed`, `Dead` or `TimedOut`) or no longer
+    /// exists, the job could never run, so the retry is refused with
+    /// [`HammerworkError::Workflow`](crate::HammerworkError::Workflow) and nothing
+    /// changes; retry the dependency first.
     async fn retry_job(&self, job_id: JobId, retry_at: DateTime<Utc>) -> Result<()>;
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>>;
     async fn delete_job(&self, job_id: JobId) -> Result<()>;
@@ -642,6 +649,14 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// This method moves a job from the archive table back to the main jobs table,
     /// decompressing the payload if necessary and resetting the job to pending status.
+    /// The job keeps its workflow (`workflow_id` and `workflow_name`).
+    ///
+    /// A job with dependencies has its dependency status re-evaluated like
+    /// [`retry_job`](Self::retry_job) does (dependencies are looked up in the jobs table,
+    /// then in the archive): when a dependency failed terminally or no longer exists the
+    /// restore is refused with
+    /// [`HammerworkError::Workflow`](crate::HammerworkError::Workflow) and the job stays
+    /// archived; restore or retry the dependency first.
     ///
     /// # Arguments
     ///

@@ -1471,6 +1471,7 @@ impl StreamManager {
         let config = self.config.clone();
         let shutdown_signal = self.shutdown_signal.clone();
         let batches = self.batches.clone();
+        let event_manager = self.event_manager.clone();
 
         self.listeners.spawn("listener", async move {
             let mut event_buffer: Vec<JobLifecycleEvent> = Vec::new();
@@ -1571,7 +1572,7 @@ impl StreamManager {
                     _ = flush_due => continue,
                 };
                 match received {
-                    Ok(event) => {
+                    Ok(mut event) => {
                         // A disabled stream drops events (but keeps listening, so
                         // that enabling it again resumes delivery). Check the current
                         // state: it may have changed while waiting.
@@ -1581,6 +1582,12 @@ impl StreamManager {
                             .get(&stream_id)
                             .is_some_and(|stream| stream.enabled);
                         if enabled && stream.filter.matches(&event) {
+                            // Another subscriber may have asked for payloads; this
+                            // stream only gets them when its filter (or the event
+                            // manager's default) asks for them.
+                            if !event_manager.delivers_payload(&stream.filter) {
+                                event.payload = None;
+                            }
                             if event_buffer.is_empty() {
                                 buffered_since = Some(tokio::time::Instant::now());
                             }

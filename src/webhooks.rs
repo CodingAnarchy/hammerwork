@@ -910,6 +910,7 @@ impl WebhookManager {
         let delivery_semaphore = self.delivery_semaphore.clone();
         let config = self.config.clone();
         let deliveries = self.deliveries.clone();
+        let event_manager = self.event_manager.clone();
         let pending = Arc::new(Semaphore::new(clamp_permits(
             config.max_pending_deliveries,
             "max_pending_deliveries",
@@ -924,7 +925,7 @@ impl WebhookManager {
                     _ = &mut stop => break,
                     received = receiver.recv() => received,
                 };
-                let event = match received {
+                let mut event = match received {
                     Ok(event) => event,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
@@ -950,6 +951,11 @@ impl WebhookManager {
                 };
                 if !webhook.enabled || !webhook.filter.matches(&event) {
                     continue;
+                }
+                // Another subscriber may have asked for payloads; this one only gets
+                // them when its filter (or the event manager's default) asks for them.
+                if !event_manager.delivers_payload(&webhook.filter) {
+                    event.payload = None;
                 }
 
                 // Bound the backlog: wait for a pending-delivery slot. While waiting,
