@@ -9,7 +9,9 @@ ignore = [
     # plaintext from RSA *private-key decryption* (PKCS#1 v1.5). No fixed `rsa`
     # release exists.
     #
-    # Pulled in only by `sqlx-mysql` (via the `mysql` feature / sqlx dev-dependency).
+    # Pulled in only by `sqlx-mysql`'s optional `rsa` feature, which since sqlx 0.9
+    # only the `cargo-hammerwork` and `hammerwork-web` binaries enable (sqlx feature
+    # `mysql-rsa`); the library itself does not.
     # sqlx uses it solely in `connection/auth.rs` to *encrypt* the password with the
     # server's RSA public key (`RsaPublicKey` + OAEP) for the `caching_sha2_password`
     # / `sha256_password` auth plugins over non-TLS connections. Hammerwork never

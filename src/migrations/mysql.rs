@@ -4,7 +4,7 @@ use super::split::{Dialect, split_statements};
 use super::{Migration, MigrationRecord, MigrationRunner};
 use crate::Result;
 use chrono::Utc;
-use sqlx::{Executor, MySql, MySqlConnection, MySqlPool, Row, pool::PoolConnection};
+use sqlx::{AssertSqlSafe, Executor, MySql, MySqlConnection, MySqlPool, Row, pool::PoolConnection};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, info};
 
@@ -130,7 +130,7 @@ impl MigrationRunner<sqlx::MySql> for MySqlMigrationRunner {
 
             // Use the text protocol: dynamic DDL (PREPARE/EXECUTE/DEALLOCATE) is not
             // supported through MySQL's prepared statement protocol.
-            tx.execute(full_statement.as_str()).await?;
+            tx.execute(AssertSqlSafe(full_statement)).await?;
         }
 
         tx.commit().await?;

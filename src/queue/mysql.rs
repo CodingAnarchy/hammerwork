@@ -23,7 +23,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, MySql, Row};
+use sqlx::{AssertSqlSafe, FromRow, MySql, Row};
 use std::{collections::HashMap, time::Duration};
 
 #[derive(FromRow, Clone)]
@@ -103,9 +103,9 @@ async fn copy_encryption_columns(
         .map(|column| format!("dst.{column} = src.{column}"))
         .collect::<Vec<_>>()
         .join(", ");
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE {to} dst JOIN {from} src ON dst.id = src.id SET {assignments} WHERE src.id = ?"
-    ))
+    )))
     .bind(id.to_string())
     .execute(&mut *conn)
     .await?;
@@ -344,7 +344,7 @@ impl crate::queue::JobQueue<MySql> {
                     ""
                 }
             );
-            let mut select = sqlx::query(&query).bind(queue_name).bind(queue_name);
+            let mut select = sqlx::query(AssertSqlSafe(query)).bind(queue_name).bind(queue_name);
             if let Some(priority) = priority {
                 select = select.bind(priority.as_i32());
             }
@@ -361,11 +361,11 @@ impl crate::queue::JobQueue<MySql> {
                 .map_err(crate::HammerworkError::from)
                 .and_then(JobRow::into_job);
 
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1, \
                  last_heartbeat_at = ?, lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
                  CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ?"
-            ))
+            )))
             .bind(JobStatus::Running)
             .bind(started_at)
             .bind(started_at)
@@ -412,7 +412,7 @@ impl crate::queue::JobQueue<MySql> {
                     ""
                 }
             );
-            let mut select = sqlx::query(&query).bind(queue_name).bind(queue_name);
+            let mut select = sqlx::query(AssertSqlSafe(query)).bind(queue_name).bind(queue_name);
             if let Some(priority) = priority {
                 select = select.bind(priority.as_i32());
             }
@@ -447,7 +447,7 @@ impl crate::queue::JobQueue<MySql> {
                  last_heartbeat_at = ?, lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
                  CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id IN ({placeholders})"
             );
-            let mut update = sqlx::query(&sql)
+            let mut update = sqlx::query(AssertSqlSafe(sql))
                 .bind(JobStatus::Running)
                 .bind(started_at)
                 .bind(started_at)
@@ -477,12 +477,13 @@ impl crate::queue::JobQueue<MySql> {
     ) -> Result<Option<Job>> {
         // Which priority levels have a runnable job: one index probe per level, so
         // every level is considered however many jobs of other levels are queued.
-        let levels: Vec<i64> =
-            sqlx::query_scalar(&super::runnable_priorities_sql(RUNNABLE_IN_QUEUE_SQL))
-                .bind(queue_name)
-                .bind(queue_name)
-                .fetch_all(&self.pool)
-                .await?;
+        let levels: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(super::runnable_priorities_sql(
+            RUNNABLE_IN_QUEUE_SQL,
+        )))
+        .bind(queue_name)
+        .bind(queue_name)
+        .fetch_all(&self.pool)
+        .await?;
         let mut candidates: Vec<JobPriority> = levels
             .into_iter()
             .filter_map(|level| i32::try_from(level).ok())
@@ -613,12 +614,13 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         };
 
         // Which priority levels have a runnable job (see `dequeue_leased`).
-        let levels: Vec<i64> =
-            sqlx::query_scalar(&super::runnable_priorities_sql(RUNNABLE_IN_QUEUE_SQL))
-                .bind(queue_name)
-                .bind(queue_name)
-                .fetch_all(&self.pool)
-                .await?;
+        let levels: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(super::runnable_priorities_sql(
+            RUNNABLE_IN_QUEUE_SQL,
+        )))
+        .bind(queue_name)
+        .bind(queue_name)
+        .fetch_all(&self.pool)
+        .await?;
         let candidates: Vec<JobPriority> = levels
             .into_iter()
             .filter_map(|level| i32::try_from(level).ok())
@@ -738,10 +740,10 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
-        let row = sqlx::query_as::<_, JobRow>(&format!(
+        let row = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {} FROM hammerwork_jobs WHERE id = ?",
             JOB_SELECT_FIELDS
-        ))
+        )))
         .bind(job_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
@@ -751,9 +753,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         }
 
         // Archiving moves a job out of hammerwork_jobs; report it with status Archived.
-        let archived = sqlx::query(&format!(
+        let archived = sqlx::query(AssertSqlSafe(format!(
             "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive WHERE id = ?"
-        ))
+        )))
         .bind(job_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
@@ -893,10 +895,10 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>> {
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {} FROM hammerwork_jobs WHERE batch_id = ? ORDER BY created_at ASC",
             JOB_SELECT_FIELDS
-        ))
+        )))
         .bind(batch_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -949,9 +951,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         let limit = limit.unwrap_or(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE status = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
-        ))
+        )))
         .bind(JobStatus::Dead)
         .bind(limit)
         .bind(offset)
@@ -976,9 +978,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         let limit = limit.unwrap_or(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE status = ? AND queue_name = ? ORDER BY failed_at DESC LIMIT ? OFFSET ?"
-        ))
+        )))
         .bind(JobStatus::Dead)
         .bind(queue_name)
         .bind(limit)
@@ -1298,14 +1300,14 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         };
 
         let rows: Vec<JobRow> = if let Some(queue) = queue_name {
-            sqlx::query_as(&query)
+            sqlx::query_as(AssertSqlSafe(query))
                 .bind(queue)
                 .bind(start_time)
                 .bind(end_time)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query_as(&query)
+            sqlx::query_as(AssertSqlSafe(query))
                 .bind(start_time)
                 .bind(end_time)
                 .fetch_all(&self.pool)
@@ -1350,13 +1352,13 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         };
 
         let rows = if let Some(queue) = queue_name {
-            sqlx::query_as::<_, JobRow>(&query)
+            sqlx::query_as::<_, JobRow>(AssertSqlSafe(query))
                 .bind(queue)
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query_as::<_, JobRow>(&query)
+            sqlx::query_as::<_, JobRow>(AssertSqlSafe(query))
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
@@ -1394,7 +1396,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            &format!("SELECT {} FROM hammerwork_jobs WHERE queue_name = ? AND recurring = TRUE ORDER BY next_run_at ASC", JOB_SELECT_FIELDS)
+            AssertSqlSafe(format!("SELECT {} FROM hammerwork_jobs WHERE queue_name = ? AND recurring = TRUE ORDER BY next_run_at ASC", JOB_SELECT_FIELDS))
         )
         .bind(queue_name)
         .fetch_all(&self.pool)
@@ -1428,9 +1430,9 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             let mut conn = self.pool.acquire().await?;
             let mut tx = Self::begin_claim_transaction(&mut conn).await?;
             let result = async {
-                let row = sqlx::query_as::<_, JobRow>(&format!(
+                let row = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
                     "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = ? FOR UPDATE"
-                ))
+                )))
                 .bind(job_id.to_string())
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -1686,7 +1688,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn get_ready_jobs(&self, queue_name: &str, limit: u32) -> Result<Vec<Job>> {
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             r#"
                 SELECT {}
                 FROM hammerwork_jobs
@@ -1698,7 +1700,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 LIMIT ?
                 "#,
             JOB_SELECT_FIELDS
-        ))
+        )))
         .bind(queue_name)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -1725,7 +1727,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         &self,
         workflow_id: crate::workflow::WorkflowId,
     ) -> Result<Vec<Job>> {
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             r#"
                 SELECT {}
                 FROM hammerwork_jobs
@@ -1733,7 +1735,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 ORDER BY created_at ASC
                 "#,
             JOB_SELECT_FIELDS
-        ))
+        )))
         .bind(workflow_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -1743,11 +1745,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .collect::<Result<Vec<_>>>()?;
 
         // Archived members, with status `Archived` (as `get_job` reports them).
-        let archived = sqlx::query(&format!(
+        let archived = sqlx::query(AssertSqlSafe(format!(
             "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive a \
              WHERE a.workflow_id = ? \
              AND NOT EXISTS (SELECT 1 FROM hammerwork_jobs j WHERE j.id = a.id)"
-        ))
+        )))
         .bind(workflow_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -1828,7 +1830,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             query.push_str(&format!(" OFFSET {}", offset));
         }
 
-        let mut sql_query = sqlx::query(&query);
+        let mut sql_query = sqlx::query(AssertSqlSafe(query));
 
         if let Some(queue) = queue_name {
             sql_query = sql_query.bind(queue);
@@ -1916,7 +1918,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             base_query.push_str(" WHERE queue_name = ?");
         }
 
-        let mut query = sqlx::query(&base_query);
+        let mut query = sqlx::query(AssertSqlSafe(base_query));
         if let Some(queue) = queue_name {
             query = query.bind(queue);
         }
@@ -2013,12 +2015,12 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         // dequeued is extended: a stale worker whose job was reclaimed and claimed again
         // must not keep the new run's lease alive.
         let started = super::run_started_range(run);
-        let result = sqlx::query(&format!(
+        let result = sqlx::query(AssertSqlSafe(format!(
             "UPDATE hammerwork_jobs SET last_heartbeat_at = UTC_TIMESTAMP(6), \
              lease_expires_at = LEAST(DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? MICROSECOND), \
              CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ? AND status = ? \
              AND attempts = ? AND (? IS NULL OR (started_at > ? AND started_at < ?))"
-        ))
+        )))
         .bind(lease_micros(lease))
         .bind(run.id.to_string())
         .bind(JobStatus::Running)
@@ -2041,12 +2043,12 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
             .fetch_one(&self.pool)
             .await?;
         let started = super::run_started_range(run);
-        let result = sqlx::query(&format!(
+        let result = sqlx::query(AssertSqlSafe(format!(
             "UPDATE hammerwork_jobs SET started_at = ?, last_heartbeat_at = ?, \
              lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
              CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ? AND status = ? \
              AND attempts = ? AND (? IS NULL OR (started_at > ? AND started_at < ?))"
-        ))
+        )))
         .bind(now)
         .bind(now)
         .bind(now)
@@ -2088,12 +2090,12 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     async fn purge_expired_encrypted_jobs(&self) -> Result<super::EncryptedJobPurge> {
         let mut tx = self.pool.begin().await?;
         let now = db_now(&mut tx).await?;
-        let jobs = sqlx::query(&format!(
+        let jobs = sqlx::query(AssertSqlSafe(format!(
             "DELETE FROM hammerwork_jobs WHERE is_encrypted = true \
              AND retention_delete_at IS NOT NULL AND retention_delete_at <= ? \
              AND status IN ({})",
             super::FINISHED_STATUS_SQL
-        ))
+        )))
         .bind(now)
         .execute(&mut *tx)
         .await?
@@ -2148,7 +2150,7 @@ impl crate::queue::JobQueue<MySql> {
         // A run's lease is written when it is claimed (`last_heartbeat_at = started_at`),
         // so only its expiry counts. The `started_at` cutoff applies only to runs without
         // a lease of their own: claimed by an older version that wrote none.
-        let candidates = sqlx::query_as::<_, JobRow>(&format!(
+        let candidates = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             r#"
             SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs
             WHERE status = ?
@@ -2162,7 +2164,7 @@ impl crate::queue::JobQueue<MySql> {
               )
             FOR UPDATE SKIP LOCKED
             "#
-        ))
+        )))
         .bind(JobStatus::Running)
         .bind(now)
         .bind(cutoff)
@@ -2518,7 +2520,8 @@ async fn insert_dependent_jobs(conn: &mut sqlx::MySqlConnection, jobs: &mut [Job
              LEFT JOIN hammerwork_workflows w ON w.id = j.workflow_id \
              WHERE j.id IN ({placeholders}) ORDER BY j.id FOR SHARE OF j"
         );
-        let mut select = sqlx::query_as::<_, (String, String, Option<String>)>(&query);
+        let mut select =
+            sqlx::query_as::<_, (String, String, Option<String>)>(AssertSqlSafe(query));
         for id in chunk {
             select = select.bind(id.to_string());
         }
@@ -2532,7 +2535,7 @@ async fn insert_dependent_jobs(conn: &mut sqlx::MySqlConnection, jobs: &mut [Job
         // Finished dependencies may already have been archived.
         let query =
             format!("SELECT id, status FROM hammerwork_jobs_archive WHERE id IN ({placeholders})");
-        let mut select = sqlx::query_as::<_, (String, String)>(&query);
+        let mut select = sqlx::query_as::<_, (String, String)>(AssertSqlSafe(query));
         for id in chunk {
             select = select.bind(id.to_string());
         }
@@ -2580,9 +2583,9 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
     type Conn = sqlx::MySqlConnection;
 
     async fn lock_job(conn: &mut sqlx::MySqlConnection, job_id: JobId) -> Result<Option<Job>> {
-        let row = sqlx::query_as::<_, JobRow>(&format!(
+        let row = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = ? FOR UPDATE"
-        ))
+        )))
         .bind(job_id.to_string())
         .fetch_optional(&mut *conn)
         .await?;
@@ -2715,7 +2718,7 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
                 "SELECT id, status FROM hammerwork_jobs WHERE id IN ({placeholders}) \
                  ORDER BY id FOR SHARE"
             );
-            let mut select = sqlx::query_as::<_, (String, String)>(&query);
+            let mut select = sqlx::query_as::<_, (String, String)>(AssertSqlSafe(query));
             for id in chunk {
                 select = select.bind(id.to_string());
             }
@@ -2728,7 +2731,7 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
             let query = format!(
                 "SELECT id, status FROM hammerwork_jobs_archive WHERE id IN ({placeholders})"
             );
-            let mut select = sqlx::query_as::<_, (String, String)>(&query);
+            let mut select = sqlx::query_as::<_, (String, String)>(AssertSqlSafe(query));
             for id in chunk {
                 select = select.bind(id.to_string());
             }
@@ -2830,7 +2833,7 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
                  UNION SELECT id FROM hammerwork_jobs_archive WHERE id IN ({placeholders}) \
                  AND status = 'Completed'"
             );
-            let mut select = sqlx::query_scalar::<_, String>(&query);
+            let mut select = sqlx::query_scalar::<_, String>(AssertSqlSafe(query));
             for _ in 0..2 {
                 for id in chunk {
                     select = select.bind(*id);
@@ -2850,7 +2853,7 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
                 "UPDATE hammerwork_jobs SET dependency_status = 'satisfied' \
                  WHERE id IN ({placeholders})"
             );
-            let mut update = sqlx::query(&query);
+            let mut update = sqlx::query(AssertSqlSafe(query));
             for id in chunk {
                 update = update.bind(id);
             }
@@ -2870,9 +2873,9 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
         let mut failed = Vec::new();
         let mut to_check = vec![failed_job_id];
         while let Some(current) = to_check.pop() {
-            let candidates: Vec<String> = sqlx::query_scalar(&format!(
+            let candidates: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT id FROM hammerwork_jobs WHERE JSON_CONTAINS(depends_on, ?) AND {CONDITION}"
-            ))
+            )))
             .bind(serde_json::json!([current.to_string()]))
             .fetch_all(&mut *conn)
             .await?;
@@ -3019,11 +3022,11 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
             .await?;
         }
 
-        let unfinished: i64 = sqlx::query_scalar(&format!(
+        let unfinished: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT EXISTS (SELECT 1 FROM hammerwork_jobs WHERE batch_id = ? \
              AND status IN ({}))",
             lifecycle::UNFINISHED_STATUS_SQL
-        ))
+        )))
         .bind(&batch)
         .fetch_one(&mut *conn)
         .await?;
@@ -3143,7 +3146,7 @@ impl crate::queue::JobQueue<MySql> {
                 "SELECT {columns} FROM hammerwork_jobs WHERE id IN ({placeholders}) \
                  AND {condition} ORDER BY id FOR UPDATE"
             );
-            let mut select = sqlx::query(&query);
+            let mut select = sqlx::query(AssertSqlSafe(query));
             for id in chunk {
                 select = select.bind(id);
             }
@@ -3173,7 +3176,7 @@ impl crate::queue::JobQueue<MySql> {
                  dependency_status = CASE WHEN dependency_status IN {failed_dependencies} \
                  THEN 'failed' ELSE dependency_status END WHERE id IN ({placeholders})"
             );
-            let mut update = sqlx::query(&query).bind(now).bind(error);
+            let mut update = sqlx::query(AssertSqlSafe(query)).bind(now).bind(error);
             for id in chunk {
                 update = update.bind(id);
             }
@@ -3196,10 +3199,10 @@ impl crate::queue::JobQueue<MySql> {
         Self::lock_workflow(conn, workflow_id).await?;
         let now = db_now(conn).await?;
         let id = workflow_id.to_string();
-        let candidates: Vec<String> = sqlx::query_scalar(&format!(
+        let candidates: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT id FROM hammerwork_jobs WHERE workflow_id = ? AND status IN ({})",
             lifecycle::UNFINISHED_STATUS_SQL
-        ))
+        )))
         .bind(&id)
         .fetch_all(&mut *conn)
         .await?;
@@ -3221,7 +3224,7 @@ impl crate::queue::JobQueue<MySql> {
                  THEN 'failed' ELSE dependency_status END, \
                  last_heartbeat_at = NULL, lease_expires_at = NULL WHERE id IN ({placeholders})"
             );
-            let mut update = sqlx::query(&query)
+            let mut update = sqlx::query(AssertSqlSafe(query))
                 .bind(now)
                 .bind(lifecycle::WORKFLOW_CANCELLED_MESSAGE);
             for id in chunk {
@@ -3380,7 +3383,7 @@ impl crate::queue::JobQueue<MySql> {
         while jobs_to_archive.len() < policy.batch_size {
             let wanted = policy.batch_size - jobs_to_archive.len();
             let select = select(wanted, examined.len());
-            let mut query = sqlx::query_as::<_, JobRow>(&select);
+            let mut query = sqlx::query_as::<_, JobRow>(AssertSqlSafe(select));
             if let Some(queue) = queue_name {
                 query = query.bind(queue);
             }
@@ -3538,9 +3541,9 @@ impl crate::queue::JobQueue<MySql> {
         let mut tx = self.pool.begin().await?;
 
         // Lock the archived row so two concurrent restores cannot both re-insert it.
-        let archived_row = sqlx::query(&format!(
+        let archived_row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive WHERE id = ? FOR UPDATE"
-        ))
+        )))
         .bind(job_id.to_string())
         .fetch_optional(&mut *tx)
         .await?

@@ -57,7 +57,7 @@ mod mysql_tests {
 
         let mut admin = MySqlConnection::connect_with(&base).await.unwrap();
         admin
-            .execute(format!("CREATE DATABASE `{scratch}`").as_str())
+            .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{scratch}`")))
             .await
             .unwrap();
 
@@ -93,7 +93,9 @@ mod mysql_tests {
         .await;
 
         admin
-            .execute(format!("DROP DATABASE IF EXISTS `{scratch}`").as_str())
+            .execute(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS `{scratch}`"
+            )))
             .await
             .unwrap();
         outcome.unwrap();
@@ -143,7 +145,9 @@ mod postgres_tests {
 
         let mut admin = PgConnection::connect_with(&base).await.unwrap();
         admin
-            .execute(format!("CREATE DATABASE \"{scratch}\"").as_str())
+            .execute(sqlx::AssertSqlSafe(format!(
+                "CREATE DATABASE \"{scratch}\""
+            )))
             .await
             .unwrap();
 
@@ -178,7 +182,9 @@ mod postgres_tests {
         .await;
 
         admin
-            .execute(format!("DROP DATABASE IF EXISTS \"{scratch}\" WITH (FORCE)").as_str())
+            .execute(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS \"{scratch}\" WITH (FORCE)"
+            )))
             .await
             .unwrap();
         outcome.unwrap();

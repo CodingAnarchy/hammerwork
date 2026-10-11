@@ -460,4 +460,7 @@ mod doc_examples {
 
     #[doc = include_str!("../docs/encryption.md")]
     struct EncryptionDoctests;
+
+    #[doc = include_str!("../docs/upgrading-to-3.0.md")]
+    struct UpgradingTo30Doctests;
 }

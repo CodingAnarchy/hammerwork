@@ -174,14 +174,14 @@ pub async fn fetch_workflows(
     Ok(match pool {
         DatabasePool::Postgres(p) => {
             summaries!(
-                bind_pg(sqlx::query(&sql), params.binds())
+                bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), params.binds())
                     .fetch_all(p)
                     .await?
             )
         }
         DatabasePool::MySQL(p) => {
             summaries!(
-                bind_mysql(sqlx::query(&sql), params.binds())
+                bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql)), params.binds())
                     .fetch_all(p)
                     .await?
             )

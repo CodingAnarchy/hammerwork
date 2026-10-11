@@ -540,13 +540,13 @@ mod builder_tests {
             if name.starts_with("job_purge") || name == "vacuum" && sql.starts_with("DELETE") {
                 // Writes: run them inside a rolled-back transaction
                 let mut tx = pool.begin().await?;
-                bind_pg(sqlx::query(&sql), &binds)
+                bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql.as_str())), &binds)
                     .execute(&mut *tx)
                     .await
                     .unwrap_or_else(|e| panic!("{name}: {e}\n{sql}"));
                 tx.rollback().await?;
             } else {
-                bind_pg(sqlx::query(&sql), &binds)
+                bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql.as_str())), &binds)
                     .fetch_all(&pool)
                     .await
                     .unwrap_or_else(|e| panic!("{name}: {e}\n{sql}"));
@@ -573,13 +573,13 @@ mod builder_tests {
         for (name, sql, binds) in all {
             if name.starts_with("job_purge") || name == "vacuum" && sql.starts_with("DELETE") {
                 let mut tx = pool.begin().await?;
-                bind_mysql(sqlx::query(&sql), &binds)
+                bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql.as_str())), &binds)
                     .execute(&mut *tx)
                     .await
                     .unwrap_or_else(|e| panic!("{name}: {e}\n{sql}"));
                 tx.rollback().await?;
             } else {
-                bind_mysql(sqlx::query(&sql), &binds)
+                bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql.as_str())), &binds)
                     .fetch_all(&pool)
                     .await
                     .unwrap_or_else(|e| panic!("{name}: {e}\n{sql}"));

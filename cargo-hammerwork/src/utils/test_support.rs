@@ -88,13 +88,13 @@ impl ScratchDb {
             .unwrap();
         match &admin {
             DatabasePool::Postgres(p) => {
-                sqlx::query(&format!("CREATE DATABASE {name}"))
+                sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
                     .execute(p)
                     .await
                     .unwrap();
             }
             DatabasePool::MySQL(p) => {
-                sqlx::query(&format!("CREATE DATABASE {name}"))
+                sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
                     .execute(p)
                     .await
                     .unwrap();
@@ -138,7 +138,7 @@ impl ScratchDb {
                     .await
                     .ok();
                 for t in tables {
-                    sqlx::query(&format!("DROP TABLE `{t}`"))
+                    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE `{t}`")))
                         .execute(p)
                         .await
                         .unwrap();
@@ -156,20 +156,23 @@ impl ScratchDb {
         match (&self.pool, &self.admin) {
             (DatabasePool::Postgres(p), DatabasePool::Postgres(a)) => {
                 p.close().await;
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DROP DATABASE IF EXISTS {} WITH (FORCE)",
                     self.name
-                ))
+                )))
                 .execute(a)
                 .await
                 .unwrap();
             }
             (DatabasePool::MySQL(p), DatabasePool::MySQL(a)) => {
                 p.close().await;
-                sqlx::query(&format!("DROP DATABASE IF EXISTS {}", self.name))
-                    .execute(a)
-                    .await
-                    .unwrap();
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DROP DATABASE IF EXISTS {}",
+                    self.name
+                )))
+                .execute(a)
+                .await
+                .unwrap();
             }
             _ => unreachable!(),
         }
@@ -206,12 +209,12 @@ pub async fn job_column(pool: &DatabasePool, id: &str, column: &str) -> Option<S
     };
     let sql = format!("SELECT {cast} AS v FROM hammerwork_jobs WHERE id = {id}");
     match pool {
-        DatabasePool::Postgres(p) => bind_pg(sqlx::query(&sql), params.binds())
+        DatabasePool::Postgres(p) => bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), params.binds())
             .fetch_optional(p)
             .await
             .unwrap()
             .and_then(|r| r.try_get::<Option<String>, _>("v").unwrap()),
-        DatabasePool::MySQL(p) => bind_mysql(sqlx::query(&sql), params.binds())
+        DatabasePool::MySQL(p) => bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql)), params.binds())
             .fetch_optional(p)
             .await
             .unwrap()
@@ -298,7 +301,7 @@ pub async fn seed(pool: &DatabasePool, job: &SeedJob<'_>) -> String {
                 CASE WHEN $8 THEN '0 0 * * * *' ELSE NULL END, $8, \
                 CASE WHEN $8 THEN NOW() + INTERVAL '1 hour' ELSE NULL END, \
                 CASE WHEN $9::text IS NULL THEN '{}'::uuid[] ELSE ARRAY[$9::uuid] END)";
-            sqlx::query(sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(&id)
                 .bind(job.queue)
                 .bind(job.payload)
@@ -322,7 +325,7 @@ pub async fn seed(pool: &DatabasePool, job: &SeedJob<'_>) -> String {
                 IF(?, '0 0 * * * *', NULL), ?, \
                 IF(?, DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 1 HOUR), NULL), \
                 IF(? IS NULL, JSON_ARRAY(), JSON_ARRAY(?)))";
-            sqlx::query(sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(&id)
                 .bind(job.queue)
                 .bind(job.payload)
@@ -373,14 +376,14 @@ pub async fn column_strings(
     column: &str,
 ) -> Vec<String> {
     match pool {
-        DatabasePool::Postgres(p) => bind_pg(sqlx::query(sql), binds)
+        DatabasePool::Postgres(p) => bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
             .fetch_all(p)
             .await
             .unwrap()
             .iter()
             .map(|r| r.try_get::<String, _>(column).unwrap())
             .collect(),
-        DatabasePool::MySQL(p) => bind_mysql(sqlx::query(sql), binds)
+        DatabasePool::MySQL(p) => bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
             .fetch_all(p)
             .await
             .unwrap()
@@ -407,8 +410,16 @@ pub async fn table_exists(pool: &DatabasePool) -> bool {
 /// Run a raw statement (test fixtures only; never build these from user input).
 pub async fn exec_sql(pool: &DatabasePool, sql: &str) -> u64 {
     match pool {
-        DatabasePool::Postgres(p) => sqlx::query(sql).execute(p).await.unwrap().rows_affected(),
-        DatabasePool::MySQL(p) => sqlx::query(sql).execute(p).await.unwrap().rows_affected(),
+        DatabasePool::Postgres(p) => sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(p)
+            .await
+            .unwrap()
+            .rows_affected(),
+        DatabasePool::MySQL(p) => sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(p)
+            .await
+            .unwrap()
+            .rows_affected(),
     }
 }
 

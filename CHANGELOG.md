@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+See [Upgrading from 2.x to 3.0](docs/upgrading-to-3.0.md) for what to change.
+
+- **sqlx 0.9** (#85). Hammerwork now depends on sqlx 0.9 instead of 0.8. sqlx types are
+  part of the public API (the pool passed to `JobQueue::new`, `JobQueue<DB: sqlx::Database>`,
+  `DatabaseQueue`, the migration runners, sqlx `Encode`/`Decode` for `JobStatus` and
+  `BatchStatus`), so applications must move their own sqlx dependency to 0.9 as well.
+  sqlx 0.9 also changes behaviour that applications may notice through their own sqlx
+  code: the combined runtime/TLS features are gone (`runtime-tokio-rustls` is now
+  `runtime-tokio` + `tls-rustls-ring-webpki`), dynamic SQL strings must be wrapped in
+  `sqlx::AssertSqlSafe`, MySQL RSA password encryption for non-TLS connections needs the
+  `mysql-rsa` feature (the CLI and dashboard enable it; the library does not), and MySQL
+  connections no longer force the `utf8mb4_unicode_ci` collation. No schema migration is
+  needed.
+- **MSRV is now Rust 1.94.0** (was 1.91.1), as required by sqlx 0.9.
 - **No features are enabled by default** (#92). `default` used to be `["metrics", "alerting", "webhooks"]`, which pulled `warp`, `reqwest`, `lettre` and `prometheus` into every build. It is now empty. Enable what you use, or the new `full` feature (`metrics`, `alerting`, `webhooks`, `streaming`, `tracing`, `encryption`; no database backend, KMS key source, event stream sink or `test-queue`). Code that uses `hammerwork::metrics`, `hammerwork::alerting` or `hammerwork::webhooks` must now enable those features. `cargo-hammerwork` and `hammerwork-web` enable the features they need themselves.
 - **`azure-kv` is renamed `azure-kms`**, to match `aws-kms`, `gcp-kms` and `vault-kms` (#92). There is no alias. The same rename applies to the `cargo-hammerwork` feature.
 - **`test` is renamed `test-queue`**, after the `TestQueue` it enables (#92). There is no alias.
@@ -20,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - CI checks the feature combinations `full`, `postgres,full`, `mysql,full` and `test-queue`.
+- The library no longer depends on the `rsa` crate (RUSTSEC-2023-0071), which sqlx 0.9
+  made optional. It stays in the lockfile only through the CLI and dashboard binaries.
 
 ## [2.5.0] - 2026-10-11
 

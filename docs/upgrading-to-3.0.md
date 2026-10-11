@@ -1,6 +1,103 @@
 # Upgrading from 2.x to 3.0
 
-This page lists what to change in your project when you move from Hammerwork 2.x to 3.0.
+Hammerwork 3.0 is a major release. This guide lists each breaking change, what it
+affects and what you need to change in your code, configuration or deployment. Read
+it together with the `3.0.0` entry in the [CHANGELOG](../CHANGELOG.md).
+
+## sqlx 0.9 and Rust 1.94
+
+Hammerwork 3.0 depends on [sqlx](https://crates.io/crates/sqlx) 0.9 instead of 0.8,
+and its minimum supported Rust version (MSRV) is now **1.94.0** (it was 1.91.1).
+sqlx 0.9 requires Rust 1.94.
+
+sqlx is part of Hammerwork's public API. You create the `sqlx::Pool` that
+`JobQueue::new` takes, `JobQueue<DB>` and `DatabaseQueue` are generic over
+`sqlx::Database`, the `MigrationRunner`s take sqlx pools, and `JobStatus` and
+`BatchStatus` implement sqlx's `Type`, `Encode` and `Decode`. Your application must
+therefore use the same sqlx major version as Hammerwork. If it still depends on sqlx
+0.8, the build fails with errors such as "expected `Pool<Postgres>`, found
+`Pool<Postgres>`", because two different versions of the `sqlx` crate are in the
+dependency graph.
+
+### What to change
+
+1. **Use Rust 1.94.0 or newer.**
+
+2. **Upgrade your own sqlx dependency to 0.9.** sqlx 0.9 removed the combined
+   runtime and TLS features, so name them separately:
+
+   ```toml
+   # Before (2.x)
+   sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
+
+   # After (3.0)
+   sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres"] }
+   ```
+
+   `runtime-tokio-native-tls` becomes `runtime-tokio` plus `tls-native-tls`.
+   Hammerwork itself enables `runtime-tokio` and `tls-rustls-ring-webpki`.
+
+3. **Wrap dynamic SQL strings in your own queries.** sqlx 0.9's `query`,
+   `query_as`, `query_scalar`, `raw_sql` and `Executor::execute` accept only string
+   literals (`&'static str`) unless you mark the string as reviewed:
+
+   ```rust,no_run
+   # async fn example(pool: sqlx::PgPool, table: &str) -> Result<(), sqlx::Error> {
+   // Before (no longer compiles):
+   // sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE status = $1"))
+   let pending: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+       "SELECT COUNT(*) FROM {table} WHERE status = $1"
+   )))
+   .bind("Pending")
+   .fetch_one(&pool)
+   .await?;
+   # Ok(())
+   # }
+   ```
+
+   This affects only SQL your application writes itself, for example reporting
+   queries against `hammerwork_jobs`. No Hammerwork API takes an SQL string.
+
+4. **MySQL without TLS: enable `mysql-rsa` if you need it.** sqlx 0.9 moved the RSA
+   password encryption used by MySQL's `caching_sha2_password` and `sha256_password`
+   authentication over unencrypted connections behind a new `mysql-rsa` feature.
+   Without it, connecting with `ssl-mode=disabled`, or to a server without TLS,
+   fails with "RSA auth backend disabled" whenever the server needs a full
+   authentication (for example the first login after a server restart). The
+   library does not enable `mysql-rsa`. If you connect without TLS, either enable
+   TLS or add the feature to your own sqlx dependency; Cargo's feature unification
+   turns it on for Hammerwork too:
+
+   ```toml
+   sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring-webpki", "mysql", "mysql-rsa"] }
+   ```
+
+   The `cargo-hammerwork` CLI and the `hammerwork-web` dashboard enable `mysql-rsa`,
+   so they connect as before.
+
+5. **MySQL connection collation.** sqlx 0.8 ran `SET NAMES utf8mb4 COLLATE
+   utf8mb4_unicode_ci` on every new MySQL connection. sqlx 0.9 runs `SET NAMES
+   utf8mb4` and lets the server pick its default collation (`utf8mb4_0900_ai_ci` on
+   MySQL 8.0). Hammerwork's queries compare columns with parameters, where the column
+   collation applies, so Hammerwork behaves the same. Queries of your own that
+   compare string literals or parameters with each other may sort or match
+   differently. To keep the old behaviour, set it on the connect options:
+   `MySqlConnectOptions::from_str(url)?.collation("utf8mb4_unicode_ci")`.
+
+For other sqlx 0.9 changes that may affect your own sqlx code (`RawSql`,
+`IntoArguments` and `Arguments` lost their lifetime parameter, the `Migrate` trait,
+`sqlx.toml`), see the
+[sqlx 0.9.0 changelog](https://github.com/launchbadge/sqlx/blob/main/CHANGELOG.md#090---2026-05-06).
+
+### What does not change
+
+- No database migration is needed. Hammerwork's migrations, and the way they are run
+  (one statement at a time, over the simple text protocol on MySQL), are the same.
+- Timestamps decode as before: PostgreSQL `TIMESTAMPTZ` and MySQL `TIMESTAMP(6)`
+  columns map to `chrono::DateTime<Utc>`, and sqlx still sets the MySQL session
+  `time_zone` to `+00:00`.
+- Hammerwork's own types and function signatures are unchanged by this upgrade;
+  only the sqlx version behind them moves.
 
 ## Feature flags
 

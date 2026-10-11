@@ -3994,7 +3994,7 @@ mod tests {
             .await
             .expect("failed to run PostgreSQL migrations");
         for table in ["hammerwork_key_audit_log", "hammerwork_encryption_keys"] {
-            sqlx::query(&format!("DELETE FROM {table}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
                 .execute(&pool)
                 .await
                 .expect("failed to clear key tables");
@@ -4019,7 +4019,7 @@ mod tests {
             .await
             .expect("failed to run MySQL migrations");
         for table in ["hammerwork_key_audit_log", "hammerwork_encryption_keys"] {
-            sqlx::query(&format!("DELETE FROM {table}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
                 .execute(&pool)
                 .await
                 .expect("failed to clear key tables");
@@ -4681,7 +4681,7 @@ mod tests {
     async fn persistence_roundtrip<DB: KeyManagerBackend>(pool: Pool<DB>)
     where
         for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
-        for<'q> <DB as Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+        <DB as Database>::Arguments: sqlx::IntoArguments<DB>,
         for<'r> Vec<u8>: sqlx::Decode<'r, DB> + sqlx::Type<DB>,
         for<'r> String: sqlx::Decode<'r, DB> + sqlx::Type<DB>,
         for<'n> &'n str: sqlx::ColumnIndex<DB::Row>,

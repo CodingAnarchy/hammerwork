@@ -379,7 +379,7 @@ pub async fn fetch_spawn_list(
     let mut out = Vec::new();
     match pool {
         DatabasePool::Postgres(pg_pool) => {
-            for row in bind_pg(sqlx::query(&query), &binds)
+            for row in bind_pg(sqlx::query(sqlx::AssertSqlSafe(query)), &binds)
                 .fetch_all(pg_pool)
                 .await?
             {
@@ -397,7 +397,7 @@ pub async fn fetch_spawn_list(
             }
         }
         DatabasePool::MySQL(mysql_pool) => {
-            for row in bind_mysql(sqlx::query(&query), &binds)
+            for row in bind_mysql(sqlx::query(sqlx::AssertSqlSafe(query)), &binds)
                 .fetch_all(mysql_pool)
                 .await?
             {
@@ -486,7 +486,7 @@ pub async fn fetch_spawn_stats(
 
     macro_rules! stats {
         ($pool:expr, $bind:ident) => {{
-            let row = $bind(sqlx::query(&total_query), &total_binds)
+            let row = $bind(sqlx::query(sqlx::AssertSqlSafe(total_query)), &total_binds)
                 .fetch_one($pool)
                 .await?;
             let mut stats = SpawnStats {
@@ -497,9 +497,12 @@ pub async fn fetch_spawn_stats(
             };
             if detailed {
                 let mut lines = Vec::new();
-                for row in $bind(sqlx::query(&breakdown_query), &breakdown_binds)
-                    .fetch_all($pool)
-                    .await?
+                for row in $bind(
+                    sqlx::query(sqlx::AssertSqlSafe(breakdown_query)),
+                    &breakdown_binds,
+                )
+                .fetch_all($pool)
+                .await?
                 {
                     lines.push(QueueSpawnStats {
                         queue_name: row.try_get("queue_name")?,
@@ -570,7 +573,7 @@ pub async fn fetch_pending_spawns(
     let mut out = Vec::new();
     match pool {
         DatabasePool::Postgres(pg_pool) => {
-            for row in bind_pg(sqlx::query(&query), &binds)
+            for row in bind_pg(sqlx::query(sqlx::AssertSqlSafe(query)), &binds)
                 .fetch_all(pg_pool)
                 .await?
             {
@@ -584,7 +587,7 @@ pub async fn fetch_pending_spawns(
             }
         }
         DatabasePool::MySQL(mysql_pool) => {
-            for row in bind_mysql(sqlx::query(&query), &binds)
+            for row in bind_mysql(sqlx::query(sqlx::AssertSqlSafe(query)), &binds)
                 .fetch_all(mysql_pool)
                 .await?
             {

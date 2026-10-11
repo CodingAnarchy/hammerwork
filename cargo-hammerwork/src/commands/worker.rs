@@ -241,7 +241,7 @@ pub async fn fetch_running_jobs(
                 sql.push_str(" AND queue_name = $1");
             }
             sql.push_str(" ORDER BY queue_name, started_at");
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             if let Some(name) = queue {
                 q = q.bind(name.to_string());
             }
@@ -272,7 +272,7 @@ pub async fn fetch_running_jobs(
                 sql.push_str(" AND queue_name = ?");
             }
             sql.push_str(" ORDER BY queue_name, started_at");
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             if let Some(name) = queue {
                 q = q.bind(name.to_string());
             }
@@ -407,7 +407,7 @@ mod tests {
             };
             match &pool {
                 DatabasePool::Postgres(p) => {
-                    sqlx::query(&sql)
+                    sqlx::query(sqlx::AssertSqlSafe(sql))
                         .bind(id)
                         .bind(&queue)
                         .execute(p)
@@ -415,7 +415,7 @@ mod tests {
                         .unwrap();
                 }
                 DatabasePool::MySQL(p) => {
-                    sqlx::query(&sql)
+                    sqlx::query(sqlx::AssertSqlSafe(sql))
                         .bind(id)
                         .bind(&queue)
                         .execute(p)

@@ -4,7 +4,7 @@ use super::split::{Dialect, split_statements};
 use super::{Migration, MigrationRecord, MigrationRunner};
 use crate::Result;
 use chrono::Utc;
-use sqlx::{PgConnection, PgPool, Postgres, Row, pool::PoolConnection};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool, Postgres, Row, pool::PoolConnection};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info};
 
@@ -124,7 +124,10 @@ impl MigrationRunner<sqlx::Postgres> for PostgresMigrationRunner {
                 full_statement
             );
 
-            if let Err(e) = sqlx::query(&full_statement).execute(&mut *tx).await {
+            if let Err(e) = sqlx::query(AssertSqlSafe(full_statement.as_str()))
+                .execute(&mut *tx)
+                .await
+            {
                 error!(
                     "Failed to execute statement {}: {} - Error: {}",
                     i + 1,

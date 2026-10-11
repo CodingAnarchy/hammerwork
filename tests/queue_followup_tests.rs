@@ -581,9 +581,9 @@ mod postgres_tests {
             ("retry_strategy", "'{\"NoSuchStrategy\": {}}'::jsonb"),
         ] {
             let id = queue.enqueue(job(&queue_name, column)).await.unwrap();
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE hammerwork_jobs SET {column} = {value} WHERE id = $1"
-            ))
+            )))
             .bind(id)
             .execute(queue.get_pool())
             .await
@@ -669,9 +669,9 @@ mod mysql_tests {
             ),
         ] {
             let id = queue.enqueue(job(&queue_name, column)).await.unwrap();
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE hammerwork_jobs SET {column} = {value} WHERE id = ?"
-            ))
+            )))
             .bind(id.to_string())
             .execute(queue.get_pool())
             .await
