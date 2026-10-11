@@ -91,10 +91,12 @@ For other sqlx 0.9 changes that may affect your own sqlx code (`RawSql`,
 
 ### What does not change
 
-- No database migration is needed. Hammerwork's migrations, and the way they are run
-  (one statement at a time, over the simple text protocol on MySQL), are the same.
-- Timestamps decode as before: PostgreSQL `TIMESTAMPTZ` and MySQL `TIMESTAMP(6)`
-  columns map to `chrono::DateTime<Utc>`, and sqlx still sets the MySQL session
+- The sqlx upgrade itself needs no database migration. Hammerwork's migrations, and the
+  way they are run (one statement at a time, over the simple text protocol on MySQL), are
+  the same. (3.0 has its own MySQL migration, 021; see
+  [MySQL timestamps](#mysql-timestamps-migration-021).)
+- Timestamps decode as before: PostgreSQL `TIMESTAMPTZ` and MySQL `TIMESTAMP(6)` or
+  `DATETIME(6)` columns map to `chrono::DateTime<Utc>`, and sqlx still sets the MySQL session
   `time_zone` to `+00:00`.
 - Hammerwork's own types and function signatures are unchanged by this upgrade;
   only the sqlx version behind them moves.
@@ -332,3 +334,67 @@ let worker = Worker::new(queue, "emails".into(), handler)
 # let _ = worker;
 # }
 ```
+
+## MySQL timestamps (migration 021)
+
+Applies to MySQL only; on PostgreSQL migration `021_mysql_datetime` does nothing.
+
+MySQL's `TIMESTAMP` type ends at 2038-01-19 03:14:07 UTC, so 2.x rejected jobs scheduled
+after that. Migration `021_mysql_datetime` converts every `TIMESTAMP` and `TIMESTAMP(n)`
+column of every Hammerwork table (39 columns in `hammerwork_jobs`,
+`hammerwork_jobs_archive`, `hammerwork_batches`, `hammerwork_encryption_keys`,
+`hammerwork_key_audit_log`, `hammerwork_kms_data_keys`, `hammerwork_queue_pause` and
+`hammerwork_migrations`) to `DATETIME(6)`, which holds years 1000 to 9999. The three
+second-precision `DATETIME` columns of `hammerwork_workflows` (`created_at`,
+`completed_at`, `failed_at`) also become `DATETIME(6)`, so every MySQL time keeps
+microseconds. The 2038 checks
+are gone, and a new install gets the same schema by running all migrations.
+
+What the migration keeps:
+
+- **Values.** `TIMESTAMP` stores UTC and converts to the session `time_zone`; `DATETIME`
+  stores the value as written. The migration sets the session `time_zone` to `+00:00`
+  for the conversion (and restores it afterwards), so every existing value keeps its
+  UTC reading whatever your connection's time zone is. Hammerwork has always written
+  UTC (`UTC_TIMESTAMP(6)`, UTC values bound by sqlx).
+- **`NULL` / `NOT NULL` and defaults.** `CURRENT_TIMESTAMP` defaults become
+  `CURRENT_TIMESTAMP(6)`, as `DATETIME(6)` requires. The one `ON UPDATE` clause,
+  `hammerwork_queue_pause.updated_at`, is kept.
+- Second-precision columns (the queue pause table, `hammerwork_workflows`, and `hammerwork_jobs.archived_at`) now
+  carry microseconds.
+
+### Cost: it rewrites every table
+
+MySQL cannot change `TIMESTAMP` to `DATETIME` in place. It copies each table
+(`ALGORITHM=COPY`) and blocks writes to it while it does, so `enqueue`, dequeues and job
+completions on `hammerwork_jobs` wait (readers are not blocked). There is one `ALTER` per
+table, so the lock on each table lasts as long as that table's copy.
+
+Measured on a local Docker MySQL 8 with an `hammerwork_jobs` table of 200,000 rows
+(about 300 bytes each, with its indexes) and an equally large `hammerwork_jobs_archive`:
+the whole migration took about 4.6 seconds, roughly 85,000 rows per second. Expect
+something like 10 to 20 seconds per million rows on comparable hardware, and much more on
+a slow disk or a large buffer-pool-bound table; measure on a copy of your own data.
+
+Before upgrading:
+
+1. **Take a backup.** DDL on MySQL cannot be rolled back.
+2. **Run it off-peak**, ideally with the workers stopped or idle (for example run
+   `cargo hammerwork migration run` before starting the 3.0 workers), and make sure there
+   is free disk space for a copy of your largest table. Archive or purge old jobs first
+   if the table is much bigger than it needs to be.
+3. If a statement fails part-way (for example the disk fills up), fix the cause and run
+   the migrations again. Each `ALTER` only runs while its table still has a `TIMESTAMP`
+   column, so completed tables are skipped.
+
+### 2.x workers and the converted schema
+
+2.x code works against the converted columns, so a rolling upgrade is possible once the
+migration has finished. 2.x only ever binds UTC `DateTime<Utc>` values and writes
+`UTC_TIMESTAMP(6)` under a `+00:00` session, which `DATETIME` stores as given, and sqlx
+0.8 decodes `DATETIME` and `TIMESTAMP` into `DateTime<Utc>` alike. A 2.x worker also
+ignores the migration record it does not know. What 2.x does not gain is the longer
+range: it still rejects times after 2038 itself.
+
+The migration blocks writes while it runs, so 2.x workers will stall (and may time out
+waiting on locks) during the conversion, so stop them or let them drain first.

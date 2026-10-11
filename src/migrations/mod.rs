@@ -539,5 +539,21 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("020_archive_retry_strategy_and_workflow_index.postgres.sql").to_string(),
             include_str!("020_archive_retry_strategy_and_workflow_index.mysql.sql").to_string(),
         );
+
+        // Migration 021: Store MySQL times as DATETIME(6) (lifts the year-2038 limit);
+        // a no-op on PostgreSQL
+        self.register_migration(
+            Migration {
+                id: "021_mysql_datetime".to_string(),
+                description: "Convert MySQL TIMESTAMP columns to DATETIME(6) (year-2038 limit)"
+                    .to_string(),
+                version: 21,
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-10-11T18:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("021_mysql_datetime.postgres.sql").to_string(),
+            include_str!("021_mysql_datetime.mysql.sql").to_string(),
+        );
     }
 }
