@@ -297,61 +297,8 @@ where
 {
     match queue.get_all_queue_stats().await {
         Ok(all_stats) => {
-            let mut total_pending = 0;
-            let mut total_running = 0;
-            let mut total_completed = 0;
-            let mut total_failed = 0;
-            let mut total_dead = 0;
-            let mut total_throughput = 0.0;
-            let mut total_processing_time = 0.0;
-            let mut queue_count = 0;
-
-            for stats in &all_stats {
-                total_pending += stats.pending_count;
-                total_running += stats.running_count;
-                total_completed += stats.completed_count;
-                total_failed += stats.dead_count + stats.timed_out_count;
-                total_dead += stats.dead_count;
-                total_throughput += stats.statistics.throughput_per_minute;
-                total_processing_time += stats.statistics.avg_processing_time_ms;
-                queue_count += 1;
-            }
-
-            let avg_processing_time = if queue_count > 0 {
-                total_processing_time / queue_count as f64
-            } else {
-                0.0
-            };
-
-            let total_jobs = total_pending + total_running + total_completed + total_failed;
-            let overall_error_rate = if total_jobs > 0 {
-                total_failed as f64 / total_jobs as f64
-            } else {
-                0.0
-            };
-
-            // Generate system health assessment
-            let health = assess_system_health(&all_stats);
-
-            let overview = SystemOverview {
-                total_queues: queue_count,
-                total_jobs,
-                pending_jobs: total_pending,
-                running_jobs: total_running,
-                completed_jobs: total_completed,
-                failed_jobs: total_failed,
-                dead_jobs: total_dead,
-                overall_throughput: total_throughput,
-                overall_error_rate,
-                avg_processing_time_ms: avg_processing_time,
-                system_health: health,
-                uptime_seconds: {
-                    let state = system_state.read().await;
-                    state.uptime_seconds() as u64
-                },
-                last_updated: chrono::Utc::now(),
-            };
-
+            let uptime_seconds = system_state.read().await.uptime_seconds() as u64;
+            let overview = generate_overview_from_stats(&all_stats, uptime_seconds);
             Ok(json_reply(&ApiResponse::success(overview)))
         }
         Err(e) => Ok(error_reply(
@@ -683,16 +630,7 @@ where
     Ok(priority_stats
         .priority_distribution
         .into_iter()
-        .map(|(priority, percentage)| {
-            let priority_name = match priority {
-                hammerwork::priority::JobPriority::Background => "background",
-                hammerwork::priority::JobPriority::Low => "low",
-                hammerwork::priority::JobPriority::Normal => "normal",
-                hammerwork::priority::JobPriority::High => "high",
-                hammerwork::priority::JobPriority::Critical => "critical",
-            };
-            (priority_name.to_string(), percentage)
-        })
+        .map(|(priority, percentage)| (priority.to_string(), percentage))
         .collect())
 }
 
