@@ -581,6 +581,24 @@ impl TestStorage {
         deps
     }
 
+    /// The statuses of the dependencies `ids` that still exist, for
+    /// [`lifecycle::reevaluate_dependencies`]. An archived job keeps its times, which
+    /// stand in for the status the database backends keep in the archive.
+    fn dependency_states(&self, ids: &[JobId]) -> HashMap<JobId, JobStatus> {
+        ids.iter()
+            .filter_map(|id| {
+                let job = self.jobs.get(id)?;
+                let status = match job.status {
+                    JobStatus::Archived if job.completed_at.is_some() => JobStatus::Completed,
+                    JobStatus::Archived if job.timed_out_at.is_some() => JobStatus::TimedOut,
+                    JobStatus::Archived if job.failed_at.is_some() => JobStatus::Failed,
+                    status => status,
+                };
+                Some((*id, status))
+            })
+            .collect()
+    }
+
     /// Whether the dependency `job_id` completed (archived jobs keep their times).
     fn dependency_completed(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|job| match job.status {
@@ -1392,6 +1410,15 @@ impl DatabaseQueue for TestQueue {
     async fn retry_job(&self, job_id: JobId, retry_at: DateTime<Utc>) -> Result<()> {
         let mut storage = self.storage.write().await;
         storage.check_transition(job_id, crate::queue::JobTransition::Retry)?;
+        // Like the database backends, re-evaluate the dependencies of a job retried by
+        // hand, refusing when one of them can no longer complete.
+        let dependency_status = match storage.jobs.get(&job_id) {
+            Some(job) if !job.depends_on.is_empty() => {
+                let states = storage.dependency_states(&job.depends_on);
+                Some(lifecycle::reevaluate_dependencies(job, &states, "retried")?)
+            }
+            _ => None,
+        };
 
         storage.update_job_status(job_id, JobStatus::Pending)?;
         storage.leases.remove(&job_id);
@@ -1399,6 +1426,9 @@ impl DatabaseQueue for TestQueue {
         if let Some(job) = storage.jobs.get_mut(&job_id) {
             job.scheduled_at = retry_at;
             job.started_at = None;
+            if let Some(status) = dependency_status {
+                job.dependency_status = status;
+            }
         }
 
         Ok(())
@@ -2725,8 +2755,22 @@ impl DatabaseQueue for TestQueue {
     async fn restore_archived_job(&self, job_id: JobId) -> Result<Job> {
         let mut storage = self.storage.write().await;
 
+        // Its dependencies may have finished (or failed) since it was archived.
+        let dependency_status = match storage.jobs.get(&job_id) {
+            Some(job) if job.status == JobStatus::Archived && !job.depends_on.is_empty() => {
+                let states = storage.dependency_states(&job.depends_on);
+                Some(lifecycle::reevaluate_dependencies(
+                    job, &states, "restored",
+                )?)
+            }
+            _ => None,
+        };
+
         if let Some(job) = storage.jobs.get_mut(&job_id) {
             if job.status == JobStatus::Archived {
+                if let Some(status) = dependency_status {
+                    job.dependency_status = status;
+                }
                 let queue_name = job.queue_name.clone(); // Clone to avoid borrow checker issues
 
                 // Restore job to pending status

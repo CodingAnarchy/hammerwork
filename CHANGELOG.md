@@ -30,7 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   includes the jobs of a cancelled workflow) or no longer exists, the call now returns
   `HammerworkError::Workflow` and changes nothing; it used to succeed and leave the job
   `Pending` forever. Retry or restore the dependency first. A job whose dependencies
-  were already satisfied is left as is, even if they have since been purged. (#102)
+  were already satisfied is left as is, even if they have since been purged. `TestQueue`
+  does the same. (#102)
 - **Events can carry job payloads.** `EventFilter::include_payload` and
   `EventConfig::include_payload_default` now work (both stay off by default), so
   webhooks and streams that ask for payloads receive them. (#101)

@@ -327,9 +327,21 @@ async fn retry_reevaluates_dependencies<Q: DatabaseQueue>(queue: &Q) {
         DependencyStatus::Satisfied
     );
 
-    for id in [parent_id, child_id] {
-        queue.delete_job(id).await.unwrap();
-    }
+    // A satisfied job stays retryable after its dependency is gone (purged).
+    queue.delete_job(parent_id).await.unwrap();
+    queue.fail_job(child_id, "failed again").await.unwrap();
+    queue.retry_job(child_id, past).await.unwrap();
+    assert_eq!(
+        queue
+            .get_job(child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dependency_status,
+        DependencyStatus::Satisfied
+    );
+
+    queue.delete_job(child_id).await.unwrap();
 }
 
 /// `restore_archived_job` re-evaluates the dependencies of the restored job the same
@@ -508,5 +520,22 @@ mod mysql_tests {
     async fn restore_reevaluates_dependencies_mysql() {
         let queue = test_utils::setup_mysql_queue().await;
         restore_reevaluates_dependencies(queue.as_ref()).await;
+    }
+}
+
+/// The in-memory `TestQueue` re-evaluates dependencies like the database backends.
+#[cfg(feature = "test")]
+mod test_queue_tests {
+    use super::*;
+    use hammerwork::queue::test::TestQueue;
+
+    #[tokio::test]
+    async fn retry_reevaluates_dependencies_test_queue() {
+        retry_reevaluates_dependencies(&TestQueue::new()).await;
+    }
+
+    #[tokio::test]
+    async fn restore_reevaluates_dependencies_test_queue() {
+        restore_reevaluates_dependencies(&TestQueue::new()).await;
     }
 }
