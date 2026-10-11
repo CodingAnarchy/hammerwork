@@ -1130,7 +1130,7 @@ mod tests {
         ])
         .await
         .unwrap();
-        assert_eq!(count_jobs(&pool, &hostile, None).await, 3);
+        assert_eq!(count_jobs(&pool, &hostile, None).await, 5);
         assert_eq!(job_status(&pool, &pending).await, "Pending");
         assert_eq!(
             job_column(&pool, &pending, "priority").await.as_deref(),
@@ -1170,7 +1170,7 @@ mod tests {
         ])
         .await
         .unwrap();
-        assert_eq!(count_jobs(&pool, &hostile, None).await, 3);
+        assert_eq!(count_jobs(&pool, &hostile, None).await, 5);
 
         // bad input is reported, and nothing is half-written
         let err = backup(vec![s("restore"), s("-i"), csv_out.clone(), s("--confirm")])

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes to check when upgrading
+
+- **`maintenance vacuum` and `backup create`** treat "failed" as `Failed`, `Dead` or
+  `TimedOut` (as `job list --failed` and `monitor` do). `vacuum` now also deletes old
+  `Dead` and `TimedOut` jobs (`--keep-failed-days`), and `backup create` without
+  `--include-failed` now leaves them out.
+- **`job enqueue`, `batch enqueue` and `cron create`**: `--queue` is optional when
+  `default_queue` (config file) or `HAMMERWORK_DEFAULT_QUEUE` is set.
+- **Dashboard `POST /api/system/maintenance` `cleanup`** now deletes exactly the dead
+  jobs its dry run counts, including dead rows whose `failed_at` is NULL (age is taken
+  from `failed_at`, else `timed_out_at`, else `created_at`).
+- **`GET /api/jobs?status=...`** now lists jobs in any status (up to the newest 100 per
+  status); `hammerwork-web`'s `jobs::routes` now needs `T: JobHistory`, and `JobHistory`
+  gains a defaulted `jobs_with_status` method.
+- `TestQueue`: `get_queue_stats` on an unknown queue returns zero counts, and
+  `get_batch_status` / `restore_archived_job` return `JobNotFound`, as the PostgreSQL and
+  MySQL backends do.
+
+### Fixed
+
+- Dashboard (#103): `/api/jobs` can list Running, Completed, TimedOut, Retrying and
+  Pending jobs scheduled for later; the stats endpoints decode `time_range=START,END` and
+  `queues=a,b` from a query string (they returned 400), `queues` now filters and
+  `granularity` (`hour`, `day`, `week`) is honoured; the maintenance cleanup dry run and
+  real run share one predicate.
+- CLI (#104): `vacuum` and `backup create` handle `Dead` and `TimedOut` jobs as failed;
+  `default_queue` / `HAMMERWORK_DEFAULT_QUEUE` is used as the fallback queue.
+- `TestQueue` (#106): a `Retry` outcome's `retry_at` is moved onto the mock clock, and
+  the error types listed above match the database backends.
+
 ## [2.3.0] - 2026-10-11
 
 A bug-fix release (#99, 47 fixes) with a small docs and dashboard cleanup (#98). It is a
