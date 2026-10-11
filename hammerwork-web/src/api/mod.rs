@@ -357,6 +357,93 @@ pub(crate) mod test_support {
         Arc::new(JobQueue::new(pool))
     }
 
+    /// The mock queue as a `JobHistory`, for handler tests that need no database: only
+    /// `jobs_with_status` does anything.
+    impl super::history::JobHistory for hammerwork::queue::test::TestQueue {
+        async fn hourly_activity(
+            &self,
+            _queue: Option<&str>,
+            _start: chrono::DateTime<chrono::Utc>,
+            _end: chrono::DateTime<chrono::Utc>,
+        ) -> hammerwork::Result<Vec<super::history::HourBucket>> {
+            Ok(Vec::new())
+        }
+
+        async fn error_groups(
+            &self,
+            _since: chrono::DateTime<chrono::Utc>,
+            _limit: u32,
+        ) -> hammerwork::Result<Vec<super::history::ErrorGroup>> {
+            Ok(Vec::new())
+        }
+
+        async fn count_jobs(
+            &self,
+            _queue: Option<&str>,
+            _kind: super::history::FinishedKind,
+            _older_than: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> hammerwork::Result<u64> {
+            Ok(0)
+        }
+
+        async fn delete_jobs(
+            &self,
+            _queue: Option<&str>,
+            _kind: super::history::FinishedKind,
+            _older_than: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> hammerwork::Result<u64> {
+            Ok(0)
+        }
+
+        async fn archived_jobs(
+            &self,
+            _filter: &super::archive::ArchiveFilterParams,
+            _limit: u32,
+            _offset: u32,
+        ) -> hammerwork::Result<(Vec<hammerwork::archive::ArchivedJob>, u64)> {
+            Ok((Vec::new(), 0))
+        }
+
+        async fn database_now(&self) -> hammerwork::Result<chrono::DateTime<chrono::Utc>> {
+            Ok(self.clock().now())
+        }
+
+        async fn recent_job_changes(
+            &self,
+            _since: chrono::DateTime<chrono::Utc>,
+            _limit: u32,
+        ) -> hammerwork::Result<Vec<crate::websocket::JobUpdate>> {
+            Ok(Vec::new())
+        }
+
+        async fn table_maintenance(
+            &self,
+            _operation: super::history::TableMaintenance,
+            _tables: &[&'static str],
+            _dry_run: bool,
+        ) -> hammerwork::Result<Vec<super::history::MaintenanceStatement>> {
+            Ok(Vec::new())
+        }
+
+        async fn jobs_with_status(
+            &self,
+            queue: Option<&str>,
+            status: &str,
+            limit: u32,
+        ) -> hammerwork::Result<Vec<hammerwork::Job>> {
+            let mut jobs: Vec<_> = self
+                .get_all_jobs()
+                .await
+                .into_iter()
+                .filter(|job| job.status.as_str() == status)
+                .filter(|job| queue.is_none_or(|name| job.queue_name == name))
+                .collect();
+            jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
+            jobs.truncate(limit as usize);
+            Ok(jobs)
+        }
+    }
+
     /// Status code and JSON body of a handler reply.
     pub async fn body_json(response: warp::reply::Response) -> (u16, serde_json::Value) {
         use warp::Filter;

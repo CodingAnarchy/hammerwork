@@ -53,8 +53,13 @@ pub enum JobCommand {
     Enqueue {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name")]
-        queue: String,
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Queue name (required unless default_queue / HAMMERWORK_DEFAULT_QUEUE is set)"
+        )]
+        queue: Option<String>,
         #[arg(short = 'j', long, help = "Job payload as JSON")]
         payload: String,
         #[arg(short = 'r', long, help = "Job priority")]
@@ -218,12 +223,13 @@ impl JobCommand {
                 pii_fields,
                 ..
             } => {
+                let queue = config.resolve_queue(queue.as_deref())?;
                 let job_queue = pool
                     .create_enqueue_queue(&config.encryption_settings()?)
                     .await?;
                 enqueue_job(
                     job_queue,
-                    queue,
+                    &queue,
                     payload,
                     priority,
                     *delay,
@@ -1217,7 +1223,7 @@ mod tests {
                 timeout,
                 ..
             } => {
-                assert_eq!((queue.as_str(), payload.as_str()), ("q", "{}"));
+                assert_eq!((queue.as_deref(), payload.as_str()), (Some("q"), "{}"));
                 assert_eq!(priority.as_deref(), Some("low"));
                 assert_eq!(
                     (delay, max_attempts, timeout),
@@ -1731,7 +1737,7 @@ mod tests {
         assert!(err.to_string().contains("holds encrypted jobs"), "{err}");
         let cron = crate::commands::cron::CronCommand::Create {
             database_url: None,
-            queue: encrypted_q.clone(),
+            queue: Some(encrypted_q.clone()),
             payload: payload.clone(),
             schedule: "0 0 0 1 1 *".to_string(),
             timezone: None,

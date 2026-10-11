@@ -460,7 +460,7 @@ async fn queue_jobs_handler<T>(
     sort: SortParams,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
     filters.queue = Some(queue_name);
     super::jobs::list_jobs_handler(queue, pagination, filters, sort).await

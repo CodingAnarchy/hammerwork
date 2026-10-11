@@ -78,6 +78,7 @@
 //! assert_eq!(bulk_delete.action, "delete");
 //! ```
 
+use super::history::JobHistory;
 use super::{
     ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
     with_filters, with_pagination, with_sort,
@@ -159,7 +160,7 @@ pub fn routes<T>(
     queue: Arc<T>,
 ) -> impl Filter<Extract = impl Reply, Error = warp::Rejection> + Clone
 where
-    T: DatabaseQueue + Send + Sync + 'static,
+    T: JobHistory + 'static,
 {
     let queue_filter = with_shared(queue);
 
@@ -248,6 +249,25 @@ fn job_info(job: &hammerwork::Job) -> JobInfo {
     }
 }
 
+/// The most jobs the listing reads per status (or per queue without a status filter).
+const LISTING_LIMIT: u32 = 100;
+
+/// The stored statuses a lowercase `status` filter selects, or `None` when it is not a
+/// plain status (`recurring`, or a name that matches nothing). `failed` covers every
+/// unsuccessful terminal status.
+fn stored_statuses(filter: &str) -> Option<&'static [&'static str]> {
+    Some(match filter {
+        "pending" => &["Pending"],
+        "running" => &["Running"],
+        "completed" => &["Completed"],
+        "failed" => &["Failed", "Dead", "TimedOut"],
+        "dead" => &["Dead"],
+        "timedout" => &["TimedOut"],
+        "retrying" => &["Retrying"],
+        _ => return None,
+    })
+}
+
 /// Whether a job satisfies the `status` filter of the listing: `failed` covers every
 /// unsuccessful terminal status, `recurring` selects recurring jobs, anything else must equal
 /// the job's status (ignoring case).
@@ -333,92 +353,112 @@ pub(crate) async fn list_jobs_handler<T>(
     sort: SortParams,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
-    // Since DatabaseQueue doesn't provide direct list methods with filters,
-    // we'll use the available methods to gather jobs
-    let mut all_jobs = Vec::new();
-
-    // Get queue stats to find available queues
-    let queue_stats = match queue.get_all_queue_stats().await {
-        Ok(stats) => stats,
-        Err(e) => {
-            return Ok(error_reply(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to get queue stats: {}", e),
-            ));
-        }
-    };
-
-    // Filter by queue if specified
-    let target_queues: Vec<String> = if let Some(ref queue_name) = filters.queue {
-        vec![queue_name.clone()]
-    } else {
-        queue_stats.iter().map(|s| s.queue_name.clone()).collect()
-    };
-
-    let status_filter = filters.status.as_deref().map(str::to_lowercase);
+    let status_filter = filters
+        .status
+        .as_deref()
+        .map(str::to_lowercase)
+        .map(|status| {
+            if status == "timed_out" {
+                "timedout".to_string()
+            } else {
+                status
+            }
+        });
     let search_term = filters
         .search
         .as_deref()
         .map(str::trim)
         .filter(|term| !term.is_empty())
         .map(str::to_lowercase);
-    let wants = |names: &[&str]| {
-        status_filter
-            .as_deref()
-            .is_none_or(|status| names.contains(&status))
+
+    let mut all_jobs = Vec::new();
+    let queue_jobs = if let Some(statuses) = status_filter.as_deref().and_then(stored_statuses) {
+        // A plain status filter: read the jobs in those statuses, whenever they are due.
+        let mut jobs = Vec::new();
+        for status in statuses {
+            jobs.extend(try_api!(
+                queue
+                    .jobs_with_status(filters.queue.as_deref(), status, LISTING_LIMIT)
+                    .await,
+                "Failed to list jobs"
+            ));
+        }
+        jobs
+    } else {
+        // No status filter (or `recurring`): the jobs ready to run, dead jobs and
+        // recurring jobs of each queue.
+        let queue_stats = match queue.get_all_queue_stats().await {
+            Ok(stats) => stats,
+            Err(e) => {
+                return Ok(error_reply(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to get queue stats: {}", e),
+                ));
+            }
+        };
+        let target_queues: Vec<String> = if let Some(ref queue_name) = filters.queue {
+            vec![queue_name.clone()]
+        } else {
+            queue_stats.iter().map(|s| s.queue_name.clone()).collect()
+        };
+        let wants = |names: &[&str]| {
+            status_filter
+                .as_deref()
+                .is_none_or(|status| names.contains(&status))
+        };
+        let mut jobs = Vec::new();
+        for queue_name in &target_queues {
+            jobs.extend(try_api!(
+                collect_jobs(
+                    queue.as_ref(),
+                    queue_name,
+                    wants(&["pending"]),
+                    wants(&["failed", "dead"]),
+                    wants(&["recurring"]),
+                    LISTING_LIMIT
+                )
+                .await,
+                "Failed to list jobs"
+            ));
+        }
+        jobs
     };
 
-    // For each queue, get jobs from different sources based on status filter
-    for queue_name in &target_queues {
-        let queue_jobs = try_api!(
-            collect_jobs(
-                queue.as_ref(),
-                queue_name,
-                wants(&["pending"]),
-                wants(&["failed", "dead"]),
-                wants(&["recurring"]),
-                100
-            )
-            .await,
-            "Failed to list jobs"
-        );
-
-        for job in &queue_jobs {
-            if filters
-                .created_after
-                .is_some_and(|after| job.created_at < after)
-                || filters
-                    .created_before
-                    .is_some_and(|before| job.created_at > before)
-            {
-                continue;
-            }
-            if let Some(ref term) = search_term
-                && !job_matches_search(job, term)
-            {
-                continue;
-            }
-
-            let job_info = job_info(job);
-
-            // Apply status filter
-            if let Some(ref status) = status_filter
-                && !status_matches(status, &job_info)
-            {
-                continue;
-            }
-
-            // Apply priority filter
-            if let Some(ref priority) = filters.priority
-                && !job_info.priority.eq_ignore_ascii_case(priority)
-            {
-                continue;
-            }
-
-            all_jobs.push(job_info);
+    for job in &queue_jobs {
+        if filters
+            .created_after
+            .is_some_and(|after| job.created_at < after)
+            || filters
+                .created_before
+                .is_some_and(|before| job.created_at > before)
+        {
+            continue;
         }
+        if let Some(ref term) = search_term
+            && !job_matches_search(job, term)
+        {
+            continue;
+        }
+
+        let job_info = job_info(job);
+
+        // Apply status filter
+        if let Some(ref status) = status_filter
+            && !status_matches(status, &job_info)
+        {
+            continue;
+        }
+
+        // Apply priority filter
+        if let Some(ref priority) = filters.priority
+            && !job_info.priority.eq_ignore_ascii_case(priority)
+        {
+            continue;
+        }
+
+        all_jobs.push(job_info);
     }
 
     // Sort jobs ascending, then reverse for descending order (the default). Without a
@@ -947,6 +987,68 @@ mod tests {
                 .await,
             vec![second, first]
         );
+    }
+
+    /// #103: the status filter reaches jobs in every status, not just the pending jobs
+    /// ready to run and the dead ones.
+    #[tokio::test]
+    async fn test_list_jobs_filters_by_any_status() {
+        use hammerwork::{Job, queue::test::TestQueue};
+        let queue = Arc::new(TestQueue::new());
+        let mk = |name: &str| Job::new("q".into(), serde_json::json!({ "name": name }));
+        let ready = queue.enqueue(mk("ready")).await.unwrap().to_string();
+        let later = queue
+            .enqueue(Job::with_delay(
+                "q".into(),
+                serde_json::json!({"name": "later"}),
+                chrono::Duration::hours(1),
+            ))
+            .await
+            .unwrap()
+            .to_string();
+        let done = queue.enqueue(mk("done")).await.unwrap();
+        let running = queue.enqueue(mk("running")).await.unwrap();
+        let timed_out = queue.enqueue(mk("timed_out")).await.unwrap();
+        let dead = queue.enqueue(mk("dead")).await.unwrap();
+        let failed = queue.enqueue(mk("failed")).await.unwrap();
+        // Claim the jobs that are due so each can end in the wanted status.
+        let mut claimed = Vec::new();
+        while let Some(job) = queue.dequeue("q").await.unwrap() {
+            claimed.push(job.id);
+        }
+        for id in [done, running, timed_out, dead, failed] {
+            assert!(claimed.contains(&id), "{id} was claimed");
+        }
+        // `ready` was claimed too; put it back to Pending.
+        let ready_id: hammerwork::JobId = ready.parse().unwrap();
+        queue
+            .retry_job(ready_id, queue.clock().now())
+            .await
+            .unwrap();
+        queue.complete_job(done).await.unwrap();
+        queue.mark_job_timed_out(timed_out, "slow").await.unwrap();
+        queue.mark_job_dead(dead, "boom").await.unwrap();
+        queue.fail_job(failed, "bad").await.unwrap();
+
+        let ids =
+            |status: &'static str| listed_ids(queue.clone(), serde_json::json!({"status": status}));
+        assert_eq!(ids("running").await, vec![running.to_string()]);
+        assert_eq!(ids("completed").await, vec![done.to_string()]);
+        assert_eq!(ids("dead").await, vec![dead.to_string()]);
+        assert_eq!(ids("timedout").await, vec![timed_out.to_string()]);
+        assert_eq!(ids("timed_out").await, vec![timed_out.to_string()]);
+        let mut every_failure = ids("failed").await;
+        every_failure.sort();
+        let mut expected = vec![dead.to_string(), timed_out.to_string(), failed.to_string()];
+        expected.sort();
+        assert_eq!(every_failure, expected);
+        // Pending includes the job scheduled for later, as well as the ready one.
+        let mut pending = ids("pending").await;
+        pending.sort();
+        let mut expected = vec![ready, later];
+        expected.sort();
+        assert_eq!(pending, expected);
+        assert!(ids("no_such_status").await.is_empty());
     }
 
     #[tokio::test]

@@ -360,6 +360,19 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("Database URL is required"))
     }
 
+    /// The queue to use: `flag` (a command's `--queue`) if given, otherwise the configured
+    /// `default_queue` / `HAMMERWORK_DEFAULT_QUEUE`. Errors when neither is set.
+    pub fn resolve_queue(&self, flag: Option<&str>) -> Result<String> {
+        flag.or(self.get_default_queue())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "A queue is required: pass --queue, or set default_queue \
+                     (config file) or HAMMERWORK_DEFAULT_QUEUE"
+                )
+            })
+    }
+
     pub fn get_default_queue(&self) -> Option<&str> {
         self.default_queue.as_deref()
     }
@@ -471,6 +484,21 @@ mod tests {
         assert_eq!(bare.get_default_limit(), 50);
         assert_eq!(bare.get_log_level(), "info");
         assert_eq!(bare.get_connection_pool_size(), 5);
+    }
+
+    #[test]
+    fn resolve_queue_prefers_the_flag_then_the_default_queue() {
+        let mut config = Config::default();
+        let err = config.resolve_queue(None).unwrap_err().to_string();
+        assert!(
+            err.contains("--queue") && err.contains("HAMMERWORK_DEFAULT_QUEUE"),
+            "{err}"
+        );
+        assert_eq!(config.resolve_queue(Some("flag")).unwrap(), "flag");
+
+        config.default_queue = Some("fallback".into());
+        assert_eq!(config.resolve_queue(None).unwrap(), "fallback");
+        assert_eq!(config.resolve_queue(Some("flag")).unwrap(), "flag");
     }
 
     #[test]

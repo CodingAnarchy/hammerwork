@@ -453,8 +453,8 @@ mod tests {
             assert_eq!(e.get_one::<u32>("batch_size"), Some(&7));
         }
         assert!(
-            Cli::try_parse_from(["cargo-hammerwork", "batch", "enqueue"]).is_err(),
-            "queue stays required"
+            Cli::try_parse_from(["cargo-hammerwork", "batch", "enqueue"]).is_ok(),
+            "the queue may come from default_queue"
         );
         let retry_help = Cli::command()
             .find_subcommand_mut("batch")

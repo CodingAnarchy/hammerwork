@@ -1507,16 +1507,17 @@ impl DatabaseQueue for TestQueue {
         let batch = storage
             .batches
             .get(&batch_id)
-            .ok_or_else(|| HammerworkError::Batch {
-                message: format!("Batch {} not found", batch_id),
+            .ok_or_else(|| HammerworkError::JobNotFound {
+                id: batch_id.to_string(),
             })?;
 
-        let job_ids = storage
-            .batch_jobs
-            .get(&batch_id)
-            .ok_or_else(|| HammerworkError::Batch {
-                message: format!("Batch jobs for {} not found", batch_id),
-            })?;
+        let job_ids =
+            storage
+                .batch_jobs
+                .get(&batch_id)
+                .ok_or_else(|| HammerworkError::JobNotFound {
+                    id: batch_id.to_string(),
+                })?;
 
         let mut completed_jobs = 0;
         let mut failed_jobs = 0;
@@ -1665,6 +1666,18 @@ impl DatabaseQueue for TestQueue {
                 error,
                 timed_out,
             } => {
+                // A worker computes `retry_at` as "now + backoff" on the wall clock; keep
+                // the backoff and move it onto the mock clock, as the database backends
+                // move it onto the database clock.
+                let retry_at = {
+                    let storage = self.storage.read().await;
+                    let delay = retry_at - Utc::now();
+                    storage
+                        .clock
+                        .now()
+                        .checked_add_signed(delay)
+                        .unwrap_or(retry_at)
+                };
                 self.retry_job(run.id, retry_at).await?;
                 // The run's error (and timeout) is recorded, as on the database backends.
                 let mut storage = self.storage.write().await;
@@ -1859,12 +1872,9 @@ impl DatabaseQueue for TestQueue {
     async fn get_queue_stats(&self, queue_name: &str) -> Result<QueueStats> {
         let storage = self.storage.read().await;
 
-        let queue_jobs = storage
-            .queues
-            .get(queue_name)
-            .ok_or_else(|| HammerworkError::Queue {
-                message: format!("Queue {} not found", queue_name),
-            })?;
+        // An unknown queue has no jobs: zero counts, as on the database backends.
+        let no_jobs = HashMap::new();
+        let queue_jobs = storage.queues.get(queue_name).unwrap_or(&no_jobs);
 
         let pending_count = queue_jobs
             .get(&JobStatus::Pending)
@@ -2738,13 +2748,15 @@ impl DatabaseQueue for TestQueue {
 
                 Ok(restored_job)
             } else {
-                Err(crate::HammerworkError::Queue {
-                    message: format!("Job {} is not archived", job_id),
+                // The database backends look only in the archive table, so a job that is
+                // not archived is as absent as an unknown id.
+                Err(crate::HammerworkError::JobNotFound {
+                    id: job_id.to_string(),
                 })
             }
         } else {
-            Err(crate::HammerworkError::Queue {
-                message: format!("Job {} not found", job_id),
+            Err(crate::HammerworkError::JobNotFound {
+                id: job_id.to_string(),
             })
         }
     }
@@ -4102,7 +4114,7 @@ mod tests {
             .await
             .unwrap();
         let run = queue.dequeue("retry_err").await.unwrap().unwrap();
-        let retry_at = queue.clock().now() + chrono::Duration::seconds(30);
+        let retry_at = Utc::now() + chrono::Duration::seconds(30);
         let recorded = queue
             .finish_job_run(
                 &run,
@@ -4118,9 +4130,73 @@ mod tests {
         assert_eq!(recorded.status, JobStatus::Pending);
         let job = queue.get_job(id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
-        assert_eq!(job.scheduled_at, retry_at);
+        // The mock clock has not moved, so the due time is on it (give or take the
+        // wall-clock time the test itself took).
+        let skew = (job.scheduled_at - retry_at).num_seconds().abs();
+        assert!(skew <= 2, "scheduled_at {skew}s off");
         assert_eq!(job.error_message.as_deref(), Some("boom"));
         assert!(job.timed_out_at.is_some());
+    }
+
+    /// A worker computes `retry_at` from the wall clock; the retry is due that long
+    /// after the mock clock's now, not after the wall clock's.
+    #[tokio::test]
+    async fn retry_outcome_is_moved_onto_the_mock_clock() {
+        use crate::queue::JobOutcome;
+        let queue = TestQueue::new();
+        let id = queue
+            .enqueue(Job::new("retry_clock".to_string(), json!({})))
+            .await
+            .unwrap();
+        let run = queue.dequeue("retry_clock").await.unwrap().unwrap();
+        queue.clock().advance(chrono::Duration::hours(2));
+        let mock_now = queue.clock().now();
+        queue
+            .finish_job_run(
+                &run,
+                JobOutcome::Retry {
+                    retry_at: Utc::now() + chrono::Duration::seconds(30),
+                    error: "boom".to_string(),
+                    timed_out: false,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let job = queue.get_job(id).await.unwrap().unwrap();
+        let after = (job.scheduled_at - mock_now).num_seconds();
+        assert!((28..=30).contains(&after), "due {after}s after mock now");
+        // Not yet due on the mock clock, due once it passes.
+        assert!(queue.dequeue("retry_clock").await.unwrap().is_none());
+        queue.clock().advance(chrono::Duration::seconds(31));
+        assert!(queue.dequeue("retry_clock").await.unwrap().is_some());
+    }
+
+    /// Unknown ids and queues fail (or succeed) as on the database backends.
+    #[tokio::test]
+    async fn unknown_ids_and_queues_match_the_database_backends() {
+        let queue = TestQueue::new();
+        let id = uuid::Uuid::new_v4();
+        assert!(matches!(
+            queue.get_batch_status(id).await,
+            Err(HammerworkError::JobNotFound { .. })
+        ));
+        assert!(matches!(
+            queue.restore_archived_job(id).await,
+            Err(HammerworkError::JobNotFound { .. })
+        ));
+        let live = queue
+            .enqueue(Job::new("live_q".to_string(), json!({})))
+            .await
+            .unwrap();
+        assert!(matches!(
+            queue.restore_archived_job(live).await,
+            Err(HammerworkError::JobNotFound { .. })
+        ));
+        let stats = queue.get_queue_stats("no_such_queue").await.unwrap();
+        assert_eq!(stats.queue_name, "no_such_queue");
+        assert_eq!(stats.pending_count, 0);
+        assert_eq!(stats.statistics.total_processed, 0);
     }
 
     /// Completing a workflow job's run reports the dependents it released.

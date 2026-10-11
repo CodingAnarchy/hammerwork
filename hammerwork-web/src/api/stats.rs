@@ -231,14 +231,179 @@ pub struct TimeRange {
     pub end: chrono::DateTime<chrono::Utc>,
 }
 
-/// Statistics query parameters
+/// Statistics query parameters.
+///
+/// In a query string, `time_range` is `START,END` (two RFC 3339 timestamps, as in
+/// `time_range=2024-01-01T00:00:00Z,2024-01-02T00:00:00Z`) and `queues` is a
+/// comma-separated list (`queues=email,reports`). A JSON body form (an object with
+/// `start` and `end`, and an array of names) is accepted as well.
 #[derive(Debug, Deserialize)]
 pub struct StatsQuery {
+    #[serde(default, deserialize_with = "de_time_range")]
     pub time_range: Option<TimeRange>,
+    /// Only these queues are reported; all queues when absent or empty.
+    #[serde(default, deserialize_with = "de_queues")]
     pub queues: Option<Vec<String>>,
-    pub granularity: Option<String>, // "hour", "day", "week"
+    /// Size of the trend buckets: `hour` (the default), `day` (UTC days) or `week`
+    /// (UTC weeks starting on Monday).
+    pub granularity: Option<String>,
     /// The last N hours (alternative to `time_range`, which a query string cannot carry).
     pub hours: Option<u32>,
+}
+
+/// Deserializes `queues` from a comma-separated string or a list of names.
+fn de_queues<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        List(Vec<String>),
+        Csv(String),
+    }
+    Ok(Option::<Raw>::deserialize(deserializer)?
+        .map(|raw| match raw {
+            Raw::List(names) => names,
+            Raw::Csv(csv) => csv.split(',').map(str::to_string).collect(),
+        })
+        .map(|names| {
+            names
+                .into_iter()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        }))
+}
+
+/// Deserializes `time_range` from `START,END` or an object with `start` and `end`.
+fn de_time_range<'de, D>(deserializer: D) -> Result<Option<TimeRange>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Range(TimeRange),
+        Pair(String),
+    }
+    match Option::<Raw>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Raw::Range(range)) => Ok(Some(range)),
+        Some(Raw::Pair(pair)) => {
+            let parse = |text: &str| {
+                chrono::DateTime::parse_from_rfc3339(text.trim())
+                    .map(|time| time.with_timezone(&chrono::Utc))
+                    .map_err(|e| D::Error::custom(format!("invalid time_range `{text}`: {e}")))
+            };
+            let (start, end) = pair.split_once(',').ok_or_else(|| {
+                D::Error::custom("time_range must be `START,END` (RFC 3339 timestamps)")
+            })?;
+            Ok(Some(TimeRange {
+                start: parse(start)?,
+                end: parse(end)?,
+            }))
+        }
+    }
+}
+
+/// The trend bucket size of a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Granularity {
+    Hour,
+    Day,
+    Week,
+}
+
+impl Granularity {
+    fn parse(name: Option<&str>) -> Result<Self, String> {
+        match name.map(|name| name.trim().to_lowercase()).as_deref() {
+            None | Some("") | Some("hour") => Ok(Self::Hour),
+            Some("day") => Ok(Self::Day),
+            Some("week") => Ok(Self::Week),
+            Some(other) => Err(format!(
+                "Invalid granularity '{other}'. Valid options: hour, day, week"
+            )),
+        }
+    }
+
+    /// The start of the bucket containing `hour`.
+    fn bucket_start(self, hour: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        use chrono::{Datelike, TimeZone};
+        let day = hour.date_naive();
+        let day = match self {
+            Self::Hour => return hour,
+            Self::Day => day,
+            Self::Week => {
+                day - chrono::Duration::days(i64::from(day.weekday().num_days_from_monday()))
+            }
+        };
+        chrono::Utc.from_utc_datetime(&day.and_hms_opt(0, 0, 0).unwrap_or_default())
+    }
+}
+
+/// Merges hourly trends (oldest first) into `granularity` buckets. Throughput is jobs per
+/// second over the hours merged; the mean run time is weighted by the completed jobs.
+fn roll_up(trends: Vec<HourlyTrend>, granularity: Granularity) -> Vec<HourlyTrend> {
+    if granularity == Granularity::Hour {
+        return trends;
+    }
+    struct Acc {
+        hour: chrono::DateTime<chrono::Utc>,
+        hours: u64,
+        completed: u64,
+        failed: u64,
+        processing_ms: f64,
+    }
+    let mut buckets: Vec<Acc> = Vec::new();
+    for trend in trends {
+        let start = granularity.bucket_start(trend.hour);
+        if buckets.last().is_none_or(|bucket| bucket.hour != start) {
+            buckets.push(Acc {
+                hour: start,
+                hours: 0,
+                completed: 0,
+                failed: 0,
+                processing_ms: 0.0,
+            });
+        }
+        if let Some(bucket) = buckets.last_mut() {
+            bucket.hours += 1;
+            bucket.completed += trend.completed;
+            bucket.failed += trend.failed;
+            bucket.processing_ms +=
+                trend.avg_processing_time_ms.unwrap_or(0.0) * trend.completed as f64;
+        }
+    }
+    buckets
+        .into_iter()
+        .map(|bucket| {
+            let total = bucket.completed + bucket.failed;
+            HourlyTrend {
+                hour: bucket.hour,
+                completed: bucket.completed,
+                failed: bucket.failed,
+                throughput: total as f64 / (bucket.hours * 3600) as f64,
+                avg_processing_time_ms: (bucket.completed > 0)
+                    .then(|| bucket.processing_ms / bucket.completed as f64),
+                error_rate: if total > 0 {
+                    bucket.failed as f64 / total as f64
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect()
+}
+
+/// Whether `queue_name` is selected by the request's `queues` filter.
+fn queue_selected(queues: &Option<Vec<String>>, queue_name: &str) -> bool {
+    match queues {
+        Some(names) if !names.is_empty() => names.iter().any(|name| name == queue_name),
+        _ => true,
+    }
 }
 
 /// Create statistics routes
@@ -323,10 +488,15 @@ where
         Ok(range) => range,
         Err(message) => return Ok(error_reply(StatusCode::BAD_REQUEST, message)),
     };
+    let granularity = match Granularity::parse(query.granularity.as_deref()) {
+        Ok(granularity) => granularity,
+        Err(message) => return Ok(error_reply(StatusCode::BAD_REQUEST, message)),
+    };
 
     let db_started = std::time::Instant::now();
     match queue.get_all_queue_stats().await {
-        Ok(all_stats) => {
+        Ok(mut all_stats) => {
+            all_stats.retain(|stats| queue_selected(&query.queues, &stats.queue_name));
             let db_ms = db_started.elapsed().as_secs_f64() * 1000.0;
             // Convert hammerwork stats to our API format
             let mut queue_stats: Vec<QueueStats> = Vec::new();
@@ -359,11 +529,11 @@ where
             }
 
             let hourly_trends = try_api!(
-                compute_trends(&*queue, start, end).await,
+                compute_trends(&*queue, start, end, &query.queues, granularity).await,
                 "Failed to compute hourly trends"
             );
             let error_patterns = try_api!(
-                generate_error_patterns(&*queue, start).await,
+                generate_error_patterns(&*queue, start, &query.queues).await,
                 "Failed to compute error patterns"
             );
             let performance_metrics = calculate_performance_metrics(&all_stats, db_ms);
@@ -427,8 +597,12 @@ where
         Ok(range) => range,
         Err(message) => return Ok(error_reply(StatusCode::BAD_REQUEST, message)),
     };
+    let granularity = match Granularity::parse(query.granularity.as_deref()) {
+        Ok(granularity) => granularity,
+        Err(message) => return Ok(error_reply(StatusCode::BAD_REQUEST, message)),
+    };
     let trends = try_api!(
-        compute_trends(&*queue, start, end).await,
+        compute_trends(&*queue, start, end, &query.queues, granularity).await,
         "Failed to compute hourly trends"
     );
     Ok(json_reply(&ApiResponse::success(trends)))
@@ -641,12 +815,46 @@ async fn compute_trends<T>(
     queue: &T,
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
+    queues: &Option<Vec<String>>,
+    granularity: Granularity,
 ) -> hammerwork::Result<Vec<HourlyTrend>>
 where
     T: JobHistory,
 {
-    let buckets = queue.hourly_activity(None, start, end).await?;
-    Ok(buckets.into_iter().map(trend_from_bucket).collect())
+    let buckets = match queues {
+        Some(names) if !names.is_empty() => {
+            // The selected queues' activity, summed hour by hour.
+            let mut merged: Vec<super::history::HourBucket> = Vec::new();
+            for name in names {
+                let queue_buckets = queue.hourly_activity(Some(name), start, end).await?;
+                if merged.is_empty() {
+                    merged = queue_buckets;
+                    continue;
+                }
+                for (total, bucket) in merged.iter_mut().zip(queue_buckets) {
+                    let done = total.completed + bucket.completed;
+                    total.avg_processing_time_ms = if done == 0 {
+                        None
+                    } else {
+                        Some(
+                            (total.avg_processing_time_ms.unwrap_or(0.0) * total.completed as f64
+                                + bucket.avg_processing_time_ms.unwrap_or(0.0)
+                                    * bucket.completed as f64)
+                                / done as f64,
+                        )
+                    };
+                    total.completed = done;
+                    total.failed += bucket.failed;
+                }
+            }
+            merged
+        }
+        _ => queue.hourly_activity(None, start, end).await?,
+    };
+    Ok(roll_up(
+        buckets.into_iter().map(trend_from_bucket).collect(),
+        granularity,
+    ))
 }
 
 fn trend_from_bucket(bucket: super::history::HourBucket) -> HourlyTrend {
@@ -672,11 +880,14 @@ fn trend_from_bucket(bucket: super::history::HourBucket) -> HourlyTrend {
 async fn generate_error_patterns<T>(
     queue: &T,
     since: chrono::DateTime<chrono::Utc>,
+    queues: &Option<Vec<String>>,
 ) -> hammerwork::Result<Vec<ErrorPattern>>
 where
     T: JobHistory,
 {
-    Ok(group_error_patterns(queue.error_groups(since, 500).await?))
+    let mut groups = queue.error_groups(since, 500).await?;
+    groups.retain(|group| queue_selected(queues, &group.queue_name));
+    Ok(group_error_patterns(groups))
 }
 
 /// Folds per-(queue, message) groups into one pattern per error type with real
@@ -804,6 +1015,7 @@ fn extract_error_type(error_msg: &str) -> String {
 mod tests {
     use super::*;
     use crate::api::test_support::{body_json, unreachable_queue};
+    use chrono::TimeZone;
 
     #[test]
     fn test_overview_counts_failed_dead_and_timed_out_jobs_as_failed() {
@@ -973,6 +1185,123 @@ mod tests {
         assert!(query.time_range.is_some());
         assert_eq!(query.queues.as_ref().unwrap().len(), 2);
         assert_eq!(query.granularity, Some("hour".to_string()));
+    }
+
+    /// #103: `time_range` and `queues` decode from a real query string.
+    #[tokio::test]
+    async fn test_stats_query_decodes_from_a_query_string() {
+        let decode = |query: &str| {
+            let path = format!("/stats?{query}");
+            async move {
+                warp::test::request()
+                    .path(&path)
+                    .filter(&warp::query::<StatsQuery>())
+                    .await
+            }
+        };
+        let query = decode(
+            "queues=email,%20reports,&granularity=day\
+             &time_range=2024-01-01T00:00:00Z,2024-01-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(query.queues.unwrap(), vec!["email", "reports"]);
+        assert_eq!(query.granularity.as_deref(), Some("day"));
+        let range = query.time_range.unwrap();
+        assert_eq!(range.start.to_rfc3339(), "2024-01-01T00:00:00+00:00");
+        assert_eq!(range.end - range.start, chrono::Duration::days(1));
+
+        let bare = decode("hours=6").await.unwrap();
+        assert!(bare.time_range.is_none() && bare.queues.is_none());
+        assert!(decode("time_range=yesterday").await.is_err());
+        assert!(decode("time_range=2024-01-01T00:00:00Z").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stats_routes_accept_query_string_filters() {
+        let routes = routes(Arc::new(hammerwork::queue::test::TestQueue::new()), state());
+        let status = |path: String| {
+            let routes = routes.clone();
+            async move {
+                warp::test::request()
+                    .path(&path)
+                    .reply(&routes)
+                    .await
+                    .status()
+                    .as_u16()
+            }
+        };
+        let range = "time_range=2024-01-01T00:00:00Z,2024-01-02T00:00:00Z";
+        assert_eq!(
+            status(format!("/stats/trends?{range}&queues=a,b&granularity=week")).await,
+            200
+        );
+        assert_eq!(
+            status("/stats/trends?granularity=month".to_string()).await,
+            400
+        );
+        assert_eq!(
+            status("/stats/trends?time_range=2024-01-02T00:00:00Z,2024-01-01T00:00:00Z".into())
+                .await,
+            400
+        );
+    }
+
+    #[test]
+    fn test_roll_up_merges_hours_into_days_and_weeks() {
+        let at = |day: u32, hour: u32| {
+            chrono::Utc
+                .with_ymd_and_hms(2024, 1, day, hour, 0, 0)
+                .unwrap()
+        };
+        let trend = |hour, completed, failed, avg| HourlyTrend {
+            hour,
+            completed,
+            failed,
+            throughput: 0.0,
+            avg_processing_time_ms: avg,
+            error_rate: 0.0,
+        };
+        // Sunday the 7th and Monday the 8th (UTC), three hours in all.
+        let hours = || {
+            vec![
+                trend(at(7, 22), 1, 0, Some(100.0)),
+                trend(at(7, 23), 3, 1, Some(200.0)),
+                trend(at(8, 0), 0, 0, None),
+            ]
+        };
+
+        assert_eq!(roll_up(hours(), Granularity::Hour).len(), 3);
+
+        let days = roll_up(hours(), Granularity::Day);
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[0].hour, at(7, 0));
+        assert_eq!((days[0].completed, days[0].failed), (4, 1));
+        assert!((days[0].avg_processing_time_ms.unwrap() - 175.0).abs() < 1e-9);
+        assert!((days[0].throughput - 5.0 / 7200.0).abs() < 1e-12);
+        assert!((days[0].error_rate - 0.2).abs() < 1e-12);
+        assert_eq!(days[1].hour, at(8, 0));
+        assert_eq!(days[1].avg_processing_time_ms, None);
+
+        let weeks = roll_up(hours(), Granularity::Week);
+        assert_eq!(
+            weeks.len(),
+            2,
+            "the Sunday and the Monday are in different weeks"
+        );
+        assert_eq!(weeks[0].hour, at(1, 0), "Monday the 1st");
+        assert_eq!(weeks[1].hour, at(8, 0));
+    }
+
+    #[test]
+    fn test_granularity_and_queue_filters() {
+        assert_eq!(Granularity::parse(None), Ok(Granularity::Hour));
+        assert_eq!(Granularity::parse(Some(" DAY ")), Ok(Granularity::Day));
+        assert!(Granularity::parse(Some("month")).is_err());
+        let all: Option<Vec<String>> = None;
+        let some = Some(vec!["a".to_string()]);
+        assert!(queue_selected(&all, "x") && queue_selected(&Some(vec![]), "x"));
+        assert!(queue_selected(&some, "a") && !queue_selected(&some, "b"));
     }
 
     #[test]

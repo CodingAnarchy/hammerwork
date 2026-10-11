@@ -92,6 +92,11 @@ Every command group and subcommand below exists in the CLI; run
   `--dry-run`, that previews the change without `--confirm`.
 - **Queue filter**: `-n/--queue` on every command that takes one (`-Q` and
   `archive --queue-name` remain as aliases).
+- **Default queue**: `job enqueue`, `batch enqueue` and `cron create` need a queue; without
+  `--queue` they use `default_queue` from the config file or `HAMMERWORK_DEFAULT_QUEUE`, and
+  fail with an error naming both if neither is set. Commands where leaving the queue out
+  means "all queues" (`job list`, `monitor`, `backup create`, ...) and the targeted
+  `queue clear|pause|resume` ignore it.
 - **Connect timeout**: connecting to an unreachable database fails after 10 seconds. Change
   it with `connect_timeout_secs` in the config file, `config set connect_timeout_secs N`
   (1-600) or the `HAMMERWORK_CONNECT_TIMEOUT` environment variable.
@@ -328,7 +333,9 @@ cargo hammerwork maintenance purge-encrypted --dry-run
 cargo hammerwork maintenance purge-encrypted --confirm
 ```
 
-- `vacuum` deletes old completed and failed jobs (defaults: 30 and 7 days).
+- `vacuum` deletes old completed and failed jobs (defaults: 30 and 7 days). "Failed" means
+  `Failed`, `Dead` or `TimedOut`, as in `job list --failed` and `monitor`; their age is
+  measured from `failed_at` (or `timed_out_at` when that is unset).
 - `dead-jobs` marks stale jobs (`Running` jobs that started more than `--stale-hours` ago, default 24) as dead. Compare `job requeue-stale`, which gives them another attempt.
 - `check` inspects integrity and job consistency; `--fix` repairs minor issues.
 - There is no `maintenance cleanup` or `maintenance health`; use `vacuum` and `check`
@@ -480,7 +487,8 @@ cargo hammerwork backup restore --input backup.json --confirm
 cargo hammerwork backup restore --input backup.json --skip-existing --confirm
 ```
 
-`backup create` requires `--output` and `--format` is `json` or `csv`. A JSON backup
+`backup create` requires `--output` and `--format` is `json` or `csv`. Without `--include-completed` and
+`--include-failed` those jobs are left out; "failed" means `Failed`, `Dead` or `TimedOut`. A JSON backup
 (format version 2.0) holds every column of every selected job: encrypted payloads stay
 encrypted, with their nonce, tag, key id and metadata, and cron schedules, timeouts, retry
 strategies, dependencies, workflows, batches, results, tracing ids and retention are all
