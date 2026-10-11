@@ -311,6 +311,9 @@ Every claimed job gets the same guarantees as a job claimed on its own:
   holds a permit until it finishes, so a worker claims no more jobs than there are free
   permits. With a rate limit, a batch claims no more jobs than there are tokens, and
   tokens for jobs it did not get are handed back.
+- **Pause.** Before starting a claimed job, the worker checks whether the queue was
+  paused (at most once per poll interval). If it was, the claimed jobs that have not
+  started are released back to `Pending` as on shutdown; running jobs finish.
 - **Shutdown.** Claimed jobs that have not started are released back to `Pending` at once
   (`DatabaseQueue::release_job_run`, which also takes back the claim's attempt), so other
   workers can run them right away. Running jobs get the shutdown grace period.

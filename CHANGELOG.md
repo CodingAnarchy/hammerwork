@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pausing a queue stops batch-mode workers from starting the jobs they hold.** A worker
+  with `with_batch_size(n)` kept starting the claimed jobs of its current batch after the
+  queue was paused, up to `n` more jobs, contrary to "paused queues are honoured". Before
+  starting a held job it now checks the pause (at most once per poll interval) and, when
+  the queue is paused, hands the unstarted jobs back to `Pending` without counting an
+  attempt, as on shutdown. Running jobs finish.
+- **A weighted batch claim no longer loses jobs it already claimed.** With weighted
+  priorities, `dequeue_batch_leased` claims level by level; when a later level's claim
+  failed (a dropped connection, or a MySQL deadlock past its retries), the error was
+  returned and the jobs claimed from earlier levels were dropped. They stayed `Running`
+  until their leases expired, with an attempt spent, so a job on its last attempt went to
+  `Dead` without having run. The claimed jobs are now returned (and the error logged), as
+  the trait's default implementation already did.
+- **A job row that cannot be decoded no longer stops the stale job reaper.** On MySQL any
+  such row among the stale `Running` jobs, and on PostgreSQL one that was out of
+  attempts, made `requeue_stale_jobs` fail and roll back, so no stale job of any queue
+  was reclaimed while the row existed. The reaper now reclaims it like any other (back
+  to `Pending`, or `Dead` with a warning that its dependents, workflow, batch and
+  recurring schedule could not be updated).
+- **A job row that cannot be decoded no longer blocks a MySQL queue.** It stayed
+  `Pending` at the head of the queue: every single claim failed on it, and batch claims of
+  one job came back empty forever. MySQL now claims it, as PostgreSQL does (a single claim
+  returns the decoding error, a batch claim skips it), so the jobs behind it run; it stays
+  `Running` until its lease expires and the reaper takes it. Such rows come from corrupt
+  data or a newer version's data (for example a retry strategy this version does not
+  know).
+
 ## [2.1.0] - 2026-10-10
 
 ### Upgrading from 2.0

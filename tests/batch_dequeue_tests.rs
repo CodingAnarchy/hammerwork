@@ -710,6 +710,74 @@ mod worker {
         assert_eq!(claimed.len(), 4);
     }
 
+    /// Pausing the queue stops a batch-mode worker from starting the jobs it already
+    /// claimed: they go back to `Pending` (attempt not counted) and run after a resume.
+    pub async fn pause_releases_unstarted_jobs<DB>(queue: Arc<JobQueue<DB>>)
+    where
+        DB: sqlx::Database + Send + Sync + 'static,
+        JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    {
+        let queue_name = test_utils::unique_queue("batch_pause");
+        let ids = enqueue_jobs(&queue, &queue_name, 3).await;
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        // Each run waits for a permit, so the test decides when jobs finish.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let handler: JobHandler = {
+            let (runs, gate) = (Arc::clone(&runs), Arc::clone(&gate));
+            Arc::new(move |job: Job| {
+                let (runs, gate) = (Arc::clone(&runs), Arc::clone(&gate));
+                Box::pin(async move {
+                    runs.lock().unwrap().push(job.id);
+                    gate.acquire().await.unwrap().forget();
+                    Ok::<(), HammerworkError>(())
+                })
+            })
+        };
+        let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+            .with_poll_interval(Duration::from_millis(50))
+            .with_batch_size(3)
+            .with_batch_concurrency(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let worker_task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+        // All three are claimed in one batch, and the first starts.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while runs.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "no job started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        wait_for_status(&queue, &queue_name, "Running", 3, Duration::from_secs(20)).await;
+
+        // Pause, wait longer than the poll interval, and let the running job finish.
+        queue.pause_queue(&queue_name, Some("test")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        gate.add_permits(1);
+
+        // The two held jobs are handed back instead of started.
+        wait_for_status(&queue, &queue_name, "Pending", 2, Duration::from_secs(30)).await;
+        let started = runs.lock().unwrap().clone();
+        assert_eq!(
+            started.len(),
+            1,
+            "a held job started while the queue was paused"
+        );
+        for id in ids.iter().filter(|id| !started.contains(id)) {
+            let job = queue.get_job(*id).await.unwrap().unwrap();
+            assert_eq!(job.status, JobStatus::Pending);
+            assert_eq!(job.attempts, 0);
+        }
+
+        // After a resume they run.
+        queue.resume_queue(&queue_name, Some("test")).await.unwrap();
+        gate.add_permits(10);
+        wait_for_status(&queue, &queue_name, "Completed", 3, Duration::from_secs(30)).await;
+        let runs = runs.lock().unwrap().clone();
+        assert_eq!(runs.len(), 3, "each job ran once: {runs:?}");
+
+        shutdown_tx.send(()).await.unwrap();
+        worker_task.await.unwrap().unwrap();
+    }
+
     /// A throttle's `max_concurrent` bounds the jobs a batch-mode pool holds (claims or
     /// runs) at once, whatever the batch size and concurrency.
     pub async fn batch_worker_respects_throttle<DB>(queue: Arc<JobQueue<DB>>)
@@ -953,6 +1021,7 @@ mod worker {
             batch_worker_processes_everything_once,
             held_jobs_are_not_reaped_while_waiting,
             shutdown_releases_unstarted_jobs,
+            pause_releases_unstarted_jobs,
             batch_worker_respects_throttle,
             batch_worker_respects_rate_limit,
             batch_vs_single_claim_throughput,
@@ -968,6 +1037,7 @@ mod worker {
             batch_worker_processes_everything_once,
             held_jobs_are_not_reaped_while_waiting,
             shutdown_releases_unstarted_jobs,
+            pause_releases_unstarted_jobs,
             batch_worker_respects_throttle,
             batch_worker_respects_rate_limit,
             batch_vs_single_claim_throughput,

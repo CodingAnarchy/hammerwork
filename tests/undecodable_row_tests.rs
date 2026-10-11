@@ -155,3 +155,180 @@ async fn mysql_listings_skip_undecodable_rows() {
     })
     .await;
 }
+
+/// The stale job reaper reclaims a job whose row cannot be decoded (requeued, or dead
+/// once out of attempts) instead of failing, which would leave every stale job of every
+/// queue unreclaimed for as long as the corrupt row stays `Running`.
+async fn reaper_reclaims_undecodable_rows<Q, S, F>(queue: &Q, sql: S)
+where
+    Q: DatabaseQueue + Send + Sync,
+    S: Fn(String) -> F,
+    F: Future<Output = ()>,
+{
+    let name = test_utils::unique_queue("undecodable_reaper");
+    let enqueue = |max_attempts: i32| {
+        queue.enqueue(Job::new(name.clone(), json!({})).with_max_attempts(max_attempts))
+    };
+    let healthy = enqueue(3).await.unwrap();
+    let bad_requeued = enqueue(3).await.unwrap();
+    let bad_dead = enqueue(1).await.unwrap();
+
+    // Claim all three with a lease that has expired by the time the reaper runs.
+    let claimed = queue
+        .dequeue_batch_leased(&name, None, std::time::Duration::from_millis(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 3);
+    for id in [bad_requeued, bad_dead] {
+        sql(format!(
+            "UPDATE hammerwork_jobs SET timeout_seconds = -1 WHERE id = '{id}'"
+        ))
+        .await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Another test's reaper may reclaim some of them first; either way they end up
+    // reclaimed and this call succeeds.
+    queue
+        .requeue_stale_jobs(std::time::Duration::from_secs(3600))
+        .await
+        .expect("an undecodable stale row must not fail the reaper");
+    let counts = queue.get_job_counts_by_status(&name).await.unwrap();
+    assert_eq!(counts.get("Pending"), Some(&2), "{counts:?}");
+    assert_eq!(counts.get("Dead"), Some(&1), "{counts:?}");
+    assert_eq!(
+        queue.get_job(healthy).await.unwrap().unwrap().status,
+        hammerwork::JobStatus::Pending
+    );
+
+    sql(format!(
+        "DELETE FROM hammerwork_jobs WHERE queue_name = '{name}'"
+    ))
+    .await;
+}
+
+/// A job whose row cannot be decoded does not block its queue: a claim takes it out of
+/// the way (it stays `Running` until its lease expires, then the reaper handles it) and
+/// the next claim gets the jobs behind it, for single and batch claims alike.
+async fn undecodable_rows_do_not_block_claims<Q, S, F>(queue: &Q, sql: S)
+where
+    Q: DatabaseQueue + Send + Sync,
+    S: Fn(String) -> F,
+    F: Future<Output = ()>,
+{
+    use hammerwork::priority::JobPriority;
+
+    for batch in [false, true] {
+        let name = test_utils::unique_queue("undecodable_claim");
+        let bad = queue
+            .enqueue(Job::new(name.clone(), json!({})).with_priority(JobPriority::Critical))
+            .await
+            .unwrap();
+        let healthy = queue
+            .enqueue(Job::new(name.clone(), json!({})))
+            .await
+            .unwrap();
+        sql(format!(
+            "UPDATE hammerwork_jobs SET timeout_seconds = -1 WHERE id = '{bad}'"
+        ))
+        .await;
+
+        // The first claim takes the corrupt job (an error for a single claim, nothing
+        // for a batch); the healthy job behind it is claimed next.
+        let mut claimed: Vec<JobId> = Vec::new();
+        for _ in 0..3 {
+            let jobs = if batch {
+                queue.dequeue_batch(&name, 1).await
+            } else {
+                queue
+                    .dequeue(&name)
+                    .await
+                    .map(|job| job.into_iter().collect())
+            };
+            if let Ok(jobs) = jobs {
+                claimed.extend(jobs.into_iter().map(|job| job.id));
+            }
+            if !claimed.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            claimed,
+            vec![healthy],
+            "the corrupt job blocked the queue (batch: {batch})"
+        );
+
+        sql(format!(
+            "DELETE FROM hammerwork_jobs WHERE queue_name = '{name}'"
+        ))
+        .await;
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_sql(
+    pool: sqlx::PgPool,
+) -> impl Fn(String) -> std::pin::Pin<Box<dyn Future<Output = ()>>> {
+    move |statement| {
+        let pool = pool.clone();
+        Box::pin(async move {
+            sqlx::query(&statement).execute(&pool).await.unwrap();
+        })
+    }
+}
+
+#[cfg(feature = "mysql")]
+fn mysql_sql(
+    pool: sqlx::MySqlPool,
+) -> impl Fn(String) -> std::pin::Pin<Box<dyn Future<Output = ()>>> {
+    move |statement| {
+        let pool = pool.clone();
+        Box::pin(async move {
+            sqlx::query(&statement).execute(&pool).await.unwrap();
+        })
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+#[ignore = "requires PostgreSQL: DATABASE_URL"]
+async fn postgres_reaper_reclaims_undecodable_rows() {
+    let queue = test_utils::setup_postgres_queue().await;
+    let pool = sqlx::PgPool::connect(&test_utils::postgres_url())
+        .await
+        .unwrap();
+    reaper_reclaims_undecodable_rows(queue.as_ref(), postgres_sql(pool)).await;
+}
+
+#[cfg(feature = "mysql")]
+#[tokio::test]
+#[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+async fn mysql_reaper_reclaims_undecodable_rows() {
+    let queue = test_utils::setup_mysql_queue().await;
+    let pool = sqlx::MySqlPool::connect(&test_utils::mysql_url())
+        .await
+        .unwrap();
+    reaper_reclaims_undecodable_rows(queue.as_ref(), mysql_sql(pool)).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+#[ignore = "requires PostgreSQL: DATABASE_URL"]
+async fn postgres_undecodable_rows_do_not_block_claims() {
+    let queue = test_utils::setup_postgres_queue().await;
+    let pool = sqlx::PgPool::connect(&test_utils::postgres_url())
+        .await
+        .unwrap();
+    undecodable_rows_do_not_block_claims(queue.as_ref(), postgres_sql(pool)).await;
+}
+
+#[cfg(feature = "mysql")]
+#[tokio::test]
+#[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+async fn mysql_undecodable_rows_do_not_block_claims() {
+    let queue = test_utils::setup_mysql_queue().await;
+    let pool = sqlx::MySqlPool::connect(&test_utils::mysql_url())
+        .await
+        .unwrap();
+    undecodable_rows_do_not_block_claims(queue.as_ref(), mysql_sql(pool)).await;
+}

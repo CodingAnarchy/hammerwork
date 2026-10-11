@@ -693,34 +693,30 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 .bind(queue_name)
                 .fetch_all(&self.pool)
                 .await?;
-        let mut candidates: Vec<JobPriority> = levels
+        let candidates: Vec<JobPriority> = levels
             .into_iter()
             .filter_map(|level| JobPriority::from_i32(level).ok())
             .collect();
 
         // Pick a level by weight and fill the batch with its oldest runnable jobs. If it
         // runs out first, pick another of the remaining levels by weight for the rest.
-        let mut jobs = Vec::with_capacity(max_jobs);
-        let mut attempt = 0;
-        while jobs.len() < max_jobs
-            && let Some(priority) = super::pick_weighted_priority(
-                &candidates,
-                weights,
-                super::weighted_seed(queue_name, attempt),
-            )
-        {
-            let rows = sqlx::query_as::<_, JobRow>(&claim_batch_sql(true))
-                .bind(queue_name)
-                .bind(lease)
-                .bind((max_jobs - jobs.len()) as i64)
-                .bind(priority.as_i32())
-                .fetch_all(&self.pool)
-                .await?;
-            jobs.extend(claimed_jobs(rows));
-            candidates.retain(|candidate| *candidate != priority);
-            attempt += 1;
-        }
-        Ok(jobs)
+        super::fill_weighted_batch(
+            queue_name,
+            candidates,
+            weights,
+            max_jobs,
+            |priority, room| async move {
+                let rows = sqlx::query_as::<_, JobRow>(&claim_batch_sql(true))
+                    .bind(queue_name)
+                    .bind(lease)
+                    .bind(room as i64)
+                    .bind(priority.as_i32())
+                    .fetch_all(&self.pool)
+                    .await?;
+                Ok(claimed_jobs(rows))
+            },
+        )
+        .await
     }
 
     async fn release_job_run(&self, run: &Job) -> Result<bool> {
@@ -2209,7 +2205,16 @@ impl crate::queue::JobQueue<Postgres> {
             .bind(id)
             .fetch_one(&mut *conn)
             .await?;
-            let job = row.into_job()?;
+            // A row that cannot be decoded is still reclaimed (it is Dead now), but its
+            // side effects cannot be applied. Failing here would roll back the whole
+            // pass, so no stale job would ever be reclaimed again while the row exists.
+            let job = match row.into_job() {
+                Ok(job) => job,
+                Err(error) => {
+                    super::warn_undecodable_stale_job(*id, &error);
+                    continue;
+                }
+            };
             Self::after_terminal(conn, &job, JobStatus::Dead, now, true).await?;
         }
 

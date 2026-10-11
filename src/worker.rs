@@ -1539,6 +1539,10 @@ where
     ///   jobs than there are free permits (it waits for at least one). With a rate limit,
     ///   it claims no more jobs than it can take tokens for and hands back the tokens of
     ///   jobs it did not get.
+    /// - **Pause.** Before starting a claimed job, the worker checks whether the queue
+    ///   was paused (at most once per [poll interval](Self::with_poll_interval)). If it
+    ///   was, the claimed jobs that have not started are handed back to the queue as on
+    ///   shutdown, and the running ones finish.
     /// - **Shutdown.** Claimed jobs that have not started are handed back to the queue
     ///   at once ([`DatabaseQueue::release_job_run`]), without counting an attempt, so
     ///   other workers can run them instead of waiting for their leases to expire. Jobs
@@ -2273,8 +2277,34 @@ where
         let mut running: Vec<BatchRun<'_>> = Vec::new();
         let mut first_error = None;
         let mut shutting_down = false;
+        // The claim checked the pause; check again before starting held jobs, at most
+        // once per poll interval (as often as a single-job worker polls).
+        let pause_check_interval = self.poll_interval.max(MIN_POLL_INTERVAL);
+        let mut pause_checked_at = std::time::Instant::now();
 
         loop {
+            if !queued.is_empty()
+                && running.len() < concurrency
+                && pause_checked_at.elapsed() >= pause_check_interval
+            {
+                pause_checked_at = std::time::Instant::now();
+                if self.queue_is_paused().await {
+                    let unstarted: Vec<Job> = queued.drain(..).map(|claimed| claimed.job).collect();
+                    {
+                        let mut held = held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        held.waiting.clear();
+                        held.renewed.clear();
+                    }
+                    info!(
+                        "Queue {} was paused; handing back {} claimed job(s) that have not \
+                         started",
+                        self.queue_name,
+                        unstarted.len()
+                    );
+                    self.release_unstarted(unstarted).await;
+                }
+            }
+
             while running.len() < concurrency
                 && let Some(ClaimedJob { job, permit }) = queued.pop_front()
             {
