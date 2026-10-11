@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-11
+
+A fix and cleanup release. It is a minor version because it adds public API with default
+implementations: `DatabaseQueue::start_claimed_run`; in `hammerwork-web`,
+`JobHistory::running_jobs`, `job_states` and `count_archivable`, and
+`SortParams::is_ascending`. Nothing existing changes, and the internals were simplified
+without changing behaviour (#95).
+
 ### Fixed
 
 - **A failed fail-fast batch no longer runs the jobs a batch-mode worker already
