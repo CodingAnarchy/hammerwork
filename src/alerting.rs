@@ -14,6 +14,7 @@ pub const FAILED_ALERT_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 /// Configuration for alerting thresholds and targets
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AlertingConfig {
     /// Error rate threshold (0.0 to 1.0) that triggers alerts
     pub error_rate_threshold: Option<f64>,
@@ -172,6 +173,7 @@ impl AlertingConfig {
 /// files. The value is read each time it is needed, so rotating the variable takes
 /// effect on the next alert.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SecretSource {
     /// The secret itself. Only for development and tests.
     Static(String),
@@ -238,6 +240,7 @@ fn default_smtp_timeout_secs() -> u64 {
 /// config.validate().unwrap();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SmtpConfig {
     /// SMTP server host name.
     pub host: String,
@@ -341,6 +344,7 @@ fn single_line(value: &str) -> String {
 /// `Debug` never shows header values or the path of a webhook or Slack URL (a Slack
 /// webhook URL is itself a credential).
 #[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AlertTarget {
     /// Webhook alert target
     Webhook {
@@ -411,6 +415,7 @@ impl std::fmt::Display for AlertSeverity {
 
 /// Alert types that can be triggered
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AlertType {
     HighErrorRate,
     QueueDepthExceeded,
@@ -433,6 +438,7 @@ impl std::fmt::Display for AlertType {
 
 /// An alert that has been triggered
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Alert {
     /// Type of alert
     pub alert_type: AlertType,

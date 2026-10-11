@@ -48,22 +48,17 @@ mod tests {
     async fn test_dashboard_startup_with_postgres() {
         let temp_dir = tempdir().unwrap();
 
-        let config = DashboardConfig {
-            bind_address: "127.0.0.1".to_string(),
-            port: 0, // Use random port
-            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgresql://postgres:hammerwork@localhost:5433/hammerwork".to_string()
-            }),
-            pool_size: 2,
-            static_dir: temp_dir.path().to_path_buf(),
-            auth: AuthConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            enable_cors: true,
-            allowed_origins: vec!["https://ops.example.com".to_string()],
-            ..Default::default()
-        };
+        let mut config = DashboardConfig::default();
+        config.bind_address = "127.0.0.1".to_string();
+        config.port = 0;
+        config.database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:hammerwork@localhost:5433/hammerwork".to_string()
+        });
+        config.pool_size = 2;
+        config.static_dir = temp_dir.path().to_path_buf();
+        config.auth = AuthConfig::default().with_enabled(false);
+        config.enable_cors = true;
+        config.allowed_origins = vec!["https://ops.example.com".to_string()];
 
         // Create minimal static files
         write_index(temp_dir.path());
@@ -78,20 +73,15 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         write_index(temp_dir.path());
 
-        let config = DashboardConfig {
-            bind_address: "127.0.0.1".to_string(),
-            port: 0,
-            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://postgres:hammerwork@localhost:5433/hammerwork".to_string()
-            }),
-            static_dir: temp_dir.path().to_path_buf(),
-            auth: AuthConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            enable_cors: false,
-            ..Default::default()
-        };
+        let mut config = DashboardConfig::default();
+        config.bind_address = "127.0.0.1".to_string();
+        config.port = 0;
+        config.database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:hammerwork@localhost:5433/hammerwork".to_string()
+        });
+        config.static_dir = temp_dir.path().to_path_buf();
+        config.auth = AuthConfig::default().with_enabled(false);
+        config.enable_cors = false;
 
         assert_dashboard_starts(config).await;
     }
@@ -102,21 +92,15 @@ mod tests {
     async fn test_dashboard_startup_with_mysql() {
         let temp_dir = tempdir().unwrap();
 
-        let config = DashboardConfig {
-            bind_address: "127.0.0.1".to_string(),
-            port: 0, // Use random port
-            database_url: std::env::var("MYSQL_DATABASE_URL").unwrap_or_else(|_| {
-                "mysql://root:hammerwork@localhost:3307/hammerwork".to_string()
-            }),
-            pool_size: 2,
-            static_dir: temp_dir.path().to_path_buf(),
-            auth: AuthConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            enable_cors: false,
-            ..Default::default()
-        };
+        let mut config = DashboardConfig::default();
+        config.bind_address = "127.0.0.1".to_string();
+        config.port = 0;
+        config.database_url = std::env::var("MYSQL_DATABASE_URL")
+            .unwrap_or_else(|_| "mysql://root:hammerwork@localhost:3307/hammerwork".to_string());
+        config.pool_size = 2;
+        config.static_dir = temp_dir.path().to_path_buf();
+        config.auth = AuthConfig::default().with_enabled(false);
+        config.enable_cors = false;
 
         // Create minimal static files
         write_index(temp_dir.path());
@@ -179,13 +163,11 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         write_index(temp_dir.path());
 
-        let config = DashboardConfig {
-            bind_address: "127.0.0.1".to_string(),
-            port: 0,
-            database_url: "invalid://url".to_string(),
-            static_dir: temp_dir.path().to_path_buf(),
-            ..Default::default()
-        };
+        let mut config = DashboardConfig::default();
+        config.bind_address = "127.0.0.1".to_string();
+        config.port = 0;
+        config.database_url = "invalid://url".to_string();
+        config.static_dir = temp_dir.path().to_path_buf();
 
         // The database URL is only used when the server starts, which must fail fast.
         let dashboard = WebDashboard::new(config).await.unwrap();
@@ -203,10 +185,8 @@ mod tests {
     fn test_static_directory_validation() {
         let non_existent_dir = PathBuf::from("/non/existent/directory");
 
-        let config = DashboardConfig {
-            static_dir: non_existent_dir,
-            ..Default::default()
-        };
+        let mut config = DashboardConfig::default();
+        config.static_dir = non_existent_dir;
 
         // This should be handled gracefully or produce appropriate error
         assert!(!config.static_dir.exists());
@@ -231,13 +211,11 @@ mod tests {
     async fn test_websocket_config_validation() {
         use hammerwork_web::__private::config::WebSocketConfig;
 
-        let ws_config = WebSocketConfig {
-            ping_interval: Duration::from_secs(10),
-            max_connections: 50,
-            message_buffer_size: 512,
-            max_message_size: 32 * 1024,
-            ..Default::default()
-        };
+        let ws_config = WebSocketConfig::default()
+            .with_ping_interval(Duration::from_secs(10))
+            .with_max_connections(50)
+            .with_message_buffer_size(512)
+            .with_max_message_size(32 * 1024);
 
         assert_eq!(ws_config.ping_interval, Duration::from_secs(10));
         assert_eq!(ws_config.max_connections, 50);
@@ -323,14 +301,16 @@ mod websocket_archive_tests {
             },
             ArchiveEvent::BulkArchiveCompleted {
                 operation_id: "test_op_123".to_string(),
-                stats: ArchivalStats {
-                    jobs_archived: 1000,
-                    jobs_purged: 0,
-                    bytes_archived: 50000,
-                    bytes_purged: 0,
-                    compression_ratio: 0.8,
-                    operation_duration: std::time::Duration::from_secs(30),
-                    last_run_at: Utc::now(),
+                stats: {
+                    let mut value = ArchivalStats::default();
+                    value.jobs_archived = 1000;
+                    value.jobs_purged = 0;
+                    value.bytes_archived = 50000;
+                    value.bytes_purged = 0;
+                    value.compression_ratio = 0.8;
+                    value.operation_duration = std::time::Duration::from_secs(30);
+                    value.last_run_at = Utc::now();
+                    value
                 },
             },
             ArchiveEvent::JobsPurged {
@@ -419,13 +399,11 @@ mod websocket_archive_tests {
 
     #[tokio::test]
     async fn test_websocket_state_connection_management() {
-        let config = WebSocketConfig {
-            max_connections: 5,
-            ping_interval: Duration::from_secs(30),
-            message_buffer_size: 1024,
-            max_message_size: 64 * 1024,
-            ..Default::default()
-        };
+        let config = WebSocketConfig::default()
+            .with_max_connections(5)
+            .with_ping_interval(Duration::from_secs(30))
+            .with_message_buffer_size(1024)
+            .with_max_message_size(64 * 1024);
 
         let ws_state = WebSocketState::new(config);
 

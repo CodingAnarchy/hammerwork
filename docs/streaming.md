@@ -23,13 +23,12 @@ let stream = StreamConfig::new(
     },
 )
 .with_filter(EventFilter::new().with_event_types(vec![JobLifecycleEventType::Failed]))
-.with_retry_policy(StreamRetryPolicy {
-    max_attempts: 5,
-    initial_delay_secs: 1,
-    max_delay_secs: 60,
-    backoff_multiplier: 2.0,
-    use_jitter: true,
-});
+.with_retry_policy(StreamRetryPolicy::default()
+    .with_max_attempts(5)
+    .with_initial_delay_secs(1)
+    .with_max_delay_secs(60)
+    .with_backoff_multiplier(2.0)
+    .with_use_jitter(true));
 streams.add_stream(stream).await?;
 
 // ... on shutdown:

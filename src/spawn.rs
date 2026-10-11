@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 /// Result of a spawn operation containing information about spawned jobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SpawnResult {
     /// The parent job that performed the spawn operation
     pub parent_job_id: JobId,
@@ -54,14 +55,13 @@ pub struct SpawnResult {
 /// ```rust
 /// use hammerwork::spawn::SpawnConfig;
 ///
-/// let config = SpawnConfig {
-///     max_spawn_count: Some(50),        // Limit to 50 files
-///     inherit_priority: true,           // Inherit parent priority
-///     inherit_retry_strategy: true,     // Inherit retry settings
-///     inherit_timeout: false,           // Each file has own timeout
-///     inherit_trace_context: true,      // Maintain tracing
-///     operation_id: Some("file_batch_001".to_string()),
-/// };
+/// let config = SpawnConfig::default()
+///     .with_max_spawn_count(50)
+///     .with_inherit_priority(true)
+///     .with_inherit_retry_strategy(true)
+///     .with_inherit_timeout(false)
+///     .with_inherit_trace_context(true)
+///     .with_operation_id("file_batch_001".to_string());
 /// ```
 ///
 /// ## Configuration for Large Data Processing
@@ -69,16 +69,16 @@ pub struct SpawnResult {
 /// ```rust
 /// use hammerwork::spawn::SpawnConfig;
 ///
-/// let config = SpawnConfig {
-///     max_spawn_count: Some(1000),      // Allow many chunks
-///     inherit_priority: false,          // Let chunks be normal priority
-///     inherit_retry_strategy: true,     // Inherit retry logic
-///     inherit_timeout: true,            // Inherit timeout settings
-///     inherit_trace_context: true,      // Maintain trace correlation
-///     operation_id: Some("data_processing_2024_01".to_string()),
-/// };
+/// let config = SpawnConfig::default()
+///     .with_max_spawn_count(1000)
+///     .with_inherit_priority(false)
+///     .with_inherit_retry_strategy(true)
+///     .with_inherit_timeout(true)
+///     .with_inherit_trace_context(true)
+///     .with_operation_id("data_processing_2024_01".to_string());
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SpawnConfig {
     /// Maximum number of child jobs that can be spawned by a single parent
     pub max_spawn_count: Option<usize>,
@@ -108,6 +108,7 @@ impl Default for SpawnConfig {
 }
 
 /// Context provided to spawn handlers with information about the parent job.
+#[non_exhaustive]
 pub struct SpawnContext<DB: sqlx::Database> {
     /// The parent job that is spawning child jobs
     pub parent_job: Job,
@@ -117,8 +118,26 @@ pub struct SpawnContext<DB: sqlx::Database> {
     pub queue: Arc<dyn DatabaseQueue<Database = DB> + Send + Sync>,
 }
 
+impl<DB: sqlx::Database> SpawnContext<DB> {
+    /// The context of `parent_job` spawning on `queue` with `config`. The
+    /// [`SpawnManager`] builds these; the constructor is for testing a
+    /// [`SpawnHandler`] directly.
+    pub fn new(
+        parent_job: Job,
+        config: SpawnConfig,
+        queue: Arc<dyn DatabaseQueue<Database = DB> + Send + Sync>,
+    ) -> Self {
+        Self {
+            parent_job,
+            config,
+            queue,
+        }
+    }
+}
+
 /// Error types specific to spawn operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SpawnError {
     #[error("Spawn limit exceeded: attempted to spawn {attempted} jobs, limit is {limit}")]
     SpawnLimitExceeded { attempted: usize, limit: usize },
@@ -463,11 +482,7 @@ impl<DB: sqlx::Database> SpawnManager<DB> {
         handler.validate_spawn(job, config).await?;
 
         // Generate child jobs
-        let context = SpawnContext {
-            parent_job: job.clone(),
-            config: config.clone(),
-            queue,
-        };
+        let context = SpawnContext::new(job.clone(), config.clone(), queue);
         let mut child_jobs = handler.spawn_jobs(context).await?;
 
         // Check spawn limits
@@ -572,14 +587,13 @@ impl<DB: sqlx::Database> Default for SpawnManager<DB> {
 /// use hammerwork::{Job, spawn::{JobSpawnExt, SpawnConfig}};
 /// use serde_json::json;
 ///
-/// let spawn_config = SpawnConfig {
-///     max_spawn_count: Some(10),
-///     inherit_priority: true,
-///     inherit_retry_strategy: false,
-///     inherit_timeout: true,
-///     inherit_trace_context: true,
-///     operation_id: Some("batch_001".to_string()),
-/// };
+/// let spawn_config = SpawnConfig::default()
+///     .with_max_spawn_count(10)
+///     .with_inherit_priority(true)
+///     .with_inherit_retry_strategy(false)
+///     .with_inherit_timeout(true)
+///     .with_inherit_trace_context(true)
+///     .with_operation_id("batch_001".to_string());
 ///
 /// let job = Job::new("data_processing".to_string(), json!({"records": 5000}))
 ///     .as_high_priority()
@@ -705,6 +719,17 @@ pub fn spawn_config_from_payload(payload: &serde_json::Value) -> Result<Option<S
             .map_err(|e| HammerworkError::InvalidJobPayload {
                 message: format!("invalid `{SPAWN_CONFIG_KEY}` in job payload: {e}"),
             }),
+    }
+}
+
+with_setters! {
+    SpawnConfig {
+        with_max_spawn_count(max_spawn_count): Some(usize),
+        with_inherit_priority(inherit_priority): bool,
+        with_inherit_retry_strategy(inherit_retry_strategy): bool,
+        with_inherit_timeout(inherit_timeout): bool,
+        with_inherit_trace_context(inherit_trace_context): bool,
+        with_operation_id(operation_id): Some(String),
     }
 }
 
@@ -893,5 +918,21 @@ mod tests {
         assert_eq!(children[0].retry_strategy, parent.retry_strategy);
         assert_eq!(children[0].trace_id.as_deref(), Some("parent-trace"));
         assert_eq!(children[0].depends_on, vec![parent.id]);
+    }
+
+    /// #81: `SpawnConfig` built from its default with setters.
+    #[test]
+    fn test_spawn_config_builders() {
+        let config = SpawnConfig::default()
+            .with_max_spawn_count(5)
+            .with_inherit_priority(false)
+            .with_inherit_retry_strategy(false)
+            .with_inherit_timeout(true)
+            .with_inherit_trace_context(false)
+            .with_operation_id("op".to_string());
+        assert_eq!(config.max_spawn_count, Some(5));
+        assert!(!config.inherit_priority && !config.inherit_retry_strategy);
+        assert!(config.inherit_timeout && !config.inherit_trace_context);
+        assert_eq!(config.operation_id.as_deref(), Some("op"));
     }
 }

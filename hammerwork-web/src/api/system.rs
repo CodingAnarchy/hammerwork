@@ -106,18 +106,12 @@
 //!
 //! ```rust
 //! use hammerwork_web::__private::api::system::MetricsInfo;
-//! use chrono::Utc;
 //!
 //! let metrics_info = MetricsInfo {
-//!     prometheus_enabled: true,
-//!     metrics_endpoint: "/metrics".to_string(),
-//!     custom_metrics_count: Some(15),
-//!     last_scrape: Some(Utc::now()),
+//!     prometheus_enabled: false,
 //! };
 //!
-//! assert!(metrics_info.prometheus_enabled);
-//! assert_eq!(metrics_info.metrics_endpoint, "/metrics");
-//! assert_eq!(metrics_info.custom_metrics_count, Some(15));
+//! assert!(!metrics_info.prometheus_enabled);
 //! ```
 
 use super::history::{FinishedKind, JobHistory, TableMaintenance, maintenance_tables};
@@ -215,15 +209,11 @@ pub struct ServerConfig {
 
 /// Metrics endpoint information
 #[derive(Debug, Serialize)]
+///
+/// The dashboard serves no `/metrics` route and keeps no metrics registry: scrape the
+/// metrics of the application that embeds the library instead.
 pub struct MetricsInfo {
     pub prometheus_enabled: bool,
-    /// Deprecated and not served: the dashboard has no `/metrics` route (it always reports
-    /// `"/metrics"` for compatibility). Scrape the metrics of the application that embeds
-    /// the library instead.
-    pub metrics_endpoint: String,
-    /// `null`: the dashboard keeps no metrics registry, so there is nothing to count.
-    pub custom_metrics_count: Option<u32>,
-    pub last_scrape: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Configuration update request
@@ -383,9 +373,6 @@ async fn metrics_info_handler(
         // hammerwork-web does not serve a Prometheus endpoint itself (there is no
         // `metrics` feature on this crate), so this is always false.
         prometheus_enabled: false,
-        metrics_endpoint: "/metrics".to_string(),
-        custom_metrics_count: None,
-        last_scrape: None,
     };
 
     Ok(json_reply(&ApiResponse::success(metrics_info)))
@@ -579,16 +566,12 @@ mod tests {
     }
 
     #[test]
-    fn test_unavailable_metrics_are_none_not_zero() {
+    fn test_metrics_info_reports_only_what_is_served() {
         let json = serde_json::to_value(MetricsInfo {
             prometheus_enabled: false,
-            metrics_endpoint: "/metrics".to_string(),
-            custom_metrics_count: None,
-            last_scrape: None,
         })
         .unwrap();
-        assert!(json["custom_metrics_count"].is_null());
-        assert!(json["last_scrape"].is_null());
+        assert_eq!(json, serde_json::json!({ "prometheus_enabled": false }));
     }
 
     #[tokio::test]

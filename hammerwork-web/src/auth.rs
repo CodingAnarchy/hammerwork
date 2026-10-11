@@ -28,13 +28,13 @@
 //! use hammerwork_web::__private::auth::AuthState;
 //! use hammerwork_web::__private::config::AuthConfig;
 //!
-//! let auth_config = AuthConfig {
-//!     enabled: true,
-//!     username: "admin".to_string(),
+//! let auth_config = AuthConfig::default()
+//!     .with_enabled(true)
+//!     .with_username("admin".to_string())
 //!     // A bcrypt hash, for example from `bcrypt::hash(password, bcrypt::DEFAULT_COST)`.
-//!     password_hash: "$2b$12$abcdefghijklmnopqrstuuJ0Y7gZ8z5d0FQqfJb8yX3QZpGQ0lW6e".to_string(),
-//!     ..Default::default()
-//! };
+//!     .with_password_hash(
+//!         "$2b$12$abcdefghijklmnopqrstuuJ0Y7gZ8z5d0FQqfJb8yX3QZpGQ0lW6e".to_string(),
+//!     );
 //!
 //! let auth_state = AuthState::new(auth_config);
 //! assert!(auth_state.is_enabled());

@@ -289,33 +289,27 @@ async fn test_priority_statistics_integration() {
 
     // Create events with different priorities
     let events = vec![
-        JobEvent {
-            job_id: uuid::Uuid::new_v4(),
-            queue_name: "test_queue".to_string(),
-            event_type: JobEventType::Completed,
-            priority: JobPriority::Critical,
-            processing_time_ms: Some(1000),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        },
-        JobEvent {
-            job_id: uuid::Uuid::new_v4(),
-            queue_name: "test_queue".to_string(),
-            event_type: JobEventType::Completed,
-            priority: JobPriority::High,
-            processing_time_ms: Some(2000),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        },
-        JobEvent {
-            job_id: uuid::Uuid::new_v4(),
-            queue_name: "test_queue".to_string(),
-            event_type: JobEventType::Completed,
-            priority: JobPriority::Normal,
-            processing_time_ms: Some(1500),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        },
+        JobEvent::new(
+            uuid::Uuid::new_v4(),
+            "test_queue".to_string(),
+            JobEventType::Completed,
+            JobPriority::Critical,
+        )
+        .with_processing_time_ms(1000),
+        JobEvent::new(
+            uuid::Uuid::new_v4(),
+            "test_queue".to_string(),
+            JobEventType::Completed,
+            JobPriority::High,
+        )
+        .with_processing_time_ms(2000),
+        JobEvent::new(
+            uuid::Uuid::new_v4(),
+            "test_queue".to_string(),
+            JobEventType::Completed,
+            JobPriority::Normal,
+        )
+        .with_processing_time_ms(1500),
     ];
 
     // Record events

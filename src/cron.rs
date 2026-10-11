@@ -6,6 +6,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum CronError {
     #[error("Invalid cron expression: {0}")]
     InvalidExpression(String),

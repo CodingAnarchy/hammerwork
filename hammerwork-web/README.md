@@ -135,17 +135,14 @@ use hammerwork_web::{WebDashboard, DashboardConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = DashboardConfig {
-        bind_address: "127.0.0.1".to_string(),
-        port: 8080,
-        database_url: "postgresql://localhost/hammerwork".to_string(),
-        pool_size: 5,
-        static_dir: "./assets".into(),
-        enable_cors: true,
+    let config = DashboardConfig::new()
+        .with_bind_address("127.0.0.1", 8080)
+        .with_database_url("postgresql://localhost/hammerwork")
+        .with_pool_size(5)
+        .with_static_dir("./assets".into())
+        .with_cors(true)
         // CORS is only granted to listed origins; enabling it without any is an error.
-        allowed_origins: vec!["https://ops.example.com".to_string()],
-        ..Default::default()
-    };
+        .with_allowed_origin("https://ops.example.com");
 
     let dashboard = WebDashboard::new(config).await?;
     dashboard.start().await?;

@@ -193,11 +193,9 @@ to `tracing_endpoint` as `service_name`; call `hammerwork::tracing::shutdown_tra
 before exiting to flush them.
 
 ```rust
-let logging = hammerwork::config::LoggingConfig {
-    level: "warn,hammerwork=debug".to_string(),
-    json_format: true,
-    ..Default::default()
-};
+let logging = hammerwork::config::LoggingConfig::default()
+    .with_level("warn,hammerwork=debug".to_string())
+    .with_json_format(true);
 # let _ = &logging;
 // logging.try_init()?;
 ```

@@ -1815,7 +1815,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     ) -> Result<Vec<crate::archive::ArchivedJob>> {
         use crate::archive::ArchivedJob;
 
-        let mut query = "SELECT id, queue_name, status, created_at, archived_at, archival_reason, original_payload_size, payload_compressed, archived_by FROM hammerwork_jobs_archive".to_string();
+        let mut query = "SELECT id, queue_name, status, created_at, archived_at, archival_reason, original_payload_size, payload_compressed, archived_by, workflow_id, workflow_name FROM hammerwork_jobs_archive".to_string();
         let mut conditions = Vec::new();
 
         if queue_name.is_some() {
@@ -1865,6 +1865,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                     .transpose()?,
                 payload_compressed: row.try_get("payload_compressed")?,
                 archived_by: row.try_get("archived_by")?,
+                workflow_id: row
+                    .try_get::<Option<String>, _>("workflow_id")?
+                    .map(|id| uuid::Uuid::parse_str(&id))
+                    .transpose()?,
+                workflow_name: row.try_get("workflow_name")?,
             })
         };
         Ok(super::decodable_rows(

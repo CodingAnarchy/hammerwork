@@ -30,12 +30,9 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = DashboardConfig {
-//!         bind_address: "127.0.0.1".to_string(),
-//!         port: 8080,
-//!         database_url: "postgresql://localhost/hammerwork".to_string(),
-//!         ..Default::default()
-//!     };
+//!     let config = DashboardConfig::new()
+//!         .with_bind_address("127.0.0.1", 8080)
+//!         .with_database_url("postgresql://localhost/hammerwork");
 //!
 //!     let dashboard = WebDashboard::new(config).await?;
 //!     dashboard.start().await?;
@@ -82,14 +79,13 @@
 //! use hammerwork_web::AuthConfig;
 //! use std::time::Duration;
 //!
-//! let auth_config = AuthConfig {
-//!     enabled: true,
-//!     username: "admin".to_string(),
-//!     password_hash: "$2b$12$hash...".to_string(),
-//!     session_timeout: Duration::from_secs(8 * 60 * 60), // 8 hours
-//!     max_failed_attempts: 5,
-//!     lockout_duration: Duration::from_secs(15 * 60), // 15 minutes
-//! };
+//! let auth_config = AuthConfig::default()
+//!     .with_enabled(true)
+//!     .with_username("admin".to_string())
+//!     .with_password_hash("$2b$12$hash...".to_string())
+//!     .with_session_timeout(Duration::from_secs(8 * 60 * 60)) // 8 hours
+//!     .with_max_failed_attempts(5)
+//!     .with_lockout_duration(Duration::from_secs(15 * 60)); // 15 minutes
 //!
 //! assert!(auth_config.enabled);
 //! assert_eq!(auth_config.max_failed_attempts, 5);

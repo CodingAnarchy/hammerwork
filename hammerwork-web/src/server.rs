@@ -513,13 +513,13 @@ mod tests {
 
         // The application's settings: its engine, with its key
         let var = format!("HW_WEB_TEST_KEY_{}", uuid::Uuid::new_v4().simple());
-        let settings = hammerwork::config::PayloadEncryptionConfig {
-            enabled: true,
-            key_source: hammerwork::config::KeySourceRef::parse(&format!("env://{var}")).unwrap(),
-            key_id: Some("web-key".to_string()),
-            encrypted_queues: vec!["payments".to_string()],
-            ..Default::default()
-        };
+        let settings = hammerwork::config::PayloadEncryptionConfig::default()
+            .with_enabled(true)
+            .with_key_source(
+                hammerwork::config::KeySourceRef::parse(&format!("env://{var}")).unwrap(),
+            )
+            .with_key_id("web-key".to_string())
+            .with_encrypted_queues(vec!["payments".to_string()]);
         let err = job_queue(pool(), &settings)
             .await
             .err()
@@ -591,19 +591,13 @@ mod tests {
     fn routes(websocket: crate::config::WebSocketConfig) -> (Router, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "SPA").unwrap();
-        let config = DashboardConfig {
-            websocket: websocket.clone(),
-            ..DashboardConfig::new()
-        };
+        let config = DashboardConfig::new().with_websocket(websocket.clone());
         let system_state = Arc::new(RwLock::new(SystemState::new(
             config.clone(),
             "PostgreSQL".into(),
             1,
         )));
-        let auth = AuthState::new(crate::config::AuthConfig {
-            enabled: false,
-            ..Default::default()
-        });
+        let auth = AuthState::new(crate::config::AuthConfig::default().with_enabled(false));
         let routes = app_routes(
             crate::api::test_support::unreachable_queue(),
             auth,
@@ -756,10 +750,8 @@ mod tests {
     /// M12: messages above `max_message_size` end the connection instead of being buffered.
     #[tokio::test]
     async fn websocket_messages_are_size_limited() {
-        let (routes, _dir) = routes(crate::config::WebSocketConfig {
-            max_message_size: 1024,
-            ..Default::default()
-        });
+        let (routes, _dir) =
+            routes(crate::config::WebSocketConfig::default().with_max_message_size(1024));
         let mut client = warp::test::ws()
             .path("/ws")
             .handshake(routes.clone())

@@ -318,9 +318,10 @@ where
             "Failed to count archivable jobs"
         );
         let response = ArchiveResponse {
-            stats: ArchivalStats {
-                jobs_archived: would_archive,
-                ..ArchivalStats::default()
+            stats: {
+                let mut stats = ArchivalStats::default();
+                stats.jobs_archived = would_archive;
+                stats
             },
             dry_run: true,
             policy_used: policy,
@@ -547,17 +548,17 @@ mod tests {
 
     #[test]
     fn test_archived_job_info_conversion() {
-        let archived_job = ArchivedJob {
-            id: uuid::Uuid::new_v4(),
-            queue_name: "test_queue".to_string(),
-            status: JobStatus::Completed,
-            created_at: chrono::Utc::now(),
-            archived_at: chrono::Utc::now(),
-            archival_reason: ArchivalReason::Automatic,
-            original_payload_size: Some(1024),
-            payload_compressed: true,
-            archived_by: Some("system".to_string()),
-        };
+        let archived_job = ArchivedJob::new(
+            uuid::Uuid::new_v4(),
+            "test_queue",
+            JobStatus::Completed,
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            ArchivalReason::Automatic,
+        )
+        .with_original_payload_size(1024)
+        .with_payload_compressed(true)
+        .with_archived_by("system".to_string());
 
         let info: ArchivedJobInfo = archived_job.into();
         assert_eq!(info.queue_name, "test_queue");

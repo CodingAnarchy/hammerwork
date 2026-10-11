@@ -889,17 +889,18 @@ mod tests {
         let at = chrono::DateTime::parse_from_rfc3339("2030-01-02T03:04:05Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        ArchivedJob {
-            id: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
-            queue_name: queue.to_string(),
-            status: JobStatus::Completed,
-            created_at: at,
-            archived_at: at,
-            archival_reason: ArchivalReason::Manual,
-            original_payload_size: Some(10),
-            payload_compressed: true,
-            archived_by: by.map(String::from),
-        }
+        let mut job = ArchivedJob::new(
+            uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            queue,
+            JobStatus::Completed,
+            at,
+            at,
+            ArchivalReason::Manual,
+        )
+        .with_original_payload_size(10)
+        .with_payload_compressed(true);
+        job.archived_by = by.map(String::from);
+        job
     }
 
     #[test]
@@ -943,14 +944,12 @@ mod tests {
 
     #[test]
     fn stats_render_as_table_or_json() {
-        let stats = ArchivalStats {
-            jobs_archived: 7,
-            jobs_purged: 2,
-            bytes_archived: 1234,
-            bytes_purged: 56,
-            compression_ratio: 2.5,
-            ..ArchivalStats::default()
-        };
+        let mut stats = ArchivalStats::default();
+        stats.jobs_archived = 7;
+        stats.jobs_purged = 2;
+        stats.bytes_archived = 1234;
+        stats.bytes_purged = 56;
+        stats.compression_ratio = 2.5;
         let table = render_archival_stats(&stats, Some("emails"), "table").unwrap();
         for expected in [
             "Queue: emails",

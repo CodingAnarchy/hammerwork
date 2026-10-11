@@ -82,12 +82,10 @@ retries per its `RetryPolicy`) for every matching event.
 ```rust
 use hammerwork::webhooks::WebhookManagerConfig;
 
-let config = WebhookManagerConfig {
-    max_concurrent_deliveries: 50,
-    default_timeout_secs: 10,
-    max_pending_deliveries: 500,
-    ..Default::default()
-};
+let config = WebhookManagerConfig::default()
+    .with_max_concurrent_deliveries(50)
+    .with_default_timeout_secs(10)
+    .with_max_pending_deliveries(500);
 assert_eq!(config.max_response_body_size, 64 * 1024);
 ```
 

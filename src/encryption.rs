@@ -84,6 +84,7 @@ pub(crate) type SecretBytes = zeroize::Zeroizing<Vec<u8>>;
 
 /// Errors that can occur during encryption operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum EncryptionError {
     /// Key management error (missing, invalid, or rotation failure).
     #[error("Key management error: {0}")]
@@ -127,6 +128,7 @@ pub enum EncryptionError {
 /// Each algorithm has different characteristics in terms of performance,
 /// security, and compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum EncryptionAlgorithm {
     /// AES-256 in Galois/Counter Mode (AES-256-GCM).
     ///
@@ -150,6 +152,7 @@ pub enum EncryptionAlgorithm {
 ///
 /// `Debug` and `Display` never show a `Static` key's material.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeySource {
     /// Use a static key provided directly.
     ///
@@ -220,6 +223,7 @@ impl Default for KeySource {
 /// # }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EncryptionConfig {
     /// The encryption algorithm to use.
     pub algorithm: EncryptionAlgorithm,
@@ -476,6 +480,7 @@ impl Default for EncryptionConfig {
 /// automatic cleanup. Different retention policies can be applied
 /// based on data sensitivity and compliance requirements.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum RetentionPolicy {
     /// Keep data for a specific duration from job creation.
     DeleteAfter(Duration),
@@ -584,6 +589,7 @@ impl RetentionPolicy {
 /// Contains information needed to decrypt the payload and manage
 /// its lifecycle according to retention policies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EncryptionMetadata {
     /// The encryption algorithm used.
     pub algorithm: EncryptionAlgorithm,
@@ -746,6 +752,7 @@ impl EncryptionMetadata {
 /// Contains the encrypted payload along with all metadata needed
 /// for decryption and lifecycle management.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EncryptedPayload {
     /// Base64-encoded encrypted data.
     pub ciphertext: String,
@@ -831,6 +838,7 @@ impl EncryptedPayload {
 ///
 /// Provides metrics for monitoring encryption performance and usage.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct EncryptionStats {
     /// Total number of jobs encrypted.
     pub jobs_encrypted: u64,

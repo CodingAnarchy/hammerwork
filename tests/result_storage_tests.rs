@@ -560,11 +560,9 @@ async fn test_result_config_builder_methods() {
     let job2 = Job::new("test".to_string(), json!({})).with_result_ttl(Duration::from_secs(7200));
     assert_eq!(job2.result_config.ttl, Some(Duration::from_secs(7200)));
 
-    let config = ResultConfig {
-        storage: ResultStorage::Database,
-        ttl: Some(Duration::from_secs(3600)),
-        max_size_bytes: Some(1024 * 1024), // 1MB
-    };
+    let config = ResultConfig::new(ResultStorage::Database)
+        .with_ttl(Duration::from_secs(3600))
+        .with_max_size(1024 * 1024); // 1MB
     let job3 = Job::new("test".to_string(), json!({})).with_result_config(config.clone());
     assert_eq!(job3.result_config.storage, config.storage);
     assert_eq!(job3.result_config.ttl, config.ttl);

@@ -93,6 +93,7 @@ use std::time::Duration;
 ///
 /// `Debug` shows `database_url` with its password replaced by `***`.
 #[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DashboardConfig {
     /// Server bind address
     pub bind_address: String,
@@ -364,14 +365,13 @@ impl DashboardConfig {
 /// assert_eq!(auth_config.max_failed_attempts, 5);
 ///
 /// // Custom configuration
-/// let auth_config = AuthConfig {
-///     enabled: true,
-///     username: "dashboard_admin".to_string(),
-///     password_hash: "$2b$12$hash...".to_string(),
-///     session_timeout: Duration::from_secs(4 * 60 * 60), // 4 hours
-///     max_failed_attempts: 3,
-///     lockout_duration: Duration::from_secs(30 * 60), // 30 minutes
-/// };
+/// let auth_config = AuthConfig::default()
+///     .with_enabled(true)
+///     .with_username("dashboard_admin".to_string())
+///     .with_password_hash("$2b$12$hash...".to_string())
+///     .with_session_timeout(Duration::from_secs(4 * 60 * 60)) // 4 hours
+///     .with_max_failed_attempts(3)
+///     .with_lockout_duration(Duration::from_secs(30 * 60)); // 30 minutes
 ///
 /// assert_eq!(auth_config.username, "dashboard_admin");
 /// assert_eq!(auth_config.max_failed_attempts, 3);
@@ -379,6 +379,7 @@ impl DashboardConfig {
 ///
 /// `Debug` never shows `password_hash`.
 #[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AuthConfig {
     /// Whether authentication is enabled
     pub enabled: bool,
@@ -418,6 +419,7 @@ impl Default for AuthConfig {
 
 /// WebSocket configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WebSocketConfig {
     /// Ping interval to keep connections alive
     #[serde(with = "hammerwork::config::serde_duration")]
@@ -468,6 +470,62 @@ impl Default for WebSocketConfig {
             live_update_interval: default_live_update_interval(),
             live_update_max_jobs: default_live_update_max_jobs(),
         }
+    }
+}
+
+/// Generate `with_*` builder methods that set one public field each (the configuration
+/// structs are `#[non_exhaustive]`, so callers outside the crate cannot use literals).
+macro_rules! with_setters {
+    ($ty:ty { $($name:ident($field:ident): $fty:ty),* $(,)? }) => {
+        impl $ty {
+            $(
+                #[doc = concat!("Sets [`", stringify!($field), "`](Self::", stringify!($field), ").")]
+                #[must_use]
+                pub fn $name(mut self, value: $fty) -> Self {
+                    self.$field = value;
+                    self
+                }
+            )*
+        }
+    };
+}
+
+with_setters! {
+    DashboardConfig {
+        with_pool_size(pool_size): u32,
+        with_auth_config(auth): AuthConfig,
+        with_websocket(websocket): WebSocketConfig,
+        with_allowed_origins(allowed_origins): Vec<String>,
+    }
+}
+
+with_setters! {
+    AuthConfig {
+        with_enabled(enabled): bool,
+        with_username(username): String,
+        with_password_hash(password_hash): String,
+        with_session_timeout(session_timeout): Duration,
+        with_max_failed_attempts(max_failed_attempts): u32,
+        with_lockout_duration(lockout_duration): Duration,
+    }
+}
+
+impl AuthConfig {
+    /// The default settings with authentication turned off (for local development and
+    /// tests; never expose an unauthenticated dashboard).
+    pub fn disabled() -> Self {
+        Self::default().with_enabled(false)
+    }
+}
+
+with_setters! {
+    WebSocketConfig {
+        with_ping_interval(ping_interval): Duration,
+        with_max_connections(max_connections): usize,
+        with_message_buffer_size(message_buffer_size): usize,
+        with_max_message_size(max_message_size): usize,
+        with_live_update_interval(live_update_interval): Duration,
+        with_live_update_max_jobs(live_update_max_jobs): u32,
     }
 }
 
@@ -739,5 +797,54 @@ mod tests {
         // Disabled live updates do not need a limit.
         config.websocket.live_update_interval = Duration::ZERO;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_builders() {
+        let auth = AuthConfig::default()
+            .with_enabled(true)
+            .with_username("ops".to_string())
+            .with_password_hash("$2b$hash".to_string())
+            .with_session_timeout(Duration::from_secs(60))
+            .with_max_failed_attempts(2)
+            .with_lockout_duration(Duration::from_secs(30));
+        assert!(auth.enabled);
+        assert_eq!(
+            (auth.username.as_str(), auth.password_hash.as_str()),
+            ("ops", "$2b$hash")
+        );
+        assert_eq!(auth.session_timeout, Duration::from_secs(60));
+        assert_eq!(auth.max_failed_attempts, 2);
+        assert_eq!(auth.lockout_duration, Duration::from_secs(30));
+        assert!(!AuthConfig::disabled().enabled);
+
+        let websocket = WebSocketConfig::default()
+            .with_ping_interval(Duration::from_secs(5))
+            .with_max_connections(3)
+            .with_message_buffer_size(8)
+            .with_max_message_size(256)
+            .with_live_update_interval(Duration::ZERO)
+            .with_live_update_max_jobs(7);
+        assert_eq!(websocket.ping_interval, Duration::from_secs(5));
+        assert_eq!(
+            (
+                websocket.max_connections,
+                websocket.message_buffer_size,
+                websocket.max_message_size
+            ),
+            (3, 8, 256)
+        );
+        assert!(websocket.live_update_interval.is_zero());
+        assert_eq!(websocket.live_update_max_jobs, 7);
+
+        let config = DashboardConfig::new()
+            .with_pool_size(4)
+            .with_auth_config(auth)
+            .with_websocket(websocket)
+            .with_allowed_origins(vec!["https://ops.example.com".to_string()]);
+        assert_eq!(config.pool_size, 4);
+        assert_eq!(config.auth.username, "ops");
+        assert_eq!(config.websocket.max_connections, 3);
+        assert_eq!(config.allowed_origins, ["https://ops.example.com"]);
     }
 }

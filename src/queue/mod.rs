@@ -60,6 +60,7 @@ mod private {
 
 /// Information about a queue's pause state
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct QueuePauseInfo {
     /// Name of the paused queue
     pub queue_name: String,

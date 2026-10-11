@@ -103,20 +103,20 @@
 //!     job_id,
 //!     queue_name,
 //!     JobPriority::High,
-//!     JobError {
-//!         message: "Database connection failed".to_string(),
-//!         error_type: Some("ConnectionError".to_string()),
-//!         details: None,
-//!         retry_attempt: Some(2),
-//!     },
+//!     JobError::new("Database connection failed".to_string())
+//!         .with_error_type("ConnectionError".to_string())
+//!         .with_retry_attempt(2),
 //! );
 //! ```
 
 use crate::priority::JobPriority;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, broadcast};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak},
+};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Module for serializing UUID as string for TOML compatibility
@@ -155,24 +155,23 @@ mod uuid_string {
 /// use chrono::Utc;
 /// use std::collections::HashMap;
 ///
-/// let event = JobLifecycleEvent {
-///     event_id: Uuid::new_v4(),
-///     job_id: Uuid::new_v4(),
-///     queue_name: "email_queue".to_string(),
-///     event_type: JobLifecycleEventType::Completed,
-///     priority: JobPriority::Normal,
-///     timestamp: Utc::now(),
-///     processing_time_ms: Some(1500),
-///     error: None,
-///     payload: Some(serde_json::json!({"recipient": "user@example.com"})),
-///     metadata: {
-///         let mut meta = HashMap::new();
-///         meta.insert("tenant_id".to_string(), "acme_corp".to_string());
-///         meta
-///     },
-/// };
+/// let mut metadata = HashMap::new();
+/// metadata.insert("tenant_id".to_string(), "acme_corp".to_string());
+///
+/// let event = JobLifecycleEvent::new(
+///     Uuid::new_v4(),
+///     "email_queue",
+///     JobLifecycleEventType::Completed,
+///     JobPriority::Normal,
+/// )
+/// .with_timestamp(Utc::now())
+/// .with_processing_time_ms(1500)
+/// .with_payload(serde_json::json!({"recipient": "user@example.com"}))
+/// .with_metadata(metadata);
+/// assert!(event.error.is_none());
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JobLifecycleEvent {
     /// Unique identifier for this event
     #[serde(with = "uuid_string")]
@@ -201,6 +200,7 @@ pub struct JobLifecycleEvent {
 /// Types of job lifecycle events
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum JobLifecycleEventType {
     /// Job was enqueued and is pending execution
     Enqueued,
@@ -226,6 +226,7 @@ pub enum JobLifecycleEventType {
 
 /// Error information for failed jobs
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JobError {
     /// Error message
     pub message: String,
@@ -271,6 +272,7 @@ pub struct JobError {
 ///     ]);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct EventFilter {
     /// Filter by event types (empty means all types)
     pub event_types: Vec<JobLifecycleEventType>,
@@ -392,11 +394,28 @@ impl EventFilter {
     }
 }
 
+/// The registered filters of an [`EventManager`], keyed by subscription id.
+///
+/// A std lock (not tokio's) so that [`EventSubscription`]'s `Drop` can unregister
+/// without an async runtime. It is never held across an `.await`.
+type SubscriptionMap = RwLock<HashMap<Uuid, EventFilter>>;
+
+fn read_map(map: &SubscriptionMap) -> RwLockReadGuard<'_, HashMap<Uuid, EventFilter>> {
+    // The map stays consistent even if a holder panicked: every update is one call.
+    map.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_map(map: &SubscriptionMap) -> RwLockWriteGuard<'_, HashMap<Uuid, EventFilter>> {
+    map.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Event subscription for receiving filtered events.
 ///
-/// Dropping a subscription does not unregister it: call
-/// [`EventManager::unsubscribe`] with its `id` when done, so its filter stops counting
-/// toward [`EventManager::subscription_count`] and [`EventManager::payload_wanted`].
+/// Dropping a subscription unregisters it from its [`EventManager`], so its filter
+/// stops counting toward [`EventManager::subscription_count`] and
+/// [`EventManager::payload_wanted`]. [`EventManager::unsubscribe`] does the same
+/// ahead of the drop. Keep the subscription (not just its `receiver`) alive for as
+/// long as you read events: the fields can be borrowed but not moved out.
 #[derive(Debug)]
 pub struct EventSubscription {
     /// Unique identifier for this subscription
@@ -405,6 +424,16 @@ pub struct EventSubscription {
     pub filter: EventFilter,
     /// Channel receiver for receiving events
     pub receiver: broadcast::Receiver<JobLifecycleEvent>,
+    /// The manager's subscription map, to unregister from on drop.
+    registry: Weak<SubscriptionMap>,
+}
+
+impl Drop for EventSubscription {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            write_map(&registry).remove(&self.id);
+        }
+    }
 }
 
 /// Event manager for publishing and subscribing to job lifecycle events.
@@ -429,12 +458,11 @@ pub struct EventSubscription {
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// // Create a manager with custom configuration
-/// let config = EventConfig {
-///     max_buffer_size: 5000,
-///     include_payload_default: true,
-///     max_payload_size_bytes: 128 * 1024, // 128KB
-///     log_events: true,
-/// };
+/// let config = EventConfig::default()
+///     .with_max_buffer_size(5000)
+///     .with_include_payload_default(true)
+///     .with_max_payload_size_bytes(128 * 1024)
+///     .with_log_events(true);
 /// let manager = Arc::new(EventManager::new(config));
 ///
 /// // Subscribe to events
@@ -450,12 +478,9 @@ pub struct EventSubscription {
 ///         Uuid::new_v4(),
 ///         "background_queue".to_string(),
 ///         JobPriority::Low,
-///         hammerwork::events::JobError {
-///             message: "Service unavailable".to_string(),
-///             error_type: Some("ServiceError".to_string()),
-///             details: None,
-///             retry_attempt: Some(1),
-///         },
+///         hammerwork::events::JobError::new("Service unavailable".to_string())
+///             .with_error_type("ServiceError".to_string())
+///             .with_retry_attempt(1),
 ///     );
 ///     let _ = manager_clone.publish_event(event).await;
 /// });
@@ -477,13 +502,14 @@ pub struct EventManager {
     /// Broadcast sender for publishing events to all subscribers
     sender: broadcast::Sender<JobLifecycleEvent>,
     /// Active subscriptions (for management purposes)
-    subscriptions: Arc<RwLock<HashMap<Uuid, EventFilter>>>,
+    subscriptions: Arc<SubscriptionMap>,
     /// Configuration for event publishing
     config: EventConfig,
 }
 
 /// Configuration for the event system
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EventConfig {
     /// Maximum number of events to buffer in broadcast channel
     pub max_buffer_size: usize,
@@ -631,9 +657,7 @@ impl EventManager {
         if self.config.include_payload_default {
             return true;
         }
-        self.subscriptions
-            .read()
-            .await
+        read_map(&self.subscriptions)
             .values()
             .any(|filter| filter.include_payload)
     }
@@ -646,8 +670,8 @@ impl EventManager {
 
     /// Subscribe to job lifecycle events with a filter.
     ///
-    /// Call [`unsubscribe`](Self::unsubscribe) with the subscription's `id` when done:
-    /// dropping the subscription leaves its filter registered.
+    /// Dropping the returned subscription unregisters it (as does
+    /// [`unsubscribe`](Self::unsubscribe) with its `id`).
     ///
     /// Creates a new subscription that will receive events matching the provided filter.
     /// The returned `EventSubscription` contains a broadcast receiver that will receive
@@ -690,36 +714,35 @@ impl EventManager {
         let receiver = self.sender.subscribe();
 
         // Store subscription for management
-        {
-            let mut subscriptions = self.subscriptions.write().await;
-            subscriptions.insert(subscription_id, filter.clone());
-        }
+        write_map(&self.subscriptions).insert(subscription_id, filter.clone());
 
         Ok(EventSubscription {
             id: subscription_id,
             filter,
             receiver,
+            registry: Arc::downgrade(&self.subscriptions),
         })
     }
 
-    /// Unsubscribe from events
+    /// Unregister a subscription ahead of dropping it.
+    ///
+    /// Dropping an [`EventSubscription`] unregisters it too; this is for code that
+    /// only kept the id, or that wants the filter gone before the subscription drops.
     pub async fn unsubscribe(&self, subscription_id: Uuid) -> crate::Result<()> {
-        let mut subscriptions = self.subscriptions.write().await;
-        subscriptions.remove(&subscription_id);
+        write_map(&self.subscriptions).remove(&subscription_id);
         Ok(())
     }
 
     /// Get count of active subscriptions
     pub async fn subscription_count(&self) -> usize {
-        let subscriptions = self.subscriptions.read().await;
-        subscriptions.len()
+        read_map(&self.subscriptions).len()
     }
 
     /// Get event manager statistics
     pub async fn get_stats(&self) -> EventManagerStats {
-        let subscriptions = self.subscriptions.read().await;
+        let active_subscriptions = read_map(&self.subscriptions).len();
         EventManagerStats {
-            active_subscriptions: subscriptions.len(),
+            active_subscriptions,
             buffer_capacity: self.config.max_buffer_size,
             buffer_current_size: self.sender.len(),
         }
@@ -728,6 +751,7 @@ impl EventManager {
 
 /// Statistics about the event manager
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EventManagerStats {
     /// Number of active subscriptions
     pub active_subscriptions: usize,
@@ -916,6 +940,71 @@ impl std::fmt::Display for JobLifecycleEventType {
             JobLifecycleEventType::Archived => write!(f, "archived"),
             JobLifecycleEventType::Restored => write!(f, "restored"),
         }
+    }
+}
+
+impl JobLifecycleEvent {
+    /// An event of `event_type` for the job `job_id`, with a new event id, timestamped
+    /// now, and no processing time, error, payload or metadata. The
+    /// [`JobLifecycleEventBuilder`] constructors (`enqueued`, `failed`, ...) cover the
+    /// common event types.
+    pub fn new(
+        job_id: Uuid,
+        queue_name: impl Into<String>,
+        event_type: JobLifecycleEventType,
+        priority: JobPriority,
+    ) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            job_id,
+            queue_name: queue_name.into(),
+            event_type,
+            priority,
+            timestamp: Utc::now(),
+            processing_time_ms: None,
+            error: None,
+            payload: None,
+            metadata: HashMap::new(),
+        }
+    }
+}
+
+with_setters! {
+    JobLifecycleEvent {
+        with_timestamp(timestamp): DateTime<Utc>,
+        with_processing_time_ms(processing_time_ms): Some(u64),
+        with_error(error): Some(JobError),
+        with_payload(payload): Some(serde_json::Value),
+        with_metadata(metadata): HashMap<String, String>,
+    }
+}
+
+with_setters! {
+    EventConfig {
+        with_max_buffer_size(max_buffer_size): usize,
+        with_include_payload_default(include_payload_default): bool,
+        with_max_payload_size_bytes(max_payload_size_bytes): usize,
+        with_log_events(log_events): bool,
+    }
+}
+
+impl JobError {
+    /// An error with `message` and no type, details or retry attempt.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            error_type: None,
+            details: None,
+            retry_attempt: None,
+        }
+    }
+}
+
+with_setters! {
+    JobError {
+        with_error_type(error_type): Some(String),
+        with_details(details): Some(String),
+        with_retry_attempt(retry_attempt): Some(u32),
     }
 }
 
@@ -1591,5 +1680,102 @@ mod tests {
         });
         assert!(defaulted.delivers_payload(&EventFilter::new()));
         assert!(defaulted.payload_wanted().await);
+    }
+
+    /// Dropping a subscription unregisters it: the count drops and its
+    /// `include_payload` filter stops making `payload_wanted` true.
+    #[tokio::test]
+    async fn dropping_subscription_unregisters_it() {
+        let manager = EventManager::new_default();
+        let keep = manager.subscribe(EventFilter::new()).await.unwrap();
+        let wants = manager
+            .subscribe(EventFilter::new().include_payload())
+            .await
+            .unwrap();
+        assert_eq!(manager.subscription_count().await, 2);
+        assert!(manager.payload_wanted().await);
+
+        drop(wants);
+        assert_eq!(manager.subscription_count().await, 1);
+        assert!(!manager.payload_wanted().await);
+        assert_eq!(manager.get_stats().await.active_subscriptions, 1);
+
+        // Unsubscribing first and dropping afterwards is fine.
+        manager.unsubscribe(keep.id).await.unwrap();
+        drop(keep);
+        assert_eq!(manager.subscription_count().await, 0);
+    }
+
+    /// A subscription can be dropped outside a runtime, and after its manager.
+    #[test]
+    fn subscription_drop_needs_no_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let manager = EventManager::new_default();
+        let first = runtime
+            .block_on(manager.subscribe(EventFilter::new()))
+            .unwrap();
+        let second = runtime
+            .block_on(manager.subscribe(EventFilter::new()))
+            .unwrap();
+        drop(runtime);
+
+        drop(first);
+        let count = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(manager.subscription_count());
+        assert_eq!(count, 1);
+
+        drop(manager);
+        drop(second);
+    }
+
+    /// #81: events and errors built with constructors and setters.
+    #[test]
+    fn test_event_and_error_builders() {
+        let error = JobError::new("boom")
+            .with_error_type("Timeout".to_string())
+            .with_details("after 30s".to_string())
+            .with_retry_attempt(2);
+        assert_eq!(error.message, "boom");
+        assert_eq!(error.error_type.as_deref(), Some("Timeout"));
+        assert_eq!(error.details.as_deref(), Some("after 30s"));
+        assert_eq!(error.retry_attempt, Some(2));
+
+        let job_id = Uuid::new_v4();
+        let at = Utc::now() - chrono::Duration::seconds(5);
+        let event = JobLifecycleEvent::new(
+            job_id,
+            "emails",
+            JobLifecycleEventType::Failed,
+            JobPriority::High,
+        )
+        .with_timestamp(at)
+        .with_processing_time_ms(42)
+        .with_error(error)
+        .with_payload(serde_json::json!({"a": 1}))
+        .with_metadata(HashMap::from([("k".to_string(), "v".to_string())]));
+        assert_eq!(
+            (event.job_id, event.queue_name.as_str()),
+            (job_id, "emails")
+        );
+        assert_eq!(event.event_type, JobLifecycleEventType::Failed);
+        assert_eq!(event.priority, JobPriority::High);
+        assert_eq!(event.timestamp, at);
+        assert_eq!(event.processing_time_ms, Some(42));
+        assert_eq!(event.error.unwrap().message, "boom");
+        assert_eq!(event.payload, Some(serde_json::json!({"a": 1})));
+        assert_eq!(event.metadata["k"], "v");
+
+        let config = EventConfig::default()
+            .with_max_buffer_size(7)
+            .with_include_payload_default(true)
+            .with_max_payload_size_bytes(99)
+            .with_log_events(true);
+        assert_eq!(config.max_buffer_size, 7);
+        assert!(config.include_payload_default && config.log_events);
+        assert_eq!(config.max_payload_size_bytes, 99);
     }
 }

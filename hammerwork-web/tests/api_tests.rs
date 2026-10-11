@@ -41,11 +41,9 @@ impl<Q: JobHistory + 'static> App<Q> {
         std::fs::create_dir(static_dir.path().join("assets")).unwrap();
         std::fs::write(static_dir.path().join("asset.txt"), "static file").unwrap();
 
-        let config = DashboardConfig {
-            static_dir: static_dir.path().to_path_buf(),
-            auth: auth.clone(),
-            ..DashboardConfig::default()
-        };
+        let mut config = DashboardConfig::default();
+        config.static_dir = static_dir.path().to_path_buf();
+        config.auth = auth.clone();
         let system_state = Arc::new(RwLock::new(SystemState::new(
             config.clone(),
             database_type.to_string(),
@@ -826,7 +824,9 @@ async fn system_endpoints<Q: JobHistory + 'static>(app: &App<Q>, database_type: 
     let (status, body) = app.get("/api/system/metrics").await;
     assert_eq!(status, 200);
     assert_eq!(body["data"]["prometheus_enabled"], false);
-    assert!(body["data"]["custom_metrics_count"].is_null());
+    assert!(body["data"].get("metrics_endpoint").is_none());
+    assert!(body["data"].get("custom_metrics_count").is_none());
+    assert!(body["data"].get("last_scrape").is_none());
 
     let (status, body) = app.get("/api/version").await;
     assert_eq!(status, 200);
@@ -1225,13 +1225,11 @@ async fn authentication<Q: JobHistory + 'static>(queue: Arc<Q>, database_type: &
     let hash = bcrypt::hash("s3cret", 4).unwrap();
     let app = App::new(
         queue,
-        AuthConfig {
-            enabled: true,
-            username: "admin".into(),
-            password_hash: hash.clone(),
-            max_failed_attempts: 1000,
-            ..AuthConfig::default()
-        },
+        AuthConfig::default()
+            .with_enabled(true)
+            .with_username("admin".into())
+            .with_password_hash(hash.clone())
+            .with_max_failed_attempts(1000),
         database_type,
     );
     use base64::Engine;
@@ -1303,13 +1301,11 @@ async fn authentication<Q: JobHistory + 'static>(queue: Arc<Q>, database_type: &
     // repeated failures lock the account: even the right password is refused for a while
     let strict = App::new(
         app.queue.clone(),
-        AuthConfig {
-            enabled: true,
-            username: "admin".into(),
-            password_hash: hash,
-            max_failed_attempts: 3,
-            ..AuthConfig::default()
-        },
+        AuthConfig::default()
+            .with_enabled(true)
+            .with_username("admin".into())
+            .with_password_hash(hash)
+            .with_max_failed_attempts(3),
         database_type,
     );
     for _ in 0..3 {
@@ -1572,10 +1568,7 @@ async fn request_hardening<Q: JobHistory + 'static>(app: &App<Q>) {
 async fn run_all<Q: JobHistory + 'static>(queue: Arc<Q>, database_type: &str) {
     let app = App::new(
         queue.clone(),
-        AuthConfig {
-            enabled: false,
-            ..AuthConfig::default()
-        },
+        AuthConfig::default().with_enabled(false),
         database_type,
     );
     health_and_static_files(&app).await;
@@ -1629,10 +1622,7 @@ async fn test_http_api_reports_a_dead_database() {
         .unwrap();
     let app = App::new(
         Arc::new(JobQueue::new(pool)),
-        AuthConfig {
-            enabled: false,
-            ..AuthConfig::default()
-        },
+        AuthConfig::default().with_enabled(false),
         "PostgreSQL",
     );
     for path in [

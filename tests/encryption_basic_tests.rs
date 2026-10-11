@@ -3,13 +3,12 @@
 //! These tests validate the core encryption functionality without requiring
 //! external database connections, making them suitable for CI/CD environments.
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use hammerwork::encryption::{
-    EncryptionAlgorithm, EncryptionKey, ExternalKmsConfig, KeyDerivationConfig, KeyManagerConfig,
-    KeyManagerStats, KeyPurpose, KeySource, KeyStatus, parse_algorithm, parse_key_source,
+    EncryptionAlgorithm, ExternalKmsConfig, KeyDerivationConfig, KeyManagerConfig, KeyManagerStats,
+    KeyPurpose, KeySource, KeyStatus, parse_algorithm, parse_key_source,
 };
 use std::collections::HashMap;
-use uuid::Uuid;
 
 // Helper function to create test key manager configuration
 fn create_test_config() -> KeyManagerConfig {
@@ -19,32 +18,6 @@ fn create_test_config() -> KeyManagerConfig {
         .with_rotation_interval(Duration::days(30))
         .with_max_key_versions(5)
         .with_audit_enabled(true)
-}
-
-// Helper function to create test encryption key
-fn create_test_encryption_key(key_id: &str) -> EncryptionKey {
-    EncryptionKey {
-        id: Uuid::new_v4(),
-        key_id: key_id.to_string(),
-        version: 1,
-        algorithm: EncryptionAlgorithm::AES256GCM,
-        encrypted_key_material: vec![1, 2, 3, 4, 5, 6, 7, 8], // Mock encrypted data
-        derivation_salt: Some(vec![9, 10, 11, 12]),
-        source: KeySource::Generated("test".to_string()),
-        purpose: KeyPurpose::Encryption,
-        created_at: Utc::now(),
-        created_by: Some("test-user".to_string()),
-        expires_at: Some(Utc::now() + Duration::days(365)),
-        rotated_at: None,
-        retired_at: None,
-        status: KeyStatus::Active,
-        rotation_interval: Some(Duration::days(90)),
-        next_rotation_at: Some(Utc::now() + Duration::days(90)),
-        key_strength: 256,
-        master_key_id: Some(Uuid::new_v4()),
-        last_used_at: None,
-        usage_count: 0,
-    }
 }
 
 #[cfg(test)]
@@ -85,22 +58,6 @@ mod unit_tests {
     }
 
     #[test]
-    fn test_encryption_key_creation() {
-        let key = create_test_encryption_key("test-key-1");
-
-        assert_eq!(key.key_id, "test-key-1");
-        assert_eq!(key.version, 1);
-        assert_eq!(key.algorithm, EncryptionAlgorithm::AES256GCM);
-        assert_eq!(key.purpose, KeyPurpose::Encryption);
-        assert_eq!(key.status, KeyStatus::Active);
-        assert_eq!(key.key_strength, 256);
-        assert_eq!(key.usage_count, 0);
-        assert!(key.expires_at.is_some());
-        assert!(key.rotation_interval.is_some());
-        assert!(key.next_rotation_at.is_some());
-    }
-
-    #[test]
     fn test_key_purpose_serialization() {
         let purposes = vec![KeyPurpose::Encryption, KeyPurpose::MAC, KeyPurpose::KEK];
 
@@ -136,13 +93,13 @@ mod unit_tests {
             "test_secret_key".to_string(),
         );
 
-        let kms_config = ExternalKmsConfig {
-            service_type: "AWS".to_string(),
-            endpoint: "https://kms.us-east-1.amazonaws.com".to_string(),
-            auth_config,
-            region: Some("us-east-1".to_string()),
-            namespace: Some("hammerwork-test".to_string()),
-        };
+        let kms_config = ExternalKmsConfig::new(
+            "AWS".to_string(),
+            "https://kms.us-east-1.amazonaws.com".to_string(),
+        )
+        .with_auth_config(auth_config)
+        .with_region("us-east-1".to_string())
+        .with_namespace("hammerwork-test".to_string());
 
         assert_eq!(kms_config.service_type, "AWS");
         assert_eq!(kms_config.endpoint, "https://kms.us-east-1.amazonaws.com");
@@ -339,13 +296,13 @@ mod aws_kms_tests {
         auth_config.insert("region".to_string(), "us-east-1".to_string());
         auth_config.insert("profile".to_string(), "default".to_string());
 
-        let kms_config = ExternalKmsConfig {
-            service_type: "AWS_KMS".to_string(),
-            endpoint: "https://kms.us-east-1.amazonaws.com".to_string(),
-            auth_config,
-            region: Some("us-east-1".to_string()),
-            namespace: Some("hammerwork".to_string()),
-        };
+        let kms_config = ExternalKmsConfig::new(
+            "AWS_KMS".to_string(),
+            "https://kms.us-east-1.amazonaws.com".to_string(),
+        )
+        .with_auth_config(auth_config)
+        .with_region("us-east-1".to_string())
+        .with_namespace("hammerwork".to_string());
 
         let serialized = serde_json::to_string(&kms_config).unwrap();
         let deserialized: ExternalKmsConfig = serde_json::from_str(&serialized).unwrap();
@@ -355,42 +312,6 @@ mod aws_kms_tests {
         assert_eq!(kms_config.region, deserialized.region);
         assert_eq!(kms_config.namespace, deserialized.namespace);
         assert_eq!(kms_config.auth_config, deserialized.auth_config);
-    }
-
-    #[test]
-    fn test_aws_kms_key_with_external_source() {
-        let aws_key = EncryptionKey {
-            id: Uuid::new_v4(),
-            key_id: "aws-data-key-1".to_string(),
-            version: 1,
-            algorithm: EncryptionAlgorithm::AES256GCM,
-            encrypted_key_material: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            derivation_salt: None,
-            source: KeySource::External(
-                "aws://alias/hammerwork-data-keys?region=us-east-1".to_string(),
-            ),
-            purpose: KeyPurpose::Encryption,
-            created_at: Utc::now(),
-            created_by: Some("aws-kms-integration".to_string()),
-            expires_at: None, // AWS KMS keys don't expire
-            rotated_at: None,
-            retired_at: None,
-            status: KeyStatus::Active,
-            rotation_interval: Some(Duration::days(30)),
-            next_rotation_at: Some(Utc::now() + Duration::days(30)),
-            key_strength: 256,
-            master_key_id: Some(Uuid::new_v4()),
-            last_used_at: None,
-            usage_count: 0,
-        };
-
-        assert_eq!(aws_key.key_id, "aws-data-key-1");
-        assert!(matches!(aws_key.source, KeySource::External(_)));
-        assert_eq!(aws_key.purpose, KeyPurpose::Encryption);
-        assert_eq!(aws_key.status, KeyStatus::Active);
-        assert_eq!(aws_key.key_strength, 256);
-        assert!(aws_key.expires_at.is_none()); // AWS KMS keys don't expire
-        assert!(aws_key.rotation_interval.is_some());
     }
 }
 
@@ -510,13 +431,13 @@ mod gcp_kms_tests {
         auth_config.insert("project_id".to_string(), "my-project".to_string());
         auth_config.insert("location".to_string(), "us-central1".to_string());
 
-        let kms_config = ExternalKmsConfig {
-            service_type: "GCP_KMS".to_string(),
-            endpoint: "https://cloudkms.googleapis.com".to_string(),
-            auth_config,
-            region: Some("us-central1".to_string()),
-            namespace: Some("hammerwork".to_string()),
-        };
+        let kms_config = ExternalKmsConfig::new(
+            "GCP_KMS".to_string(),
+            "https://cloudkms.googleapis.com".to_string(),
+        )
+        .with_auth_config(auth_config)
+        .with_region("us-central1".to_string())
+        .with_namespace("hammerwork".to_string());
 
         let serialized = serde_json::to_string(&kms_config).unwrap();
         let deserialized: ExternalKmsConfig = serde_json::from_str(&serialized).unwrap();
@@ -526,50 +447,6 @@ mod gcp_kms_tests {
         assert_eq!(kms_config.region, deserialized.region);
         assert_eq!(kms_config.namespace, deserialized.namespace);
         assert_eq!(kms_config.auth_config, deserialized.auth_config);
-    }
-
-    #[test]
-    fn test_gcp_kms_key_with_external_source() {
-        let gcp_key = EncryptionKey {
-            id: Uuid::new_v4(),
-            key_id: "gcp-data-key-1".to_string(),
-            version: 1,
-            algorithm: EncryptionAlgorithm::AES256GCM,
-            encrypted_key_material: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            derivation_salt: None,
-            source: KeySource::External(
-                "gcp://projects/my-project/locations/us-central1/keyRings/hammerwork/cryptoKeys/data-keys".to_string()
-            ),
-            purpose: KeyPurpose::Encryption,
-            created_at: Utc::now(),
-            created_by: Some("gcp-kms-integration".to_string()),
-            expires_at: None, // GCP KMS keys don't expire
-            rotated_at: None,
-            retired_at: None,
-            status: KeyStatus::Active,
-            rotation_interval: Some(Duration::days(30)),
-            next_rotation_at: Some(Utc::now() + Duration::days(30)),
-            key_strength: 256,
-            master_key_id: Some(Uuid::new_v4()),
-            last_used_at: None,
-            usage_count: 0,
-        };
-
-        assert_eq!(gcp_key.key_id, "gcp-data-key-1");
-        assert!(matches!(gcp_key.source, KeySource::External(_)));
-        assert_eq!(gcp_key.purpose, KeyPurpose::Encryption);
-        assert_eq!(gcp_key.status, KeyStatus::Active);
-        assert_eq!(gcp_key.key_strength, 256);
-        assert!(gcp_key.expires_at.is_none()); // GCP KMS keys don't expire
-        assert!(gcp_key.rotation_interval.is_some());
-
-        // Verify the GCP KMS resource path structure
-        if let KeySource::External(resource) = &gcp_key.source {
-            assert!(resource.contains("projects/my-project"));
-            assert!(resource.contains("locations/us-central1"));
-            assert!(resource.contains("keyRings/hammerwork"));
-            assert!(resource.contains("cryptoKeys/data-keys"));
-        }
     }
 
     #[test]
@@ -711,13 +588,12 @@ mod vault_kms_tests {
         auth_config.insert("addr".to_string(), "https://vault.example.com".to_string());
         auth_config.insert("token".to_string(), "hvs.test-token".to_string());
 
-        let kms_config = ExternalKmsConfig {
-            service_type: "VAULT_KMS".to_string(),
-            endpoint: "https://vault.example.com".to_string(),
-            auth_config,
-            region: None,
-            namespace: Some("production".to_string()),
-        };
+        let kms_config = ExternalKmsConfig::new(
+            "VAULT_KMS".to_string(),
+            "https://vault.example.com".to_string(),
+        )
+        .with_auth_config(auth_config)
+        .with_namespace("production".to_string());
 
         let serialized = serde_json::to_string(&kms_config).unwrap();
         let deserialized: ExternalKmsConfig = serde_json::from_str(&serialized).unwrap();
@@ -727,45 +603,6 @@ mod vault_kms_tests {
         assert_eq!(kms_config.region, deserialized.region);
         assert_eq!(kms_config.namespace, deserialized.namespace);
         assert_eq!(kms_config.auth_config, deserialized.auth_config);
-    }
-
-    #[test]
-    fn test_vault_kms_key_with_external_source() {
-        let vault_key = EncryptionKey {
-            id: Uuid::new_v4(),
-            key_id: "vault-data-key-1".to_string(),
-            version: 1,
-            algorithm: EncryptionAlgorithm::AES256GCM,
-            encrypted_key_material: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            derivation_salt: None,
-            source: KeySource::External("vault://secret/hammerwork/encryption-key".to_string()),
-            purpose: KeyPurpose::Encryption,
-            created_at: Utc::now(),
-            created_by: Some("vault-kms-integration".to_string()),
-            expires_at: None, // Vault keys don't expire by default
-            rotated_at: None,
-            retired_at: None,
-            status: KeyStatus::Active,
-            rotation_interval: Some(Duration::days(30)),
-            next_rotation_at: Some(Utc::now() + Duration::days(30)),
-            key_strength: 256,
-            master_key_id: Some(Uuid::new_v4()),
-            last_used_at: None,
-            usage_count: 0,
-        };
-
-        assert_eq!(vault_key.key_id, "vault-data-key-1");
-        assert!(matches!(vault_key.source, KeySource::External(_)));
-        assert_eq!(vault_key.purpose, KeyPurpose::Encryption);
-        assert_eq!(vault_key.status, KeyStatus::Active);
-        assert_eq!(vault_key.key_strength, 256);
-        assert!(vault_key.expires_at.is_none()); // Vault keys don't expire by default
-        assert!(vault_key.rotation_interval.is_some());
-
-        // Verify the Vault secret path structure
-        if let KeySource::External(resource) = &vault_key.source {
-            assert!(resource.contains("secret/hammerwork/encryption-key"));
-        }
     }
 
     #[test]

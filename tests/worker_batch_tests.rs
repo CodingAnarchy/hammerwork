@@ -247,16 +247,16 @@ fn test_batch_processing_stats_struct() {
 fn test_worker_batch_processing_config() {
     // Test that batch processing configuration works
     // Test that BatchProcessingStats can be created and manipulated
-    let stats = BatchProcessingStats {
-        jobs_processed: 100,
-        jobs_completed: 95,
-        jobs_failed: 5,
-        batches_completed: 10,
-        batches_successful: 9,
-        total_processing_time_ms: 5000,
-        average_processing_time_ms: 52.6,
-        last_processed_job: Some(chrono::Utc::now()),
-    };
+    // The stats are `#[non_exhaustive]`: start from the default and set the counters.
+    let mut stats = BatchProcessingStats::default();
+    stats.jobs_processed = 100;
+    stats.jobs_completed = 95;
+    stats.jobs_failed = 5;
+    stats.batches_completed = 10;
+    stats.batches_successful = 9;
+    stats.total_processing_time_ms = 5000;
+    stats.average_processing_time_ms = 52.6;
+    stats.last_processed_job = Some(chrono::Utc::now());
 
     assert_eq!(stats.success_rate(), 0.95);
     assert_eq!(stats.batch_success_rate(), 0.9);

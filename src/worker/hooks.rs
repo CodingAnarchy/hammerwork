@@ -4,6 +4,7 @@ use super::*;
 
 /// Event data for job lifecycle event hooks.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JobHookEvent {
     /// The job that triggered the event
     pub job: Job,
@@ -23,6 +24,7 @@ pub type JobHookHandler = Arc<dyn Fn(JobHookEvent) + Send + Sync>;
 /// Hooks run on the worker's task. A hook that panics is contained: the panic is logged
 /// at error level, the job's outcome is recorded as usual and the worker keeps polling.
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct JobEventHooks {
     /// Called when a job starts processing
     pub on_job_start: Option<JobHookHandler>,

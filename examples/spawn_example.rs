@@ -298,14 +298,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "data/file4.csv"
             ],
             "batch_id": "batch_001",
-            "_spawn_config": SpawnConfig {
-                max_spawn_count: Some(10),
-                inherit_priority: true,
-                inherit_retry_strategy: true,
-                inherit_timeout: false,
-                inherit_trace_context: true,
-                operation_id: Some("file_processing_001".to_string()),
-            }
+            "_spawn_config": SpawnConfig::default()
+                .with_max_spawn_count(10)
+                .with_inherit_priority(true)
+                .with_inherit_retry_strategy(true)
+                .with_inherit_timeout(false)
+                .with_inherit_trace_context(true)
+                .with_operation_id("file_processing_001".to_string())
         }),
     )
     .as_high_priority()
@@ -327,14 +326,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "total_records": 5000,
             "chunk_size": 1000,
             "operation": "monthly_summary",
-            "_spawn_config": SpawnConfig {
-                max_spawn_count: Some(20),
-                inherit_priority: false, // Let chunks have normal priority
-                inherit_retry_strategy: true,
-                inherit_timeout: true,
-                inherit_trace_context: true,
-                operation_id: Some("data_agg_001".to_string()),
-            }
+            "_spawn_config": SpawnConfig::default()
+                .with_max_spawn_count(20)
+                .with_inherit_priority(false) // Let chunks have normal priority
+                .with_inherit_retry_strategy(true)
+                .with_inherit_timeout(true)
+                .with_inherit_trace_context(true)
+                .with_operation_id("data_agg_001".to_string())
         }),
     )
     .as_high_priority()

@@ -44,21 +44,16 @@
 //!     StreamManagerConfig::default()
 //! );
 //!
-//! let stream = StreamConfig {
-//!     id: uuid::Uuid::new_v4(),
-//!     name: "job_events_kafka".to_string(),
-//!     backend: StreamBackend::Kafka {
+//! let stream = StreamConfig::new("job_events_kafka".to_string(), StreamBackend::Kafka {
 //!         brokers: vec!["localhost:9092".to_string()],
 //!         topic: "hammerwork-job-events".to_string(),
 //!         config: HashMap::new(),
-//!     },
-//!     filter: EventFilter::new()
-//!         .with_event_types(vec![JobLifecycleEventType::Completed, JobLifecycleEventType::Failed]),
-//!     partitioning: PartitioningStrategy::QueueName,
-//!     serialization: SerializationFormat::Json,
-//!     enabled: true,
-//!     ..Default::default()
-//! };
+//!     })
+//!     .with_filter(EventFilter::new()
+//!         .with_event_types(vec![JobLifecycleEventType::Completed, JobLifecycleEventType::Failed]))
+//!     .with_partitioning(PartitioningStrategy::QueueName)
+//!     .with_serialization(SerializationFormat::Json)
+//!     .enabled(true);
 //!
 //! stream_manager.add_stream(stream).await?;
 //! # Ok(())
@@ -72,25 +67,20 @@
 //! use hammerwork::events::EventFilter;
 //! use std::collections::HashMap;
 //!
-//! let stream = StreamConfig {
-//!     id: uuid::Uuid::new_v4(),
-//!     name: "priority_events_kinesis".to_string(),
-//!     backend: StreamBackend::Kinesis {
+//! let stream = StreamConfig::new("priority_events_kinesis".to_string(), StreamBackend::Kinesis {
 //!         region: "us-east-1".to_string(),
 //!         stream_name: "hammerwork-priority-events".to_string(),
 //!         access_key_id: None, // Use IAM roles
 //!         secret_access_key: None,
 //!         config: HashMap::new(),
-//!     },
-//!     filter: EventFilter::new()
-//!         .with_priorities(vec![hammerwork::priority::JobPriority::High, hammerwork::priority::JobPriority::Critical]),
-//!     partitioning: PartitioningStrategy::Hash {
+//!     })
+//!     .with_filter(EventFilter::new()
+//!         .with_priorities(vec![hammerwork::priority::JobPriority::High, hammerwork::priority::JobPriority::Critical]))
+//!     .with_partitioning(PartitioningStrategy::Hash {
 //!         fields: vec![PartitionField::Priority, PartitionField::QueueName]
-//!     },
-//!     serialization: SerializationFormat::Json,
-//!     enabled: true,
-//!     ..Default::default()
-//! };
+//!     })
+//!     .with_serialization(SerializationFormat::Json)
+//!     .enabled(true);
 //! ```
 //!
 //! ## Google Cloud Pub/Sub with Buffering
@@ -100,25 +90,19 @@
 //! use hammerwork::events::EventFilter;
 //! use std::collections::HashMap;
 //!
-//! let stream = StreamConfig {
-//!     id: uuid::Uuid::new_v4(),
-//!     name: "analytics_events_pubsub".to_string(),
-//!     backend: StreamBackend::PubSub {
+//! let stream = StreamConfig::new("analytics_events_pubsub".to_string(), StreamBackend::PubSub {
 //!         project_id: "my-project".to_string(),
 //!         topic_name: "hammerwork-analytics".to_string(),
 //!         service_account_key: None, // Use default credentials
 //!         config: HashMap::new(),
-//!     },
-//!     filter: EventFilter::new().include_payload(),
-//!     buffer_config: BufferConfig {
-//!         max_events: 500,
-//!         max_buffer_time_secs: 10,
-//!         batch_size: 50,
-//!     },
-//!     serialization: SerializationFormat::Json,
-//!     enabled: true,
-//!     ..Default::default()
-//! };
+//!     })
+//!     .with_filter(EventFilter::new().include_payload())
+//!     .with_buffer_config(BufferConfig::default()
+//!     .with_max_events(500)
+//!     .with_max_buffer_time_secs(10)
+//!     .with_batch_size(50))
+//!     .with_serialization(SerializationFormat::Json)
+//!     .enabled(true);
 //! ```
 //!
 //! ## Avro Serialization with Schema Registry
@@ -126,17 +110,15 @@
 //! ```rust
 //! use hammerwork::streaming::{StreamConfig, SerializationFormat};
 //!
-//! let stream = StreamConfig {
-//!     serialization: SerializationFormat::Avro {
+//! let stream = StreamConfig::default()
+//!     .with_serialization(SerializationFormat::Avro {
 //!         schema_registry_url: "http://localhost:8081".to_string()
-//!     },
-//!     ..Default::default()
-//! };
+//!     });
 //! ```
 
 use crate::{
     HammerworkError,
-    events::{EventFilter, EventManager, JobLifecycleEvent},
+    events::{EventFilter, EventManager, EventSubscription, JobLifecycleEvent},
     task_tracker::{ListenerHandle, TaskTracker, clamp_permits},
 };
 
@@ -216,42 +198,32 @@ mod uuid_string {
 /// use std::collections::HashMap;
 ///
 /// // Basic Kafka configuration
-/// let kafka_stream = StreamConfig {
-///     id: Uuid::new_v4(),
-///     name: "main_events".to_string(),
-///     backend: StreamBackend::Kafka {
+/// let kafka_stream = StreamConfig::new("main_events".to_string(), StreamBackend::Kafka {
 ///         brokers: vec!["localhost:9092".to_string()],
 ///         topic: "job-events".to_string(),
 ///         config: HashMap::new(),
-///     },
-///     filter: EventFilter::new(),
-///     partitioning: PartitioningStrategy::QueueName,
-///     serialization: SerializationFormat::Json,
-///     enabled: true,
-///     ..Default::default()
-/// };
+///     })
+///     .with_filter(EventFilter::new())
+///     .with_partitioning(PartitioningStrategy::QueueName)
+///     .with_serialization(SerializationFormat::Json)
+///     .enabled(true);
 ///
 /// // Kinesis with custom partitioning
-/// let kinesis_stream = StreamConfig {
-///     id: Uuid::new_v4(),
-///     name: "analytics_stream".to_string(),
-///     backend: StreamBackend::Kinesis {
+/// let kinesis_stream = StreamConfig::new("analytics_stream".to_string(), StreamBackend::Kinesis {
 ///         region: "us-west-2".to_string(),
 ///         stream_name: "analytics-events".to_string(),
 ///         access_key_id: None,
 ///         secret_access_key: None,
 ///         config: HashMap::new(),
-///     },
-///     partitioning: PartitioningStrategy::JobId,
-///     buffer_config: BufferConfig {
-///         max_events: 100,
-///         max_buffer_time_secs: 5,
-///         batch_size: 25,
-///     },
-///     ..Default::default()
-/// };
+///     })
+///     .with_partitioning(PartitioningStrategy::JobId)
+///     .with_buffer_config(BufferConfig::default()
+///     .with_max_events(100)
+///     .with_max_buffer_time_secs(5)
+///     .with_batch_size(25));
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamConfig {
     /// Unique identifier for this stream
     #[serde(with = "uuid_string")]
@@ -325,6 +297,7 @@ pub struct StreamConfig {
 /// values of the `config` maps (they may hold SASL passwords), only their keys.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum StreamBackend {
     /// Apache Kafka backend
     Kafka {
@@ -453,6 +426,7 @@ impl std::fmt::Debug for StreamBackend {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum PartitioningStrategy {
     /// No partitioning - all events go to single partition
     None,
@@ -473,6 +447,7 @@ pub enum PartitioningStrategy {
 /// Fields that can be used for hash-based partitioning
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PartitionField {
     JobId,
     QueueName,
@@ -524,6 +499,7 @@ pub enum PartitionField {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SerializationFormat {
     /// JSON serialization
     Json,
@@ -549,24 +525,23 @@ pub enum SerializationFormat {
 /// let default_policy = StreamRetryPolicy::default();
 ///
 /// // Custom retry policy for critical events
-/// let aggressive_policy = StreamRetryPolicy {
-///     max_attempts: 10,
-///     initial_delay_secs: 1,
-///     max_delay_secs: 600, // 10 minutes
-///     backoff_multiplier: 2.0,
-///     use_jitter: true,
-/// };
+/// let aggressive_policy = StreamRetryPolicy::default()
+///     .with_max_attempts(10)
+///     .with_initial_delay_secs(1)
+///     .with_max_delay_secs(600)
+///     .with_backoff_multiplier(2.0)
+///     .with_use_jitter(true);
 ///
 /// // Quick retry policy for non-critical events
-/// let fast_policy = StreamRetryPolicy {
-///     max_attempts: 3,
-///     initial_delay_secs: 1,
-///     max_delay_secs: 30,
-///     backoff_multiplier: 1.5,
-///     use_jitter: false,
-/// };
+/// let fast_policy = StreamRetryPolicy::default()
+///     .with_max_attempts(3)
+///     .with_initial_delay_secs(1)
+///     .with_max_delay_secs(30)
+///     .with_backoff_multiplier(1.5)
+///     .with_use_jitter(false);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamRetryPolicy {
     /// Maximum number of delivery attempts per event, including the first one.
     /// `0` is treated as `1` (a single attempt, no retries).
@@ -634,27 +609,25 @@ impl StreamRetryPolicy {
 /// let default_config = BufferConfig::default();
 ///
 /// // High-throughput configuration
-/// let high_throughput = BufferConfig {
-///     max_events: 5000,
-///     max_buffer_time_secs: 10,
-///     batch_size: 500,
-/// };
+/// let high_throughput = BufferConfig::default()
+///     .with_max_events(5000)
+///     .with_max_buffer_time_secs(10)
+///     .with_batch_size(500);
 ///
 /// // Low-latency configuration
-/// let low_latency = BufferConfig {
-///     max_events: 100,
-///     max_buffer_time_secs: 1,
-///     batch_size: 10,
-/// };
+/// let low_latency = BufferConfig::default()
+///     .with_max_events(100)
+///     .with_max_buffer_time_secs(1)
+///     .with_batch_size(10);
 ///
 /// // Memory-constrained configuration
-/// let memory_efficient = BufferConfig {
-///     max_events: 50,
-///     max_buffer_time_secs: 2,
-///     batch_size: 5,
-/// };
+/// let memory_efficient = BufferConfig::default()
+///     .with_max_events(50)
+///     .with_max_buffer_time_secs(2)
+///     .with_batch_size(5);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BufferConfig {
     /// Maximum number of events to buffer
     pub max_events: usize,
@@ -696,6 +669,7 @@ impl Default for StreamConfig {
 
 /// A streamed event with routing metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamedEvent {
     /// The original job lifecycle event
     pub event: JobLifecycleEvent,
@@ -711,6 +685,7 @@ pub struct StreamedEvent {
 
 /// Stream delivery attempt result
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamDelivery {
     /// Unique identifier for this delivery attempt
     #[serde(with = "uuid_string")]
@@ -737,6 +712,7 @@ pub struct StreamDelivery {
 
 /// Statistics for a streaming configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamStats {
     /// Stream configuration ID
     #[serde(with = "uuid_string")]
@@ -772,6 +748,7 @@ pub struct StreamStats {
 
 /// Overall stream manager statistics  
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamManagerGlobalStats {
     /// Total number of configured streams
     pub total_streams: usize,
@@ -812,11 +789,10 @@ pub struct StreamManagerGlobalStats {
 /// let event_manager = Arc::new(EventManager::new_default());
 /// let stream_manager = StreamManager::new(
 ///     event_manager.clone(),
-///     StreamManagerConfig {
-///         max_concurrent_processors: 100,
-///         log_operations: true,
-///         global_flush_interval_secs: 5,
-///     }
+///     StreamManagerConfig::default()
+///         .with_max_concurrent_processors(100)
+///         .with_log_operations(true)
+///         .with_global_flush_interval_secs(5)
 /// );
 ///
 /// // Add streams, start processing, etc.
@@ -860,20 +836,19 @@ pub struct StreamManager {
 /// let default_config = StreamManagerConfig::default();
 ///
 /// // High-throughput configuration
-/// let high_throughput = StreamManagerConfig {
-///     max_concurrent_processors: 200,
-///     log_operations: false, // Reduce logging overhead
-///     global_flush_interval_secs: 30,
-/// };
+/// let high_throughput = StreamManagerConfig::default()
+///     .with_max_concurrent_processors(200)
+///     .with_log_operations(false)
+///     .with_global_flush_interval_secs(30);
 ///
 /// // Development configuration
-/// let dev_config = StreamManagerConfig {
-///     max_concurrent_processors: 10,
-///     log_operations: true,
-///     global_flush_interval_secs: 1, // Fast flushing for testing
-/// };
+/// let dev_config = StreamManagerConfig::default()
+///     .with_max_concurrent_processors(10)
+///     .with_log_operations(true)
+///     .with_global_flush_interval_secs(1); // Fast flushing for testing
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamManagerConfig {
     /// Maximum number of batches being sent at once, across all streams. A batch
     /// holds a slot only while it is being sent, not while it waits to retry.
@@ -1065,11 +1040,10 @@ impl StreamManager {
     /// use std::sync::Arc;
     ///
     /// let event_manager = Arc::new(EventManager::new_default());
-    /// let config = StreamManagerConfig {
-    ///     max_concurrent_processors: 50,
-    ///     log_operations: true,
-    ///     global_flush_interval_secs: 10,
-    /// };
+    /// let config = StreamManagerConfig::default()
+    ///     .with_max_concurrent_processors(50)
+    ///     .with_log_operations(true)
+    ///     .with_global_flush_interval_secs(10);
     /// let stream_manager = StreamManager::new(event_manager, config);
     /// ```
     pub fn new(event_manager: Arc<EventManager>, config: StreamManagerConfig) -> Self {
@@ -1200,18 +1174,13 @@ impl StreamManager {
     /// let event_manager = Arc::new(EventManager::new_default());
     /// let stream_manager = StreamManager::new_default(event_manager);
     ///
-    /// let stream = StreamConfig {
-    ///     id: uuid::Uuid::new_v4(),
-    ///     name: "kafka-stream".to_string(),
-    ///     backend: StreamBackend::Kafka {
+    /// let stream = StreamConfig::new("kafka-stream".to_string(), StreamBackend::Kafka {
     ///         brokers: vec!["localhost:9092".to_string()],
     ///         topic: "events".to_string(),
     ///         config: HashMap::new(),
-    ///     },
-    ///     filter: EventFilter::new(),
-    ///     enabled: true,
-    ///     ..Default::default()
-    /// };
+    ///     })
+    ///     .with_filter(EventFilter::new())
+    ///     .enabled(true);
     ///
     /// stream_manager.add_stream(stream).await?;
     /// # Ok(())
@@ -1278,7 +1247,7 @@ impl StreamManager {
         }
 
         // Start processing task for this stream
-        self.start_stream_processing_task(stream_id, subscription.receiver, stop);
+        self.start_stream_processing_task(stream_id, subscription, stop);
 
         if self.config.log_operations {
             tracing::info!("Added stream: {} ({:?})", stream.name, stream.backend);
@@ -1468,7 +1437,9 @@ impl StreamManager {
     fn start_stream_processing_task(
         &self,
         stream_id: Uuid,
-        mut receiver: broadcast::Receiver<JobLifecycleEvent>,
+        // The listener holds the whole subscription: dropping it (when the listener
+        // stops) unregisters the subscription from the event manager.
+        mut subscription: EventSubscription,
         mut stop: oneshot::Receiver<()>,
     ) {
         let streams = self.streams.clone();
@@ -1575,7 +1546,7 @@ impl StreamManager {
                 let received = tokio::select! {
                     biased;
                     _ = &mut stop => break,
-                    received = receiver.recv() => received,
+                    received = subscription.receiver.recv() => received,
                     _ = flush_due => continue,
                 };
                 match received {
@@ -3152,6 +3123,32 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+with_setters! {
+    StreamRetryPolicy {
+        with_max_attempts(max_attempts): u32,
+        with_initial_delay_secs(initial_delay_secs): u64,
+        with_max_delay_secs(max_delay_secs): u64,
+        with_backoff_multiplier(backoff_multiplier): f64,
+        with_use_jitter(use_jitter): bool,
+    }
+}
+
+with_setters! {
+    BufferConfig {
+        with_max_events(max_events): usize,
+        with_max_buffer_time_secs(max_buffer_time_secs): u64,
+        with_batch_size(batch_size): usize,
+    }
+}
+
+with_setters! {
+    StreamManagerConfig {
+        with_max_concurrent_processors(max_concurrent_processors): usize,
+        with_log_operations(log_operations): bool,
+        with_global_flush_interval_secs(global_flush_interval_secs): u64,
+    }
 }
 
 #[cfg(test)]
@@ -5370,5 +5367,47 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(processor.delivered_ids().len(), 1);
         manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// #81: stream settings built from their defaults with setters.
+    #[test]
+    fn test_stream_settings_builders() {
+        let retry = StreamRetryPolicy::default()
+            .with_max_attempts(4)
+            .with_initial_delay_secs(2)
+            .with_max_delay_secs(20)
+            .with_backoff_multiplier(1.5)
+            .with_use_jitter(false);
+        assert_eq!(
+            (
+                retry.max_attempts,
+                retry.initial_delay_secs,
+                retry.max_delay_secs
+            ),
+            (4, 2, 20)
+        );
+        assert_eq!(retry.backoff_multiplier, 1.5);
+        assert!(!retry.use_jitter);
+
+        let buffer = BufferConfig::default()
+            .with_max_events(10)
+            .with_max_buffer_time_secs(3)
+            .with_batch_size(5);
+        assert_eq!(
+            (
+                buffer.max_events,
+                buffer.max_buffer_time_secs,
+                buffer.batch_size
+            ),
+            (10, 3, 5)
+        );
+
+        let manager = StreamManagerConfig::default()
+            .with_max_concurrent_processors(2)
+            .with_log_operations(false)
+            .with_global_flush_interval_secs(9);
+        assert_eq!(manager.max_concurrent_processors, 2);
+        assert!(!manager.log_operations);
+        assert_eq!(manager.global_flush_interval_secs, 9);
     }
 }

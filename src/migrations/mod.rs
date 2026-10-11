@@ -60,6 +60,7 @@ use tracing::info;
 
 /// Migration identifier and metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Migration {
     /// Unique migration identifier (e.g., "001_initial_schema")
     pub id: String,
@@ -71,8 +72,27 @@ pub struct Migration {
     pub created_at: DateTime<Utc>,
 }
 
+impl Migration {
+    /// A migration `id` (such as `"021_add_my_table"`) at `version`, created now.
+    pub fn new(id: impl Into<String>, description: impl Into<String>, version: u32) -> Self {
+        Self {
+            id: id.into(),
+            description: description.into(),
+            version,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+with_setters! {
+    Migration {
+        with_created_at(created_at): DateTime<Utc>,
+    }
+}
+
 /// Migration execution record
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MigrationRecord {
     pub migration_id: String,
     pub executed_at: DateTime<Utc>,

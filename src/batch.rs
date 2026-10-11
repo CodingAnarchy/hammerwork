@@ -24,6 +24,7 @@ pub type BatchId = Uuid;
 
 /// Strategies for handling partial failures within a batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PartialFailureMode {
     /// Continue processing remaining jobs even if some fail.
     /// Failed jobs are tracked but don't stop batch processing.
@@ -155,6 +156,7 @@ impl Decode<'_, MySql> for BatchStatus {
 
 /// Summary of batch processing results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BatchResult {
     /// Unique identifier for the batch.
     pub batch_id: BatchId,
@@ -180,6 +182,7 @@ pub struct BatchResult {
 
 /// Configuration and container for a batch of jobs to be processed together.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JobBatch {
     /// Unique identifier for this batch.
     pub id: BatchId,

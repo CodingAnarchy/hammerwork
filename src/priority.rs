@@ -428,6 +428,7 @@ impl Default for PriorityWeights {
 
 /// Errors related to priority handling
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum PriorityError {
     #[error("Invalid priority value: {0}. Must be between 0 and 4")]
     InvalidPriorityValue(i32),
@@ -446,6 +447,7 @@ pub enum PriorityError {
 
 /// Priority-aware job selection strategy
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub enum PrioritySelectionStrategy {
     /// Weighted random selection based on priority weights
     #[default]
@@ -460,6 +462,7 @@ pub enum PrioritySelectionStrategy {
 
 /// Priority queue statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PriorityStats {
     /// Number of jobs per priority level
     pub job_counts: HashMap<JobPriority, u64>,

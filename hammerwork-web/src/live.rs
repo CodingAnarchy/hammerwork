@@ -318,6 +318,8 @@ pub fn job_update_from_event(event: &JobLifecycleEvent) -> JobUpdate {
         E::TimedOut => "TimedOut",
         E::Cancelled => "Cancelled",
         E::Archived => "Archived",
+        // `JobLifecycleEventType` is non-exhaustive: an event type added later.
+        _ => "Unknown",
     };
     let attempts = event
         .error
@@ -401,12 +403,7 @@ mod tests {
             id,
             "emails".to_string(),
             JobPriority::High,
-            hammerwork::events::JobError {
-                message: "boom".to_string(),
-                error_type: None,
-                details: None,
-                retry_attempt: Some(2),
-            },
+            hammerwork::events::JobError::new("boom".to_string()).with_retry_attempt(2),
         );
         let update = job_update_from_event(&event);
         assert_eq!(update.id, id.to_string());
@@ -522,14 +519,11 @@ mod tests {
             new_state(),
             10,
         );
-        let stats = |name: &str, pending: u64| hammerwork::stats::QueueStats {
-            queue_name: name.to_string(),
-            pending_count: pending,
-            running_count: 0,
-            dead_count: 0,
-            timed_out_count: 0,
-            completed_count: 0,
-            statistics: Default::default(),
+        let stats = |name: &str, pending: u64| {
+            let mut stats = hammerwork::stats::QueueStats::default();
+            stats.queue_name = name.to_string();
+            stats.pending_count = pending;
+            stats
         };
         let first = live.changed_queues(vec![stats("a", 1), stats("b", 0)]);
         assert_eq!(first.len(), 2);

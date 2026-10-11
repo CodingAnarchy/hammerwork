@@ -10,6 +10,7 @@ use super::*;
 /// enabled, so `with_autoscaling(AutoscaleConfig::default())` turns autoscaling on; see
 /// [`WorkerPool::with_autoscaling`] for which workers it starts and retires.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AutoscaleConfig {
     /// Whether autoscaling is enabled
     pub enabled: bool,
@@ -139,6 +140,7 @@ impl AutoscaleConfig {
 
 /// Metrics for autoscaling decisions
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct AutoscaleMetrics {
     /// Current number of active workers: those of the autoscaled queue when
     /// autoscaling is enabled, otherwise all of the pool's workers

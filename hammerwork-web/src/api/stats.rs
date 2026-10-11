@@ -1019,15 +1019,12 @@ mod tests {
 
     #[test]
     fn test_overview_counts_failed_dead_and_timed_out_jobs_as_failed() {
-        let mut stats = hammerwork::stats::QueueStats {
-            queue_name: "q".to_string(),
-            pending_count: 1,
-            running_count: 0,
-            dead_count: 2,
-            timed_out_count: 3,
-            completed_count: 4,
-            statistics: Default::default(),
-        };
+        let mut stats = hammerwork::stats::QueueStats::default();
+        stats.queue_name = "q".to_string();
+        stats.pending_count = 1;
+        stats.dead_count = 2;
+        stats.timed_out_count = 3;
+        stats.completed_count = 4;
         // Jobs in status `Failed` (a failed dependency, a fail-fast batch, `fail_job`)
         stats.statistics.failed = 5;
         let overview = generate_overview_from_stats(&[stats], 0);

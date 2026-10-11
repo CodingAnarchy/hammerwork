@@ -76,6 +76,7 @@ impl RateLimit {
 
 /// Throttling configuration for queues
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct ThrottleConfig {
     /// Maximum number of concurrent jobs for this queue
     pub max_concurrent: Option<u64>,

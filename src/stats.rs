@@ -9,6 +9,7 @@ use std::{
 
 /// Statistics for job processing over a time window
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JobStatistics {
     /// Number of job runs that finished in the time window: every recorded event
     /// except `Started` (a run is counted by its outcome)
@@ -64,7 +65,8 @@ impl Default for JobStatistics {
 }
 
 /// Queue-specific statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct QueueStats {
     /// Name of the queue
     pub queue_name: String,
@@ -84,6 +86,7 @@ pub struct QueueStats {
 
 /// Summary of dead jobs across the system
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DeadJobSummary {
     /// Total number of dead jobs across all queues
     pub total_dead_jobs: u64,
@@ -99,6 +102,7 @@ pub struct DeadJobSummary {
 
 /// Job processing event for statistics collection
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JobEvent {
     pub job_id: uuid::Uuid,
     pub queue_name: String,
@@ -110,6 +114,7 @@ pub struct JobEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JobEventType {
     Started,
     Completed,
@@ -156,6 +161,7 @@ pub struct InMemoryStatsCollector {
 
 /// Configuration for statistics collection
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StatsConfig {
     /// Maximum number of events to keep in memory; the oldest are dropped first.
     pub max_events: usize,
@@ -486,6 +492,43 @@ impl StatisticsCollector for InMemoryStatsCollector {
         let original_len = events.len();
         events.retain(|event| event.timestamp >= cutoff);
         Ok((original_len - events.len()) as u64)
+    }
+}
+
+with_setters! {
+    StatsConfig {
+        with_max_events(max_events): usize,
+        with_max_event_age_secs(max_event_age_secs): u64,
+        with_collect_timing(collect_timing): bool,
+    }
+}
+
+impl JobEvent {
+    /// An event of type `event_type` for the job `job_id`, timestamped now, with no
+    /// processing time or error message.
+    pub fn new(
+        job_id: uuid::Uuid,
+        queue_name: impl Into<String>,
+        event_type: JobEventType,
+        priority: JobPriority,
+    ) -> Self {
+        Self {
+            job_id,
+            queue_name: queue_name.into(),
+            event_type,
+            priority,
+            processing_time_ms: None,
+            error_message: None,
+            timestamp: Utc::now(),
+        }
+    }
+}
+
+with_setters! {
+    JobEvent {
+        with_processing_time_ms(processing_time_ms): Some(u64),
+        with_error_message(error_message): Some(String),
+        with_timestamp(timestamp): DateTime<Utc>,
     }
 }
 
@@ -1310,5 +1353,29 @@ mod tests {
         assert_eq!(stats.completed, 1);
         assert_eq!(stats.error_rate, 0.5);
         assert_eq!(stats.running, 0);
+    }
+
+    /// #81: `JobEvent` and `StatsConfig` built with constructors and setters.
+    #[test]
+    fn test_job_event_and_stats_config_builders() {
+        let id = uuid::Uuid::new_v4();
+        let at = Utc::now() - chrono::Duration::seconds(1);
+        let event = JobEvent::new(id, "q", JobEventType::Failed, JobPriority::Low)
+            .with_processing_time_ms(10)
+            .with_error_message("boom".to_string())
+            .with_timestamp(at);
+        assert_eq!((event.job_id, event.queue_name.as_str()), (id, "q"));
+        assert_eq!(event.event_type, JobEventType::Failed);
+        assert_eq!(event.priority, JobPriority::Low);
+        assert_eq!(event.processing_time_ms, Some(10));
+        assert_eq!(event.error_message.as_deref(), Some("boom"));
+        assert_eq!(event.timestamp, at);
+
+        let config = StatsConfig::default()
+            .with_max_events(5)
+            .with_max_event_age_secs(60)
+            .with_collect_timing(false);
+        assert_eq!((config.max_events, config.max_event_age_secs), (5, 60));
+        assert!(!config.collect_timing);
     }
 }

@@ -328,6 +328,7 @@ fn error_backoff(base: Duration, consecutive_errors: u32) -> Duration {
 
 /// Statistics for batch job processing by a worker.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct BatchProcessingStats {
     /// Total number of batch jobs processed
     pub jobs_processed: u64,
@@ -437,6 +438,7 @@ pub type JobHandlerWithResult = Arc<
 
 /// Result returned by job handlers, optionally containing result data.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JobResult {
     /// Optional result data to store for retrieval
     pub data: Option<serde_json::Value>,
@@ -462,6 +464,7 @@ impl Default for JobResult {
 
 /// Enum to support both original and enhanced job handlers
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum JobHandlerType {
     /// Original handler type that returns Result<()>
     Legacy(JobHandler),

@@ -67,6 +67,7 @@ pub type ArchivalPolicyId = String;
 /// assert_eq!(ArchivalReason::default(), ArchivalReason::Automatic);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ArchivalReason {
     /// Job was archived due to automatic policy.
     #[default]
@@ -155,6 +156,7 @@ impl std::fmt::Display for ArchivalReason {
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ArchiveEvent {
     /// A job was archived
     JobArchived {
@@ -209,6 +211,7 @@ pub enum ArchiveEvent {
 ///     .purge_archived_after(Duration::days(365));
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ArchivalPolicy {
     /// How long to keep completed jobs before archiving.
     pub archive_completed_after: Option<Duration>,
@@ -462,6 +465,7 @@ impl ArchivalPolicy {
 
 /// Configuration for archive storage and compression settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ArchivalConfig {
     /// Default compression level (0-9, where 9 is maximum compression).
     pub compression_level: u32,
@@ -555,15 +559,14 @@ impl ArchivalConfig {
 /// use chrono::Utc;
 /// use std::time::Duration;
 ///
-/// let stats = ArchivalStats {
-///     jobs_archived: 150,
-///     jobs_purged: 25,
-///     bytes_archived: 1024 * 1024, // 1MB
-///     bytes_purged: 500 * 1024,    // 500KB
-///     compression_ratio: 0.7,      // 30% size reduction
-///     operation_duration: Duration::from_secs(45),
-///     last_run_at: Utc::now(),
-/// };
+/// let mut stats = ArchivalStats::default();
+/// stats.jobs_archived = 150;
+/// stats.jobs_purged = 25;
+/// stats.bytes_archived = 1024 * 1024;
+/// stats.bytes_purged = 500 * 1024;
+/// stats.compression_ratio = 0.7;
+/// stats.operation_duration = Duration::from_secs(45);
+/// stats.last_run_at = Utc::now();
 ///
 /// assert_eq!(stats.jobs_archived, 150);
 /// assert_eq!(stats.compression_ratio, 0.7);
@@ -575,6 +578,7 @@ impl ArchivalConfig {
 /// assert_eq!(default_stats.compression_ratio, 1.0);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ArchivalStats {
     /// Number of jobs archived in the last operation.
     pub jobs_archived: u64,
@@ -622,17 +626,17 @@ impl Default for ArchivalStats {
 /// let job_id = Uuid::new_v4();
 /// let now = Utc::now();
 ///
-/// let archived_job = ArchivedJob {
-///     id: job_id,
-///     queue_name: "email_queue".to_string(),
-///     status: JobStatus::Completed,
-///     created_at: now,
-///     archived_at: now,
-///     archival_reason: ArchivalReason::Automatic,
-///     original_payload_size: Some(1024),
-///     payload_compressed: true,
-///     archived_by: Some("scheduler".to_string()),
-/// };
+/// let archived_job = ArchivedJob::new(
+///     job_id,
+///     "email_queue",
+///     JobStatus::Completed,
+///     now,
+///     now,
+///     ArchivalReason::Automatic,
+/// )
+/// .with_original_payload_size(1024)
+/// .with_payload_compressed(true)
+/// .with_archived_by("scheduler".to_string());
 ///
 /// assert_eq!(archived_job.queue_name, "email_queue");
 /// assert_eq!(archived_job.status, JobStatus::Completed);
@@ -640,6 +644,7 @@ impl Default for ArchivalStats {
 /// assert!(archived_job.payload_compressed);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ArchivedJob {
     /// Unique identifier of the archived job.
     pub id: JobId,
@@ -659,6 +664,51 @@ pub struct ArchivedJob {
     pub payload_compressed: bool,
     /// Who or what archived the job.
     pub archived_by: Option<String>,
+    /// The workflow the job belonged to, if any.
+    #[serde(default)]
+    pub workflow_id: Option<crate::workflow::WorkflowId>,
+    /// The name of the workflow the job belonged to, if any.
+    #[serde(default)]
+    pub workflow_name: Option<String>,
+}
+
+impl ArchivedJob {
+    /// An archived job record with no payload size, an uncompressed payload, and no
+    /// `archived_by` or workflow. Queue backends build these when listing the archive;
+    /// the constructor is public for code that lists archived jobs itself (such as the
+    /// dashboard) and for tests.
+    pub fn new(
+        id: JobId,
+        queue_name: impl Into<String>,
+        status: JobStatus,
+        created_at: DateTime<Utc>,
+        archived_at: DateTime<Utc>,
+        archival_reason: ArchivalReason,
+    ) -> Self {
+        Self {
+            id,
+            queue_name: queue_name.into(),
+            status,
+            created_at,
+            archived_at,
+            archival_reason,
+            original_payload_size: None,
+            payload_compressed: false,
+            archived_by: None,
+            workflow_id: None,
+            workflow_name: None,
+        }
+    }
+}
+
+with_setters! {
+    ArchivedJob {
+        with_original_payload_size(original_payload_size): Some(usize),
+        with_payload_compressed(payload_compressed): bool,
+        with_archived_by(archived_by): Some(String),
+        with_workflow_id(workflow_id): Some(crate::workflow::WorkflowId),
+        with_workflow_name(workflow_name): Some(String),
+    }
 }
 
 /// Upper bound on the number of `batch_size` batches a single
@@ -688,6 +738,7 @@ where
 
 /// Result of one [`JobArchiver::run_scheduled_pass`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScheduledArchivalPass {
     /// Jobs moved to the archive table.
     pub jobs_archived: u64,
@@ -1733,5 +1784,48 @@ mod tests {
         assert_eq!(ArchivalReason::Manual.to_string(), "Manual");
         assert_eq!(ArchivalReason::Compliance.to_string(), "Compliance");
         assert_eq!(ArchivalReason::Maintenance.to_string(), "Maintenance");
+    }
+
+    /// #81: `ArchivedJob` built with its constructor and setters.
+    #[test]
+    fn test_archived_job_builder() {
+        let id = Uuid::new_v4();
+        let workflow = Uuid::new_v4();
+        let now = Utc::now();
+        let job = ArchivedJob::new(
+            id,
+            "emails",
+            JobStatus::Dead,
+            now,
+            now,
+            ArchivalReason::Automatic,
+        );
+        assert_eq!(
+            (job.original_payload_size, job.payload_compressed),
+            (None, false)
+        );
+        assert_eq!((job.archived_by.as_deref(), job.workflow_id), (None, None));
+
+        let job = job
+            .with_original_payload_size(10)
+            .with_payload_compressed(true)
+            .with_archived_by("cli".to_string())
+            .with_workflow_id(workflow)
+            .with_workflow_name("nightly".to_string());
+        assert_eq!(job.id, id);
+        assert_eq!(job.queue_name, "emails");
+        assert_eq!(job.original_payload_size, Some(10));
+        assert!(job.payload_compressed);
+        assert_eq!(job.archived_by.as_deref(), Some("cli"));
+        assert_eq!(job.workflow_id, Some(workflow));
+        assert_eq!(job.workflow_name.as_deref(), Some("nightly"));
+
+        // Archives listed by older versions have no workflow fields.
+        let mut value = serde_json::to_value(&job).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("workflow_id");
+        object.remove("workflow_name");
+        let decoded: ArchivedJob = serde_json::from_value(value).unwrap();
+        assert_eq!((decoded.workflow_id, decoded.workflow_name), (None, None));
     }
 }
