@@ -130,46 +130,24 @@ where
 mod postgres_tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_weighted_dequeue_never_double_claims() {
-        weighted_dequeue_never_double_claims(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_weighted_dequeue_preserves_job_fields() {
-        weighted_dequeue_preserves_job_fields(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_dequeue_skips_jobs_waiting_on_dependencies() {
-        dequeue_skips_jobs_waiting_on_dependencies(test_utils::setup_postgres_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_postgres_queue;
+        test_postgres_weighted_dequeue_never_double_claims => weighted_dequeue_never_double_claims,
+        test_postgres_weighted_dequeue_preserves_job_fields => weighted_dequeue_preserves_job_fields,
+        test_postgres_dequeue_skips_jobs_waiting_on_dependencies => dequeue_skips_jobs_waiting_on_dependencies,
+    );
 }
 
 #[cfg(feature = "mysql")]
 mod mysql_tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_weighted_dequeue_never_double_claims() {
-        weighted_dequeue_never_double_claims(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_weighted_dequeue_preserves_job_fields() {
-        weighted_dequeue_preserves_job_fields(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_dequeue_skips_jobs_waiting_on_dependencies() {
-        dequeue_skips_jobs_waiting_on_dependencies(test_utils::setup_mysql_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_mysql_queue;
+        test_mysql_weighted_dequeue_never_double_claims => weighted_dequeue_never_double_claims,
+        test_mysql_weighted_dequeue_preserves_job_fields => weighted_dequeue_preserves_job_fields,
+        test_mysql_dequeue_skips_jobs_waiting_on_dependencies => dequeue_skips_jobs_waiting_on_dependencies,
+    );
 
     /// A pooled connection returned while still inside a transaction (as happens when a
     /// future is dropped mid-transaction) must not break later claims on it.

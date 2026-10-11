@@ -376,24 +376,8 @@ where
     }
 }
 
-/// One `#[tokio::test]` per scenario, run against the queue returned by `$setup`.
-macro_rules! backend_tests {
-    ($module:ident, $setup:path, $ignore:meta, [$($scenario:ident),* $(,)?]) => {
-        mod $module {
-            use super::*;
-            $(
-                #[tokio::test]
-                #[$ignore]
-                async fn $scenario() {
-                    super::$scenario($setup().await).await;
-                }
-            )*
-        }
-    };
-}
-
 #[cfg(feature = "postgres")]
-backend_tests!(
+crate::test_utils::backend_tests!(
     postgres_tests,
     test_utils::setup_postgres_queue,
     ignore = "requires PostgreSQL: DATABASE_URL",
@@ -407,7 +391,7 @@ backend_tests!(
 );
 
 #[cfg(feature = "mysql")]
-backend_tests!(
+crate::test_utils::backend_tests!(
     mysql_tests,
     test_utils::setup_mysql_queue,
     ignore = "requires MySQL: MYSQL_DATABASE_URL",
@@ -421,14 +405,9 @@ backend_tests!(
 );
 
 #[cfg(feature = "test")]
-async fn test_queue() -> Arc<hammerwork::queue::test::TestQueue> {
-    Arc::new(hammerwork::queue::test::TestQueue::new())
-}
-
-#[cfg(feature = "test")]
-backend_tests!(
+crate::test_utils::backend_tests!(
     test_queue_tests,
-    test_queue,
+    test_utils::test_queue,
     allow(unused_attributes),
     [
         fail_job_is_terminal,

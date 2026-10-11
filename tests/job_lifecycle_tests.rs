@@ -22,31 +22,9 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
-
-/// Poll `get_job` until `predicate` holds or `timeout` elapses; returns the last job.
-async fn wait_for_job<DB, F>(
-    queue: &Arc<JobQueue<DB>>,
-    id: JobId,
-    timeout: Duration,
-    predicate: F,
-) -> Job
-where
-    DB: sqlx::Database,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
-    F: Fn(&Job) -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        let job = queue.get_job(id).await.unwrap().expect("job exists");
-        if predicate(&job) || Instant::now() >= deadline {
-            return job;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 /// Wait until no job of `ids` is `Pending` or `Running` (or `timeout` elapses).
 async fn wait_until_finished<DB>(queue: &Arc<JobQueue<DB>>, ids: &[JobId], timeout: Duration)
@@ -55,7 +33,7 @@ where
     JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
 {
     for id in ids {
-        wait_for_job(queue, *id, timeout, |job| {
+        test_utils::wait_for_job(queue, *id, timeout, |job| {
             !matches!(job.status, JobStatus::Pending | JobStatus::Running)
         })
         .await;
@@ -267,7 +245,7 @@ where
             w = w.with_max_retries(cap);
         }
         let running = RunningWorker::start(w);
-        let job = wait_for_job(&queue, id, Duration::from_secs(15), |job| {
+        let job = test_utils::wait_for_job(&queue, id, Duration::from_secs(15), |job| {
             job.status == JobStatus::Dead
         })
         .await;
@@ -389,7 +367,7 @@ where
     let started = Utc::now();
     let running = RunningWorker::start(worker(&queue, &queue_name, handler));
     for id in [dies, times_out] {
-        wait_for_job(&queue, id, Duration::from_secs(15), |job| {
+        test_utils::wait_for_job(&queue, id, Duration::from_secs(15), |job| {
             job.status != JobStatus::Running && job.scheduled_at > started
         })
         .await;
@@ -886,159 +864,40 @@ where
 mod postgres_tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_manual_transitions_are_guarded() {
-        manual_transitions_are_guarded(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_zombie_worker_cannot_overwrite_reclaimed_job() {
-        zombie_worker_cannot_overwrite_reclaimed_job(test_utils::setup_postgres_queue().await)
-            .await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_job_max_attempts_is_the_retry_limit() {
-        job_max_attempts_is_the_retry_limit(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_timeouts_retry_until_attempts_are_exhausted() {
-        timeouts_retry_until_attempts_are_exhausted(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_recurring_jobs_are_rescheduled_after_terminal_failure() {
-        recurring_jobs_are_rescheduled_after_terminal_failure(
-            test_utils::setup_postgres_queue().await,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_workflows_complete_end_to_end() {
-        workflows_complete_end_to_end(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_workflow_failure_policies() {
-        workflow_failure_policies(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_concurrent_parent_completions_release_child() {
-        concurrent_parent_completions_release_child(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_concurrent_completions_do_not_block() {
-        concurrent_completions_do_not_block(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_batch_failure_modes_are_enforced() {
-        batch_failure_modes_are_enforced(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_retry_strategy_is_persisted() {
-        retry_strategy_is_persisted(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_enqueue_batch_stores_all_fields() {
-        enqueue_batch_stores_all_fields(test_utils::setup_postgres_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_postgres_queue;
+        test_postgres_manual_transitions_are_guarded => manual_transitions_are_guarded,
+        test_postgres_zombie_worker_cannot_overwrite_reclaimed_job => zombie_worker_cannot_overwrite_reclaimed_job,
+        test_postgres_job_max_attempts_is_the_retry_limit => job_max_attempts_is_the_retry_limit,
+        test_postgres_timeouts_retry_until_attempts_are_exhausted => timeouts_retry_until_attempts_are_exhausted,
+        test_postgres_recurring_jobs_are_rescheduled_after_terminal_failure => recurring_jobs_are_rescheduled_after_terminal_failure,
+        test_postgres_workflows_complete_end_to_end => workflows_complete_end_to_end,
+        test_postgres_workflow_failure_policies => workflow_failure_policies,
+        test_postgres_concurrent_parent_completions_release_child => concurrent_parent_completions_release_child,
+        test_postgres_concurrent_completions_do_not_block => concurrent_completions_do_not_block,
+        test_postgres_batch_failure_modes_are_enforced => batch_failure_modes_are_enforced,
+        test_postgres_retry_strategy_is_persisted => retry_strategy_is_persisted,
+        test_postgres_enqueue_batch_stores_all_fields => enqueue_batch_stores_all_fields,
+    );
 }
 
 #[cfg(feature = "mysql")]
 mod mysql_tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_manual_transitions_are_guarded() {
-        manual_transitions_are_guarded(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_zombie_worker_cannot_overwrite_reclaimed_job() {
-        zombie_worker_cannot_overwrite_reclaimed_job(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_job_max_attempts_is_the_retry_limit() {
-        job_max_attempts_is_the_retry_limit(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_timeouts_retry_until_attempts_are_exhausted() {
-        timeouts_retry_until_attempts_are_exhausted(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_recurring_jobs_are_rescheduled_after_terminal_failure() {
-        recurring_jobs_are_rescheduled_after_terminal_failure(
-            test_utils::setup_mysql_queue().await,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_workflows_complete_end_to_end() {
-        workflows_complete_end_to_end(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_workflow_failure_policies() {
-        workflow_failure_policies(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_concurrent_parent_completions_release_child() {
-        concurrent_parent_completions_release_child(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_concurrent_completions_do_not_block() {
-        concurrent_completions_do_not_block(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_batch_failure_modes_are_enforced() {
-        batch_failure_modes_are_enforced(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_retry_strategy_is_persisted() {
-        retry_strategy_is_persisted(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_enqueue_batch_stores_all_fields() {
-        enqueue_batch_stores_all_fields(test_utils::setup_mysql_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_mysql_queue;
+        test_mysql_manual_transitions_are_guarded => manual_transitions_are_guarded,
+        test_mysql_zombie_worker_cannot_overwrite_reclaimed_job => zombie_worker_cannot_overwrite_reclaimed_job,
+        test_mysql_job_max_attempts_is_the_retry_limit => job_max_attempts_is_the_retry_limit,
+        test_mysql_timeouts_retry_until_attempts_are_exhausted => timeouts_retry_until_attempts_are_exhausted,
+        test_mysql_recurring_jobs_are_rescheduled_after_terminal_failure => recurring_jobs_are_rescheduled_after_terminal_failure,
+        test_mysql_workflows_complete_end_to_end => workflows_complete_end_to_end,
+        test_mysql_workflow_failure_policies => workflow_failure_policies,
+        test_mysql_concurrent_parent_completions_release_child => concurrent_parent_completions_release_child,
+        test_mysql_concurrent_completions_do_not_block => concurrent_completions_do_not_block,
+        test_mysql_batch_failure_modes_are_enforced => batch_failure_modes_are_enforced,
+        test_mysql_retry_strategy_is_persisted => retry_strategy_is_persisted,
+        test_mysql_enqueue_batch_stores_all_fields => enqueue_batch_stores_all_fields,
+    );
 }

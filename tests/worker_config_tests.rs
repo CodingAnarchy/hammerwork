@@ -30,24 +30,6 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-/// Poll `condition` until it holds or `timeout` elapses; returns whether it held.
-async fn eventually<F, Fut>(timeout: Duration, mut condition: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let deadline = Instant::now() + timeout;
-    loop {
-        if condition().await {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
 /// Wait until every job in `ids` matches `predicate`.
 async fn wait_for_jobs<DB, P>(
     queue: &Arc<JobQueue<DB>>,
@@ -60,7 +42,7 @@ where
     JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
     P: Fn(&Job) -> bool,
 {
-    eventually(timeout, || async {
+    test_utils::eventually(timeout, || async {
         for id in ids {
             match queue.get_job(*id).await.unwrap() {
                 Some(job) if predicate(&job) => {}
@@ -516,7 +498,7 @@ where
     );
 
     // With the queue empty it scales back down to min_workers.
-    let scaled_down = eventually(Duration::from_secs(10), || async {
+    let scaled_down = test_utils::eventually(Duration::from_secs(10), || async {
         pool.get_autoscale_metrics().active_workers == 1
     })
     .await;
@@ -953,7 +935,7 @@ where
     let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
 
     // Let alerts fire (and hang) while the queue is idle, then give it work.
-    let fired = eventually(Duration::from_secs(5), || async {
+    let fired = test_utils::eventually(Duration::from_secs(5), || async {
         accepted.load(Ordering::SeqCst) > 0
     })
     .await;
@@ -1164,106 +1146,34 @@ mod postgres_tests {
         Arc::new(JobQueue::new(pool))
     }
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_pool_runs_pool_size_workers() {
-        pool_runs_pool_size_workers(queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        queue;
+        test_postgres_pool_runs_pool_size_workers => pool_runs_pool_size_workers,
+        test_postgres_config_timeout_and_retry_strategy_apply => config_timeout_and_retry_strategy_apply,
+        test_postgres_config_strict_priority_orders_jobs => config_strict_priority_orders_jobs,
+        test_postgres_throttle_max_concurrent_caps_the_pool => throttle_max_concurrent_caps_the_pool,
+        test_postgres_throttle_rate_limits_the_pool => throttle_rate_limits_the_pool,
+        test_postgres_autoscaling_adds_and_retires_workers => autoscaling_adds_and_retires_workers,
+        test_postgres_autoscaling_only_scales_the_template_queue => autoscaling_only_scales_the_template_queue,
+        test_postgres_rate_limit_is_not_spent_on_empty_polls => rate_limit_is_not_spent_on_empty_polls,
+        test_postgres_worker_waits_while_queue_is_paused => worker_waits_while_queue_is_paused,
+        test_postgres_job_hooks_fire_for_each_outcome => job_hooks_fire_for_each_outcome,
+        #[cfg(feature = "alerting")]
+        test_postgres_worker_sends_queue_depth_and_starvation_alerts => worker_sends_queue_depth_and_starvation_alerts,
+        #[cfg(feature = "alerting")]
+        test_postgres_worker_sends_error_rate_alerts => worker_sends_error_rate_alerts,
+        #[cfg(feature = "alerting")]
+        test_postgres_hanging_alert_target_does_not_block_jobs => hanging_alert_target_does_not_block_jobs,
+        #[cfg(feature = "metrics")]
+        test_postgres_worker_records_prometheus_metrics => worker_records_prometheus_metrics,
+        #[cfg(feature = "webhooks")]
+        test_postgres_worker_publishes_lifecycle_events => worker_publishes_lifecycle_events,
+    );
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_config_timeout_and_retry_strategy_apply() {
-        config_timeout_and_retry_strategy_apply(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_config_strict_priority_orders_jobs() {
-        config_strict_priority_orders_jobs(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_throttle_max_concurrent_caps_the_pool() {
-        throttle_max_concurrent_caps_the_pool(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_throttle_rate_limits_the_pool() {
-        throttle_rate_limits_the_pool(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_autoscaling_adds_and_retires_workers() {
-        autoscaling_adds_and_retires_workers(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_autoscaling_only_scales_the_template_queue() {
-        autoscaling_only_scales_the_template_queue(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_rate_limit_is_not_spent_on_empty_polls() {
-        rate_limit_is_not_spent_on_empty_polls(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_worker_waits_while_queue_is_paused() {
-        worker_waits_while_queue_is_paused(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_job_hooks_fire_for_each_outcome() {
-        job_hooks_fire_for_each_outcome(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_worker_backs_off_on_errors_and_stops_promptly() {
-        worker_backs_off_on_errors_and_stops_promptly(broken_queue().await).await;
-    }
-
-    #[cfg(feature = "alerting")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_worker_sends_queue_depth_and_starvation_alerts() {
-        worker_sends_queue_depth_and_starvation_alerts(queue().await).await;
-    }
-
-    #[cfg(feature = "alerting")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_worker_sends_error_rate_alerts() {
-        worker_sends_error_rate_alerts(queue().await).await;
-    }
-
-    #[cfg(feature = "alerting")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_hanging_alert_target_does_not_block_jobs() {
-        hanging_alert_target_does_not_block_jobs(queue().await).await;
-    }
-
-    #[cfg(feature = "metrics")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_worker_records_prometheus_metrics() {
-        worker_records_prometheus_metrics(queue().await).await;
-    }
-
-    #[cfg(feature = "webhooks")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_worker_publishes_lifecycle_events() {
-        worker_publishes_lifecycle_events(queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        broken_queue;
+        test_postgres_worker_backs_off_on_errors_and_stops_promptly => worker_backs_off_on_errors_and_stops_promptly,
+    );
 }
 
 #[cfg(feature = "mysql")]
@@ -1283,104 +1193,32 @@ mod mysql_tests {
         Arc::new(JobQueue::new(pool))
     }
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_pool_runs_pool_size_workers() {
-        pool_runs_pool_size_workers(queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        queue;
+        test_mysql_pool_runs_pool_size_workers => pool_runs_pool_size_workers,
+        test_mysql_config_timeout_and_retry_strategy_apply => config_timeout_and_retry_strategy_apply,
+        test_mysql_config_strict_priority_orders_jobs => config_strict_priority_orders_jobs,
+        test_mysql_throttle_max_concurrent_caps_the_pool => throttle_max_concurrent_caps_the_pool,
+        test_mysql_throttle_rate_limits_the_pool => throttle_rate_limits_the_pool,
+        test_mysql_autoscaling_adds_and_retires_workers => autoscaling_adds_and_retires_workers,
+        test_mysql_autoscaling_only_scales_the_template_queue => autoscaling_only_scales_the_template_queue,
+        test_mysql_rate_limit_is_not_spent_on_empty_polls => rate_limit_is_not_spent_on_empty_polls,
+        test_mysql_worker_waits_while_queue_is_paused => worker_waits_while_queue_is_paused,
+        test_mysql_job_hooks_fire_for_each_outcome => job_hooks_fire_for_each_outcome,
+        #[cfg(feature = "alerting")]
+        test_mysql_worker_sends_queue_depth_and_starvation_alerts => worker_sends_queue_depth_and_starvation_alerts,
+        #[cfg(feature = "alerting")]
+        test_mysql_worker_sends_error_rate_alerts => worker_sends_error_rate_alerts,
+        #[cfg(feature = "alerting")]
+        test_mysql_hanging_alert_target_does_not_block_jobs => hanging_alert_target_does_not_block_jobs,
+        #[cfg(feature = "metrics")]
+        test_mysql_worker_records_prometheus_metrics => worker_records_prometheus_metrics,
+        #[cfg(feature = "webhooks")]
+        test_mysql_worker_publishes_lifecycle_events => worker_publishes_lifecycle_events,
+    );
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_config_timeout_and_retry_strategy_apply() {
-        config_timeout_and_retry_strategy_apply(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_config_strict_priority_orders_jobs() {
-        config_strict_priority_orders_jobs(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_throttle_max_concurrent_caps_the_pool() {
-        throttle_max_concurrent_caps_the_pool(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_throttle_rate_limits_the_pool() {
-        throttle_rate_limits_the_pool(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_autoscaling_adds_and_retires_workers() {
-        autoscaling_adds_and_retires_workers(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_autoscaling_only_scales_the_template_queue() {
-        autoscaling_only_scales_the_template_queue(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_rate_limit_is_not_spent_on_empty_polls() {
-        rate_limit_is_not_spent_on_empty_polls(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_worker_waits_while_queue_is_paused() {
-        worker_waits_while_queue_is_paused(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_job_hooks_fire_for_each_outcome() {
-        job_hooks_fire_for_each_outcome(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_worker_backs_off_on_errors_and_stops_promptly() {
-        worker_backs_off_on_errors_and_stops_promptly(broken_queue().await).await;
-    }
-
-    #[cfg(feature = "alerting")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_worker_sends_queue_depth_and_starvation_alerts() {
-        worker_sends_queue_depth_and_starvation_alerts(queue().await).await;
-    }
-
-    #[cfg(feature = "alerting")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_worker_sends_error_rate_alerts() {
-        worker_sends_error_rate_alerts(queue().await).await;
-    }
-
-    #[cfg(feature = "alerting")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_hanging_alert_target_does_not_block_jobs() {
-        hanging_alert_target_does_not_block_jobs(queue().await).await;
-    }
-
-    #[cfg(feature = "metrics")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_worker_records_prometheus_metrics() {
-        worker_records_prometheus_metrics(queue().await).await;
-    }
-
-    #[cfg(feature = "webhooks")]
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_worker_publishes_lifecycle_events() {
-        worker_publishes_lifecycle_events(queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        broken_queue;
+        test_mysql_worker_backs_off_on_errors_and_stops_promptly => worker_backs_off_on_errors_and_stops_promptly,
+    );
 }

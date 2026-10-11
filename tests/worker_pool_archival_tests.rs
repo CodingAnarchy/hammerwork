@@ -11,18 +11,12 @@ mod test_utils;
 
 use chrono::Utc;
 use hammerwork::{
-    HammerworkConfig, Job, JobId, JobQueue, JobStatus, Worker, WorkerPool,
+    HammerworkConfig, Job, JobId, JobQueue, JobStatus, WorkerPool,
     archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason, JobArchiver},
     queue::DatabaseQueue,
-    worker::JobHandler,
 };
 use serde_json::json;
-use std::{
-    collections::HashSet,
-    future::Future,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 /// Archive completed jobs at once; keep archived jobs for an hour.
 fn policy() -> ArchivalPolicy {
@@ -66,37 +60,6 @@ where
         .into_iter()
         .map(|job| job.id)
         .collect()
-}
-
-/// Polls `condition` every 50ms until it holds or 20 seconds pass.
-async fn eventually<F, Fut>(condition: F) -> bool
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if condition().await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    false
-}
-
-/// A worker on a queue of its own, so it never touches the jobs under test.
-fn idle_worker<DB>(queue: &Arc<JobQueue<DB>>) -> Worker<DB>
-where
-    DB: sqlx::Database + Send + Sync + 'static,
-    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
-{
-    let handler: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
-    Worker::new(
-        Arc::clone(queue),
-        test_utils::unique_queue("archival_idle"),
-        handler,
-    )
-    .with_poll_interval(Duration::from_millis(50))
 }
 
 /// The pool archives eligible jobs (in several batches), leaves pending jobs alone,
@@ -146,11 +109,11 @@ where
         .without_autoscaling()
         .without_stale_job_reaper()
         .with_archival(policy(), ArchivalConfig::new(), Duration::from_millis(100));
-    pool.add_worker(idle_worker(&queue));
+    pool.add_worker(test_utils::idle_worker(&queue, "archival_idle"));
 
     tokio::select! {
         result = pool.start() => panic!("pool stopped early: {result:?}"),
-        done = eventually(|| async {
+        done = test_utils::eventually(Duration::from_secs(20), || async {
             let archived = archived_ids(&queue, &queue_name).await;
             eligible.iter().all(|id| archived.contains(id)) && !archived.contains(&old)
         }) => assert!(done, "the pool archived the eligible jobs and purged the old one"),
@@ -210,9 +173,12 @@ where
     config.archive.check_interval = Duration::from_millis(100);
 
     let job = completed_job(&queue, &queue_name).await;
-    let mut pool = WorkerPool::from_hammerwork_config(idle_worker(&queue), &config)
-        .unwrap()
-        .without_stale_job_reaper();
+    let mut pool = WorkerPool::from_hammerwork_config(
+        test_utils::idle_worker(&queue, "archival_idle"),
+        &config,
+    )
+    .unwrap()
+    .without_stale_job_reaper();
     tokio::select! {
         result = pool.start() => panic!("pool stopped early: {result:?}"),
         () = tokio::time::sleep(Duration::from_millis(500)) => {}
@@ -224,12 +190,15 @@ where
     );
 
     config.archive.enabled = true;
-    let mut pool = WorkerPool::from_hammerwork_config(idle_worker(&queue), &config)
-        .unwrap()
-        .without_stale_job_reaper();
+    let mut pool = WorkerPool::from_hammerwork_config(
+        test_utils::idle_worker(&queue, "archival_idle"),
+        &config,
+    )
+    .unwrap()
+    .without_stale_job_reaper();
     tokio::select! {
         result = pool.start() => panic!("pool stopped early: {result:?}"),
-        done = eventually(|| async { archived_ids(&queue, &queue_name).await.contains(&job) }) => {
+        done = test_utils::eventually(Duration::from_secs(20), || async { archived_ids(&queue, &queue_name).await.contains(&job) }) => {
             assert!(done, "the configured pool archived the job");
         }
     }
@@ -332,17 +301,11 @@ mod postgres_tests {
         pool_archives_and_purges(queue().await, backdate).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_configured_pool_archives() {
-        configured_pool_archives(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_concurrent_passes_archive_each_job_once() {
-        concurrent_passes_archive_each_job_once(queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        queue;
+        test_postgres_configured_pool_archives => configured_pool_archives,
+        test_postgres_concurrent_passes_archive_each_job_once => concurrent_passes_archive_each_job_once,
+    );
 }
 
 #[cfg(feature = "mysql")]
@@ -368,15 +331,9 @@ mod mysql_tests {
         pool_archives_and_purges(queue().await, backdate).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_configured_pool_archives() {
-        configured_pool_archives(queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_concurrent_passes_archive_each_job_once() {
-        concurrent_passes_archive_each_job_once(queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        queue;
+        test_mysql_configured_pool_archives => configured_pool_archives,
+        test_mysql_concurrent_passes_archive_each_job_once => concurrent_passes_archive_each_job_once,
+    );
 }

@@ -551,65 +551,23 @@ mod postgres_tests {
         Arc::new(JobQueue::new(pool))
     }
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_late_dependents_are_settled_at_enqueue() {
-        late_dependents_are_settled_at_enqueue(test_utils::setup_postgres_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_postgres_queue;
+        test_postgres_late_dependents_are_settled_at_enqueue => late_dependents_are_settled_at_enqueue,
+        test_postgres_late_dependents_respect_manual_policy => late_dependents_respect_manual_policy,
+        test_postgres_late_dependents_race_with_completion => late_dependents_race_with_completion,
+        test_postgres_paused_queue_is_not_dequeued => paused_queue_is_not_dequeued,
+        test_postgres_weighted_dequeue_reaches_every_priority => weighted_dequeue_reaches_every_priority,
+        test_postgres_cancel_workflow_discards_running_jobs => cancel_workflow_discards_running_jobs,
+        test_postgres_cron_catches_up_missed_slots_once => cron_catches_up_missed_slots_once,
+        test_postgres_processing_time_statistics => processing_time_statistics,
+        test_postgres_fan_out_dependents_are_released_together => fan_out_dependents_are_released_together,
+    );
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_late_dependents_respect_manual_policy() {
-        late_dependents_respect_manual_policy(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_late_dependents_race_with_completion() {
-        late_dependents_race_with_completion(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_paused_queue_is_not_dequeued() {
-        paused_queue_is_not_dequeued(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_weighted_dequeue_reaches_every_priority() {
-        weighted_dequeue_reaches_every_priority(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_due_times_use_the_database_clock() {
-        due_times_use_the_database_clock(queue_with_clock_ahead().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_cancel_workflow_discards_running_jobs() {
-        cancel_workflow_discards_running_jobs(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_cron_catches_up_missed_slots_once() {
-        cron_catches_up_missed_slots_once(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_processing_time_statistics() {
-        processing_time_statistics(test_utils::setup_postgres_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_postgres_fan_out_dependents_are_released_together() {
-        fan_out_dependents_are_released_together(test_utils::setup_postgres_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        queue_with_clock_ahead;
+        test_postgres_due_times_use_the_database_clock => due_times_use_the_database_clock,
+    );
 
     /// #17 M13: corrupt column values are reported instead of being replaced with
     /// defaults or wrapped into huge numbers.
@@ -675,65 +633,23 @@ mod mysql_tests {
         Arc::new(JobQueue::new(pool))
     }
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_late_dependents_are_settled_at_enqueue() {
-        late_dependents_are_settled_at_enqueue(test_utils::setup_mysql_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        test_utils::setup_mysql_queue;
+        test_mysql_late_dependents_are_settled_at_enqueue => late_dependents_are_settled_at_enqueue,
+        test_mysql_late_dependents_respect_manual_policy => late_dependents_respect_manual_policy,
+        test_mysql_late_dependents_race_with_completion => late_dependents_race_with_completion,
+        test_mysql_paused_queue_is_not_dequeued => paused_queue_is_not_dequeued,
+        test_mysql_weighted_dequeue_reaches_every_priority => weighted_dequeue_reaches_every_priority,
+        test_mysql_cancel_workflow_discards_running_jobs => cancel_workflow_discards_running_jobs,
+        test_mysql_cron_catches_up_missed_slots_once => cron_catches_up_missed_slots_once,
+        test_mysql_processing_time_statistics => processing_time_statistics,
+        test_mysql_fan_out_dependents_are_released_together => fan_out_dependents_are_released_together,
+    );
 
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_late_dependents_respect_manual_policy() {
-        late_dependents_respect_manual_policy(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_late_dependents_race_with_completion() {
-        late_dependents_race_with_completion(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_paused_queue_is_not_dequeued() {
-        paused_queue_is_not_dequeued(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_weighted_dequeue_reaches_every_priority() {
-        weighted_dequeue_reaches_every_priority(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_due_times_use_the_database_clock() {
-        due_times_use_the_database_clock(mysql_queue_with_clock_ahead().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_cancel_workflow_discards_running_jobs() {
-        cancel_workflow_discards_running_jobs(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_cron_catches_up_missed_slots_once() {
-        cron_catches_up_missed_slots_once(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_processing_time_statistics() {
-        processing_time_statistics(test_utils::setup_mysql_queue().await).await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires database connection
-    async fn test_mysql_fan_out_dependents_are_released_together() {
-        fan_out_dependents_are_released_together(test_utils::setup_mysql_queue().await).await;
-    }
+    crate::test_utils::scenario_tests!(
+        mysql_queue_with_clock_ahead;
+        test_mysql_due_times_use_the_database_clock => due_times_use_the_database_clock,
+    );
 
     /// #17 M13: corrupt column values are reported instead of being replaced with
     /// defaults or wrapped into huge numbers.
