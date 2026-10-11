@@ -51,7 +51,11 @@ pub enum BatchCommand {
         database_url: Option<String>,
         #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name filter")]
         queue: Option<String>,
-        #[arg(short = 't', long, help = "Status filter (failed, dead)")]
+        #[arg(
+            short = 't',
+            long,
+            help = "Status filter (failed, dead, timed_out); default: all three"
+        )]
         status: Option<String>,
         #[arg(long, help = "Hours since last failure")]
         failed_since_hours: Option<u32>,
@@ -68,7 +72,12 @@ pub enum BatchCommand {
         database_url: Option<String>,
         #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name filter")]
         queue: Option<String>,
-        #[arg(short = 't', long, help = "Status filter (pending, running)")]
+        #[arg(
+            short = 't',
+            long,
+            help = "Status filter (pending, running); default: pending only. Cancelling \
+                    deletes the job, so running jobs need --status running"
+        )]
         status: Option<String>,
         #[arg(long, help = "Jobs older than N hours")]
         older_than_hours: Option<u32>,
@@ -460,13 +469,15 @@ fn retry_selector(
     failed_since_hours: Option<u32>,
     max_attempts_reached: bool,
 ) -> Result<JobSelector> {
-    let statuses = match status {
+    // Without a filter: every failed end state (Failed, Dead and TimedOut).
+    let statuses = match status.map(str::to_lowercase).as_deref() {
         Some("failed") => vec![JobStatus::Failed],
         Some("dead") => vec![JobStatus::Dead],
-        None => vec![JobStatus::Failed, JobStatus::Dead],
+        Some("timed_out" | "timedout") => vec![JobStatus::TimedOut],
+        None => vec![JobStatus::Failed, JobStatus::Dead, JobStatus::TimedOut],
         _ => {
             return Err(anyhow::anyhow!(
-                "Invalid status filter. Use 'failed' or 'dead'"
+                "Invalid status filter. Use 'failed', 'dead' or 'timed_out'"
             ));
         }
     };
@@ -489,10 +500,12 @@ fn cancel_selector(
     status: Option<&str>,
     older_than_hours: Option<u32>,
 ) -> Result<JobSelector> {
-    let statuses = match status {
+    // Pending only by default: cancelling deletes the job, so a Running job (which a
+    // worker is executing) must be asked for with `--status running`.
+    let statuses = match status.map(str::to_lowercase).as_deref() {
         Some("pending") => vec![JobStatus::Pending],
         Some("running") => vec![JobStatus::Running],
-        None => vec![JobStatus::Pending, JobStatus::Running],
+        None => vec![JobStatus::Pending],
         _ => {
             return Err(anyhow::anyhow!(
                 "Invalid status filter. Use 'pending' or 'running'"
@@ -800,14 +813,25 @@ mod tests {
         let failed = retry_selector(&None, Some("failed"), None, false).unwrap();
         assert_eq!(failed.statuses, vec![JobStatus::Failed]);
         let all = retry_selector(&None, None, None, false).unwrap();
-        assert_eq!(all.statuses, vec![JobStatus::Failed, JobStatus::Dead]);
+        assert_eq!(
+            all.statuses,
+            vec![JobStatus::Failed, JobStatus::Dead, JobStatus::TimedOut]
+        );
+        let timed_out = retry_selector(&None, Some("timed_out"), None, false).unwrap();
+        assert_eq!(timed_out.statuses, vec![JobStatus::TimedOut]);
+        let alias = retry_selector(&None, Some("TimedOut"), None, false).unwrap();
+        assert_eq!(alias.statuses, vec![JobStatus::TimedOut]);
         assert!(retry_selector(&None, Some("bogus"), None, false).is_err());
     }
 
     #[test]
     fn cancel_selector_validates_status() {
         let sel = cancel_selector(&None, None, None).unwrap();
-        assert_eq!(sel.statuses, vec![JobStatus::Pending, JobStatus::Running]);
+        assert_eq!(
+            sel.statuses,
+            vec![JobStatus::Pending],
+            "never Running by default"
+        );
         let sel = cancel_selector(&Some("q".into()), Some("running"), Some(1)).unwrap();
         assert_eq!(sel.statuses, vec![JobStatus::Running]);
         assert!(sel.created_before.is_some() && sel.queue.as_deref() == Some("q"));
@@ -1134,7 +1158,37 @@ mod tests {
         );
         run(retry(&["--confirm"])).await.unwrap(); // nothing left to retry
 
+        // a TimedOut job has no failed_at: it is retried by default and by --status
+        let timed_out_a = seed(&pool, &SeedJob::new(&queue, "TimedOut")).await;
+        let timed_out_b = seed(&pool, &SeedJob::new(&queue, "TimedOut")).await;
+        run(retry(&["--confirm", "-t", "failed"])).await.unwrap();
+        assert_eq!(job_status(&pool, &timed_out_a).await, "TimedOut");
+        run(retry(&["--confirm", "-t", "timed_out"])).await.unwrap();
+        assert_eq!(job_status(&pool, &timed_out_a).await, "Pending");
+        assert_eq!(job_status(&pool, &timed_out_b).await, "Pending");
+        let timed_out_c = seed(&pool, &SeedJob::new(&queue, "TimedOut")).await;
+        run(retry(&["--confirm"])).await.unwrap();
+        assert_eq!(job_status(&pool, &timed_out_c).await, "Pending");
+        cleanup(&pool, &[&queue]).await;
+
         // --- cancel: removes matching jobs
+        // by default only Pending jobs: a Running job is being executed by a worker
+        let guarded = {
+            let mut job = SeedJob::new(&queue, "Running");
+            job.started_long_ago = true;
+            seed(&pool, &job).await
+        };
+        let guarded_pending = seed(&pool, &SeedJob::new(&queue, "Pending")).await;
+        run(vec![s("cancel"), s("-n"), queue.clone(), s("--confirm")])
+            .await
+            .unwrap();
+        assert_eq!(job_status(&pool, &guarded).await, "Running");
+        assert!(
+            job_column(&pool, &guarded_pending, "status")
+                .await
+                .is_none()
+        );
+        cleanup(&pool, &[&queue]).await;
         let running = {
             let mut job = SeedJob::new(&queue, "Running");
             job.started_long_ago = true;

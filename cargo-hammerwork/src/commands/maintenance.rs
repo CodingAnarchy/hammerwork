@@ -7,8 +7,10 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
-use crate::utils::job_ops::{JobSelector, retry_many, select_job_ids};
-use crate::utils::sql::{Backend, Bind, SqlParams, execute_binds, fetch_i64};
+use crate::utils::job_ops::{JobSelector, StaleRunning, retry_many, select_job_ids};
+use crate::utils::sql::{
+    Backend, Bind, FAILURE_STATUSES_SQL, FAILURE_TIME_SQL, SqlParams, execute_binds, fetch_i64,
+};
 
 #[derive(Subcommand)]
 pub enum MaintenanceCommand {
@@ -29,14 +31,20 @@ pub enum MaintenanceCommand {
         #[arg(long, help = "Dry run - show what would be deleted")]
         dry_run: bool,
     },
-    #[command(about = "Clean up dead/stale jobs")]
+    #[command(
+        about = "Mark stale running jobs as dead",
+        long_about = "Mark Running jobs as Dead when they were abandoned: their lease expired, \
+            or, for runs that hold no lease (claimed by an older version), they started \
+            more than --stale-hours ago. A long-running job that keeps heartbeating is \
+            never touched. This is the rule of the library's stale-job recovery."
+    )]
     DeadJobs {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
         #[arg(
             long,
             default_value = "24",
-            help = "Hours since a running job started to consider it dead"
+            help = "Hours since a running job without a lease started to consider it dead"
         )]
         stale_hours: u32,
         #[arg(long, help = "Confirm the cleanup operation")]
@@ -239,11 +247,8 @@ pub fn build_vacuum_query(
     // "Failed" covers every failed end state, as in `job list --failed` and `monitor`.
     // A timed-out job may only carry `timed_out_at`.
     let (statuses, column) = match kind {
-        VacuumKind::Completed => ("= 'Completed'", "completed_at"),
-        VacuumKind::Failed => (
-            "IN ('Failed', 'Dead', 'TimedOut')",
-            "COALESCE(failed_at, timed_out_at)",
-        ),
+        VacuumKind::Completed => ("= 'Completed'".to_string(), "completed_at"),
+        VacuumKind::Failed => (format!("IN {FAILURE_STATUSES_SQL}"), FAILURE_TIME_SQL),
     };
     let verb = if delete {
         "DELETE FROM hammerwork_jobs"
@@ -343,12 +348,13 @@ async fn cleanup_dead_jobs(
         return Ok(());
     }
 
-    let stale_cutoff = chrono::Utc::now() - chrono::Duration::hours(stale_hours as i64);
-
-    // Find stale running jobs
+    // Find stale running jobs: lease expired, or no lease and started before the cutoff
     let selector = JobSelector {
         statuses: vec![JobStatus::Running],
-        started_before: Some(stale_cutoff),
+        stale_running: Some(StaleRunning::new(
+            chrono::Utc::now(),
+            chrono::Duration::hours(stale_hours as i64),
+        )),
         ..Default::default()
     };
     let stale_ids = select_job_ids(&pool, &selector).await?;
@@ -357,7 +363,7 @@ async fn cleanup_dead_jobs(
     println!("🔍 Dead Jobs Analysis");
     println!("═══════════════════════");
     println!(
-        "Stale running jobs (started more than {} hours ago): {}",
+        "Stale running jobs (lease expired, or no lease and started more than {} hours ago): {}",
         stale_hours, stale_count
     );
 
@@ -861,6 +867,38 @@ mod tests {
         run(&["dead-jobs", "--confirm", "--stale-hours", "1"])
             .await
             .unwrap(); // none left
+
+        // a long-running job that keeps heartbeating is not dead, however old its start
+        let heartbeating = {
+            let mut job = SeedJob::new(q, "Running");
+            job.started_long_ago = true;
+            seed(pool, &job).await
+        };
+        set_time(pool, &heartbeating, "last_heartbeat_at", -1).await;
+        set_time(pool, &heartbeating, "lease_expires_at", 5).await;
+        // a run with an expired lease is dead even though it started recently
+        let expired = seed(pool, &SeedJob::new(q, "Running")).await;
+        set_time(pool, &expired, "started_at", -30).await;
+        set_time(pool, &expired, "last_heartbeat_at", -20).await;
+        set_time(pool, &expired, "lease_expires_at", -10).await;
+        // a run whose lease is valid but whose start predates the cutoff: still alive
+        let leased_old = {
+            let mut job = SeedJob::new(q, "Running");
+            job.started_long_ago = true;
+            seed(pool, &job).await
+        };
+        set_time(pool, &leased_old, "last_heartbeat_at", -2).await;
+        set_time(pool, &leased_old, "lease_expires_at", 1).await;
+        run(&["dead-jobs", "--dry-run", "--stale-hours", "1"])
+            .await
+            .unwrap();
+        assert_eq!(job_status(pool, &expired).await, "Running");
+        run(&["dead-jobs", "--confirm", "--stale-hours", "1"])
+            .await
+            .unwrap();
+        assert_eq!(job_status(pool, &expired).await, "Dead");
+        assert_eq!(job_status(pool, &heartbeating).await, "Running");
+        assert_eq!(job_status(pool, &leased_old).await, "Running");
 
         // --- check: reports, and --fix repairs minor corruption
         let orphan = seed(pool, &SeedJob::new(q, "Running")).await; // Running, never started

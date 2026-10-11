@@ -12,7 +12,8 @@ use crate::config::Config;
 use crate::utils::database::DatabasePool;
 use crate::utils::display::StatsTable;
 use crate::utils::sql::{
-    Backend, Bind, IntervalUnit, SqlParams, execute_binds, fetch_i64, fetch_rows,
+    Backend, Bind, FAILURE_STATUSES_SQL, FAILURE_TIME_SQL, IntervalUnit, SqlParams, execute_binds,
+    fetch_i64, fetch_rows,
 };
 
 #[derive(Subcommand)]
@@ -290,7 +291,12 @@ pub fn build_health_query(
     match metric {
         HealthMetric::Total => {}
         HealthMetric::RecentFailures => {
-            conditions.push(format!("failed_at > {}", params.ago(1, IntervalUnit::Hour)));
+            // Failed, Dead and TimedOut, as `monitor` counts them
+            conditions.push(format!("status IN {FAILURE_STATUSES_SQL}"));
+            conditions.push(format!(
+                "{FAILURE_TIME_SQL} > {}",
+                params.ago(1, IntervalUnit::Hour)
+            ));
         }
         HealthMetric::LongRunning => {
             conditions.push("status = 'Running'".to_string());
@@ -582,7 +588,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE queue_name = $1 AND failed_at > NOW() - make_interval(hours => $2::int)"
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE queue_name = $1 AND status IN ('Failed', 'Dead', 'TimedOut') AND COALESCE(failed_at, timed_out_at) > NOW() - make_interval(hours => $2::int)"
         );
         assert_eq!(binds, vec![Bind::Text(HOSTILE_QUEUE.into()), Bind::Int(1)]);
 
@@ -631,10 +637,16 @@ mod tests {
         assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 1);
         let (sql, binds) = build_health_query(backend, HealthMetric::LongRunning, Some(&hostile));
         assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 1);
+        // a TimedOut job has no failed_at, and still counts as a recent failure
+        let timed_out = seed(&pool, &SeedJob::new(&hostile, "TimedOut")).await;
+        set_time(&pool, &timed_out, "timed_out_at", -5).await;
+        let (sql, binds) =
+            build_health_query(backend, HealthMetric::RecentFailures, Some(&hostile));
+        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 2);
 
         let (sql, binds) = build_detailed_stats_query(backend, Some(&hostile));
         let statuses = column_strings(&pool, &sql, &binds, "status").await;
-        assert_eq!(statuses, vec!["Failed", "Pending", "Running"]);
+        assert_eq!(statuses, vec!["Failed", "Pending", "Running", "TimedOut"]);
 
         show_queue_stats(pool.clone(), Some(hostile.clone()), false)
             .await

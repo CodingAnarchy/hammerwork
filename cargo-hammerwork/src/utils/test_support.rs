@@ -186,6 +186,16 @@ pub async fn backdate(pool: &DatabasePool, id: &str, column: &str, days: u32) {
     assert_eq!(n, 1, "backdate {column} of {id}");
 }
 
+/// Set timestamp `column` of job `id` to `minutes` from now (negative: in the past).
+pub async fn set_time(pool: &DatabasePool, id: &str, column: &str, minutes: i64) {
+    let mut params = SqlParams::new(pool.backend());
+    let at = params.time(chrono::Utc::now() + chrono::Duration::minutes(minutes));
+    let id = params.uuid(id);
+    let sql = format!("UPDATE hammerwork_jobs SET {column} = {at} WHERE id = {id}");
+    let n = execute_binds(pool, &sql, params.binds()).await.unwrap();
+    assert_eq!(n, 1, "set_time {column} of {id}");
+}
+
 /// Read one text column of one job.
 pub async fn job_column(pool: &DatabasePool, id: &str, column: &str) -> Option<String> {
     let mut params = SqlParams::new(pool.backend());

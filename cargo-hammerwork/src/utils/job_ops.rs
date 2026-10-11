@@ -24,16 +24,53 @@ use super::sql::{Backend, Bind, SqlParams, bind_mysql, bind_pg};
 pub struct JobSelector {
     pub statuses: Vec<JobStatus>,
     pub queue: Option<String>,
-    /// Only jobs whose `failed_at` is later than this.
+    /// Only jobs that failed after this: `COALESCE(failed_at, timed_out_at)`, since a
+    /// `TimedOut` job may carry only `timed_out_at`.
     pub failed_after: Option<DateTime<Utc>>,
     /// Only jobs whose `created_at` is earlier than this.
     pub created_before: Option<DateTime<Utc>>,
     /// Only jobs whose `started_at` is earlier than this.
     pub started_before: Option<DateTime<Utc>>,
+    /// Only `Running` jobs that `requeue_stale_jobs` would reclaim (see [`StaleRunning`]).
+    pub stale_running: Option<StaleRunning>,
     /// Only jobs with no `started_at`.
     pub never_started: bool,
     /// Only jobs that used all their attempts.
     pub attempts_exhausted: bool,
+}
+
+/// The library's stale-run rule (`DatabaseQueue::requeue_stale_jobs`) for a `Running` job:
+/// its lease expired, or, when it holds no lease of its own (claimed by an older version),
+/// it started before `cutoff`. A run that keeps heartbeating is never stale, however long
+/// it has been running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleRunning {
+    /// The current time: leases that expired before it are stale.
+    pub now: DateTime<Utc>,
+    /// Lease-less runs that started before this are stale.
+    pub cutoff: DateTime<Utc>,
+}
+
+impl StaleRunning {
+    /// A rule evaluated at `now` for runs older than `older_than`.
+    pub fn new(now: DateTime<Utc>, older_than: chrono::Duration) -> Self {
+        Self {
+            now,
+            cutoff: now - older_than,
+        }
+    }
+
+    /// The SQL condition, with `now` and `cutoff` bound as parameters.
+    pub fn condition(&self, params: &mut SqlParams) -> String {
+        let now = params.time(self.now);
+        let cutoff = params.time(self.cutoff);
+        format!(
+            "((last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= started_at \
+             AND lease_expires_at < {now}) \
+             OR ((last_heartbeat_at IS NULL OR lease_expires_at IS NULL \
+             OR last_heartbeat_at < started_at) AND started_at < {cutoff}))"
+        )
+    }
 }
 
 impl JobSelector {
@@ -54,13 +91,20 @@ impl JobSelector {
             conditions.push(format!("queue_name = {}", params.text(queue)));
         }
         if let Some(t) = self.failed_after {
-            conditions.push(format!("failed_at > {}", params.time(t)));
+            conditions.push(format!(
+                "{} > {}",
+                super::sql::FAILURE_TIME_SQL,
+                params.time(t)
+            ));
         }
         if let Some(t) = self.created_before {
             conditions.push(format!("created_at < {}", params.time(t)));
         }
         if let Some(t) = self.started_before {
             conditions.push(format!("started_at < {}", params.time(t)));
+        }
+        if let Some(stale) = &self.stale_running {
+            conditions.push(stale.condition(&mut params));
         }
         if self.never_started {
             conditions.push("started_at IS NULL".to_string());
@@ -202,7 +246,7 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT id FROM hammerwork_jobs WHERE status IN ($1, $2, $3) AND queue_name = $4 \
-             AND failed_at > $5 AND attempts >= max_attempts ORDER BY created_at"
+             AND COALESCE(failed_at, timed_out_at) > $5 AND attempts >= max_attempts ORDER BY created_at"
         );
         assert_eq!(
             binds,
@@ -217,7 +261,9 @@ mod tests {
         assert!(!sql.contains("DROP"));
 
         let (sql, binds) = selector.sql(Backend::MySql);
-        assert!(sql.contains("status IN (?, ?, ?) AND queue_name = ? AND failed_at > ?"));
+        assert!(sql.contains(
+            "status IN (?, ?, ?) AND queue_name = ? AND COALESCE(failed_at, timed_out_at) > ?"
+        ));
         assert_eq!(binds.len(), 5);
     }
 

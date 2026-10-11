@@ -246,6 +246,26 @@ impl Config {
         }
     }
 
+    /// The keys the config file at `path` sets, and nothing else: unlike
+    /// [`Config::load_from_path`] a missing (or unreadable, or unparseable) file gives
+    /// all `None` rather than the defaults. Tells file values from defaults and the
+    /// environment, e.g. for `config show`.
+    pub fn file_values(path: &Path) -> Self {
+        let empty = Self {
+            database_url: None,
+            default_queue: None,
+            default_limit: None,
+            log_level: None,
+            connection_pool_size: None,
+            connect_timeout_secs: None,
+            encryption_config: None,
+        };
+        match fs::read_to_string(path) {
+            Ok(content) => toml::from_str(&content).unwrap_or(empty),
+            Err(_) => empty,
+        }
+    }
+
     /// Override fields with the `DATABASE_URL` / `HAMMERWORK_*` environment variables.
     /// Unparseable numbers are ignored.
     fn apply_env(&mut self, get: &impl Fn(&str) -> Option<String>) {
@@ -307,13 +327,11 @@ impl Config {
         self.save_to(&Self::config_file_path()?)
     }
 
-    /// Save configuration to `path`, creating parent directories.
+    /// Save configuration to `path`, creating parent directories. The file is written
+    /// through a temp file with mode 0600 and renamed into place, since it can hold
+    /// the database URL.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, toml::to_string_pretty(self)?)?;
-        Ok(())
+        crate::utils::fs::write_private_atomic(path, toml::to_string_pretty(self)?.as_bytes())
     }
 
     /// Where the config file lives: `HAMMERWORK_CONFIG` if set, otherwise

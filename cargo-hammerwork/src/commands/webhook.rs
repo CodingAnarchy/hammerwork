@@ -49,7 +49,11 @@ pub enum WebhookCommand {
         secret: Option<String>,
         #[arg(long, help = "Request timeout in seconds", default_value = "30")]
         timeout: u64,
-        #[arg(long, help = "Maximum retry attempts", default_value = "3")]
+        #[arg(
+            long,
+            help = "Maximum retries after the first delivery attempt",
+            default_value = "3"
+        )]
         max_retries: u32,
         #[arg(long, help = "Include job payload in events")]
         include_payload: bool,
@@ -99,7 +103,7 @@ pub enum WebhookCommand {
         headers: Option<String>,
         #[arg(long, help = "New timeout in seconds")]
         timeout: Option<u64>,
-        #[arg(long, help = "New max retry attempts")]
+        #[arg(long, help = "New maximum retries after the first delivery attempt")]
         max_retries: Option<u32>,
     },
 }
@@ -200,7 +204,10 @@ async fn list_webhooks(config: &Config, detailed: bool) -> Result<()> {
             println!("  Method: {}", webhook.method);
             println!("  Enabled: {}", webhook.enabled);
             println!("  Timeout: {}s", webhook.timeout_secs);
-            println!("  Max Retries: {}", webhook.retry_policy.max_attempts);
+            println!(
+                "  Max Retries: {}",
+                webhook.retry_policy.max_attempts.saturating_sub(1)
+            );
 
             if !webhook.headers.is_empty() {
                 println!("  Headers:");
@@ -562,7 +569,7 @@ async fn update_webhook(
                 w.timeout_secs = new_timeout;
             }
             if let Some(new_max_retries) = max_retries {
-                w.retry_policy.max_attempts = new_max_retries;
+                w.retry_policy.max_attempts = new_max_retries.saturating_add(1);
             }
 
             // Update filters
@@ -660,7 +667,8 @@ fn create_webhook_config(
     filter.include_payload = include_payload;
 
     let retry_policy = RetryPolicy {
-        max_attempts: max_retries,
+        // `max_attempts` counts the first delivery, so N retries is N + 1 attempts
+        max_attempts: max_retries.saturating_add(1),
         initial_delay_secs: 1,
         max_delay_secs: 300,
         backoff_multiplier: 2.0,
@@ -787,18 +795,7 @@ fn read_webhooks(path: &std::path::Path) -> Result<Vec<WebhookConfig>> {
 
 /// Writes the list atomically (temp file + rename), owner-read/write only on Unix.
 fn write_webhooks(path: &std::path::Path, webhooks: &[WebhookConfig]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(webhooks)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    crate::utils::fs::write_private_atomic(path, serde_json::to_string_pretty(webhooks)?.as_bytes())
 }
 
 #[cfg(test)]
@@ -890,7 +887,7 @@ mod tests {
         assert_eq!(loaded[0].id, hook.id);
         assert_eq!(loaded[0].headers.get("X-Custom").unwrap(), "yes");
         assert_eq!(loaded[0].timeout_secs, 5);
-        assert_eq!(loaded[0].retry_policy.max_attempts, 2);
+        assert_eq!(loaded[0].retry_policy.max_attempts, 3);
         assert_eq!(loaded[0].secret.as_deref(), Some("s3cret"));
         assert!(loaded[0].auth.is_some());
         assert!(loaded[0].filter.include_payload);
@@ -1254,7 +1251,7 @@ mod tests {
         }
         let config = build(None, None, None, None).unwrap();
         assert!(
-            config.enabled && config.retry_policy.max_attempts == 3 && config.timeout_secs == 30
+            config.enabled && config.retry_policy.max_attempts == 4 && config.timeout_secs == 30
         );
         assert!(!config.filter.include_payload && config.filter.event_types.is_empty());
     }
@@ -1318,7 +1315,7 @@ mod tests {
         assert_eq!(hook.filter.queue_names, vec!["a", "b"]);
         assert_eq!(hook.filter.event_types.len(), 2);
         assert_eq!(hook.headers["X-Token"], "abc==");
-        assert_eq!((hook.timeout_secs, hook.retry_policy.max_attempts), (7, 5));
+        assert_eq!((hook.timeout_secs, hook.retry_policy.max_attempts), (7, 6));
         assert!(hook.filter.include_payload && hook.enabled);
         let id = hook.id.to_string();
 
@@ -1391,7 +1388,7 @@ mod tests {
         assert_eq!(hook.filter.queue_names, vec!["z"]);
         assert_eq!(hook.filter.priorities.len(), 2);
         assert_eq!(hook.headers.len(), 1);
-        assert_eq!((hook.timeout_secs, hook.retry_policy.max_attempts), (2, 0));
+        assert_eq!((hook.timeout_secs, hook.retry_policy.max_attempts), (2, 1));
         assert_eq!(hook.secret.as_deref(), Some("s"), "untouched fields stay");
         run(&config, &["update", "-w", "plain"]).await.unwrap(); // nothing to change is fine
         // #94: a rename cannot take another webhook's name, as `add` refuses it; keeping

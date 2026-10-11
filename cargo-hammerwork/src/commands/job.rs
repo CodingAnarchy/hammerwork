@@ -13,7 +13,8 @@ use crate::utils::job_ops::{
     JobSelector, cancel_many, cancel_one, retry_many, retry_one, select_job_ids,
 };
 use crate::utils::sql::{
-    Backend, Bind, IdText, IntervalUnit, SqlParams, execute_binds, fetch_rows,
+    Backend, Bind, FAILURE_STATUSES, FAILURE_STATUSES_SQL, IdText, IntervalUnit, SqlParams,
+    execute_binds, fetch_rows,
 };
 use crate::utils::validation::{validate_json_payload, validate_priority, validate_status};
 
@@ -364,7 +365,7 @@ pub fn build_list_jobs_query(
         conditions.push(format!("priority = {p}"));
     }
     if failed {
-        conditions.push("status IN ('Failed', 'Dead', 'TimedOut')".to_string());
+        conditions.push(format!("status IN {FAILURE_STATUSES_SQL}"));
     }
     if completed {
         conditions.push("status = 'Completed'".to_string());
@@ -381,6 +382,26 @@ pub fn build_list_jobs_query(
     let limit_clause = params.limit(limit);
     query.push_str(&format!(" ORDER BY created_at DESC {limit_clause}"));
     (query, params.into_binds())
+}
+
+/// The status condition of `job purge`: `--failed` is every failed end state (Failed, Dead
+/// and TimedOut, as everywhere in the CLI), `--dead` only Dead jobs. Built from constants.
+fn purge_status_condition(completed: bool, dead: bool, failed: bool) -> String {
+    let mut statuses: Vec<&str> = Vec::new();
+    if completed {
+        statuses.push("Completed");
+    }
+    if failed {
+        statuses.extend(FAILURE_STATUSES);
+    } else if dead {
+        statuses.push("Dead");
+    }
+    let list = statuses
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("status IN ({list})")
 }
 
 /// The `DELETE` behind `job purge`. `status_condition` must be built from constant status
@@ -845,17 +866,7 @@ async fn purge_jobs(
     }
 
     // Statuses are stored capitalized; the queue name is bound, never interpolated.
-    let mut statuses = Vec::new();
-    if completed {
-        statuses.push("'Completed'");
-    }
-    if dead {
-        statuses.push("'Dead'");
-    }
-    if failed {
-        statuses.push("'Failed'");
-    }
-    let status_condition = format!("status IN ({})", statuses.join(", "));
+    let status_condition = purge_status_condition(completed, dead, failed);
 
     let (query, binds) = build_purge_query(
         pool.backend(),
@@ -875,6 +886,26 @@ mod tests {
     use crate::utils::sql::fetch_i64;
     use crate::utils::test_support::*;
     use clap::Parser;
+
+    #[test]
+    fn purge_status_condition_uses_the_shared_failure_statuses() {
+        assert_eq!(
+            purge_status_condition(false, false, true),
+            "status IN ('Failed', 'Dead', 'TimedOut')"
+        );
+        assert_eq!(
+            purge_status_condition(false, true, false),
+            "status IN ('Dead')"
+        );
+        assert_eq!(
+            purge_status_condition(true, true, true),
+            "status IN ('Completed', 'Failed', 'Dead', 'TimedOut')"
+        );
+        assert_eq!(
+            purge_status_condition(true, false, false),
+            "status IN ('Completed')"
+        );
+    }
 
     #[test]
     fn test_delayed_schedule_adds_delay() {
@@ -1565,6 +1596,26 @@ mod tests {
         run(&["purge", "-Q", &q, "--completed", "--failed", "--confirm"])
             .await
             .unwrap();
+        assert_eq!(count_jobs(pool, &q, None).await, 0);
+
+        // --- purge --failed covers TimedOut too (it may carry only timed_out_at); --dead does not
+        let timed_out = seed(pool, &SeedJob::new(&q, "TimedOut")).await;
+        set_time(pool, &timed_out, "timed_out_at", -60).await;
+        let failed_one = seed(pool, &SeedJob::new(&q, "Failed")).await;
+        let dead_one = seed(pool, &SeedJob::new(&q, "Dead")).await;
+        let pending_one = seed(pool, &SeedJob::new(&q, "Pending")).await;
+        run(&["purge", "-Q", &q, "--dead", "--confirm"])
+            .await
+            .unwrap();
+        assert!(job_column(pool, &dead_one, "status").await.is_none());
+        assert!(job_column(pool, &timed_out, "status").await.is_some());
+        run(&["purge", "-Q", &q, "--failed", "--confirm"])
+            .await
+            .unwrap();
+        assert!(job_column(pool, &timed_out, "status").await.is_none());
+        assert!(job_column(pool, &failed_one, "status").await.is_none());
+        assert!(job_column(pool, &pending_one, "status").await.is_some());
+        run(&["cancel", "--all-pending"]).await.unwrap();
         assert_eq!(count_jobs(pool, &q, None).await, 0);
 
         // --- requeue-stale: a stale job with attempts left goes back to Pending, an exhausted one dies
