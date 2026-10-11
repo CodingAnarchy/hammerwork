@@ -285,6 +285,23 @@ where
     }
 }
 
+/// Percent-decode a queue name taken from the request path (`email%20jobs` is the queue
+/// `email jobs`). Invalid UTF-8 is an error (a 400 reply, see [`invalid_queue_name`]).
+fn decode_queue_name(raw: &str) -> Result<String, ()> {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|name| name.into_owned())
+        .map_err(|_| ())
+}
+
+/// The 400 reply for a queue name that is not valid UTF-8 once decoded.
+fn invalid_queue_name() -> warp::reply::Response {
+    error_reply(
+        StatusCode::BAD_REQUEST,
+        "Queue name in the path is not valid UTF-8",
+    )
+}
+
 /// Handler for getting a specific queue
 async fn get_queue_handler<T>(
     queue_name: String,
@@ -293,6 +310,10 @@ async fn get_queue_handler<T>(
 where
     T: JobHistory,
 {
+    let queue_name = match decode_queue_name(&queue_name) {
+        Ok(name) => name,
+        Err(()) => return Ok(invalid_queue_name()),
+    };
     match queue.get_all_queue_stats().await {
         Ok(all_stats) => {
             if let Some(stats) = all_stats.into_iter().find(|s| s.queue_name == queue_name) {
@@ -375,6 +396,10 @@ async fn queue_action_handler<T>(
 where
     T: JobHistory,
 {
+    let queue_name = match decode_queue_name(&queue_name) {
+        Ok(name) => name,
+        Err(()) => return Ok(invalid_queue_name()),
+    };
     match action_request.action.as_str() {
         "clear_dead" => {
             let older_than = chrono::Utc::now() - chrono::Duration::days(7); // Remove jobs older than 7 days
@@ -462,8 +487,16 @@ async fn queue_jobs_handler<T>(
 where
     T: JobHistory,
 {
+    let queue_name = match decode_queue_name(&queue_name) {
+        Ok(name) => name,
+        Err(()) => return Ok(invalid_queue_name()),
+    };
     filters.queue = Some(queue_name);
-    super::jobs::list_jobs_handler(queue, pagination, filters, sort).await
+    Ok(
+        super::jobs::list_jobs_handler(queue, pagination, filters, sort)
+            .await?
+            .into_response(),
+    )
 }
 
 /// Helper function to get the last job time for a queue
@@ -667,6 +700,61 @@ mod tests {
         // The real listing ran (and failed on the dead database), not a stub message.
         assert_eq!(status, 500);
         assert!(body.get("data").is_none_or(|d| d.is_null()));
+    }
+
+    /// #114: queue path parameters are percent-decoded on every queue route.
+    #[tokio::test]
+    async fn test_queue_routes_percent_decode_the_queue_name() {
+        let queue = Arc::new(hammerwork::queue::test::TestQueue::new());
+        let filter = routes(queue.clone());
+
+        let reply = warp::test::request()
+            .method("POST")
+            .path("/queues/email%20jobs/actions")
+            .header("content-type", "application/json")
+            .body(r#"{"action": "pause"}"#)
+            .reply(&filter)
+            .await;
+        assert_eq!(reply.status(), 200, "{:?}", reply.body());
+        let body: serde_json::Value = serde_json::from_slice(reply.body()).unwrap();
+        assert_eq!(body["data"]["queue"], "email jobs");
+        assert!(queue.is_queue_paused("email jobs").await.unwrap());
+        assert!(!queue.is_queue_paused("email%20jobs").await.unwrap());
+
+        // A literal percent sign survives (`%25`), decoded exactly once.
+        let reply = warp::test::request()
+            .method("POST")
+            .path("/queues/100%2525/actions")
+            .header("content-type", "application/json")
+            .body(r#"{"action": "pause"}"#)
+            .reply(&filter)
+            .await;
+        let body: serde_json::Value = serde_json::from_slice(reply.body()).unwrap();
+        assert_eq!(body["data"]["queue"], "100%25");
+    }
+
+    #[tokio::test]
+    async fn test_queue_routes_reject_invalid_utf8_names() {
+        let queue = Arc::new(hammerwork::queue::test::TestQueue::new());
+        let filter = routes(queue);
+        let reply = warp::test::request()
+            .method("POST")
+            .path("/queues/%FF/actions")
+            .header("content-type", "application/json")
+            .body(r#"{"action": "pause"}"#)
+            .reply(&filter)
+            .await;
+        assert_eq!(reply.status(), 400);
+        let reply = warp::test::request()
+            .path("/queues/%FF")
+            .reply(&filter)
+            .await;
+        assert_eq!(reply.status(), 400);
+        let reply = warp::test::request()
+            .path("/queues/%FF/jobs")
+            .reply(&filter)
+            .await;
+        assert_eq!(reply.status(), 400);
     }
 
     #[test]

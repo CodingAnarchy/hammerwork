@@ -24,6 +24,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`webhook add/update --max-retries N`** now means N retries after the first delivery
   (stored as N + 1 attempts); it used to give N - 1 retries. Webhooks added before keep
   their stored attempts and `webhook list` shows `attempts - 1` as their retries.
+- **Dashboard queue routes** (`/api/queues/{name}`, `.../actions`, `.../jobs`)
+  percent-decode the queue name, so `email%20jobs` is the queue `email jobs`; a name that
+  is not valid UTF-8 once decoded is a 400.
+- **`POST /api/jobs/search`** reads jobs in every status (failed, timed out, completed,
+  running, retrying and jobs scheduled for later, up to 200 per status and queue), not just
+  the ready, dead and recurring ones. `statuses` accepts the same names as the jobs
+  listing (`failed` covers `Failed`, `Dead` and `TimedOut`). The route needs `T: JobHistory`.
+- **`GET /api/system/metrics`**: the dashboard serves no `/metrics` route. The
+  `metrics_endpoint` field is kept for compatibility but documented as not served;
+  `custom_metrics_count` and `last_scrape` are always null.
+- **`WebhookManager::shutdown` and `StreamManager::shutdown`** unsubscribe their listeners
+  from the event manager, so `EventManager::subscription_count` and `payload_wanted` stop
+  counting them. Dropping an `EventSubscription` does not unregister it: call
+  `EventManager::unsubscribe(id)` when done (now documented).
+- **Webhook statistics**: `successful_deliveries`, `failed_deliveries` and `success_rate`
+  count events by final outcome (an event delivered on its third attempt is one successful
+  delivery, not two failures and a success); `total_attempts` still counts every HTTP
+  attempt, retries included.
+- **`EventFilter` processing-time range** rejects events that have no processing time when
+  a minimum or maximum is set (it used to let them through).
+- **`HammerworkConfig::save_to_file`** writes the file with mode 0600 on Unix (through a
+  temporary file renamed over the target); `from_file` validates the `[encryption]` section
+  like `JobQueue::from_config`.
+- **Streaming `Hash` partitioner** uses a stable FNV-1a hash, so partition keys change
+  (they were a character sum, which collided for anagrams).
 
 ### Fixed
 
@@ -42,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chmod-ed after it was written.
 - `backup restore --skip-existing` is hidden (it is a no-op: existing jobs are always
   skipped), and `archive` resolves the database URL like the other commands.
+- A deserialized `CronSchedule` is rebuilt from its expression and timezone, so it fires
+  (it used to have no schedule and never matched); an invalid expression or timezone is a
+  deserialization error.
+- Concurrent checks of the same alert reserve the cooldown under the write lock, so the
+  alert is sent once instead of once per concurrent caller.
+- The streaming `Hash` partitioner no longer panics on overflow in debug builds.
 
 ## [2.4.0] - 2026-10-11
 

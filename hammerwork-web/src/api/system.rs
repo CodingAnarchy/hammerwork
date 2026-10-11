@@ -217,6 +217,9 @@ pub struct ServerConfig {
 #[derive(Debug, Serialize)]
 pub struct MetricsInfo {
     pub prometheus_enabled: bool,
+    /// Deprecated and not served: the dashboard has no `/metrics` route (it always reports
+    /// `"/metrics"` for compatibility). Scrape the metrics of the application that embeds
+    /// the library instead.
     pub metrics_endpoint: String,
     /// `null`: the dashboard keeps no metrics registry, so there is nothing to count.
     pub custom_metrics_count: Option<u32>,
@@ -381,8 +384,8 @@ async fn metrics_info_handler(
         // `metrics` feature on this crate), so this is always false.
         prometheus_enabled: false,
         metrics_endpoint: "/metrics".to_string(),
-        custom_metrics_count: get_custom_metrics_count(),
-        last_scrape: get_last_scrape_time().await,
+        custom_metrics_count: None,
+        last_scrape: None,
     };
 
     Ok(json_reply(&ApiResponse::success(metrics_info)))
@@ -532,16 +535,6 @@ fn get_memory_usage() -> Option<u64> {
     None
 }
 
-/// Count of custom metrics: unavailable, hammerwork-web serves no metrics registry.
-fn get_custom_metrics_count() -> Option<u32> {
-    None
-}
-
-/// Last metrics scrape: unavailable, hammerwork-web serves no metrics endpoint.
-async fn get_last_scrape_time() -> Option<chrono::DateTime<chrono::Utc>> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,7 +580,15 @@ mod tests {
 
     #[test]
     fn test_unavailable_metrics_are_none_not_zero() {
-        assert_eq!(get_custom_metrics_count(), None);
+        let json = serde_json::to_value(MetricsInfo {
+            prometheus_enabled: false,
+            metrics_endpoint: "/metrics".to_string(),
+            custom_metrics_count: None,
+            last_scrape: None,
+        })
+        .unwrap();
+        assert!(json["custom_metrics_count"].is_null());
+        assert!(json["last_scrape"].is_null());
     }
 
     #[tokio::test]

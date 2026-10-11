@@ -359,8 +359,12 @@ impl EventFilter {
             return false;
         }
 
-        // Check processing time range
-        if let Some(processing_time) = event.processing_time_ms {
+        // Check processing time range: an event without a processing time cannot be in
+        // a range, so it is rejected when either bound is set.
+        if self.min_processing_time_ms.is_some() || self.max_processing_time_ms.is_some() {
+            let Some(processing_time) = event.processing_time_ms else {
+                return false;
+            };
             if let Some(min_time) = self.min_processing_time_ms
                 && processing_time < min_time
             {
@@ -388,7 +392,11 @@ impl EventFilter {
     }
 }
 
-/// Event subscription for receiving filtered events
+/// Event subscription for receiving filtered events.
+///
+/// Dropping a subscription does not unregister it: call
+/// [`EventManager::unsubscribe`] with its `id` when done, so its filter stops counting
+/// toward [`EventManager::subscription_count`] and [`EventManager::payload_wanted`].
 #[derive(Debug)]
 pub struct EventSubscription {
     /// Unique identifier for this subscription
@@ -637,6 +645,9 @@ impl EventManager {
     }
 
     /// Subscribe to job lifecycle events with a filter.
+    ///
+    /// Call [`unsubscribe`](Self::unsubscribe) with the subscription's `id` when done:
+    /// dropping the subscription leaves its filter registered.
     ///
     /// Creates a new subscription that will receive events matching the provided filter.
     /// The returned `EventSubscription` contains a broadcast receiver that will receive
@@ -1464,10 +1475,25 @@ mod tests {
                 .matches(&event),
             "missing metadata key"
         );
-        // Without a processing time the time range does not apply.
+        // An event without a processing time is outside any processing-time range.
+        assert!(
+            !EventFilter::new()
+                .with_processing_time_range(Some(10), Some(20))
+                .matches(&event)
+        );
+        assert!(
+            !EventFilter::new()
+                .with_processing_time_range(Some(10), None)
+                .matches(&event)
+        );
+        assert!(
+            !EventFilter::new()
+                .with_processing_time_range(None, Some(20))
+                .matches(&event)
+        );
         assert!(
             EventFilter::new()
-                .with_processing_time_range(Some(10), Some(20))
+                .with_processing_time_range(None, None)
                 .matches(&event)
         );
     }

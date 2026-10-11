@@ -356,8 +356,8 @@ async fn job_endpoints<Q: JobHistory + 'static>(app: &App<Q>) {
         .await;
     assert_eq!(
         job_ids(&only_queue).len(),
-        0,
-        "scheduled-in-the-future jobs are not ready"
+        1,
+        "scheduled-in-the-future jobs are searchable (#114)"
     );
     let (_, by_status) = app
         .post(

@@ -15,8 +15,28 @@ pub enum CronError {
     ParseError(#[from] cron::error::Error),
 }
 
-/// Represents a cron schedule with timezone support
+/// The serialized form of a [`CronSchedule`]: deserializing rebuilds the schedule from it.
+#[derive(Deserialize)]
+struct CronScheduleData {
+    expression: String,
+    timezone: String,
+}
+
+impl TryFrom<CronScheduleData> for CronSchedule {
+    type Error = CronError;
+
+    fn try_from(data: CronScheduleData) -> Result<Self, Self::Error> {
+        CronSchedule::with_timezone(&data.expression, &data.timezone)
+    }
+}
+
+/// Represents a cron schedule with timezone support.
+///
+/// Deserializing parses the expression and timezone again, so a deserialized schedule
+/// fires like one built with [`CronSchedule::with_timezone`]; an invalid expression or
+/// timezone is a deserialization error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "CronScheduleData")]
 pub struct CronSchedule {
     pub expression: String,
     pub timezone: String,
@@ -178,6 +198,32 @@ pub mod presets {
 mod tests {
     use super::*;
     use chrono::{Datelike, TimeZone, Timelike};
+
+    /// #114: a deserialized schedule is rebuilt, so it fires; invalid input errors.
+    #[test]
+    fn test_deserialized_schedule_fires() {
+        let original = CronSchedule::with_timezone("0 0 9 * * *", "America/New_York").unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: CronSchedule = serde_json::from_str(&json).unwrap();
+        let after = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        assert!(restored.next_execution(after).is_some());
+        assert_eq!(
+            restored.next_execution(after),
+            original.next_execution(after)
+        );
+        assert!(restored.matches(Utc.with_ymd_and_hms(2024, 1, 1, 14, 0, 30).unwrap()));
+
+        assert!(
+            serde_json::from_str::<CronSchedule>(r#"{"expression":"nonsense","timezone":"UTC"}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<CronSchedule>(
+                r#"{"expression":"0 0 9 * * *","timezone":"Not/AZone"}"#
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_cron_schedule_creation() {

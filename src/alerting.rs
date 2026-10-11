@@ -674,9 +674,10 @@ impl AlertManager {
     async fn send_alert_if_needed(&self, alert: Alert) -> Result<()> {
         let alert_key = (alert.queue_name.clone(), alert.alert_type.clone());
 
-        // Check cooldown period
+        // Check the cooldown and reserve it in one step under the write lock, so concurrent
+        // checks of the same alert cannot all pass the check and each send a duplicate.
         {
-            let last_alerts = self.last_alerts.read().await;
+            let mut last_alerts = self.last_alerts.write().await;
             if let Some(last_time) = last_alerts.get(&alert_key) {
                 // A cooldown too long for chrono never ends.
                 let cooldown_duration = chrono::Duration::from_std(self.config.cooldown_period)
@@ -686,19 +687,21 @@ impl AlertManager {
                     return Ok(()); // Still in cooldown period
                 }
             }
-        }
-        // An alert that reached no target is retried after a shorter delay.
-        {
-            let failed_alerts = self.failed_alerts.read().await;
-            if let Some(failed_at) = failed_alerts.get(&alert_key) {
-                let retry_delay = chrono::Duration::from_std(
-                    FAILED_ALERT_RETRY_DELAY.min(self.config.cooldown_period),
-                )
-                .unwrap_or(chrono::Duration::MAX);
-                if Utc::now() - *failed_at < retry_delay {
-                    return Ok(());
+            // An alert that reached no target is retried after a shorter delay.
+            {
+                let failed_alerts = self.failed_alerts.read().await;
+                if let Some(failed_at) = failed_alerts.get(&alert_key) {
+                    let retry_delay = chrono::Duration::from_std(
+                        FAILED_ALERT_RETRY_DELAY.min(self.config.cooldown_period),
+                    )
+                    .unwrap_or(chrono::Duration::MAX);
+                    if Utc::now() - *failed_at < retry_delay {
+                        return Ok(());
+                    }
                 }
             }
+            // Reserved: released again below when no target is reached.
+            last_alerts.insert(alert_key.clone(), alert.timestamp);
         }
 
         // Send alert to all targets
@@ -718,6 +721,8 @@ impl AlertManager {
             let mut last_alerts = self.last_alerts.write().await;
             last_alerts.insert(alert_key, alert.timestamp);
         } else {
+            // Release the reservation: no cooldown without a delivery.
+            self.last_alerts.write().await.remove(&alert_key);
             self.failed_alerts
                 .write()
                 .await
@@ -1096,6 +1101,32 @@ mod tests {
 
         let result = manager.check_queue_depth("test_queue", 1500).await;
         assert!(result.is_ok());
+    }
+
+    /// #114: concurrent checks of the same alert send it once, not once per caller.
+    #[tokio::test]
+    async fn test_concurrent_alerts_respect_the_cooldown() {
+        let (url, mut requests) = fake_http_server(200).await;
+        let manager = Arc::new(AlertManager::new(
+            AlertingConfig::new().alert_on_queue_depth(1).webhook(&url),
+        ));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                manager.check_queue_depth("q", 5).await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        next_request(&mut requests).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), requests.recv())
+                .await
+                .is_err(),
+            "the alert was sent more than once"
+        );
     }
 
     #[tokio::test]

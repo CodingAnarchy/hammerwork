@@ -1103,6 +1103,13 @@ impl StreamManager {
         self.shutdown_signal.send_replace(true);
         self.listeners.close();
         self.listeners.abort_all().await;
+        // The listeners are stopped: take their subscriptions off the event manager too.
+        let handles: Vec<_> = self.subscriptions.write().await.drain().collect();
+        for (_, handle) in handles {
+            if let Err(e) = self.event_manager.unsubscribe(handle.subscription_id).await {
+                tracing::warn!("Failed to unsubscribe a listener during shutdown: {e}");
+            }
+        }
         let aborted = self.batches.drain(grace).await;
 
         let processors: Vec<_> = {
@@ -2022,9 +2029,8 @@ impl StreamManager {
                     hash_input.push('|');
                 }
 
-                // Simple hash function (in production, use a proper hash function)
-                let hash = hash_input.chars().map(|c| c as u32).sum::<u32>();
-                Some(format!("{}", hash % 1000))
+                // A stable hash (the same key on every platform and release), into 1000 buckets.
+                Some(format!("{}", fnv1a_64(hash_input.as_bytes()) % 1000))
             }
         }
     }
@@ -3138,6 +3144,16 @@ impl StreamProcessor for InMemoryProcessor {
     }
 }
 
+/// 64-bit FNV-1a hash: stable across platforms and releases, unlike `DefaultHasher`.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3310,6 +3326,34 @@ mod tests {
             },
         );
         assert!(hash_result.is_some());
+    }
+
+    /// #114: the hash partitioner is a stable hash: no collisions between reorderings and
+    /// no overflow on long inputs.
+    #[test]
+    fn test_hash_partitioning_is_a_stable_hash() {
+        // Known FNV-1a test vectors.
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+
+        let key = |queue: &str| {
+            let mut event = completed_event();
+            event.queue_name = queue.to_string();
+            StreamManager::calculate_partition_key(
+                &event,
+                &PartitioningStrategy::Hash {
+                    fields: vec![PartitionField::QueueName],
+                },
+            )
+            .unwrap()
+        };
+        // A character sum maps anagrams to the same bucket.
+        assert_ne!(key("ab"), key("ba"));
+        assert_eq!(key("emails"), key("emails"));
+        // Very long input must not overflow (the old u32 sum panicked in debug builds).
+        let long = "\u{10FFFF}".repeat(10_000);
+        assert!(key(&long).parse::<u32>().unwrap() < 1000);
     }
 
     #[test]
@@ -5175,6 +5219,23 @@ mod tests {
         assert_eq!(processor.delivered_ids(), vec![event.event_id]);
         assert_eq!(processor.calls(), 1);
         manager.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// #114: shutting the manager down takes its listeners off the event manager.
+    #[tokio::test]
+    async fn test_shutdown_unsubscribes_listeners() {
+        let events = Arc::new(EventManager::new_default());
+        let manager = StreamManager::new_default(events.clone());
+        manager
+            .add_stream_with_processor(
+                test_stream(1, immediate_retries(1)),
+                Box::new(InMemoryProcessor::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.subscription_count().await, 1);
+        manager.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(events.subscription_count().await, 0);
     }
 
     /// A processor whose sends wait until `gate` has a permit (one per send).

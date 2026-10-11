@@ -360,6 +360,7 @@ impl HammerworkConfig {
         let config: Self = toml::from_str(&content)?;
         config.worker.validate()?;
         config.archive.validate()?;
+        config.encryption.validate()?;
         config.validate_delivery_targets()?;
         Ok(config)
     }
@@ -377,10 +378,43 @@ impl HammerworkConfig {
         Ok(())
     }
 
-    /// Save configuration to a TOML file
+    /// Save configuration to a TOML file.
+    ///
+    /// The file can hold secrets (database passwords, webhook secrets, key references),
+    /// so on Unix it is created readable by its owner only (mode 0600). It is written to
+    /// a temporary file next to `path` and renamed over it, so a failure never leaves a
+    /// half-written configuration and the permissions apply even when `path` existed.
     pub fn save_to_file(&self, path: &str) -> crate::Result<()> {
+        use std::io::Write;
+
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        let target = std::path::Path::new(path);
+        let file_name = target.file_name().ok_or_else(|| {
+            crate::HammerworkError::Config(format!("Invalid config path: {path}"))
+        })?;
+        let mut temp_name = std::ffi::OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+        let temp_path = target.with_file_name(temp_name);
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| -> std::io::Result<()> {
+            let mut file = options.open(&temp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp_path, target)
+        })();
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -2329,6 +2363,48 @@ service_name = "hammerwork"
         config.save_to_file(path).unwrap();
         let err = HammerworkConfig::from_file(path).unwrap_err();
         assert!(err.to_string().contains("unknown placeholder"), "{err}");
+    }
+
+    /// #114: the saved file is private to its owner, also when it replaces a file with
+    /// looser permissions, and no temporary file is left behind.
+    #[cfg(unix)]
+    #[test]
+    fn test_save_to_file_writes_owner_only_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hammerwork.toml");
+        let path_str = path.to_str().unwrap();
+
+        HammerworkConfig::default().save_to_file(path_str).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        HammerworkConfig::default().save_to_file(path_str).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        HammerworkConfig::from_file(path_str).unwrap();
+    }
+
+    /// #114: `from_file` validates the `[encryption]` section.
+    #[test]
+    fn test_from_file_validates_the_encryption_section() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hammerwork.toml");
+        let path = path.to_str().unwrap();
+
+        // Queues listed for encryption while encryption is disabled: plaintext by mistake.
+        let mut config = HammerworkConfig::default();
+        config.encryption.encrypted_queues = vec!["secrets".to_string()];
+        config.save_to_file(path).unwrap();
+        let err = HammerworkConfig::from_file(path).unwrap_err();
+        assert!(err.to_string().contains("encryption.enabled"), "{err}");
+
+        let mut config = HammerworkConfig::default();
+        config.encryption.purge_interval_secs = Some(0);
+        config.save_to_file(path).unwrap();
+        assert!(HammerworkConfig::from_file(path).is_err());
     }
 
     #[test]
