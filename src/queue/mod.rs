@@ -32,7 +32,7 @@ pub mod postgres;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 pub mod test;
 
 mod payload_encryption;
@@ -1250,7 +1250,7 @@ pub(crate) fn saturating_chrono_duration(duration: std::time::Duration) -> chron
 
 /// `now - duration`, saturating at the minimum representable timestamp.
 #[cfg_attr(
-    not(any(feature = "postgres", feature = "mysql", feature = "test")),
+    not(any(feature = "postgres", feature = "mysql", feature = "test-queue")),
     allow(dead_code)
 )]
 pub(crate) fn saturating_sub_from(
@@ -1262,7 +1262,7 @@ pub(crate) fn saturating_sub_from(
 }
 
 /// `now + duration`, saturating at the maximum representable timestamp.
-#[cfg_attr(not(feature = "test"), allow(dead_code))]
+#[cfg_attr(not(feature = "test-queue"), allow(dead_code))]
 pub(crate) fn saturating_add_to(
     now: DateTime<Utc>,
     duration: std::time::Duration,
@@ -1958,7 +1958,7 @@ mod tests {
         // This test doesn't require an actual database connection
 
         // We'll use the test queue for this since it doesn't require a real database
-        #[cfg(feature = "test")]
+        #[cfg(feature = "test-queue")]
         {
             use crate::queue::test::TestQueue;
             let test_queue = TestQueue::new();
@@ -2050,7 +2050,7 @@ mod tests {
         // Test that JobQueue implements Clone trait correctly
         // This test verifies compilation and basic cloning functionality
 
-        #[cfg(feature = "test")]
+        #[cfg(feature = "test-queue")]
         {
             use crate::queue::test::TestQueue;
 

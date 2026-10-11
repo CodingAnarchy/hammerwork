@@ -3,7 +3,7 @@
 //! the other jobs (`fail_job`, a worker's `finish_job_run` and the explicit
 //! `fail_job_dependencies` helper all apply it the same way).
 
-#![cfg(any(feature = "postgres", feature = "mysql", feature = "test"))]
+#![cfg(any(feature = "postgres", feature = "mysql", feature = "test-queue"))]
 
 mod test_utils;
 
@@ -404,7 +404,7 @@ crate::test_utils::backend_tests!(
     ]
 );
 
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 crate::test_utils::backend_tests!(
     test_queue_tests,
     test_utils::test_queue,

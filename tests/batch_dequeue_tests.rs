@@ -7,7 +7,7 @@
 //! attempt count, pause/dependency/recurring checks, priority order and exactly-once
 //! claiming under concurrency.
 
-#![cfg(any(feature = "postgres", feature = "mysql", feature = "test"))]
+#![cfg(any(feature = "postgres", feature = "mysql", feature = "test-queue"))]
 
 mod test_utils;
 
@@ -433,7 +433,7 @@ crate::test_utils::backend_tests!(
     ]
 );
 
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 crate::test_utils::backend_tests!(
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     test_queue_tests,

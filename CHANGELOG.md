@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **No features are enabled by default** (#92). `default` used to be `["metrics", "alerting", "webhooks"]`, which pulled `warp`, `reqwest`, `lettre` and `prometheus` into every build. It is now empty. Enable what you use, or the new `full` feature (`metrics`, `alerting`, `webhooks`, `streaming`, `tracing`, `encryption`; no database backend, KMS key source, event stream sink or `test-queue`). Code that uses `hammerwork::metrics`, `hammerwork::alerting` or `hammerwork::webhooks` must now enable those features. `cargo-hammerwork` and `hammerwork-web` enable the features they need themselves.
+- **`azure-kv` is renamed `azure-kms`**, to match `aws-kms`, `gcp-kms` and `vault-kms` (#92). There is no alias. The same rename applies to the `cargo-hammerwork` feature.
+- **`test` is renamed `test-queue`**, after the `TestQueue` it enables (#92). There is no alias.
+
+### Fixed
+
+- Building with `encryption` but no database backend (and so with `full`) no longer fails clippy with dead-code and unused-import errors.
+
+### Changed
+
+- CI checks the feature combinations `full`, `postgres,full`, `mysql,full` and `test-queue`.
+
 ## [2.5.0] - 2026-10-11
 
 A bug-fix release from a third bug hunt (#111 to #114, #118). It is a minor version

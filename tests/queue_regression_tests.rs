@@ -524,7 +524,7 @@ mod mysql_tests {
 }
 
 /// The in-memory `TestQueue` re-evaluates dependencies like the database backends.
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 mod test_queue_tests {
     use super::*;
     use hammerwork::queue::test::TestQueue;

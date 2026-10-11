@@ -280,7 +280,7 @@ In-memory results are faster to store than database results, but:
 `ResultConfig::with_max_size` is recorded with the job but not enforced, for database
 and in-memory results alike.
 
-The `TestQueue` (feature `test`) keeps all results in memory regardless of
+The `TestQueue` (feature `test-queue`) keeps all results in memory regardless of
 `ResultStorage`, expiring them by its mock clock.
 
 ## Error Handling

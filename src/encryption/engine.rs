@@ -1417,7 +1417,7 @@ async fn load_external_key(
     } else if service_config.starts_with("vault://") {
         load_from_vault(service_config, expected_size).await
     } else if service_config.starts_with("azure://") {
-        load_from_azure_kv(service_config, expected_size).await
+        load_from_azure_kms(service_config, expected_size).await
     } else {
         Err(EncryptionError::KeyManagement(format!(
             "Unknown external key management service: {}",
@@ -1461,7 +1461,7 @@ async fn load_from_vault(
 /// Load a key from Azure Key Vault (`azure://<vault-host>/keys/<key-name>`, key name
 /// defaults to `encryption-key`). The key material must be exactly `expected_size`
 /// bytes; anything else is an [`EncryptionError::InvalidConfiguration`].
-async fn load_from_azure_kv(
+async fn load_from_azure_kms(
     service_config: &str,
     expected_size: usize,
 ) -> Result<SecretBytes, EncryptionError> {
@@ -1472,13 +1472,13 @@ async fn load_from_azure_kv(
         vault_url, key_name
     );
 
-    #[cfg(not(feature = "azure-kv"))]
+    #[cfg(not(feature = "azure-kms"))]
     {
         let _ = (vault_url, key_name, expected_size);
-        Err(kms::kms_feature_disabled("azure://", "azure-kv"))
+        Err(kms::kms_feature_disabled("azure://", "azure-kms"))
     }
 
-    #[cfg(feature = "azure-kv")]
+    #[cfg(feature = "azure-kms")]
     {
         let decoded_key = super::azure::fetch_key_material(&vault_url, &key_name)
             .await
@@ -1500,6 +1500,7 @@ async fn load_from_azure_kv(
 }
 
 #[cfg(test)]
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1826,8 +1827,8 @@ mod tests {
             "gcp://projects/p/locations/global/keyRings/r/cryptoKeys/k",
             "gcp-kms",
         ));
-        #[cfg(not(feature = "azure-kv"))]
-        cases.push(("azure://my-vault.vault.azure.net/keys/k", "azure-kv"));
+        #[cfg(not(feature = "azure-kms"))]
+        cases.push(("azure://my-vault.vault.azure.net/keys/k", "azure-kms"));
 
         for (source, feature) in cases {
             let err = load_external_key(source, 32).await.unwrap_err();
@@ -2613,16 +2614,16 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "azure-kv")]
+    #[cfg(feature = "azure-kms")]
     #[tokio::test]
     async fn test_azure_key_with_invalid_vault_fails() {
-        let err = load_from_azure_kv("azure://", 32).await.unwrap_err();
+        let err = load_from_azure_kms("azure://", 32).await.unwrap_err();
         assert!(
             matches!(err, EncryptionError::InvalidConfiguration(_)),
             "{err}"
         );
         // A vault host that is not a valid URL fails before any request is made.
-        let err = load_from_azure_kv("azure://bad host/keys/k", 32)
+        let err = load_from_azure_kms("azure://bad host/keys/k", 32)
             .await
             .unwrap_err();
         assert!(

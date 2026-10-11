@@ -819,12 +819,12 @@ mod tests {
         assert!(err.to_string().contains("_spawn_config"));
     }
 
-    #[cfg(all(feature = "test", feature = "postgres"))]
+    #[cfg(all(feature = "test-queue", feature = "postgres"))]
     struct OwnSettingsSpawner {
         sibling: crate::JobId,
     }
 
-    #[cfg(all(feature = "test", feature = "postgres"))]
+    #[cfg(all(feature = "test-queue", feature = "postgres"))]
     #[async_trait]
     impl<DB: sqlx::Database> SpawnHandler<DB> for OwnSettingsSpawner {
         async fn spawn_jobs(&self, _context: SpawnContext<DB>) -> Result<Vec<Job>> {
@@ -843,7 +843,7 @@ mod tests {
     /// A parent without a retry strategy, timeout or trace id no longer wipes the
     /// child's own (a parent that has one still overrides it), and the child keeps its
     /// own dependencies in addition to the parent.
-    #[cfg(all(feature = "test", feature = "postgres"))]
+    #[cfg(all(feature = "test-queue", feature = "postgres"))]
     #[tokio::test]
     async fn test_prepare_spawn_keeps_the_childs_own_settings() {
         use crate::queue::test::TestQueue;

@@ -62,7 +62,7 @@ impl StoredWorkflow for hammerwork::JobQueue<sqlx::MySql> {
     }
 }
 
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 impl StoredWorkflow for hammerwork::queue::test::TestQueue {
     async fn stored_workflow(&self, id: WorkflowId) -> (String, i32, i32, i32) {
         // TestQueue computes the workflow when it is read.
@@ -599,7 +599,7 @@ where
 /// #111 (5), with the default policy enabled: a queue without a policy of its own gets
 /// the default one, a queue with its own policy keeps it. Only run on `TestQueue`: on
 /// a shared database an archive-now default policy would archive other tests' jobs.
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 async fn scheduled_pass_applies_default_policy_to_other_queues<Q>(queue: Arc<Q>)
 where
     Q: DatabaseQueue + Send + Sync + 'static,
@@ -674,7 +674,7 @@ crate::test_utils::backend_tests!(
     ]
 );
 
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 crate::test_utils::backend_tests!(
     test_queue_tests,
     test_utils::test_queue,

@@ -258,7 +258,7 @@ let config = EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
 # }
 ```
 
-Credentials come from the environment (`AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`, workload identity, managed identity, or the Azure CLI). Requires the `azure-kv` feature. The key material must be exactly the algorithm's key size (32 bytes, e.g. a 256-bit `oct` key); shorter or longer material is rejected with `EncryptionError::InvalidConfiguration` instead of being padded or truncated, for engine keys and `KeyManager` master keys alike.
+Credentials come from the environment (`AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`, workload identity, managed identity, or the Azure CLI). Requires the `azure-kms` feature. The key material must be exactly the algorithm's key size (32 bytes, e.g. a 256-bit `oct` key); shorter or longer material is rejected with `EncryptionError::InvalidConfiguration` instead of being padded or truncated, for engine keys and `KeyManager` master keys alike.
 
 #### Key loading fails closed
 
@@ -267,7 +267,7 @@ Loading a key from an external source never falls back to another key. `Encrypti
 - the KMS or vault is unreachable, or rejects the credentials
 - the key, secret or `key` field does not exist
 - the source is malformed (for example a Vault path without a mount, or a GCP resource that is not `projects/.../locations/...`)
-- the cargo feature for the source (`aws-kms`, `gcp-kms`, `vault-kms`, `azure-kv`) is not enabled
+- the cargo feature for the source (`aws-kms`, `gcp-kms`, `vault-kms`, `azure-kms`) is not enabled
 
 Previously, these cases logged an error and used a key derived from the source string (key ID, region, Vault path, vault URL). Anyone who knew the configuration could derive that key. For development without a KMS, use `KeySource::Static` with a base64-encoded key, or `KeySource::Generated`.
 
@@ -413,7 +413,7 @@ let pool = WorkerPool::from_hammerwork_config(worker, &config)?;
 
 ### Testing with `TestQueue`
 
-The in-memory `TestQueue` (feature `test`) applies the same semantics when given an engine, so unit tests exercise the real redaction and decryption paths:
+The in-memory `TestQueue` (feature `test-queue`) applies the same semantics when given an engine, so unit tests exercise the real redaction and decryption paths:
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::{*, encryption::*, queue::DatabaseQueue, worker::JobHandler};
