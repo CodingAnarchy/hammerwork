@@ -296,6 +296,17 @@ pub async fn handle_api_error(
     ))
 }
 
+/// Hand a clone of shared state (a queue handle, system state, ...) to a handler.
+pub fn with_shared<T>(
+    value: T,
+) -> impl warp::Filter<Extract = (T,), Error = std::convert::Infallible> + Clone
+where
+    T: Clone + Send,
+{
+    use warp::Filter;
+    warp::any().map(move || value.clone())
+}
+
 /// Extract pagination parameters from query string
 pub fn with_pagination()
 -> impl warp::Filter<Extract = (PaginationParams,), Error = warp::Rejection> + Clone {
