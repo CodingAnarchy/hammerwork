@@ -110,7 +110,7 @@
 //! ```
 
 use super::history::{ErrorGroup, JobHistory, MAX_BUCKETS, hour_floor};
-use super::{ApiResponse, error_reply, json_reply};
+use super::{ApiResponse, error_reply, json_reply, with_shared};
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -249,8 +249,8 @@ pub fn routes<T>(
 where
     T: JobHistory + 'static,
 {
-    let queue_filter = warp::any().map(move || queue.clone());
-    let state_filter = warp::any().map(move || system_state.clone());
+    let queue_filter = with_shared(queue);
+    let state_filter = with_shared(system_state);
 
     let overview = warp::path("stats")
         .and(warp::path("overview"))

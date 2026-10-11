@@ -81,19 +81,21 @@ The codebase follows a modular architecture with clear separation of concerns:
    - Job priorities: Background, Low, Normal, High, Critical
    - Supports delayed execution, configurable retry attempts, and priority levels
 
-2. **Queue (`src/queue.rs`)**
-   - `DatabaseQueue` trait defines the interface for database operations
-   - `JobQueue<DB>` generic struct wraps database connection pools
-   - Database-specific implementations in `postgres` and `mysql` modules
-   - Uses database transactions for atomic job operations
-   - Priority-aware job selection with weighted algorithms
+2. **Queue (`src/queue/`)**
+   - `mod.rs`: the `DatabaseQueue` trait (the interface for database operations) and the generic `JobQueue<DB>` wrapping a connection pool
+   - `postgres.rs` / `mysql.rs`: the dialect-specific implementations (SQL, row types, locking)
+   - `backend.rs`: helpers shared by both backends (transactions and conflict retries, column encoding, cron and dequeue helpers)
+   - `row.rs`: dialect-independent row decoding (column lists, status, result config and encryption columns)
+   - `lifecycle.rs`: the job lifecycle state machine (manual transitions and worker run outcomes)
+   - `payload_encryption.rs`, `memory_results.rs`: payload sealing and in-memory result storage
+   - `test.rs`: the in-memory `TestQueue` (feature `test`)
+   - Priority-aware job selection with weighted algorithms; atomic transitions in transactions
 
-3. **Worker (`src/worker.rs`)**
-   - `Worker<DB>` processes jobs from specific queues
-   - Configurable polling intervals, retry delays, max retries, and priority weights
-   - Support for strict priority or weighted priority scheduling
-   - `WorkerPool<DB>` manages multiple workers with graceful shutdown
-   - Uses async channels for shutdown coordination
+3. **Worker (`src/worker.rs` and `src/worker/`)**
+   - `worker.rs`: `Worker<DB>` processes jobs from specific queues (polling intervals, retry delays, priority weights, strict or weighted scheduling)
+   - `worker/pool.rs`: `WorkerPool<DB>` manages multiple workers with graceful shutdown, supervision and periodic maintenance
+   - `worker/autoscale.rs`: autoscaling configuration and decisions
+   - `worker/hooks.rs`: job lifecycle event hooks
 
 4. **Priority System (`src/priority.rs`)**
    - `JobPriority` enum with 5 levels: Background, Low, Normal, High, Critical
@@ -104,6 +106,15 @@ The codebase follows a modular architecture with clear separation of concerns:
 5. **Error Handling (`src/error.rs`)**
    - `HammerworkError` enum using thiserror for structured error handling
    - Wraps SQLx, serialization, and custom errors
+
+6. **Other modules**: `migrations/` (versioned SQL migrations per backend), `cron`, `retry`, `batch`, `workflow`, `spawn`, `archive`, `rate_limit`, `stats`, `metrics`, `events`, `streaming`, `webhooks`, `alerting`, `tracing`, `encryption/`, `config`, `task_tracker`. Most are feature-gated; see `[features]` in `Cargo.toml`.
+
+### Workspace Crates
+
+- `hammerwork` (repo root): the library
+- `cargo-hammerwork/`: the CLI (`cargo hammerwork ...`)
+- `hammerwork-web/`: the web dashboard and REST API
+- `integrations/`: Docker-based integration test binaries
 
 ### Database Schema
 

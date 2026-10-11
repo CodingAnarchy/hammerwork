@@ -104,7 +104,7 @@ use super::{
     ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, SortParams,
     with_filters, with_pagination, with_sort,
 };
-use super::{error_reply, json_reply};
+use super::{error_reply, json_reply, with_shared};
 use hammerwork::queue::DatabaseQueue;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -171,7 +171,7 @@ pub fn routes<T>(
 where
     T: JobHistory + 'static,
 {
-    let queue_filter = warp::any().map(move || queue.clone());
+    let queue_filter = with_shared(queue);
 
     let list_queues = warp::path("queues")
         .and(warp::path::end())

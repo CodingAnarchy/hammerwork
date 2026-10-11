@@ -67,7 +67,7 @@
 use super::history::JobHistory;
 use super::{
     ApiResponse, FilterParams, PaginatedResponse, PaginationMeta, PaginationParams, error_reply,
-    internal_error, json_reply,
+    internal_error, json_reply, with_shared,
 };
 use hammerwork::{
     JobId, JobStatus,
@@ -259,32 +259,32 @@ where
     let archive_jobs = warp::path!("archive" / "jobs")
         .and(warp::post())
         .and(crate::security::json_body())
-        .and(with_queue(queue.clone()))
+        .and(with_shared(queue.clone()))
         .and_then(handle_archive_jobs);
 
     let list_archived = warp::path!("archive" / "jobs")
         .and(warp::get())
         .and(super::with_pagination())
         .and(with_archive_filters())
-        .and(with_queue(queue.clone()))
+        .and(with_shared(queue.clone()))
         .and_then(handle_list_archived_jobs);
 
     let restore_job = warp::path!("archive" / "jobs" / String / "restore")
         .and(warp::post())
         .and(crate::security::json_body())
-        .and(with_queue(queue.clone()))
+        .and(with_shared(queue.clone()))
         .and_then(handle_restore_job);
 
     let purge_jobs = warp::path!("archive" / "purge")
         .and(warp::delete())
         .and(crate::security::json_body())
-        .and(with_queue(queue.clone()))
+        .and(with_shared(queue.clone()))
         .and_then(handle_purge_jobs);
 
     let archive_stats = warp::path!("archive" / "stats")
         .and(warp::get())
         .and(warp::query::<FilterParams>())
-        .and(with_queue(queue.clone()))
+        .and(with_shared(queue.clone()))
         .and_then(handle_archive_stats);
 
     archive_jobs
@@ -292,16 +292,6 @@ where
         .or(restore_job)
         .or(purge_jobs)
         .or(archive_stats)
-}
-
-/// Helper to inject queue into handlers
-fn with_queue<Q>(
-    queue: Arc<Q>,
-) -> impl Filter<Extract = (Arc<Q>,), Error = std::convert::Infallible> + Clone
-where
-    Q: JobHistory + 'static,
-{
-    warp::any().map(move || queue.clone())
 }
 
 /// Extract archive filter parameters from query string
