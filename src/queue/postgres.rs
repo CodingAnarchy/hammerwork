@@ -2209,7 +2209,16 @@ impl crate::queue::JobQueue<Postgres> {
             .bind(id)
             .fetch_one(&mut *conn)
             .await?;
-            let job = row.into_job()?;
+            // A row that cannot be decoded is still reclaimed (it is Dead now), but its
+            // side effects cannot be applied. Failing here would roll back the whole
+            // pass, so no stale job would ever be reclaimed again while the row exists.
+            let job = match row.into_job() {
+                Ok(job) => job,
+                Err(error) => {
+                    super::warn_undecodable_stale_job(*id, &error);
+                    continue;
+                }
+            };
             Self::after_terminal(conn, &job, JobStatus::Dead, now, true).await?;
         }
 

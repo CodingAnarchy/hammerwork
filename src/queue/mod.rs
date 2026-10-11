@@ -1463,6 +1463,18 @@ pub(crate) fn decodable_rows<T>(
         .collect()
 }
 
+/// Log a stale job the reaper reclaimed although its row cannot be decoded, so the side
+/// effects of its death (dependents, workflow, batch, recurring schedule) were skipped.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) fn warn_undecodable_stale_job(job_id: JobId, error: &crate::HammerworkError) {
+    tracing::warn!(
+        job_id = %job_id,
+        error = %error,
+        "Reclaimed a stale job whose row cannot be decoded; its dependents, workflow, \
+         batch and recurring schedule were not updated"
+    );
+}
+
 /// Convert an integer read from the database into the type the API exposes (e.g. a
 /// `COUNT(*)` `i64` into `u64`), failing instead of wrapping on out-of-range values.
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A job row that cannot be decoded no longer stops the stale job reaper.** On MySQL any
+  such row among the stale `Running` jobs, and on PostgreSQL one that was out of
+  attempts, made `requeue_stale_jobs` fail and roll back, so no stale job of any queue
+  was reclaimed while the row existed. The reaper now reclaims it like any other (back
+  to `Pending`, or `Dead` with a warning that its dependents, workflow, batch and
+  recurring schedule could not be updated).
+- **A job row that cannot be decoded no longer blocks a MySQL queue.** It stayed
+  `Pending` at the head of the queue: every single claim failed on it, and batch claims of
+  one job came back empty forever. MySQL now claims it, as PostgreSQL does (a single claim
+  returns the decoding error, a batch claim skips it), so the jobs behind it run; it stays
+  `Running` until its lease expires and the reaper takes it. Such rows come from corrupt
+  data or a newer version's data (for example a retry strategy this version does not
+  know).
+
 ## [2.1.0] - 2026-10-10
 
 ### Upgrading from 2.0

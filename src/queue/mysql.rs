@@ -661,8 +661,15 @@ impl crate::queue::JobQueue<MySql> {
             let Some(row) = select.fetch_optional(&mut *tx).await? else {
                 return Ok(None);
             };
-            let job_row = JobRow::from_row(&row)?;
+            let id: String = row.try_get("id")?;
             let started_at: DateTime<Utc> = row.try_get("claimed_at")?;
+            // A row that cannot be decoded is claimed all the same and the error returned
+            // after the claim commits, as on PostgreSQL: it stays Running until its lease
+            // expires and the reaper takes it (eventually Dead). Leaving it Pending would
+            // make it the head of the queue for every claim, blocking the queue forever.
+            let decoded = JobRow::from_row(&row)
+                .map_err(crate::HammerworkError::from)
+                .and_then(JobRow::into_job);
 
             sqlx::query(&format!(
                 "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1, \
@@ -674,18 +681,19 @@ impl crate::queue::JobQueue<MySql> {
             .bind(started_at)
             .bind(started_at)
             .bind(lease)
-            .bind(&job_row.id)
+            .bind(&id)
             .execute(&mut *tx)
             .await?;
 
-            let mut job = job_row.into_job()?;
-            job.status = JobStatus::Running;
-            job.attempts += 1;
-            job.started_at = Some(started_at);
-            Ok(Some(job))
+            Ok(Some(decoded.map(|mut job| {
+                job.status = JobStatus::Running;
+                job.attempts += 1;
+                job.started_at = Some(started_at);
+                job
+            })))
         }
         .await;
-        super::end_transaction(tx, result).await
+        super::end_transaction(tx, result).await?.transpose()
     }
 
     /// One attempt at claiming up to `limit` runnable jobs of `queue_name` (of
@@ -724,23 +732,26 @@ impl crate::queue::JobQueue<MySql> {
             };
             // One claim time for the whole batch, from the database clock.
             let started_at: DateTime<Utc> = first.try_get("claimed_at")?;
-            // A row that cannot be decoded is not claimed: it stays Pending (its lock is
-            // released at commit) instead of failing the healthy jobs claimed with it.
+            let ids = rows
+                .iter()
+                .map(|row| row.try_get::<String, _>("id"))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            // A row that cannot be decoded is claimed with the others but skipped (and
+            // logged) rather than failing the healthy jobs claimed with it; it stays
+            // Running until its lease expires, as on PostgreSQL. Leaving it Pending
+            // would put it at the head of every claim of the queue, so a batch of one
+            // would never get past it.
             let mut jobs = super::decodable_rows(
                 "claimed jobs",
-                rows.iter().map(|row| {
-                    let id: String = row.try_get("id").unwrap_or_default();
+                rows.iter().zip(&ids).map(|(row, id)| {
                     let job = JobRow::from_row(row)
                         .map_err(crate::HammerworkError::from)
                         .and_then(JobRow::into_job);
-                    (id, job)
+                    (id.clone(), job)
                 }),
             );
-            if jobs.is_empty() {
-                return Ok(Vec::new());
-            }
 
-            let placeholders = vec!["?"; jobs.len()].join(", ");
+            let placeholders = vec!["?"; ids.len()].join(", ");
             let sql = format!(
                 "UPDATE hammerwork_jobs SET status = ?, started_at = ?, attempts = attempts + 1, \
                  last_heartbeat_at = ?, lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
@@ -752,8 +763,8 @@ impl crate::queue::JobQueue<MySql> {
                 .bind(started_at)
                 .bind(started_at)
                 .bind(lease);
-            for job in &jobs {
-                update = update.bind(job.id.to_string());
+            for id in &ids {
+                update = update.bind(id);
             }
             update.execute(&mut *tx).await?;
 
@@ -2394,10 +2405,12 @@ impl crate::queue::JobQueue<MySql> {
 
         let mut recovery = super::StaleJobRecovery::default();
         for row in candidates {
-            let job = row.into_job()?;
-            let id_str = job.id.to_string();
-
-            let exhausted = job.attempts >= job.max_attempts;
+            // Reclaiming needs only the id and attempt counts, read straight from the
+            // row: one that cannot be decoded as a whole is reclaimed too, instead of
+            // failing (and rolling back) the pass for every stale job.
+            let id_str = row.id.clone();
+            let exhausted = row.attempts >= row.max_attempts;
+            let job = row.into_job();
             let result = if exhausted {
                 sqlx::query(
                     "UPDATE hammerwork_jobs SET status = ?, failed_at = ?, error_message = ?, \
@@ -2427,6 +2440,28 @@ impl crate::queue::JobQueue<MySql> {
             };
 
             if result.rows_affected() == 1 {
+                let job = match job {
+                    Ok(job) => job,
+                    Err(error) => {
+                        // The status changed above; the rest needs the decoded job.
+                        match uuid::Uuid::parse_str(&id_str) {
+                            Ok(id) => {
+                                super::warn_undecodable_stale_job(id, &error);
+                                if exhausted {
+                                    recovery.dead.push(id);
+                                } else {
+                                    recovery.requeued.push(id);
+                                }
+                            }
+                            Err(_) => tracing::warn!(
+                                job_id = %id_str,
+                                error = %error,
+                                "Reclaimed a stale job whose row cannot be decoded"
+                            ),
+                        }
+                        continue;
+                    }
+                };
                 if exhausted {
                     // A reclaimed job that died is a terminal failure like any other:
                     // reschedule it if recurring, otherwise apply it to its dependents,
