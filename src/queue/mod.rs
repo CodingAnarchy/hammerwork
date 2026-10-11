@@ -1563,6 +1563,54 @@ pub(crate) fn pick_weighted_priority(
     None
 }
 
+/// Fill a weighted batch claim of up to `max_jobs` jobs of `queue_name`
+/// ([`DatabaseQueue::dequeue_batch_leased`] with weights): pick one of `candidates` (the
+/// levels with runnable jobs) by weight, claim up to the room left with
+/// `claim(level, room)`, and repeat with the remaining levels until the batch is full or
+/// no level is left.
+///
+/// Each `claim` commits its jobs before the next one runs, so if a later claim fails the
+/// jobs already claimed are returned (and the error logged) rather than the error: they
+/// are `Running` under this caller's lease, and dropping them would leave them stuck
+/// until their leases expire, with an attempt spent (a job on its last attempt would go
+/// to `Dead` without having run). The error is returned when nothing was claimed.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+pub(crate) async fn fill_weighted_batch<F, Fut>(
+    queue_name: &str,
+    mut candidates: Vec<crate::priority::JobPriority>,
+    weights: &crate::priority::PriorityWeights,
+    max_jobs: usize,
+    mut claim: F,
+) -> Result<Vec<Job>>
+where
+    F: FnMut(crate::priority::JobPriority, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Job>>>,
+{
+    let mut jobs = Vec::with_capacity(max_jobs);
+    let mut attempt = 0;
+    while jobs.len() < max_jobs
+        && let Some(priority) =
+            pick_weighted_priority(&candidates, weights, weighted_seed(queue_name, attempt))
+    {
+        match claim(priority, max_jobs - jobs.len()).await {
+            Ok(claimed) => jobs.extend(claimed),
+            Err(error) if jobs.is_empty() => return Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    "claiming jobs of queue {} failed after {} were claimed; returning those: {}",
+                    queue_name,
+                    jobs.len(),
+                    error
+                );
+                break;
+            }
+        }
+        candidates.retain(|candidate| *candidate != priority);
+        attempt += 1;
+    }
+    Ok(jobs)
+}
+
 /// A seed for [`pick_weighted_priority`]: a hash of the queue name and the current
 /// time (hash-based so the future stays `Send`).
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
@@ -2238,6 +2286,68 @@ mod tests {
     }
 
     use super::*;
+
+    /// A weighted batch claim keeps the jobs it already claimed when claiming from a
+    /// later level fails: they are Running under the caller's lease and would otherwise
+    /// be stranded until it expires.
+    #[tokio::test]
+    async fn weighted_batch_keeps_claimed_jobs_when_a_later_claim_fails() {
+        use crate::priority::{JobPriority, PriorityWeights};
+        let weights = PriorityWeights::new();
+        let levels = vec![JobPriority::High, JobPriority::Normal, JobPriority::Low];
+        let first = vec![
+            Job::new("q".to_string(), serde_json::json!(1)),
+            Job::new("q".to_string(), serde_json::json!(2)),
+        ];
+        let expected: Vec<JobId> = first.iter().map(|job| job.id).collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let jobs = fill_weighted_batch("q", levels.clone(), &weights, 10, |_, room| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let first = first.clone();
+            async move {
+                assert!(room > 0);
+                if call == 0 {
+                    Ok(first)
+                } else {
+                    Err(crate::HammerworkError::Queue {
+                        message: "connection reset".to_string(),
+                    })
+                }
+            }
+        })
+        .await
+        .expect("the claimed jobs are returned, not the error");
+        assert_eq!(jobs.iter().map(|job| job.id).collect::<Vec<_>>(), expected);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // With nothing claimed yet, the error is returned.
+        let failed = fill_weighted_batch("q", levels.clone(), &weights, 10, |_, _| async {
+            Err::<Vec<Job>, _>(crate::HammerworkError::Queue {
+                message: "connection reset".to_string(),
+            })
+        })
+        .await;
+        assert!(failed.is_err());
+
+        // Each level is tried once, with the room left.
+        let rooms = std::sync::Mutex::new(Vec::new());
+        let jobs = fill_weighted_batch("q", levels, &weights, 3, |priority, room| {
+            rooms.lock().unwrap().push((priority, room));
+            async move { Ok(vec![Job::new("q".to_string(), serde_json::json!(0))]) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(jobs.len(), 3);
+        let rooms = rooms.into_inner().unwrap();
+        assert_eq!(
+            rooms.iter().map(|(_, room)| *room).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        let mut tried: Vec<_> = rooms.iter().map(|(priority, _)| *priority).collect();
+        tried.sort();
+        tried.dedup();
+        assert_eq!(tried.len(), 3);
+    }
 
     /// #71: a listing keeps the rows it can decode and drops the others.
     #[test]

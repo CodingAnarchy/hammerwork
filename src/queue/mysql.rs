@@ -927,7 +927,7 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
                 .bind(queue_name)
                 .fetch_all(&self.pool)
                 .await?;
-        let mut candidates: Vec<JobPriority> = levels
+        let candidates: Vec<JobPriority> = levels
             .into_iter()
             .filter_map(|level| i32::try_from(level).ok())
             .filter_map(|level| JobPriority::from_i32(level).ok())
@@ -935,25 +935,18 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         // Pick a level by weight and fill the batch with its oldest runnable jobs. If it
         // runs out first, pick another of the remaining levels by weight for the rest.
-        let mut jobs = Vec::with_capacity(max_jobs);
-        let mut attempt = 0;
-        while jobs.len() < max_jobs
-            && let Some(priority) = super::pick_weighted_priority(
-                &candidates,
-                weights,
-                super::weighted_seed(queue_name, attempt),
-            )
-        {
-            let room = max_jobs - jobs.len();
-            let claimed = retry_on_deadlock(|| {
-                self.claim_batch_attempt(queue_name, Some(priority), lease, room)
-            })
-            .await?;
-            jobs.extend(claimed);
-            candidates.retain(|candidate| *candidate != priority);
-            attempt += 1;
-        }
-        Ok(jobs)
+        super::fill_weighted_batch(
+            queue_name,
+            candidates,
+            weights,
+            max_jobs,
+            |priority, room| {
+                retry_on_deadlock(move || {
+                    self.claim_batch_attempt(queue_name, Some(priority), lease, room)
+                })
+            },
+        )
+        .await
     }
 
     async fn release_job_run(&self, run: &Job) -> Result<bool> {

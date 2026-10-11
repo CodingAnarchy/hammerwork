@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A weighted batch claim no longer loses jobs it already claimed.** With weighted
+  priorities, `dequeue_batch_leased` claims level by level; when a later level's claim
+  failed (a dropped connection, or a MySQL deadlock past its retries), the error was
+  returned and the jobs claimed from earlier levels were dropped. They stayed `Running`
+  until their leases expired, with an attempt spent, so a job on its last attempt went to
+  `Dead` without having run. The claimed jobs are now returned (and the error logged), as
+  the trait's default implementation already did.
 - **A job row that cannot be decoded no longer stops the stale job reaper.** On MySQL any
   such row among the stale `Running` jobs, and on PostgreSQL one that was out of
   attempts, made `requeue_stale_jobs` fail and roll back, so no stale job of any queue
