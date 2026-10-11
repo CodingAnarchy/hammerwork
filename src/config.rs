@@ -614,6 +614,18 @@ pub struct WorkerConfig {
     /// Must be greater than zero when `result_cleanup_enabled`.
     #[serde(default = "default_result_cleanup_interval", with = "serde_duration")]
     pub result_cleanup_interval: StdDuration,
+
+    /// Claim up to this many jobs per poll (batch mode; see
+    /// [`Worker::with_batch_size`](crate::Worker::with_batch_size)). Unset (the default),
+    /// workers claim one job at a time, unless batch mode is enabled in code.
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+
+    /// In batch mode, run up to this many claimed jobs at once (see
+    /// [`Worker::with_batch_concurrency`](crate::Worker::with_batch_concurrency)).
+    /// Unset (the default), the worker's own setting applies (one by default).
+    #[serde(default)]
+    pub batch_concurrency: Option<usize>,
 }
 
 /// Default [`WorkerConfig::result_cleanup_interval`]: five minutes.
@@ -644,6 +656,8 @@ impl Default for WorkerConfig {
             max_workers: 16,
             result_cleanup_enabled: true,
             result_cleanup_interval: DEFAULT_RESULT_CLEANUP_INTERVAL,
+            batch_size: None,
+            batch_concurrency: None,
         }
     }
 }
@@ -2707,6 +2721,14 @@ retry_strategy = { type = "Fixed", duration_ms = 1000 }
 "#;
         let worker: WorkerConfig = toml::from_str(old).unwrap();
         assert!(worker.result_cleanup_enabled);
+        // Without batch keys, batch mode stays off.
+        assert_eq!((worker.batch_size, worker.batch_concurrency), (None, None));
+        let batched: WorkerConfig =
+            toml::from_str(&format!("{old}batch_size = 50\nbatch_concurrency = 8\n")).unwrap();
+        assert_eq!(
+            (batched.batch_size, batched.batch_concurrency),
+            (Some(50), Some(8))
+        );
         assert_eq!(worker.result_cleanup_interval, StdDuration::from_secs(300));
         assert_eq!(
             WorkerConfig::default().result_cleanup_interval,

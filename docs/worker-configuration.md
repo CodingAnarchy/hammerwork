@@ -13,7 +13,7 @@ use std::time::Duration;
 
 let worker = Worker::new(queue, "email_queue".to_string(), handler)
     .with_poll_interval(Duration::from_millis(500))  // Check for jobs every 500ms
-    .with_max_retries(3)                             // At most 3 attempts per job (job max_attempts still applies)
+    .with_attempt_cap(3)                             // At most 3 attempts per job (job max_attempts still applies)
     .with_retry_delay(Duration::from_secs(30));      // Wait 30s between retries
 # Ok(())
 # }
@@ -370,7 +370,8 @@ A worker that crashes, is OOM-killed or loses its pod leaves its job in `Running
 Hammerwork recovers these jobs with leases (requires migration `015_add_job_leases`):
 
 - A worker takes the lease in the same statement that claims the job
-  (`DatabaseQueue::dequeue_leased`; plain `dequeue` takes the default 5 minute lease).
+  (`DequeueOptions::lease_duration` of `DatabaseQueue::dequeue`; `dequeue_one` takes the
+  default 5 minute lease).
   While the handler runs, the worker records a heartbeat and extends the lease every
   third of its lease duration (5 minutes by default). Jobs that finish sooner never
   write a heartbeat.
@@ -489,7 +490,7 @@ let background_worker = Worker::new(queue.clone(), "cleanup".to_string(), handle
 
 // Email worker with retry configuration
 let email_worker = Worker::new(queue.clone(), "email".to_string(), handler.clone())
-    .with_max_retries(5)
+    .with_attempt_cap(5)
     .with_retry_delay(Duration::from_secs(60));
 
 let mut pool = WorkerPool::new();
@@ -557,7 +558,7 @@ runs. A failing run is retried while attempts remain; the last failure makes the
 `Dead`. A run that exceeds its timeout counts as a failed attempt too: it is retried
 while attempts remain and the job only ends `TimedOut` on its last attempt.
 
-`Worker::with_max_retries(n)` can only lower that limit (`min(job.max_attempts, n)`);
+`Worker::with_attempt_cap(n)` can only lower that limit (`min(job.max_attempts, n)`);
 by default workers set no cap.
 
 ```rust,no_run
@@ -568,7 +569,7 @@ use hammerwork::Worker;
 use std::time::Duration;
 
 let worker = Worker::new(queue, "retry_queue".to_string(), handler)
-    .with_max_retries(5)                        // Never more than 5 attempts per job
+    .with_attempt_cap(5)                        // Never more than 5 attempts per job
     .with_retry_delay(Duration::from_secs(30))  // Wait 30s between attempts
     .with_default_timeout(Duration::from_secs(300)); // 5 minute timeout per attempt
 # Ok(())
@@ -675,6 +676,17 @@ assert_eq!(worker.batch_size(), 20);
 A worker holds the jobs it claimed until it gets to them, so other workers cannot take
 them meanwhile. Prefer small batches for slow jobs, or raise the batch concurrency.
 
+In a configuration file, the `[worker]` keys `batch_size` and `batch_concurrency` set the
+same (`WorkerConfig::batch_size`, `WorkerConfig::batch_concurrency`, applied by
+`Worker::with_config`). Both are optional: without `batch_size` workers claim one job at a
+time unless batch mode is enabled in code.
+
+```toml
+[worker]
+batch_size = 20
+batch_concurrency = 5
+```
+
 ### Resource-Intensive Jobs
 
 ```rust,no_run
@@ -688,7 +700,7 @@ let worker = Worker::new(queue, "heavy_processing".to_string(), handler)
     .with_poll_interval(Duration::from_secs(5))      // Check less frequently
     .with_rate_limit(RateLimit::per_minute(10))      // Limit load
     .with_default_timeout(Duration::from_secs(1800)) // 30 minute timeout
-    .with_max_retries(1);                            // Minimal retries
+    .with_attempt_cap(1);                            // One attempt per job, no retries
 # Ok(())
 # }
 ```
@@ -741,7 +753,7 @@ use std::time::Duration;
 
 let api_worker = Worker::new(queue, "api_calls".to_string(), handler)
     .with_rate_limit(RateLimit::per_second(5).with_burst_limit(10))
-    .with_max_retries(3)
+    .with_attempt_cap(3)
     .with_retry_delay(Duration::from_secs(60))
     .with_default_timeout(Duration::from_secs(30));
 # Ok(())
@@ -785,7 +797,7 @@ use std::time::Duration;
 let critical_worker = Worker::new(queue, "system".to_string(), handler)
     .with_strict_priority()
     .with_poll_interval(Duration::from_millis(100))
-    .with_max_retries(5)
+    .with_attempt_cap(5)
     .with_retry_delay(Duration::from_secs(5))
     .with_default_timeout(Duration::from_secs(120));
 # Ok(())

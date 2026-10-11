@@ -94,7 +94,7 @@ where
     Q: DatabaseQueue + Send + Sync + 'static,
 {
     let job = queue
-        .dequeue(&graph.queue_of(step))
+        .dequeue_one(&graph.queue_of(step))
         .await
         .unwrap()
         .unwrap_or_else(|| panic!("job {step} is runnable"));
@@ -190,7 +190,7 @@ where
         .enqueue(Job::new(queue_name.clone(), json!({})).with_max_attempts(3))
         .await
         .unwrap();
-    let job = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    let job = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
     assert_eq!(job.attempts, 1);
     queue.fail_job(id, "permanent").await.unwrap();
 
@@ -199,14 +199,14 @@ where
     assert_eq!(job.attempts, 1);
     assert_eq!(job.error_message.as_deref(), Some("permanent"));
     assert!(job.failed_at.is_some());
-    assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+    assert!(queue.dequeue_one(&queue_name).await.unwrap().is_none());
     assert!(
         queue.fail_job(id, "again").await.is_err(),
         "a Failed job cannot fail again"
     );
 
     queue.retry_job(id, past()).await.unwrap();
-    let job = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    let job = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
     assert_eq!(job.id, id);
     assert_eq!(job.attempts, 2);
     queue.delete_job(id).await.unwrap();
@@ -365,7 +365,7 @@ where
     queue.enqueue(parent).await.unwrap();
     queue.enqueue(child).await.unwrap();
 
-    queue.dequeue(&queue_name).await.unwrap().unwrap();
+    queue.dequeue_one(&queue_name).await.unwrap().unwrap();
     let failed = queue.fail_job_dependencies(parent_id).await.unwrap();
     assert_eq!(failed, [child_id]);
     let child = queue.get_job(child_id).await.unwrap().unwrap();

@@ -11,6 +11,7 @@
 mod test_utils;
 
 use chrono::{DateTime, Duration as ChronoDuration, DurationRound, Utc};
+use hammerwork::queue::DequeueOptions;
 use hammerwork::{
     CronSchedule, Job, JobId, JobOutcome, JobQueue, JobStatus, PriorityWeights,
     batch::JobBatch,
@@ -108,7 +109,7 @@ where
 
     // The satisfied jobs are dequeued; nothing else is
     let mut dequeued = Vec::new();
-    while let Some(job) = queue.dequeue(&queue_name).await.unwrap() {
+    while let Some(job) = queue.dequeue_one(&queue_name).await.unwrap() {
         dequeued.push(job.id);
     }
     dequeued.sort_unstable();
@@ -161,7 +162,11 @@ where
     let queue_name = test_utils::unique_queue("late_race");
     for _ in 0..25 {
         let parent = queue.enqueue(job(&queue_name, "parent")).await.unwrap();
-        let run = queue.dequeue(&queue_name).await.unwrap().expect("parent");
+        let run = queue
+            .dequeue_one(&queue_name)
+            .await
+            .unwrap()
+            .expect("parent");
         let child = job(&queue_name, "child").depends_on(&parent);
         let (finished, enqueued) = tokio::join!(
             queue.finish_job_run(&run, JobOutcome::Completed),
@@ -190,11 +195,15 @@ where
     let id = queue.enqueue(job(&queue_name, "paused")).await.unwrap();
 
     queue.pause_queue(&queue_name, Some("test")).await.unwrap();
-    assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+    assert!(queue.dequeue_one(&queue_name).await.unwrap().is_none());
     assert!(
         queue
-            .dequeue_with_priority_weights(&queue_name, &PriorityWeights::new())
+            .dequeue(
+                &queue_name,
+                &DequeueOptions::new().with_priority_weights(PriorityWeights::new())
+            )
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap()
             .is_none()
     );
@@ -202,7 +211,10 @@ where
     queue.resume_queue(&queue_name, None).await.unwrap();
     let other = test_utils::unique_queue("paused_other");
     queue.pause_queue(&other, None).await.unwrap();
-    assert_eq!(queue.dequeue(&queue_name).await.unwrap().unwrap().id, id);
+    assert_eq!(
+        queue.dequeue_one(&queue_name).await.unwrap().unwrap().id,
+        id
+    );
 
     queue.resume_queue(&other, None).await.unwrap();
     queue.delete_job(id).await.unwrap();
@@ -236,8 +248,12 @@ where
     let mut picked = Vec::new();
     for _ in 0..3 {
         let job = queue
-            .dequeue_with_priority_weights(&queue_name, &weights)
+            .dequeue(
+                &queue_name,
+                &DequeueOptions::new().with_priority_weights(weights.clone()),
+            )
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap()
             .expect("a job");
         picked.push(job.priority);
@@ -250,8 +266,12 @@ where
     // Every job is still handed out exactly once
     let mut remaining = 0;
     while queue
-        .dequeue_with_priority_weights(&queue_name, &weights)
+        .dequeue(
+            &queue_name,
+            &DequeueOptions::new().with_priority_weights(weights.clone()),
+        )
         .await
+        .map(|jobs| jobs.into_iter().next())
         .unwrap()
         .is_some()
     {
@@ -277,7 +297,7 @@ where
     let id = queue.enqueue(delayed).await.unwrap();
 
     let run = queue
-        .dequeue(&queue_name)
+        .dequeue_one(&queue_name)
         .await
         .unwrap()
         .expect("due by the database clock");
@@ -302,7 +322,7 @@ where
         .await
         .unwrap()
         .expect("recorded");
-    assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+    assert!(queue.dequeue_one(&queue_name).await.unwrap().is_none());
     let job = queue.get_job(id).await.unwrap().unwrap();
     assert!(job.scheduled_at > Utc::now() + ChronoDuration::minutes(50));
 
@@ -336,7 +356,11 @@ where
         .enqueue_workflow(JobGroup::new("cancel").add_job(a).add_job(b))
         .await
         .unwrap();
-    let run = queue.dequeue(&queue_name).await.unwrap().expect("a runs");
+    let run = queue
+        .dequeue_one(&queue_name)
+        .await
+        .unwrap()
+        .expect("a runs");
     assert_eq!(run.id, a_id);
 
     queue.cancel_workflow(workflow_id).await.unwrap();
@@ -401,7 +425,7 @@ where
     let id = queue.enqueue(daily).await.unwrap();
 
     // The late run is the catch-up run...
-    let run = queue.dequeue(&queue_name).await.unwrap().expect("due");
+    let run = queue.dequeue_one(&queue_name).await.unwrap().expect("due");
     let recorded = queue
         .finish_job_run(&run, JobOutcome::Completed)
         .await
@@ -415,7 +439,7 @@ where
         (job.scheduled_at, job.next_run_at),
         (tomorrow, Some(tomorrow))
     );
-    assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+    assert!(queue.dequeue_one(&queue_name).await.unwrap().is_none());
 
     queue.delete_job(id).await.unwrap();
 }
@@ -432,7 +456,7 @@ where
         .enqueue(job(&queue_name, "timed").with_priority(JobPriority::High))
         .await
         .unwrap();
-    let run = queue.dequeue(&queue_name).await.unwrap().expect("job");
+    let run = queue.dequeue_one(&queue_name).await.unwrap().expect("job");
     tokio::time::sleep(Duration::from_millis(30)).await;
     queue
         .finish_job_run(&run, JobOutcome::Completed)
@@ -494,7 +518,11 @@ where
         .await
         .unwrap();
 
-    let run = queue.dequeue(&queue_name).await.unwrap().expect("parent");
+    let run = queue
+        .dequeue_one(&queue_name)
+        .await
+        .unwrap()
+        .expect("parent");
     let recorded = queue
         .finish_job_run(&run, JobOutcome::Completed)
         .await
@@ -703,7 +731,7 @@ mod mysql_tests {
         }
 
         let id = queue.enqueue(job(&queue_name, "on time")).await.unwrap();
-        let run = queue.dequeue(&queue_name).await.unwrap().expect("job");
+        let run = queue.dequeue_one(&queue_name).await.unwrap().expect("job");
         assert!(matches!(
             queue.retry_job(id, after_2038).await,
             Err(HammerworkError::InvalidJobPayload { .. })
@@ -749,14 +777,18 @@ mod mysql_tests {
         let delayed = queue.enqueue(delayed).await.unwrap();
         let now = queue.enqueue(job(&queue_name, "now")).await.unwrap();
 
-        let run = queue.dequeue(&queue_name).await.unwrap().expect("due job");
+        let run = queue
+            .dequeue_one(&queue_name)
+            .await
+            .unwrap()
+            .expect("due job");
         assert_eq!(run.id, now);
         let started_at = run.started_at.unwrap();
         assert!(
             (started_at - Utc::now()).num_seconds().abs() < 60,
             "{started_at}"
         );
-        assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+        assert!(queue.dequeue_one(&queue_name).await.unwrap().is_none());
 
         queue.pause_queue(&queue_name, None).await.unwrap();
         let paused_at = queue

@@ -1026,7 +1026,7 @@ mod tests {
         let failed = queue.enqueue(mk("failed")).await.unwrap();
         // Claim the jobs that are due so each can end in the wanted status.
         let mut claimed = Vec::new();
-        while let Some(job) = queue.dequeue("q").await.unwrap() {
+        while let Some(job) = queue.dequeue_one("q").await.unwrap() {
             claimed.push(job.id);
         }
         for id in [done, running, timed_out, dead, failed] {
@@ -1081,7 +1081,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let claimed = queue.dequeue("q").await.unwrap().unwrap();
+        let claimed = queue.dequeue_one("q").await.unwrap().unwrap();
         assert_eq!(claimed.id, now_job);
         queue.fail_job(now_job, "bad needle").await.unwrap();
 

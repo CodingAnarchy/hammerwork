@@ -23,7 +23,7 @@ mod postgres_tests {
         queue.enqueue(job).await.unwrap();
 
         // Dequeue the job
-        let dequeued_job = queue.dequeue(&queue_name).await.unwrap();
+        let dequeued_job = queue.dequeue_one(&queue_name).await.unwrap();
         assert!(dequeued_job.is_some());
         let dequeued_job = dequeued_job.unwrap();
         assert_eq!(dequeued_job.id, job_id);
@@ -55,7 +55,7 @@ mod postgres_tests {
         queue.enqueue(job).await.unwrap();
 
         // Dequeue and fail the job
-        let dequeued_job = queue.dequeue(&queue_name).await.unwrap().unwrap();
+        let dequeued_job = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
         queue
             .fail_job(dequeued_job.id, "Intentional failure")
             .await
@@ -87,12 +87,12 @@ mod postgres_tests {
         queue.enqueue(job).await.unwrap();
 
         // Try to dequeue immediately - should get nothing
-        let immediate_dequeue = queue.dequeue(&queue_name).await.unwrap();
+        let immediate_dequeue = queue.dequeue_one(&queue_name).await.unwrap();
         assert!(immediate_dequeue.is_none());
 
         // Wait for the delay and try again
         sleep(Duration::from_secs(2)).await;
-        let delayed_dequeue = queue.dequeue(&queue_name).await.unwrap();
+        let delayed_dequeue = queue.dequeue_one(&queue_name).await.unwrap();
         assert!(delayed_dequeue.is_some());
 
         let dequeued_job = delayed_dequeue.unwrap();
@@ -124,7 +124,7 @@ mod mysql_tests {
         queue.enqueue(job).await.unwrap();
 
         // Dequeue the job
-        let dequeued_job = queue.dequeue(&queue_name).await.unwrap();
+        let dequeued_job = queue.dequeue_one(&queue_name).await.unwrap();
         assert!(dequeued_job.is_some());
         let dequeued_job = dequeued_job.unwrap();
         assert_eq!(dequeued_job.id, job_id);
@@ -161,7 +161,7 @@ mod mysql_tests {
         for _ in 0..3 {
             let queue_clone = queue.clone();
             let queue_name = queue_name.clone();
-            let handle = tokio::spawn(async move { queue_clone.dequeue(&queue_name).await });
+            let handle = tokio::spawn(async move { queue_clone.dequeue_one(&queue_name).await });
             handles.push(handle);
         }
 

@@ -47,7 +47,7 @@ async fn test_job_processing() {
     let job_id = queue.enqueue(job).await.unwrap();
     
     // Dequeue and process
-    let dequeued_job = queue.dequeue("test_queue").await.unwrap().unwrap();
+    let dequeued_job = queue.dequeue_one("test_queue").await.unwrap().unwrap();
     assert_eq!(dequeued_job.id, job_id);
     
     // Complete the job
@@ -108,7 +108,7 @@ async fn test_job_lifecycle() {
     let job_id = queue.enqueue(job).await.unwrap();
     
     // Dequeue job
-    let dequeued = queue.dequeue("priority_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("priority_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.priority, JobPriority::High);
     
     // Complete job
@@ -185,13 +185,13 @@ async fn test_time_dependent_processing() {
     queue.enqueue(job).await.unwrap();
     
     // Job shouldn't be available yet
-    assert!(queue.dequeue("delayed_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("delayed_queue").await.unwrap().is_none());
     
     // Advance time past scheduled time
     clock.advance(Duration::hours(2));
     
     // Now job should be available
-    let dequeued = queue.dequeue("delayed_queue").await.unwrap();
+    let dequeued = queue.dequeue_one("delayed_queue").await.unwrap();
     assert!(dequeued.is_some());
 }
 ```
@@ -216,15 +216,15 @@ async fn test_delayed_job_execution() {
     queue.enqueue(job).await.unwrap();
     
     // Verify job is not available immediately
-    assert!(queue.dequeue("delayed_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("delayed_queue").await.unwrap().is_none());
     
     // Advance time to just before scheduled time
     clock.advance(Duration::minutes(29));
-    assert!(queue.dequeue("delayed_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("delayed_queue").await.unwrap().is_none());
     
     // Advance past scheduled time
     clock.advance(Duration::minutes(2));
-    let dequeued = queue.dequeue("delayed_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("delayed_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.payload["data"], "delayed_payload");
 }
 ```
@@ -249,7 +249,7 @@ async fn test_cron_job_scheduling() {
 
     // Process the first occurrence, as a worker does
     clock.advance(Duration::hours(1));
-    let first_run = queue.dequeue("cron_queue").await.unwrap().unwrap();
+    let first_run = queue.dequeue_one("cron_queue").await.unwrap().unwrap();
     let recorded = queue
         .finish_job_run(&first_run, JobOutcome::Completed)
         .await
@@ -264,7 +264,7 @@ async fn test_cron_job_scheduling() {
 
     // The next occurrence runs once its time comes
     clock.advance(Duration::hours(1));
-    let second_run = queue.dequeue("cron_queue").await.unwrap().unwrap();
+    let second_run = queue.dequeue_one("cron_queue").await.unwrap().unwrap();
     assert_eq!(second_run.id, job_id);
 }
 ```
@@ -291,13 +291,13 @@ async fn test_priority_ordering() {
     queue.enqueue(critical_job).await.unwrap();
     
     // Jobs should be dequeued in priority order (highest first)
-    let first = queue.dequeue("priority_queue").await.unwrap().unwrap();
+    let first = queue.dequeue_one("priority_queue").await.unwrap().unwrap();
     assert_eq!(first.priority, JobPriority::Critical);
     
-    let second = queue.dequeue("priority_queue").await.unwrap().unwrap();
+    let second = queue.dequeue_one("priority_queue").await.unwrap().unwrap();
     assert_eq!(second.priority, JobPriority::High);
     
-    let third = queue.dequeue("priority_queue").await.unwrap().unwrap();
+    let third = queue.dequeue_one("priority_queue").await.unwrap().unwrap();
     assert_eq!(third.priority, JobPriority::Low);
 }
 ```
@@ -331,11 +331,12 @@ async fn test_weighted_priority_selection() {
     }
     
     // Use weighted dequeue
-    let job = queue.dequeue_with_priority_weights("weighted_queue", &weights).await.unwrap();
-    assert!(job.is_some());
+    let options = DequeueOptions::new().with_priority_weights(weights);
+    let jobs = queue.dequeue("weighted_queue", &options).await.unwrap();
+    assert_eq!(jobs.len(), 1);
     
     // With these weights, background jobs should be selected more frequently
-    let dequeued = job.unwrap();
+    let dequeued = &jobs[0];
     // Note: Weighted selection is probabilistic, so we can't assert specific priority
     // but we can verify the job was dequeued correctly
     assert!(matches!(dequeued.priority, JobPriority::Background | JobPriority::Critical));
@@ -368,7 +369,7 @@ async fn test_batch_operations() {
     
     // Process all batch jobs
     for _ in 0..3 {
-        if let Some(job) = queue.dequeue("batch_queue").await.unwrap() {
+        if let Some(job) = queue.dequeue_one("batch_queue").await.unwrap() {
             queue.complete_job(job.id).await.unwrap();
         }
     }
@@ -401,7 +402,7 @@ async fn test_batch_fail_fast() {
     let batch_id = batch_result.successful_jobs[0].batch_id.unwrap();
     
     // Process first job and fail it
-    let first_job = queue.dequeue("fail_fast_queue").await.unwrap().unwrap();
+    let first_job = queue.dequeue_one("fail_fast_queue").await.unwrap().unwrap();
     queue.fail_job(first_job.id, "Intentional failure").await.unwrap();
     
     // With FailFast, remaining jobs should be automatically failed
@@ -435,21 +436,21 @@ async fn test_workflow_dependencies() {
     let workflow_id = queue.enqueue_workflow(workflow).await.unwrap();
     
     // Only job1 should be available initially (no dependencies)
-    let first_available = queue.dequeue("workflow_queue").await.unwrap().unwrap();
+    let first_available = queue.dequeue_one("workflow_queue").await.unwrap().unwrap();
     assert_eq!(first_available.payload["step"], 1);
     
     // Complete job1
     queue.complete_job(first_available.id).await.unwrap();
     
     // Now job2 should be available
-    let second_available = queue.dequeue("workflow_queue").await.unwrap().unwrap();
+    let second_available = queue.dequeue_one("workflow_queue").await.unwrap().unwrap();
     assert_eq!(second_available.payload["step"], 2);
     
     // Complete job2
     queue.complete_job(second_available.id).await.unwrap();
     
     // Now job3 should be available
-    let third_available = queue.dequeue("workflow_queue").await.unwrap().unwrap();
+    let third_available = queue.dequeue_one("workflow_queue").await.unwrap().unwrap();
     assert_eq!(third_available.payload["step"], 3);
     
     // Complete job3
@@ -481,7 +482,7 @@ async fn test_workflow_fail_fast() {
     let workflow_id = queue.enqueue_workflow(workflow).await.unwrap();
     
     // Dequeue any job and fail it
-    let job = queue.dequeue("fail_fast_workflow").await.unwrap().unwrap();
+    let job = queue.dequeue_one("fail_fast_workflow").await.unwrap().unwrap();
     queue.fail_job(job.id, "Intentional failure for testing").await.unwrap();
     
     // With FailFast policy, the workflow should be marked as failed
@@ -509,7 +510,7 @@ async fn test_job_retry_logic() {
     // worker retries a failed run with `retry_job` while the job has attempts left
     // (each dequeue counts as one) and marks it dead after the last one.
     for attempt in 1..=3 {
-        let job = queue.dequeue("retry_queue").await.unwrap().unwrap();
+        let job = queue.dequeue_one("retry_queue").await.unwrap().unwrap();
         assert_eq!(job.attempts, attempt);
         if job.attempts < job.max_attempts {
             queue.retry_job(job_id, queue.clock().now()).await.unwrap();
@@ -519,7 +520,7 @@ async fn test_job_retry_logic() {
     }
 
     // No more retries
-    assert!(queue.dequeue("retry_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("retry_queue").await.unwrap().is_none());
 
     // Verify job is dead
     let final_job = queue.get_job(job_id).await.unwrap().unwrap();
@@ -543,7 +544,7 @@ async fn test_dead_job_purging() {
             .with_max_attempts(1);
         let job_id = queue.enqueue(job).await.unwrap();
         
-        let dequeued = queue.dequeue("purge_queue").await.unwrap().unwrap();
+        let dequeued = queue.dequeue_one("purge_queue").await.unwrap().unwrap();
         queue.mark_job_dead(dequeued.id, "Failed for purge test").await.unwrap();
     }
     
@@ -594,7 +595,7 @@ async fn test_job_processing_logic() {
     queue.enqueue(job).await.unwrap();
     
     // Manually dequeue and test your processing logic
-    if let Some(job) = queue.dequeue("test_queue").await.unwrap() {
+    if let Some(job) = queue.dequeue_one("test_queue").await.unwrap() {
         // This is where you test your actual job processing logic
         let result = your_job_handler(job.clone()).await;
         assert!(result.is_ok());
@@ -642,9 +643,9 @@ async fn test_delayed_processing() {
     queue.enqueue(job).await.unwrap();
     
     // Test before and after the scheduled time
-    assert!(queue.dequeue("delayed").await.unwrap().is_none());
+    assert!(queue.dequeue_one("delayed").await.unwrap().is_none());
     clock.advance(Duration::hours(2));
-    assert!(queue.dequeue("delayed").await.unwrap().is_some());
+    assert!(queue.dequeue_one("delayed").await.unwrap().is_some());
 }
 ```
 
@@ -656,7 +657,7 @@ async fn test_edge_cases() {
     let queue = TestQueue::new();
     
     // Test empty queue
-    assert!(queue.dequeue("nonexistent").await.unwrap().is_none());
+    assert!(queue.dequeue_one("nonexistent").await.unwrap().is_none());
     
     // Test invalid job operations
     let fake_id = JobId::new();
@@ -760,26 +761,26 @@ async fn test_email_service() {
     queue.enqueue(newsletter).await.unwrap();
     
     // Process urgent email immediately
-    let urgent_job = queue.dequeue("email_queue").await.unwrap().unwrap();
+    let urgent_job = queue.dequeue_one("email_queue").await.unwrap().unwrap();
     assert_eq!(urgent_job.id, urgent_id);
     assert_eq!(urgent_job.priority, JobPriority::Critical);
     queue.complete_job(urgent_id).await.unwrap();
     
     // Newsletter shouldn't be available yet
-    assert!(queue.dequeue("email_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("email_queue").await.unwrap().is_none());
     
     // Advance time to newsletter time
     clock.advance(Duration::hours(25));
     
     // Newsletter should now be available
-    let newsletter_job = queue.dequeue("email_queue").await.unwrap().unwrap();
+    let newsletter_job = queue.dequeue_one("email_queue").await.unwrap().unwrap();
     assert_eq!(newsletter_job.payload["template"], "newsletter");
     
     // Simulate email sending failure and retry it, as a worker would
     queue.retry_job(newsletter_job.id, clock.now()).await.unwrap();
     
     // Job should be available for retry; each dequeue counts as an attempt
-    let retry_job = queue.dequeue("email_queue").await.unwrap().unwrap();
+    let retry_job = queue.dequeue_one("email_queue").await.unwrap().unwrap();
     assert_eq!(retry_job.attempts, 2);
     queue.complete_job(retry_job.id).await.unwrap();
 }
@@ -826,22 +827,22 @@ async fn test_data_pipeline() {
     let workflow_id = queue.enqueue_workflow(pipeline).await.unwrap();
     
     // Process extract stage
-    let extract = queue.dequeue("data_pipeline").await.unwrap().unwrap();
+    let extract = queue.dequeue_one("data_pipeline").await.unwrap().unwrap();
     assert_eq!(extract.payload["stage"], "extract");
     queue.complete_job(extract.id).await.unwrap();
     
     // Process transform stage
-    let transform = queue.dequeue("data_pipeline").await.unwrap().unwrap();
+    let transform = queue.dequeue_one("data_pipeline").await.unwrap().unwrap();
     assert_eq!(transform.payload["stage"], "transform");
     queue.complete_job(transform.id).await.unwrap();
     
     // Process load stage
-    let load = queue.dequeue("data_pipeline").await.unwrap().unwrap();
+    let load = queue.dequeue_one("data_pipeline").await.unwrap().unwrap();
     assert_eq!(load.payload["stage"], "load");
     queue.complete_job(load.id).await.unwrap();
     
     // Process notification
-    let notify = queue.dequeue("notifications").await.unwrap().unwrap();
+    let notify = queue.dequeue_one("notifications").await.unwrap().unwrap();
     assert_eq!(notify.payload["stage"], "notify");
     queue.complete_job(notify.id).await.unwrap();
     

@@ -106,7 +106,7 @@ where
         .enqueue(Job::new(queue_name.clone(), json!({})))
         .await
         .unwrap();
-    queue.dequeue(&queue_name).await.unwrap().expect("job");
+    queue.dequeue_one(&queue_name).await.unwrap().expect("job");
     queue.mark_job_timed_out(id, "too slow").await.unwrap();
     assert_invalid_transition(queue.complete_job(id).await, "complete TimedOut");
     assert_invalid_transition(queue.fail_job(id, "x").await, "fail TimedOut");
@@ -182,7 +182,7 @@ where
     // and another worker runs the job to completion.
     queue.retry_job(id, Utc::now()).await.unwrap();
     let rerun = queue
-        .dequeue(&queue_name)
+        .dequeue_one(&queue_name)
         .await
         .unwrap()
         .expect("requeued job");
@@ -225,7 +225,7 @@ where
     queue.delete_job(id).await.unwrap();
 }
 
-/// H3: the job's `max_attempts` is the retry limit; `with_max_retries` only caps it.
+/// H3: the job's `max_attempts` is the retry limit; `with_attempt_cap` only caps it.
 async fn job_max_attempts_is_the_retry_limit<DB>(queue: Arc<JobQueue<DB>>)
 where
     DB: sqlx::Database + Send + Sync + 'static,
@@ -242,7 +242,7 @@ where
         let runs = Arc::new(AtomicUsize::new(0));
         let mut w = worker(&queue, &queue_name, failing_handler(Arc::clone(&runs)));
         if let Some(cap) = worker_cap {
-            w = w.with_max_retries(cap);
+            w = w.with_attempt_cap(cap);
         }
         let running = RunningWorker::start(w);
         let job = test_utils::wait_for_job(&queue, id, Duration::from_secs(15), |job| {
@@ -661,7 +661,7 @@ where
                 let queue = Arc::clone(&queue);
                 let queue_name = queue_name.clone();
                 tokio::spawn(async move {
-                    while let Some(job) = queue.dequeue(&queue_name).await.unwrap() {
+                    while let Some(job) = queue.dequeue_one(&queue_name).await.unwrap() {
                         queue.complete_job(job.id).await.unwrap();
                     }
                 })
@@ -679,7 +679,7 @@ where
             .enqueue(Job::new(queue_name.clone(), json!({ "probe": true })))
             .await
             .unwrap();
-        let dequeued = queue.dequeue(&queue_name).await.unwrap();
+        let dequeued = queue.dequeue_one(&queue_name).await.unwrap();
         assert_eq!(dequeued.map(|job| job.id), Some(probe));
         ids.push(probe);
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -804,7 +804,7 @@ where
         .unwrap();
     let job = queue.get_job(id).await.unwrap().unwrap();
     assert_eq!(job.retry_strategy, Some(strategy.clone()));
-    let dequeued = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
     assert_eq!(dequeued.retry_strategy, Some(strategy.clone()));
     queue.delete_job(id).await.unwrap();
 
@@ -855,7 +855,7 @@ where
     assert_eq!(stored.depends_on, vec![parent]);
     assert_eq!(stored.dependency_status, DependencyStatus::Waiting);
     // The unresolved dependency keeps it from running.
-    assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+    assert!(queue.dequeue_one(&queue_name).await.unwrap().is_none());
 
     queue.delete_batch(batch_id).await.unwrap();
 }

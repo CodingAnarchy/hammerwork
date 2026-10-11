@@ -7,6 +7,7 @@
 mod test_utils;
 
 use chrono::Duration;
+use hammerwork::queue::DequeueOptions;
 use hammerwork::{
     Job, JobId,
     archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason},
@@ -181,7 +182,10 @@ where
 
     // Claim all three with a lease that has expired by the time the reaper runs.
     let claimed = queue
-        .dequeue_batch_leased(&name, None, std::time::Duration::from_millis(1), 10)
+        .dequeue(
+            &name,
+            &DequeueOptions::batch(10).with_lease_duration(std::time::Duration::from_millis(1)),
+        )
         .await
         .unwrap();
     assert_eq!(claimed.len(), 3);
@@ -244,10 +248,10 @@ where
         let mut claimed: Vec<JobId> = Vec::new();
         for _ in 0..3 {
             let jobs = if batch {
-                queue.dequeue_batch(&name, 1).await
+                queue.dequeue(&name, &DequeueOptions::batch(1)).await
             } else {
                 queue
-                    .dequeue(&name)
+                    .dequeue_one(&name)
                     .await
                     .map(|job| job.into_iter().collect())
             };

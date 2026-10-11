@@ -439,7 +439,7 @@ async fn job_endpoints<Q: JobHistory + 'static>(app: &App<Q>) {
     let dead = enqueue(app.queue.as_ref(), &q, json!({"kind": "doomed"})).await;
     let claimed = app
         .queue
-        .dequeue(&q)
+        .dequeue_one(&q)
         .await
         .unwrap()
         .expect("a job to claim");
@@ -548,9 +548,9 @@ async fn queue_endpoints<Q: JobHistory + 'static>(app: &App<Q>) {
         enqueue(app.queue.as_ref(), &q, json!({"i": 2})).await,
     ];
     // one completed job, one dead job
-    let done = app.queue.dequeue(&q).await.unwrap().unwrap();
+    let done = app.queue.dequeue_one(&q).await.unwrap().unwrap();
     app.queue.complete_job(done.id).await.unwrap();
-    let doomed = app.queue.dequeue(&q).await.unwrap().unwrap();
+    let doomed = app.queue.dequeue_one(&q).await.unwrap().unwrap();
     app.queue
         .mark_job_dead(doomed.id, "queue test failure")
         .await
@@ -690,11 +690,11 @@ async fn queue_endpoints<Q: JobHistory + 'static>(app: &App<Q>) {
 async fn stats_endpoints<Q: JobHistory + 'static>(app: &App<Q>) {
     let q = unique("stats");
     let done = enqueue(app.queue.as_ref(), &q, json!({})).await;
-    let claimed = app.queue.dequeue(&q).await.unwrap().unwrap();
+    let claimed = app.queue.dequeue_one(&q).await.unwrap().unwrap();
     assert_eq!(claimed.id, done);
     app.queue.complete_job(done).await.unwrap();
     let failing = enqueue(app.queue.as_ref(), &q, json!({})).await;
-    let claimed = app.queue.dequeue(&q).await.unwrap().unwrap();
+    let claimed = app.queue.dequeue_one(&q).await.unwrap().unwrap();
     app.queue
         .mark_job_dead(claimed.id, "TimeoutError: upstream timed out after 30s")
         .await
@@ -949,7 +949,7 @@ async fn archive_one<Q: DatabaseQueue>(queue: &Q, q: &str, payload: Value, by: &
         .enqueue(Job::new(q.to_string(), payload).with_priority(JobPriority::Normal))
         .await
         .unwrap();
-    let claimed = queue.dequeue(q).await.unwrap().unwrap();
+    let claimed = queue.dequeue_one(q).await.unwrap().unwrap();
     assert_eq!(claimed.id, id);
     queue.complete_job(id).await.unwrap();
     let policy = ArchivalPolicy::new().archive_completed_after(chrono::Duration::zero());
@@ -1086,7 +1086,7 @@ async fn archive_endpoints<Q: JobHistory + 'static>(app: &App<Q>) {
         .enqueue(Job::new(q.clone(), json!({"later": true})))
         .await
         .unwrap();
-    app.queue.dequeue(&q).await.unwrap();
+    app.queue.dequeue_one(&q).await.unwrap();
     app.queue.complete_job(completed).await.unwrap();
     let policy = serde_json::to_value(
         ArchivalPolicy::new().archive_completed_after(chrono::Duration::zero()),

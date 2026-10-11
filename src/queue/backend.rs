@@ -408,7 +408,7 @@ pub(crate) fn pick_weighted_priority(
 }
 
 /// Fill a weighted batch claim of up to `max_jobs` jobs of `queue_name`
-/// ([`DatabaseQueue::dequeue_batch_leased`] with weights): pick one of `candidates` (the
+/// ([`DatabaseQueue::dequeue`] of several jobs with weights): pick one of `candidates` (the
 /// levels with runnable jobs) by weight, claim up to the room left with
 /// `claim(level, room)`, and repeat with the remaining levels until the batch is full or
 /// no level is left.
@@ -470,7 +470,7 @@ pub(crate) fn weighted_seed(queue_name: &str, attempt: usize) -> u64 {
 }
 
 /// Put claimed jobs in claim order: highest priority first, then oldest (`priority
-/// DESC, scheduled_at ASC`), as [`DatabaseQueue::dequeue_batch_leased`] returns them.
+/// DESC, scheduled_at ASC`), as [`DatabaseQueue::dequeue`] returns them.
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub(crate) fn sort_in_claim_order(jobs: &mut [Job]) {
     jobs.sort_by(|a, b| {

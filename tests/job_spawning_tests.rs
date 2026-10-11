@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 /// Every job of `queue_name`, by claiming them all.
 async fn drain<Q: DatabaseQueue + ?Sized>(queue: &Arc<Q>, queue_name: &str) -> Vec<Job> {
     let mut jobs = Vec::new();
-    while let Some(job) = queue.dequeue(queue_name).await.unwrap() {
+    while let Some(job) = queue.dequeue_one(queue_name).await.unwrap() {
         jobs.push(job);
     }
     jobs
@@ -239,7 +239,7 @@ where
         .enqueue(Job::new(queue_name.clone(), json!({})))
         .await
         .unwrap();
-    let run = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    let run = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
     let child = |i: u32| Job::new(child_queue.clone(), json!({ "i": i })).depends_on(&id);
 
     // A failing child rolls back the completion and the children before it.

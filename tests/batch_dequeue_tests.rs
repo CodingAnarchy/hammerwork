@@ -1,4 +1,4 @@
-//! Batch claims (`DatabaseQueue::dequeue_batch_leased`) and batch-mode workers
+//! Batch claims (`DatabaseQueue::dequeue` with `max_jobs` above one) and batch-mode workers
 //! (`Worker::with_batch_size`).
 //!
 //! The queue scenarios run against PostgreSQL, MySQL and `TestQueue`, so the in-memory
@@ -12,6 +12,7 @@
 mod test_utils;
 
 use chrono::Utc;
+use hammerwork::queue::DequeueOptions;
 use hammerwork::{
     Job, JobId, JobPriority, JobStatus, PriorityWeights, cron::CronSchedule, queue::DatabaseQueue,
     workflow::JobGroup,
@@ -58,13 +59,16 @@ where
 
     assert!(
         queue
-            .dequeue_batch(&queue_name, 0)
+            .dequeue(&queue_name, &DequeueOptions::batch(0))
             .await
             .unwrap()
             .is_empty()
     );
 
-    let first = queue.dequeue_batch(&queue_name, 4).await.unwrap();
+    let first = queue
+        .dequeue(&queue_name, &DequeueOptions::batch(4))
+        .await
+        .unwrap();
     let order: Vec<(JobPriority, i64)> = first.iter().map(|job| ids[&job.id]).collect();
     assert_eq!(
         order,
@@ -85,12 +89,15 @@ where
     }
 
     // The rest, then nothing.
-    let rest = queue.dequeue_batch(&queue_name, 10).await.unwrap();
+    let rest = queue
+        .dequeue(&queue_name, &DequeueOptions::batch(10))
+        .await
+        .unwrap();
     let order: Vec<(JobPriority, i64)> = rest.iter().map(|job| ids[&job.id]).collect();
     assert_eq!(order, [(JobPriority::Normal, 50), (JobPriority::Low, 90)]);
     assert!(
         queue
-            .dequeue_batch(&queue_name, 10)
+            .dequeue(&queue_name, &DequeueOptions::batch(10))
             .await
             .unwrap()
             .is_empty()
@@ -105,11 +112,11 @@ where
             .unwrap();
     }
     let strict = queue
-        .dequeue_batch_leased(
+        .dequeue(
             &strict_queue,
-            Some(&PriorityWeights::strict()),
-            Duration::from_secs(60),
-            3,
+            &DequeueOptions::batch(3)
+                .with_lease_duration(Duration::from_secs(60))
+                .with_priority_weights(PriorityWeights::strict()),
         )
         .await
         .unwrap();
@@ -145,7 +152,12 @@ where
     let lease = Duration::from_secs(60);
 
     let first = queue
-        .dequeue_batch_leased(&queue_name, Some(&weights), lease, 3)
+        .dequeue(
+            &queue_name,
+            &DequeueOptions::batch(3)
+                .with_lease_duration(lease)
+                .with_priority_weights(weights.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(first.len(), 3);
@@ -163,7 +175,12 @@ where
 
     // Seven are left (2 of the picked level, 5 of the other): a batch of 7 takes all.
     let rest = queue
-        .dequeue_batch_leased(&queue_name, Some(&weights), lease, 10)
+        .dequeue(
+            &queue_name,
+            &DequeueOptions::batch(10)
+                .with_lease_duration(lease)
+                .with_priority_weights(weights.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(rest.len(), 7);
@@ -207,14 +224,17 @@ where
     queue.pause_queue(&queue_name, Some("test")).await.unwrap();
     assert!(
         queue
-            .dequeue_batch(&queue_name, 10)
+            .dequeue(&queue_name, &DequeueOptions::batch(10))
             .await
             .unwrap()
             .is_empty()
     );
     queue.resume_queue(&queue_name, Some("test")).await.unwrap();
 
-    let claimed = queue.dequeue_batch(&queue_name, 10).await.unwrap();
+    let claimed = queue
+        .dequeue(&queue_name, &DequeueOptions::batch(10))
+        .await
+        .unwrap();
     let ids: HashSet<JobId> = claimed.iter().map(|job| job.id).collect();
     assert_eq!(ids, HashSet::from([parent_id, plain]));
 
@@ -225,7 +245,10 @@ where
         .await
         .unwrap()
         .expect("the parent run is recorded");
-    let next = queue.dequeue_batch(&queue_name, 10).await.unwrap();
+    let next = queue
+        .dequeue(&queue_name, &DequeueOptions::batch(10))
+        .await
+        .unwrap();
     let ids: Vec<JobId> = next.iter().map(|job| job.id).collect();
     assert_eq!(ids, [child_id]);
     assert_eq!(
@@ -251,7 +274,10 @@ where
             .unwrap();
     }
     let claimed = queue
-        .dequeue_batch_leased(&queue_name, None, Duration::from_secs(600), 3)
+        .dequeue(
+            &queue_name,
+            &DequeueOptions::batch(3).with_lease_duration(Duration::from_secs(600)),
+        )
         .await
         .unwrap();
     assert_eq!(claimed.len(), 3);
@@ -283,7 +309,10 @@ where
             .await
             .unwrap();
     }
-    let claimed = queue.dequeue_batch(&queue_name, 2).await.unwrap();
+    let claimed = queue
+        .dequeue(&queue_name, &DequeueOptions::batch(2))
+        .await
+        .unwrap();
     assert_eq!(claimed.len(), 2);
     let released = &claimed[0];
 
@@ -303,7 +332,10 @@ where
 
     // It keeps its place and is claimed again.
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let again = queue.dequeue_batch(&queue_name, 5).await.unwrap();
+    let again = queue
+        .dequeue(&queue_name, &DequeueOptions::batch(5))
+        .await
+        .unwrap();
     let ids: Vec<JobId> = again.iter().map(|job| job.id).collect();
     assert_eq!(ids, [released.id]);
     assert_eq!(again[0].attempts, 1);
@@ -355,22 +387,29 @@ where
             while empty_polls < 3 {
                 let batch = match task % 4 {
                     0 => queue
-                        .dequeue_leased(&queue_name, None, Duration::from_secs(600))
+                        .dequeue(
+                            &queue_name,
+                            &DequeueOptions::new().with_lease_duration(Duration::from_secs(600)),
+                        )
                         .await
+                        .map(|jobs| jobs.into_iter().next())
                         .unwrap()
                         .into_iter()
                         .collect(),
                     1 => queue
-                        .dequeue_batch_leased(
+                        .dequeue(
                             &queue_name,
-                            Some(&weights),
-                            Duration::from_secs(600),
-                            5 + task,
+                            &DequeueOptions::batch(5 + task)
+                                .with_lease_duration(Duration::from_secs(600))
+                                .with_priority_weights(weights.clone()),
                         )
                         .await
                         .unwrap(),
                     _ => queue
-                        .dequeue_batch_leased(&queue_name, None, Duration::from_secs(600), 7)
+                        .dequeue(
+                            &queue_name,
+                            &DequeueOptions::batch(7).with_lease_duration(Duration::from_secs(600)),
+                        )
                         .await
                         .unwrap(),
                 };
@@ -688,7 +727,10 @@ mod worker {
         }
 
         // The released jobs run normally afterwards.
-        let claimed = queue.dequeue_batch(&queue_name, 10).await.unwrap();
+        let claimed = queue
+            .dequeue(&queue_name, &DequeueOptions::batch(10))
+            .await
+            .unwrap();
         assert_eq!(claimed.len(), 4);
     }
 
@@ -1103,7 +1145,7 @@ mod worker {
         enqueue_jobs(&queue, &single_queue, JOBS).await;
         let began = Instant::now();
         let mut claimed = 0;
-        while queue.dequeue(&single_queue).await.unwrap().is_some() {
+        while queue.dequeue_one(&single_queue).await.unwrap().is_some() {
             claimed += 1;
         }
         let single = claimed as f64 / began.elapsed().as_secs_f64();
@@ -1115,7 +1157,10 @@ mod worker {
             let began = Instant::now();
             let mut claimed = 0;
             loop {
-                let batch = queue.dequeue_batch(&batch_queue, size).await.unwrap();
+                let batch = queue
+                    .dequeue(&batch_queue, &DequeueOptions::batch(size))
+                    .await
+                    .unwrap();
                 if batch.is_empty() {
                     break;
                 }

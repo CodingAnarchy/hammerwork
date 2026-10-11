@@ -79,7 +79,11 @@ where
         .enqueue(Job::new(queue_name.clone(), json!({})).with_max_attempts(1))
         .await
         .unwrap();
-    let run = queue.dequeue(&queue_name).await.unwrap().expect("job runs");
+    let run = queue
+        .dequeue_one(&queue_name)
+        .await
+        .unwrap()
+        .expect("job runs");
     assert_eq!(run.id, id);
     queue.mark_job_dead(id, "out of attempts").await.unwrap();
     finished_in_the_past(queue.as_ref(), id).await;
@@ -98,7 +102,7 @@ where
     }
 
     let run = queue
-        .dequeue(&queue_name)
+        .dequeue_one(&queue_name)
         .await
         .unwrap()
         .expect("the restored job runs again");
@@ -325,7 +329,7 @@ where
         .unwrap();
 
     let run = queue
-        .dequeue(&format!("{name}_running"))
+        .dequeue_one(&format!("{name}_running"))
         .await
         .unwrap()
         .expect("job runs");

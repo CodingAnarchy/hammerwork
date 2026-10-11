@@ -98,7 +98,7 @@ async fn huge_result_settings_stay_readable<Q: DatabaseQueue>(queue: &Q) {
         stored.result_config.max_size_bytes,
         Some(usize::try_from(i64::MAX).unwrap_or(usize::MAX))
     );
-    let claimed = queue.dequeue(&name).await.unwrap().unwrap();
+    let claimed = queue.dequeue_one(&name).await.unwrap().unwrap();
     assert_eq!(claimed.id, id);
     queue.delete_job(id).await.unwrap();
 }
@@ -195,10 +195,18 @@ where
         .unwrap();
 
     // a completes, so b's dependencies are satisfied, then x fails the workflow.
-    let run_a = queue.dequeue(&format!("{name}_a")).await.unwrap().unwrap();
+    let run_a = queue
+        .dequeue_one(&format!("{name}_a"))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(run_a.id, a_id);
     queue.complete_job(a_id).await.unwrap();
-    let run_x = queue.dequeue(&format!("{name}_x")).await.unwrap().unwrap();
+    let run_x = queue
+        .dequeue_one(&format!("{name}_x"))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(run_x.id, x_id);
     queue.fail_job(x_id, "boom").await.unwrap();
     assert_eq!(
@@ -211,7 +219,7 @@ where
         .await
         .unwrap();
     let retried = queue
-        .dequeue(&format!("{name}_b"))
+        .dequeue_one(&format!("{name}_b"))
         .await
         .unwrap()
         .expect("a retried job whose dependencies completed is runnable");
@@ -294,21 +302,21 @@ async fn retry_reevaluates_dependencies<Q: DatabaseQueue>(queue: &Q) {
     assert_eq!(waiting.dependency_status, DependencyStatus::Waiting);
     assert!(
         queue
-            .dequeue(&format!("{name}_child"))
+            .dequeue_one(&format!("{name}_child"))
             .await
             .unwrap()
             .is_none()
     );
 
     let run = queue
-        .dequeue(&format!("{name}_parent"))
+        .dequeue_one(&format!("{name}_parent"))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(run.id, parent_id);
     queue.complete_job(parent_id).await.unwrap();
     let run = queue
-        .dequeue(&format!("{name}_child"))
+        .dequeue_one(&format!("{name}_child"))
         .await
         .unwrap()
         .expect("released when its dependency completed");
@@ -380,11 +388,11 @@ async fn restore_reevaluates_dependencies<Q: DatabaseQueue>(queue: &Q) {
         DependencyStatus::Waiting
     );
 
-    let run = queue.dequeue(&name).await.unwrap().unwrap();
+    let run = queue.dequeue_one(&name).await.unwrap().unwrap();
     assert_eq!(run.id, parent_id, "the dependent waits for its dependency");
     queue.complete_job(parent_id).await.unwrap();
     let run = queue
-        .dequeue(&name)
+        .dequeue_one(&name)
         .await
         .unwrap()
         .expect("released when its dependency completed");

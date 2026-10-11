@@ -85,7 +85,7 @@ where
 {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(job) = queue.dequeue(queue_name).await.unwrap() {
+        if let Some(job) = queue.dequeue_one(queue_name).await.unwrap() {
             return job;
         }
         assert!(

@@ -8,6 +8,7 @@
 
 mod test_utils;
 
+use hammerwork::queue::DequeueOptions;
 use hammerwork::{
     HammerworkError, Job, JobId, JobQueue, JobStatus, Worker, WorkerPool, queue::DatabaseQueue,
     worker::JobHandler,
@@ -48,7 +49,7 @@ where
     });
     let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
         .with_poll_interval(Duration::from_millis(50))
-        .with_max_retries(1);
+        .with_attempt_cap(1);
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let worker_task = tokio::spawn(async move { worker.run(shutdown_rx).await });
@@ -104,7 +105,7 @@ where
         Arc::new(|_job: Job| Box::pin(async move { panic!("transient explosion") }));
     let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
         .with_poll_interval(Duration::from_millis(50))
-        .with_max_retries(5)
+        .with_attempt_cap(5)
         .with_retry_delay(Duration::from_secs(3600));
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -257,7 +258,6 @@ where
     let worker = Arc::new(
         Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
             .with_poll_interval(Duration::from_millis(20))
-            .with_batch_processing_enabled(true)
             .with_batch_size(JOBS)
             .with_batch_concurrency(JOBS),
     );
@@ -389,8 +389,12 @@ where
     let queue_name = job.queue_name.clone();
     let id = queue.enqueue(job).await.unwrap();
     let claimed = queue
-        .dequeue_leased(&queue_name, None, lease)
+        .dequeue(
+            &queue_name,
+            &DequeueOptions::new().with_lease_duration(lease),
+        )
         .await
+        .map(|jobs| jobs.into_iter().next())
         .unwrap()
         .expect("job claimed");
     assert_eq!(claimed.id, id);
@@ -492,7 +496,7 @@ where
     assert!(job.started_at.is_none());
     assert!(job.error_message.unwrap().contains("lease expired"));
     // The requeued job can be claimed again.
-    let reclaimed = queue.dequeue(&job.queue_name).await.unwrap().unwrap();
+    let reclaimed = queue.dequeue_one(&job.queue_name).await.unwrap().unwrap();
     assert_eq!(reclaimed.id, expiring.id);
     assert_eq!(reclaimed.attempts, 2);
 
@@ -545,7 +549,7 @@ where
         .enqueue(Job::new(queue_name.clone(), json!({})))
         .await
         .unwrap();
-    let default = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    let default = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
     assert_eq!(default.id, id);
     let short = start_job(
         &queue,
@@ -619,8 +623,12 @@ where
     assert!(recovery.requeued.contains(&first.id), "{recovery:?}");
 
     let second = queue
-        .dequeue_leased(&first.queue_name, None, lease)
+        .dequeue(
+            &first.queue_name,
+            &DequeueOptions::new().with_lease_duration(lease),
+        )
         .await
+        .map(|jobs| jobs.into_iter().next())
         .unwrap()
         .expect("requeued job");
     assert_eq!(second.id, first.id);

@@ -257,7 +257,7 @@ async fn batch_worker_demo(
     // Create workers for different notification channels
     let email_worker = Worker::new(queue.clone(), "notifications".to_string(), handler.clone())
         .with_poll_interval(std::time::Duration::from_millis(100))
-        .with_max_retries(3)
+        .with_attempt_cap(3)
         .with_stats_collector(stats_collector.clone());
 
     // Start worker pool

@@ -133,7 +133,7 @@ async fn test_json_operations(
     queue.enqueue(job).await?;
     info!("✅ Complex JSON job enqueued");
 
-    let dequeued_job = queue.dequeue("json_test").await?;
+    let dequeued_job = queue.dequeue_one("json_test").await?;
     assert!(dequeued_job.is_some());
     let dequeued_job = dequeued_job.unwrap();
 
@@ -178,7 +178,7 @@ async fn test_mysql_transactions(
     for worker_id in 0..2 {
         let queue_clone = queue.clone();
         let handle = tokio::spawn(async move {
-            let result = queue_clone.dequeue("transaction_test").await;
+            let result = queue_clone.dequeue_one("transaction_test").await;
             (worker_id, result)
         });
         handles.push(handle);
@@ -250,7 +250,7 @@ async fn test_mysql_character_handling(
     queue.enqueue(job).await?;
     info!("✅ Special character job enqueued");
 
-    let dequeued_job = queue.dequeue("encoding_test").await?;
+    let dequeued_job = queue.dequeue_one("encoding_test").await?;
     assert!(dequeued_job.is_some());
     let dequeued_job = dequeued_job.unwrap();
 
@@ -310,7 +310,7 @@ async fn run_performance_tests(
     let mut dequeued_count = 0;
 
     for _ in 0..job_count {
-        if let Ok(Some(job)) = queue.dequeue("mysql_performance_test").await {
+        if let Ok(Some(job)) = queue.dequeue_one("mysql_performance_test").await {
             dequeued_count += 1;
             let _ = queue.complete_job(job.id).await;
         }

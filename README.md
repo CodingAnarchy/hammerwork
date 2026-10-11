@@ -296,13 +296,13 @@ async fn test_delayed_job_processing() {
     let job_id = queue.enqueue(job).await.unwrap();
     
     // Job shouldn't be available immediately
-    assert!(queue.dequeue("test_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("test_queue").await.unwrap().is_none());
     
     // Advance time past scheduled time
     clock.advance(Duration::hours(2));
     
     // Now job should be available for processing
-    let dequeued = queue.dequeue("test_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("test_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.id, job_id);
     
     // Complete the job

@@ -90,7 +90,7 @@ macro_rules! job_state_scenarios {
             "retry --queue must not touch other queues"
         );
         // The retried job is actually runnable by the library's dequeue.
-        let dequeued = queue.dequeue(&qname).await.unwrap();
+        let dequeued = queue.dequeue_one(&qname).await.unwrap();
         assert!(dequeued.is_some(), "retried job should be dequeueable");
 
         // --- retry of a single job in a state that cannot be retried is rejected ---

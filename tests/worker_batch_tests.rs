@@ -54,11 +54,11 @@ mod postgres_worker_batch_tests {
 
         // Create worker with batch processing enabled
         let worker = Worker::new(queue.clone(), queue_name.clone(), handler)
-            .with_batch_processing_enabled(true)
+            .with_batch_size(1) // Batch mode (statistics), one job per poll
             .with_stats_collector(stats_collector.clone())
             .with_poll_interval(Duration::from_millis(50))
             // Fail for good on the first attempt instead of waiting out retry delays
-            .with_max_retries(1);
+            .with_attempt_cap(1);
 
         // Verify initial batch stats
         let initial_stats = worker.get_batch_stats();
@@ -146,7 +146,7 @@ mod postgres_worker_batch_tests {
 
         // Create worker with batch processing enabled
         let worker = Worker::new(queue.clone(), queue_name.clone(), handler)
-            .with_batch_processing_enabled(true)
+            .with_batch_size(1) // Batch mode (statistics), one job per poll
             .with_poll_interval(Duration::from_millis(50));
 
         // Create a small batch

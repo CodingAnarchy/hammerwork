@@ -45,7 +45,7 @@ where
         info!("✅ Job enqueued: {}", job_id);
 
         // Dequeue the job
-        let dequeued_job = self.queue.dequeue("test_basic").await?;
+        let dequeued_job = self.queue.dequeue_one("test_basic").await?;
         assert!(dequeued_job.is_some(), "Job should be dequeued");
         let dequeued_job = dequeued_job.unwrap();
         assert_eq!(dequeued_job.id, job_id);
@@ -89,7 +89,7 @@ where
         info!("✅ Delayed job enqueued: {}", job_id);
 
         // Try to dequeue immediately - should get nothing
-        let immediate_result = self.queue.dequeue("test_delayed").await?;
+        let immediate_result = self.queue.dequeue_one("test_delayed").await?;
         assert!(
             immediate_result.is_none(),
             "Delayed job should not be available immediately"
@@ -100,7 +100,7 @@ where
         sleep(Duration::from_secs(3)).await;
 
         // Now try to dequeue - should get the job
-        let delayed_result = self.queue.dequeue("test_delayed").await?;
+        let delayed_result = self.queue.dequeue_one("test_delayed").await?;
         assert!(
             delayed_result.is_some(),
             "Delayed job should be available after delay"
@@ -136,7 +136,7 @@ where
         info!("✅ Retry test job enqueued: {}", job_id);
 
         // Dequeue and fail the job
-        let dequeued_job = self.queue.dequeue("test_retry").await?;
+        let dequeued_job = self.queue.dequeue_one("test_retry").await?;
         assert!(dequeued_job.is_some());
         let dequeued_job = dequeued_job.unwrap();
         assert_eq!(dequeued_job.attempts, 1);
@@ -191,7 +191,7 @@ where
             handler.clone(),
         )
         .with_poll_interval(Duration::from_millis(100))
-        .with_max_retries(2);
+        .with_attempt_cap(2);
 
         let worker2 = Worker::new(
             self.queue.clone(),
@@ -199,7 +199,7 @@ where
             handler.clone(),
         )
         .with_poll_interval(Duration::from_millis(100))
-        .with_max_retries(2);
+        .with_attempt_cap(2);
 
         // Enqueue test jobs
         for i in 0..5 {
@@ -264,7 +264,7 @@ where
         for _ in 0..3 {
             let queue_clone = self.queue.clone();
             let handle = tokio::spawn(async move {
-                if let Ok(Some(job)) = queue_clone.dequeue("concurrent_test").await {
+                if let Ok(Some(job)) = queue_clone.dequeue_one("concurrent_test").await {
                     // Simulate processing
                     sleep(Duration::from_millis(50)).await;
                     let _ = queue_clone.complete_job(job.id).await;
@@ -303,7 +303,7 @@ where
         info!("🧪 Testing error handling and edge cases");
 
         // Test dequeue from empty queue
-        let empty_result = self.queue.dequeue("nonexistent_queue").await?;
+        let empty_result = self.queue.dequeue_one("nonexistent_queue").await?;
         assert!(empty_result.is_none(), "Empty queue should return None");
         info!("✅ Empty queue correctly returns None");
 
@@ -350,7 +350,7 @@ where
 
         // Dequeue and fail the job multiple times to exhaust retries
         for attempt in 1..=2 {
-            let dequeued_job = self.queue.dequeue("dead_job_test").await?;
+            let dequeued_job = self.queue.dequeue_one("dead_job_test").await?;
             assert!(dequeued_job.is_some());
             let dequeued_job = dequeued_job.unwrap();
             assert_eq!(dequeued_job.attempts, attempt);
@@ -457,7 +457,7 @@ where
         // Create worker with stats collector
         let worker = Worker::new(self.queue.clone(), "stats_test".to_string(), handler)
             .with_poll_interval(Duration::from_millis(100))
-            .with_max_retries(2)
+            .with_attempt_cap(2)
             .with_stats_collector(Arc::clone(&stats_collector));
 
         // Enqueue test jobs (mix of successful and failing)
@@ -561,10 +561,10 @@ where
         info!("✅ Enqueued jobs in multiple queues");
 
         // Complete some jobs to generate statistics
-        if let Some(job) = self.queue.dequeue("email_queue").await? {
+        if let Some(job) = self.queue.dequeue_one("email_queue").await? {
             self.queue.complete_job(job.id).await?;
         }
-        if let Some(job) = self.queue.dequeue("notification_queue").await? {
+        if let Some(job) = self.queue.dequeue_one("notification_queue").await? {
             self.queue.complete_job(job.id).await?;
         }
 
