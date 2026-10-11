@@ -10,7 +10,7 @@ use crate::commands::job::priority_display;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
 use crate::utils::job_rows::{self, Column, Param, RowInsert};
-use crate::utils::sql::{Backend, Bind, SqlParams, bind_mysql, bind_pg};
+use crate::utils::sql::{Backend, Bind, IdText, SqlParams, bind_mysql, bind_pg, fetch_rows};
 use crate::utils::validation::validate_priority;
 
 /// Version of the JSON backup format written by `backup create`.
@@ -114,11 +114,7 @@ impl BackupCommand {
                 include_failed,
                 format,
             } => {
-                let db_url = database_url
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .or(config.get_database_url())
-                    .ok_or_else(|| anyhow::anyhow!("Database URL is required"))?;
+                let db_url = &config.resolve_database_url(database_url.as_deref())?;
 
                 create_backup(
                     db_url,
@@ -137,11 +133,7 @@ impl BackupCommand {
                 confirm,
                 skip_existing,
             } => {
-                let db_url = database_url
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .or(config.get_database_url())
-                    .ok_or_else(|| anyhow::anyhow!("Database URL is required"))?;
+                let db_url = &config.resolve_database_url(database_url.as_deref())?;
 
                 restore_backup(
                     db_url,
@@ -255,24 +247,21 @@ pub(crate) async fn fetch_job_data(
     query: &str,
     binds: &[Bind],
 ) -> Result<Vec<JobData>> {
-    match pool {
-        DatabasePool::Postgres(pg_pool) => {
-            let rows = bind_pg(sqlx::query(query), binds)
-                .fetch_all(pg_pool)
-                .await?;
-            rows.into_iter()
-                .map(|row| extract_job_data_postgres(&row))
-                .collect()
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            let rows = bind_mysql(sqlx::query(query), binds)
-                .fetch_all(mysql_pool)
-                .await?;
-            rows.into_iter()
-                .map(|row| extract_job_data_mysql(&row))
-                .collect()
-        }
-    }
+    Ok(fetch_rows!(pool, query, binds, |row| JobData {
+        id: row.id_text("id")?,
+        queue_name: row.try_get("queue_name")?,
+        payload: row.try_get("payload")?,
+        status: row.try_get("status")?,
+        priority: priority_display(row.try_get("priority")?),
+        attempts: row.try_get("attempts")?,
+        max_attempts: row.try_get("max_attempts")?,
+        created_at: row.try_get("created_at")?,
+        scheduled_at: row.try_get("scheduled_at")?,
+        started_at: row.try_get("started_at")?,
+        completed_at: row.try_get("completed_at")?,
+        failed_at: row.try_get("failed_at")?,
+        error_message: row.try_get("error_message")?,
+    }))
 }
 
 pub(crate) const CSV_HEADER: &str = "id,queue_name,payload,status,priority,attempts,max_attempts,created_at,scheduled_at,started_at,completed_at,failed_at,error_message";
@@ -287,6 +276,11 @@ pub(crate) fn csv_field(value: &str) -> String {
 }
 
 pub(crate) fn csv_row(job: &JobData) -> String {
+    csv_fields(job).join(",")
+}
+
+/// The [`CSV_HEADER`] columns of `job`, each quoted as needed.
+pub(crate) fn csv_fields(job: &JobData) -> Vec<String> {
     let time =
         |t: Option<chrono::DateTime<chrono::Utc>>| t.map(|t| t.to_rfc3339()).unwrap_or_default();
     [
@@ -304,7 +298,7 @@ pub(crate) fn csv_row(job: &JobData) -> String {
         time(job.failed_at),
         csv_field(job.error_message.as_deref().unwrap_or("")),
     ]
-    .join(",")
+    .into()
 }
 
 async fn create_backup(
@@ -370,42 +364,6 @@ async fn create_backup(
     println!("📊 Total jobs backed up: {}", total);
 
     Ok(())
-}
-
-fn extract_job_data_postgres(row: &sqlx::postgres::PgRow) -> Result<JobData> {
-    Ok(JobData {
-        id: row.try_get::<uuid::Uuid, _>("id")?.to_string(),
-        queue_name: row.try_get("queue_name")?,
-        payload: row.try_get("payload")?,
-        status: row.try_get("status")?,
-        priority: priority_display(row.try_get("priority")?),
-        attempts: row.try_get("attempts")?,
-        max_attempts: row.try_get("max_attempts")?,
-        created_at: row.try_get("created_at")?,
-        scheduled_at: row.try_get("scheduled_at")?,
-        started_at: row.try_get("started_at")?,
-        completed_at: row.try_get("completed_at")?,
-        failed_at: row.try_get("failed_at")?,
-        error_message: row.try_get("error_message")?,
-    })
-}
-
-fn extract_job_data_mysql(row: &sqlx::mysql::MySqlRow) -> Result<JobData> {
-    Ok(JobData {
-        id: row.try_get("id")?,
-        queue_name: row.try_get("queue_name")?,
-        payload: row.try_get("payload")?,
-        status: row.try_get("status")?,
-        priority: priority_display(row.try_get("priority")?),
-        attempts: row.try_get("attempts")?,
-        max_attempts: row.try_get("max_attempts")?,
-        created_at: row.try_get("created_at")?,
-        scheduled_at: row.try_get("scheduled_at")?,
-        started_at: row.try_get("started_at")?,
-        completed_at: row.try_get("completed_at")?,
-        failed_at: row.try_get("failed_at")?,
-        error_message: row.try_get("error_message")?,
-    })
 }
 
 async fn restore_backup(

@@ -1,3 +1,4 @@
+use crate::utils::database::with_queue;
 use anyhow::Result;
 use clap::Subcommand;
 use tracing::info;
@@ -291,20 +292,11 @@ async fn archive_jobs(
         return Ok(());
     }
 
-    let stats = match pool {
-        DatabasePool::Postgres(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue
-                .archive_jobs(queue_name, &policy, &config, archival_reason, archived_by)
-                .await?
-        }
-        DatabasePool::MySQL(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue
-                .archive_jobs(queue_name, &policy, &config, archival_reason, archived_by)
-                .await?
-        }
-    };
+    let stats = with_queue!(pool.create_job_queue(), |queue| {
+        queue
+            .archive_jobs(queue_name, &policy, &config, archival_reason, archived_by)
+            .await?
+    });
 
     println!("Archival completed successfully!");
     println!("  Jobs archived: {}", stats.jobs_archived);
@@ -349,16 +341,9 @@ async fn restore_archived_job(pool: DatabasePool, job_id: &str) -> Result<()> {
 
     let job_uuid = Uuid::parse_str(job_id)?;
 
-    let job = match pool {
-        DatabasePool::Postgres(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue.restore_archived_job(job_uuid).await?
-        }
-        DatabasePool::MySQL(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue.restore_archived_job(job_uuid).await?
-        }
-    };
+    let job = with_queue!(pool.create_job_queue(), |queue| {
+        queue.restore_archived_job(job_uuid).await?
+    });
 
     println!("Job restored successfully!");
     println!("  Job ID: {}", job.id);
@@ -381,20 +366,11 @@ async fn list_archived_jobs(
     info!("Listing archived jobs...");
     let format = check_format(format, &["table", "json", "csv"])?;
 
-    let archived_jobs = match pool {
-        DatabasePool::Postgres(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue
-                .list_archived_jobs(queue_name, Some(limit), Some(offset))
-                .await?
-        }
-        DatabasePool::MySQL(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue
-                .list_archived_jobs(queue_name, Some(limit), Some(offset))
-                .await?
-        }
-    };
+    let archived_jobs = with_queue!(pool.create_job_queue(), |queue| {
+        queue
+            .list_archived_jobs(queue_name, Some(limit), Some(offset))
+            .await?
+    });
 
     println!("{}", render_archived_jobs(&archived_jobs, format)?);
     Ok(())
@@ -469,16 +445,9 @@ async fn show_archival_stats(
     info!("Getting archival statistics...");
     let format = check_format(format, &["table", "json"])?;
 
-    let stats = match pool {
-        DatabasePool::Postgres(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue.get_archival_stats(queue_name).await?
-        }
-        DatabasePool::MySQL(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue.get_archival_stats(queue_name).await?
-        }
-    };
+    let stats = with_queue!(pool.create_job_queue(), |queue| {
+        queue.get_archival_stats(queue_name).await?
+    });
 
     println!("{}", render_archival_stats(&stats, queue_name, format)?);
     Ok(())
@@ -535,16 +504,9 @@ async fn purge_archived_jobs(
         return Ok(());
     }
 
-    let deleted_count = match pool {
-        DatabasePool::Postgres(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue.purge_archived_jobs(cutoff_date).await?
-        }
-        DatabasePool::MySQL(pool) => {
-            let queue = hammerwork::JobQueue::new(pool);
-            queue.purge_archived_jobs(cutoff_date).await?
-        }
-    };
+    let deleted_count = with_queue!(pool.create_job_queue(), |queue| {
+        queue.purge_archived_jobs(cutoff_date).await?
+    });
 
     println!("Purged {} archived jobs", deleted_count);
 
@@ -554,7 +516,6 @@ async fn purge_archived_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::database::JobQueueWrapper;
     use crate::utils::sql::{IntervalUnit, SqlParams, execute_binds, fetch_i64};
     use crate::utils::test_support::*;
     use clap::Parser;
@@ -943,16 +904,11 @@ mod tests {
         assert!(job_column(pool, &other, "status").await.is_some());
 
         let library = pool.clone().create_job_queue();
-        let listed = match &library {
-            JobQueueWrapper::Postgres(l) => l
-                .list_archived_jobs(Some(q), Some(10), Some(0))
+        let listed = with_queue!(&library, |l| {
+            l.list_archived_jobs(Some(q), Some(10), Some(0))
                 .await
-                .unwrap(),
-            JobQueueWrapper::MySQL(l) => l
-                .list_archived_jobs(Some(q), Some(10), Some(0))
-                .await
-                .unwrap(),
-        };
+                .unwrap()
+        });
         assert_eq!(listed.len(), 2);
         assert!(
             listed
@@ -979,16 +935,11 @@ mod tests {
         let uncompressed = seed(pool, &more).await;
         backdate(pool, &uncompressed, "completed_at", 9).await;
         run(&["run", "-Q", q, "--compress", "false"]).await.unwrap();
-        let listed = match &library {
-            JobQueueWrapper::Postgres(l) => l
-                .list_archived_jobs(Some(q), Some(10), Some(0))
+        let listed = with_queue!(&library, |l| {
+            l.list_archived_jobs(Some(q), Some(10), Some(0))
                 .await
-                .unwrap(),
-            JobQueueWrapper::MySQL(l) => l
-                .list_archived_jobs(Some(q), Some(10), Some(0))
-                .await
-                .unwrap(),
-        };
+                .unwrap()
+        });
         let entry = listed
             .iter()
             .find(|j| j.id.to_string() == uncompressed)

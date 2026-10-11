@@ -1,3 +1,4 @@
+use crate::utils::database::with_queue;
 use anyhow::Result;
 use clap::Subcommand;
 use hammerwork::queue::DatabaseQueue;
@@ -12,7 +13,7 @@ use crate::utils::job_ops::{
     JobSelector, cancel_many, cancel_one, retry_many, retry_one, select_job_ids,
 };
 use crate::utils::sql::{
-    Backend, Bind, IntervalUnit, SqlParams, bind_mysql, bind_pg, execute_binds,
+    Backend, Bind, IdText, IntervalUnit, SqlParams, execute_binds, fetch_rows,
 };
 use crate::utils::validation::{validate_json_payload, validate_priority, validate_status};
 
@@ -295,12 +296,7 @@ impl JobCommand {
             JobCommand::RequeueStale { database_url, .. } => database_url,
         };
 
-        url_option
-            .as_ref()
-            .map(|s| s.as_str())
-            .or(config.get_database_url())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("Database URL is required"))
+        config.resolve_database_url(url_option.as_deref())
     }
 }
 
@@ -422,76 +418,34 @@ async fn list_jobs(
 
     let mut job_table = JobTable::new();
 
-    match pool {
-        DatabasePool::Postgres(pg_pool) => {
-            let (query, params) = build_list_jobs_query(
-                true,
-                queue.as_deref(),
-                status.as_deref(),
-                priority,
-                limit,
-                failed,
-                completed,
-                last_hours,
-            );
-            let rows = bind_pg(sqlx::query(&query), &params)
-                .fetch_all(&pg_pool)
-                .await?;
-            for row in rows {
-                let id: uuid::Uuid = row.try_get("id")?;
-                let queue_name: String = row.try_get("queue_name")?;
-                let status: String = row.try_get("status")?;
-                let priority: i32 = row.try_get("priority")?;
-                let attempts: i32 = row.try_get("attempts")?;
-                let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-                let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
-
-                job_table.add_job_row(
-                    &id.to_string(),
-                    &queue_name,
-                    &status,
-                    &priority_display(priority),
-                    attempts,
-                    &created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    &scheduled_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                );
-            }
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            let (query, params) = build_list_jobs_query(
-                false,
-                queue.as_deref(),
-                status.as_deref(),
-                priority,
-                limit,
-                failed,
-                completed,
-                last_hours,
-            );
-            let rows = bind_mysql(sqlx::query(&query), &params)
-                .fetch_all(&mysql_pool)
-                .await?;
-            for row in rows {
-                let id: String = row.try_get("id")?;
-                let queue_name: String = row.try_get("queue_name")?;
-                let status: String = row.try_get("status")?;
-                let priority: i32 = row.try_get("priority")?;
-                let attempts: i32 = row.try_get("attempts")?;
-                let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
-                let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
-
-                job_table.add_job_row(
-                    &id,
-                    &queue_name,
-                    &status,
-                    &priority_display(priority),
-                    attempts,
-                    &created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    &scheduled_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                );
-            }
-        }
-    }
+    let (query, params) = build_list_jobs_query(
+        pool.backend() == Backend::Postgres,
+        queue.as_deref(),
+        status.as_deref(),
+        priority,
+        limit,
+        failed,
+        completed,
+        last_hours,
+    );
+    fetch_rows!(&pool, &query, &params, |row| {
+        let id = row.id_text("id")?;
+        let queue_name: String = row.try_get("queue_name")?;
+        let status: String = row.try_get("status")?;
+        let priority: i32 = row.try_get("priority")?;
+        let attempts: i32 = row.try_get("attempts")?;
+        let created_at: chrono::DateTime<chrono::Utc> = row.try_get("created_at")?;
+        let scheduled_at: chrono::DateTime<chrono::Utc> = row.try_get("scheduled_at")?;
+        job_table.add_job_row(
+            &id,
+            &queue_name,
+            &status,
+            &priority_display(priority),
+            attempts,
+            &created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            &scheduled_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        )
+    });
 
     println!("{}", job_table);
     Ok(())
@@ -725,16 +679,10 @@ async fn enqueue_job(
         job.scheduled_at = delayed_schedule(chrono::Utc::now(), delay_secs)?;
     }
 
-    match job_queue {
-        crate::utils::database::JobQueueWrapper::Postgres(queue) => {
-            let job_id = queue.enqueue(job).await?;
-            info!("✅ Job enqueued successfully: {}", job_id);
-        }
-        crate::utils::database::JobQueueWrapper::MySQL(queue) => {
-            let job_id = queue.enqueue(job).await?;
-            info!("✅ Job enqueued successfully: {}", job_id);
-        }
-    }
+    with_queue!(job_queue, |queue| {
+        let job_id = queue.enqueue(job).await?;
+        info!("✅ Job enqueued successfully: {}", job_id);
+    });
 
     Ok(())
 }
@@ -753,14 +701,9 @@ fn delayed_schedule(
 
 async fn requeue_stale_jobs(pool: DatabasePool, older_than_secs: u64) -> Result<()> {
     let older_than = std::time::Duration::from_secs(older_than_secs);
-    let recovery = match pool.create_job_queue() {
-        crate::utils::database::JobQueueWrapper::Postgres(queue) => {
-            queue.requeue_stale_jobs(older_than).await?
-        }
-        crate::utils::database::JobQueueWrapper::MySQL(queue) => {
-            queue.requeue_stale_jobs(older_than).await?
-        }
-    };
+    let recovery = with_queue!(pool.create_job_queue(), |queue| {
+        queue.requeue_stale_jobs(older_than).await?
+    });
 
     for id in &recovery.requeued {
         info!("↩️  Requeued stale job {}", id);
@@ -792,10 +735,7 @@ async fn retry_jobs(
     // A single job: report the library's verdict (not found / invalid transition).
     if let Some(id) = job_id {
         let job_uuid = uuid::Uuid::parse_str(&id)?;
-        match &wrapper {
-            JobQueueWrapper::Postgres(q) => retry_one(q, job_uuid).await?,
-            JobQueueWrapper::MySQL(q) => retry_one(q, job_uuid).await?,
-        }
+        with_queue!(&wrapper, |q| retry_one(q, job_uuid).await?);
         info!("✅ Retried job {}", job_uuid);
         return Ok(());
     }
@@ -848,10 +788,7 @@ async fn cancel_jobs(
 
     if let Some(id) = job_id {
         let job_uuid = uuid::Uuid::parse_str(&id)?;
-        match &wrapper {
-            JobQueueWrapper::Postgres(q) => cancel_one(q, job_uuid, &allowed).await?,
-            JobQueueWrapper::MySQL(q) => cancel_one(q, job_uuid, &allowed).await?,
-        }
+        with_queue!(&wrapper, |q| cancel_one(q, job_uuid, &allowed).await?);
         info!("✅ Cancelled job {}", job_uuid);
         return Ok(());
     }
@@ -1773,18 +1710,11 @@ mod tests {
         .await
         .unwrap();
         let job_id = uuid::Uuid::parse_str(&id).unwrap();
-        let opened = match app_queue {
-            JobQueueWrapper::Postgres(q) => {
-                let q = q.with_encryption(engine);
-                q.decrypt_job(q.get_job(job_id).await.unwrap().unwrap())
-                    .await
-            }
-            JobQueueWrapper::MySQL(q) => {
-                let q = q.with_encryption(engine);
-                q.decrypt_job(q.get_job(job_id).await.unwrap().unwrap())
-                    .await
-            }
-        }
+        let opened = with_queue!(app_queue, |q| {
+            let q = q.with_encryption(engine);
+            q.decrypt_job(q.get_job(job_id).await.unwrap().unwrap())
+                .await
+        })
         .unwrap();
         assert_eq!(opened.payload["card"], secret.as_str());
 

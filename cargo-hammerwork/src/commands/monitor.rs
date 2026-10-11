@@ -7,7 +7,9 @@ use tokio::time::interval;
 use crate::commands::job::priority_display;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
-use crate::utils::sql::{Backend, Bind, IntervalUnit, SqlParams, bind_mysql, bind_pg, fetch_i64};
+use crate::utils::sql::{
+    Backend, Bind, IdText, IntervalUnit, SqlParams, bind_mysql, bind_pg, fetch_i64, fetch_rows,
+};
 
 #[derive(Subcommand)]
 pub enum MonitorCommand {
@@ -79,12 +81,7 @@ impl MonitorCommand {
             MonitorCommand::Metrics { database_url, .. } => database_url,
         };
 
-        url_option
-            .as_ref()
-            .map(|s| s.as_str())
-            .or(config.get_database_url())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("Database URL is required"))
+        config.resolve_database_url(url_option.as_deref())
     }
 }
 
@@ -254,51 +251,17 @@ pub async fn fetch_dashboard_data(
 ) -> Result<DashboardData> {
     let (status_query, status_binds) = build_status_counts_query(pool.backend(), queue);
     let (recent_query, recent_binds) = build_recent_jobs_query(pool.backend(), queue);
-    let mut status_counts = Vec::new();
-    let mut recent = Vec::new();
-
-    match pool {
-        DatabasePool::Postgres(pg_pool) => {
-            for row in bind_pg(sqlx::query(&status_query), &status_binds)
-                .fetch_all(pg_pool)
-                .await?
-            {
-                status_counts.push((row.try_get("status")?, row.try_get("count")?));
-            }
-            for row in bind_pg(sqlx::query(&recent_query), &recent_binds)
-                .fetch_all(pg_pool)
-                .await?
-            {
-                recent.push(RecentJob {
-                    id: row.try_get::<uuid::Uuid, _>("id")?.to_string(),
-                    queue: row.try_get("queue_name")?,
-                    status: row.try_get("status")?,
-                    priority: priority_display(row.try_get("priority")?),
-                    created_at: row.try_get("created_at")?,
-                });
-            }
-        }
-        DatabasePool::MySQL(mysql_pool) => {
-            for row in bind_mysql(sqlx::query(&status_query), &status_binds)
-                .fetch_all(mysql_pool)
-                .await?
-            {
-                status_counts.push((row.try_get("status")?, row.try_get("count")?));
-            }
-            for row in bind_mysql(sqlx::query(&recent_query), &recent_binds)
-                .fetch_all(mysql_pool)
-                .await?
-            {
-                recent.push(RecentJob {
-                    id: row.try_get("id")?,
-                    queue: row.try_get("queue_name")?,
-                    status: row.try_get("status")?,
-                    priority: priority_display(row.try_get("priority")?),
-                    created_at: row.try_get("created_at")?,
-                });
-            }
-        }
-    }
+    let status_counts = fetch_rows!(pool, &status_query, &status_binds, |row| (
+        row.try_get("status")?,
+        row.try_get("count")?
+    ));
+    let recent = fetch_rows!(pool, &recent_query, &recent_binds, |row| RecentJob {
+        id: row.id_text("id")?,
+        queue: row.try_get("queue_name")?,
+        status: row.try_get("status")?,
+        priority: priority_display(row.try_get("priority")?),
+        created_at: row.try_get("created_at")?,
+    });
     Ok(DashboardData {
         status_counts,
         recent,

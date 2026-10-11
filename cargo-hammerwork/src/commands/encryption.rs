@@ -13,7 +13,7 @@ use sqlx::Row;
 
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
-use crate::utils::sql::{Backend, Bind, SqlParams, bind_mysql, bind_pg};
+use crate::utils::sql::{Backend, Bind, SqlParams, fetch_rows};
 
 #[derive(Subcommand)]
 pub enum EncryptionCommand {
@@ -95,11 +95,7 @@ impl EncryptionCommand {
 
     fn get_database_url(&self, config: &Config) -> Result<String> {
         let EncryptionCommand::Audit { database_url, .. } = self;
-        database_url
-            .as_deref()
-            .or(config.get_database_url())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("Database URL is required"))
+        config.resolve_database_url(database_url.as_deref())
     }
 
     /// The filter described by the `audit` flags.
@@ -247,46 +243,18 @@ pub fn build_audit_query(backend: Backend, filter: &AuditFilter) -> (String, Vec
 /// Read the audit records matching `filter`, newest first.
 pub async fn read_audit_log(pool: &DatabasePool, filter: &AuditFilter) -> Result<Vec<AuditRecord>> {
     let (sql, binds) = build_audit_query(pool.backend(), filter);
-    match pool {
-        DatabasePool::Postgres(p) => bind_pg(sqlx::query(&sql), &binds)
-            .fetch_all(p)
-            .await?
-            .iter()
-            .map(|row| {
-                Ok(AuditRecord {
-                    id: row.try_get("id")?,
-                    key_id: row.try_get("key_id")?,
-                    operation: row.try_get("operation")?,
-                    success: row.try_get("success")?,
-                    error_message: row.try_get("error_message")?,
-                    timestamp: row.try_get("timestamp")?,
-                    user_id: row.try_get("user_id")?,
-                    client_ip: row.try_get("client_ip")?,
-                    user_agent: row.try_get("user_agent")?,
-                    session_id: row.try_get("session_id")?,
-                })
-            })
-            .collect(),
-        DatabasePool::MySQL(p) => bind_mysql(sqlx::query(&sql), &binds)
-            .fetch_all(p)
-            .await?
-            .iter()
-            .map(|row| {
-                Ok(AuditRecord {
-                    id: row.try_get("id")?,
-                    key_id: row.try_get("key_id")?,
-                    operation: row.try_get("operation")?,
-                    success: row.try_get("success")?,
-                    error_message: row.try_get("error_message")?,
-                    timestamp: row.try_get("timestamp")?,
-                    user_id: row.try_get("user_id")?,
-                    client_ip: row.try_get("client_ip")?,
-                    user_agent: row.try_get("user_agent")?,
-                    session_id: row.try_get("session_id")?,
-                })
-            })
-            .collect(),
-    }
+    Ok(fetch_rows!(pool, &sql, &binds, |row| AuditRecord {
+        id: row.try_get("id")?,
+        key_id: row.try_get("key_id")?,
+        operation: row.try_get("operation")?,
+        success: row.try_get("success")?,
+        error_message: row.try_get("error_message")?,
+        timestamp: row.try_get("timestamp")?,
+        user_id: row.try_get("user_id")?,
+        client_ip: row.try_get("client_ip")?,
+        user_agent: row.try_get("user_agent")?,
+        session_id: row.try_get("session_id")?,
+    }))
 }
 
 /// The audit records as a table (`table`) or a JSON array (`json`).
