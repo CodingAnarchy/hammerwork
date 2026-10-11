@@ -482,10 +482,10 @@ impl<DB: sqlx::Database> SpawnManager<DB> {
             ));
         }
 
-        // Apply inheritance settings. Optional settings are inherited only when the
-        // child has none of its own, so a parent without them never wipes the child's.
+        // Apply inheritance settings. An optional setting is inherited when the parent
+        // has one, so a parent without it never wipes the child's own.
         fn inherit<T: Clone>(child: &mut Option<T>, parent: &Option<T>) {
-            if child.is_none() {
+            if parent.is_some() {
                 child.clone_from(parent);
             }
         }
