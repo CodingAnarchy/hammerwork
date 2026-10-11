@@ -161,17 +161,10 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Result of one attempt to acquire a job in the worker loop.
-enum Acquired {
-    // Boxed: a `Job` is much larger than the other variants.
-    Job(Box<Job>),
-    Idle,
-    Shutdown,
-}
-
-/// What a batch-mode worker got from one poll.
-enum AcquiredBatch {
-    Jobs(Vec<ClaimedJob>),
+/// Result of one attempt to acquire work in the worker loop: a job (boxed, as a `Job`
+/// is much larger than the other variants) or, in batch mode, the claimed jobs.
+enum Acquired<T> {
+    Work(T),
     Idle,
     Shutdown,
 }
@@ -223,6 +216,25 @@ enum HeldStart {
     /// Renew its lease first: the running heartbeat only fires after a full interval, and
     /// together with the time since the last renewal that could outlast the lease.
     RenewThenRun,
+}
+
+/// A [`JobEvent`] of `event_type` for `job`.
+fn job_event(
+    job: &Job,
+    event_type: JobEventType,
+    processing_time_ms: Option<u64>,
+    error_message: Option<String>,
+    timestamp: DateTime<Utc>,
+) -> JobEvent {
+    JobEvent {
+        job_id: job.id,
+        queue_name: job.queue_name.clone(),
+        event_type,
+        priority: job.priority,
+        processing_time_ms,
+        error_message,
+        timestamp,
+    }
 }
 
 /// Whether shutdown was requested (or the shutdown sender was dropped), without waiting.
@@ -1923,14 +1935,14 @@ where
             let (outcome, shutting_down) = if self.batch_processing_enabled {
                 // Each claimed job holds its own throttle permit (see `acquire_batch`).
                 match self.acquire_batch(&mut shutdown_rx).await {
-                    Ok(AcquiredBatch::Shutdown) => {
+                    Ok(Acquired::Shutdown) => {
                         info!("Worker shutting down for queue: {}", self.queue_name);
                         break;
                     }
-                    Ok(AcquiredBatch::Jobs(batch)) => {
+                    Ok(Acquired::Work(batch)) => {
                         self.run_batch_until_done(batch, &mut shutdown_rx).await
                     }
-                    Ok(AcquiredBatch::Idle) => (Ok(()), false),
+                    Ok(Acquired::Idle) => (Ok(()), false),
                     Err(e) => {
                         error!("Error dequeuing jobs from queue {}: {}", self.queue_name, e);
                         (Err(e), false)
@@ -1958,7 +1970,9 @@ where
                         info!("Worker shutting down for queue: {}", self.queue_name);
                         break;
                     }
-                    Ok(Acquired::Job(job)) => self.run_job_until_done(*job, &mut shutdown_rx).await,
+                    Ok(Acquired::Work(job)) => {
+                        self.run_job_until_done(*job, &mut shutdown_rx).await
+                    }
                     Ok(Acquired::Idle) => (Ok(()), false),
                     Err(e) => {
                         error!("Error dequeuing job from queue {}: {}", self.queue_name, e);
@@ -2061,7 +2075,10 @@ where
     /// Returns `Idle` after waiting for the poll interval when the queue is empty or
     /// paused, `Shutdown` when shutdown is requested during a wait, and `Err` when the
     /// dequeue itself fails. Database calls are never interrupted by shutdown.
-    async fn acquire_job(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> Result<Acquired> {
+    async fn acquire_job(
+        &self,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<Acquired<Box<Job>>> {
         // Alert checks and queue depth metrics run in the monitoring task
         // (`start_monitoring_task`), never here: a slow alert endpoint or a COUNT(*) must
         // not hold up dequeuing.
@@ -2096,7 +2113,7 @@ where
                     "Processing job: {} with priority: {:?}",
                     job.id, job.priority
                 );
-                Ok(Acquired::Job(Box::new(job)))
+                Ok(Acquired::Work(Box::new(job)))
             }
             // No job available (or the queue is paused): wait before polling again.
             None => Ok(self.idle_wait(shutdown_rx).await),
@@ -2144,14 +2161,17 @@ where
     /// more as are free right now, up to the batch size, and claims no more jobs than
     /// that. Tokens for jobs it did not get are handed back; permits it did not need are
     /// dropped.
-    async fn acquire_batch(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> Result<AcquiredBatch> {
+    async fn acquire_batch(
+        &self,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<Acquired<Vec<ClaimedJob>>> {
         let mut capacity = self.batch_size.max(1);
 
         let mut permits = Vec::new();
         if let Some(limit) = &self.concurrency_limit {
             let first = tokio::select! {
                 biased;
-                _ = shutdown_rx.recv() => return Ok(AcquiredBatch::Shutdown),
+                _ = shutdown_rx.recv() => return Ok(Acquired::Shutdown),
                 // The semaphore is never closed, so this is always a permit.
                 permit = Arc::clone(limit).acquire_owned() => permit.ok(),
             };
@@ -2164,7 +2184,7 @@ where
             }
             capacity = permits.len();
             if capacity == 0 {
-                return Ok(self.idle_wait_batch(shutdown_rx).await);
+                return Ok(self.idle_wait(shutdown_rx).await);
             }
         }
 
@@ -2172,12 +2192,12 @@ where
         if let Some(rate_limiter) = &self.rate_limiter {
             let permit = tokio::select! {
                 biased;
-                _ = shutdown_rx.recv() => return Ok(AcquiredBatch::Shutdown),
+                _ = shutdown_rx.recv() => return Ok(Acquired::Shutdown),
                 permit = rate_limiter.acquire() => permit,
             };
             if let Err(e) = permit {
                 warn!("Rate limiter error: {}", e);
-                return Ok(self.idle_wait_batch(shutdown_rx).await);
+                return Ok(self.idle_wait(shutdown_rx).await);
             }
             tokens = 1;
             while tokens < capacity && rate_limiter.try_acquire() {
@@ -2208,7 +2228,7 @@ where
         let jobs = claimed?;
         if jobs.is_empty() {
             // No job available (or the queue is paused): wait before polling again.
-            return Ok(self.idle_wait_batch(shutdown_rx).await);
+            return Ok(self.idle_wait(shutdown_rx).await);
         }
         debug!(
             "Claimed {} job(s) from queue {}",
@@ -2216,7 +2236,7 @@ where
             self.queue_name
         );
         let mut permits = permits.into_iter();
-        Ok(AcquiredBatch::Jobs(
+        Ok(Acquired::Work(
             jobs.into_iter()
                 .map(|job| ClaimedJob {
                     job,
@@ -2224,14 +2244,6 @@ where
                 })
                 .collect(),
         ))
-    }
-
-    /// [`idle_wait`](Self::idle_wait) for batch mode.
-    async fn idle_wait_batch(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> AcquiredBatch {
-        match self.idle_wait(shutdown_rx).await {
-            Acquired::Shutdown => AcquiredBatch::Shutdown,
-            _ => AcquiredBatch::Idle,
-        }
     }
 
     /// Process the jobs of a claimed batch, up to `batch_concurrency` at a time, while
@@ -2422,12 +2434,7 @@ where
     /// job, which takes over once a job starts). A job whose lease is found lost is
     /// marked so it is not run. Never completes.
     async fn maintain_held_leases(&self, held: &std::sync::Mutex<HeldJobs>) {
-        if self.lease_duration.is_zero() {
-            return std::future::pending().await;
-        }
-        let interval = self.held_renewal_interval();
-        loop {
-            sleep(interval).await;
+        self.every_heartbeat(|| async move {
             let waiting = held
                 .lock()
                 .map(|held| held.waiting.clone())
@@ -2454,7 +2461,29 @@ where
                     Err(e) => warn!("Failed to renew the lease on waiting job {}: {}", run.id, e),
                 }
             }
+            true
+        })
+        .await
+    }
+
+    /// Run `beat` every [heartbeat interval](Self::held_renewal_interval) (the first
+    /// one after an interval) until it returns `false`. Never completes. With a zero
+    /// lease, which never expires, `beat` never runs.
+    async fn every_heartbeat<F, Fut>(&self, mut beat: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        if !self.lease_duration.is_zero() {
+            let interval = self.held_renewal_interval();
+            loop {
+                sleep(interval).await;
+                if !beat().await {
+                    break;
+                }
+            }
         }
+        std::future::pending().await
     }
 
     /// Hand claimed jobs that never started back to the queue
@@ -2491,7 +2520,7 @@ where
 
     /// Sleep for the poll interval (at least [`MIN_POLL_INTERVAL`]), returning early
     /// with `Shutdown` if shutdown is requested meanwhile.
-    async fn idle_wait(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> Acquired {
+    async fn idle_wait<T>(&self, shutdown_rx: &mut mpsc::Receiver<()>) -> Acquired<T> {
         tokio::select! {
             biased;
             _ = shutdown_rx.recv() => Acquired::Shutdown,
@@ -2602,7 +2631,6 @@ where
     }
 
     async fn process_job(&self, job: Job) -> Result<()> {
-        let job_id = job.id;
         let batch_id = job.batch_id;
         let start_time = Utc::now();
 
@@ -2622,15 +2650,13 @@ where
         self.event_hooks.fire_job_start(job.clone());
 
         // Record job started event
-        self.record_event(JobEvent {
-            job_id,
-            queue_name: job.queue_name.clone(),
-            event_type: JobEventType::Started,
-            priority: job.priority,
-            processing_time_ms: None,
-            error_message: None,
-            timestamp: start_time,
-        })
+        self.record_event(job_event(
+            &job,
+            JobEventType::Started,
+            None,
+            None,
+            start_time,
+        ))
         .await;
 
         // The job's own max_attempts decides whether a failed run is retried.
@@ -2834,15 +2860,13 @@ where
             .fire_job_complete(job.clone(), processing_duration);
 
         // Record job completed event
-        self.record_event(JobEvent {
-            job_id,
-            queue_name: job.queue_name.clone(),
-            event_type: JobEventType::Completed,
-            priority: job.priority,
-            processing_time_ms: Some(processing_time_ms),
-            error_message: None,
-            timestamp: Utc::now(),
-        })
+        self.record_event(job_event(
+            job,
+            JobEventType::Completed,
+            Some(processing_time_ms),
+            None,
+            Utc::now(),
+        ))
         .await;
 
         Ok(())
@@ -2899,31 +2923,18 @@ where
                 job.attempts + 1,
                 self.attempt_limit(job)
             );
-            self.event_hooks
-                .fire_job_retry(job.clone(), error_message.clone());
-            self.record_event(JobEvent {
-                job_id,
-                queue_name: job.queue_name.clone(),
-                event_type: JobEventType::Retried,
-                priority: job.priority,
-                processing_time_ms: None,
-                error_message: Some(error_message),
-                timestamp: Utc::now(),
-            })
-            .await;
+            self.announce_retry(job, error_message).await;
         } else {
             debug!("Job {} run ended with status {:?}", job_id, recorded.status);
             self.event_hooks
                 .fire_job_fail(job.clone(), error_message.clone());
-            self.record_event(JobEvent {
-                job_id,
-                queue_name: job.queue_name.clone(),
-                event_type: JobEventType::Dead,
-                priority: job.priority,
-                processing_time_ms: None,
-                error_message: Some(error_message),
-                timestamp: Utc::now(),
-            })
+            self.record_event(job_event(
+                job,
+                JobEventType::Dead,
+                None,
+                Some(error_message),
+                Utc::now(),
+            ))
             .await;
         }
 
@@ -2974,15 +2985,13 @@ where
         self.event_hooks.fire_job_timeout(job.clone(), timeout);
 
         // Record timeout event
-        self.record_event(JobEvent {
-            job_id,
-            queue_name: job.queue_name.clone(),
-            event_type: JobEventType::TimedOut,
-            priority: job.priority,
-            processing_time_ms: Some(timeout.as_millis() as u64),
-            error_message: Some(error_message.clone()),
-            timestamp: Utc::now(),
-        })
+        self.record_event(job_event(
+            job,
+            JobEventType::TimedOut,
+            Some(timeout.as_millis() as u64),
+            Some(error_message.clone()),
+            Utc::now(),
+        ))
         .await;
 
         if attempts_left {
@@ -2992,21 +3001,24 @@ where
                 job.attempts + 1,
                 self.attempt_limit(job)
             );
-            self.event_hooks
-                .fire_job_retry(job.clone(), error_message.clone());
-            self.record_event(JobEvent {
-                job_id,
-                queue_name: job.queue_name.clone(),
-                event_type: JobEventType::Retried,
-                priority: job.priority,
-                processing_time_ms: None,
-                error_message: Some(error_message),
-                timestamp: Utc::now(),
-            })
-            .await;
+            self.announce_retry(job, error_message).await;
         }
 
         Ok(())
+    }
+
+    /// Fire the retry hook and record the `Retried` event of a failed or timed-out run.
+    async fn announce_retry(&self, job: &Job, error_message: String) {
+        self.event_hooks
+            .fire_job_retry(job.clone(), error_message.clone());
+        self.record_event(job_event(
+            job,
+            JobEventType::Retried,
+            None,
+            Some(error_message),
+            Utc::now(),
+        ))
+        .await;
     }
 
     /// Batch statistics after a failed (or timed-out) run.
@@ -3097,12 +3109,7 @@ where
     /// interval, so short jobs never pay for a heartbeat write. Never completes.
     async fn maintain_lease(&self, run: &Job) {
         let job_id = run.id;
-        if self.lease_duration.is_zero() {
-            return std::future::pending().await;
-        }
-        let interval = (self.lease_duration / 3).max(MIN_HEARTBEAT_INTERVAL);
-        loop {
-            sleep(interval).await;
+        self.every_heartbeat(|| async move {
             match self.queue.heartbeat_job(run, self.lease_duration).await {
                 Ok(true) => debug!("Renewed lease on job {}", job_id),
                 Ok(false) => {
@@ -3111,11 +3118,13 @@ where
                          have been reclaimed as stale); the handler keeps running",
                         job_id
                     );
-                    return std::future::pending().await;
+                    return false;
                 }
                 Err(e) => warn!("Failed to renew the lease on job {}: {}", job_id, e),
             }
-        }
+            true
+        })
+        .await
     }
 
     /// Update batch processing statistics
@@ -3238,11 +3247,10 @@ where
 
     /// Get current batch processing statistics
     pub fn get_batch_stats(&self) -> BatchProcessingStats {
-        if let Ok(stats) = self.batch_stats.read() {
-            stats.clone()
-        } else {
-            BatchProcessingStats::default()
-        }
+        self.batch_stats
+            .read()
+            .map(|stats| stats.clone())
+            .unwrap_or_default()
     }
 
     async fn record_event(&self, event: JobEvent) {
@@ -3360,13 +3368,7 @@ where
                 // Check worker starvation
                 #[cfg(feature = "alerting")]
                 if let Some(alert_manager) = &alert_manager {
-                    let last_time_value = {
-                        if let Ok(last_time) = last_job_time.read() {
-                            Some(*last_time)
-                        } else {
-                            None
-                        }
-                    };
+                    let last_time_value = last_job_time.read().ok().map(|last_time| *last_time);
                     if let Some(last_time_value) = last_time_value
                         && let Err(e) = alert_manager
                             .check_worker_starvation(&queue_name, last_time_value)
@@ -4036,7 +4038,6 @@ where
         signal_rx: watch::Receiver<bool>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let interval = self.reaper_interval?;
-        let queue = Arc::clone(&workers.first()?.queue);
         let older_than = self.reaper_older_than.unwrap_or_else(|| {
             workers
                 .iter()
@@ -4046,20 +4047,17 @@ where
                 .unwrap_or(DEFAULT_LEASE_DURATION)
         });
 
-        Some(spawn_periodic(interval, signal_rx, move || {
-            let queue = Arc::clone(&queue);
-            async move {
-                match queue.requeue_stale_jobs(older_than).await {
-                    Ok(recovery) if !recovery.is_empty() => info!(
-                        "Stale job reaper requeued {} and marked {} dead",
-                        recovery.requeued.len(),
-                        recovery.dead.len()
-                    ),
-                    Ok(_) => {}
-                    Err(e) => warn!("Stale job reaper failed: {}", e),
-                }
+        spawn_queue_task(workers, interval, signal_rx, move |queue| async move {
+            match queue.requeue_stale_jobs(older_than).await {
+                Ok(recovery) if !recovery.is_empty() => info!(
+                    "Stale job reaper requeued {} and marked {} dead",
+                    recovery.requeued.len(),
+                    recovery.dead.len()
+                ),
+                Ok(_) => {}
+                Err(e) => warn!("Stale job reaper failed: {}", e),
             }
-        }))
+        })
     }
 
     /// Spawn the periodic encrypted job retention purge, if enabled.
@@ -4069,20 +4067,16 @@ where
         signal_rx: watch::Receiver<bool>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let interval = self.encrypted_job_purge_interval?;
-        let queue = Arc::clone(&workers.first()?.queue);
-        Some(spawn_periodic(interval, signal_rx, move || {
-            let queue = Arc::clone(&queue);
-            async move {
-                match queue.purge_expired_encrypted_jobs().await {
-                    Ok(purge) if purge.total() > 0 => info!(
-                        "Encrypted job purge deleted {} jobs and {} archived jobs",
-                        purge.jobs, purge.archived_jobs
-                    ),
-                    Ok(_) => {}
-                    Err(e) => warn!("Encrypted job purge failed: {}", e),
-                }
+        spawn_queue_task(workers, interval, signal_rx, |queue| async move {
+            match queue.purge_expired_encrypted_jobs().await {
+                Ok(purge) if purge.total() > 0 => info!(
+                    "Encrypted job purge deleted {} jobs and {} archived jobs",
+                    purge.jobs, purge.archived_jobs
+                ),
+                Ok(_) => {}
+                Err(e) => warn!("Encrypted job purge failed: {}", e),
             }
-        }))
+        })
     }
 
     /// Spawn the periodic archival pass, if enabled.
@@ -4135,20 +4129,18 @@ where
         signal_rx: watch::Receiver<bool>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let interval = self.result_cleanup_interval?;
-        let queue = Arc::clone(&workers.first()?.queue);
-        debug!("Clearing expired job results every {:?}", interval);
-        Some(spawn_periodic(interval, signal_rx, move || {
-            let queue = Arc::clone(&queue);
-            async move {
-                match queue.cleanup_expired_results().await {
-                    Ok(cleared) if cleared > 0 => {
-                        info!("Result cleanup cleared {} expired job results", cleared)
-                    }
-                    Ok(_) => debug!("Result cleanup found no expired job results"),
-                    Err(e) => warn!("Result cleanup failed: {}", e),
+        if !workers.is_empty() {
+            debug!("Clearing expired job results every {:?}", interval);
+        }
+        spawn_queue_task(workers, interval, signal_rx, |queue| async move {
+            match queue.cleanup_expired_results().await {
+                Ok(cleared) if cleared > 0 => {
+                    info!("Result cleanup cleared {} expired job results", cleared)
                 }
+                Ok(_) => debug!("Result cleanup found no expired job results"),
+                Err(e) => warn!("Result cleanup failed: {}", e),
             }
-        }))
+        })
     }
 
     /// Start the autoscaling background task.
@@ -4248,11 +4240,10 @@ where
 
     /// Get current autoscaling metrics
     pub fn get_autoscale_metrics(&self) -> AutoscaleMetrics {
-        if let Ok(metrics) = self.autoscale_metrics.read() {
-            metrics.clone()
-        } else {
-            AutoscaleMetrics::default()
-        }
+        self.autoscale_metrics
+            .read()
+            .map(|metrics| metrics.clone())
+            .unwrap_or_default()
     }
 
     /// Shut the pool down gracefully.
@@ -4503,6 +4494,25 @@ where
             }
         }
     })
+}
+
+/// [`spawn_periodic`] for a maintenance pass on the queue of the pool's first worker
+/// (`None` when the pool has no workers).
+fn spawn_queue_task<DB, F, Fut>(
+    workers: &[Worker<DB>],
+    interval: Duration,
+    signal_rx: watch::Receiver<bool>,
+    pass: F,
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    DB: Database + Send + Sync + 'static,
+    F: Fn(Arc<JobQueue<DB>>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let queue = Arc::clone(&workers.first()?.queue);
+    Some(spawn_periodic(interval, signal_rx, move || {
+        pass(Arc::clone(&queue))
+    }))
 }
 
 impl<DB: Database> Drop for WorkerPool<DB> {
@@ -5753,7 +5763,7 @@ mod tests {
         let started = std::time::Instant::now();
         for _ in 0..5 {
             assert!(matches!(
-                worker.idle_wait(&mut shutdown_rx).await,
+                worker.idle_wait::<Box<Job>>(&mut shutdown_rx).await,
                 Acquired::Idle
             ));
         }
