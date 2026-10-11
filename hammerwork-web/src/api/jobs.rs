@@ -252,6 +252,20 @@ fn job_info(job: &hammerwork::Job) -> JobInfo {
 /// The most jobs the listing reads per status (or per queue without a status filter).
 const LISTING_LIMIT: u32 = 100;
 
+/// The most jobs a search reads per status and queue.
+const SEARCH_LIMIT: u32 = 200;
+
+/// Every status a job can be stored in.
+const ALL_STATUSES: [&str; 7] = [
+    "Pending",
+    "Running",
+    "Completed",
+    "Failed",
+    "Dead",
+    "TimedOut",
+    "Retrying",
+];
+
 /// The stored statuses a lowercase `status` filter selects, or `None` when it is not a
 /// plain status (`recurring`, or a name that matches nothing). `failed` covers every
 /// unsuccessful terminal status.
@@ -763,48 +777,47 @@ async fn search_jobs_handler<T>(
     pagination: PaginationParams,
 ) -> Result<impl Reply, warp::Rejection>
 where
-    T: DatabaseQueue + Send + Sync,
+    T: JobHistory,
 {
-    // Since we don't have direct search methods, we'll gather jobs and filter in memory
-    let mut matching_jobs = Vec::new();
     let search_term = search_request.query.to_lowercase();
 
-    // Get queue stats to find available queues
-    let queue_stats = match queue.get_all_queue_stats().await {
-        Ok(stats) => stats,
-        Err(e) => {
-            return Ok(error_reply(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to get queue stats: {}", e),
+    // The stored statuses to read: those requested, or every status when none is given.
+    let statuses: Vec<&'static str> = match search_request.statuses {
+        Some(ref requested) if !requested.is_empty() => {
+            let mut stored: Vec<&'static str> = Vec::new();
+            for name in requested {
+                let name = name.to_lowercase().replace('_', "");
+                for status in stored_statuses(&name).unwrap_or(&[]) {
+                    if !stored.contains(status) {
+                        stored.push(status);
+                    }
+                }
+            }
+            stored
+        }
+        _ => ALL_STATUSES.to_vec(),
+    };
+    // `None` reads across every queue.
+    let target_queues: Vec<Option<&str>> = match search_request.queues {
+        Some(ref names) => names.iter().map(|n| Some(n.as_str())).collect(),
+        None => vec![None],
+    };
+
+    let mut matching_jobs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for queue_name in target_queues {
+        let mut queue_jobs = Vec::new();
+        for status in &statuses {
+            queue_jobs.extend(try_api!(
+                queue
+                    .jobs_with_status(queue_name, status, SEARCH_LIMIT)
+                    .await,
+                "Failed to list jobs"
             ));
         }
-    };
-
-    // Filter by specified queues or use all
-    let target_queues: Vec<String> = if let Some(ref queue_names) = search_request.queues {
-        queue_names.clone()
-    } else {
-        queue_stats.iter().map(|s| s.queue_name.clone()).collect()
-    };
-
-    for queue_name in &target_queues {
-        // Search every source: ready, dead and recurring jobs
-        let queue_jobs = try_api!(
-            collect_jobs(queue.as_ref(), queue_name, true, true, true, 200).await,
-            "Failed to list jobs"
-        );
 
         for job in &queue_jobs {
-            if !job_matches_search(job, &search_term) {
-                continue;
-            }
-
-            // Apply status filter
-            if let Some(ref statuses) = search_request.statuses
-                && !statuses
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(job.status.as_str()))
-            {
+            if !seen.insert(job.id) || !job_matches_search(job, &search_term) {
                 continue;
             }
 
@@ -1049,6 +1062,66 @@ mod tests {
         expected.sort();
         assert_eq!(pending, expected);
         assert!(ids("no_such_status").await.is_empty());
+    }
+
+    /// #114: search reaches jobs in every status, including failed and future ones.
+    #[tokio::test]
+    async fn test_search_reaches_every_status() {
+        use hammerwork::{Job, queue::test::TestQueue};
+        let queue = Arc::new(TestQueue::new());
+        let now_job = queue
+            .enqueue(Job::new("q".into(), serde_json::json!({"tag": "needle"})))
+            .await
+            .unwrap();
+        let later = queue
+            .enqueue(Job::with_delay(
+                "q".into(),
+                serde_json::json!({"tag": "needle"}),
+                chrono::Duration::hours(1),
+            ))
+            .await
+            .unwrap();
+        let claimed = queue.dequeue("q").await.unwrap().unwrap();
+        assert_eq!(claimed.id, now_job);
+        queue.fail_job(now_job, "bad needle").await.unwrap();
+
+        let search = |body: serde_json::Value| {
+            let queue = queue.clone();
+            async move {
+                let response = search_jobs_handler(
+                    queue,
+                    serde_json::from_value(body).unwrap(),
+                    PaginationParams::default(),
+                )
+                .await
+                .unwrap()
+                .into_response();
+                let (status, body) = body_json(response).await;
+                assert_eq!(status, 200, "{body}");
+                let mut ids: Vec<String> = body["data"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["id"].as_str().unwrap().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+        let mut both = vec![now_job.to_string(), later.to_string()];
+        both.sort();
+        assert_eq!(search(serde_json::json!({"query": "needle"})).await, both);
+        assert_eq!(
+            search(serde_json::json!({"query": "needle", "statuses": ["failed"]})).await,
+            vec![now_job.to_string()]
+        );
+        assert_eq!(
+            search(
+                serde_json::json!({"query": "needle", "statuses": ["Pending"], "queues": ["q"]})
+            )
+            .await,
+            vec![later.to_string()]
+        );
     }
 
     #[tokio::test]

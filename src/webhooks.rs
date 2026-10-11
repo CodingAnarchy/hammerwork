@@ -392,13 +392,16 @@ pub struct WebhookStats {
     /// Webhook configuration ID
     #[serde(with = "uuid_string")]
     pub webhook_id: Uuid,
-    /// Total number of delivery attempts
+    /// Total number of HTTP delivery attempts, retries included: one event can take
+    /// several attempts.
     pub total_attempts: u64,
-    /// Number of successful deliveries
+    /// Number of events delivered successfully (by any attempt)
     pub successful_deliveries: u64,
-    /// Number of failed deliveries
+    /// Number of events whose delivery ultimately failed (retries exhausted, or a
+    /// non-retryable response)
     pub failed_deliveries: u64,
-    /// Current success rate (0.0 to 1.0)
+    /// Current success rate (0.0 to 1.0): `successful_deliveries` out of the events
+    /// whose delivery has finished (`successful_deliveries + failed_deliveries`)
     pub success_rate: f64,
     /// Average response time in milliseconds
     pub avg_response_time_ms: f64,
@@ -423,11 +426,11 @@ pub struct WebhookManagerStats {
     pub total_webhooks: usize,
     /// Number of active/enabled webhooks
     pub active_webhooks: usize,
-    /// Total delivery attempts across all webhooks
+    /// Total HTTP delivery attempts across all webhooks, retries included
     pub total_attempts: u64,
-    /// Total successful deliveries across all webhooks
+    /// Total events delivered successfully across all webhooks
     pub successful_deliveries: u64,
-    /// Total failed deliveries across all webhooks
+    /// Total events whose delivery ultimately failed across all webhooks
     pub failed_deliveries: u64,
 }
 
@@ -676,6 +679,13 @@ impl WebhookManager {
     pub async fn shutdown(&self, grace: Duration) -> usize {
         self.listeners.close();
         self.listeners.abort_all().await;
+        // The listeners are stopped: take their subscriptions off the event manager too.
+        let handles: Vec<_> = self.subscriptions.write().await.drain().collect();
+        for (_, handle) in handles {
+            if let Err(e) = self.event_manager.unsubscribe(handle.subscription_id).await {
+                tracing::warn!("Failed to unsubscribe a listener during shutdown: {e}");
+            }
+        }
         let aborted = self.deliveries.drain(grace).await;
 
         if self.config.log_deliveries {
@@ -760,7 +770,7 @@ impl WebhookManager {
                 .await?;
         }
 
-        self.start_webhook_delivery_task(webhook_id, subscription.receiver, stop);
+        self.start_webhook_delivery_task(webhook_id, subscription, stop);
 
         if self.config.log_deliveries {
             // The URL path of chat webhooks (Slack, Discord, Teams) is a credential.
@@ -896,12 +906,12 @@ impl WebhookManager {
         }
     }
 
-    /// Start the listener of a webhook: it reads `receiver` until `stop` fires (its
+    /// Start the listener of a webhook: it reads `subscription` until `stop` fires (its
     /// [`ListenerHandle`] is dropped) and starts a delivery for every matching event.
     fn start_webhook_delivery_task(
         &self,
         webhook_id: Uuid,
-        mut receiver: broadcast::Receiver<JobLifecycleEvent>,
+        mut subscription: crate::events::EventSubscription,
         mut stop: oneshot::Receiver<()>,
     ) {
         let webhooks = self.webhooks.clone();
@@ -923,7 +933,7 @@ impl WebhookManager {
                 let received = tokio::select! {
                     biased;
                     _ = &mut stop => break,
-                    received = receiver.recv() => received,
+                    received = subscription.receiver.recv() => received,
                 };
                 let mut event = match received {
                     Ok(event) => event,
@@ -1016,6 +1026,8 @@ impl WebhookManager {
         let mut attempt = 0;
         // Every event is attempted at least once, even with `max_attempts: 0`.
         let max_attempts = webhook.retry_policy.max_attempts.max(1);
+        // How the delivery of this event ended (its last attempt), counted once.
+        let mut outcome: Option<bool> = None;
 
         while attempt < max_attempts {
             attempt += 1;
@@ -1031,6 +1043,7 @@ impl WebhookManager {
 
             // Update statistics
             Self::update_webhook_stats(&webhook.id, &delivery_result, stats.clone()).await;
+            outcome = Some(delivery_result.success);
 
             if delivery_result.success {
                 if config.log_deliveries {
@@ -1081,6 +1094,10 @@ impl WebhookManager {
                     crate::config::redact_url_path(&webhook.url)
                 );
             }
+        }
+
+        if let Some(success) = outcome {
+            Self::record_delivery_outcome(&webhook.id, success, stats).await;
         }
     }
 
@@ -1251,7 +1268,8 @@ impl WebhookManager {
         format!("sha256={}", hex::encode(result.into_bytes()))
     }
 
-    /// Update webhook statistics
+    /// Update the per-attempt statistics: the attempts counter, the average response
+    /// time and the last success and failure timestamps.
     async fn update_webhook_stats(
         webhook_id: &Uuid,
         delivery: &WebhookDelivery,
@@ -1262,18 +1280,12 @@ impl WebhookManager {
             webhook_stats.total_attempts += 1;
 
             if delivery.success {
-                webhook_stats.successful_deliveries += 1;
                 webhook_stats.last_success_at = Some(delivery.attempted_at);
             } else {
-                webhook_stats.failed_deliveries += 1;
                 webhook_stats.last_failure_at = Some(delivery.attempted_at);
             }
 
-            // Update success rate
-            webhook_stats.success_rate =
-                webhook_stats.successful_deliveries as f64 / webhook_stats.total_attempts as f64;
-
-            // Update average response time
+            // Update average response time (per attempt)
             if let Some(duration) = delivery.duration_ms {
                 let total_time =
                     webhook_stats.avg_response_time_ms * (webhook_stats.total_attempts - 1) as f64;
@@ -1281,6 +1293,27 @@ impl WebhookManager {
                     (total_time + duration as f64) / webhook_stats.total_attempts as f64;
             }
 
+            webhook_stats.calculated_at = Utc::now();
+        }
+    }
+
+    /// Count the final outcome of one event's delivery (after its retries): a success on
+    /// the third attempt is one successful delivery, not two failed ones and a success.
+    async fn record_delivery_outcome(
+        webhook_id: &Uuid,
+        success: bool,
+        stats: Arc<RwLock<HashMap<Uuid, WebhookStats>>>,
+    ) {
+        let mut stats_map = stats.write().await;
+        if let Some(webhook_stats) = stats_map.get_mut(webhook_id) {
+            if success {
+                webhook_stats.successful_deliveries += 1;
+            } else {
+                webhook_stats.failed_deliveries += 1;
+            }
+            let finished = webhook_stats.successful_deliveries + webhook_stats.failed_deliveries;
+            webhook_stats.success_rate =
+                webhook_stats.successful_deliveries as f64 / finished as f64;
             webhook_stats.calculated_at = Utc::now();
         }
     }
@@ -3068,6 +3101,83 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timed out waiting until {what}");
+    }
+
+    /// #114: deliveries are counted by final outcome per event, attempts separately.
+    #[tokio::test]
+    async fn test_stats_count_final_outcomes_not_attempts() {
+        let id = Uuid::new_v4();
+        let stats = Arc::new(RwLock::new(HashMap::from([(
+            id,
+            WebhookStats {
+                webhook_id: id,
+                total_attempts: 0,
+                successful_deliveries: 0,
+                failed_deliveries: 0,
+                success_rate: 0.0,
+                avg_response_time_ms: 0.0,
+                last_success_at: None,
+                last_failure_at: None,
+                dropped_events: 0,
+                calculated_at: Utc::now(),
+            },
+        )])));
+        let attempt = |success: bool| WebhookDelivery {
+            delivery_id: Uuid::new_v4(),
+            webhook_id: id,
+            event_id: Uuid::new_v4(),
+            status_code: Some(if success { 200 } else { 500 }),
+            response_body: None,
+            error_message: None,
+            attempted_at: Utc::now(),
+            duration_ms: Some(10),
+            attempt_number: 1,
+            success,
+        };
+
+        // An event delivered on its third attempt.
+        for success in [false, false, true] {
+            WebhookManager::update_webhook_stats(&id, &attempt(success), stats.clone()).await;
+        }
+        WebhookManager::record_delivery_outcome(&id, true, stats.clone()).await;
+        {
+            let stats = stats.read().await;
+            let s = &stats[&id];
+            assert_eq!(s.total_attempts, 3);
+            assert_eq!((s.successful_deliveries, s.failed_deliveries), (1, 0));
+            assert_eq!(s.success_rate, 1.0);
+            assert!(s.last_success_at.is_some() && s.last_failure_at.is_some());
+        }
+
+        // An event that failed on every attempt.
+        for _ in 0..3 {
+            WebhookManager::update_webhook_stats(&id, &attempt(false), stats.clone()).await;
+        }
+        WebhookManager::record_delivery_outcome(&id, false, stats.clone()).await;
+        let stats = stats.read().await;
+        let s = &stats[&id];
+        assert_eq!(s.total_attempts, 6);
+        assert_eq!((s.successful_deliveries, s.failed_deliveries), (1, 1));
+        assert_eq!(s.success_rate, 0.5);
+    }
+
+    /// #114: shutting the manager down takes its listeners off the event manager.
+    #[tokio::test]
+    async fn test_shutdown_unsubscribes_listeners() {
+        let events = Arc::new(EventManager::new_default());
+        let manager = WebhookManager::new_default(events.clone());
+        for name in ["a", "b"] {
+            manager
+                .add_webhook(WebhookConfig::new(
+                    name.to_string(),
+                    "http://127.0.0.1:1/hook".to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(events.subscription_count().await, 2);
+        manager.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(events.subscription_count().await, 0);
     }
 
     /// M9: the subscription exists when `add_webhook` returns, so an event published

@@ -23,6 +23,7 @@ hammerwork = { workspace = true, features = ["postgres", "mysql", "metrics", "en
 
 # Web framework and HTTP
 warp = { workspace = true }
+percent-encoding = "2"
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

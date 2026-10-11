@@ -115,8 +115,9 @@
 use crate::priority::JobPriority;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::{RwLock, Weak};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Module for serializing UUID as string for TOML compatibility
@@ -359,8 +360,12 @@ impl EventFilter {
             return false;
         }
 
-        // Check processing time range
-        if let Some(processing_time) = event.processing_time_ms {
+        // Check processing time range: an event without a processing time cannot be in
+        // a range, so it is rejected when either bound is set.
+        if self.min_processing_time_ms.is_some() || self.max_processing_time_ms.is_some() {
+            let Some(processing_time) = event.processing_time_ms else {
+                return false;
+            };
             if let Some(min_time) = self.min_processing_time_ms
                 && processing_time < min_time
             {
@@ -388,7 +393,14 @@ impl EventFilter {
     }
 }
 
-/// Event subscription for receiving filtered events
+/// The manager's registry of active subscriptions.
+type SubscriptionRegistry = RwLock<HashMap<Uuid, EventFilter>>;
+
+/// Event subscription for receiving filtered events.
+///
+/// Dropping the subscription unregisters it from the [`EventManager`] (the same as
+/// [`EventManager::unsubscribe`]), so it stops counting in
+/// [`EventManager::subscription_count`] and [`EventManager::payload_wanted`].
 #[derive(Debug)]
 pub struct EventSubscription {
     /// Unique identifier for this subscription
@@ -397,6 +409,20 @@ pub struct EventSubscription {
     pub filter: EventFilter,
     /// Channel receiver for receiving events
     pub receiver: broadcast::Receiver<JobLifecycleEvent>,
+    /// The manager's registry, to unregister from on drop (gone with the manager).
+    registry: Weak<SubscriptionRegistry>,
+}
+
+impl Drop for EventSubscription {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            // A short synchronous critical section: safe outside a runtime too.
+            registry
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.id);
+        }
+    }
 }
 
 /// Event manager for publishing and subscribing to job lifecycle events.
@@ -469,7 +495,7 @@ pub struct EventManager {
     /// Broadcast sender for publishing events to all subscribers
     sender: broadcast::Sender<JobLifecycleEvent>,
     /// Active subscriptions (for management purposes)
-    subscriptions: Arc<RwLock<HashMap<Uuid, EventFilter>>>,
+    subscriptions: Arc<SubscriptionRegistry>,
     /// Configuration for event publishing
     config: EventConfig,
 }
@@ -616,6 +642,18 @@ impl EventManager {
         }
     }
 
+    fn read_subscriptions(&self) -> std::sync::RwLockReadGuard<'_, HashMap<Uuid, EventFilter>> {
+        self.subscriptions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write_subscriptions(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<Uuid, EventFilter>> {
+        self.subscriptions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Whether any subscriber receives job payloads: `include_payload_default` is set,
     /// or a subscription's filter has [`EventFilter::include_payload`]. Publishers can
     /// skip building a payload when this is false.
@@ -623,9 +661,7 @@ impl EventManager {
         if self.config.include_payload_default {
             return true;
         }
-        self.subscriptions
-            .read()
-            .await
+        self.read_subscriptions()
             .values()
             .any(|filter| filter.include_payload)
     }
@@ -680,35 +716,33 @@ impl EventManager {
 
         // Store subscription for management
         {
-            let mut subscriptions = self.subscriptions.write().await;
-            subscriptions.insert(subscription_id, filter.clone());
+            self.write_subscriptions()
+                .insert(subscription_id, filter.clone());
         }
 
         Ok(EventSubscription {
             id: subscription_id,
             filter,
             receiver,
+            registry: Arc::downgrade(&self.subscriptions),
         })
     }
 
     /// Unsubscribe from events
     pub async fn unsubscribe(&self, subscription_id: Uuid) -> crate::Result<()> {
-        let mut subscriptions = self.subscriptions.write().await;
-        subscriptions.remove(&subscription_id);
+        self.write_subscriptions().remove(&subscription_id);
         Ok(())
     }
 
     /// Get count of active subscriptions
     pub async fn subscription_count(&self) -> usize {
-        let subscriptions = self.subscriptions.read().await;
-        subscriptions.len()
+        self.read_subscriptions().len()
     }
 
     /// Get event manager statistics
     pub async fn get_stats(&self) -> EventManagerStats {
-        let subscriptions = self.subscriptions.read().await;
         EventManagerStats {
-            active_subscriptions: subscriptions.len(),
+            active_subscriptions: self.read_subscriptions().len(),
             buffer_capacity: self.config.max_buffer_size,
             buffer_current_size: self.sender.len(),
         }
@@ -1134,6 +1168,54 @@ mod tests {
         assert_eq!(manager.subscription_count().await, 0);
     }
 
+    /// #114: dropping a subscription unregisters it, so it no longer counts and no longer
+    /// keeps payloads alive.
+    #[tokio::test]
+    async fn dropping_a_subscription_unregisters_it() {
+        let manager = EventManager::new_default();
+        let wants = manager
+            .subscribe(EventFilter::new().include_payload())
+            .await
+            .unwrap();
+        let plain = manager.subscribe(EventFilter::new()).await.unwrap();
+        assert_eq!(manager.subscription_count().await, 2);
+        assert!(manager.payload_wanted().await);
+
+        drop(wants);
+        assert_eq!(manager.subscription_count().await, 1);
+        assert!(!manager.payload_wanted().await);
+        assert_eq!(manager.get_stats().await.active_subscriptions, 1);
+
+        // Unsubscribing explicitly first, then dropping, is fine.
+        manager.unsubscribe(plain.id).await.unwrap();
+        drop(plain);
+        assert_eq!(manager.subscription_count().await, 0);
+    }
+
+    /// Dropping works outside a runtime and after the manager is gone.
+    #[test]
+    fn dropping_a_subscription_needs_no_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let manager = EventManager::new_default();
+        let subscription = rt.block_on(manager.subscribe(EventFilter::new())).unwrap();
+        drop(rt);
+        drop(subscription);
+        assert_eq!(
+            manager.subscriptions.read().unwrap().len(),
+            0,
+            "unregistered without a runtime"
+        );
+        let subscription = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(manager.subscribe(EventFilter::new()))
+            .unwrap();
+        drop(manager);
+        drop(subscription);
+    }
+
     #[test]
     fn test_event_type_display() {
         assert_eq!(JobLifecycleEventType::Enqueued.to_string(), "enqueued");
@@ -1464,10 +1546,25 @@ mod tests {
                 .matches(&event),
             "missing metadata key"
         );
-        // Without a processing time the time range does not apply.
+        // An event without a processing time is outside any processing-time range.
+        assert!(
+            !EventFilter::new()
+                .with_processing_time_range(Some(10), Some(20))
+                .matches(&event)
+        );
+        assert!(
+            !EventFilter::new()
+                .with_processing_time_range(Some(10), None)
+                .matches(&event)
+        );
+        assert!(
+            !EventFilter::new()
+                .with_processing_time_range(None, Some(20))
+                .matches(&event)
+        );
         assert!(
             EventFilter::new()
-                .with_processing_time_range(Some(10), Some(20))
+                .with_processing_time_range(None, None)
                 .matches(&event)
         );
     }
