@@ -37,7 +37,7 @@ clap = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 
 # Database
-sqlx = { workspace = true, features = ["postgres", "mysql"] }
+sqlx = { workspace = true, features = ["postgres", "mysql", "mysql-rsa"] }
 
 # Utility
 anyhow = { workspace = true }

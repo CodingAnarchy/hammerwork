@@ -97,6 +97,7 @@ See the [Quick Start Guide](docs/quick-start.md) for complete examples with Post
 
 ## Documentation
 
+- **[Upgrading to 3.0](docs/upgrading-to-3.0.md)** - Breaking changes from 2.x and how to migrate (see also the [CHANGELOG](CHANGELOG.md))
 - **[Quick Start Guide](docs/quick-start.md)** - Get started with PostgreSQL and MySQL
 - **[TestQueue Framework](docs/testing.md)** - In-memory testing with MockClock for unit tests and time control
 - **[Web Dashboard](hammerwork-web/README.md)** - Real-time web interface for queue monitoring and job management

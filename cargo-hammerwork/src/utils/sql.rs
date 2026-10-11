@@ -189,11 +189,15 @@ pub async fn fetch_i64(
 ) -> Result<i64> {
     match pool {
         DatabasePool::Postgres(p) => {
-            let row = bind_pg(sqlx::query(sql), binds).fetch_one(p).await?;
+            let row = bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
+                .fetch_one(p)
+                .await?;
             Ok(row.try_get(column)?)
         }
         DatabasePool::MySQL(p) => {
-            let row = bind_mysql(sqlx::query(sql), binds).fetch_one(p).await?;
+            let row = bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
+                .fetch_one(p)
+                .await?;
             Ok(row.try_get(column)?)
         }
     }
@@ -202,11 +206,11 @@ pub async fn fetch_i64(
 /// Run a write statement and return the number of affected rows.
 pub async fn execute_binds(pool: &DatabasePool, sql: &str, binds: &[Bind]) -> Result<u64> {
     match pool {
-        DatabasePool::Postgres(p) => Ok(bind_pg(sqlx::query(sql), binds)
+        DatabasePool::Postgres(p) => Ok(bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
             .execute(p)
             .await?
             .rows_affected()),
-        DatabasePool::MySQL(p) => Ok(bind_mysql(sqlx::query(sql), binds)
+        DatabasePool::MySQL(p) => Ok(bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql)), binds)
             .execute(p)
             .await?
             .rows_affected()),
@@ -223,9 +227,14 @@ macro_rules! fetch_rows {
     ($pool:expr, $sql:expr, $binds:expr, |$row:ident| $map:expr) => {
         match $pool {
             $crate::utils::database::DatabasePool::Postgres(pool) => {
-                let rows = $crate::utils::sql::bind_pg(sqlx::query($sql), $binds)
-                    .fetch_all(pool)
-                    .await?;
+                let rows = $crate::utils::sql::bind_pg(
+                    sqlx::query(sqlx::AssertSqlSafe(::std::convert::AsRef::<str>::as_ref(
+                        $sql,
+                    ))),
+                    $binds,
+                )
+                .fetch_all(pool)
+                .await?;
                 let mut mapped = Vec::with_capacity(rows.len());
                 for $row in rows {
                     mapped.push($map);
@@ -233,9 +242,14 @@ macro_rules! fetch_rows {
                 mapped
             }
             $crate::utils::database::DatabasePool::MySQL(pool) => {
-                let rows = $crate::utils::sql::bind_mysql(sqlx::query($sql), $binds)
-                    .fetch_all(pool)
-                    .await?;
+                let rows = $crate::utils::sql::bind_mysql(
+                    sqlx::query(sqlx::AssertSqlSafe(::std::convert::AsRef::<str>::as_ref(
+                        $sql,
+                    ))),
+                    $binds,
+                )
+                .fetch_all(pool)
+                .await?;
                 let mut mapped = Vec::with_capacity(rows.len());
                 for $row in rows {
                     mapped.push($map);

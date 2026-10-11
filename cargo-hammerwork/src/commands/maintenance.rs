@@ -175,8 +175,11 @@ async fn count_expired_encrypted_jobs(pool: &DatabasePool) -> Result<(i64, i64)>
         DatabasePool::Postgres(pg) => {
             let (jobs, archived) = expired_encrypted_count_queries("$1");
             (
-                sqlx::query_scalar(&jobs).bind(now).fetch_one(pg).await?,
-                sqlx::query_scalar(&archived)
+                sqlx::query_scalar(sqlx::AssertSqlSafe(jobs))
+                    .bind(now)
+                    .fetch_one(pg)
+                    .await?,
+                sqlx::query_scalar(sqlx::AssertSqlSafe(archived))
                     .bind(now)
                     .fetch_one(pg)
                     .await?,
@@ -185,8 +188,11 @@ async fn count_expired_encrypted_jobs(pool: &DatabasePool) -> Result<(i64, i64)>
         DatabasePool::MySQL(my) => {
             let (jobs, archived) = expired_encrypted_count_queries("?");
             (
-                sqlx::query_scalar(&jobs).bind(now).fetch_one(my).await?,
-                sqlx::query_scalar(&archived)
+                sqlx::query_scalar(sqlx::AssertSqlSafe(jobs))
+                    .bind(now)
+                    .fetch_one(my)
+                    .await?,
+                sqlx::query_scalar(sqlx::AssertSqlSafe(archived))
                     .bind(now)
                     .fetch_one(my)
                     .await?,
@@ -419,9 +425,12 @@ async fn reindex_database(pool: DatabasePool, confirm: bool) -> Result<()> {
             .await?;
             for table in &tables {
                 // Names come from the catalog; quote them anyway.
-                sqlx::query(&format!("REINDEX TABLE \"{}\"", table.replace('"', "\"\"")))
-                    .execute(pg_pool)
-                    .await?;
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "REINDEX TABLE \"{}\"",
+                    table.replace('"', "\"\"")
+                )))
+                .execute(pg_pool)
+                .await?;
             }
 
             println!("✅ PostgreSQL indexes rebuilt ({} tables)", tables.len());

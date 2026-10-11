@@ -508,10 +508,13 @@ pub async fn fetch_metrics(
 
     Ok(match pool {
         DatabasePool::Postgres(pg_pool) => {
-            let t = bind_pg(sqlx::query(&throughput_query), &throughput_binds)
-                .fetch_one(pg_pool)
-                .await?;
-            let a = bind_pg(sqlx::query(&avg_query), &avg_binds)
+            let t = bind_pg(
+                sqlx::query(sqlx::AssertSqlSafe(throughput_query)),
+                &throughput_binds,
+            )
+            .fetch_one(pg_pool)
+            .await?;
+            let a = bind_pg(sqlx::query(sqlx::AssertSqlSafe(avg_query)), &avg_binds)
                 .fetch_one(pg_pool)
                 .await?;
             Metrics {
@@ -522,10 +525,13 @@ pub async fn fetch_metrics(
             }
         }
         DatabasePool::MySQL(mysql_pool) => {
-            let t = bind_mysql(sqlx::query(&throughput_query), &throughput_binds)
-                .fetch_one(mysql_pool)
-                .await?;
-            let a = bind_mysql(sqlx::query(&avg_query), &avg_binds)
+            let t = bind_mysql(
+                sqlx::query(sqlx::AssertSqlSafe(throughput_query)),
+                &throughput_binds,
+            )
+            .fetch_one(mysql_pool)
+            .await?;
+            let a = bind_mysql(sqlx::query(sqlx::AssertSqlSafe(avg_query)), &avg_binds)
                 .fetch_one(mysql_pool)
                 .await?;
             Metrics {

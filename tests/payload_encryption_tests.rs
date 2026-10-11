@@ -85,11 +85,13 @@ impl Inspect for sqlx::Postgres {
             })
             .collect::<Vec<_>>()
             .join(" || '|' || ");
-        let hex: String = sqlx::query_scalar(&format!("SELECT {parts} FROM {table} WHERE id = $1"))
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+        let hex: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT {parts} FROM {table} WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
         hex.to_lowercase()
     }
 
@@ -160,9 +162,9 @@ impl Inspect for sqlx::MySql {
             .map(|column| format!("COALESCE(HEX(`{column}`), '')"))
             .collect::<Vec<_>>()
             .join(", ");
-        let hex: String = sqlx::query_scalar(&format!(
+        let hex: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT CONCAT_WS('|', {parts}) FROM {table} WHERE id = ?"
-        ))
+        )))
         .bind(id.to_string())
         .fetch_one(pool)
         .await

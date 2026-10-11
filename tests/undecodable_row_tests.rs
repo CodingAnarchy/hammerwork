@@ -133,7 +133,10 @@ async fn postgres_listings_skip_undecodable_rows() {
     listings_skip_undecodable_rows(queue.as_ref(), |statement| {
         let pool = pool.clone();
         async move {
-            sqlx::query(&statement).execute(&pool).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .unwrap();
         }
     })
     .await;
@@ -150,7 +153,10 @@ async fn mysql_listings_skip_undecodable_rows() {
     listings_skip_undecodable_rows(queue.as_ref(), |statement| {
         let pool = pool.clone();
         async move {
-            sqlx::query(&statement).execute(&pool).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .unwrap();
         }
     })
     .await;
@@ -272,7 +278,10 @@ fn postgres_sql(
     move |statement| {
         let pool = pool.clone();
         Box::pin(async move {
-            sqlx::query(&statement).execute(&pool).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .unwrap();
         })
     }
 }
@@ -284,7 +293,10 @@ fn mysql_sql(
     move |statement| {
         let pool = pool.clone();
         Box::pin(async move {
-            sqlx::query(&statement).execute(&pool).await.unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .unwrap();
         })
     }
 }

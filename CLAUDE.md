@@ -16,6 +16,9 @@ Hammerwork is a high-performance, database-driven job queue library for Rust wit
 - Tracing is integrated for observability
 - Examples demonstrate database configurations, cron scheduling, and prioritization
 - Use edition 2024 as the preference
+- sqlx 0.9; MSRV is Rust 1.94.0 (workspace `rust-version`, checked by the CI MSRV job)
+- sqlx 0.9 only accepts `&'static str` SQL: wrap runtime-built SQL in `sqlx::AssertSqlSafe(...)`
+  (owned `String` preferred) after checking that only bind parameters carry user input
 
 ## Common Development Commands
 

@@ -134,13 +134,17 @@ pub async fn select_job_ids(pool: &DatabasePool, selector: &JobSelector) -> Resu
     let (sql, binds) = selector.sql(pool.backend());
     match pool {
         DatabasePool::Postgres(pg) => {
-            let rows = bind_pg(sqlx::query(&sql), &binds).fetch_all(pg).await?;
+            let rows = bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), &binds)
+                .fetch_all(pg)
+                .await?;
             rows.iter()
                 .map(|row| row.try_get::<JobId, _>("id").map_err(Into::into))
                 .collect()
         }
         DatabasePool::MySQL(my) => {
-            let rows = bind_mysql(sqlx::query(&sql), &binds).fetch_all(my).await?;
+            let rows = bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql)), &binds)
+                .fetch_all(my)
+                .await?;
             rows.iter()
                 .map(|row| {
                     let id: String = row.try_get("id")?;

@@ -794,7 +794,10 @@ mod undecodable_row_tests {
         let sql = |statement: String| {
             let pool = pool.clone();
             async move {
-                sqlx::query(&statement).execute(&pool).await.unwrap();
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             }
         };
         listings_skip_undecodable_rows(queue, sql, false).await;
@@ -809,7 +812,10 @@ mod undecodable_row_tests {
         let sql = |statement: String| {
             let pool = pool.clone();
             async move {
-                sqlx::query(&statement).execute(&pool).await.unwrap();
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             }
         };
         listings_skip_undecodable_rows(queue, sql, true).await;

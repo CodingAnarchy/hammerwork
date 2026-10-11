@@ -444,7 +444,7 @@ pub async fn insert_rows(pool: &DatabasePool, rows: &[RowInsert]) -> Result<usiz
             let mut tx = p.begin().await?;
             for row in rows {
                 let sql = row.sql(Backend::Postgres);
-                let affected = bind_pg(sqlx::query(&sql), &row.params)
+                let affected = bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), &row.params)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| anyhow!("Cannot restore job {}: {}", row.id, e))?
@@ -457,7 +457,7 @@ pub async fn insert_rows(pool: &DatabasePool, rows: &[RowInsert]) -> Result<usiz
             let mut tx = p.begin().await?;
             for row in rows {
                 let sql = row.sql(Backend::MySql);
-                match bind_mysql(sqlx::query(&sql), &row.params)
+                match bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql)), &row.params)
                     .execute(&mut *tx)
                     .await
                 {

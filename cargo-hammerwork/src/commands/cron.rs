@@ -279,12 +279,18 @@ pub async fn fetch_cron_jobs(
     let mut out = Vec::new();
     match pool {
         DatabasePool::Postgres(pg) => {
-            for row in bind_pg(sqlx::query(&sql), &binds).fetch_all(pg).await? {
+            for row in bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), &binds)
+                .fetch_all(pg)
+                .await?
+            {
                 out.push(cron_row!(&row));
             }
         }
         DatabasePool::MySQL(my) => {
-            for row in bind_mysql(sqlx::query(&sql), &binds).fetch_all(my).await? {
+            for row in bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql)), &binds)
+                .fetch_all(my)
+                .await?
+            {
                 out.push(cron_row!(&row));
             }
         }

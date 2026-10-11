@@ -23,7 +23,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, Postgres, Row};
+use sqlx::{AssertSqlSafe, FromRow, Postgres, Row};
 use std::collections::HashMap;
 
 #[derive(FromRow, Clone)]
@@ -106,10 +106,10 @@ async fn copy_encryption_columns(
         .map(|column| format!("{column} = src.{column}"))
         .collect::<Vec<_>>()
         .join(", ");
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "UPDATE {to} dst SET {assignments} FROM {from} src \
          WHERE dst.id = src.id AND src.id = ANY($1)"
-    ))
+    )))
     .bind(ids)
     .execute(&mut *conn)
     .await?;
@@ -352,7 +352,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             Some(weights) if !weights.is_strict() => weights,
             // Strict priority: the highest priority, then the oldest job.
             _ => {
-                let row = sqlx::query_as::<_, JobRow>(&claim_sql(false))
+                let row = sqlx::query_as::<_, JobRow>(AssertSqlSafe(claim_sql(false)))
                     .bind(queue_name)
                     .bind(lease)
                     .fetch_optional(&self.pool)
@@ -363,11 +363,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
         // Which priority levels have a runnable job: one index probe per level, so
         // every level is considered however many jobs of other levels are queued.
-        let levels: Vec<i32> =
-            sqlx::query_scalar(&super::runnable_priorities_sql(RUNNABLE_IN_QUEUE_SQL))
-                .bind(queue_name)
-                .fetch_all(&self.pool)
-                .await?;
+        let levels: Vec<i32> = sqlx::query_scalar(AssertSqlSafe(super::runnable_priorities_sql(
+            RUNNABLE_IN_QUEUE_SQL,
+        )))
+        .bind(queue_name)
+        .fetch_all(&self.pool)
+        .await?;
         let mut candidates: Vec<JobPriority> = levels
             .into_iter()
             .filter_map(|level| JobPriority::from_i32(level).ok())
@@ -381,7 +382,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             weights,
             super::weighted_seed(queue_name, attempt),
         ) {
-            let claimed = sqlx::query_as::<_, JobRow>(&claim_sql(true))
+            let claimed = sqlx::query_as::<_, JobRow>(AssertSqlSafe(claim_sql(true)))
                 .bind(queue_name)
                 .bind(lease)
                 .bind(priority.as_i32())
@@ -412,7 +413,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             Some(weights) if !weights.is_strict() => weights,
             // Strict priority: highest priority first, then the oldest jobs.
             _ => {
-                let rows = sqlx::query_as::<_, JobRow>(&claim_batch_sql(false))
+                let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(claim_batch_sql(false)))
                     .bind(queue_name)
                     .bind(lease)
                     .bind(max_jobs as i64)
@@ -423,11 +424,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         };
 
         // Which priority levels have a runnable job (see `dequeue_leased`).
-        let levels: Vec<i32> =
-            sqlx::query_scalar(&super::runnable_priorities_sql(RUNNABLE_IN_QUEUE_SQL))
-                .bind(queue_name)
-                .fetch_all(&self.pool)
-                .await?;
+        let levels: Vec<i32> = sqlx::query_scalar(AssertSqlSafe(super::runnable_priorities_sql(
+            RUNNABLE_IN_QUEUE_SQL,
+        )))
+        .bind(queue_name)
+        .fetch_all(&self.pool)
+        .await?;
         let candidates: Vec<JobPriority> = levels
             .into_iter()
             .filter_map(|level| JobPriority::from_i32(level).ok())
@@ -441,7 +443,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             weights,
             max_jobs,
             |priority, room| async move {
-                let rows = sqlx::query_as::<_, JobRow>(&claim_batch_sql(true))
+                let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(claim_batch_sql(true)))
                     .bind(queue_name)
                     .bind(lease)
                     .bind(room as i64)
@@ -546,10 +548,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         .await
     }
     async fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
-        let row = sqlx::query_as::<_, JobRow>(&format!(
+        let row = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {} FROM hammerwork_jobs WHERE id = $1",
             JOB_SELECT_FIELDS
-        ))
+        )))
         .bind(job_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -559,9 +561,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         }
 
         // Archiving moves a job out of hammerwork_jobs; report it with status Archived.
-        let archived = sqlx::query(&format!(
+        let archived = sqlx::query(AssertSqlSafe(format!(
             "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive WHERE id = $1"
-        ))
+        )))
         .bind(job_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -697,10 +699,10 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn get_batch_jobs(&self, batch_id: crate::batch::BatchId) -> Result<Vec<Job>> {
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {} FROM hammerwork_jobs WHERE batch_id = $1 ORDER BY created_at ASC",
             JOB_SELECT_FIELDS
-        ))
+        )))
         .bind(batch_id)
         .fetch_all(&self.pool)
         .await?;
@@ -751,9 +753,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let limit = limit.unwrap_or(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE status = $1 ORDER BY failed_at DESC LIMIT $2 OFFSET $3"
-        ))
+        )))
         .bind(JobStatus::Dead)
         .bind(limit)
         .bind(offset)
@@ -776,9 +778,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         let limit = limit.unwrap_or(100) as i64;
         let offset = offset.unwrap_or(0) as i64;
 
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE status = $1 AND queue_name = $2 ORDER BY failed_at DESC LIMIT $3 OFFSET $4"
-        ))
+        )))
         .bind(JobStatus::Dead)
         .bind(queue_name)
         .bind(limit)
@@ -795,13 +797,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn retry_dead_job(&self, job_id: JobId) -> Result<()> {
         let transition = JobTransition::RetryDead;
-        let result = sqlx::query(&format!(
+        let result = sqlx::query(AssertSqlSafe(format!(
             "UPDATE hammerwork_jobs SET status = $1, attempts = 0, scheduled_at = now(), \
              started_at = NULL, failed_at = NULL, timed_out_at = NULL, \
              last_heartbeat_at = NULL, lease_expires_at = NULL \
              WHERE id = $2 AND status IN ({})",
             transition.sql_status_list()
-        ))
+        )))
         .bind(JobStatus::Pending)
         .bind(job_id)
         .execute(&self.pool)
@@ -1104,14 +1106,14 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         };
 
         let rows: Vec<JobRow> = if let Some(queue) = queue_name {
-            sqlx::query_as(&query)
+            sqlx::query_as(AssertSqlSafe(query))
                 .bind(queue)
                 .bind(start_time)
                 .bind(end_time)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query_as(&query)
+            sqlx::query_as(AssertSqlSafe(query))
                 .bind(start_time)
                 .bind(end_time)
                 .fetch_all(&self.pool)
@@ -1154,13 +1156,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         };
 
         let rows = if let Some(queue) = queue_name {
-            sqlx::query_as::<_, JobRow>(&query)
+            sqlx::query_as::<_, JobRow>(AssertSqlSafe(query))
                 .bind(queue)
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query_as::<_, JobRow>(&query)
+            sqlx::query_as::<_, JobRow>(AssertSqlSafe(query))
                 .bind(JobStatus::Pending)
                 .fetch_all(&self.pool)
                 .await?
@@ -1171,7 +1173,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn reschedule_cron_job(&self, job_id: JobId, next_run_at: DateTime<Utc>) -> Result<()> {
         let transition = JobTransition::RescheduleCron;
-        let result = sqlx::query(&format!(
+        let result = sqlx::query(AssertSqlSafe(format!(
             r#"
             UPDATE hammerwork_jobs
             SET status = $1,
@@ -1188,7 +1190,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             WHERE id = $3 AND recurring = TRUE AND status IN ({})
             "#,
             transition.sql_status_list()
-        ))
+        )))
         .bind(JobStatus::Pending)
         .bind(next_run_at)
         .bind(job_id)
@@ -1203,7 +1205,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn get_recurring_jobs(&self, queue_name: &str) -> Result<Vec<Job>> {
         let rows = sqlx::query_as::<_, JobRow>(
-            &format!("SELECT {} FROM hammerwork_jobs WHERE queue_name = $1 AND recurring = TRUE ORDER BY next_run_at ASC", JOB_SELECT_FIELDS)
+            AssertSqlSafe(format!("SELECT {} FROM hammerwork_jobs WHERE queue_name = $1 AND recurring = TRUE ORDER BY next_run_at ASC", JOB_SELECT_FIELDS))
         )
         .bind(queue_name)
         .fetch_all(&self.pool)
@@ -1235,9 +1237,9 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         super::retry_on_conflict(|| async {
             let mut tx = self.pool.begin().await?;
             let result = async {
-                let row = sqlx::query_as::<_, JobRow>(&format!(
+                let row = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
                     "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = $1 FOR UPDATE"
-                ))
+                )))
                 .bind(job_id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -1489,7 +1491,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn get_ready_jobs(&self, queue_name: &str, limit: u32) -> Result<Vec<Job>> {
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             r#"
                 SELECT {}
                 FROM hammerwork_jobs
@@ -1501,7 +1503,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 LIMIT $2
                 "#,
             JOB_SELECT_FIELDS
-        ))
+        )))
         .bind(queue_name)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
@@ -1527,7 +1529,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         &self,
         workflow_id: crate::workflow::WorkflowId,
     ) -> Result<Vec<Job>> {
-        let rows = sqlx::query_as::<_, JobRow>(&format!(
+        let rows = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             r#"
                 SELECT {}
                 FROM hammerwork_jobs
@@ -1535,7 +1537,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
                 ORDER BY created_at ASC
                 "#,
             JOB_SELECT_FIELDS
-        ))
+        )))
         .bind(workflow_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1545,11 +1547,11 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             .collect::<Result<Vec<_>>>()?;
 
         // Archived members, with status `Archived` (as `get_job` reports them).
-        let archived = sqlx::query(&format!(
+        let archived = sqlx::query(AssertSqlSafe(format!(
             "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive a \
              WHERE a.workflow_id = $1 \
              AND NOT EXISTS (SELECT 1 FROM hammerwork_jobs j WHERE j.id = a.id)"
-        ))
+        )))
         .bind(workflow_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1637,7 +1639,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             query.push_str(&format!(" OFFSET ${}", param_num));
         }
 
-        let mut sql_query = sqlx::query(&query);
+        let mut sql_query = sqlx::query(AssertSqlSafe(query));
 
         if let Some(queue) = queue_name {
             sql_query = sql_query.bind(queue);
@@ -1734,7 +1736,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             base_query.push_str(" WHERE queue_name = $1");
         }
 
-        let mut query = sqlx::query(&base_query);
+        let mut query = sqlx::query(AssertSqlSafe(base_query));
         if let Some(queue) = queue_name {
             query = query.bind(queue);
         }
@@ -1895,12 +1897,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     async fn purge_expired_encrypted_jobs(&self) -> Result<super::EncryptedJobPurge> {
         let mut tx = self.pool.begin().await?;
         let now = db_now(&mut tx).await?;
-        let jobs = sqlx::query(&format!(
+        let jobs = sqlx::query(AssertSqlSafe(format!(
             "DELETE FROM hammerwork_jobs WHERE is_encrypted = true \
              AND retention_delete_at IS NOT NULL AND retention_delete_at <= $1 \
              AND status IN ({})",
             super::FINISHED_STATUS_SQL
-        ))
+        )))
         .bind(now)
         .execute(&mut *tx)
         .await?
@@ -2008,9 +2010,9 @@ impl crate::queue::JobQueue<Postgres> {
         // A reclaimed job that died is a terminal failure like any other: reschedule it
         // if recurring, otherwise apply it to its dependents, workflow and batch.
         for id in &recovery.dead {
-            let row = sqlx::query_as::<_, JobRow>(&format!(
+            let row = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
                 "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = $1"
-            ))
+            )))
             .bind(id)
             .fetch_one(&mut *conn)
             .await?;
@@ -2317,9 +2319,9 @@ impl TransitionStore for crate::queue::JobQueue<Postgres> {
     type Conn = sqlx::PgConnection;
 
     async fn lock_job(conn: &mut sqlx::PgConnection, job_id: JobId) -> Result<Option<Job>> {
-        let row = sqlx::query_as::<_, JobRow>(&format!(
+        let row = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = $1 FOR UPDATE"
-        ))
+        )))
         .bind(job_id)
         .fetch_optional(&mut *conn)
         .await?;
@@ -2701,11 +2703,11 @@ impl TransitionStore for crate::queue::JobQueue<Postgres> {
             Vec::new()
         };
 
-        let unfinished: bool = sqlx::query_scalar(&format!(
+        let unfinished: bool = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT EXISTS (SELECT 1 FROM hammerwork_jobs WHERE batch_id = $1 \
              AND status IN ({}))",
             lifecycle::UNFINISHED_STATUS_SQL
-        ))
+        )))
         .bind(batch_id)
         .fetch_one(&mut *conn)
         .await?;
@@ -2812,7 +2814,7 @@ impl crate::queue::JobQueue<Postgres> {
         // Serializes with the terminal transitions of the workflow's jobs.
         Self::lock_workflow(conn, workflow_id).await?;
         let now = db_now(conn).await?;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             r#"
             UPDATE hammerwork_jobs
             SET status = 'Failed',
@@ -2826,7 +2828,7 @@ impl crate::queue::JobQueue<Postgres> {
               AND status IN ({})
             "#,
             lifecycle::UNFINISHED_STATUS_SQL
-        ))
+        )))
         .bind(workflow_id)
         .bind(now)
         .bind(lifecycle::WORKFLOW_CANCELLED_MESSAGE)
@@ -2940,7 +2942,7 @@ impl crate::queue::JobQueue<Postgres> {
         while jobs_to_archive.len() < policy.batch_size {
             let wanted = policy.batch_size - jobs_to_archive.len();
             let select = select(wanted);
-            let mut query = sqlx::query_as::<_, JobRow>(&select);
+            let mut query = sqlx::query_as::<_, JobRow>(AssertSqlSafe(select));
             if let Some(queue) = queue_name {
                 query = query.bind(queue);
             }
@@ -3098,9 +3100,9 @@ impl crate::queue::JobQueue<Postgres> {
         let mut tx = self.pool.begin().await?;
 
         // Lock the archived row so two concurrent restores cannot both re-insert it.
-        let archived_row = sqlx::query(&format!(
+        let archived_row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {ARCHIVED_JOB_FIELDS} FROM hammerwork_jobs_archive WHERE id = $1 FOR UPDATE"
-        ))
+        )))
         .bind(job_id)
         .fetch_optional(&mut *tx)
         .await?

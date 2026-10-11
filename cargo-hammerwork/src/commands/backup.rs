@@ -208,18 +208,20 @@ async fn fetch_backup_rows(
         include_failed,
     );
     match pool {
-        DatabasePool::Postgres(pg_pool) => bind_pg(sqlx::query(&query), &binds)
+        DatabasePool::Postgres(pg_pool) => bind_pg(sqlx::query(sqlx::AssertSqlSafe(query)), &binds)
             .fetch_all(pg_pool)
             .await?
             .iter()
             .map(|row| job_rows::pg_row_to_json(row, columns))
             .collect(),
-        DatabasePool::MySQL(mysql_pool) => bind_mysql(sqlx::query(&query), &binds)
-            .fetch_all(mysql_pool)
-            .await?
-            .iter()
-            .map(|row| job_rows::mysql_row_to_json(row, columns))
-            .collect(),
+        DatabasePool::MySQL(mysql_pool) => {
+            bind_mysql(sqlx::query(sqlx::AssertSqlSafe(query)), &binds)
+                .fetch_all(mysql_pool)
+                .await?
+                .iter()
+                .map(|row| job_rows::mysql_row_to_json(row, columns))
+                .collect()
+        }
     }
 }
 
@@ -435,14 +437,18 @@ async fn check_job_exists(pool: &DatabasePool, id: &str) -> Result<bool> {
     let id = params.uuid(id);
     let sql = format!("SELECT 1 AS present FROM hammerwork_jobs WHERE id = {id}");
     Ok(match pool {
-        DatabasePool::Postgres(pg_pool) => bind_pg(sqlx::query(&sql), params.binds())
-            .fetch_optional(pg_pool)
-            .await?
-            .is_some(),
-        DatabasePool::MySQL(mysql_pool) => bind_mysql(sqlx::query(&sql), params.binds())
-            .fetch_optional(mysql_pool)
-            .await?
-            .is_some(),
+        DatabasePool::Postgres(pg_pool) => {
+            bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), params.binds())
+                .fetch_optional(pg_pool)
+                .await?
+                .is_some()
+        }
+        DatabasePool::MySQL(mysql_pool) => {
+            bind_mysql(sqlx::query(sqlx::AssertSqlSafe(sql)), params.binds())
+                .fetch_optional(mysql_pool)
+                .await?
+                .is_some()
+        }
     })
 }
 
@@ -1363,9 +1369,9 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                sqlx::query_scalar(&format!(
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT CONCAT_WS('|', {parts}) FROM hammerwork_jobs WHERE id = ?"
-                ))
+                )))
                 .bind(id)
                 .fetch_one(p)
                 .await

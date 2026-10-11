@@ -32,7 +32,9 @@ hammerwork = { version = "2.5", features = ["postgres", "tracing"] }
 # Metrics, alerting, webhooks, streaming, tracing and encryption together
 hammerwork = { version = "2.5", features = ["postgres", "full"] }
 
-# Additional dependencies for examples
+# Additional dependencies for examples. Your sqlx must be the same major
+# version as Hammerwork's (0.9), since you pass Hammerwork a sqlx pool.
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }  # or "mysql"
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"

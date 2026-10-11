@@ -742,7 +742,9 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
              FROM hammerwork_jobs WHERE status = 'Completed' \
              AND completed_at >= $1 AND completed_at < $2{queue_clause} GROUP BY 1"
         );
-        let mut q = sqlx::query(&completed_sql).bind(first).bind(upper);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(completed_sql))
+            .bind(first)
+            .bind(upper);
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -761,7 +763,9 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
              AND COALESCE(failed_at, timed_out_at) >= $1 AND COALESCE(failed_at, timed_out_at) < $2{queue_clause} \
              GROUP BY 1"
         );
-        let mut q = sqlx::query(&failed_sql).bind(first).bind(upper);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(failed_sql))
+            .bind(first)
+            .bind(upper);
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -812,7 +816,7 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             "SELECT COUNT(*)::bigint FROM hammerwork_jobs {}",
             finished_filter(kind, queue.is_some(), older_than.is_some(), true)
         );
-        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -832,7 +836,7 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
         else {
             return Ok(0);
         };
-        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -852,7 +856,7 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             "DELETE FROM hammerwork_jobs {}",
             finished_filter(kind, queue.is_some(), older_than.is_some(), true)
         );
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -870,9 +874,12 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
     ) -> Result<(Vec<ArchivedJob>, u64)> {
         let (conditions, binds) = archive_conditions(filter, true);
         let count_sql = format!("SELECT COUNT(*) FROM hammerwork_jobs_archive {conditions}");
-        let total = bind_archive_filter!(sqlx::query_scalar::<_, i64>(&count_sql), &binds)
-            .fetch_one(&self.pool)
-            .await?;
+        let total = bind_archive_filter!(
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql)),
+            &binds
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let (limit_ph, offset_ph) = (
             format!("${}", binds.len() + 1),
             format!("${}", binds.len() + 2),
@@ -881,7 +888,7 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             "SELECT {ARCHIVED_JOB_COLUMNS} FROM hammerwork_jobs_archive {conditions} \
              ORDER BY archived_at DESC, id DESC LIMIT {limit_ph} OFFSET {offset_ph}"
         );
-        let rows = bind_archive_filter!(sqlx::query(&page_sql), &binds)
+        let rows = bind_archive_filter!(sqlx::query(sqlx::AssertSqlSafe(page_sql)), &binds)
             .bind(i64::from(limit))
             .bind(i64::from(offset))
             .fetch_all(&self.pool)
@@ -911,7 +918,7 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             CHANGE_COLUMNS.join(", "),
             changed_since_filter(true)
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(since)
             .bind(i64::from(limit))
             .fetch_all(&self.pool)
@@ -938,7 +945,7 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
         limit: u32,
     ) -> Result<Vec<hammerwork::Job>> {
         let sql = jobs_with_status_sql(queue_name.is_some(), true);
-        let mut query = sqlx::query(&sql).bind(status.to_string());
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(status.to_string());
         if let Some(name) = queue_name {
             query = query.bind(name.to_string());
         }
@@ -961,7 +968,10 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
              FROM hammerwork_jobs WHERE id = ANY($1)",
             CHANGE_COLUMNS.join(", ")
         );
-        let rows = sqlx::query(&sql).bind(&ids).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&ids)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(pg_job_changes(&rows))
     }
 
@@ -984,7 +994,9 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             let statement = operation.postgres_statement(table);
             if !dry_run {
                 // Simple-query protocol: VACUUM may not run inside a transaction block.
-                sqlx::raw_sql(&statement).execute(&self.pool).await?;
+                sqlx::raw_sql(sqlx::AssertSqlSafe(statement.as_str()))
+                    .execute(&self.pool)
+                    .await?;
             }
             ran.push(MaintenanceStatement {
                 table,
@@ -1021,7 +1033,9 @@ impl JobHistory for JobQueue<sqlx::MySql> {
              FROM hammerwork_jobs WHERE status = 'Completed' \
              AND completed_at >= ? AND completed_at < ?{queue_clause} GROUP BY bucket"
         );
-        let mut q = sqlx::query(&completed_sql).bind(first).bind(upper);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(completed_sql))
+            .bind(first)
+            .bind(upper);
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -1042,7 +1056,9 @@ impl JobHistory for JobQueue<sqlx::MySql> {
              AND COALESCE(failed_at, timed_out_at) >= ? AND COALESCE(failed_at, timed_out_at) < ?{queue_clause} \
              GROUP BY bucket"
         );
-        let mut q = sqlx::query(&failed_sql).bind(first).bind(upper);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(failed_sql))
+            .bind(first)
+            .bind(upper);
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -1095,7 +1111,7 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             "SELECT CAST(COUNT(*) AS SIGNED) FROM hammerwork_jobs {}",
             finished_filter(kind, queue.is_some(), older_than.is_some(), false)
         );
-        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -1115,7 +1131,7 @@ impl JobHistory for JobQueue<sqlx::MySql> {
         else {
             return Ok(0);
         };
-        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -1135,7 +1151,7 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             "DELETE FROM hammerwork_jobs {}",
             finished_filter(kind, queue.is_some(), older_than.is_some(), false)
         );
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         if let Some(name) = queue {
             q = q.bind(name.to_string());
         }
@@ -1153,14 +1169,17 @@ impl JobHistory for JobQueue<sqlx::MySql> {
     ) -> Result<(Vec<ArchivedJob>, u64)> {
         let (conditions, binds) = archive_conditions(filter, false);
         let count_sql = format!("SELECT COUNT(*) FROM hammerwork_jobs_archive {conditions}");
-        let total = bind_archive_filter!(sqlx::query_scalar::<_, i64>(&count_sql), &binds)
-            .fetch_one(&self.pool)
-            .await?;
+        let total = bind_archive_filter!(
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql)),
+            &binds
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let page_sql = format!(
             "SELECT {ARCHIVED_JOB_COLUMNS} FROM hammerwork_jobs_archive {conditions} \
              ORDER BY archived_at DESC, id DESC LIMIT ? OFFSET ?"
         );
-        let rows = bind_archive_filter!(sqlx::query(&page_sql), &binds)
+        let rows = bind_archive_filter!(sqlx::query(sqlx::AssertSqlSafe(page_sql)), &binds)
             .bind(i64::from(limit))
             .bind(i64::from(offset))
             .fetch_all(&self.pool)
@@ -1188,7 +1207,7 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             mysql_latest_change(),
             changed_since_filter(false)
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for _ in CHANGE_COLUMNS {
             query = query.bind(since);
         }
@@ -1215,7 +1234,7 @@ impl JobHistory for JobQueue<sqlx::MySql> {
         limit: u32,
     ) -> Result<Vec<hammerwork::Job>> {
         let sql = jobs_with_status_sql(queue_name.is_some(), false);
-        let mut query = sqlx::query(&sql).bind(status.to_string());
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(status.to_string());
         if let Some(name) = queue_name {
             query = query.bind(name.to_string());
         }
@@ -1242,7 +1261,7 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             mysql_latest_change(),
             vec!["?"; ids.len()].join(", ")
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for id in &ids {
             query = query.bind(id);
         }
@@ -1263,7 +1282,7 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             "SELECT CAST(TABLE_NAME AS CHAR) FROM information_schema.TABLES \
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ({placeholders})"
         );
-        let mut q = sqlx::query_scalar::<_, String>(&sql);
+        let mut q = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
         for table in tables {
             q = q.bind(*table);
         }
@@ -1274,7 +1293,10 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             let mut messages = Vec::new();
             if !dry_run {
                 // OPTIMIZE TABLE reports failures as result rows, not as SQL errors.
-                for row in sqlx::raw_sql(&statement).fetch_all(&self.pool).await? {
+                for row in sqlx::raw_sql(sqlx::AssertSqlSafe(statement.as_str()))
+                    .fetch_all(&self.pool)
+                    .await?
+                {
                     let kind = text_column(&row, "Msg_type");
                     let text = text_column(&row, "Msg_text");
                     if kind.eq_ignore_ascii_case("error") {

@@ -90,7 +90,7 @@ mod postgres_tests {
         .await
         .unwrap();
         assert_eq!(recorded, 1);
-        sqlx::query(&format!("DROP TABLE {table}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
             .execute(pool)
             .await
             .expect("the probe migration created its table");
@@ -117,7 +117,9 @@ mod postgres_tests {
         let scratch = format!("hw_lock_{}", uuid::Uuid::new_v4().simple());
         let mut admin = PgConnection::connect_with(&base).await.unwrap();
         admin
-            .execute(format!("CREATE DATABASE \"{scratch}\"").as_str())
+            .execute(sqlx::AssertSqlSafe(format!(
+                "CREATE DATABASE \"{scratch}\""
+            )))
             .await
             .unwrap();
 
@@ -146,7 +148,9 @@ mod postgres_tests {
         .await;
 
         admin
-            .execute(format!("DROP DATABASE IF EXISTS \"{scratch}\" WITH (FORCE)").as_str())
+            .execute(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS \"{scratch}\" WITH (FORCE)"
+            )))
             .await
             .unwrap();
         outcome.unwrap();
@@ -203,7 +207,7 @@ mod mysql_tests {
                 .await
                 .unwrap();
         assert_eq!(recorded, 1);
-        sqlx::query(&format!("DROP TABLE {table}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
             .execute(pool)
             .await
             .expect("the probe migration created its table");
@@ -222,7 +226,7 @@ mod mysql_tests {
         let scratch = format!("hw_lock_{}", uuid::Uuid::new_v4().simple());
         let mut admin = MySqlConnection::connect_with(&base).await.unwrap();
         admin
-            .execute(format!("CREATE DATABASE `{scratch}`").as_str())
+            .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{scratch}`")))
             .await
             .unwrap();
 
@@ -251,7 +255,9 @@ mod mysql_tests {
         .await;
 
         admin
-            .execute(format!("DROP DATABASE IF EXISTS `{scratch}`").as_str())
+            .execute(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS `{scratch}`"
+            )))
             .await
             .unwrap();
         outcome.unwrap();
