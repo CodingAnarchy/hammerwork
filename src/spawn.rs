@@ -840,9 +840,9 @@ mod tests {
         }
     }
 
-    /// Inheritance fills in what a child does not set itself: a parent without a retry
-    /// strategy, timeout or trace id no longer wipes the child's own, and the child
-    /// keeps its own dependencies in addition to the parent.
+    /// A parent without a retry strategy, timeout or trace id no longer wipes the
+    /// child's own (a parent that has one still overrides it), and the child keeps its
+    /// own dependencies in addition to the parent.
     #[cfg(all(feature = "test", feature = "postgres"))]
     #[tokio::test]
     async fn test_prepare_spawn_keeps_the_childs_own_settings() {

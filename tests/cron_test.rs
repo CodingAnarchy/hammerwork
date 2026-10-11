@@ -6,15 +6,15 @@ use serde_json::json;
 
 #[test]
 fn test_cron_schedule_creation() {
-    let schedule = CronSchedule::new("0 0 9 * * 1-5").unwrap();
-    assert_eq!(schedule.expression, "0 0 9 * * 1-5");
+    let schedule = CronSchedule::new("0 0 9 * * Mon-Fri").unwrap();
+    assert_eq!(schedule.expression, "0 0 9 * * Mon-Fri");
     assert_eq!(schedule.timezone, "UTC");
 }
 
 #[test]
 fn test_cron_schedule_with_timezone() {
-    let schedule = CronSchedule::with_timezone("0 0 9 * * 1-5", "America/New_York").unwrap();
-    assert_eq!(schedule.expression, "0 0 9 * * 1-5");
+    let schedule = CronSchedule::with_timezone("0 0 9 * * Mon-Fri", "America/New_York").unwrap();
+    assert_eq!(schedule.expression, "0 0 9 * * Mon-Fri");
     assert_eq!(schedule.timezone, "America/New_York");
 }
 
@@ -44,32 +44,32 @@ fn test_cron_presets() {
 
 #[test]
 fn test_job_with_cron() {
-    let schedule = CronSchedule::new("0 0 9 * * 1-5").unwrap();
+    let schedule = CronSchedule::new("0 0 9 * * Mon-Fri").unwrap();
     let job = Job::new("test".to_string(), json!({"test": "data"}))
         .with_cron(schedule)
         .unwrap();
 
     assert!(job.is_recurring());
     assert!(job.has_cron_schedule());
-    assert_eq!(job.cron_schedule, Some("0 0 9 * * 1-5".to_string()));
+    assert_eq!(job.cron_schedule, Some("0 0 9 * * Mon-Fri".to_string()));
     assert_eq!(job.timezone, Some("UTC".to_string()));
 }
 
 #[test]
 fn test_job_with_cron_schedule_constructor() {
-    let schedule = CronSchedule::new("0 0 9 * * 1-5").unwrap();
+    let schedule = CronSchedule::new("0 0 9 * * Mon-Fri").unwrap();
     let job =
         Job::with_cron_schedule("test".to_string(), json!({"test": "data"}), schedule).unwrap();
 
     assert!(job.is_recurring());
     assert!(job.has_cron_schedule());
-    assert_eq!(job.cron_schedule, Some("0 0 9 * * 1-5".to_string()));
+    assert_eq!(job.cron_schedule, Some("0 0 9 * * Mon-Fri".to_string()));
     assert!(job.next_run_at.is_some());
 }
 
 #[test]
 fn test_job_next_run_calculation() {
-    let schedule = CronSchedule::new("0 0 9 * * 1-5").unwrap(); // Weekdays at 9 AM
+    let schedule = CronSchedule::new("0 0 9 * * Mon-Fri").unwrap(); // Weekdays at 9 AM
     let mut job =
         Job::with_cron_schedule("test".to_string(), json!({"test": "data"}), schedule).unwrap();
 
@@ -87,7 +87,7 @@ fn test_job_next_run_calculation() {
 
 #[test]
 fn test_cron_validation() {
-    assert!(CronSchedule::validate("0 0 9 * * 1-5").is_ok());
+    assert!(CronSchedule::validate("0 0 9 * * Mon-Fri").is_ok());
     assert!(CronSchedule::validate("0 * * * * *").is_ok());
     assert!(CronSchedule::validate("0 0 0 * * *").is_ok());
     assert!(CronSchedule::validate("invalid").is_err());
@@ -95,7 +95,7 @@ fn test_cron_validation() {
 
 #[test]
 fn test_cron_serialization() {
-    let schedule = CronSchedule::with_timezone("0 0 9 * * 1-5", "America/New_York").unwrap();
+    let schedule = CronSchedule::with_timezone("0 0 9 * * Mon-Fri", "America/New_York").unwrap();
     let json = serde_json::to_string(&schedule).unwrap();
     let mut deserialized: CronSchedule = serde_json::from_str(&json).unwrap();
 

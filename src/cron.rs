@@ -181,15 +181,16 @@ mod tests {
 
     #[test]
     fn test_cron_schedule_creation() {
-        let schedule = CronSchedule::new("0 0 9 * * 1-5").unwrap();
-        assert_eq!(schedule.expression, "0 0 9 * * 1-5");
+        let schedule = CronSchedule::new("0 0 9 * * Mon-Fri").unwrap();
+        assert_eq!(schedule.expression, "0 0 9 * * Mon-Fri");
         assert_eq!(schedule.timezone, "UTC");
     }
 
     #[test]
     fn test_cron_schedule_with_timezone() {
-        let schedule = CronSchedule::with_timezone("0 0 9 * * 1-5", "America/New_York").unwrap();
-        assert_eq!(schedule.expression, "0 0 9 * * 1-5");
+        let schedule =
+            CronSchedule::with_timezone("0 0 9 * * Mon-Fri", "America/New_York").unwrap();
+        assert_eq!(schedule.expression, "0 0 9 * * Mon-Fri");
         assert_eq!(schedule.timezone, "America/New_York");
     }
 
@@ -201,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_invalid_timezone() {
-        let result = CronSchedule::with_timezone("0 9 * * 1-5", "Invalid/Timezone");
+        let result = CronSchedule::with_timezone("0 9 * * Mon-Fri", "Invalid/Timezone");
         assert!(result.is_err());
     }
 
@@ -290,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_cron_validation() {
-        assert!(CronSchedule::validate("0 0 9 * * 1-5").is_ok());
+        assert!(CronSchedule::validate("0 0 9 * * Mon-Fri").is_ok());
         assert!(CronSchedule::validate("0 * * * * *").is_ok());
         assert!(CronSchedule::validate("0 0 0 * * *").is_ok());
         assert!(CronSchedule::validate("invalid").is_err());
@@ -298,7 +299,8 @@ mod tests {
 
     #[test]
     fn test_serialization() {
-        let schedule = CronSchedule::with_timezone("0 0 9 * * 1-5", "America/New_York").unwrap();
+        let schedule =
+            CronSchedule::with_timezone("0 0 9 * * Mon-Fri", "America/New_York").unwrap();
         let json = serde_json::to_string(&schedule).unwrap();
         let mut deserialized: CronSchedule = serde_json::from_str(&json).unwrap();
 
@@ -311,8 +313,8 @@ mod tests {
 
     #[test]
     fn test_from_str() {
-        let schedule: CronSchedule = "0 0 9 * * 1-5".parse().unwrap();
-        assert_eq!(schedule.expression, "0 0 9 * * 1-5");
+        let schedule: CronSchedule = "0 0 9 * * Mon-Fri".parse().unwrap();
+        assert_eq!(schedule.expression, "0 0 9 * * Mon-Fri");
         assert_eq!(schedule.timezone, "UTC");
     }
 }

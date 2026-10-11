@@ -16,6 +16,11 @@ use hammerwork::{
 use serde_json::json;
 use std::sync::Arc;
 
+/// `purge_archived_jobs` purges every queue's archived jobs, so the tests here that
+/// archive and then purge run one at a time: a purge must not delete the jobs another
+/// test has just archived and is about to list.
+static ARCHIVE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Archive every finished job of `queue_name` now.
 async fn archive_now<Q: DatabaseQueue>(
     queue: &Q,
@@ -37,6 +42,7 @@ async fn archive_now<Q: DatabaseQueue>(
 /// `list_archived_jobs` with an offset and no limit skips the first jobs. MySQL does not
 /// accept `OFFSET` without `LIMIT`, so this used to be a syntax error there.
 async fn archived_listing_offset_without_limit<Q: DatabaseQueue>(queue: &Q) {
+    let _serial = ARCHIVE_TESTS.lock().await;
     let name = test_utils::unique_queue("archived_offset");
     for i in 0..3 {
         let id = queue
@@ -99,6 +105,7 @@ async fn huge_result_settings_stay_readable<Q: DatabaseQueue>(queue: &Q) {
 /// An archival policy with an age too large to subtract from now archives nothing
 /// instead of panicking.
 async fn huge_archival_age_does_not_panic<Q: DatabaseQueue>(queue: &Q) {
+    let _serial = ARCHIVE_TESTS.lock().await;
     let name = test_utils::unique_queue("huge_archival_age");
     let id = queue
         .enqueue(Job::new(name.clone(), json!({})))
@@ -121,6 +128,7 @@ async fn huge_archival_age_does_not_panic<Q: DatabaseQueue>(queue: &Q) {
 /// whose payloads were stored uncompressed as 1.0 instead of 0, so it is never below 1
 /// when nothing grew.
 async fn compression_ratio_counts_uncompressed_jobs<Q: DatabaseQueue>(queue: &Q) {
+    let _serial = ARCHIVE_TESTS.lock().await;
     let name = test_utils::unique_queue("compression_ratio");
     // Random hex compresses about 2:1; the tiny payloads do not compress at all.
     let hex: String = (0..40)

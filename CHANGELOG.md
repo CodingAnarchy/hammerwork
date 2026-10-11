@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes to check when upgrading
+
+These are all bug fixes (details under **Fixed**), but each changes something you can
+observe:
+
+- **Retry delays are one step shorter**: the first retry waits the strategy's base
+  delay (`calculate_delay(1)`), as `RetryStrategy` documents.
+- **Cron presets fire on the right days.** `every_weekday_at_9am` now fires Monday to
+  Friday and `every_monday_at_noon` on Mondays. Recurring jobs already stored with the
+  old expressions (`0 0 9 * * 1-5`, `0 0 12 * * 1`) keep their stored expression: re-create
+  them, or update `cron_schedule` to `0 0 9 * * Mon-Fri` / `0 0 12 * * Mon`.
+- `CronSchedule::matches` is true if the schedule fires at any second of the minute.
+- `HammerworkConfig::from_env` returns an error for an invalid
+  `HAMMERWORK_DATABASE_POOL_SIZE`, `HAMMERWORK_WORKER_POOL_SIZE`,
+  `HAMMERWORK_JOB_TIMEOUT_SECONDS` or `HAMMERWORK_EVENT_BUFFER_SIZE` instead of silently
+  using the default.
+- `[archive]` durations are saved as `12h`, `90m`, ... instead of whole days; versions
+  before this one cannot read a sub-day value written this way.
+- Spawned jobs keep their own retry strategy, timeout and trace fields when the parent
+  has none, and the parent is added to a child's `depends_on` instead of replacing it.
+- Webhooks with `max_attempts = 0` are delivered once (they were never delivered); a
+  rate limit with a burst limit of 0 behaves as a burst of 1;
+  `AutoscaleConfig::with_min_workers` raises `max_workers` when needed.
+- Statistics: `InMemoryStatsCollector`'s `running` is the number of jobs running now,
+  and `BatchProcessingStats.batches_successful` requires 95% of a batch to complete.
+- `TestQueue` behaves like the databases: dependent jobs wait for their dependencies,
+  `statistics.failed` excludes `Dead` jobs, the dead-job APIs exclude `TimedOut` jobs and
+  `retry_dead_job` on a live job returns `InvalidJobTransition`. Tests written against
+  the old behaviour may need updating.
+- Dashboard: the "failed" counts (REST overview, queue endpoints, WebSocket) include
+  `Failed`, `Dead` and `TimedOut` jobs and agree with each other, so they can go up.
+  `/api/jobs` applies `created_after`, `created_before`, `search`, and `sort_order`
+  without `sort_by`.
+- CLI: `job list --failed` includes `TimedOut` jobs; `monitor metrics` / `monitor
+  health` count `Dead` and `TimedOut` jobs as failures; the configured `log_level` is
+  honoured; a config file that fails to parse still gets the environment variables.
+
 ### Changed
 
 - Docs: `docs/integration-testing.md` now describes the real CI workflow and queue module paths.
