@@ -30,9 +30,10 @@ pub enum BatchCommand {
             short = 'n',
             short_alias = 'Q',
             long,
-            help = "Queue for jobs whose line has no \"queue\" of its own (required)"
+            help = "Queue for jobs whose line has no \"queue\" of its own (required unless \
+                    default_queue / HAMMERWORK_DEFAULT_QUEUE is set)"
         )]
-        queue: String,
+        queue: Option<String>,
         #[arg(short = 'r', long, help = "Default priority")]
         priority: Option<String>,
         #[arg(
@@ -109,11 +110,12 @@ impl BatchCommand {
                 continue_on_error,
                 ..
             } => {
+                let queue = config.resolve_queue(queue.as_deref())?;
                 batch_enqueue(
                     pool,
                     &config.encryption_settings()?,
                     file.clone(),
-                    queue,
+                    &queue,
                     priority.clone(),
                     batch_size.unwrap_or(100),
                     *continue_on_error,
@@ -664,7 +666,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(file.as_deref(), Some("jobs.jsonl"));
-                assert_eq!(queue, "q");
+                assert_eq!(queue.as_deref(), Some("q"));
                 assert_eq!(priority.as_deref(), Some("high"));
                 assert_eq!(batch_size, Some(5));
                 assert!(continue_on_error);
@@ -752,10 +754,15 @@ mod tests {
             }
             _ => panic!("expected Export"),
         }
-        assert!(
-            TestCli::try_parse_from(["test", "enqueue"]).is_err(),
-            "--queue is required"
-        );
+        // --queue falls back to default_queue, so it parses without one; the command
+        // reports the missing queue when it runs.
+        match TestCli::try_parse_from(["test", "enqueue"])
+            .unwrap()
+            .command
+        {
+            BatchCommand::Enqueue { queue, .. } => assert_eq!(queue, None),
+            _ => panic!("expected Enqueue"),
+        }
         assert!(
             TestCli::try_parse_from(["test", "export"]).is_err(),
             "--output is required"

@@ -191,6 +191,14 @@ curl -u admin:password http://localhost:8080/api/stats/overview
 - `GET /api/stats/trends` - Completed/failed jobs per hour from the database (last 24 hours, or the last `?hours=N` hours, up to 31 days)
 - `GET /api/stats/health` - Health assessment
 
+`/api/stats/detailed` and `/api/stats/trends` take these query parameters:
+
+- `hours=N` - the last N hours (1 to 744).
+- `time_range=START,END` - two RFC 3339 timestamps separated by a comma, e.g.
+  `time_range=2024-01-01T00:00:00Z,2024-01-02T00:00:00Z` (at most 31 days; `hours` wins if both are given).
+- `queues=a,b` - only these queues (comma-separated, like the other list filters); stats, trends and error patterns cover just them.
+- `granularity=hour|day|week` - trend bucket size; `hour` is the default, days are UTC days and weeks start on Monday (UTC).
+
 Values the dashboard cannot measure are reported as `null` (for example memory usage on macOS, worker counts, CPU, and the metrics count), never as made-up numbers. "Failed" in trends and error patterns means jobs currently in `Failed`, `Dead` or `TimedOut`, counted at the hour they failed.
 
 #### Queues
@@ -200,7 +208,7 @@ Values the dashboard cannot measure are reported as `null` (for example memory u
 - `POST /api/queues/{name}/actions` - `{"action": "pause" | "resume" | "clear_completed" | "clear_dead"}`; `clear_completed` deletes the queue's completed jobs, `clear_dead` its dead jobs older than 7 days
 
 #### Jobs
-- `GET /api/jobs?status=failed&limit=50` - List jobs with filters
+- `GET /api/jobs?status=failed&limit=50` - List jobs with filters. `status` is any of `pending` (including jobs scheduled for later), `running`, `completed`, `failed` (Failed, Dead or TimedOut), `dead`, `timedout`, `retrying`, or `recurring`; the newest 100 jobs per status are listed. Without `status`, ready pending jobs, dead jobs and recurring jobs are listed
 - `GET /api/jobs/{id}` - Get job details
 - `POST /api/jobs` - Create new job
 - `POST /api/jobs/{id}/actions` - `{"action": "retry" | "cancel" | "delete"}`; `retry` re-queues the job, `cancel` and `delete` delete it
@@ -217,7 +225,7 @@ Values the dashboard cannot measure are reported as `null` (for example memory u
 #### System
 - `GET /api/system/info`, `GET /api/system/config`, `GET /api/system/metrics`, `GET /api/version`
 - `POST /api/system/maintenance` - `{"operation": ..., "target": ..., "dry_run": ...}`:
-  - `cleanup` deletes dead jobs older than 7 days
+  - `cleanup` deletes dead jobs older than 7 days (age is measured from `failed_at`, else `timed_out_at`, else `created_at`; the dry run counts exactly what the real run deletes)
   - `vacuum`: `VACUUM (ANALYZE)` on PostgreSQL, `OPTIMIZE TABLE` on MySQL
   - `reindex`: `REINDEX TABLE` on PostgreSQL, `OPTIMIZE TABLE` on MySQL (InnoDB rebuilds the indexes)
   - `optimize`: `ANALYZE` on PostgreSQL, `OPTIMIZE TABLE` on MySQL

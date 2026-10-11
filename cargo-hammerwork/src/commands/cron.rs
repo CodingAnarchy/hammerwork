@@ -31,8 +31,13 @@ pub enum CronCommand {
     Create {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(short = 'n', short_alias = 'Q', long, help = "Queue name")]
-        queue: String,
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Queue name (required unless default_queue / HAMMERWORK_DEFAULT_QUEUE is set)"
+        )]
+        queue: Option<String>,
         #[arg(short = 'j', long, help = "Job payload as JSON")]
         payload: String,
         #[arg(
@@ -131,12 +136,13 @@ impl CronCommand {
                 priority,
                 ..
             } => {
+                let queue = config.resolve_queue(queue.as_deref())?;
                 let job_queue = pool
                     .create_enqueue_queue(&config.encryption_settings()?)
                     .await?;
                 create_cron_job(
                     job_queue,
-                    queue,
+                    &queue,
                     payload,
                     schedule,
                     timezone.as_deref(),
@@ -652,7 +658,7 @@ mod tests {
                 priority,
                 ..
             } => {
-                assert_eq!((queue.as_str(), payload.as_str()), ("q", "{}"));
+                assert_eq!((queue.as_deref(), payload.as_str()), (Some("q"), "{}"));
                 assert_eq!(schedule, "0 * * * * *");
                 assert_eq!(timezone.as_deref(), Some("UTC"));
                 assert_eq!(priority.as_deref(), Some("high"));
@@ -902,7 +908,7 @@ mod tests {
         let create = |queue: &str, schedule: &str, tz: Option<&str>, priority: Option<&str>| {
             CronCommand::Create {
                 database_url: None,
-                queue: queue.to_string(),
+                queue: Some(queue.to_string()),
                 payload: r#"{"task": "report"}"#.to_string(),
                 schedule: schedule.to_string(),
                 timezone: tz.map(String::from),

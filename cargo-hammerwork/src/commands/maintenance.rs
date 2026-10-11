@@ -12,13 +12,17 @@ use crate::utils::sql::{Backend, Bind, SqlParams, execute_binds, fetch_i64};
 
 #[derive(Subcommand)]
 pub enum MaintenanceCommand {
-    #[command(about = "Clean up old completed and failed jobs")]
+    #[command(about = "Clean up old completed and failed (Failed, Dead or TimedOut) jobs")]
     Vacuum {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
         #[arg(long, default_value = "30", help = "Days to keep completed jobs")]
         keep_completed_days: u32,
-        #[arg(long, default_value = "7", help = "Days to keep failed jobs")]
+        #[arg(
+            long,
+            default_value = "7",
+            help = "Days to keep failed (Failed, Dead or TimedOut) jobs"
+        )]
         keep_failed_days: u32,
         #[arg(long, help = "Confirm the vacuum operation")]
         confirm: bool,
@@ -232,9 +236,14 @@ pub fn build_vacuum_query(
     cutoff: chrono::DateTime<chrono::Utc>,
 ) -> (String, Vec<Bind>) {
     let mut params = SqlParams::new(backend);
-    let (status, column) = match kind {
-        VacuumKind::Completed => ("Completed", "completed_at"),
-        VacuumKind::Failed => ("Failed", "failed_at"),
+    // "Failed" covers every failed end state, as in `job list --failed` and `monitor`.
+    // A timed-out job may only carry `timed_out_at`.
+    let (statuses, column) = match kind {
+        VacuumKind::Completed => ("= 'Completed'", "completed_at"),
+        VacuumKind::Failed => (
+            "IN ('Failed', 'Dead', 'TimedOut')",
+            "COALESCE(failed_at, timed_out_at)",
+        ),
     };
     let verb = if delete {
         "DELETE FROM hammerwork_jobs"
@@ -243,7 +252,7 @@ pub fn build_vacuum_query(
     };
     let cutoff = params.time(cutoff);
     (
-        format!("{verb} WHERE status = '{status}' AND {column} < {cutoff}"),
+        format!("{verb} WHERE status {statuses} AND {column} < {cutoff}"),
         params.into_binds(),
     )
 }
@@ -603,9 +612,24 @@ mod tests {
         let (sql, binds) = build_vacuum_query(Backend::MySql, VacuumKind::Failed, true, cutoff);
         assert_eq!(
             sql,
-            "DELETE FROM hammerwork_jobs WHERE status = 'Failed' AND failed_at < ?"
+            "DELETE FROM hammerwork_jobs WHERE status IN ('Failed', 'Dead', 'TimedOut') \
+             AND COALESCE(failed_at, timed_out_at) < ?"
         );
         assert_eq!(binds, vec![Bind::Time(cutoff)]);
+    }
+
+    #[test]
+    fn vacuum_failed_covers_failed_dead_and_timed_out() {
+        let cutoff = chrono::Utc::now();
+        let (sql, _) = build_vacuum_query(Backend::Postgres, VacuumKind::Failed, true, cutoff);
+        assert!(
+            sql.contains("status IN ('Failed', 'Dead', 'TimedOut')"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("COALESCE(failed_at, timed_out_at) < $1"),
+            "{sql}"
+        );
     }
 
     async fn vacuum_roundtrip(pool: DatabasePool) {
@@ -616,13 +640,19 @@ mod tests {
         let mut failed = SeedJob::new(&queue, "Failed");
         failed.failed_now = true;
         seed(&pool, &failed).await;
+        for status in ["Dead", "TimedOut"] {
+            let mut job = SeedJob::new(&queue, status);
+            job.failed_now = true;
+            seed(&pool, &job).await;
+        }
 
         let backend = pool.backend();
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let (sql, binds) = build_vacuum_query(backend, VacuumKind::Completed, false, future);
         assert!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap() >= 1);
         let (sql, binds) = build_vacuum_query(backend, VacuumKind::Failed, false, future);
-        assert!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap() >= 1);
+        // Failed, Dead and TimedOut all count as failed.
+        assert!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap() >= 3);
 
         // A cutoff in the distant past executes the DELETE without touching any rows
         let past = chrono::Utc::now() - chrono::Duration::days(365 * 20);

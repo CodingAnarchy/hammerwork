@@ -294,6 +294,27 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
         async { Ok(Vec::new()) }
     }
 
+    /// Jobs with exactly `status` (a status as stored: `Pending`, `Running`, `Completed`,
+    /// `Failed`, `Dead`, `TimedOut`, `Retrying`), optionally for one queue, newest first,
+    /// at most `limit`. Pending jobs scheduled for later are included. Rows that cannot
+    /// be decoded are skipped.
+    ///
+    /// The default implementation returns an error, for implementations that predate
+    /// this method.
+    fn jobs_with_status(
+        &self,
+        queue: Option<&str>,
+        status: &str,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<hammerwork::Job>>> + Send {
+        let _ = (queue, status, limit);
+        async {
+            Err(hammerwork::HammerworkError::Queue {
+                message: "listing jobs by status is not supported by this queue".to_string(),
+            })
+        }
+    }
+
     /// The current state of the jobs `ids` (UUIDs) that still exist, each with the time
     /// of its latest change as in [`recent_job_changes`](Self::recent_job_changes). Ids
     /// that are not UUIDs, jobs that no longer exist and rows that cannot be decoded are
@@ -657,6 +678,45 @@ fn finished_filter(kind: FinishedKind, queue: bool, cutoff: bool, postgres: bool
     sql
 }
 
+/// `SELECT` of the ids of [`JobHistory::jobs_with_status`]: the status, and the queue when
+/// `queue`, are bound.
+fn jobs_with_status_sql(queue: bool, postgres: bool) -> String {
+    let (status, name, limit) = if postgres {
+        ("$1", "$2", if queue { "$3" } else { "$2" })
+    } else {
+        ("?", "?", "?")
+    };
+    let queue_filter = if queue {
+        format!(" AND queue_name = {name}")
+    } else {
+        String::new()
+    };
+    format!(
+        "SELECT id FROM hammerwork_jobs WHERE status = {status}{queue_filter} \
+         ORDER BY created_at DESC LIMIT {limit}"
+    )
+}
+
+/// Reads the jobs `ids` (in order) with [`DatabaseQueue::get_job`]; ids that are not
+/// UUIDs, jobs that no longer exist and jobs that cannot be read are skipped.
+async fn load_jobs<Q: DatabaseQueue>(
+    queue: &Q,
+    ids: impl IntoIterator<Item = String>,
+) -> Vec<hammerwork::Job> {
+    let mut jobs = Vec::new();
+    for id in ids {
+        let Ok(id) = id.parse::<uuid::Uuid>() else {
+            continue;
+        };
+        match queue.get_job(id).await {
+            Ok(Some(job)) => jobs.push(job),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(job_id = %id, error = %e, "skipping unreadable job"),
+        }
+    }
+    jobs
+}
+
 impl JobHistory for JobQueue<sqlx::Postgres> {
     async fn hourly_activity(
         &self,
@@ -869,6 +929,26 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
         .fetch_all(&self.pool)
         .await?;
         Ok(pg_job_changes(&rows))
+    }
+
+    async fn jobs_with_status(
+        &self,
+        queue_name: Option<&str>,
+        status: &str,
+        limit: u32,
+    ) -> Result<Vec<hammerwork::Job>> {
+        let sql = jobs_with_status_sql(queue_name.is_some(), true);
+        let mut query = sqlx::query(&sql).bind(status.to_string());
+        if let Some(name) = queue_name {
+            query = query.bind(name.to_string());
+        }
+        let rows = query.bind(i64::from(limit)).fetch_all(&self.pool).await?;
+        let ids: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.try_get::<uuid::Uuid, _>("id").ok())
+            .map(|id| id.to_string())
+            .collect();
+        Ok(load_jobs(self, ids).await)
     }
 
     async fn job_states(&self, ids: &[String]) -> Result<Vec<JobUpdate>> {
@@ -1126,6 +1206,25 @@ impl JobHistory for JobQueue<sqlx::MySql> {
         .fetch_all(&self.pool)
         .await?;
         Ok(mysql_job_changes(&rows))
+    }
+
+    async fn jobs_with_status(
+        &self,
+        queue_name: Option<&str>,
+        status: &str,
+        limit: u32,
+    ) -> Result<Vec<hammerwork::Job>> {
+        let sql = jobs_with_status_sql(queue_name.is_some(), false);
+        let mut query = sqlx::query(&sql).bind(status.to_string());
+        if let Some(name) = queue_name {
+            query = query.bind(name.to_string());
+        }
+        let rows = query.bind(i64::from(limit)).fetch_all(&self.pool).await?;
+        let ids: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("id").ok())
+            .collect();
+        Ok(load_jobs(self, ids).await)
     }
 
     async fn job_states(&self, ids: &[String]) -> Result<Vec<JobUpdate>> {
@@ -1540,6 +1639,32 @@ mod db_tests {
         );
         assert_eq!(ours[0].last_seen, ours[0].first_seen);
 
+        // Jobs can be listed by any status, scoped to a queue or not, up to a limit.
+        let listed = q
+            .jobs_with_status(Some(queue), "Completed", 100)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|j| j.status == JobStatus::Completed));
+        assert_eq!(
+            q.jobs_with_status(Some(queue), "Completed", 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let dead_jobs = q.jobs_with_status(Some(queue), "Dead", 100).await.unwrap();
+        assert_eq!(dead_jobs.len(), 1);
+        assert_eq!(dead_jobs[0].status, JobStatus::Dead);
+        assert!(
+            q.jobs_with_status(Some(queue), "Running", 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let everywhere = q.jobs_with_status(None, "Completed", 1000).await.unwrap();
+        assert!(everywhere.iter().any(|j| j.queue_name == other));
+
         // Counting and deleting are scoped to the queue and kind.
         let completed = FinishedKind::Completed;
         let dead = FinishedKind::Dead;
@@ -1554,6 +1679,70 @@ mod db_tests {
         assert_eq!(q.count_jobs(Some(queue), completed, None).await.unwrap(), 0);
         assert_eq!(q.count_jobs(Some(queue), dead, None).await.unwrap(), 1);
         assert_eq!(q.count_jobs(Some(other), completed, None).await.unwrap(), 1);
+    }
+
+    /// #103: a dead job without `failed_at` is counted and deleted by the same predicate.
+    async fn assert_dead_count_matches_delete<Q: JobHistory>(q: &Q, queue: &str) {
+        let cutoff = Some(Utc::now() + Duration::hours(1));
+        let counted = q
+            .count_jobs(Some(queue), FinishedKind::Dead, cutoff)
+            .await
+            .unwrap();
+        assert_eq!(counted, 1, "the dead row without failed_at is counted");
+        let deleted = q
+            .delete_jobs(Some(queue), FinishedKind::Dead, cutoff)
+            .await
+            .unwrap();
+        assert_eq!(deleted, counted);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn test_dead_job_without_failed_at_postgres() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let queue = format!("dead_null_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO hammerwork_jobs (id, queue_name, payload, status, priority, attempts, \
+             max_attempts, created_at, scheduled_at) \
+             VALUES ($1, $2, '{}'::jsonb, 'Dead', 2, 1, 3, NOW(), NOW())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(&queue)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_dead_count_matches_delete(&JobQueue::<sqlx::Postgres>::new(pool.clone()), &queue)
+            .await;
+        sqlx::query("DELETE FROM hammerwork_jobs WHERE queue_name = $1")
+            .bind(&queue)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MYSQL_DATABASE_URL"]
+    async fn test_dead_job_without_failed_at_mysql() {
+        let url = std::env::var("MYSQL_DATABASE_URL").expect("MYSQL_DATABASE_URL");
+        let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+        let queue = format!("dead_null_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO hammerwork_jobs (id, queue_name, payload, status, priority, attempts, \
+             max_attempts, created_at, scheduled_at) \
+             VALUES (?, ?, '{}', 'Dead', 2, 1, 3, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&queue)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_dead_count_matches_delete(&JobQueue::<sqlx::MySql>::new(pool.clone()), &queue).await;
+        sqlx::query("DELETE FROM hammerwork_jobs WHERE queue_name = ?")
+            .bind(&queue)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

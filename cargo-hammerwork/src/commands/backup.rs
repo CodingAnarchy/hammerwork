@@ -45,7 +45,7 @@ pub enum BackupCommand {
         queue: Option<String>,
         #[arg(long, help = "Include completed jobs")]
         include_completed: bool,
-        #[arg(long, help = "Include failed jobs")]
+        #[arg(long, help = "Include failed (Failed, Dead or TimedOut) jobs")]
         include_failed: bool,
         #[arg(
             long,
@@ -181,7 +181,7 @@ pub fn build_backup_select(
         conditions.push("status != 'Completed'".to_string());
     }
     if !include_failed {
-        conditions.push("status != 'Failed'".to_string());
+        conditions.push("status NOT IN ('Failed', 'Dead', 'TimedOut')".to_string());
     }
     if !conditions.is_empty() {
         query.push_str(&format!(" AND {}", conditions.join(" AND ")));
@@ -957,6 +957,17 @@ mod tests {
     }
 
     #[test]
+    fn backup_without_include_failed_excludes_dead_and_timed_out() {
+        let (sql, _) = build_backup_query(Backend::Postgres, None, true, false);
+        assert!(
+            sql.contains("status NOT IN ('Failed', 'Dead', 'TimedOut')"),
+            "{sql}"
+        );
+        let (sql, _) = build_backup_query(Backend::Postgres, None, true, true);
+        assert!(!sql.contains("'Dead'"), "{sql}");
+    }
+
+    #[test]
     fn test_backup_query_binds_queue_name() {
         let (sql, binds) = build_backup_query(Backend::Postgres, Some(HOSTILE_QUEUE), false, true);
         assert!(sql.contains("AND queue_name = $1 AND status != 'Completed' ORDER BY"));
@@ -1018,6 +1029,9 @@ mod tests {
         )
         .await;
         let completed = seed(&pool, &SeedJob::new(&hostile, "Completed")).await;
+        // Dead and TimedOut are failed states too: left out without --include-failed.
+        seed(&pool, &SeedJob::new(&hostile, "Dead")).await;
+        seed(&pool, &SeedJob::new(&hostile, "TimedOut")).await;
         seed(&pool, &SeedJob::new(&other, "Pending")).await;
 
         let backup = |args: Vec<String>| {
@@ -1061,7 +1075,7 @@ mod tests {
         .unwrap();
         let doc: Value =
             serde_json::from_str(&std::fs::read_to_string(&full_out).unwrap()).unwrap();
-        assert_eq!(doc["total_jobs"], 3);
+        assert_eq!(doc["total_jobs"], 5);
         let failed_json = doc["jobs"]
             .as_array()
             .unwrap()
@@ -1116,7 +1130,7 @@ mod tests {
         ])
         .await
         .unwrap();
-        assert_eq!(count_jobs(&pool, &hostile, None).await, 3);
+        assert_eq!(count_jobs(&pool, &hostile, None).await, 5);
         assert_eq!(job_status(&pool, &pending).await, "Pending");
         assert_eq!(
             job_column(&pool, &pending, "priority").await.as_deref(),
@@ -1156,7 +1170,7 @@ mod tests {
         ])
         .await
         .unwrap();
-        assert_eq!(count_jobs(&pool, &hostile, None).await, 3);
+        assert_eq!(count_jobs(&pool, &hostile, None).await, 5);
 
         // bad input is reported, and nothing is half-written
         let err = backup(vec![s("restore"), s("-i"), csv_out.clone(), s("--confirm")])

@@ -421,7 +421,12 @@ where
                     )),
                 }
             } else {
-                match queue.purge_dead_jobs(older_than).await {
+                // The same predicate the dry run counts with (`FinishedKind::Dead`), so the
+                // dry-run count is what is deleted, including dead rows without `failed_at`.
+                match queue
+                    .delete_jobs(None, FinishedKind::Dead, Some(older_than))
+                    .await
+                {
                     Ok(count) => {
                         let response = ApiResponse::success(serde_json::json!({
                             "operation": "cleanup",
