@@ -20,15 +20,17 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 /// Archive completed jobs at once; keep archived jobs for an hour.
 fn policy() -> ArchivalPolicy {
-    ArchivalPolicy {
-        archive_completed_after: Some(chrono::Duration::zero()),
-        archive_failed_after: None,
-        archive_dead_after: None,
-        archive_timed_out_after: None,
-        purge_archived_after: Some(chrono::Duration::hours(1)),
-        compress_payloads: true,
-        batch_size: 2,
-        enabled: true,
+    {
+        let mut value = ArchivalPolicy::default();
+        value.archive_completed_after = Some(chrono::Duration::zero());
+        value.archive_failed_after = None;
+        value.archive_dead_after = None;
+        value.archive_timed_out_after = None;
+        value.purge_archived_after = Some(chrono::Duration::hours(1));
+        value.compress_payloads = true;
+        value.batch_size = 2;
+        value.enabled = true;
+        value
     }
 }
 
@@ -224,10 +226,11 @@ where
 
     let archiver = || {
         JobArchiver::new(queue.pool.clone())
-            .with_default_policy(ArchivalPolicy {
-                purge_archived_after: None,
-                batch_size: 5,
-                ..policy()
+            .with_default_policy({
+                let mut value = policy();
+                value.purge_archived_after = None;
+                value.batch_size = 5;
+                value
             })
             .with_config(ArchivalConfig::new())
     };

@@ -308,8 +308,9 @@ turn batch mode off, do not call `with_batch_size`.
 Batch settings can now also come from configuration: the optional `[worker]` keys
 `batch_size` and `batch_concurrency` (`WorkerConfig::batch_size` and
 `WorkerConfig::batch_concurrency`, both `Option<usize>`) are applied by
-`Worker::with_config` when set. If you build a `WorkerConfig` with a struct literal, add
-the two fields or end it with `..WorkerConfig::default()`.
+`Worker::with_config` when set. `WorkerConfig` is now `#[non_exhaustive]` (see
+[below](#non-exhaustive-structs-and-enums)): build it with
+`WorkerConfig::default().with_batch_size(n).with_batch_concurrency(m)`.
 
 ### `with_max_retries` is now `with_attempt_cap`
 
@@ -398,3 +399,140 @@ range: it still rejects times after 2038 itself.
 
 The migration blocks writes while it runs, so 2.x workers will stall (and may time out
 waiting on locks) during the conversion, so stop them or let them drain first.
+
+## Non-exhaustive structs and enums
+
+Configuration, statistics and record types that gain fields from release to release are
+`#[non_exhaustive]` in 3.0 ([#81](https://github.com/CodingAnarchy/hammerwork/issues/81)),
+so a new field is no longer a breaking change. Outside Hammerwork you can still read and
+assign their public fields and match them with `..`, but you cannot build them with a
+struct literal, not even one that ends in `..Default::default()`. Start from `default()` or
+a constructor and chain the `with_*` methods instead:
+
+```rust
+use hammerwork::config::{HammerworkConfig, WorkerConfig};
+use std::time::Duration;
+
+// Before (2.x):
+// let worker = WorkerConfig {
+//     pool_size: 8,
+//     job_timeout: Duration::from_secs(60),
+//     batch_size: Some(25),
+//     ..WorkerConfig::default()
+// };
+
+// After (3.0):
+let worker = WorkerConfig::default()
+    .with_pool_size(8)
+    .with_job_timeout(Duration::from_secs(60))
+    .with_batch_size(25); // `Option` fields take the value and store `Some(value)`
+let config = HammerworkConfig::new().with_worker(worker);
+
+// Assigning fields of a default value works too:
+let mut worker = WorkerConfig::default();
+worker.pool_size = 8;
+# let _ = (config, worker);
+```
+
+### Configuration types
+
+Every public field of these types has a `with_<field>` method unless noted otherwise.
+
+| Module | Types | How to build them |
+| --- | --- | --- |
+| `config` | `HammerworkConfig` | `new()` / `default()`, one setter per section (`with_database`, `with_worker`, `with_events`, `with_webhooks`, `with_streaming`, `with_alerting`, `with_metrics`, `with_archive`, `with_rate_limiting`, `with_logging`, `with_encryption`) and the existing shortcuts |
+| `config` | `DatabaseConfig`, `WorkerConfig`, `WebhookConfigs`, `WebhookGlobalSettings`, `StreamingConfigs`, `StreamingGlobalSettings`, `SimpleEventFilter`, `ArchiveConfig`, `RateLimitingConfig`, `LoggingConfig`, `PayloadEncryptionConfig`, `KeyRotationConfig` | `default()` and the new `with_*` setters; also `RateLimitingConfig::with_queue_throttle(queue, throttle)` and `PayloadEncryptionConfig::with_decryption_key(key_id, source)` |
+| `events` | `EventConfig` | `default()` and the new setters |
+| `events` | `EventFilter` | `new()` and its existing builders |
+| `events` | `JobLifecycleEvent` | the `JobLifecycleEventBuilder` constructors (`enqueued`, `failed`, ...) or the new `JobLifecycleEvent::new(job_id, queue, event_type, priority)`, then `with_timestamp`, `with_processing_time_ms`, `with_error`, `with_payload`, `with_metadata` |
+| `events` | `JobError` | new `JobError::new(message)`, then `with_error_type`, `with_details`, `with_retry_attempt` |
+| `webhooks` | `WebhookConfig` | `new(name, url)` and its existing builders |
+| `webhooks` | `RetryPolicy`, `WebhookManagerConfig` | `default()` and the new setters |
+| `streaming` | `StreamConfig` | `new(name, backend)` and its existing builders |
+| `streaming` | `StreamRetryPolicy`, `BufferConfig`, `StreamManagerConfig` | `default()` and the new setters |
+| `alerting` | `AlertingConfig`, `SmtpConfig` | `new()` / `SmtpConfig::new(host, from)` and their existing builders |
+| `archive` | `ArchivalPolicy`, `ArchivalConfig` | `new()` and their existing builders |
+| `encryption` | `EncryptionConfig`, `KeyManagerConfig`, `KeyAuditFilter` | `new()` and their existing builders; new `KeyManagerConfig::with_key_derivation_config` |
+| `encryption` | `ExternalKmsConfig` | new `ExternalKmsConfig::new(service_type, endpoint)`, then `with_auth(key, value)`, `with_auth_config`, `with_region`, `with_namespace` |
+| `encryption` | `KeyDerivationConfig` | `default()` and the new setters |
+| `metrics`, `tracing`, `rate_limit`, `worker` | `MetricsConfig`, `TracingConfig`, `ThrottleConfig`, `AutoscaleConfig`, `JobEventHooks` | `new()` and their existing builders |
+| `spawn`, `stats` | `SpawnConfig`, `StatsConfig` | `default()` and the new setters |
+| `stats` | `JobEvent` | new `JobEvent::new(job_id, queue, event_type, priority)`, then `with_processing_time_ms`, `with_error_message`, `with_timestamp` |
+| `job`, `batch`, `workflow` | `Job`, `ResultConfig`, `JobBatch`, `JobGroup` | `Job::new` / `Job::with_delay` / `Job::with_cron_schedule`, `ResultConfig::new`, `JobBatch::new`, `JobGroup::new` and their existing builders |
+| `migrations` | `Migration` | new `Migration::new(id, description, version)` (and `with_created_at`) |
+| `archive` | `ArchivedJob` | new `ArchivedJob::new(id, queue, status, created_at, archived_at, reason)`, then `with_original_payload_size`, `with_payload_compressed`, `with_archived_by`, `with_workflow_id`, `with_workflow_name` |
+| `spawn` | `SpawnContext` | new `SpawnContext::new(parent_job, config, queue)`, for testing a `SpawnHandler` |
+| `hammerwork_web` | `DashboardConfig` | `new()` and its builders, plus the new `with_pool_size`, `with_auth_config`, `with_websocket`, `with_allowed_origins` |
+| `hammerwork_web` | `AuthConfig`, `WebSocketConfig` | `default()` and the new setters; `AuthConfig::disabled()` |
+
+### Statistics and records
+
+These are returned by Hammerwork and have no builders. Read their fields as before. In
+tests, start from `default()` where the type has one and assign the fields you need
+(`QueueStats` now implements `Default` for this).
+
+- Statistics: `stats::JobStatistics`, `stats::QueueStats`, `stats::DeadJobSummary`,
+  `priority::PriorityStats`, `worker::BatchProcessingStats`, `worker::AutoscaleMetrics`,
+  `archive::ArchivalStats`, `archive::ScheduledArchivalPass`,
+  `encryption::EncryptionStats`, `encryption::KeyManagerStats`,
+  `events::EventManagerStats`, `webhooks::WebhookStats`, `webhooks::WebhookManagerStats`,
+  `streaming::StreamStats`, `streaming::StreamManagerGlobalStats`.
+- Records: `webhooks::WebhookDelivery`, `streaming::StreamDelivery`,
+  `streaming::StreamedEvent`, `encryption::EncryptionKey`, `encryption::KeyAuditRecord`,
+  `encryption::KmsWrappedKey`, `encryption::EncryptionMetadata`,
+  `encryption::EncryptedPayload`, `migrations::MigrationRecord`,
+  `queue::QueuePauseInfo`, `queue::RecordedOutcome`, `spawn::SpawnResult`,
+  `worker::JobHookEvent`, `worker::JobResult` (still built with `JobResult::success()` and
+  `JobResult::with_data`), `batch::BatchResult`, `alerting::Alert`.
+
+Small types that are complete by definition stay exhaustive: `queue::StaleJobRecovery`
+(`requeued`, `dead`), `queue::EncryptedJobPurge` (`jobs`, `archived_jobs`),
+`rate_limit::RateLimit` (`rate`, `per`, `burst_limit`) and the newtypes
+`tracing::TraceId`, `tracing::CorrelationId` and `config::KeySourceRef`.
+
+### `ArchivedJob` lists the workflow
+
+`ArchivedJob` has two new fields, `workflow_id` and `workflow_name`, filled in by
+`list_archived_jobs` on PostgreSQL, MySQL and `TestQueue` (the archive has stored them
+since migration 019). Both are `None` for a job outside a workflow.
+
+### Event subscriptions unregister when dropped
+
+Dropping an `EventSubscription` now unregisters it from its `EventManager`: its filter
+stops counting toward `subscription_count` and `payload_wanted` without a call to
+`EventManager::unsubscribe` (which still works, for example to unregister by id). The
+subscription keeps a reference to the manager's registry, so its fields can be borrowed
+but no longer moved out: keep the whole subscription alive while you read from it.
+
+```rust
+# async fn example(events: hammerwork::events::EventManager) -> hammerwork::Result<()> {
+use hammerwork::events::EventFilter;
+
+// Before (2.x):
+// let receiver = events.subscribe(EventFilter::new()).await?.receiver;
+// ... later: events.unsubscribe(id).await?;
+
+// After (3.0):
+let mut subscription = events.subscribe(EventFilter::new()).await?;
+while let Ok(event) = subscription.receiver.recv().await {
+    println!("{} {}", event.job_id, event.event_type);
+#   break;
+}
+drop(subscription); // unregisters
+# Ok(())
+# }
+```
+
+### Webhook statistics count failed attempts
+
+`WebhookStats` and `WebhookManagerStats` have a new `failed_attempts` counter: HTTP
+delivery attempts that failed, retries included, next to `total_attempts`. The
+per-delivery counters (`successful_deliveries`, `failed_deliveries`, `success_rate`) are
+unchanged. Serialized statistics without the field read it as 0.
+
+### Dashboard metrics endpoint
+
+`GET /api/system/metrics` no longer returns `metrics_endpoint`, `custom_metrics_count`
+or `last_scrape`. The dashboard serves no `/metrics` route and keeps no metrics registry,
+so they were always `"/metrics"`, `null` and `null`. Only `prometheus_enabled` (always
+`false`) remains.

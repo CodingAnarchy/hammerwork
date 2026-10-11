@@ -87,10 +87,7 @@ fn children<DB: sqlx::Database + Send + Sync>(
 
 /// Children keep their own retry strategy, so the injected bad child stays bad.
 fn spawn_config() -> SpawnConfig {
-    SpawnConfig {
-        inherit_retry_strategy: false,
-        ..SpawnConfig::default()
-    }
+    SpawnConfig::default().with_inherit_retry_strategy(false)
 }
 
 /// The parent completes and its children exist, released by the completion.

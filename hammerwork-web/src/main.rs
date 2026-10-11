@@ -475,13 +475,11 @@ mod tests {
 
         let empty_url = write_config(
             &dir,
-            &toml::to_string(&DashboardConfig {
-                database_url: String::new(),
-                auth: hammerwork_web::AuthConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                ..DashboardConfig::new()
+            &toml::to_string(&{
+                let mut value = DashboardConfig::new();
+                value.database_url = String::new();
+                value.auth = hammerwork_web::AuthConfig::default().with_enabled(false);
+                value
             })
             .unwrap(),
         );

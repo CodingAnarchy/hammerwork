@@ -86,16 +86,15 @@
 //!     "reliable_webhook".to_string(),
 //!     "https://api.example.com/events".to_string(),
 //! )
-//! .with_retry_policy(RetryPolicy {
-//!     max_attempts: 5,
-//!     initial_delay_secs: 2,
-//!     max_delay_secs: 300,
-//!     backoff_multiplier: 2.5,
-//!     retry_on_status_codes: vec![500, 502, 503, 504, 429],
-//! });
+//! .with_retry_policy(RetryPolicy::default()
+//!     .with_max_attempts(5)
+//!     .with_initial_delay_secs(2)
+//!     .with_max_delay_secs(300)
+//!     .with_backoff_multiplier(2.5)
+//!     .with_retry_on_status_codes(vec![500, 502, 503, 504, 429]));
 //! ```
 
-use crate::events::{EventFilter, EventManager, JobLifecycleEvent};
+use crate::events::{EventFilter, EventManager, EventSubscription, JobLifecycleEvent};
 use crate::task_tracker::{ListenerHandle, TaskTracker, clamp_permits};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -172,6 +171,7 @@ mod uuid_string {
 /// `Debug` never shows the signing secret, header values, credentials, or the path of
 /// the URL (webhook URLs of chat services are themselves credentials).
 #[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WebhookConfig {
     /// Unique identifier for this webhook
     #[serde(with = "uuid_string")]
@@ -315,6 +315,7 @@ impl std::fmt::Debug for WebhookAuth {
 
 /// Retry policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RetryPolicy {
     /// Maximum number of delivery attempts, including the first (0 is treated as 1:
     /// every event is attempted at least once)
@@ -360,6 +361,7 @@ impl RetryPolicy {
 
 /// Webhook delivery attempt result
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WebhookDelivery {
     /// Unique identifier for this delivery attempt
     #[serde(with = "uuid_string")]
@@ -388,6 +390,7 @@ pub struct WebhookDelivery {
 
 /// Webhook delivery statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WebhookStats {
     /// Webhook configuration ID
     #[serde(with = "uuid_string")]
@@ -395,6 +398,12 @@ pub struct WebhookStats {
     /// Total number of HTTP delivery attempts, retries included: one event can take
     /// several attempts.
     pub total_attempts: u64,
+    /// Number of HTTP delivery attempts that failed (an error, a timeout or a non-2xx
+    /// response), retried ones included. `total_attempts - failed_attempts` attempts
+    /// succeeded. Compare [`failed_deliveries`](Self::failed_deliveries), which counts
+    /// events whose delivery failed for good.
+    #[serde(default)]
+    pub failed_attempts: u64,
     /// Number of events delivered successfully (by any attempt)
     pub successful_deliveries: u64,
     /// Number of events whose delivery ultimately failed (retries exhausted, or a
@@ -419,8 +428,28 @@ pub struct WebhookStats {
     pub calculated_at: DateTime<Utc>,
 }
 
+impl WebhookStats {
+    /// Statistics of a webhook with no deliveries yet.
+    pub(crate) fn empty(webhook_id: Uuid) -> Self {
+        Self {
+            webhook_id,
+            total_attempts: 0,
+            failed_attempts: 0,
+            successful_deliveries: 0,
+            failed_deliveries: 0,
+            success_rate: 0.0,
+            avg_response_time_ms: 0.0,
+            last_success_at: None,
+            last_failure_at: None,
+            dropped_events: 0,
+            calculated_at: Utc::now(),
+        }
+    }
+}
+
 /// Overall webhook manager statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WebhookManagerStats {
     /// Total number of configured webhooks
     pub total_webhooks: usize,
@@ -428,6 +457,9 @@ pub struct WebhookManagerStats {
     pub active_webhooks: usize,
     /// Total HTTP delivery attempts across all webhooks, retries included
     pub total_attempts: u64,
+    /// Total failed HTTP delivery attempts across all webhooks, retries included
+    #[serde(default)]
+    pub failed_attempts: u64,
     /// Total events delivered successfully across all webhooks
     pub successful_deliveries: u64,
     /// Total events whose delivery ultimately failed across all webhooks
@@ -461,14 +493,13 @@ pub struct WebhookManagerStats {
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// // Create webhook manager
 /// let event_manager = Arc::new(EventManager::new_default());
-/// let config = WebhookManagerConfig {
-///     max_concurrent_deliveries: 20,
-///     max_response_body_size: 64 * 1024,
-///     log_deliveries: true,
-///     default_timeout_secs: 30,
-///     max_pending_deliveries: 1_000,
-///     user_agent: "MyApp/1.0".to_string(),
-/// };
+/// let config = WebhookManagerConfig::default()
+///     .with_max_concurrent_deliveries(20)
+///     .with_max_response_body_size(64 * 1024)
+///     .with_log_deliveries(true)
+///     .with_default_timeout_secs(30)
+///     .with_max_pending_deliveries(1_000)
+///     .with_user_agent("MyApp/1.0".to_string());
 /// let webhook_manager = WebhookManager::new(event_manager, config);
 ///
 /// // Add a webhook
@@ -512,6 +543,7 @@ pub struct WebhookManager {
 
 /// Configuration for the webhook manager
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WebhookManagerConfig {
     /// Maximum number of HTTP requests in flight at once, across all webhooks.
     /// A delivery holds a slot only while a request is in flight, not while it waits
@@ -745,21 +777,7 @@ impl WebhookManager {
         // Initialize statistics
         {
             let mut stats = self.stats.write().await;
-            stats.insert(
-                webhook_id,
-                WebhookStats {
-                    webhook_id,
-                    total_attempts: 0,
-                    successful_deliveries: 0,
-                    failed_deliveries: 0,
-                    success_rate: 0.0,
-                    avg_response_time_ms: 0.0,
-                    last_success_at: None,
-                    last_failure_at: None,
-                    dropped_events: 0,
-                    calculated_at: Utc::now(),
-                },
-            );
+            stats.insert(webhook_id, WebhookStats::empty(webhook_id));
         }
 
         // Replacing the handle of an existing listener stops that listener.
@@ -770,7 +788,7 @@ impl WebhookManager {
                 .await?;
         }
 
-        self.start_webhook_delivery_task(webhook_id, subscription.receiver, stop);
+        self.start_webhook_delivery_task(webhook_id, subscription, stop);
 
         if self.config.log_deliveries {
             // The URL path of chat webhooks (Slack, Discord, Teams) is a credential.
@@ -894,6 +912,7 @@ impl WebhookManager {
         let total_webhooks = webhooks.len();
         let active_webhooks = webhooks.values().filter(|w| w.enabled).count();
         let total_attempts = stats.values().map(|s| s.total_attempts).sum();
+        let failed_attempts = stats.values().map(|s| s.failed_attempts).sum();
         let successful_deliveries = stats.values().map(|s| s.successful_deliveries).sum();
         let failed_deliveries = stats.values().map(|s| s.failed_deliveries).sum();
 
@@ -901,6 +920,7 @@ impl WebhookManager {
             total_webhooks,
             active_webhooks,
             total_attempts,
+            failed_attempts,
             successful_deliveries,
             failed_deliveries,
         }
@@ -911,7 +931,9 @@ impl WebhookManager {
     fn start_webhook_delivery_task(
         &self,
         webhook_id: Uuid,
-        mut receiver: broadcast::Receiver<JobLifecycleEvent>,
+        // The listener holds the whole subscription: dropping it (when the listener
+        // stops) unregisters the subscription from the event manager.
+        mut subscription: EventSubscription,
         mut stop: oneshot::Receiver<()>,
     ) {
         let webhooks = self.webhooks.clone();
@@ -933,7 +955,7 @@ impl WebhookManager {
                 let received = tokio::select! {
                     biased;
                     _ = &mut stop => break,
-                    received = receiver.recv() => received,
+                    received = subscription.receiver.recv() => received,
                 };
                 let mut event = match received {
                     Ok(event) => event,
@@ -1268,7 +1290,7 @@ impl WebhookManager {
         format!("sha256={}", hex::encode(result.into_bytes()))
     }
 
-    /// Update the per-attempt statistics: the attempts counter, the average response
+    /// Update the per-attempt statistics: the attempt counters, the average response
     /// time and the last success and failure timestamps.
     async fn update_webhook_stats(
         webhook_id: &Uuid,
@@ -1282,6 +1304,7 @@ impl WebhookManager {
             if delivery.success {
                 webhook_stats.last_success_at = Some(delivery.attempted_at);
             } else {
+                webhook_stats.failed_attempts += 1;
                 webhook_stats.last_failure_at = Some(delivery.attempted_at);
             }
 
@@ -1732,6 +1755,27 @@ pub fn verify_hmac_signature(secret: &str, payload: &[u8], signature: &str) -> b
     mac.verify_slice(&signature_bytes).is_ok()
 }
 
+with_setters! {
+    RetryPolicy {
+        with_max_attempts(max_attempts): u32,
+        with_initial_delay_secs(initial_delay_secs): u64,
+        with_max_delay_secs(max_delay_secs): u64,
+        with_backoff_multiplier(backoff_multiplier): f64,
+        with_retry_on_status_codes(retry_on_status_codes): Vec<u16>,
+    }
+}
+
+with_setters! {
+    WebhookManagerConfig {
+        with_max_concurrent_deliveries(max_concurrent_deliveries): usize,
+        with_max_response_body_size(max_response_body_size): usize,
+        with_log_deliveries(log_deliveries): bool,
+        with_default_timeout_secs(default_timeout_secs): u64,
+        with_max_pending_deliveries(max_pending_deliveries): usize,
+        with_user_agent(user_agent): Into(String),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1932,18 +1976,7 @@ mod tests {
 
     #[test]
     fn test_webhook_stats_calculation() {
-        let mut stats = WebhookStats {
-            webhook_id: Uuid::new_v4(),
-            total_attempts: 0,
-            successful_deliveries: 0,
-            failed_deliveries: 0,
-            success_rate: 0.0,
-            avg_response_time_ms: 0.0,
-            last_success_at: None,
-            last_failure_at: None,
-            dropped_events: 0,
-            calculated_at: Utc::now(),
-        };
+        let mut stats = WebhookStats::empty(Uuid::new_v4());
 
         // Simulate successful delivery
         stats.total_attempts = 1;
@@ -2308,6 +2341,7 @@ mod tests {
         let mut stats = WebhookStats {
             webhook_id,
             total_attempts: 10,
+            failed_attempts: 3,
             successful_deliveries: 7,
             failed_deliveries: 3,
             success_rate: 0.7,
@@ -3107,21 +3141,7 @@ mod tests {
     #[tokio::test]
     async fn test_stats_count_final_outcomes_not_attempts() {
         let id = Uuid::new_v4();
-        let stats = Arc::new(RwLock::new(HashMap::from([(
-            id,
-            WebhookStats {
-                webhook_id: id,
-                total_attempts: 0,
-                successful_deliveries: 0,
-                failed_deliveries: 0,
-                success_rate: 0.0,
-                avg_response_time_ms: 0.0,
-                last_success_at: None,
-                last_failure_at: None,
-                dropped_events: 0,
-                calculated_at: Utc::now(),
-            },
-        )])));
+        let stats = Arc::new(RwLock::new(HashMap::from([(id, WebhookStats::empty(id))])));
         let attempt = |success: bool| WebhookDelivery {
             delivery_id: Uuid::new_v4(),
             webhook_id: id,
@@ -3143,7 +3163,7 @@ mod tests {
         {
             let stats = stats.read().await;
             let s = &stats[&id];
-            assert_eq!(s.total_attempts, 3);
+            assert_eq!((s.total_attempts, s.failed_attempts), (3, 2));
             assert_eq!((s.successful_deliveries, s.failed_deliveries), (1, 0));
             assert_eq!(s.success_rate, 1.0);
             assert!(s.last_success_at.is_some() && s.last_failure_at.is_some());
@@ -3156,7 +3176,7 @@ mod tests {
         WebhookManager::record_delivery_outcome(&id, false, stats.clone()).await;
         let stats = stats.read().await;
         let s = &stats[&id];
-        assert_eq!(s.total_attempts, 6);
+        assert_eq!((s.total_attempts, s.failed_attempts), (6, 5));
         assert_eq!((s.successful_deliveries, s.failed_deliveries), (1, 1));
         assert_eq!(s.success_rate, 0.5);
     }
@@ -3496,5 +3516,40 @@ mod tests {
         assert_eq!(webhook.filter.queue_names, vec!["q".to_string()]);
         assert_eq!(webhook.retry_policy.max_attempts, 1);
         assert!(!webhook.enabled);
+    }
+
+    /// #81: webhook settings built from their defaults with setters.
+    #[test]
+    fn test_webhook_settings_builders() {
+        let retry = RetryPolicy::default()
+            .with_max_attempts(2)
+            .with_initial_delay_secs(1)
+            .with_max_delay_secs(5)
+            .with_backoff_multiplier(3.0)
+            .with_retry_on_status_codes(vec![503]);
+        assert_eq!(
+            (
+                retry.max_attempts,
+                retry.initial_delay_secs,
+                retry.max_delay_secs
+            ),
+            (2, 1, 5)
+        );
+        assert_eq!(retry.backoff_multiplier, 3.0);
+        assert!(retry.should_retry_status(503) && !retry.should_retry_status(500));
+
+        let manager = WebhookManagerConfig::default()
+            .with_max_concurrent_deliveries(3)
+            .with_max_response_body_size(100)
+            .with_log_deliveries(false)
+            .with_default_timeout_secs(4)
+            .with_max_pending_deliveries(6)
+            .with_user_agent("acme");
+        assert_eq!(manager.max_concurrent_deliveries, 3);
+        assert_eq!(manager.max_response_body_size, 100);
+        assert!(!manager.log_deliveries);
+        assert_eq!(manager.default_timeout_secs, 4);
+        assert_eq!(manager.max_pending_deliveries, 6);
+        assert_eq!(manager.user_agent, "acme");
     }
 }

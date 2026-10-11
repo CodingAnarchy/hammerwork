@@ -154,6 +154,7 @@ use uuid::Uuid;
 
 /// Configuration for the key management system
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct KeyManagerConfig {
     /// Source for the master key used to encrypt data encryption keys
     pub master_key_source: KeySource,
@@ -181,6 +182,7 @@ pub struct KeyManagerConfig {
 ///
 /// `Debug` shows the names of the `auth_config` entries but never their values.
 #[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ExternalKmsConfig {
     /// KMS service type (AWS, GCP, Azure, HashiCorp Vault, etc.)
     pub service_type: String,
@@ -220,6 +222,7 @@ impl std::fmt::Debug for ExternalKmsConfig {
 
 /// Configuration for key derivation from passwords or passphrases
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct KeyDerivationConfig {
     /// Argon2 memory cost parameter (in KB)
     pub memory_cost: u32,
@@ -236,6 +239,7 @@ pub struct KeyDerivationConfig {
 
 /// Represents an encryption key with its metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EncryptionKey {
     /// Unique identifier for the key
     pub id: Uuid,
@@ -322,6 +326,7 @@ pub enum KeyStatus {
 
 /// Key usage audit record
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct KeyAuditRecord {
     /// Unique audit record ID
     pub id: Uuid,
@@ -393,6 +398,7 @@ pub const DEFAULT_AUDIT_LOG_LIMIT: u32 = 100;
 /// # }
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct KeyAuditFilter {
     /// Only records of this key
     pub key_id: Option<String>,
@@ -466,6 +472,7 @@ impl KeyAuditFilter {
 
 /// Statistics about key management operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct KeyManagerStats {
     /// Total number of keys managed
     pub total_keys: u64,
@@ -515,6 +522,7 @@ const KMS_MASTER_KEY_NAME: &str = "key-manager/master";
 /// key is stored, and it is decrypted with the KMS on load.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct KmsWrappedKey {
     /// Row ID
     pub id: Uuid,
@@ -772,13 +780,9 @@ impl KeyManagerConfig {
     /// auth_config.insert("access_key".to_string(), "AKIA...".to_string());
     /// auth_config.insert("secret_key".to_string(), "secret...".to_string());
     ///
-    /// let kms_config = ExternalKmsConfig {
-    ///     service_type: "aws-kms".to_string(),
-    ///     endpoint: "https://kms.us-east-1.amazonaws.com".to_string(),
-    ///     auth_config,
-    ///     region: Some("us-east-1".to_string()),
-    ///     namespace: None,
-    /// };
+    /// let kms_config = ExternalKmsConfig::new("aws-kms".to_string(), "https://kms.us-east-1.amazonaws.com".to_string())
+    ///     .with_auth_config(auth_config)
+    ///     .with_region("us-east-1".to_string());
     ///
     /// let config = KeyManagerConfig::new()
     ///     .with_external_kms(kms_config);
@@ -3903,6 +3907,50 @@ impl std::fmt::Display for KeyOperation {
     }
 }
 
+impl ExternalKmsConfig {
+    /// A KMS configuration for `service_type` (such as `"AWS"`, `"GCP"`, `"Azure"` or
+    /// `"Vault"`) at `endpoint`, with no authentication settings, region or namespace.
+    pub fn new(service_type: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        Self {
+            service_type: service_type.into(),
+            endpoint: endpoint.into(),
+            auth_config: HashMap::new(),
+            region: None,
+            namespace: None,
+        }
+    }
+
+    /// Adds (or replaces) one entry of [`auth_config`](Self::auth_config).
+    #[must_use]
+    pub fn with_auth(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.auth_config.insert(key.into(), value.into());
+        self
+    }
+}
+
+with_setters! {
+    ExternalKmsConfig {
+        with_auth_config(auth_config): HashMap<String, String>,
+        with_region(region): Some(String),
+        with_namespace(namespace): Some(String),
+    }
+}
+
+with_setters! {
+    KeyDerivationConfig {
+        with_memory_cost(memory_cost): u32,
+        with_time_cost(time_cost): u32,
+        with_parallelism(parallelism): u32,
+        with_salt_length(salt_length): usize,
+    }
+}
+
+with_setters! {
+    KeyManagerConfig {
+        with_key_derivation_config(key_derivation_config): KeyDerivationConfig,
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 mod tests {
@@ -6227,5 +6275,39 @@ mod tests {
         assert_eq!(context["client_ip"], "10.0.0.1");
         assert_eq!(context["session_id"], "s");
         assert!(audit_context(None, None, None).is_empty());
+    }
+
+    /// #81: external KMS and key derivation settings built with constructors and
+    /// setters.
+    #[test]
+    fn test_kms_and_derivation_builders() {
+        let kms = ExternalKmsConfig::new("AWS", "https://kms.example.com")
+            .with_auth("access_key_id", "AKIA")
+            .with_region("us-east-1".to_string())
+            .with_namespace("jobs".to_string());
+        assert_eq!(kms.service_type, "AWS");
+        assert_eq!(kms.endpoint, "https://kms.example.com");
+        assert_eq!(kms.auth_config["access_key_id"], "AKIA");
+        assert_eq!(kms.region.as_deref(), Some("us-east-1"));
+        assert_eq!(kms.namespace.as_deref(), Some("jobs"));
+        let kms = kms.with_auth_config(HashMap::new());
+        assert!(kms.auth_config.is_empty());
+
+        let derivation = KeyDerivationConfig::default()
+            .with_memory_cost(1024)
+            .with_time_cost(2)
+            .with_parallelism(1)
+            .with_salt_length(16);
+        assert_eq!(
+            (
+                derivation.memory_cost,
+                derivation.time_cost,
+                derivation.parallelism,
+                derivation.salt_length
+            ),
+            (1024, 2, 1, 16)
+        );
+        let config = KeyManagerConfig::new().with_key_derivation_config(derivation);
+        assert_eq!(config.key_derivation_config.memory_cost, 1024);
     }
 }

@@ -2858,6 +2858,8 @@ impl DatabaseQueue for TestQueue {
                 original_payload_size: Some(payload_size),
                 payload_compressed: false,             // Mock
                 archived_by: Some("test".to_string()), // Mock user
+                workflow_id: job.workflow_id,
+                workflow_name: job.workflow_name.clone(),
             });
         }
 

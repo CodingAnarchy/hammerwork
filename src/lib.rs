@@ -151,19 +151,14 @@
 //!     // Set up Kafka streaming for analytics
 //!     let stream_manager = StreamManager::new_default(event_manager.clone());
 //!
-//!     let kafka_stream = StreamConfig {
-//!         id: uuid::Uuid::new_v4(),
-//!         name: "analytics_stream".to_string(),
-//!         backend: StreamBackend::Kafka {
+//!     let kafka_stream = StreamConfig::new("analytics_stream".to_string(), StreamBackend::Kafka {
 //!             brokers: vec!["localhost:9092".to_string()],
 //!             topic: "job-events".to_string(),
 //!             config: HashMap::new(),
-//!         },
-//!         filter: EventFilter::new().include_payload(),
-//!         partitioning: PartitioningStrategy::QueueName,
-//!         enabled: true,
-//!         ..Default::default()
-//!     };
+//!         })
+//!         .with_filter(EventFilter::new().include_payload())
+//!         .with_partitioning(PartitioningStrategy::QueueName)
+//!         .enabled(true);
 //!
 //!     stream_manager.add_stream(kafka_stream).await?;
 //!
@@ -227,6 +222,9 @@
 //! - `webhooks` - Enable webhook and event system features (default)
 //! - `encryption` - Enable job payload encryption and PII protection
 //! - `tracing` - Enable OpenTelemetry distributed tracing
+
+#[macro_use]
+mod macros;
 
 pub mod archive;
 pub mod batch;

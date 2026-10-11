@@ -260,6 +260,7 @@ pub enum ResultStorage {
 ///     .with_ttl(Duration::from_secs(3600));
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ResultConfig {
     /// Where to store the job results.
     pub storage: ResultStorage,
@@ -407,6 +408,7 @@ impl Default for ResultConfig {
 /// assert!(job.scheduled_at > job.created_at);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Job {
     /// Unique identifier for this job.
     pub id: JobId,

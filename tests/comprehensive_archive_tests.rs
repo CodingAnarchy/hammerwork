@@ -45,14 +45,16 @@ async fn test_archive_event_serialization_comprehensive() {
         },
         ArchiveEvent::BulkArchiveCompleted {
             operation_id: "op_123".to_string(),
-            stats: hammerwork::archive::ArchivalStats {
-                jobs_archived: 100,
-                jobs_purged: 0,
-                bytes_archived: 1024,
-                bytes_purged: 0,
-                compression_ratio: 0.8,
-                operation_duration: std::time::Duration::from_secs(30),
-                last_run_at: Utc::now(),
+            stats: {
+                let mut value = hammerwork::archive::ArchivalStats::default();
+                value.jobs_archived = 100;
+                value.jobs_purged = 0;
+                value.bytes_archived = 1024;
+                value.bytes_purged = 0;
+                value.compression_ratio = 0.8;
+                value.operation_duration = std::time::Duration::from_secs(30);
+                value.last_run_at = Utc::now();
+                value
             },
         },
         ArchiveEvent::JobsPurged {

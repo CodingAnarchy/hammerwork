@@ -220,6 +220,7 @@ impl Default for KeySource {
 /// # }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EncryptionConfig {
     /// The encryption algorithm to use.
     pub algorithm: EncryptionAlgorithm,
@@ -584,6 +585,7 @@ impl RetentionPolicy {
 /// Contains information needed to decrypt the payload and manage
 /// its lifecycle according to retention policies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EncryptionMetadata {
     /// The encryption algorithm used.
     pub algorithm: EncryptionAlgorithm,
@@ -746,6 +748,7 @@ impl EncryptionMetadata {
 /// Contains the encrypted payload along with all metadata needed
 /// for decryption and lifecycle management.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EncryptedPayload {
     /// Base64-encoded encrypted data.
     pub ciphertext: String,
@@ -831,6 +834,7 @@ impl EncryptedPayload {
 ///
 /// Provides metrics for monitoring encryption performance and usage.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct EncryptionStats {
     /// Total number of jobs encrypted.
     pub jobs_encrypted: u64,

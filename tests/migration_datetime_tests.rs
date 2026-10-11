@@ -124,12 +124,7 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
         runner.create_migration_table().await.unwrap();
         runner
             .record_migration(
-                &Migration {
-                    id: MIGRATION_ID.to_string(),
-                    description: String::new(),
-                    version: 21,
-                    created_at: Utc::now(),
-                },
+                &Migration::new(MIGRATION_ID, String::new(), 21),
                 0,
             )
             .await

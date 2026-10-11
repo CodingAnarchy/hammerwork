@@ -460,6 +460,7 @@ pub enum PrioritySelectionStrategy {
 
 /// Priority queue statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PriorityStats {
     /// Number of jobs per priority level
     pub job_counts: HashMap<JobPriority, u64>,

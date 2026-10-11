@@ -398,26 +398,18 @@ fn build_test_event(
 
     let mut metadata = HashMap::new();
     metadata.insert("test".to_string(), "true".to_string());
-    Ok(JobLifecycleEvent {
-        event_id: Uuid::new_v4(),
-        job_id,
-        queue_name: queue.to_string(),
-        event_type,
-        priority: JobPriority::Normal,
-        timestamp: chrono::Utc::now(),
-        processing_time_ms: is_completed.then_some(123),
-        error: is_error.then(|| JobError {
-            message: "Test error from `cargo hammerwork webhook test`".to_string(),
-            error_type: Some("test".to_string()),
-            details: None,
-            retry_attempt: None,
-        }),
-        payload: webhook
-            .filter
-            .include_payload
-            .then(|| json!({"test": true})),
-        metadata,
-    })
+    let mut event = JobLifecycleEvent::new(job_id, queue, event_type, JobPriority::Normal);
+    event.processing_time_ms = is_completed.then_some(123);
+    event.error = is_error.then(|| {
+        JobError::new("Test error from `cargo hammerwork webhook test`")
+            .with_error_type("test".to_string())
+    });
+    event.payload = webhook
+        .filter
+        .include_payload
+        .then(|| json!({"test": true}));
+    event.metadata = metadata;
+    Ok(event)
 }
 
 /// Sends `event` to the webhook the way the library's delivery does: configured
@@ -666,29 +658,23 @@ fn create_webhook_config(
     }
     filter.include_payload = include_payload;
 
-    let retry_policy = RetryPolicy {
+    let retry_policy = RetryPolicy::default()
         // `max_attempts` counts the first delivery, so N retries is N + 1 attempts
-        max_attempts: max_retries.saturating_add(1),
-        initial_delay_secs: 1,
-        max_delay_secs: 300,
-        backoff_multiplier: 2.0,
-        retry_on_status_codes: vec![408, 429, 500, 502, 503, 504],
-    };
+        .with_max_attempts(max_retries.saturating_add(1))
+        .with_initial_delay_secs(1)
+        .with_max_delay_secs(300)
+        .with_backoff_multiplier(2.0)
+        .with_retry_on_status_codes(vec![408, 429, 500, 502, 503, 504]);
 
-    Ok(WebhookConfig {
-        id: Uuid::new_v4(),
-        name,
-        url,
-        method: http_method,
-        headers: parsed_headers,
-        filter,
-        retry_policy,
-        auth,
-        timeout_secs: timeout,
-        enabled: true,
-        secret,
-        payload_template: None,
-    })
+    let mut webhook = WebhookConfig::new(name, url)
+        .with_method(http_method)
+        .with_filter(filter)
+        .with_retry_policy(retry_policy)
+        .with_timeout_secs(timeout);
+    webhook.headers = parsed_headers;
+    webhook.auth = auth;
+    webhook.secret = secret;
+    Ok(webhook)
 }
 
 fn parse_http_method(method: &str) -> Result<hammerwork::HttpMethod> {

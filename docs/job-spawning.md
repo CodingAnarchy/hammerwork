@@ -150,11 +150,9 @@ use hammerwork::spawn::{JobSpawnExt, SpawnConfig};
 use hammerwork::Job;
 use serde_json::json;
 
-let spawn_config = SpawnConfig {
-    max_spawn_count: Some(15),
-    operation_id: Some("op-dataset-123".to_string()),
-    ..SpawnConfig::default()
-};
+let spawn_config = SpawnConfig::default()
+    .with_max_spawn_count(15)
+    .with_operation_id("op-dataset-123".to_string());
 
 // The payload must be a JSON object; anything else is rejected with
 // `HammerworkError::InvalidJobPayload` instead of silently losing the configuration.
@@ -214,7 +212,7 @@ encrypted jobs.
 
 ### SpawnConfig Fields
 
-`SpawnConfig` is a plain struct with public fields. `SpawnConfig::default()` allows 100 children, inherits priority, retry strategy and trace context, and does not inherit the timeout.
+`SpawnConfig` has public fields and is `#[non_exhaustive]`: start from `SpawnConfig::default()` and use its `with_*` methods. The default allows 100 children, inherits priority, retry strategy and trace context, and does not inherit the timeout.
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
@@ -222,14 +220,13 @@ encrypted jobs.
 # async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, payload: serde_json::Value, job: hammerwork::Job) -> std::result::Result<(), Box<dyn std::error::Error>> {
 use hammerwork::spawn::SpawnConfig;
 
-let config = SpawnConfig {
-    max_spawn_count: Some(50),           // Maximum children one parent may spawn (None = unlimited)
-    inherit_priority: true,              // Children get the parent's priority
-    inherit_retry_strategy: true,        // Children get the parent's retry strategy
-    inherit_timeout: false,              // Children keep their own timeout
-    inherit_trace_context: true,         // Children get trace_id, correlation_id, parent_span_id, span_context
-    operation_id: Some("custom-op-123".to_string()), // Identifier reported in SpawnResult
-};
+let config = SpawnConfig::default()
+    .with_max_spawn_count(50)            // Maximum children one parent may spawn (unlimited when unset)
+    .with_inherit_priority(true)         // Children get the parent's priority
+    .with_inherit_retry_strategy(true)   // Children get the parent's retry strategy
+    .with_inherit_timeout(false)         // Children keep their own timeout
+    .with_inherit_trace_context(true)    // Children get trace_id, correlation_id, parent_span_id, span_context
+    .with_operation_id("custom-op-123".to_string()); // Identifier reported in SpawnResult
 
 let defaults = SpawnConfig::default();
 assert_eq!(defaults.max_spawn_count, Some(100));
@@ -237,7 +234,7 @@ assert_eq!(defaults.max_spawn_count, Some(100));
 # }
 ```
 
-The manager runs the handler first and then applies the inheritance flags, so inherited values overwrite whatever the handler set on the child. If you want children with their own priority, set `inherit_priority: false`.
+The manager runs the handler first and then applies the inheritance flags, so inherited values overwrite whatever the handler set on the child. If you want children with their own priority, use `.with_inherit_priority(false)`.
 
 ### Children Use Their Own Queue
 

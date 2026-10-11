@@ -592,7 +592,8 @@ macro_rules! bind_archive_filter {
 
 /// Columns of an archived job listing.
 const ARCHIVED_JOB_COLUMNS: &str = "id, queue_name, status, created_at, archived_at, \
-     archival_reason, original_payload_size, payload_compressed, archived_by";
+     archival_reason, original_payload_size, payload_compressed, archived_by, workflow_id, \
+     workflow_name";
 
 /// The status stored in the archive (possibly JSON-quoted); unknown values read as `Dead`,
 /// as the core library does.
@@ -628,8 +629,9 @@ pub(crate) fn decodable<T>(rows: impl IntoIterator<Item = (String, Result<T>)>) 
         .collect()
 }
 
-/// An archived job from a row of [`ARCHIVED_JOB_COLUMNS`], with the id already decoded.
-fn archived_job<R>(row: &R, id: uuid::Uuid) -> Result<ArchivedJob>
+/// An archived job from a row of [`ARCHIVED_JOB_COLUMNS`], with the id and workflow id
+/// already decoded (their column types differ between PostgreSQL and MySQL).
+fn archived_job<R>(row: &R, id: uuid::Uuid, workflow_id: Option<uuid::Uuid>) -> Result<ArchivedJob>
 where
     R: Row,
     for<'a> &'a str: sqlx::ColumnIndex<R>,
@@ -639,22 +641,23 @@ where
     for<'a> bool: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
     for<'a> DateTime<Utc>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
 {
-    Ok(ArchivedJob {
+    let mut job = ArchivedJob::new(
         id,
-        queue_name: row.try_get("queue_name")?,
-        status: archived_status(&row.try_get::<String, _>("status")?),
-        created_at: row.try_get("created_at")?,
-        archived_at: row.try_get("archived_at")?,
-        archival_reason: ArchivalReason::parse_from_db(
-            &row.try_get::<String, _>("archival_reason")?,
-        )
-        .unwrap_or_default(),
-        original_payload_size: row
-            .try_get::<Option<i32>, _>("original_payload_size")?
-            .and_then(|size| usize::try_from(size).ok()),
-        payload_compressed: row.try_get("payload_compressed")?,
-        archived_by: row.try_get("archived_by")?,
-    })
+        row.try_get::<String, _>("queue_name")?,
+        archived_status(&row.try_get::<String, _>("status")?),
+        row.try_get("created_at")?,
+        row.try_get("archived_at")?,
+        ArchivalReason::parse_from_db(&row.try_get::<String, _>("archival_reason")?)
+            .unwrap_or_default(),
+    )
+    .with_payload_compressed(row.try_get("payload_compressed")?);
+    job.original_payload_size = row
+        .try_get::<Option<i32>, _>("original_payload_size")?
+        .and_then(|size| usize::try_from(size).ok());
+    job.archived_by = row.try_get("archived_by")?;
+    job.workflow_id = workflow_id;
+    job.workflow_name = row.try_get("workflow_name")?;
+    Ok(job)
 }
 
 /// Filters shared by count and delete: `$n`/`?` placeholders, queue then cutoff.
@@ -898,7 +901,10 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             let label = id.as_ref().map(|id| id.to_string()).unwrap_or_default();
             (
                 label,
-                id.map_err(Into::into).and_then(|id| archived_job(row, id)),
+                id.map_err(Into::into).and_then(|id| {
+                    let workflow_id = row.try_get::<Option<uuid::Uuid>, _>("workflow_id")?;
+                    archived_job(row, id, workflow_id)
+                }),
             )
         }));
         Ok((jobs, to_u64(total)))
@@ -1188,7 +1194,13 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             let label = row.try_get::<String, _>("id").unwrap_or_default();
             let job = uuid::Uuid::parse_str(&label)
                 .map_err(Into::into)
-                .and_then(|id| archived_job(row, id));
+                .and_then(|id| {
+                    let workflow_id = row
+                        .try_get::<Option<String>, _>("workflow_id")?
+                        .map(|id| uuid::Uuid::parse_str(&id))
+                        .transpose()?;
+                    archived_job(row, id, workflow_id)
+                });
             (label, job)
         }));
         Ok((jobs, to_u64(total)))

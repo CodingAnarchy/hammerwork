@@ -62,6 +62,7 @@ const MIN_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Configuration for metrics collection
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct MetricsConfig {
     /// HTTP server address for metrics exposition (as string)
     #[serde(

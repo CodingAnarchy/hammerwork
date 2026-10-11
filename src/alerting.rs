@@ -14,6 +14,7 @@ pub const FAILED_ALERT_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 /// Configuration for alerting thresholds and targets
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AlertingConfig {
     /// Error rate threshold (0.0 to 1.0) that triggers alerts
     pub error_rate_threshold: Option<f64>,
@@ -238,6 +239,7 @@ fn default_smtp_timeout_secs() -> u64 {
 /// config.validate().unwrap();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SmtpConfig {
     /// SMTP server host name.
     pub host: String,
@@ -433,6 +435,7 @@ impl std::fmt::Display for AlertType {
 
 /// An alert that has been triggered
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Alert {
     /// Type of alert
     pub alert_type: AlertType,

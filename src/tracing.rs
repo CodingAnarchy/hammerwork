@@ -224,6 +224,7 @@ impl From<&str> for CorrelationId {
 /// tracing for job processing, including service information and export settings.
 #[cfg(feature = "tracing")]
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TracingConfig {
     /// Name of the service for tracing identification
     pub service_name: String,

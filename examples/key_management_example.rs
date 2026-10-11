@@ -50,13 +50,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     aws_auth.insert("access_key_id".to_string(), "AKIA...".to_string());
     aws_auth.insert("secret_access_key".to_string(), "secret123".to_string());
 
-    let external_kms = ExternalKmsConfig {
-        service_type: "AWS".to_string(),
-        endpoint: "https://kms.us-east-1.amazonaws.com".to_string(),
-        auth_config: aws_auth,
-        region: Some("us-east-1".to_string()),
-        namespace: Some("hammerwork-production".to_string()),
-    };
+    let external_kms = ExternalKmsConfig::new("AWS", "https://kms.us-east-1.amazonaws.com")
+        .with_auth_config(aws_auth)
+        .with_region("us-east-1".to_string())
+        .with_namespace("hammerwork-production".to_string());
 
     let _kms_config = KeyManagerConfig::new().with_external_kms(external_kms);
 
@@ -67,14 +64,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 3: Key derivation configuration for password-based keys
     println!("3. Key derivation configuration:");
 
-    let _derivation_config = KeyDerivationConfig {
-        memory_cost: 65536, // 64 MB
-        time_cost: 3,       // 3 iterations
-        parallelism: 4,     // 4 threads
-        salt_length: 32,    // 32 bytes salt
-    };
+    let derivation_config = KeyDerivationConfig::default()
+        .with_memory_cost(65536) // 64 MB
+        .with_time_cost(3) // 3 iterations
+        .with_parallelism(4) // 4 threads
+        .with_salt_length(32); // 32 bytes salt
 
-    let _password_config = KeyManagerConfig::new().with_audit_enabled(true);
+    let _password_config = KeyManagerConfig::new()
+        .with_key_derivation_config(derivation_config)
+        .with_audit_enabled(true);
 
     println!("   Algorithm: Argon2id");
     println!("   Memory cost: 64 MB");
@@ -127,18 +125,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("6. Key management statistics and monitoring:");
 
     // Mock statistics for demonstration
-    let stats = hammerwork::encryption::KeyManagerStats {
-        total_keys: 25,
-        active_keys: 20,
-        retired_keys: 4,
-        revoked_keys: 1,
-        expired_keys: 0,
-        total_access_operations: 15420,
-        rotations_performed: 8,
-        average_key_age_days: 45.5,
-        keys_expiring_soon: 2,
-        keys_due_for_rotation: 1,
-    };
+    let mut stats = hammerwork::encryption::KeyManagerStats::default();
+    stats.total_keys = 25;
+    stats.active_keys = 20;
+    stats.retired_keys = 4;
+    stats.revoked_keys = 1;
+    stats.expired_keys = 0;
+    stats.total_access_operations = 15420;
+    stats.rotations_performed = 8;
+    stats.average_key_age_days = 45.5;
+    stats.keys_expiring_soon = 2;
+    stats.keys_due_for_rotation = 1;
 
     println!("   📊 Key Management Statistics:");
     println!("     Total keys managed: {}", stats.total_keys);

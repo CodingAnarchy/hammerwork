@@ -180,6 +180,7 @@ impl FailurePolicy {
 ///     .then(final_job);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct JobGroup {
     /// Unique identifier for this workflow
     pub id: WorkflowId,

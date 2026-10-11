@@ -169,6 +169,7 @@ impl JobOutcome {
 /// What [`DatabaseQueue::finish_job_run`](super::DatabaseQueue::finish_job_run) (or a
 /// manual transition) recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RecordedOutcome {
     /// The status the job is in now: the terminal status, or `Pending` for a retry or a
     /// recurring job rescheduled for its next run.

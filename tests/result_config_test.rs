@@ -16,11 +16,9 @@ async fn test_postgres_result_config_persistence() {
     let queue = test_utils::setup_postgres_queue().await;
 
     // Create a job with result storage configuration
-    let config = ResultConfig {
-        storage: ResultStorage::Database,
-        ttl: Some(Duration::from_secs(3600)),
-        max_size_bytes: Some(1024),
-    };
+    let config = ResultConfig::new(ResultStorage::Database)
+        .with_ttl(Duration::from_secs(3600))
+        .with_max_size(1024);
     let queue_name = format!("test_result_config_{}", uuid::Uuid::new_v4());
     let _cleanup = test_utils::QueueCleanup::postgres(&queue_name);
     let job = Job::new(queue_name.clone(), json!({"task": "test"})).with_result_config(config);
@@ -49,11 +47,9 @@ async fn test_mysql_result_config_persistence() {
     let queue = test_utils::setup_mysql_queue().await;
 
     // Create a job with result storage configuration
-    let config = ResultConfig {
-        storage: ResultStorage::Database,
-        ttl: Some(Duration::from_secs(7200)),
-        max_size_bytes: Some(2048),
-    };
+    let config = ResultConfig::new(ResultStorage::Database)
+        .with_ttl(Duration::from_secs(7200))
+        .with_max_size(2048);
     let queue_name = format!("test_result_config_mysql_{}", uuid::Uuid::new_v4());
     let _cleanup = test_utils::QueueCleanup::mysql(&queue_name);
     let job = Job::new(queue_name.clone(), json!({"task": "test"})).with_result_config(config);

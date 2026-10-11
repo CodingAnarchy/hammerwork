@@ -467,13 +467,11 @@ where
         concurrency.handler(Duration::from_millis(150)),
     )
     .with_poll_interval(Duration::from_millis(20));
-    let config = hammerwork::config::WorkerConfig {
-        pool_size: 1,
-        autoscaling_enabled: true,
-        min_workers: 1,
-        max_workers: 3,
-        ..Default::default()
-    };
+    let config = hammerwork::config::WorkerConfig::default()
+        .with_pool_size(1)
+        .with_autoscaling_enabled(true)
+        .with_min_workers(1)
+        .with_max_workers(3);
     let mut pool = WorkerPool::from_config(worker, &config)
         .with_autoscaling(
             config

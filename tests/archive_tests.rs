@@ -938,14 +938,16 @@ mod websocket_archive_event_tests {
             },
             ArchiveEvent::BulkArchiveCompleted {
                 operation_id: "op_123".to_string(),
-                stats: ArchivalStats {
-                    jobs_archived: 1000,
-                    jobs_purged: 0,
-                    bytes_archived: 50000,
-                    bytes_purged: 0,
-                    compression_ratio: 0.7,
-                    operation_duration: std::time::Duration::from_secs(30),
-                    last_run_at: Utc::now(),
+                stats: {
+                    let mut value = ArchivalStats::default();
+                    value.jobs_archived = 1000;
+                    value.jobs_purged = 0;
+                    value.bytes_archived = 50000;
+                    value.bytes_purged = 0;
+                    value.compression_ratio = 0.7;
+                    value.operation_duration = std::time::Duration::from_secs(30);
+                    value.last_run_at = Utc::now();
+                    value
                 },
             },
             ArchiveEvent::JobsPurged {

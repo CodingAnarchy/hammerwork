@@ -268,6 +268,41 @@ where
     assert_eq!(status.jobs.len(), 2);
 }
 
+/// #81: `list_archived_jobs` returns the workflow of an archived member (and none for a
+/// job outside a workflow).
+async fn archived_jobs_list_their_workflow<Q>(queue: Arc<Q>)
+where
+    Q: DatabaseQueue + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+    let name = test_utils::unique_queue("listed_workflow");
+    let member = Job::new(name.clone(), json!({ "step": "member" }));
+    let loner = Job::new(name.clone(), json!({ "step": "loner" }));
+    let (member_id, loner_id) = (member.id, loner.id);
+    let workflow_id = queue
+        .enqueue_workflow(JobGroup::new("listed_workflow").add_job(member))
+        .await
+        .unwrap();
+    queue.enqueue(loner).await.unwrap();
+    queue.complete_job(member_id).await.unwrap();
+    queue.complete_job(loner_id).await.unwrap();
+    assert_eq!(archive_queue(queue.as_ref(), &name).await, 2);
+
+    let archived = queue
+        .list_archived_jobs(Some(&name), None, None)
+        .await
+        .unwrap();
+    assert_eq!(archived.len(), 2, "{archived:?}");
+    let member = archived.iter().find(|job| job.id == member_id).unwrap();
+    assert_eq!(member.workflow_id, Some(workflow_id));
+    assert_eq!(member.workflow_name.as_deref(), Some("listed_workflow"));
+    let loner = archived.iter().find(|job| job.id == loner_id).unwrap();
+    assert_eq!(
+        (loner.workflow_id, loner.workflow_name.as_deref()),
+        (None, None)
+    );
+}
+
 /// #111 (2): an archived failure counts as a failure.
 async fn archived_failures_fail_their_workflow<Q>(queue: Arc<Q>)
 where
@@ -648,6 +683,7 @@ crate::test_utils::backend_tests!(
         archived_jobs_keep_their_times,
         archiving_uses_the_database_clock,
         archived_members_count_towards_their_workflow,
+        archived_jobs_list_their_workflow,
         archived_failures_fail_their_workflow,
         spawned_children_raise_workflow_total,
         dependency_limit_is_enforced,
@@ -666,6 +702,7 @@ crate::test_utils::backend_tests!(
         archived_jobs_keep_their_times,
         archiving_uses_the_database_clock,
         archived_members_count_towards_their_workflow,
+        archived_jobs_list_their_workflow,
         archived_failures_fail_their_workflow,
         spawned_children_raise_workflow_total,
         dependency_limit_is_enforced,
@@ -684,6 +721,7 @@ crate::test_utils::backend_tests!(
         archived_jobs_keep_their_times,
         archiving_uses_the_database_clock,
         archived_members_count_towards_their_workflow,
+        archived_jobs_list_their_workflow,
         archived_failures_fail_their_workflow,
         spawned_children_raise_workflow_total,
         dependency_limit_is_enforced,

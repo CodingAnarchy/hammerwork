@@ -6,7 +6,6 @@
 
 mod test_utils;
 
-use chrono::Utc;
 use hammerwork::migrations::{Migration, MigrationManager, MigrationRunner};
 
 /// How many runs race each other.
@@ -16,12 +15,11 @@ const RUNS: usize = 6;
 /// not wait for the others would replay it and fail.
 fn probe_migration() -> (Migration, String) {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let migration = Migration {
-        id: format!("900_lock_probe_{suffix}"),
-        description: "Concurrency probe (test only)".to_string(),
-        version: 900_000,
-        created_at: Utc::now(),
-    };
+    let migration = Migration::new(
+        format!("900_lock_probe_{suffix}"),
+        "Concurrency probe (test only)",
+        900_000,
+    );
     (migration, format!("hw_lock_probe_{suffix}"))
 }
 

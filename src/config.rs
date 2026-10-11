@@ -268,6 +268,7 @@ mod chrono_duration_days_option {
 ///     .with_job_timeout(std::time::Duration::from_secs(300));
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct HammerworkConfig {
     /// Database configuration
     pub database: DatabaseConfig,
@@ -467,6 +468,7 @@ impl HammerworkConfig {
 ///
 /// `Debug` shows `url` with its password replaced by `***` ([`redact_url`]).
 #[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DatabaseConfig {
     /// Database connection URL
     pub url: String,
@@ -572,6 +574,7 @@ impl Default for DatabaseConfig {
 
 /// Worker configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WorkerConfig {
     /// Number of workers in the pool
     pub pool_size: usize,
@@ -704,6 +707,7 @@ impl WorkerConfig {
 /// Webhook configurations container
 #[cfg(feature = "webhooks")]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct WebhookConfigs {
     /// List of configured webhooks
     pub webhooks: Vec<WebhookConfig>,
@@ -715,6 +719,7 @@ pub struct WebhookConfigs {
 /// Global webhook settings
 #[cfg(feature = "webhooks")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WebhookGlobalSettings {
     /// Maximum concurrent webhook deliveries
     pub max_concurrent_deliveries: usize,
@@ -771,6 +776,7 @@ impl Default for WebhookGlobalSettings {
     feature = "kinesis"
 ))]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct StreamingConfigs {
     /// List of configured streams
     pub streams: Vec<StreamConfig>,
@@ -782,6 +788,7 @@ pub struct StreamingConfigs {
 /// Simple event filter for when webhooks feature is disabled
 #[cfg(not(feature = "webhooks"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SimpleEventFilter {
     /// Event types to include
     pub event_types: Vec<String>,
@@ -812,6 +819,7 @@ impl Default for SimpleEventFilter {
     feature = "kinesis"
 ))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StreamingGlobalSettings {
     /// Maximum concurrent stream processors
     pub max_concurrent_processors: usize,
@@ -854,6 +862,7 @@ fn default_archive_check_interval() -> StdDuration {
 /// `delete_after`, every `check_interval` (see
 /// [`WorkerPool::with_archival`](crate::WorkerPool::with_archival)).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ArchiveConfig {
     /// Whether automatic archiving is enabled
     pub enabled: bool,
@@ -929,6 +938,7 @@ impl Default for ArchiveConfig {
 
 /// Rate limiting configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct RateLimitingConfig {
     /// Whether rate limiting is enabled
     pub enabled: bool,
@@ -967,6 +977,7 @@ type LoggingSubscriber =
 /// [`LoggingConfig::try_init`] (for example `config.logging.try_init()?`) once at
 /// startup to apply this section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LoggingConfig {
     /// Log filter: a level (trace, debug, info, warn, error) or any
     /// [`EnvFilter`](tracing_subscriber::EnvFilter) directive, such as
@@ -1236,6 +1247,7 @@ impl std::fmt::Display for KeySourceRef {
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct PayloadEncryptionConfig {
     /// Whether the queue encrypts payloads.
     pub enabled: bool,
@@ -1287,6 +1299,7 @@ pub struct PayloadEncryptionConfig {
 /// Several processes can rotate at once: each due key gets exactly one new version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct KeyRotationConfig {
     /// Whether the worker pool rotates due keys (default `false`).
     pub enabled: bool,
@@ -1637,6 +1650,192 @@ impl HammerworkConfig {
     pub fn add_stream(mut self, stream: StreamConfig) -> Self {
         self.streaming.streams.push(stream);
         self
+    }
+}
+
+// Builders for the `#[non_exhaustive]` configuration sections. Start from `default()`
+// (or `HammerworkConfig::new()`) and chain these instead of writing struct literals.
+
+with_setters! {
+    HammerworkConfig {
+        with_database(database): DatabaseConfig,
+        with_worker(worker): WorkerConfig,
+        with_events(events): EventConfig,
+        #[cfg(feature = "webhooks")]
+        with_webhooks(webhooks): WebhookConfigs,
+        #[cfg(any(
+            feature = "streaming",
+            feature = "kafka",
+            feature = "google-pubsub",
+            feature = "kinesis"
+        ))]
+        with_streaming(streaming): StreamingConfigs,
+        #[cfg(feature = "alerting")]
+        with_alerting(alerting): AlertingConfig,
+        #[cfg(feature = "metrics")]
+        with_metrics(metrics): MetricsConfig,
+        with_archive(archive): ArchiveConfig,
+        with_rate_limiting(rate_limiting): RateLimitingConfig,
+        with_logging(logging): LoggingConfig,
+        with_encryption(encryption): PayloadEncryptionConfig,
+    }
+}
+
+with_setters! {
+    DatabaseConfig {
+        with_url(url): Into(String),
+        with_pool_size(pool_size): u32,
+        with_connection_timeout_secs(connection_timeout_secs): u64,
+        with_auto_migrate(auto_migrate): bool,
+    }
+}
+
+with_setters! {
+    WorkerConfig {
+        with_pool_size(pool_size): usize,
+        with_polling_interval(polling_interval): StdDuration,
+        with_job_timeout(job_timeout): StdDuration,
+        with_priority_weights(priority_weights): PriorityWeights,
+        with_retry_strategy(retry_strategy): RetryStrategy,
+        with_autoscaling_enabled(autoscaling_enabled): bool,
+        with_min_workers(min_workers): usize,
+        with_max_workers(max_workers): usize,
+        with_result_cleanup_enabled(result_cleanup_enabled): bool,
+        with_result_cleanup_interval(result_cleanup_interval): StdDuration,
+        with_batch_size(batch_size): Some(usize),
+        with_batch_concurrency(batch_concurrency): Some(usize),
+    }
+}
+
+#[cfg(feature = "webhooks")]
+with_setters! {
+    WebhookConfigs {
+        with_webhooks(webhooks): Vec<WebhookConfig>,
+        with_global_settings(global_settings): WebhookGlobalSettings,
+    }
+}
+
+#[cfg(feature = "webhooks")]
+with_setters! {
+    WebhookGlobalSettings {
+        with_max_concurrent_deliveries(max_concurrent_deliveries): usize,
+        with_max_response_body_size(max_response_body_size): usize,
+        with_log_deliveries(log_deliveries): bool,
+        with_user_agent(user_agent): Into(String),
+        with_default_timeout_secs(default_timeout_secs): u64,
+        with_max_pending_deliveries(max_pending_deliveries): usize,
+    }
+}
+
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
+with_setters! {
+    StreamingConfigs {
+        with_streams(streams): Vec<StreamConfig>,
+        with_global_settings(global_settings): StreamingGlobalSettings,
+    }
+}
+
+#[cfg(any(
+    feature = "streaming",
+    feature = "kafka",
+    feature = "google-pubsub",
+    feature = "kinesis"
+))]
+with_setters! {
+    StreamingGlobalSettings {
+        with_max_concurrent_processors(max_concurrent_processors): usize,
+        with_log_operations(log_operations): bool,
+        with_global_flush_interval_secs(global_flush_interval_secs): u64,
+    }
+}
+
+#[cfg(not(feature = "webhooks"))]
+with_setters! {
+    SimpleEventFilter {
+        with_event_types(event_types): Vec<String>,
+        with_queue_names(queue_names): Vec<String>,
+        with_include_payload(include_payload): bool,
+    }
+}
+
+with_setters! {
+    ArchiveConfig {
+        with_enabled(enabled): bool,
+        with_compression_level(compression_level): u32,
+        with_archive_after(archive_after): Duration,
+        with_delete_after(delete_after): Some(Duration),
+        with_check_interval(check_interval): StdDuration,
+    }
+}
+
+with_setters! {
+    RateLimitingConfig {
+        with_enabled(enabled): bool,
+        with_default_throttle(default_throttle): ThrottleConfig,
+        with_queue_throttles(queue_throttles): HashMap<String, ThrottleConfig>,
+    }
+}
+
+impl RateLimitingConfig {
+    /// Adds (or replaces) the throttle of one queue in
+    /// [`queue_throttles`](Self::queue_throttles).
+    #[must_use]
+    pub fn with_queue_throttle(
+        mut self,
+        queue_name: impl Into<String>,
+        throttle: ThrottleConfig,
+    ) -> Self {
+        self.queue_throttles.insert(queue_name.into(), throttle);
+        self
+    }
+}
+
+with_setters! {
+    LoggingConfig {
+        with_level(level): Into(String),
+        with_json_format(json_format): bool,
+        with_include_location(include_location): bool,
+        with_enable_tracing(enable_tracing): bool,
+        with_tracing_endpoint(tracing_endpoint): Some(String),
+        with_service_name(service_name): Into(String),
+    }
+}
+
+with_setters! {
+    PayloadEncryptionConfig {
+        with_enabled(enabled): bool,
+        with_algorithm(algorithm): PayloadEncryptionAlgorithm,
+        with_key_source(key_source): KeySourceRef,
+        with_key_id(key_id): Some(String),
+        with_compression(compression): bool,
+        with_default_retention_secs(default_retention_secs): Some(u64),
+        with_purge_interval_secs(purge_interval_secs): Some(u64),
+        with_encrypted_queues(encrypted_queues): Vec<String>,
+        with_key_rotation(key_rotation): KeyRotationConfig,
+    }
+}
+
+impl PayloadEncryptionConfig {
+    /// Adds (or replaces) a key in [`decryption_keys`](Self::decryption_keys), for
+    /// payloads sealed under an earlier `key_id`.
+    #[must_use]
+    pub fn with_decryption_key(mut self, key_id: impl Into<String>, source: KeySourceRef) -> Self {
+        self.decryption_keys.insert(key_id.into(), source);
+        self
+    }
+}
+
+with_setters! {
+    KeyRotationConfig {
+        with_enabled(enabled): bool,
+        with_master_key_source(master_key_source): KeySourceRef,
+        with_check_interval_secs(check_interval_secs): u64,
+        with_max_key_versions(max_key_versions): u32,
     }
 }
 
@@ -2874,5 +3073,184 @@ retry_strategy = { type = "Fixed", duration_ms = 1000 }
             config.master_key_source,
             KeySource::Environment("ROTATION_MASTER".to_string())
         );
+    }
+
+    /// #81: every configuration section can be built from its default with `with_*`
+    /// setters (the structs are `#[non_exhaustive]`).
+    #[test]
+    fn test_section_builders_set_their_fields() {
+        let worker = WorkerConfig::default()
+            .with_pool_size(8)
+            .with_polling_interval(StdDuration::from_millis(250))
+            .with_job_timeout(StdDuration::from_secs(60))
+            .with_retry_strategy(RetryStrategy::fixed(StdDuration::from_secs(5)))
+            .with_autoscaling_enabled(true)
+            .with_min_workers(2)
+            .with_max_workers(16)
+            .with_result_cleanup_enabled(false)
+            .with_result_cleanup_interval(StdDuration::from_secs(120))
+            .with_batch_size(25)
+            .with_batch_concurrency(4);
+        assert_eq!(worker.pool_size, 8);
+        assert_eq!(worker.polling_interval, StdDuration::from_millis(250));
+        assert_eq!(worker.job_timeout, StdDuration::from_secs(60));
+        assert!(worker.autoscaling_enabled);
+        assert_eq!((worker.min_workers, worker.max_workers), (2, 16));
+        assert!(!worker.result_cleanup_enabled);
+        assert_eq!(worker.result_cleanup_interval, StdDuration::from_secs(120));
+        assert_eq!(
+            (worker.batch_size, worker.batch_concurrency),
+            (Some(25), Some(4))
+        );
+        worker.validate().unwrap();
+
+        let database = DatabaseConfig::default()
+            .with_url("postgres://localhost/jobs")
+            .with_pool_size(3)
+            .with_connection_timeout_secs(7)
+            .with_auto_migrate(true);
+        assert_eq!(database.url, "postgres://localhost/jobs");
+        assert_eq!(database.pool_size, 3);
+        assert_eq!(database.connection_timeout(), StdDuration::from_secs(7));
+        assert!(database.auto_migrate);
+
+        let archive = ArchiveConfig::default()
+            .with_enabled(true)
+            .with_compression_level(9)
+            .with_archive_after(Duration::days(2))
+            .with_delete_after(Duration::days(30))
+            .with_check_interval(StdDuration::from_secs(600));
+        assert!(archive.enabled);
+        assert_eq!(archive.compression_level, 9);
+        assert_eq!(archive.archive_after, Duration::days(2));
+        assert_eq!(archive.delete_after, Some(Duration::days(30)));
+        assert_eq!(archive.check_interval, StdDuration::from_secs(600));
+
+        let throttle = ThrottleConfig::new().max_concurrent(2);
+        let rate_limiting = RateLimitingConfig::default()
+            .with_enabled(true)
+            .with_default_throttle(ThrottleConfig::new().rate_per_minute(60))
+            .with_queue_throttle("emails", throttle.clone());
+        assert!(rate_limiting.enabled);
+        assert_eq!(rate_limiting.default_throttle.rate_per_minute, Some(60));
+        assert_eq!(
+            rate_limiting.throttle_for("emails").unwrap().max_concurrent,
+            Some(2)
+        );
+
+        let logging = LoggingConfig::default()
+            .with_level("debug")
+            .with_json_format(true)
+            .with_include_location(true)
+            .with_enable_tracing(true)
+            .with_tracing_endpoint("http://otel:4317".to_string())
+            .with_service_name("billing");
+        assert_eq!(logging.level, "debug");
+        assert!(logging.json_format && logging.include_location && logging.enable_tracing);
+        assert_eq!(
+            logging.tracing_endpoint.as_deref(),
+            Some("http://otel:4317")
+        );
+        assert_eq!(logging.service_name, "billing");
+
+        let rotation = KeyRotationConfig::default()
+            .with_enabled(true)
+            .with_master_key_source(KeySourceRef::parse("env://MASTER").unwrap())
+            .with_check_interval_secs(30)
+            .with_max_key_versions(4);
+        let encryption = PayloadEncryptionConfig::default()
+            .with_enabled(true)
+            .with_algorithm(PayloadEncryptionAlgorithm::ChaCha20Poly1305)
+            .with_key_source(KeySourceRef::parse("env://PAYLOAD_KEY").unwrap())
+            .with_key_id("k2".to_string())
+            .with_compression(true)
+            .with_default_retention_secs(3600)
+            .with_purge_interval_secs(60)
+            .with_encrypted_queues(vec!["payments".to_string()])
+            .with_decryption_key("k1", KeySourceRef::parse("env://OLD_KEY").unwrap())
+            .with_key_rotation(rotation.clone());
+        assert!(encryption.enabled && encryption.compression);
+        assert_eq!(
+            encryption.algorithm,
+            PayloadEncryptionAlgorithm::ChaCha20Poly1305
+        );
+        assert_eq!(encryption.key_source.as_str(), "env://PAYLOAD_KEY");
+        assert_eq!(encryption.key_id.as_deref(), Some("k2"));
+        assert_eq!(encryption.default_retention_secs, Some(3600));
+        assert_eq!(
+            encryption.purge_interval(),
+            Some(StdDuration::from_secs(60))
+        );
+        assert!(encryption.encrypts_queue("payments"));
+        assert_eq!(encryption.decryption_keys["k1"].as_str(), "env://OLD_KEY");
+        assert_eq!(encryption.key_rotation, rotation);
+
+        let events = EventConfig::default()
+            .with_max_buffer_size(10)
+            .with_include_payload_default(true)
+            .with_max_payload_size_bytes(1024)
+            .with_log_events(true);
+
+        let config = HammerworkConfig::new()
+            .with_database(database.clone())
+            .with_worker(worker.clone())
+            .with_events(events)
+            .with_archive(archive)
+            .with_rate_limiting(rate_limiting)
+            .with_logging(logging)
+            .with_encryption(encryption);
+        assert_eq!(config.database.url, database.url);
+        assert_eq!(config.worker.batch_size, Some(25));
+        assert_eq!(config.events.max_buffer_size, 10);
+        assert!(config.events.include_payload_default);
+        assert!(config.archive.enabled);
+        assert!(config.rate_limiting.enabled);
+        assert_eq!(config.logging.service_name, "billing");
+        assert!(config.encryption.enabled);
+    }
+
+    #[cfg(feature = "webhooks")]
+    #[test]
+    fn test_webhook_section_builders() {
+        let settings = WebhookGlobalSettings::default()
+            .with_max_concurrent_deliveries(5)
+            .with_max_response_body_size(512)
+            .with_log_deliveries(false)
+            .with_user_agent("acme/1.0")
+            .with_default_timeout_secs(9)
+            .with_max_pending_deliveries(50);
+        let webhooks = WebhookConfigs::default()
+            .with_webhooks(vec![WebhookConfig::new(
+                "hook".to_string(),
+                "https://example.com/hook".to_string(),
+            )])
+            .with_global_settings(settings);
+        let manager: crate::webhooks::WebhookManagerConfig = (&webhooks.global_settings).into();
+        assert_eq!(manager.max_concurrent_deliveries, 5);
+        assert_eq!(manager.max_response_body_size, 512);
+        assert!(!manager.log_deliveries);
+        assert_eq!(manager.user_agent, "acme/1.0");
+        assert_eq!(manager.default_timeout_secs, 9);
+        assert_eq!(manager.max_pending_deliveries, 50);
+        let config = HammerworkConfig::new().with_webhooks(webhooks);
+        assert_eq!(config.webhooks.webhooks.len(), 1);
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn test_streaming_section_builders() {
+        let settings = StreamingGlobalSettings::default()
+            .with_max_concurrent_processors(3)
+            .with_log_operations(false)
+            .with_global_flush_interval_secs(2);
+        let streaming = StreamingConfigs::default()
+            .with_streams(vec![StreamConfig::default()])
+            .with_global_settings(settings);
+        assert_eq!(streaming.streams.len(), 1);
+        assert_eq!(streaming.global_settings.max_concurrent_processors, 3);
+        assert!(!streaming.global_settings.log_operations);
+        assert_eq!(streaming.global_settings.global_flush_interval_secs, 2);
+        let config = HammerworkConfig::new().with_streaming(streaming);
+        assert_eq!(config.streaming.streams.len(), 1);
     }
 }
