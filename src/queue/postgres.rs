@@ -3,7 +3,13 @@
 //! This module provides the PostgreSQL-specific implementation of the `DatabaseQueue` trait,
 //! optimized for PostgreSQL's JSONB and advanced querying capabilities.
 
-use super::lifecycle::{self, Guard, ParentState, Target, TransitionResult};
+use super::lifecycle::{
+    self, Guard, LockedWorkflow, ParentState, Target, TransitionResult, TransitionStore,
+};
+use super::row::{
+    self, ARCHIVED_JOB_FIELDS, ENCRYPTION_COLUMNS, INSERT_JOB_COLUMNS, JOB_SELECT_FIELDS,
+    result_storage_str,
+};
 use super::{
     DatabaseQueue, DeadJobSummary, JobOutcome, JobTransition, QueueStats, RecordedOutcome,
 };
@@ -84,30 +90,6 @@ pub(crate) struct JobRow {
     #[cfg(feature = "encryption")]
     pub encrypted_at: Option<DateTime<Utc>>,
 }
-
-/// Standard field list for selecting complete job data from hammerwork_jobs table.
-const JOB_SELECT_FIELDS: &str = "id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_data, result_stored_at, result_expires_at, result_storage_type, result_ttl_seconds, result_max_size_bytes, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context, retry_strategy, is_encrypted, encryption_key_id, encryption_algorithm, encrypted_payload, encryption_nonce, encryption_tag, encryption_metadata, payload_hash, pii_fields, retention_policy, retention_delete_at, encrypted_at";
-
-/// Columns of hammerwork_jobs_archive needed to rebuild a [`Job`].
-const ARCHIVED_JOB_FIELDS: &str = "id, queue_name, payload, payload_compressed, status, priority, attempts, max_attempts, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, result, result_ttl, retry_strategy, timeout_seconds, cron_schedule, next_run_at, recurring, timezone, batch_id, depends_on, dependency_status, result_config, trace_id, correlation_id, parent_span_id, span_context, is_encrypted, pii_fields";
-
-/// Encryption columns of hammerwork_jobs and hammerwork_jobs_archive (migration 011).
-/// Archiving and restoring copy them between the tables in SQL, so encrypted payloads
-/// move without being decrypted, with or without the `encryption` feature.
-const ENCRYPTION_COLUMNS: [&str; 12] = [
-    "is_encrypted",
-    "encryption_key_id",
-    "encryption_algorithm",
-    "encrypted_payload",
-    "encryption_nonce",
-    "encryption_tag",
-    "encryption_metadata",
-    "payload_hash",
-    "pii_fields",
-    "retention_policy",
-    "retention_delete_at",
-    "encrypted_at",
-];
 
 /// Copies the encryption columns of the jobs `ids` from table `from` to table `to`.
 async fn copy_encryption_columns(
@@ -211,40 +193,17 @@ fn archived_job_from_row(row: &sqlx::postgres::PgRow) -> Result<Job> {
 }
 
 impl JobRow {
-    pub fn into_job(self) -> Result<Job> {
-        // Extract encryption data before moving self
+    pub fn into_job(mut self) -> Result<Job> {
+        let pii_fields = self.pii_fields.take().unwrap_or_default();
         #[cfg(feature = "encryption")]
-        let encryption_config = self.build_encryption_config()?;
-        #[cfg(feature = "encryption")]
-        let retention_policy = self.parse_retention_policy()?;
-        #[cfg(feature = "encryption")]
-        let encrypted_payload = self.build_encrypted_payload()?;
-        let pii_fields = self.pii_fields.unwrap_or_default();
+        let (encryption_config, retention_policy, encrypted_payload) =
+            self.encryption_row(&pii_fields).decode()?;
 
         Ok(Job {
             id: self.id,
             queue_name: self.queue_name,
             payload: self.payload,
-            status: {
-                // Handle both quoted (old format) and unquoted (new format) status values
-                let cleaned_str = self.status.trim_matches('"');
-                match cleaned_str {
-                    "Pending" => JobStatus::Pending,
-                    "Running" => JobStatus::Running,
-                    "Completed" => JobStatus::Completed,
-                    "Failed" => JobStatus::Failed,
-                    "Dead" => JobStatus::Dead,
-                    "TimedOut" => JobStatus::TimedOut,
-                    "Retrying" => JobStatus::Retrying,
-                    "Archived" => JobStatus::Archived,
-                    _ => {
-                        return Err(crate::error::HammerworkError::Processing(format!(
-                            "Unknown job status: {}",
-                            cleaned_str
-                        )));
-                    }
-                }
-            },
+            status: row::job_status_from_row(&self.status)?,
             priority: JobPriority::from_i32(self.priority).unwrap_or(JobPriority::Normal),
             attempts: self.attempts,
             max_attempts: self.max_attempts,
@@ -265,16 +224,7 @@ impl JobRow {
             timezone: self.timezone,
             batch_id: self.batch_id,
             result_config: crate::job::ResultConfig {
-                storage: self
-                    .result_storage_type
-                    .as_ref()
-                    .map(|s| match s.as_str() {
-                        "database" => crate::job::ResultStorage::Database,
-                        "memory" => crate::job::ResultStorage::Memory,
-                        "none" => crate::job::ResultStorage::None,
-                        _ => crate::job::ResultStorage::None,
-                    })
-                    .unwrap_or(crate::job::ResultStorage::None),
+                storage: row::result_storage_from_db(self.result_storage_type.as_deref()),
                 ttl: self
                     .result_ttl_seconds
                     .map(|s| super::db_seconds(s, "result_ttl_seconds"))
@@ -290,12 +240,7 @@ impl JobRow {
             retry_strategy: super::retry_strategy_from_json(self.retry_strategy)?,
             depends_on: self.depends_on,
             dependents: self.dependents,
-            dependency_status: self
-                .dependency_status
-                .as_deref()
-                .map(crate::workflow::DependencyStatus::parse_from_db)
-                .transpose()?
-                .unwrap_or(crate::workflow::DependencyStatus::None),
+            dependency_status: row::dependency_status_from_row(self.dependency_status.as_deref())?,
             workflow_id: self.workflow_id,
             workflow_name: self.workflow_name,
             trace_id: self.trace_id,
@@ -313,235 +258,24 @@ impl JobRow {
         })
     }
 
-    /// Builds an EncryptionConfig from database fields if encryption is enabled.
+    /// The encryption columns, for [`row::EncryptionRow::decode`].
     #[cfg(feature = "encryption")]
-    fn build_encryption_config(&self) -> Result<Option<crate::encryption::EncryptionConfig>> {
-        if !self.is_encrypted {
-            return Ok(None);
+    fn encryption_row<'a>(&'a self, pii_fields: &'a [String]) -> row::EncryptionRow<'a> {
+        row::EncryptionRow {
+            is_encrypted: self.is_encrypted,
+            created_at: self.created_at,
+            encryption_key_id: self.encryption_key_id.as_deref(),
+            encryption_algorithm: self.encryption_algorithm.as_deref(),
+            encrypted_payload: self.encrypted_payload.as_deref(),
+            encryption_nonce: self.encryption_nonce.as_deref(),
+            encryption_tag: self.encryption_tag.as_deref(),
+            encryption_metadata: self.encryption_metadata.as_ref(),
+            payload_hash: self.payload_hash.as_deref(),
+            pii_fields,
+            retention_policy: self.retention_policy.as_deref(),
+            retention_delete_at: self.retention_delete_at,
+            encrypted_at: self.encrypted_at,
         }
-
-        // Parse algorithm
-        let algorithm = match self.encryption_algorithm.as_deref() {
-            Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
-            Some("ChaCha20Poly1305") => crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305,
-            Some(alg) => {
-                return Err(crate::HammerworkError::Processing(format!(
-                    "Unknown encryption algorithm: {}",
-                    alg
-                )));
-            }
-            None => {
-                return Err(crate::HammerworkError::Processing(
-                    "Missing encryption algorithm for encrypted job".to_string(),
-                ));
-            }
-        };
-
-        // Parse metadata if available
-        let (key_id, compression_enabled, version) =
-            if let Some(metadata) = &self.encryption_metadata {
-                let key_id = metadata
-                    .get("key_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let compression_enabled = metadata
-                    .get("compressed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let version = metadata
-                    .get("config_version")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as u32;
-                (key_id, compression_enabled, version)
-            } else {
-                (self.encryption_key_id.clone(), false, 1)
-            };
-
-        let config = crate::encryption::EncryptionConfig {
-            algorithm,
-            key_source: crate::encryption::KeySource::External(
-                key_id.unwrap_or_else(|| "unknown".to_string()),
-            ),
-            key_rotation_enabled: false, // Not stored in database
-            key_rotation_interval: None,
-            default_retention: None, // Will be parsed separately
-            compression_enabled,
-            key_id: self.encryption_key_id.clone(),
-            version,
-        };
-
-        Ok(Some(config))
-    }
-
-    /// Parses the retention policy from the database string.
-    #[cfg(feature = "encryption")]
-    fn parse_retention_policy(&self) -> Result<Option<crate::encryption::RetentionPolicy>> {
-        match self.retention_policy.as_deref() {
-            None => Ok(None),
-            Some("KeepIndefinitely") => {
-                Ok(Some(crate::encryption::RetentionPolicy::KeepIndefinitely))
-            }
-            Some("DeleteImmediately") => {
-                Ok(Some(crate::encryption::RetentionPolicy::DeleteImmediately))
-            }
-            Some("UseDefault") => Ok(Some(crate::encryption::RetentionPolicy::UseDefault)),
-            Some(policy_str) => {
-                // Handle DeleteAfter and DeleteAt policies
-                if let Some(delete_at) = self.retention_delete_at {
-                    if policy_str == "DeleteAt" {
-                        Ok(Some(crate::encryption::RetentionPolicy::DeleteAt(
-                            delete_at,
-                        )))
-                    } else if policy_str == "DeleteAfter" {
-                        // Calculate duration from creation to deletion time
-                        let duration = delete_at.signed_duration_since(self.created_at);
-                        if let Ok(std_duration) = duration.to_std() {
-                            Ok(Some(crate::encryption::RetentionPolicy::DeleteAfter(
-                                std_duration,
-                            )))
-                        } else {
-                            Ok(Some(crate::encryption::RetentionPolicy::UseDefault))
-                        }
-                    } else {
-                        Err(crate::HammerworkError::Processing(format!(
-                            "Unknown retention policy: {}",
-                            policy_str
-                        )))
-                    }
-                } else {
-                    Err(crate::HammerworkError::Processing(format!(
-                        "Retention policy '{}' requires retention_delete_at timestamp",
-                        policy_str
-                    )))
-                }
-            }
-        }
-    }
-
-    /// Builds an EncryptedPayload from database fields if the job is encrypted.
-    #[cfg(feature = "encryption")]
-    fn build_encrypted_payload(&self) -> Result<Option<crate::encryption::EncryptedPayload>> {
-        if !self.is_encrypted {
-            return Ok(None);
-        }
-
-        let encrypted_data = self.encrypted_payload.as_ref().ok_or_else(|| {
-            crate::HammerworkError::Processing(
-                "Missing encrypted payload for encrypted job".to_string(),
-            )
-        })?;
-
-        let nonce = self.encryption_nonce.as_ref().ok_or_else(|| {
-            crate::HammerworkError::Processing(
-                "Missing encryption nonce for encrypted job".to_string(),
-            )
-        })?;
-
-        let tag = self.encryption_tag.as_ref().ok_or_else(|| {
-            crate::HammerworkError::Processing(
-                "Missing encryption tag for encrypted job".to_string(),
-            )
-        })?;
-
-        // Parse metadata
-        let metadata = if let Some(metadata_json) = &self.encryption_metadata {
-            // Build metadata from JSON
-            let algorithm = match self.encryption_algorithm.as_deref() {
-                Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
-                Some("ChaCha20Poly1305") => {
-                    crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305
-                }
-                _ => crate::encryption::EncryptionAlgorithm::AES256GCM, // Default fallback
-            };
-
-            let key_id = metadata_json
-                .get("key_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| self.encryption_key_id.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let config_version = metadata_json
-                .get("config_version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
-
-            let compressed = metadata_json
-                .get("compressed")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            let encrypted_fields = metadata_json
-                .get("encrypted_fields")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_else(|| self.pii_fields.clone().unwrap_or_default());
-
-            let retention_policy = self
-                .parse_retention_policy()?
-                .unwrap_or(crate::encryption::RetentionPolicy::UseDefault);
-
-            let encrypted_at = self.encrypted_at.unwrap_or(self.created_at);
-
-            crate::encryption::EncryptionMetadata {
-                algorithm,
-                key_id,
-                config_version,
-                compressed,
-                encrypted_fields,
-                retention_policy,
-                encrypted_at,
-                delete_at: self.retention_delete_at,
-                payload_hash: self.payload_hash.clone().unwrap_or_default(),
-                format_version: crate::encryption::EncryptionMetadata::format_version_from_json(
-                    metadata_json,
-                ),
-            }
-        } else {
-            // Build basic metadata from available fields
-            let algorithm = match self.encryption_algorithm.as_deref() {
-                Some("AES256GCM") => crate::encryption::EncryptionAlgorithm::AES256GCM,
-                Some("ChaCha20Poly1305") => {
-                    crate::encryption::EncryptionAlgorithm::ChaCha20Poly1305
-                }
-                _ => crate::encryption::EncryptionAlgorithm::AES256GCM, // Default fallback
-            };
-
-            crate::encryption::EncryptionMetadata {
-                algorithm,
-                key_id: self
-                    .encryption_key_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                config_version: 1,
-                compressed: false,
-                encrypted_fields: self.pii_fields.clone().unwrap_or_default(),
-                retention_policy: self
-                    .parse_retention_policy()?
-                    .unwrap_or(crate::encryption::RetentionPolicy::UseDefault),
-                encrypted_at: self.encrypted_at.unwrap_or(self.created_at),
-                delete_at: self.retention_delete_at,
-                payload_hash: self.payload_hash.clone().unwrap_or_default(),
-                format_version: crate::encryption::EncryptionMetadata::FORMAT_UNBOUND,
-            }
-        };
-
-        // Encode binary data to base64
-        use base64::Engine;
-        let ciphertext = base64::engine::general_purpose::STANDARD.encode(encrypted_data);
-        let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce);
-        let tag_b64 = base64::engine::general_purpose::STANDARD.encode(tag);
-
-        Ok(Some(crate::encryption::EncryptedPayload {
-            ciphertext,
-            nonce: nonce_b64,
-            tag: tag_b64,
-            metadata,
-        }))
     }
 }
 
@@ -740,33 +474,31 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
-        let transition = JobTransition::Complete;
-        self.transition_job(job_id, Guard::Manual(transition), &Target::Completed, false)
-            .await?
-            .into_manual(job_id, transition)?;
-        Ok(())
+        lifecycle::manual_transition(self, job_id, JobTransition::Complete, Target::Completed).await
     }
 
     async fn fail_job(&self, job_id: JobId, error_message: &str) -> Result<()> {
-        let transition = JobTransition::Fail;
-        let target = Target::Failed(error_message.to_string());
-        self.transition_job(job_id, Guard::Manual(transition), &target, false)
-            .await?
-            .into_manual(job_id, transition)?;
-        Ok(())
+        lifecycle::manual_transition(
+            self,
+            job_id,
+            JobTransition::Fail,
+            Target::Failed(error_message.to_string()),
+        )
+        .await
     }
 
     async fn retry_job(&self, job_id: JobId, retry_at: DateTime<Utc>) -> Result<()> {
-        let transition = JobTransition::Retry;
-        let target = Target::Retry {
-            retry_at,
-            error: None,
-            timed_out: false,
-        };
-        self.transition_job(job_id, Guard::Manual(transition), &target, false)
-            .await?
-            .into_manual(job_id, transition)?;
-        Ok(())
+        lifecycle::manual_transition(
+            self,
+            job_id,
+            JobTransition::Retry,
+            Target::Retry {
+                retry_at,
+                error: None,
+                timed_out: false,
+            },
+        )
+        .await
     }
 
     async fn finish_job_run(
@@ -774,11 +506,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         run: &Job,
         outcome: JobOutcome,
     ) -> Result<Option<RecordedOutcome>> {
-        let target = Target::from(outcome);
-        Ok(self
-            .transition_job(run.id, Guard::Run(run), &target, true)
-            .await?
-            .into_run())
+        lifecycle::finish_run(self, run, outcome).await
     }
 
     async fn complete_job_run_with_children(
@@ -792,7 +520,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         super::retry_on_conflict(|| async {
             let mut tx = self.pool.begin().await?;
             let result = async {
-                let transition = Self::transition_in_tx(
+                let transition = lifecycle::transition_in_tx::<Self>(
                     &mut tx,
                     run.id,
                     Guard::Run(run),
@@ -996,21 +724,23 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
     }
 
     async fn mark_job_dead(&self, job_id: JobId, error_message: &str) -> Result<()> {
-        let transition = JobTransition::MarkDead;
-        let target = Target::Dead(error_message.to_string());
-        self.transition_job(job_id, Guard::Manual(transition), &target, false)
-            .await?
-            .into_manual(job_id, transition)?;
-        Ok(())
+        lifecycle::manual_transition(
+            self,
+            job_id,
+            JobTransition::MarkDead,
+            Target::Dead(error_message.to_string()),
+        )
+        .await
     }
 
     async fn mark_job_timed_out(&self, job_id: JobId, error_message: &str) -> Result<()> {
-        let transition = JobTransition::MarkTimedOut;
-        let target = Target::TimedOut(error_message.to_string());
-        self.transition_job(job_id, Guard::Manual(transition), &target, false)
-            .await?
-            .into_manual(job_id, transition)?;
-        Ok(())
+        lifecycle::manual_transition(
+            self,
+            job_id,
+            JobTransition::MarkTimedOut,
+            Target::TimedOut(error_message.to_string()),
+        )
+        .await
     }
 
     async fn get_dead_jobs(&self, limit: Option<u32>, offset: Option<u32>) -> Result<Vec<Job>> {
@@ -2215,7 +1945,7 @@ impl crate::queue::JobQueue<Postgres> {
                     continue;
                 }
             };
-            Self::after_terminal(conn, &job, JobStatus::Dead, now, true).await?;
+            lifecycle::after_terminal::<Self>(conn, &job, JobStatus::Dead, now, true).await?;
         }
 
         Ok(recovery)
@@ -2234,19 +1964,8 @@ impl crate::queue::JobQueue<Postgres> {
     }
 }
 
-/// Columns written by [`insert_jobs`], in bind order.
-const INSERT_JOB_COLUMNS: &str = "id, queue_name, payload, status, priority, attempts, max_attempts, timeout_seconds, created_at, scheduled_at, started_at, completed_at, failed_at, timed_out_at, error_message, cron_schedule, next_run_at, recurring, timezone, batch_id, result_storage_type, result_ttl_seconds, result_max_size_bytes, retry_strategy, depends_on, dependents, dependency_status, workflow_id, workflow_name, trace_id, correlation_id, parent_span_id, span_context, is_encrypted, encryption_key_id, encryption_algorithm, encrypted_payload, encryption_nonce, encryption_tag, encryption_metadata, payload_hash, pii_fields, retention_policy, retention_delete_at, encrypted_at";
-
 /// Rows per multi-row INSERT; 45 binds per row stays below PostgreSQL's 65535.
 const INSERT_CHUNK_ROWS: usize = 1000;
-
-fn result_storage_str(storage: &crate::job::ResultStorage) -> &'static str {
-    match storage {
-        crate::job::ResultStorage::Database => "database",
-        crate::job::ResultStorage::Memory => "memory",
-        crate::job::ResultStorage::None => "none",
-    }
-}
 
 /// Insert `jobs` with every persisted field. Used by `enqueue`, `enqueue_batch`,
 /// `enqueue_workflow` and archive restore, so all of them store the same columns.
@@ -2471,17 +2190,25 @@ async fn insert_dependent_jobs(conn: &mut sqlx::PgConnection, jobs: &mut [Job]) 
     Ok(())
 }
 
-/// The locked `hammerwork_workflows` row of a job's workflow.
-struct LockedWorkflow {
-    id: uuid::Uuid,
-    policy: FailurePolicy,
-    status: WorkflowStatus,
-    total_jobs: usize,
-}
-
 /// Job lifecycle transitions and their side effects (dependencies, workflows, batches,
 /// cron). See [`crate::queue::lifecycle`].
-impl crate::queue::JobQueue<Postgres> {
+impl TransitionStore for crate::queue::JobQueue<Postgres> {
+    type Conn = sqlx::PgConnection;
+
+    async fn lock_job(conn: &mut sqlx::PgConnection, job_id: JobId) -> Result<Option<Job>> {
+        let row = sqlx::query_as::<_, JobRow>(&format!(
+            "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(job_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        row.map(JobRow::into_job).transpose()
+    }
+
+    async fn db_now(conn: &mut sqlx::PgConnection) -> Result<DateTime<Utc>> {
+        db_now(conn).await
+    }
+
     /// Apply `target` to a job if `guard` admits its current state, together with the
     /// side effects of the new state, in one transaction.
     async fn transition_job(
@@ -2495,52 +2222,6 @@ impl crate::queue::JobQueue<Postgres> {
             self.transition_job_once(job_id, guard, target, reschedule_recurring)
         })
         .await
-    }
-
-    async fn transition_job_once(
-        &self,
-        job_id: JobId,
-        guard: Guard<'_>,
-        target: &Target,
-        reschedule_recurring: bool,
-    ) -> Result<TransitionResult> {
-        let mut tx = self.pool.begin().await?;
-        let result =
-            Self::transition_in_tx(&mut tx, job_id, guard, target, reschedule_recurring).await;
-        super::end_transaction(tx, result).await
-    }
-
-    async fn transition_in_tx(
-        conn: &mut sqlx::PgConnection,
-        job_id: JobId,
-        guard: Guard<'_>,
-        target: &Target,
-        reschedule_recurring: bool,
-    ) -> Result<TransitionResult> {
-        let row = sqlx::query_as::<_, JobRow>(&format!(
-            "SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(job_id)
-        .fetch_optional(&mut *conn)
-        .await?;
-        let Some(row) = row else {
-            return Ok(TransitionResult::NotFound);
-        };
-        let job = row.into_job()?;
-        if !guard.admits(&job) {
-            return Ok(TransitionResult::Rejected(job.status));
-        }
-
-        let now = db_now(conn).await?;
-        let target = target.on_db_clock(&guard, now);
-        Self::write_target(conn, job_id, &target, now).await?;
-        let recorded = match target.terminal_status() {
-            Some(status) => {
-                Self::after_terminal(conn, &job, status, now, reschedule_recurring).await?
-            }
-            None => RecordedOutcome::new(JobStatus::Pending),
-        };
-        Ok(TransitionResult::Applied(recorded))
     }
 
     /// Write the new status and its timestamps. Clears the lease: the run is over.
@@ -2590,113 +2271,6 @@ impl crate::queue::JobQueue<Postgres> {
         };
         query.execute(&mut *conn).await?;
         Ok(())
-    }
-
-    /// Side effects of `job` reaching the terminal `status`.
-    ///
-    /// A recurring job (when `reschedule_recurring`) is rescheduled for its next run
-    /// instead. Otherwise dependents are resolved or failed, the workflow policy and
-    /// counters are applied, and the batch's failure mode and status.
-    async fn after_terminal(
-        conn: &mut sqlx::PgConnection,
-        job: &Job,
-        status: JobStatus,
-        now: DateTime<Utc>,
-        reschedule_recurring: bool,
-    ) -> Result<RecordedOutcome> {
-        if reschedule_recurring && job.recurring {
-            if let Some(next_run_at) = lifecycle::next_cron_run(job, now) {
-                Self::reschedule_after_run(conn, job.id, next_run_at, status).await?;
-                let mut recorded = RecordedOutcome::new(JobStatus::Pending);
-                recorded.next_run_at = Some(next_run_at);
-                return Ok(recorded);
-            }
-            tracing::warn!(
-                "Could not calculate the next run time for recurring job {}; it stays {}",
-                job.id,
-                status.as_str()
-            );
-        }
-
-        let mut recorded = RecordedOutcome::new(status);
-
-        // Lock the workflow row first: it serializes terminal transitions within a
-        // workflow, so concurrent completions cannot both miss each other.
-        let workflow = match job.workflow_id {
-            Some(id) => Self::lock_workflow(conn, id).await?,
-            None => None,
-        };
-
-        if status == JobStatus::Completed {
-            recorded.unblocked = Self::resolve_dependents(conn, job.id).await?;
-        } else {
-            recorded.cancelled =
-                Self::apply_failure_policy(conn, workflow.as_ref(), job.id, now).await?;
-        }
-
-        if let Some(workflow) = &workflow {
-            Self::refresh_workflow(conn, workflow, now).await?;
-        }
-        if let Some(batch_id) = job.batch_id {
-            let cancelled = Self::apply_batch_outcome(conn, batch_id, job.id, status, now).await?;
-            recorded.cancelled.extend(cancelled);
-        }
-        Ok(recorded)
-    }
-
-    /// Apply the [`FailurePolicy`] of `workflow` (the failed job's locked workflow, if
-    /// any) to the failure of `failed_job_id`. Returns the jobs that were failed.
-    ///
-    /// - `FailFast` fails the workflow's other `Pending` and `Retrying` jobs, then the
-    ///   jobs that (transitively) depend on the failed one;
-    /// - `ContinueOnFailure`, and jobs with dependencies outside any workflow, fail
-    ///   only the jobs that (transitively) depend on the failed one;
-    /// - `Manual` leaves the dependents waiting for an operator.
-    async fn apply_failure_policy(
-        conn: &mut sqlx::PgConnection,
-        workflow: Option<&LockedWorkflow>,
-        failed_job_id: JobId,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<JobId>> {
-        match workflow {
-            Some(w) if w.policy == FailurePolicy::Manual => Ok(Vec::new()),
-            Some(w) if w.policy == FailurePolicy::FailFast => {
-                let mut failed =
-                    Self::fail_workflow_pending(conn, w.id, failed_job_id, now).await?;
-                for id in Self::fail_dependents(conn, failed_job_id, now).await? {
-                    if !failed.contains(&id) {
-                        failed.push(id);
-                    }
-                }
-                Ok(failed)
-            }
-            _ => Self::fail_dependents(conn, failed_job_id, now).await,
-        }
-    }
-
-    /// [`DatabaseQueue::fail_job_dependencies`] in one transaction: lock the failed job
-    /// and its workflow (in the same order as a terminal transition), apply the
-    /// workflow's failure policy and update the workflow's counters and status.
-    async fn fail_job_dependencies_in_tx(
-        conn: &mut sqlx::PgConnection,
-        failed_job_id: JobId,
-    ) -> Result<Vec<JobId>> {
-        let workflow_id: Option<Option<uuid::Uuid>> =
-            sqlx::query_scalar("SELECT workflow_id FROM hammerwork_jobs WHERE id = $1 FOR UPDATE")
-                .bind(failed_job_id)
-                .fetch_optional(&mut *conn)
-                .await?;
-        let workflow = match workflow_id.flatten() {
-            Some(id) => Self::lock_workflow(conn, id).await?,
-            None => None,
-        };
-        let now = db_now(conn).await?;
-        let failed =
-            Self::apply_failure_policy(conn, workflow.as_ref(), failed_job_id, now).await?;
-        if let Some(workflow) = &workflow {
-            Self::refresh_workflow(conn, workflow, now).await?;
-        }
-        Ok(failed)
     }
 
     /// Put a recurring job back to `Pending` for its next run. A failed run's error and
@@ -2805,55 +2379,6 @@ impl crate::queue::JobQueue<Postgres> {
         .bind(&dependents)
         .fetch_all(&mut *conn)
         .await?)
-    }
-
-    /// Cancel a workflow: its unfinished jobs (pending, retrying and **running**) become
-    /// `Failed` with "Workflow cancelled", and the workflow `cancelled`.
-    ///
-    /// A running job keeps running in its worker (a handler cannot be interrupted), but
-    /// its outcome is discarded: `finish_job_run` only records outcomes for jobs that
-    /// are still `Running` the same run, and heartbeats stop extending the lease.
-    async fn cancel_workflow_in_tx(
-        conn: &mut sqlx::PgConnection,
-        workflow_id: crate::workflow::WorkflowId,
-    ) -> Result<()> {
-        // Serializes with the terminal transitions of the workflow's jobs.
-        Self::lock_workflow(conn, workflow_id).await?;
-        let now = db_now(conn).await?;
-        sqlx::query(&format!(
-            r#"
-            UPDATE hammerwork_jobs
-            SET status = 'Failed',
-                failed_at = $2,
-                error_message = $3,
-                dependency_status = CASE WHEN dependency_status = 'waiting'
-                                         THEN 'failed' ELSE dependency_status END,
-                last_heartbeat_at = NULL,
-                lease_expires_at = NULL
-            WHERE workflow_id = $1
-              AND status IN ({})
-            "#,
-            lifecycle::UNFINISHED_STATUS_SQL
-        ))
-        .bind(workflow_id)
-        .bind(now)
-        .bind(lifecycle::WORKFLOW_CANCELLED_MESSAGE)
-        .execute(&mut *conn)
-        .await?;
-
-        sqlx::query(
-            r#"
-            UPDATE hammerwork_workflows
-            SET status = 'cancelled',
-                failed_at = COALESCE(failed_at, $2)
-            WHERE id = $1
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(now)
-        .execute(&mut *conn)
-        .await?;
-        Ok(())
     }
 
     /// Fail every pending job that (transitively) depends on `failed_job_id`.
@@ -3062,6 +2587,91 @@ impl crate::queue::JobQueue<Postgres> {
         .execute(&mut *conn)
         .await?;
         Ok(cancelled)
+    }
+}
+
+impl crate::queue::JobQueue<Postgres> {
+    async fn transition_job_once(
+        &self,
+        job_id: JobId,
+        guard: Guard<'_>,
+        target: &Target,
+        reschedule_recurring: bool,
+    ) -> Result<TransitionResult> {
+        let mut tx = self.pool.begin().await?;
+        let result = lifecycle::transition_in_tx::<Self>(
+            &mut tx,
+            job_id,
+            guard,
+            target,
+            reschedule_recurring,
+        )
+        .await;
+        super::end_transaction(tx, result).await
+    }
+
+    /// [`DatabaseQueue::fail_job_dependencies`] in one transaction: lock the failed job
+    /// and its workflow (in the same order as a terminal transition), apply the
+    /// workflow's failure policy and update the workflow's counters and status.
+    async fn fail_job_dependencies_in_tx(
+        conn: &mut sqlx::PgConnection,
+        failed_job_id: JobId,
+    ) -> Result<Vec<JobId>> {
+        let workflow_id: Option<Option<uuid::Uuid>> =
+            sqlx::query_scalar("SELECT workflow_id FROM hammerwork_jobs WHERE id = $1 FOR UPDATE")
+                .bind(failed_job_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        lifecycle::fail_job_dependencies::<Self>(conn, failed_job_id, workflow_id.flatten()).await
+    }
+
+    /// Cancel a workflow: its unfinished jobs (pending, retrying and **running**) become
+    /// `Failed` with "Workflow cancelled", and the workflow `cancelled`.
+    ///
+    /// A running job keeps running in its worker (a handler cannot be interrupted), but
+    /// its outcome is discarded: `finish_job_run` only records outcomes for jobs that
+    /// are still `Running` the same run, and heartbeats stop extending the lease.
+    async fn cancel_workflow_in_tx(
+        conn: &mut sqlx::PgConnection,
+        workflow_id: crate::workflow::WorkflowId,
+    ) -> Result<()> {
+        // Serializes with the terminal transitions of the workflow's jobs.
+        Self::lock_workflow(conn, workflow_id).await?;
+        let now = db_now(conn).await?;
+        sqlx::query(&format!(
+            r#"
+            UPDATE hammerwork_jobs
+            SET status = 'Failed',
+                failed_at = $2,
+                error_message = $3,
+                dependency_status = CASE WHEN dependency_status = 'waiting'
+                                         THEN 'failed' ELSE dependency_status END,
+                last_heartbeat_at = NULL,
+                lease_expires_at = NULL
+            WHERE workflow_id = $1
+              AND status IN ({})
+            "#,
+            lifecycle::UNFINISHED_STATUS_SQL
+        ))
+        .bind(workflow_id)
+        .bind(now)
+        .bind(lifecycle::WORKFLOW_CANCELLED_MESSAGE)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE hammerwork_workflows
+            SET status = 'cancelled',
+                failed_at = COALESCE(failed_at, $2)
+            WHERE id = $1
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
     }
 
     /// The error for a manual transition whose guarded UPDATE matched no row.

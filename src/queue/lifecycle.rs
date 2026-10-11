@@ -24,7 +24,10 @@
 //! [`DatabaseQueue::complete_job`]: super::DatabaseQueue::complete_job
 //! [`DatabaseQueue::finish_job_run`]: super::DatabaseQueue::finish_job_run
 
+#![cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+
 use crate::job::{Job, JobId, JobStatus};
+use crate::{Result, workflow::FailurePolicy};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -196,7 +199,6 @@ impl RecordedOutcome {
 
 /// The new state a transition writes. Shared by manual transitions and run outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) enum Target {
     Completed,
     Failed(String),
@@ -209,7 +211,6 @@ pub(crate) enum Target {
     },
 }
 
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 impl Target {
     /// The terminal status this target writes, or `None` for a retry.
     pub fn terminal_status(&self) -> Option<JobStatus> {
@@ -273,7 +274,6 @@ impl From<JobOutcome> for Target {
 
 /// Which current states a transition accepts.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) enum Guard<'a> {
     /// A manual transition: any of its allowed source statuses.
     Manual(JobTransition),
@@ -281,7 +281,6 @@ pub(crate) enum Guard<'a> {
     Run(&'a Job),
 }
 
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 impl Guard<'_> {
     /// Whether the job, in its current (locked) state, accepts the transition.
     pub fn admits(&self, current: &Job) -> bool {
@@ -314,7 +313,6 @@ pub(crate) fn is_same_run(current: &Job, run: &Job) -> bool {
 
 /// What a backend's transition did.
 #[derive(Debug)]
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) enum TransitionResult {
     Applied(RecordedOutcome),
     /// The guard rejected the job's current status (or run).
@@ -322,7 +320,6 @@ pub(crate) enum TransitionResult {
     NotFound,
 }
 
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 impl TransitionResult {
     /// The result of a manual transition: rejections are errors.
     pub fn into_manual(
@@ -349,7 +346,6 @@ impl TransitionResult {
 }
 
 /// Parse a `status` column value (old rows may hold it JSON-quoted).
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn job_status_from_db(value: &str) -> Option<JobStatus> {
     Some(match value.trim_matches('"') {
         "Pending" => JobStatus::Pending,
@@ -366,7 +362,6 @@ pub(crate) fn job_status_from_db(value: &str) -> Option<JobStatus> {
 
 /// The error for a manual transition whose guarded UPDATE matched no row, given the
 /// job's current status (`None` when the job does not exist).
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn rejection_error(
     job_id: JobId,
     transition: JobTransition,
@@ -394,29 +389,24 @@ pub(crate) fn rejection_error(
 }
 
 /// Error message for a dependent that can no longer run because `failed` failed.
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn dependency_failed_message(failed: JobId) -> String {
     format!("Dependency failed: job {failed} failed")
 }
 
 /// Error message for a pending job failed by a fail-fast workflow.
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn workflow_failed_message(failed: JobId) -> String {
     format!("Workflow failed: job {failed} failed (fail-fast policy)")
 }
 
 /// Error message for a pending job failed by a fail-fast batch.
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn batch_failed_message(failed: JobId) -> String {
     format!("Batch failed: job {failed} failed (fail-fast mode)")
 }
 
 /// The statuses that count as "not finished yet" for workflow and batch progress.
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) const UNFINISHED_STATUS_SQL: &str = "'Pending', 'Running', 'Retrying'";
 
 /// Error message recorded on the unfinished jobs of a cancelled workflow.
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) const WORKFLOW_CANCELLED_MESSAGE: &str = "Workflow cancelled";
 
 /// How many missed occurrences [`next_cron_run`] steps through before it gives up
@@ -440,7 +430,6 @@ const CRON_CATCH_UP_SCAN_LIMIT: usize = 10_000;
 /// next run is the first occurrence after it started, not another immediate one.
 ///
 /// Returns `None` when the job has no valid cron schedule or no next occurrence.
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn next_cron_run(job: &Job, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let schedule = job.get_cron_schedule()?.ok()?;
     // `next_run_at` is the slot; a retried run has a later `scheduled_at`, and a run
@@ -473,7 +462,6 @@ pub(crate) fn next_cron_run(job: &Job, now: DateTime<Utc>) -> Option<DateTime<Ut
 /// The state of a dependency of a job being enqueued, as far as the new job is
 /// concerned. See [`settle_new_dependents`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) enum ParentState {
     /// The dependency completed: it no longer blocks.
     Completed,
@@ -484,7 +472,6 @@ pub(crate) enum ParentState {
     Unfinished,
 }
 
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 impl ParentState {
     /// The state of a stored dependency with job status `status`, in a workflow with
     /// failure policy `policy` (the `failure_policy` column, `None` outside workflows).
@@ -514,7 +501,6 @@ impl ParentState {
 }
 
 /// The dependencies of `jobs` (about to be inserted) that are not themselves in `jobs`.
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn external_dependencies(jobs: &[Job]) -> Vec<JobId> {
     let new: std::collections::HashSet<JobId> = jobs.iter().map(|job| job.id).collect();
     let mut parents: Vec<JobId> = jobs
@@ -542,7 +528,6 @@ pub(crate) fn external_dependencies(jobs: &[Job]) -> Vec<JobId> {
 /// - everything else keeps waiting.
 ///
 /// Returns the ids of the jobs that were failed.
-#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn settle_new_dependents(
     jobs: &mut [Job],
     parents: &std::collections::HashMap<JobId, ParentState>,
@@ -603,6 +588,271 @@ pub(crate) fn settle_new_dependents(
             return failed;
         }
     }
+}
+
+/// The locked `hammerwork_workflows` row of a job's workflow.
+pub(crate) struct LockedWorkflow {
+    pub id: crate::workflow::WorkflowId,
+    pub policy: FailurePolicy,
+    pub status: crate::workflow::WorkflowStatus,
+    pub total_jobs: usize,
+}
+
+/// The statements a database backend runs for a job lifecycle transition.
+///
+/// The transition itself (lock the job, check the guard, write the target, then apply
+/// the side effects of a terminal status) is backend-independent and implemented once,
+/// by [`transition_in_tx`] and the functions it calls; each backend implements these
+/// statements in its SQL dialect. Every statement runs on the transaction's connection.
+pub(crate) trait TransitionStore: Sync {
+    /// The connection a transition's statements run on.
+    type Conn: Send;
+
+    /// Apply `target` to a job if `guard` admits its current state, together with the
+    /// side effects of the new state, in one transaction (retried on conflicts).
+    fn transition_job(
+        &self,
+        job_id: JobId,
+        guard: Guard<'_>,
+        target: &Target,
+        reschedule_recurring: bool,
+    ) -> impl Future<Output = Result<TransitionResult>> + Send;
+
+    /// The job `job_id`, locked for update (`None` if it does not exist).
+    fn lock_job(
+        conn: &mut Self::Conn,
+        job_id: JobId,
+    ) -> impl Future<Output = Result<Option<Job>>> + Send;
+
+    /// The current time by the database clock.
+    fn db_now(conn: &mut Self::Conn) -> impl Future<Output = Result<DateTime<Utc>>> + Send;
+
+    /// Write the new status and its timestamps. Clears the lease: the run is over.
+    fn write_target(
+        conn: &mut Self::Conn,
+        job_id: JobId,
+        target: &Target,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Whether `next_run_at` can be stored as a recurring job's next run.
+    fn can_schedule_at(_next_run_at: DateTime<Utc>) -> bool {
+        true
+    }
+
+    /// Put a recurring job back to `Pending` for its next run. A failed run's error and
+    /// failure time stay visible until the next run; a successful run clears them.
+    fn reschedule_after_run(
+        conn: &mut Self::Conn,
+        job_id: JobId,
+        next_run_at: DateTime<Utc>,
+        run_status: JobStatus,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Lock a workflow's row (`None` if it does not exist).
+    fn lock_workflow(
+        conn: &mut Self::Conn,
+        workflow_id: crate::workflow::WorkflowId,
+    ) -> impl Future<Output = Result<Option<LockedWorkflow>>> + Send;
+
+    /// Mark `waiting` dependents of `completed_job_id` whose dependencies have all
+    /// completed as `satisfied`, so they can be dequeued. Returns them.
+    fn resolve_dependents(
+        conn: &mut Self::Conn,
+        completed_job_id: JobId,
+    ) -> impl Future<Output = Result<Vec<JobId>>> + Send;
+
+    /// Fail every pending job that (transitively) depends on `failed_job_id`.
+    fn fail_dependents(
+        conn: &mut Self::Conn,
+        failed_job_id: JobId,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Vec<JobId>>> + Send;
+
+    /// Fail the pending jobs of a fail-fast workflow after `failed_job_id` failed.
+    fn fail_workflow_pending(
+        conn: &mut Self::Conn,
+        workflow_id: crate::workflow::WorkflowId,
+        failed_job_id: JobId,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Vec<JobId>>> + Send;
+
+    /// Recompute a workflow's counters and status from its jobs.
+    fn refresh_workflow(
+        conn: &mut Self::Conn,
+        workflow: &LockedWorkflow,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Apply a batch job's terminal `status` to its batch: a `FailFast` batch fails its
+    /// pending jobs on the first failure, and the batch's counters and status are
+    /// persisted once the batch has finished (or failed fast). Returns the jobs failed.
+    fn apply_batch_outcome(
+        conn: &mut Self::Conn,
+        batch_id: crate::batch::BatchId,
+        job_id: JobId,
+        status: JobStatus,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Vec<JobId>>> + Send;
+}
+
+/// Apply a manual transition (see [`JobTransition`]) to `target`.
+pub(crate) async fn manual_transition<S: TransitionStore>(
+    store: &S,
+    job_id: JobId,
+    transition: JobTransition,
+    target: Target,
+) -> Result<()> {
+    store
+        .transition_job(job_id, Guard::Manual(transition), &target, false)
+        .await?
+        .into_manual(job_id, transition)?;
+    Ok(())
+}
+
+/// Record the outcome of the run `run` ([`DatabaseQueue::finish_job_run`]).
+///
+/// [`DatabaseQueue::finish_job_run`]: super::DatabaseQueue::finish_job_run
+pub(crate) async fn finish_run<S: TransitionStore>(
+    store: &S,
+    run: &Job,
+    outcome: JobOutcome,
+) -> Result<Option<RecordedOutcome>> {
+    let target = Target::from(outcome);
+    Ok(store
+        .transition_job(run.id, Guard::Run(run), &target, true)
+        .await?
+        .into_run())
+}
+
+/// Apply `target` to a job if `guard` admits its current state, together with the side
+/// effects of the new state, inside the caller's transaction.
+pub(crate) async fn transition_in_tx<S: TransitionStore>(
+    conn: &mut S::Conn,
+    job_id: JobId,
+    guard: Guard<'_>,
+    target: &Target,
+    reschedule_recurring: bool,
+) -> Result<TransitionResult> {
+    let Some(job) = S::lock_job(conn, job_id).await? else {
+        return Ok(TransitionResult::NotFound);
+    };
+    if !guard.admits(&job) {
+        return Ok(TransitionResult::Rejected(job.status));
+    }
+
+    let now = S::db_now(conn).await?;
+    let target = target.on_db_clock(&guard, now);
+    S::write_target(conn, job_id, &target, now).await?;
+    let recorded = match target.terminal_status() {
+        Some(status) => after_terminal::<S>(conn, &job, status, now, reschedule_recurring).await?,
+        None => RecordedOutcome::new(JobStatus::Pending),
+    };
+    Ok(TransitionResult::Applied(recorded))
+}
+
+/// Side effects of `job` reaching the terminal `status`.
+///
+/// A recurring job (when `reschedule_recurring`) is rescheduled for its next run
+/// instead. Otherwise dependents are resolved or failed, the workflow policy and
+/// counters are applied, and the batch's failure mode and status.
+pub(crate) async fn after_terminal<S: TransitionStore>(
+    conn: &mut S::Conn,
+    job: &Job,
+    status: JobStatus,
+    now: DateTime<Utc>,
+    reschedule_recurring: bool,
+) -> Result<RecordedOutcome> {
+    if reschedule_recurring && job.recurring {
+        if let Some(next_run_at) = next_cron_run(job, now).filter(|at| S::can_schedule_at(*at)) {
+            S::reschedule_after_run(conn, job.id, next_run_at, status).await?;
+            let mut recorded = RecordedOutcome::new(JobStatus::Pending);
+            recorded.next_run_at = Some(next_run_at);
+            return Ok(recorded);
+        }
+        tracing::warn!(
+            "Could not calculate the next run time for recurring job {}; it stays {}",
+            job.id,
+            status.as_str()
+        );
+    }
+
+    let mut recorded = RecordedOutcome::new(status);
+
+    // Lock the workflow row first: it serializes terminal transitions within a
+    // workflow, so concurrent completions cannot both miss each other.
+    let workflow = match job.workflow_id {
+        Some(id) => S::lock_workflow(conn, id).await?,
+        None => None,
+    };
+
+    if status == JobStatus::Completed {
+        recorded.unblocked = S::resolve_dependents(conn, job.id).await?;
+    } else {
+        recorded.cancelled =
+            apply_failure_policy::<S>(conn, workflow.as_ref(), job.id, now).await?;
+    }
+
+    if let Some(workflow) = &workflow {
+        S::refresh_workflow(conn, workflow, now).await?;
+    }
+    if let Some(batch_id) = job.batch_id {
+        let cancelled = S::apply_batch_outcome(conn, batch_id, job.id, status, now).await?;
+        recorded.cancelled.extend(cancelled);
+    }
+    Ok(recorded)
+}
+
+/// Apply the [`FailurePolicy`] of `workflow` (the failed job's locked workflow, if any)
+/// to the failure of `failed_job_id`. Returns the jobs that were failed.
+///
+/// - `FailFast` fails the workflow's other `Pending` and `Retrying` jobs, then the jobs
+///   that (transitively) depend on the failed one;
+/// - `ContinueOnFailure`, and jobs with dependencies outside any workflow, fail only
+///   the jobs that (transitively) depend on the failed one;
+/// - `Manual` leaves the dependents waiting for an operator.
+async fn apply_failure_policy<S: TransitionStore>(
+    conn: &mut S::Conn,
+    workflow: Option<&LockedWorkflow>,
+    failed_job_id: JobId,
+    now: DateTime<Utc>,
+) -> Result<Vec<JobId>> {
+    match workflow {
+        Some(w) if w.policy == FailurePolicy::Manual => Ok(Vec::new()),
+        Some(w) if w.policy == FailurePolicy::FailFast => {
+            let mut failed = S::fail_workflow_pending(conn, w.id, failed_job_id, now).await?;
+            for id in S::fail_dependents(conn, failed_job_id, now).await? {
+                if !failed.contains(&id) {
+                    failed.push(id);
+                }
+            }
+            Ok(failed)
+        }
+        _ => S::fail_dependents(conn, failed_job_id, now).await,
+    }
+}
+
+/// [`DatabaseQueue::fail_job_dependencies`] inside the caller's transaction, once the
+/// failed job is locked: lock its workflow (`workflow_id`, in the same order as a
+/// terminal transition), apply the workflow's failure policy and update the workflow's
+/// counters and status.
+///
+/// [`DatabaseQueue::fail_job_dependencies`]: super::DatabaseQueue::fail_job_dependencies
+pub(crate) async fn fail_job_dependencies<S: TransitionStore>(
+    conn: &mut S::Conn,
+    failed_job_id: JobId,
+    workflow_id: Option<crate::workflow::WorkflowId>,
+) -> Result<Vec<JobId>> {
+    let workflow = match workflow_id {
+        Some(id) => S::lock_workflow(conn, id).await?,
+        None => None,
+    };
+    let now = S::db_now(conn).await?;
+    let failed = apply_failure_policy::<S>(conn, workflow.as_ref(), failed_job_id, now).await?;
+    if let Some(workflow) = &workflow {
+        S::refresh_workflow(conn, workflow, now).await?;
+    }
+    Ok(failed)
 }
 
 #[cfg(test)]

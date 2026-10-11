@@ -21,6 +21,8 @@ use tokio::sync::RwLock;
 pub mod lifecycle;
 pub use lifecycle::{JobOutcome, JobTransition, RecordedOutcome};
 
+mod row;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
