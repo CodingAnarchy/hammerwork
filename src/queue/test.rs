@@ -553,9 +553,113 @@ impl TestStorage {
             .iter()
             .filter_map(|id| self.jobs.get(id))
             .filter(|job| job.scheduled_at <= now)
+            // Like the database backends, a job waiting on its dependencies is held.
+            .filter(|job| {
+                matches!(
+                    job.dependency_status,
+                    DependencyStatus::None | DependencyStatus::Satisfied
+                )
+            })
             // A disabled recurring job's pending occurrence is held.
             .filter(|job| job.recurring || job.cron_schedule.is_none())
             .collect()
+    }
+
+    /// The dependencies of `job_id`: its `depends_on` and those recorded for it by
+    /// `enqueue_workflow`.
+    fn dependencies_of(&self, job_id: JobId) -> Vec<JobId> {
+        let mut deps = self
+            .jobs
+            .get(&job_id)
+            .map(|job| job.depends_on.clone())
+            .unwrap_or_default();
+        for dep in self.dependencies.get(&job_id).into_iter().flatten() {
+            if !deps.contains(dep) {
+                deps.push(*dep);
+            }
+        }
+        deps
+    }
+
+    /// Whether the dependency `job_id` completed (archived jobs keep their times).
+    fn dependency_completed(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|job| match job.status {
+            JobStatus::Completed => true,
+            JobStatus::Archived => job.completed_at.is_some(),
+            _ => false,
+        })
+    }
+
+    /// Release the pending dependents of `completed_job_id` whose dependencies have all
+    /// completed, like the database backends' `resolve_dependents`: their dependency
+    /// status becomes `Satisfied` (and a workflow job held by `enqueue_workflow` becomes
+    /// due). Returns the released jobs.
+    fn resolve_dependents(&mut self, completed_job_id: JobId, now: DateTime<Utc>) -> Vec<JobId> {
+        let mut candidates: Vec<JobId> = self
+            .jobs
+            .values()
+            .filter(|job| {
+                job.status == JobStatus::Pending
+                    && (job.dependency_status == DependencyStatus::Waiting
+                        || (job.dependency_status == DependencyStatus::None
+                            && job.scheduled_at == DateTime::<Utc>::MAX_UTC))
+            })
+            .map(|job| job.id)
+            .filter(|id| self.dependencies_of(*id).contains(&completed_job_id))
+            .collect();
+        candidates.sort_unstable();
+
+        let mut resolved = Vec::new();
+        for id in candidates {
+            let ready = self
+                .dependencies_of(id)
+                .iter()
+                .all(|dep| self.dependency_completed(*dep));
+            if !ready {
+                continue;
+            }
+            if let Some(job) = self.jobs.get_mut(&id) {
+                if job.dependency_status == DependencyStatus::Waiting {
+                    job.dependency_status = DependencyStatus::Satisfied;
+                }
+                if job.scheduled_at == DateTime::<Utc>::MAX_UTC {
+                    job.scheduled_at = now;
+                }
+                resolved.push(id);
+            }
+        }
+        resolved
+    }
+
+    /// Settle the dependency status of `jobs` about to be enqueued against the stored
+    /// state of their dependencies, as the database backends do on insert: a job whose
+    /// dependencies already completed is runnable, one with a failed dependency is
+    /// enqueued as failed. Returns the jobs that were failed.
+    fn settle_new_dependents(&self, jobs: &mut [Job], now: DateTime<Utc>) -> Vec<JobId> {
+        let mut parents = HashMap::new();
+        for parent in lifecycle::external_dependencies(jobs) {
+            let Some(job) = self.jobs.get(&parent) else {
+                continue;
+            };
+            let manual = self
+                .workflow_of(parent)
+                .is_some_and(|w| w.failure_policy == FailurePolicy::Manual);
+            let state = match job.status {
+                JobStatus::Completed => lifecycle::ParentState::Completed,
+                JobStatus::Failed | JobStatus::Dead | JobStatus::TimedOut if !manual => {
+                    lifecycle::ParentState::Failed
+                }
+                JobStatus::Archived if job.completed_at.is_some() => {
+                    lifecycle::ParentState::Completed
+                }
+                JobStatus::Archived if job.failed_at.or(job.timed_out_at).is_some() => {
+                    lifecycle::ParentState::Failed
+                }
+                _ => lifecycle::ParentState::Unfinished,
+            };
+            parents.insert(parent, state);
+        }
+        lifecycle::settle_new_dependents(jobs, &parents, now)
     }
 
     /// Up to `max_jobs` jobs to claim at once, in claim order, chosen like the database
@@ -654,29 +758,18 @@ impl TestStorage {
                 .push(job);
         }
 
-        // Build weighted selection pool
-        let mut weighted_choices = Vec::new();
-        for priority in candidates_by_priority.keys() {
-            let weight = weights.get_weight(*priority);
-            for _ in 0..weight {
-                weighted_choices.push(*priority);
-            }
-        }
-
-        if weighted_choices.is_empty() {
-            return None;
-        }
-
-        // Use hash-based selection for deterministic behavior
+        // Pick a level by weight as the database backends do (all-zero weights take
+        // the highest level), with a hash-based seed for deterministic behavior.
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        let mut candidates: Vec<JobPriority> = candidates_by_priority.keys().copied().collect();
+        candidates.sort_unstable_by_key(|priority| std::cmp::Reverse(priority.as_i32()));
         let mut hasher = DefaultHasher::new();
         queue_name.hash(&mut hasher);
         self.clock.now().timestamp_millis().hash(&mut hasher);
-        let hash_value = hasher.finish();
-
-        let selected_priority = weighted_choices[hash_value as usize % weighted_choices.len()];
+        let selected_priority =
+            super::pick_weighted_priority(&candidates, weights, hasher.finish())?;
 
         // Get the oldest job from the selected priority
         candidates_by_priority
@@ -1126,6 +1219,23 @@ impl TestQueue {
         }
         Ok(cancelled)
     }
+
+    /// Complete a job and release its dependents, as the database backends do.
+    /// Returns the dependents that became runnable.
+    async fn complete_and_resolve(&self, job_id: JobId) -> Result<Vec<JobId>> {
+        let mut storage = self.storage.write().await;
+        storage.check_transition(job_id, crate::queue::JobTransition::Complete)?;
+        storage.update_job_status(job_id, JobStatus::Completed)?;
+        storage.leases.remove(&job_id);
+
+        let now = storage.clock.now();
+        if let Some(job) = storage.jobs.get_mut(&job_id) {
+            // Like the database backends, completing a job by hand does not reschedule a
+            // recurring job; `finish_job_run` does that for a finished run.
+            job.completed_at = Some(now);
+        }
+        Ok(storage.resolve_dependents(job_id, now))
+    }
 }
 
 impl Default for TestQueue {
@@ -1160,6 +1270,7 @@ impl DatabaseQueue for TestQueue {
             // For delayed jobs, preserve the delay but use mock clock time as base
             job.scheduled_at = now + delay;
         }
+        storage.settle_new_dependents(std::slice::from_mut(&mut job), now);
 
         // Store the job
         storage.jobs.insert(job.id, job.clone());
@@ -1255,44 +1366,7 @@ impl DatabaseQueue for TestQueue {
     }
 
     async fn complete_job(&self, job_id: JobId) -> Result<()> {
-        let mut storage = self.storage.write().await;
-        storage.check_transition(job_id, crate::queue::JobTransition::Complete)?;
-
-        storage.update_job_status(job_id, JobStatus::Completed)?;
-
-        let now = storage.clock.now();
-        if let Some(job) = storage.jobs.get_mut(&job_id) {
-            // Like the database backends, completing a job by hand does not reschedule a
-            // recurring job; `finish_job_run` does that for a finished run.
-            job.completed_at = Some(now);
-        }
-
-        // Resolve dependencies
-        if let Some(dependents) = storage.dependents.get(&job_id).cloned() {
-            let now = storage.clock.now();
-            for dependent_id in dependents {
-                // Check if all dependencies are satisfied
-                if let Some(deps) = storage.dependencies.get(&dependent_id) {
-                    let all_complete = deps.iter().all(|dep_id| {
-                        storage
-                            .jobs
-                            .get(dep_id)
-                            .map(|j| j.status == JobStatus::Completed)
-                            .unwrap_or(false)
-                    });
-
-                    if all_complete {
-                        // Make the job eligible for execution
-                        if let Some(dep_job) = storage.jobs.get_mut(&dependent_id)
-                            && dep_job.status == JobStatus::Pending
-                        {
-                            dep_job.scheduled_at = now;
-                        }
-                    }
-                }
-            }
-        }
-
+        self.complete_and_resolve(job_id).await?;
         Ok(())
     }
 
@@ -1320,6 +1394,7 @@ impl DatabaseQueue for TestQueue {
         storage.check_transition(job_id, crate::queue::JobTransition::Retry)?;
 
         storage.update_job_status(job_id, JobStatus::Pending)?;
+        storage.leases.remove(&job_id);
 
         if let Some(job) = storage.jobs.get_mut(&job_id) {
             job.scheduled_at = retry_at;
@@ -1387,7 +1462,7 @@ impl DatabaseQueue for TestQueue {
         let batch_id = batch.id;
 
         // Enqueue all jobs in the batch
-        let mut job_ids = Vec::new();
+        let mut jobs = Vec::with_capacity(batch.jobs.len());
         for mut job in batch.jobs.iter().cloned() {
             job.batch_id = Some(batch_id);
 
@@ -1409,10 +1484,15 @@ impl DatabaseQueue for TestQueue {
                 // For delayed jobs, preserve the delay but use mock clock time as base
                 job.scheduled_at = now + delay;
             }
-
-            storage.jobs.insert(job.id, job.clone());
+            jobs.push(job);
+        }
+        let now = storage.clock.now();
+        storage.settle_new_dependents(&mut jobs, now);
+        let mut job_ids = Vec::with_capacity(jobs.len());
+        for job in jobs {
             storage.add_job_to_queue(&job);
             job_ids.push(job.id);
+            storage.jobs.insert(job.id, job);
         }
 
         storage.batch_jobs.insert(batch_id, job_ids);
@@ -1574,13 +1654,27 @@ impl DatabaseQueue for TestQueue {
         let apply_policy = next_run_at.is_none();
         let mut recorded = match outcome {
             JobOutcome::Completed => {
+                let mut recorded = RecordedOutcome::new(JobStatus::Completed);
                 if next_run_at.is_none() {
-                    self.complete_job(run.id).await?;
+                    recorded.unblocked = self.complete_and_resolve(run.id).await?;
                 }
-                RecordedOutcome::new(JobStatus::Completed)
+                recorded
             }
-            JobOutcome::Retry { retry_at, .. } => {
+            JobOutcome::Retry {
+                retry_at,
+                error,
+                timed_out,
+            } => {
                 self.retry_job(run.id, retry_at).await?;
+                // The run's error (and timeout) is recorded, as on the database backends.
+                let mut storage = self.storage.write().await;
+                let now = storage.clock.now();
+                if let Some(job) = storage.jobs.get_mut(&run.id) {
+                    job.error_message = Some(error);
+                    if timed_out {
+                        job.timed_out_at = Some(now);
+                    }
+                }
                 RecordedOutcome::new(JobStatus::Pending)
             }
             JobOutcome::Dead { error } => {
@@ -1608,8 +1702,6 @@ impl DatabaseQueue for TestQueue {
                 .reschedule_in_place(run.id, next, keep_failure)?;
             recorded.status = JobStatus::Pending;
             recorded.next_run_at = Some(next);
-        } else if recorded.status == JobStatus::Completed {
-            recorded.unblocked = self.resolve_job_dependencies(run.id).await?;
         }
         Ok(Some(recorded))
     }
@@ -1620,7 +1712,8 @@ impl DatabaseQueue for TestQueue {
         let mut dead_jobs: Vec<Job> = storage
             .jobs
             .values()
-            .filter(|job| job.status == JobStatus::Dead || job.status == JobStatus::TimedOut)
+            // Like the database backends: `Dead` only, not `TimedOut`.
+            .filter(|job| job.status == JobStatus::Dead)
             .cloned()
             .collect();
 
@@ -1649,10 +1742,7 @@ impl DatabaseQueue for TestQueue {
         let mut dead_jobs: Vec<Job> = storage
             .jobs
             .values()
-            .filter(|job| {
-                job.queue_name == queue_name
-                    && (job.status == JobStatus::Dead || job.status == JobStatus::TimedOut)
-            })
+            .filter(|job| job.queue_name == queue_name && job.status == JobStatus::Dead)
             .cloned()
             .collect();
 
@@ -1672,26 +1762,18 @@ impl DatabaseQueue for TestQueue {
 
     async fn retry_dead_job(&self, job_id: JobId) -> Result<()> {
         let mut storage = self.storage.write().await;
-
-        let job = storage
-            .jobs
-            .get(&job_id)
-            .ok_or_else(|| HammerworkError::JobNotFound {
-                id: job_id.to_string(),
-            })?;
-
-        if job.status != JobStatus::Dead && job.status != JobStatus::TimedOut {
-            return Err(HammerworkError::Queue {
-                message: format!("Job {} is not dead", job_id),
-            });
-        }
+        // A job that is not dead (or timed out) is rejected with `InvalidJobTransition`,
+        // as on the database backends.
+        storage.check_transition(job_id, crate::queue::JobTransition::RetryDead)?;
 
         storage.update_job_status(job_id, JobStatus::Pending)?;
+        storage.leases.remove(&job_id);
 
         let now = storage.clock.now();
         if let Some(job) = storage.jobs.get_mut(&job_id) {
             job.attempts = 0;
             job.error_message = None;
+            job.started_at = None;
             job.failed_at = None;
             job.timed_out_at = None;
             job.scheduled_at = now;
@@ -1706,9 +1788,12 @@ impl DatabaseQueue for TestQueue {
         let dead_job_ids: Vec<JobId> = storage
             .jobs
             .iter()
+            // Like the database backends: dead jobs that failed before `older_than`.
             .filter(|(_, job)| {
-                (job.status == JobStatus::Dead || job.status == JobStatus::TimedOut)
-                    && job.failed_at.or(job.timed_out_at).unwrap_or(job.created_at) <= older_than
+                job.status == JobStatus::Dead
+                    && job
+                        .failed_at
+                        .is_some_and(|failed_at| failed_at < older_than)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1737,7 +1822,7 @@ impl DatabaseQueue for TestQueue {
         let mut newest_dead_job: Option<DateTime<Utc>> = None;
 
         for job in storage.jobs.values() {
-            if job.status == JobStatus::Dead || job.status == JobStatus::TimedOut {
+            if job.status == JobStatus::Dead {
                 total_dead_jobs += 1;
 
                 *dead_jobs_by_queue
@@ -1838,13 +1923,13 @@ impl DatabaseQueue for TestQueue {
             .count() as f64;
 
         let total_processed = completed_count + dead_count + timed_out_count;
+        // `Failed` jobs only, as on the database backends: dead jobs are in `dead`.
         let failed_count = queue_jobs
             .get(&JobStatus::Failed)
             .map(|j| j.len())
-            .unwrap_or(0) as u64
-            + dead_count;
+            .unwrap_or(0) as u64;
         let error_rate = if total_processed > 0 {
-            (failed_count + timed_out_count) as f64 / total_processed as f64
+            (failed_count + dead_count + timed_out_count) as f64 / total_processed as f64
         } else {
             0.0
         };
@@ -2342,6 +2427,7 @@ impl DatabaseQueue for TestQueue {
         }
 
         // Enqueue all jobs
+        let mut jobs = Vec::with_capacity(workflow.jobs.len());
         for mut job in workflow.jobs.iter().cloned() {
             // Apply the same timestamp logic as regular enqueue
             let now = storage.clock.now();
@@ -2372,9 +2458,20 @@ impl DatabaseQueue for TestQueue {
                     job.scheduled_at = now + delay;
                 }
             }
-
-            storage.jobs.insert(job.id, job.clone());
+            jobs.push(job);
+        }
+        let now = storage.clock.now();
+        storage.settle_new_dependents(&mut jobs, now);
+        for job in jobs {
+            let mut job = job;
+            // Dependencies outside the workflow that already completed release it.
+            if job.dependency_status == DependencyStatus::Satisfied
+                && job.scheduled_at == DateTime::<Utc>::MAX_UTC
+            {
+                job.scheduled_at = now;
+            }
             storage.add_job_to_queue(&job);
+            storage.jobs.insert(job.id, job);
         }
 
         storage.workflows.insert(workflow_id, workflow);
@@ -2426,36 +2523,8 @@ impl DatabaseQueue for TestQueue {
 
     async fn resolve_job_dependencies(&self, completed_job_id: JobId) -> Result<Vec<JobId>> {
         let mut storage = self.storage.write().await;
-        let mut resolved_jobs = Vec::new();
-
-        if let Some(dependents) = storage.dependents.get(&completed_job_id).cloned() {
-            for dependent_id in dependents {
-                // Check if all dependencies are satisfied
-                if let Some(deps) = storage.dependencies.get(&dependent_id) {
-                    let all_complete = deps.iter().all(|dep_id| {
-                        storage
-                            .jobs
-                            .get(dep_id)
-                            .map(|j| j.status == JobStatus::Completed)
-                            .unwrap_or(false)
-                    });
-
-                    if all_complete {
-                        // Make the job eligible for execution
-                        let now = storage.clock.now();
-                        if let Some(job) = storage.jobs.get_mut(&dependent_id)
-                            && job.status == JobStatus::Pending
-                            && job.scheduled_at == DateTime::<Utc>::MAX_UTC
-                        {
-                            job.scheduled_at = now;
-                            resolved_jobs.push(dependent_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(resolved_jobs)
+        let now = storage.clock.now();
+        Ok(storage.resolve_dependents(completed_job_id, now))
     }
 
     async fn get_ready_jobs(&self, queue_name: &str, limit: u32) -> Result<Vec<Job>> {
@@ -2906,10 +2975,21 @@ impl DatabaseQueue for TestQueue {
                     job.failed_at = Some(now);
                     job.error_message = Some(super::STALE_JOB_ERROR_MESSAGE.to_string());
                 }
-                // A terminal failure like any other, as on the database backends.
+                recovery.dead.push(job_id);
+                // A terminal failure like any other, as on the database backends: a
+                // recurring job is rescheduled for its next run, otherwise the failure
+                // policies apply.
+                let next_run_at = storage
+                    .jobs
+                    .get(&job_id)
+                    .filter(|job| job.recurring)
+                    .and_then(|job| lifecycle::next_cron_run(job, now));
+                if let Some(next_run_at) = next_run_at {
+                    storage.reschedule_in_place(job_id, next_run_at, true)?;
+                    continue;
+                }
                 storage.apply_workflow_failure(job_id, now);
                 storage.apply_batch_failure(job_id, now);
-                recovery.dead.push(job_id);
             } else {
                 storage.update_job_status(job_id, JobStatus::Pending)?;
                 if let Some(job) = storage.jobs.get_mut(&job_id) {
@@ -3955,5 +4035,286 @@ mod tests {
             );
             assert!(queue.get_job(kept).await.unwrap().is_some());
         }
+    }
+
+    /// Like the database backends, a job enqueued with `depends_on` waits until its
+    /// dependencies complete; one whose dependencies already completed runs at once and
+    /// one with a failed dependency is enqueued as failed.
+    #[tokio::test]
+    async fn dependent_jobs_wait_for_their_dependencies() {
+        use crate::queue::JobOutcome;
+        let queue = TestQueue::new();
+        let parent = queue
+            .enqueue(Job::new("deps".to_string(), json!({"n": 1})))
+            .await
+            .unwrap();
+        let child = queue
+            .enqueue(Job::new("deps".to_string(), json!({"n": 2})).depends_on(&parent))
+            .await
+            .unwrap();
+
+        let run = queue.dequeue("deps").await.unwrap().unwrap();
+        assert_eq!(run.id, parent);
+        assert!(
+            queue.dequeue("deps").await.unwrap().is_none(),
+            "a job ran before its dependency finished"
+        );
+
+        let recorded = queue
+            .finish_job_run(&run, JobOutcome::Completed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.unblocked, vec![child]);
+        let run = queue.dequeue("deps").await.unwrap().unwrap();
+        assert_eq!(run.id, child);
+        assert_eq!(run.dependency_status, DependencyStatus::Satisfied);
+
+        // Enqueued after its dependency completed: runnable at once.
+        let late = queue
+            .enqueue(Job::new("deps".to_string(), json!({"n": 3})).depends_on(&parent))
+            .await
+            .unwrap();
+        assert_eq!(queue.dequeue("deps").await.unwrap().unwrap().id, late);
+
+        // Enqueued after its dependency failed: failed at once.
+        let failed = queue
+            .enqueue(Job::new("deps".to_string(), json!({"n": 4})))
+            .await
+            .unwrap();
+        queue.fail_job(failed, "boom").await.unwrap();
+        let orphan = queue
+            .enqueue(Job::new("deps".to_string(), json!({"n": 5})).depends_on(&failed))
+            .await
+            .unwrap();
+        let orphan = queue.get_job(orphan).await.unwrap().unwrap();
+        assert_eq!(orphan.status, JobStatus::Failed);
+        assert_eq!(orphan.dependency_status, DependencyStatus::Failed);
+    }
+
+    /// A retried run records its error and, if it timed out, when, as on the databases.
+    #[tokio::test]
+    async fn retried_run_records_its_error_and_timeout() {
+        use crate::queue::JobOutcome;
+        let queue = TestQueue::new();
+        let id = queue
+            .enqueue(Job::new("retry_err".to_string(), json!({})))
+            .await
+            .unwrap();
+        let run = queue.dequeue("retry_err").await.unwrap().unwrap();
+        let retry_at = queue.clock().now() + chrono::Duration::seconds(30);
+        let recorded = queue
+            .finish_job_run(
+                &run,
+                JobOutcome::Retry {
+                    retry_at,
+                    error: "boom".to_string(),
+                    timed_out: true,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.status, JobStatus::Pending);
+        let job = queue.get_job(id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.scheduled_at, retry_at);
+        assert_eq!(job.error_message.as_deref(), Some("boom"));
+        assert!(job.timed_out_at.is_some());
+    }
+
+    /// Completing a workflow job's run reports the dependents it released.
+    #[tokio::test]
+    async fn completed_run_reports_unblocked_workflow_jobs() {
+        use crate::queue::JobOutcome;
+        let queue = TestQueue::new();
+        let first = Job::new("wf_unblock".to_string(), json!({"step": 1}));
+        let second = Job::new("wf_unblock".to_string(), json!({"step": 2}));
+        let (first_id, second_id) = (first.id, second.id);
+        let workflow = JobGroup::new("unblock").add_job(first).then(second);
+        queue.enqueue_workflow(workflow).await.unwrap();
+
+        let run = queue.dequeue("wf_unblock").await.unwrap().unwrap();
+        assert_eq!(run.id, first_id);
+        let recorded = queue
+            .finish_job_run(&run, JobOutcome::Completed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.unblocked, vec![second_id]);
+        assert_eq!(
+            queue.dequeue("wf_unblock").await.unwrap().unwrap().id,
+            second_id
+        );
+    }
+
+    /// A stale recurring job out of attempts is rescheduled for its next occurrence,
+    /// like the database reapers do, instead of staying dead.
+    #[tokio::test]
+    async fn stale_recurring_job_out_of_attempts_is_rescheduled() {
+        let queue = TestQueue::new();
+        let clock = queue.clock();
+        // Half past the hour, so the run (an hour later) and the reaping five minutes
+        // after it stay before the next hourly slot whatever the wall-clock time is.
+        clock.set_time(
+            chrono::DateTime::parse_from_rfc3339("2026-01-05T10:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        let mut job = Job::new("stale_cron".to_string(), json!({})).with_max_attempts(1);
+        job.cron_schedule = Some("0 0 * * * *".to_string());
+        let id = queue.enqueue_cron_job(job).await.unwrap();
+
+        clock.advance(chrono::Duration::hours(1));
+        let lease = std::time::Duration::from_secs(30);
+        let run = queue
+            .dequeue_leased("stale_cron", None, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.id, id);
+
+        clock.advance(chrono::Duration::minutes(5));
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(recovery.dead, vec![id]);
+
+        let job = queue.get_job(id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending, "the schedule was killed");
+        assert_eq!(job.attempts, 0);
+        assert!(job.next_run_at.is_some_and(|next| next > clock.now()));
+        assert_eq!(Some(job.scheduled_at), job.next_run_at);
+    }
+
+    /// `QueueStats::statistics.failed` counts `Failed` jobs only, as on the database
+    /// backends; dead jobs are in `dead` (counting them in both made the dashboard count
+    /// them twice).
+    #[tokio::test]
+    async fn queue_stats_failed_counts_failed_jobs_only() {
+        let queue = TestQueue::new();
+        let failed = queue
+            .enqueue(Job::new("stats_q".to_string(), json!({"n": 1})))
+            .await
+            .unwrap();
+        queue.fail_job(failed, "nope").await.unwrap();
+        let dead = queue
+            .enqueue(Job::new("stats_q".to_string(), json!({"n": 2})))
+            .await
+            .unwrap();
+        queue.mark_job_dead(dead, "broken").await.unwrap();
+
+        let stats = queue.get_queue_stats("stats_q").await.unwrap();
+        assert_eq!(stats.statistics.failed, 1);
+        assert_eq!(stats.statistics.dead, 1);
+        assert_eq!(stats.dead_count, 1);
+    }
+
+    /// Only `Dead` jobs are dead jobs: timed-out jobs are not listed, counted or purged
+    /// as dead, and the purge cut-off is exclusive, as on the database backends.
+    #[tokio::test]
+    async fn timed_out_jobs_are_not_dead_jobs() {
+        let queue = TestQueue::new();
+        let timed_out = queue
+            .enqueue(Job::new("dead_q".to_string(), json!({"n": 1})))
+            .await
+            .unwrap();
+        queue.dequeue("dead_q").await.unwrap().unwrap();
+        queue.mark_job_timed_out(timed_out, "slow").await.unwrap();
+        let dead = queue
+            .enqueue(Job::new("dead_q".to_string(), json!({"n": 2})))
+            .await
+            .unwrap();
+        queue.mark_job_dead(dead, "broken").await.unwrap();
+
+        let listed: Vec<JobId> = queue
+            .get_dead_jobs(None, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(listed, vec![dead]);
+        let by_queue: Vec<JobId> = queue
+            .get_dead_jobs_by_queue("dead_q", None, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(by_queue, vec![dead]);
+        let summary = queue.get_dead_job_summary().await.unwrap();
+        assert_eq!(summary.total_dead_jobs, 1);
+
+        let failed_at = queue
+            .get_job(dead)
+            .await
+            .unwrap()
+            .unwrap()
+            .failed_at
+            .unwrap();
+        assert_eq!(queue.purge_dead_jobs(failed_at).await.unwrap(), 0);
+        assert_eq!(
+            queue
+                .purge_dead_jobs(failed_at + chrono::Duration::seconds(1))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(queue.get_job(timed_out).await.unwrap().is_some());
+    }
+
+    /// With every weight zero, a weighted dequeue takes the highest priority with a job,
+    /// as the database backends do, instead of returning nothing.
+    #[tokio::test]
+    async fn weighted_dequeue_with_zero_weights_takes_the_highest_priority() {
+        let queue = TestQueue::new();
+        let id = queue
+            .enqueue(Job::new("zero_w".to_string(), json!({})))
+            .await
+            .unwrap();
+        let weights = PriorityWeights::new()
+            .with_weight(JobPriority::Background, 0)
+            .with_weight(JobPriority::Low, 0)
+            .with_weight(JobPriority::Normal, 0)
+            .with_weight(JobPriority::High, 0)
+            .with_weight(JobPriority::Critical, 0);
+        let job = queue
+            .dequeue_with_priority_weights("zero_w", &weights)
+            .await
+            .unwrap();
+        assert_eq!(job.map(|job| job.id), Some(id));
+    }
+
+    /// A huge weight is a probability, not an allocation.
+    #[tokio::test]
+    async fn weighted_dequeue_with_a_huge_weight_does_not_allocate_per_unit() {
+        let queue = TestQueue::new();
+        let id = queue
+            .enqueue(Job::new("huge_w".to_string(), json!({})))
+            .await
+            .unwrap();
+        let weights = PriorityWeights::new().with_weight(JobPriority::Normal, u32::MAX);
+        let job = queue
+            .dequeue_with_priority_weights("huge_w", &weights)
+            .await
+            .unwrap();
+        assert_eq!(job.map(|job| job.id), Some(id));
+    }
+
+    /// Manual transitions on the wrong status fail with `InvalidJobTransition`, as on the
+    /// database backends.
+    #[tokio::test]
+    async fn retry_dead_job_rejects_a_live_job_as_an_invalid_transition() {
+        let queue = TestQueue::new();
+        let id = queue
+            .enqueue(Job::new("retry_dead".to_string(), json!({})))
+            .await
+            .unwrap();
+        assert!(matches!(
+            queue.retry_dead_job(id).await,
+            Err(HammerworkError::InvalidJobTransition { .. })
+        ));
     }
 }

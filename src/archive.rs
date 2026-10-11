@@ -838,7 +838,9 @@ where
                 pass.stopped_early = true;
                 return Ok(pass);
             }
-            pass.jobs_purged = queue.purge_archived_jobs(Utc::now() - after).await?;
+            if let Some(older_than) = age_threshold(Utc::now(), after) {
+                pass.jobs_purged = queue.purge_archived_jobs(older_than).await?;
+            }
         }
         pass.stopped_early = stopped;
         Ok(pass)
@@ -1371,6 +1373,20 @@ pub(crate) fn archival_candidates(
     ]
 }
 
+/// The cutoff for an age policy (`archive_*_after`, `purge_archived_after`): jobs whose
+/// timestamp is at or before it qualify.
+///
+/// A zero or negative age is "now" (everything finished so far qualifies). An age reaching
+/// back before the Unix epoch, or too large to subtract at all, is `None`: nothing can be
+/// that old, and such a cutoff would panic or not fit the database's timestamp range.
+pub(crate) fn age_threshold(now: DateTime<Utc>, age: Duration) -> Option<DateTime<Utc>> {
+    if age <= Duration::zero() {
+        return Some(now);
+    }
+    now.checked_sub_signed(age)
+        .filter(|threshold| *threshold >= DateTime::<Utc>::UNIX_EPOCH)
+}
+
 /// Resets an archived job so it can be processed again after a restore.
 #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 pub(crate) fn reset_for_restore(mut job: Job) -> Job {
@@ -1421,6 +1437,44 @@ pub(crate) fn parse_archived_dependency_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn age_threshold_handles_extreme_ages() {
+        let now = Utc::now();
+        assert_eq!(
+            age_threshold(now, Duration::days(1)),
+            Some(now - Duration::days(1))
+        );
+        assert_eq!(age_threshold(now, Duration::zero()), Some(now));
+        assert_eq!(age_threshold(now, Duration::days(-3)), Some(now));
+        assert_eq!(age_threshold(now, Duration::MIN), Some(now));
+        assert_eq!(age_threshold(now, Duration::MAX), None);
+        // Before the epoch: nothing is that old, and MySQL could not store the cutoff.
+        assert_eq!(age_threshold(now, Duration::days(365 * 100)), None);
+    }
+
+    /// A scheduled pass whose policy ages are too large to subtract from now (say
+    /// `Duration::MAX` for "never purge") archives and purges nothing instead of
+    /// panicking.
+    #[cfg(all(feature = "test", feature = "postgres"))]
+    #[tokio::test]
+    async fn scheduled_pass_with_huge_ages_does_not_panic() {
+        let queue = crate::queue::test::TestQueue::new();
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+        let mut archiver = JobArchiver::new(pool);
+        archiver.set_default_policy(
+            ArchivalPolicy::new()
+                .archive_completed_after(Duration::MAX)
+                .purge_archived_after(Duration::MAX)
+                .enabled(true),
+        );
+        let pass = archiver
+            .run_scheduled_pass(&queue, None, || false)
+            .await
+            .unwrap();
+        assert_eq!(pass.jobs_archived, 0);
+        assert_eq!(pass.jobs_purged, 0);
+    }
 
     #[test]
     fn test_archival_reason_db_round_trip() {

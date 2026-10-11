@@ -56,9 +56,11 @@ impl AutoscaleConfig {
         self
     }
 
-    /// Set the minimum number of workers
+    /// Set the minimum number of workers (at least 1). The maximum is raised to the
+    /// minimum when it is lower.
     pub fn with_min_workers(mut self, min_workers: usize) -> Self {
         self.min_workers = min_workers.max(1); // Ensure at least 1 worker
+        self.max_workers = self.max_workers.max(self.min_workers);
         self
     }
 
@@ -447,5 +449,14 @@ mod tests {
         let m = metrics.read().unwrap().clone();
         assert_eq!(m.avg_queue_depth, (10.0 + 20.0 + 40.0) / 3.0);
         assert_eq!(m.current_queue_depth, 40);
+    }
+
+    /// Raising `min_workers` above the current `max_workers` raises `max_workers` too,
+    /// so the configuration never ends up with `min_workers > max_workers`.
+    #[test]
+    fn with_min_workers_keeps_max_at_least_min() {
+        let config = AutoscaleConfig::new().with_min_workers(15);
+        assert_eq!(config.min_workers, 15);
+        assert!(config.max_workers >= config.min_workers);
     }
 }

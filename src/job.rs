@@ -597,7 +597,14 @@ impl Job {
             attempts: 0,
             max_attempts: 3,
             created_at: now,
-            scheduled_at: now + delay,
+            // A delay past the representable range saturates instead of panicking.
+            scheduled_at: now.checked_add_signed(delay).unwrap_or(
+                if delay > chrono::Duration::zero() {
+                    DateTime::<Utc>::MAX_UTC
+                } else {
+                    DateTime::<Utc>::MIN_UTC
+                },
+            ),
             started_at: None,
             completed_at: None,
             failed_at: None,
@@ -1230,7 +1237,8 @@ impl Job {
     pub fn should_timeout(&self) -> bool {
         if let (Some(started_at), Some(timeout)) = (self.started_at, self.timeout) {
             let elapsed = Utc::now() - started_at;
-            let timeout_duration = chrono::Duration::from_std(timeout).unwrap_or_default();
+            // A timeout too large for chrono is effectively no timeout, not zero.
+            let timeout_duration = crate::queue::saturating_chrono_duration(timeout);
             elapsed >= timeout_duration
         } else {
             false
@@ -1999,6 +2007,22 @@ impl Job {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_timeout_too_large_for_chrono_never_expires() {
+        let mut job = Job::new("q".to_string(), json!({}))
+            .with_timeout(std::time::Duration::from_secs(u64::MAX));
+        job.started_at = Some(Utc::now());
+        assert!(!job.should_timeout());
+    }
+
+    #[test]
+    fn with_delay_saturates_instead_of_panicking() {
+        let job = Job::with_delay("q".to_string(), json!({}), chrono::Duration::MAX);
+        assert_eq!(job.scheduled_at, DateTime::<Utc>::MAX_UTC);
+        let job = Job::with_delay("q".to_string(), json!({}), chrono::Duration::MIN);
+        assert_eq!(job.scheduled_at, DateTime::<Utc>::MIN_UTC);
+    }
 
     #[test]
     fn test_job_new() {

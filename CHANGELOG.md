@@ -7,9 +7,209 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes to check when upgrading
+
+These are all bug fixes (details under **Fixed**), but each changes something you can
+observe:
+
+- **Retry delays are one step shorter**: the first retry waits the strategy's base
+  delay (`calculate_delay(1)`), as `RetryStrategy` documents.
+- **Cron presets fire on the right days.** `every_weekday_at_9am` now fires Monday to
+  Friday and `every_monday_at_noon` on Mondays. Recurring jobs already stored with the
+  old expressions (`0 0 9 * * 1-5`, `0 0 12 * * 1`) keep their stored expression: re-create
+  them, or update `cron_schedule` to `0 0 9 * * Mon-Fri` / `0 0 12 * * Mon`.
+- `CronSchedule::matches` is true if the schedule fires at any second of the minute.
+- `HammerworkConfig::from_env` returns an error for an invalid
+  `HAMMERWORK_DATABASE_POOL_SIZE`, `HAMMERWORK_WORKER_POOL_SIZE`,
+  `HAMMERWORK_JOB_TIMEOUT_SECONDS` or `HAMMERWORK_EVENT_BUFFER_SIZE` instead of silently
+  using the default.
+- `[archive]` durations are saved as `12h`, `90m`, ... instead of whole days; versions
+  before this one cannot read a sub-day value written this way.
+- Spawned jobs keep their own retry strategy, timeout and trace fields when the parent
+  has none, and the parent is added to a child's `depends_on` instead of replacing it.
+- Webhooks with `max_attempts = 0` are delivered once (they were never delivered); a
+  rate limit with a burst limit of 0 behaves as a burst of 1;
+  `AutoscaleConfig::with_min_workers` raises `max_workers` when needed.
+- Statistics: `InMemoryStatsCollector`'s `running` is the number of jobs running now,
+  and `BatchProcessingStats.batches_successful` requires 95% of a batch to complete.
+- `TestQueue` behaves like the databases: dependent jobs wait for their dependencies,
+  `statistics.failed` excludes `Dead` jobs, the dead-job APIs exclude `TimedOut` jobs and
+  `retry_dead_job` on a live job returns `InvalidJobTransition`. Tests written against
+  the old behaviour may need updating.
+- Dashboard: the "failed" counts (REST overview, queue endpoints, WebSocket) include
+  `Failed`, `Dead` and `TimedOut` jobs and agree with each other, so they can go up.
+  `/api/jobs` applies `created_after`, `created_before`, `search`, and `sort_order`
+  without `sort_by`.
+- CLI: `job list --failed` includes `TimedOut` jobs; `monitor metrics` / `monitor
+  health` count `Dead` and `TimedOut` jobs as failures; the configured `log_level` is
+  honoured; a config file that fails to parse still gets the environment variables.
+
 ### Changed
 
 - Docs: `docs/integration-testing.md` now describes the real CI workflow and queue module paths.
+
+### Fixed
+
+- **`CronSchedule::every_weekday_at_9am` and `every_monday_at_noon` (and the matching
+  `cron::presets`) fire on the right days.** They used numeric weekdays (`1-5`, `1`), but
+  the `cron` crate numbers days of the week from Sunday = 1, so the "weekday" preset ran
+  Sunday to Thursday and the "Monday" preset ran on Sundays. They now use `Mon-Fri` and
+  `Mon`.
+- **`CronSchedule::matches` is true whenever the schedule fires during the given
+  minute.** It only looked at the first fire after the minute before, so schedules that
+  fire several times a minute (`* * * * * *`, `0,30 * * * * *`) or later in the minute
+  (`30 * * * * *`) did not match.
+- **The `cron_example` example runs.** It used five-field cron expressions, which
+  `CronSchedule::new` rejects (Hammerwork's expressions have a seconds field), so it
+  stopped at its first schedule.
+- **`list_archived_jobs` with an offset and no limit works on MySQL.** MySQL has no
+  `OFFSET` without `LIMIT`, so the query was a syntax error.
+- **A job with a huge result TTL or result size limit stays readable.** `insert_jobs`
+  wrapped values above `i64::MAX` (e.g. `with_result_ttl(Duration::MAX)`) to negative
+  numbers, and every later read or claim of the job failed to decode it. They are now
+  stored as `i64::MAX`, as job timeouts already saturate.
+- **One job row that cannot be decoded no longer stops archival.** `archive_jobs`
+  failed and rolled back the whole batch on such a row, and since candidates are taken
+  oldest first, every later pass failed on it too, for every queue. The row is now
+  skipped (with a warning, and left in `hammerwork_jobs`) and the batch is filled with
+  the jobs after it, so the pass archives everything else.
+- **An archival or purge age too large to subtract from now no longer panics.**
+  `archive_*_after` or `purge_archived_after` set to something like
+  `chrono::Duration::MAX` (an easy way to say "never") panicked in `archive_jobs` and
+  `JobArchiver::run_scheduled_pass`. Such an age now matches nothing, and a zero or
+  negative age matches everything finished so far, as before.
+- **`ArchivalStats::compression_ratio` counts payloads stored uncompressed as 1.**
+  They counted as 0, so a batch in which a few payloads compressed reported a ratio
+  below 1, as if archiving had grown the data.
+- **A job cancelled by a fail-fast workflow or batch on MySQL keeps its satisfied
+  dependencies.** MySQL marked them `failed`, unlike PostgreSQL, so retrying such a job
+  with `retry_job` left it `Pending` forever. Jobs failed because a dependency failed
+  still have their dependencies marked failed on both backends.
+- **`KeyManager::get_key` refuses a key that has expired while cached.** Keys are cached
+  for up to an hour, and the cache did not check the key's expiry, so an expired key
+  could still be used for up to an hour after it expired.
+- **The first retry waits the retry strategy's first delay.** A claim already counts the
+  run in `attempts`, so after the first failed run `attempts` is 1, but the worker asked
+  the strategy for `calculate_delay(attempts + 1)`. That skipped a step:
+  `RetryStrategy::exponential(1s, 2.0, ..)` waited 2s, 4s, ... instead of 1s, 2s, ...,
+  and `max_delay` was reached one retry early. Retries now use `calculate_delay(attempts)`,
+  so the first retry is attempt 1, as `RetryStrategy` documents. **This shortens every
+  retry delay computed from a strategy by one step.**
+- **Batch-mode statistics no longer count nearly every batch as successful.**
+  `BatchResult::success_rate` is a percentage, but the worker compared it with `0.95`,
+  so a batch counted in `BatchProcessingStats::batches_successful` once 0.95% of its jobs
+  completed (and the log printed rates like "8000.0%"). The threshold is now 95%.
+- **`JobBatch::into_chunks` no longer panics with a batch size of 0**
+  (`with_batch_size(0)`); 0 is treated as unset.
+- **`JobStatistics::running` counts the jobs that are running**, not every `Started`
+  event in the window, which included runs that had finished.
+- **A timed-out run that is retried is counted once in the statistics.** It records
+  `TimedOut` then `Retried`, and both counted as finished runs: one timeout followed by
+  a successful retry reported 3 runs and a 67% error rate instead of 2 and 50%.
+- **`JobGroup::update_statistics` follows the backends' rules
+  (`WorkflowProgress::status`).** A `ContinueOnFailure` or `Manual` workflow whose jobs
+  had all finished, some failed, stayed `Running` forever; it could also overwrite
+  `Cancelled`, and made an empty workflow `Completed`.
+- **`WorkerPool::with_stats_collector` reaches the workers already in the pool.** After
+  `from_config(..)` or `from_hammerwork_config(..)`, only workers added later and
+  autoscaled clones got the collector.
+- **Workers whose jobs fail and are retried no longer raise starvation alerts.** The
+  worker's last job time moved only on completed, failed, dead and timed-out runs, so a
+  worker busy retrying jobs looked idle.
+- **A rate limit with a burst limit of 0 no longer stalls the worker forever.** The token
+  bucket had no capacity, so `RateLimiter::acquire` never returned; it now holds at least
+  one token.
+- **`PriorityWeights::total_weight` saturates** instead of overflowing (a panic in debug
+  builds) when weights sum past `u32::MAX`.
+- **`AutoscaleConfig::with_min_workers` keeps `max_workers >= min_workers`.**
+  `with_min_workers(15)` left the maximum at 10, so the pool could neither scale up past
+  10 nor scale down.
+- **Spawned jobs keep their own settings when the parent has none.**
+  `SpawnManager::prepare_spawn` copied the parent's retry strategy, timeout and trace
+  fields onto each child even when the parent had none, wiping the child's own (retry
+  strategy and trace context are inherited by default). They are now inherited only
+  when the parent has them. It also replaced the child's own dependencies with the
+  parent; the parent is now added to them.
+- **`TestQueue` behaves like the database backends** in several places where tests
+  written against it could pass while the code fails in production:
+  - It holds a job enqueued with `depends_on` until its dependencies complete (it handed
+    it out at once), in `enqueue`, `enqueue_batch` and `enqueue_workflow`. A job enqueued
+    after a dependency failed is enqueued as `Failed`.
+  - `finish_job_run` reports the jobs a completion released in
+    `RecordedOutcome::unblocked` (always empty for workflow jobs), and records a retried
+    run's `error_message` and `timed_out_at`.
+  - `requeue_stale_jobs` reschedules a recurring job that is out of attempts for its next
+    occurrence instead of leaving it `Dead`.
+  - `get_dead_jobs`, `get_dead_jobs_by_queue`, `get_dead_job_summary` and
+    `purge_dead_jobs` cover `Dead` jobs only (they included `TimedOut` jobs), and the
+    purge keeps jobs that died exactly at the cut-off (`failed_at < older_than`).
+  - A weighted dequeue whose candidate weights are all zero takes the highest priority
+    instead of returning nothing, and a huge weight (e.g. `u32::MAX`) no longer tries to
+    allocate gigabytes.
+  - `retry_dead_job` on a job that is not dead fails with `InvalidJobTransition`, not
+    `HammerworkError::Queue`.
+  - `get_queue_stats` reports `statistics.failed` as the `Failed` jobs only (it added the
+    `Dead` ones, which are in `statistics.dead`).
+- **`[archive]` durations survive saving a configuration, and invalid ones are
+  rejected.** `archive_after` and `delete_after` were written as whole days, so
+  `HammerworkConfig::save_to_file` turned `archive_after = 12h` into `"0d"`, and
+  reloading it archived every finished job at once. They are now written in the largest
+  exact unit (`"30d"`, `"12h"`, `"90m"`, `"45s"`), and `h`, `m` and `s` are read as well
+  as `d` and bare numbers (days). A negative duration (which made every finished job
+  eligible) or one too large for `chrono::Duration` (which panicked) is rejected when the
+  file loads. Files written by this version with sub-day durations cannot be read by
+  older versions.
+- **`HammerworkConfig::from_env` rejects invalid numbers** in
+  `HAMMERWORK_DATABASE_POOL_SIZE`, `HAMMERWORK_WORKER_POOL_SIZE`,
+  `HAMMERWORK_JOB_TIMEOUT_SECONDS` and `HAMMERWORK_EVENT_BUFFER_SIZE`, naming the
+  variable, as the encryption variables already did. They fell back to the defaults
+  silently, so `HAMMERWORK_JOB_TIMEOUT_SECONDS=30s` meant 5 minutes.
+- **`webhooks::verify_hmac_signature` accepts the signature webhooks send, and compares
+  in constant time.** Deliveries send `X-Hammerwork-Signature: sha256=<hex>`, but the
+  verifier only accepted bare hex, so verifying a received header always failed; and the
+  comparison stopped at the first differing byte despite claiming to be constant-time.
+  It now accepts both forms and compares with `Mac::verify_slice`.
+- **A webhook with `retry_policy.max_attempts = 0` is delivered once.** The delivery
+  loop made no attempt at all, so every event was dropped without a log or statistic.
+  `max_attempts` is documented as counting every attempt, including the first.
+- **An alert cooldown too long for `chrono` suppresses repeats instead of failing.**
+  With `with_cooldown(Duration::MAX)` ("alert once"), every later check of the same alert
+  returned `Err(Alerting("Invalid cooldown duration"))`.
+- **Huge durations no longer time jobs out at once or panic.** `Job::should_timeout`
+  treated a timeout too large for `chrono` as zero, so such a job timed out as soon as it
+  started; `Job::with_delay` panicked on a delay past the representable range (it now
+  saturates); and `RetentionPolicy::calculate_deletion_time` panicked when the deletion
+  time fell past it (it now keeps the data, as for durations `chrono` cannot hold).
+- **`cargo hammerwork monitor metrics` and `monitor health` count dead and timed-out
+  jobs as failures.** They counted only `Failed` jobs, but a job out of retries ends
+  `Dead` and a timed-out one `TimedOut`, so the failure rate and the recent-failures
+  health check missed the usual ways a job fails.
+- **`cargo hammerwork job list --failed` includes timed-out jobs**, as `job retry` does,
+  and `queue stats` shows an icon for `TimedOut` jobs.
+- **A `cargo hammerwork` config file that cannot be parsed no longer drops the
+  environment variables.** The CLI fell back to the built-in defaults, losing
+  `DATABASE_URL` and the `HAMMERWORK_*` variables; it now warns and applies the
+  environment to the defaults.
+- **`cargo hammerwork` uses the configured `log_level`** (config file or
+  `HAMMERWORK_LOG_LEVEL`) when neither `--verbose` nor `--quiet` is given. It was
+  documented but ignored, because logging was set up before the configuration loaded.
+- **The dashboard's job lists apply the `created_after`, `created_before` and `search`
+  filters** (`GET /api/jobs`, `/api/queues/{name}/jobs`), which were parsed but ignored,
+  **and honour `sort_order` without `sort_by`** (or with an unknown one), which always
+  listed newest first.
+- **The dashboard counts jobs in `Failed` as failed.** REST (`failed_count` in
+  `/api/queues`, `failed_total`, and the overview's `failed_jobs`, `total_jobs` and
+  `overall_error_rate`) counted only `Dead` and `TimedOut` jobs, while the WebSocket
+  `failed_count` counted only `Failed`. Both now count `Failed`, `Dead` and `TimedOut`
+  jobs (`dead_count` is still `Dead` alone), and a change in `Failed` jobs alone pushes a
+  queue update.
+- **Dashboard pagination metadata describes the page served when `offset` is given.**
+  `/api/queues` and `/api/archive/jobs` reported `page=1`, `has_prev=false` and
+  `has_next=true` for `?offset=100&limit=50` of 120 items.
+- **The `hammerwork-web` documentation lists the real endpoints**: job actions are
+  `POST /api/jobs/{id}/actions` (not `POST /api/jobs/{id}/retry` or
+  `DELETE /api/jobs/{id}`), trends take `?hours=N`, archive purge is
+  `DELETE /api/archive/purge`, and there are no `/api/archive/policies` endpoints.
 
 ## [2.2.0] - 2026-10-11
 

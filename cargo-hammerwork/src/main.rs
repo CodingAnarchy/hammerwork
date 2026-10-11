@@ -128,16 +128,17 @@ async fn main() -> Result<()> {
         Cli::parse()
     };
 
-    // Initialize logging based on verbosity flags
-    setup_logging(&cli)?;
+    // Load configuration. A config file that cannot be read or parsed falls back to the
+    // defaults, still overridden by the environment variables.
+    let (mut config, load_error) = Config::load_or_env();
+    if let Some(e) = load_error
+        && !cli.quiet
+    {
+        eprintln!("⚠️  Warning: Could not load config ({}), using defaults", e);
+    }
 
-    // Load configuration
-    let mut config = Config::load().unwrap_or_else(|e| {
-        if !cli.quiet {
-            eprintln!("⚠️  Warning: Could not load config ({}), using defaults", e);
-        }
-        Config::default()
-    });
+    // Initialize logging from the verbosity flags, else the configured log level
+    setup_logging(&cli, &config)?;
 
     // Execute command
     let result = execute_command(&cli.command, &mut config).await;
@@ -158,14 +159,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn setup_logging(cli: &Cli) -> Result<()> {
-    let log_level = if cli.quiet {
+/// The log level: `--quiet` and `--verbose` win, then the configured `log_level`
+/// (`HAMMERWORK_LOG_LEVEL` or the config file), then `info`. An unknown configured level
+/// is ignored.
+fn effective_log_level(quiet: bool, verbose: bool, config: &Config) -> &'static str {
+    const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+    if quiet {
         "error"
-    } else if cli.verbose {
+    } else if verbose {
         "debug"
     } else {
-        "info"
-    };
+        let configured = config.get_log_level();
+        LEVELS
+            .into_iter()
+            .find(|level| level.eq_ignore_ascii_case(configured.trim()))
+            .unwrap_or("info")
+    }
+}
+
+fn setup_logging(cli: &Cli, config: &Config) -> Result<()> {
+    let log_level = effective_log_level(cli.quiet, cli.verbose, config);
 
     let env_filter = EnvFilter::from_default_env()
         .add_directive(format!("cargo_hammerwork={}", log_level).parse()?)
@@ -484,5 +497,20 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn log_level_comes_from_the_flags_then_the_config() {
+        let mut config = Config {
+            log_level: Some("WARN".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(effective_log_level(false, false, &config), "warn");
+        assert_eq!(effective_log_level(true, false, &config), "error");
+        assert_eq!(effective_log_level(false, true, &config), "debug");
+        config.log_level = Some("loud".to_string());
+        assert_eq!(effective_log_level(false, false, &config), "info");
+        config.log_level = None;
+        assert_eq!(effective_log_level(false, false, &config), "info");
     }
 }

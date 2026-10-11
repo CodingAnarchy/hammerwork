@@ -482,26 +482,35 @@ impl<DB: sqlx::Database> SpawnManager<DB> {
             ));
         }
 
-        // Apply inheritance settings
+        // Apply inheritance settings. An optional setting is inherited when the parent
+        // has one, so a parent without it never wipes the child's own.
+        fn inherit<T: Clone>(child: &mut Option<T>, parent: &Option<T>) {
+            if parent.is_some() {
+                child.clone_from(parent);
+            }
+        }
         for child_job in &mut child_jobs {
             if config.inherit_priority {
                 child_job.priority = job.priority;
             }
             if config.inherit_retry_strategy {
-                child_job.retry_strategy = job.retry_strategy.clone();
+                inherit(&mut child_job.retry_strategy, &job.retry_strategy);
             }
             if config.inherit_timeout {
-                child_job.timeout = job.timeout;
+                inherit(&mut child_job.timeout, &job.timeout);
             }
             if config.inherit_trace_context {
-                child_job.trace_id = job.trace_id.clone();
-                child_job.correlation_id = job.correlation_id.clone();
-                child_job.parent_span_id = job.parent_span_id.clone();
-                child_job.span_context = job.span_context.clone();
+                inherit(&mut child_job.trace_id, &job.trace_id);
+                inherit(&mut child_job.correlation_id, &job.correlation_id);
+                inherit(&mut child_job.parent_span_id, &job.parent_span_id);
+                inherit(&mut child_job.span_context, &job.span_context);
             }
 
-            // Set up parent-child relationship
-            child_job.depends_on = vec![job.id];
+            // Set up parent-child relationship: every child depends on the parent, in
+            // addition to any dependencies of its own.
+            if !child_job.depends_on.contains(&job.id) {
+                child_job.depends_on.push(job.id);
+            }
             child_job.workflow_id = job.workflow_id;
             child_job.workflow_name = job.workflow_name.clone();
         }
@@ -808,5 +817,81 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, HammerworkError::InvalidJobPayload { .. }));
         assert!(err.to_string().contains("_spawn_config"));
+    }
+
+    #[cfg(all(feature = "test", feature = "postgres"))]
+    struct OwnSettingsSpawner {
+        sibling: crate::JobId,
+    }
+
+    #[cfg(all(feature = "test", feature = "postgres"))]
+    #[async_trait]
+    impl<DB: sqlx::Database> SpawnHandler<DB> for OwnSettingsSpawner {
+        async fn spawn_jobs(&self, _context: SpawnContext<DB>) -> Result<Vec<Job>> {
+            Ok(vec![
+                Job::new("child".to_string(), json!({}))
+                    .with_retry_strategy(crate::retry::RetryStrategy::fixed(
+                        std::time::Duration::from_secs(7),
+                    ))
+                    .with_timeout(std::time::Duration::from_secs(9))
+                    .with_trace_id("child-trace")
+                    .depends_on(&self.sibling),
+            ])
+        }
+    }
+
+    /// A parent without a retry strategy, timeout or trace id no longer wipes the
+    /// child's own (a parent that has one still overrides it), and the child keeps its
+    /// own dependencies in addition to the parent.
+    #[cfg(all(feature = "test", feature = "postgres"))]
+    #[tokio::test]
+    async fn test_prepare_spawn_keeps_the_childs_own_settings() {
+        use crate::queue::test::TestQueue;
+        let sibling = uuid::Uuid::new_v4();
+        let mut manager = SpawnManager::<sqlx::Postgres>::new();
+        manager.register_handler("parent", OwnSettingsSpawner { sibling });
+        let parent = Job::new("parent".to_string(), json!({}));
+        assert!(parent.retry_strategy.is_none() && parent.trace_id.is_none());
+        let config = SpawnConfig {
+            inherit_timeout: true,
+            ..Default::default()
+        };
+        let queue: Arc<dyn DatabaseQueue<Database = sqlx::Postgres> + Send + Sync> =
+            Arc::new(TestQueue::new());
+        let children = manager
+            .prepare_spawn(&parent, &config, queue)
+            .await
+            .unwrap()
+            .unwrap();
+        let child = &children[0];
+        assert_eq!(
+            child.retry_strategy,
+            Some(crate::retry::RetryStrategy::fixed(
+                std::time::Duration::from_secs(7)
+            ))
+        );
+        assert_eq!(child.timeout, Some(std::time::Duration::from_secs(9)));
+        assert_eq!(child.trace_id.as_deref(), Some("child-trace"));
+        assert!(child.depends_on.contains(&parent.id));
+        assert!(child.depends_on.contains(&sibling));
+
+        // A child without settings of its own still inherits the parent's.
+        let parent = Job::new("parent".to_string(), json!({}))
+            .with_retry_strategy(crate::retry::RetryStrategy::fixed(
+                std::time::Duration::from_secs(3),
+            ))
+            .with_trace_id("parent-trace");
+        let mut manager = SpawnManager::<sqlx::Postgres>::new();
+        manager.register_handler("parent", TestSpawnHandler);
+        let queue: Arc<dyn DatabaseQueue<Database = sqlx::Postgres> + Send + Sync> =
+            Arc::new(TestQueue::new());
+        let children = manager
+            .prepare_spawn(&parent, &SpawnConfig::default(), queue)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(children[0].retry_strategy, parent.retry_strategy);
+        assert_eq!(children[0].trace_id.as_deref(), Some("parent-trace"));
+        assert_eq!(children[0].depends_on, vec![parent.id]);
     }
 }

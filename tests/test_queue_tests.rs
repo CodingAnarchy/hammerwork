@@ -544,7 +544,9 @@ async fn test_dead_job_management() {
     // Purge old dead jobs
     let purge_before = clock.now() - Duration::hours(2);
     let purged = queue.purge_dead_jobs(purge_before).await.unwrap();
-    assert_eq!(purged, 3); // Jobs older than 2 hours
+    // Jobs that died more than 2 hours ago (the ones that died 4 and 3 hours ago); the
+    // cut-off is exclusive, as on the database backends.
+    assert_eq!(purged, 2);
 }
 
 #[tokio::test]
@@ -697,8 +699,11 @@ async fn test_queue_statistics() {
     let stats = queue.get_queue_stats("stats_queue").await.unwrap();
     assert_eq!(stats.pending_count, 5);
     assert_eq!(stats.statistics.completed, 3);
-    assert_eq!(stats.statistics.failed, 2);
-    assert_eq!(stats.statistics.total_processed, 5); // 3 completed + 2 failed
+    // Dead jobs are counted in `dead`, not `failed` (`Failed` jobs only), as on the
+    // database backends.
+    assert_eq!(stats.statistics.failed, 0);
+    assert_eq!(stats.statistics.dead, 2);
+    assert_eq!(stats.statistics.total_processed, 5); // 3 completed + 2 dead
     assert!(stats.statistics.avg_processing_time_ms > 0.0);
     assert!(stats.statistics.min_processing_time_ms > 0);
     assert!(stats.statistics.max_processing_time_ms > 0);

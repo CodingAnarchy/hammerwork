@@ -189,6 +189,19 @@ impl PaginationParams {
     }
 }
 
+/// The jobs of a queue that failed: those in status `Failed` (a failed dependency, a
+/// fail-fast batch or workflow, `fail_job`), `Dead` (out of retries) and `TimedOut`.
+///
+/// Every "failed" figure of the dashboard (REST and WebSocket) is this count;
+/// `dead_count` reports the `Dead` jobs separately.
+pub(crate) fn failed_job_count(stats: &hammerwork::stats::QueueStats) -> u64 {
+    stats
+        .statistics
+        .failed
+        .saturating_add(stats.dead_count)
+        .saturating_add(stats.timed_out_count)
+}
+
 /// Pagination metadata for responses
 #[derive(Debug, Serialize)]
 pub struct PaginationMeta {
@@ -205,7 +218,12 @@ impl PaginationMeta {
     pub fn new(params: &PaginationParams, total: u64) -> Self {
         let limit = params.get_limit();
         let offset = params.get_offset();
-        let page = params.page.unwrap_or(1);
+        // An explicit offset decides which items were served, whatever `page` says, so
+        // the page number and the neighbours are derived from it.
+        let page = match params.offset {
+            Some(offset) => (offset / limit).saturating_add(1),
+            None => params.page.unwrap_or(1),
+        };
         let total_pages = u32::try_from(total.div_ceil(u64::from(limit))).unwrap_or(u32::MAX);
 
         Self {
@@ -214,8 +232,8 @@ impl PaginationMeta {
             offset,
             total,
             total_pages,
-            has_next: page < total_pages,
-            has_prev: page > 1,
+            has_next: u64::from(offset) + u64::from(limit) < total,
+            has_prev: offset > 0,
         }
     }
 }
@@ -447,6 +465,31 @@ mod tests {
         assert_eq!(meta.total_pages, 5);
         assert!(meta.has_next);
         assert!(meta.has_prev);
+    }
+
+    #[test]
+    fn test_pagination_meta_describes_an_explicit_offset() {
+        let last_page = PaginationParams {
+            page: None,
+            limit: Some(50),
+            offset: Some(100),
+        };
+        let meta = PaginationMeta::new(&last_page, 120);
+        assert_eq!(meta.page, 3);
+        assert_eq!(meta.offset, 100);
+        assert!(!meta.has_next);
+        assert!(meta.has_prev);
+
+        // The offset wins over a page that disagrees with it
+        let first_items = PaginationParams {
+            page: Some(3),
+            limit: Some(50),
+            offset: Some(0),
+        };
+        let meta = PaginationMeta::new(&first_items, 120);
+        assert_eq!(meta.page, 1);
+        assert!(meta.has_next);
+        assert!(!meta.has_prev);
     }
 
     #[test]

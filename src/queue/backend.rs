@@ -276,6 +276,13 @@ pub(crate) fn timeout_db_seconds(timeout: Option<std::time::Duration>) -> Option
     Some(i32::try_from(seconds).unwrap_or(i32::MAX))
 }
 
+/// An unsigned setting (a result TTL in seconds, a size in bytes) as a `BIGINT` column
+/// value, saturating at `i64::MAX` instead of wrapping negative, which would make the row
+/// unreadable.
+pub(crate) fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// The decoded rows of a listing (dead jobs, ready jobs, archived jobs, ...), skipping and
 /// logging the rows that cannot be decoded.
 ///

@@ -2037,8 +2037,16 @@ async fn insert_jobs(conn: &mut sqlx::PgConnection, jobs: &[Job]) -> Result<()> 
                 .push_bind(&job.timezone)
                 .push_bind(job.batch_id)
                 .push_bind(result_storage_str(&job.result_config.storage))
-                .push_bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
-                .push_bind(job.result_config.max_size_bytes.map(|s| s as i64))
+                .push_bind(
+                    job.result_config
+                        .ttl
+                        .map(|d| super::saturating_i64(d.as_secs())),
+                )
+                .push_bind(
+                    job.result_config
+                        .max_size_bytes
+                        .map(|s| super::saturating_i64(s as u64)),
+                )
                 .push_bind(strategy)
                 .push_bind(&job.depends_on)
                 .push_bind(&job.dependents)
@@ -2746,11 +2754,13 @@ impl crate::queue::JobQueue<Postgres> {
         let mut status_conditions = Vec::new();
         let mut param = if queue_name.is_some() { 2 } else { 1 };
         for (after, status, column) in crate::archive::archival_candidates(policy) {
-            if let Some(after) = after {
+            if let Some(threshold) =
+                after.and_then(|after| crate::archive::age_threshold(now, after))
+            {
                 status_conditions.push(format!(
                     "(status = '{status}' AND {column} IS NOT NULL AND {column} <= ${param})"
                 ));
-                thresholds.push(now - after);
+                thresholds.push(threshold);
                 param += 1;
             }
         }
@@ -2759,43 +2769,77 @@ impl crate::queue::JobQueue<Postgres> {
         }
 
         // Lock the candidate rows so concurrent archivers (and workers) skip them
-        // instead of archiving the same job twice.
-        let select = format!(
-            "SELECT {} FROM hammerwork_jobs WHERE archived_at IS NULL{} AND ({}) \
-             ORDER BY created_at ASC LIMIT {} FOR UPDATE SKIP LOCKED",
-            JOB_SELECT_FIELDS,
-            if queue_name.is_some() {
-                " AND queue_name = $1"
-            } else {
-                ""
-            },
-            status_conditions.join(" OR "),
-            policy.batch_size
-        );
+        // instead of archiving the same job twice. Rows already examined by this batch
+        // are excluded, so a batch can be topped up after skipping undecodable rows.
+        let select = |limit: usize| {
+            format!(
+                "SELECT {} FROM hammerwork_jobs WHERE archived_at IS NULL{} AND ({}) \
+                 AND NOT (id = ANY(${param})) \
+                 ORDER BY created_at ASC LIMIT {limit} FOR UPDATE SKIP LOCKED",
+                JOB_SELECT_FIELDS,
+                if queue_name.is_some() {
+                    " AND queue_name = $1"
+                } else {
+                    ""
+                },
+                status_conditions.join(" OR "),
+            )
+        };
 
         // Archiving a job moves its row: insert into the archive table and delete from
         // the main table in the same transaction.
         let mut tx = self.pool.begin().await?;
 
-        let mut query = sqlx::query_as::<_, JobRow>(&select);
-        if let Some(queue) = queue_name {
-            query = query.bind(queue);
+        // A row that cannot be decoded is skipped and left where it is, and the batch is
+        // topped up with the rows after it: failing would roll back every pass, and a
+        // short batch would end the pass early, stopping archival for every queue.
+        let mut jobs_to_archive = Vec::new();
+        let mut examined: Vec<uuid::Uuid> = Vec::new();
+        while jobs_to_archive.len() < policy.batch_size {
+            let wanted = policy.batch_size - jobs_to_archive.len();
+            let select = select(wanted);
+            let mut query = sqlx::query_as::<_, JobRow>(&select);
+            if let Some(queue) = queue_name {
+                query = query.bind(queue);
+            }
+            for threshold in &thresholds {
+                query = query.bind(*threshold);
+            }
+            let rows = query.bind(&examined).fetch_all(&mut *tx).await?;
+            let fetched = rows.len();
+            let mut skipped = false;
+            for row in rows {
+                let id = row.id;
+                examined.push(id);
+                match row.into_job() {
+                    Ok(job) => jobs_to_archive.push(job),
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = %id,
+                            error = %error,
+                            "Skipping a job that cannot be decoded while archiving"
+                        );
+                        skipped = true;
+                    }
+                }
+            }
+            if !skipped || fetched < wanted {
+                break;
+            }
         }
-        for threshold in thresholds {
-            query = query.bind(threshold);
-        }
-        let jobs_to_archive = query.fetch_all(&mut *tx).await?;
 
         let archived_at = Utc::now();
         let mut archived_ids = Vec::with_capacity(jobs_to_archive.len());
         let mut encrypted_ids = Vec::new();
-        for job_row in jobs_to_archive {
-            let job = job_row.into_job()?;
+        for job in jobs_to_archive {
             let (final_payload, is_compressed, original_size) =
                 crate::archive::encode_archived_payload(&job.payload, policy, config)?;
-            if is_compressed {
-                total_compression_ratio += original_size as f64 / final_payload.len() as f64;
-            }
+            // original size / stored size: a payload stored uncompressed counts as 1.
+            total_compression_ratio += if is_compressed {
+                original_size as f64 / final_payload.len() as f64
+            } else {
+                1.0
+            };
 
             sqlx::query(
                 r#"

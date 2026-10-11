@@ -408,7 +408,9 @@ impl PriorityWeights {
                 .map(|p| p.as_i32() as u32)
                 .sum()
         } else {
-            self.weights.values().sum()
+            self.weights
+                .values()
+                .fold(0u32, |total, weight| total.saturating_add(*weight))
         }
     }
 
@@ -630,5 +632,15 @@ mod tests {
         assert_eq!(priorities.len(), 5);
         assert_eq!(priorities[0], JobPriority::Background);
         assert_eq!(priorities[4], JobPriority::Critical);
+    }
+
+    /// Weights large enough to overflow `u32` saturate instead of panicking (debug) or
+    /// wrapping (release).
+    #[test]
+    fn test_total_weight_saturates() {
+        let weights = PriorityWeights::new()
+            .with_weight(JobPriority::Critical, u32::MAX)
+            .with_weight(JobPriority::High, 10);
+        assert_eq!(weights.total_weight(), u32::MAX);
     }
 }

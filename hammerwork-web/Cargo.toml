@@ -66,6 +66,8 @@ mysql = ["hammerwork/mysql", "sqlx/mysql"]
 auth = ["bcrypt"]
 
 [dev-dependencies]
+# `TestQueue` (in-memory queue) for handler tests
+hammerwork = { workspace = true, features = ["test"] }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
 warp = { workspace = true, features = ["test"] }

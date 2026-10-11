@@ -1,19 +1,16 @@
 //! Archive management API endpoints.
 //!
 //! This module provides REST API endpoints for managing job archiving operations,
-//! including archiving jobs, restoring archived jobs, listing archived jobs,
-//! and configuring archival policies.
+//! including archiving jobs, restoring archived jobs, listing archived jobs
+//! and purging old archived jobs.
 //!
 //! # Endpoints
 //!
 //! - `POST /api/archive/jobs` - Archive jobs based on policy
 //! - `GET /api/archive/jobs` - List archived jobs with pagination and filtering
 //! - `POST /api/archive/jobs/{id}/restore` - Restore an archived job
-//! - `DELETE /api/archive/jobs` - Purge old archived jobs
+//! - `DELETE /api/archive/purge` - Purge old archived jobs
 //! - `GET /api/archive/stats` - Get archival statistics
-//! - `GET /api/archive/policies` - List archival policies
-//! - `POST /api/archive/policies` - Create or update archival policy
-//! - `DELETE /api/archive/policies/{id}` - Delete archival policy
 //!
 //! # Examples
 //!

@@ -149,6 +149,13 @@ fn retry_at_from_delay(now: DateTime<Utc>, retry_delay: Duration) -> DateTime<Ut
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
+/// Whether a finished batch counts as successful in [`BatchProcessingStats`]: at least
+/// 95% of its jobs completed. [`BatchResult::success_rate`](crate::batch::BatchResult::success_rate)
+/// is a percentage (0 to 100).
+fn batch_counts_as_successful(result: &crate::batch::BatchResult) -> bool {
+    result.success_rate() >= 95.0
+}
+
 /// How many attempts a job gets: its own `max_attempts`, lowered by the worker's cap
 /// (`Worker::with_max_retries`) when one is set.
 fn effective_attempt_limit(job_max_attempts: i32, worker_cap: Option<i32>) -> i32 {
@@ -2348,11 +2355,14 @@ where
     /// Uses, in order: the job's own retry strategy, the worker's default strategy,
     /// and the fixed retry delay.
     fn retry_at_for(&self, job: &Job) -> DateTime<Utc> {
-        let next_attempt = u32::try_from(job.attempts.saturating_add(1)).unwrap_or(u32::MAX);
+        // The claim of this run already counted it in `attempts`, so after the first
+        // failed run `attempts` is 1: the first retry (`calculate_delay(1)`, the
+        // strategy's base delay).
+        let retry = u32::try_from(job.attempts.max(1)).unwrap_or(u32::MAX);
         let retry_delay = if let Some(ref job_strategy) = job.retry_strategy {
-            job_strategy.calculate_delay(next_attempt)
+            job_strategy.calculate_delay(retry)
         } else if let Some(ref default_strategy) = self.default_retry_strategy {
-            default_strategy.calculate_delay(next_attempt)
+            default_strategy.calculate_delay(retry)
         } else {
             self.retry_delay
         };
@@ -3005,25 +3015,22 @@ where
         if batch_result.pending_jobs == 0 {
             let completion_rate = batch_result.success_rate();
 
-            if completion_rate >= 0.95 {
+            if batch_counts_as_successful(&batch_result) {
                 info!(
                     "Batch {} completed successfully with {:.1}% success rate",
-                    batch_id,
-                    completion_rate * 100.0
+                    batch_id, completion_rate
                 );
             } else {
                 warn!(
                     "Batch {} completed with {:.1}% success rate ({} failures)",
-                    batch_id,
-                    completion_rate * 100.0,
-                    batch_result.failed_jobs
+                    batch_id, completion_rate, batch_result.failed_jobs
                 );
             }
 
             // Update batch completion statistics
             self.update_batch_stats(|stats| {
                 stats.batches_completed += 1;
-                if completion_rate >= 0.95 {
+                if batch_counts_as_successful(&batch_result) {
                     stats.batches_successful += 1;
                 }
             });
@@ -3087,14 +3094,10 @@ where
             }
         }
 
-        // Update last job time for worker starvation detection
-        if matches!(
-            event.event_type,
-            JobEventType::Completed
-                | JobEventType::Failed
-                | JobEventType::Dead
-                | JobEventType::TimedOut
-        ) && let Ok(mut last_time) = self.last_job_time.write()
+        // Update last job time for worker starvation detection: every finished run,
+        // including one that failed and will be retried.
+        if event.event_type != JobEventType::Started
+            && let Ok(mut last_time) = self.last_job_time.write()
         {
             *last_time = event.timestamp;
         }
@@ -3850,5 +3853,95 @@ mod tests {
             Worker::<sqlx::Postgres>::start_held(&held, job.id, Duration::from_millis(10)),
             HeldStart::RenewThenRun
         );
+    }
+
+    fn batch_result(total: u32, completed: u32) -> crate::batch::BatchResult {
+        crate::batch::BatchResult {
+            batch_id: uuid::Uuid::new_v4(),
+            total_jobs: total,
+            completed_jobs: completed,
+            failed_jobs: total - completed,
+            pending_jobs: 0,
+            status: crate::batch::BatchStatus::Completed,
+            created_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            error_summary: None,
+            job_errors: Default::default(),
+        }
+    }
+
+    /// `BatchResult::success_rate` is a percentage (0-100), so a batch where half the
+    /// jobs failed must not count as successful (the threshold used to be 0.95, i.e.
+    /// 0.95%).
+    #[test]
+    fn batch_success_threshold_is_a_percentage() {
+        assert!(!batch_counts_as_successful(&batch_result(100, 50)));
+        assert!(!batch_counts_as_successful(&batch_result(100, 1)));
+        assert!(!batch_counts_as_successful(&batch_result(100, 94)));
+        assert!(batch_counts_as_successful(&batch_result(100, 95)));
+        assert!(batch_counts_as_successful(&batch_result(10, 10)));
+    }
+
+    /// Claims count the attempt, so after a job's first failed run `attempts` is 1 and
+    /// the delay must be the strategy's first retry delay (`calculate_delay(1)`).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn first_retry_uses_the_strategys_first_delay() {
+        let worker = lazy_worker("retry_numbering").with_default_retry_strategy(
+            RetryStrategy::exponential(Duration::from_secs(60), 10.0, None),
+        );
+        let mut job = Job::new("retry_numbering".to_string(), serde_json::json!({}));
+        job.attempts = 1; // as returned by the claim of its first run
+        let delay = worker.retry_at_for(&job) - Utc::now();
+        assert!(
+            delay <= chrono::Duration::seconds(61) && delay >= chrono::Duration::seconds(59),
+            "first retry waited {delay}, expected the 60s base delay"
+        );
+
+        job.attempts = 2;
+        let delay = worker.retry_at_for(&job) - Utc::now();
+        assert!(
+            delay <= chrono::Duration::seconds(601) && delay >= chrono::Duration::seconds(599),
+            "second retry waited {delay}, expected 600s"
+        );
+
+        // A job without attempts recorded still gets the first delay.
+        job.attempts = 0;
+        let delay = worker.retry_at_for(&job) - Utc::now();
+        assert!(delay <= chrono::Duration::seconds(61), "waited {delay}");
+    }
+
+    /// A worker whose jobs fail and are retried is processing jobs, not starving: a
+    /// `Retried` event moves `last_job_time` like any other finished run.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn retried_runs_update_last_job_time() {
+        let worker = lazy_worker("starvation");
+        let long_ago = Utc::now() - chrono::Duration::hours(1);
+        *worker.last_job_time.write().unwrap() = long_ago;
+        let job = Job::new("starvation".to_string(), serde_json::json!({}));
+        worker
+            .record_event(job_event(
+                &job,
+                JobEventType::Retried,
+                None,
+                Some("boom".to_string()),
+                Utc::now(),
+            ))
+            .await;
+        assert!(*worker.last_job_time.read().unwrap() > long_ago);
+
+        // A start is not a finished run.
+        *worker.last_job_time.write().unwrap() = long_ago;
+        worker
+            .record_event(job_event(
+                &job,
+                JobEventType::Started,
+                None,
+                None,
+                Utc::now(),
+            ))
+            .await;
+        assert_eq!(*worker.last_job_time.read().unwrap(), long_ago);
     }
 }

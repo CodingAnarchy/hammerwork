@@ -105,7 +105,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("=== Creating Cron Jobs ===");
 
         // 1. Daily report at 9 AM
-        let daily_report_schedule = CronSchedule::new("0 9 * * *")?; // Every day at 9:00 AM
+        let daily_report_schedule = CronSchedule::new("0 0 9 * * *")?; // Every day at 9:00 AM
         let daily_report_job = Job::with_cron_schedule(
             "reports".to_string(),
             json!({
@@ -118,7 +118,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("Enqueued daily report job: {}", daily_job_id);
 
         // 2. Weekly report every Monday at 8 AM
-        let weekly_report_schedule = CronSchedule::new("0 8 * * 1")?; // Every Monday at 8:00 AM
+        let weekly_report_schedule = CronSchedule::new("0 0 8 * * Mon")?; // Every Monday at 8:00 AM
         let weekly_report_job = Job::with_cron_schedule(
             "reports".to_string(),
             json!({
@@ -131,7 +131,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("Enqueued weekly report job: {}", weekly_job_id);
 
         // 3. Monthly report on the 1st of each month at 7 AM
-        let monthly_report_schedule = CronSchedule::new("0 7 1 * *")?; // 1st day of every month at 7:00 AM
+        let monthly_report_schedule = CronSchedule::new("0 0 7 1 * *")?; // 1st day of every month at 7:00 AM
         let monthly_report_job = Job::with_cron_schedule(
             "reports".to_string(),
             json!({
@@ -144,7 +144,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("Enqueued monthly report job: {}", monthly_job_id);
 
         // 4. Cleanup job every 30 minutes using preset
-        let cleanup_schedule = CronSchedule::new("*/30 * * * *")?; // Every 30 minutes
+        let cleanup_schedule = CronSchedule::new("0 */30 * * * *")?; // Every 30 minutes
         let cleanup_job = Job::with_cron_schedule(
             "cleanup".to_string(),
             json!({
@@ -169,7 +169,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("Enqueued log rotation job: {}", log_job_id);
 
         // 6. Cache cleanup with timezone (New York time)
-        let ny_cleanup_schedule = CronSchedule::with_timezone("0 2 * * *", "America/New_York")?; // 2 AM EST/EDT
+        let ny_cleanup_schedule = CronSchedule::with_timezone("0 0 2 * * *", "America/New_York")?; // 2 AM EST/EDT
         let cache_cleanup_job = Job::with_cron_schedule(
             "cleanup".to_string(),
             json!({
@@ -183,7 +183,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         info!("Enqueued cache cleanup job (NY timezone): {}", cache_job_id);
 
         // 7. Demonstration: Create a job that runs every minute for immediate testing
-        let demo_schedule = CronSchedule::new("* * * * *")?; // Every minute
+        let demo_schedule = CronSchedule::new("0 * * * * *")?; // Every minute
         let demo_job = Job::with_cron_schedule(
             "reports".to_string(),
             json!({

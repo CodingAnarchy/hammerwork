@@ -35,7 +35,7 @@ pub enum JobCommand {
         priority: Option<String>,
         #[arg(short, long, help = "Maximum number of jobs to display")]
         limit: Option<u32>,
-        #[arg(long, help = "Show only failed jobs")]
+        #[arg(long, help = "Show only failed jobs (Failed, Dead or TimedOut)")]
         failed: bool,
         #[arg(long, help = "Show only completed jobs")]
         completed: bool,
@@ -358,7 +358,7 @@ pub fn build_list_jobs_query(
         conditions.push(format!("priority = {p}"));
     }
     if failed {
-        conditions.push("status IN ('Failed', 'Dead')".to_string());
+        conditions.push("status IN ('Failed', 'Dead', 'TimedOut')".to_string());
     }
     if completed {
         conditions.push("status = 'Completed'".to_string());
@@ -975,7 +975,8 @@ mod tests {
             Some(1),
         );
         assert!(query.contains("queue_name = ?"));
-        assert!(query.contains("status IN ('Failed', 'Dead')"));
+        // Failed jobs are Failed, Dead and TimedOut, as for `job retry`
+        assert!(query.contains("status IN ('Failed', 'Dead', 'TimedOut')"));
         assert!(query.contains("DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? HOUR)"));
         // User input is bound, never interpolated
         assert!(!query.contains("DROP"));

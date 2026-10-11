@@ -316,7 +316,8 @@ impl std::fmt::Debug for WebhookAuth {
 /// Retry policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
-    /// Maximum number of retry attempts
+    /// Maximum number of delivery attempts, including the first (0 is treated as 1:
+    /// every event is attempted at least once)
     pub max_attempts: u32,
     /// Initial delay between retries (in seconds)
     pub initial_delay_secs: u64,
@@ -1007,7 +1008,8 @@ impl WebhookManager {
         _pending: OwnedSemaphorePermit,
     ) {
         let mut attempt = 0;
-        let max_attempts = webhook.retry_policy.max_attempts;
+        // Every event is attempted at least once, even with `max_attempts: 0`.
+        let max_attempts = webhook.retry_policy.max_attempts.max(1);
 
         while attempt < max_attempts {
             attempt += 1;
@@ -1608,8 +1610,8 @@ impl PayloadTemplate {
 /// let payload = b"{'event': 'job.completed', 'job_id': '123'}";
 /// let signature = generate_hmac_signature(secret, payload);
 ///
-/// // The signature can be sent in a header like X-Webhook-Signature
-/// println!("X-Webhook-Signature: sha256={}", signature);
+/// // Deliveries send it as the X-Hammerwork-Signature header
+/// println!("X-Hammerwork-Signature: sha256={}", signature);
 /// ```
 ///
 /// # Security Notes
@@ -1639,7 +1641,8 @@ pub fn generate_hmac_signature(secret: &str, payload: &[u8]) -> String {
 ///
 /// * `secret` - The shared secret key used for verification
 /// * `payload` - The raw payload bytes to verify
-/// * `signature` - The signature to verify against (as hexadecimal string)
+/// * `signature` - The signature to verify against: the `X-Hammerwork-Signature` header
+///   value of a delivery (`sha256=<hex>`), or the bare hexadecimal signature
 ///
 /// # Returns
 ///
@@ -1672,15 +1675,50 @@ pub fn generate_hmac_signature(secret: &str, payload: &[u8]) -> String {
 /// - This function uses constant-time comparison to prevent timing attacks
 #[cfg(feature = "webhooks")]
 pub fn verify_hmac_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
-    let expected = generate_hmac_signature(secret, payload);
-    // Use constant-time comparison to prevent timing attacks
-    expected.len() == signature.len()
-        && expected.bytes().zip(signature.bytes()).all(|(a, b)| a == b)
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    // Deliveries send `X-Hammerwork-Signature: sha256=<hex>`; accept that header value as
+    // well as the bare hex of `generate_hmac_signature`.
+    let signature = signature.trim();
+    let hex_signature = signature.strip_prefix("sha256=").unwrap_or(signature);
+    let Ok(signature_bytes) = hex::decode(hex_signature) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(payload);
+    // `verify_slice` compares in constant time.
+    mac.verify_slice(&signature_bytes).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_hmac_signature_accepts_the_delivered_signature_header() {
+        let secret = "webhook-secret";
+        let payload = serde_json::json!({"event": "job.completed", "job_id": "123"});
+        let body = serde_json::to_vec(&payload).unwrap();
+        // What a delivery sends in X-Hammerwork-Signature: "sha256=<hex>"
+        let header = WebhookManager::calculate_hmac_signature(secret, &payload);
+        assert!(header.starts_with("sha256="));
+        assert!(verify_hmac_signature(secret, &body, &header));
+        // The bare hex form keeps working
+        assert!(verify_hmac_signature(
+            secret,
+            &body,
+            &generate_hmac_signature(secret, &body)
+        ));
+        // Wrong secret, tampered body, garbage and empty signatures are rejected
+        assert!(!verify_hmac_signature("other", &body, &header));
+        assert!(!verify_hmac_signature(secret, b"{}", &header));
+        assert!(!verify_hmac_signature(secret, &body, "sha256=zz"));
+        assert!(!verify_hmac_signature(secret, &body, ""));
+        assert!(!verify_hmac_signature(secret, &body, "sha256="));
+    }
 
     #[test]
     fn test_debug_does_not_print_webhook_secrets() {
@@ -2820,6 +2858,17 @@ mod tests {
         let recorded = next_recorded(url_rx).await;
         manager.shutdown(Duration::from_secs(5)).await;
         recorded
+    }
+
+    #[tokio::test]
+    async fn a_zero_max_attempts_still_delivers_once() {
+        let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
+        let webhook = WebhookConfig::new("zero".to_string(), url).with_retry_policy(RetryPolicy {
+            max_attempts: 0,
+            ..RetryPolicy::default()
+        });
+        let recorded = deliver_one(webhook, &mut rx).await;
+        assert!(recorded.request_line.starts_with("POST"));
     }
 
     #[tokio::test]

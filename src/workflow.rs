@@ -519,17 +519,22 @@ impl JobGroup {
             })
             .count();
 
-        // Update workflow status based on job completion
-        if self.completed_jobs == self.total_jobs {
-            self.status = WorkflowStatus::Completed;
-            if self.completed_at.is_none() {
+        // The same rules as the database backends (`WorkflowProgress::status`): a
+        // cancelled workflow stays cancelled, and a workflow whose jobs have all
+        // finished with failures among them is failed whatever its failure policy.
+        let progress = WorkflowProgress {
+            completed: self.completed_jobs,
+            failed: self.failed_jobs,
+        };
+        self.status = progress.status(self.total_jobs, &self.failure_policy, &self.status);
+        match self.status {
+            WorkflowStatus::Completed if self.completed_at.is_none() => {
                 self.completed_at = Some(Utc::now());
             }
-        } else if self.failed_jobs > 0 && self.failure_policy == FailurePolicy::FailFast {
-            self.status = WorkflowStatus::Failed;
-            if self.failed_at.is_none() {
+            WorkflowStatus::Failed if self.failed_at.is_none() => {
                 self.failed_at = Some(Utc::now());
             }
+            _ => {}
         }
     }
 }
@@ -838,5 +843,49 @@ mod tests {
             .with_failure_policy(FailurePolicy::ContinueOnFailure);
 
         assert_eq!(workflow.failure_policy, FailurePolicy::ContinueOnFailure);
+    }
+
+    fn finished(mut job: Job, status: crate::JobStatus) -> Job {
+        job.status = status;
+        job
+    }
+
+    /// Once every job of a `ContinueOnFailure` (or `Manual`) workflow has finished with
+    /// a failure among them, the workflow is `Failed`, as `WorkflowProgress::status`
+    /// (used by the database backends) decides; it used to stay `Running` forever.
+    #[test]
+    fn test_update_statistics_fails_finished_workflow_with_failures() {
+        for policy in [FailurePolicy::ContinueOnFailure, FailurePolicy::Manual] {
+            let mut workflow = JobGroup::new("finished")
+                .add_job(finished(
+                    Job::new("q".to_string(), json!({})),
+                    crate::JobStatus::Completed,
+                ))
+                .add_job(finished(
+                    Job::new("q".to_string(), json!({})),
+                    crate::JobStatus::Dead,
+                ))
+                .with_failure_policy(policy.clone());
+            workflow.update_statistics();
+            assert_eq!(workflow.status, WorkflowStatus::Failed, "{policy:?}");
+            assert!(workflow.failed_at.is_some());
+        }
+    }
+
+    /// `update_statistics` never overrides a cancelled workflow, and an empty workflow
+    /// is not `Completed`.
+    #[test]
+    fn test_update_statistics_keeps_cancelled_and_empty() {
+        let mut workflow = JobGroup::new("cancelled").add_job(finished(
+            Job::new("q".to_string(), json!({})),
+            crate::JobStatus::Completed,
+        ));
+        workflow.status = WorkflowStatus::Cancelled;
+        workflow.update_statistics();
+        assert_eq!(workflow.status, WorkflowStatus::Cancelled);
+
+        let mut empty = JobGroup::new("empty");
+        empty.update_statistics();
+        assert_eq!(empty.status, WorkflowStatus::Running);
     }
 }

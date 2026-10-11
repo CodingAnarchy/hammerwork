@@ -528,8 +528,9 @@ impl RetentionPolicy {
     ) -> Option<DateTime<Utc>> {
         match self {
             RetentionPolicy::DeleteAfter(duration) => {
+                // A deletion time past the representable range is never.
                 let duration_chrono = chrono::Duration::from_std(*duration).ok()?;
-                Some(created_at + duration_chrono)
+                created_at.checked_add_signed(duration_chrono)
             }
             RetentionPolicy::DeleteAt(timestamp) => Some(*timestamp),
             RetentionPolicy::KeepIndefinitely => None,
@@ -537,7 +538,7 @@ impl RetentionPolicy {
             RetentionPolicy::UseDefault => {
                 if let Some(default_duration) = default_retention {
                     let duration_chrono = chrono::Duration::from_std(default_duration).ok()?;
-                    Some(created_at + duration_chrono)
+                    created_at.checked_add_signed(duration_chrono)
                 } else {
                     None
                 }
@@ -1083,6 +1084,21 @@ pub fn generate_deterministic_key_with_size(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_retention_past_the_representable_range_keeps_the_data() {
+        // About 300,000 years: valid for chrono::Duration, but not after `created_at`.
+        let long = Duration::from_secs(10u64.pow(13));
+        let now = Utc::now();
+        assert_eq!(
+            RetentionPolicy::DeleteAfter(long).calculate_deletion_time(now, None, None),
+            None
+        );
+        assert_eq!(
+            RetentionPolicy::UseDefault.calculate_deletion_time(now, None, Some(long)),
+            None
+        );
+    }
 
     #[test]
     fn test_encryption_config_creation() {

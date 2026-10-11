@@ -213,10 +213,21 @@ struct StatsAccumulator {
     min_processing_time_ms: Option<u64>,
     max_processing_time_ms: u64,
     priorities: HashMap<JobPriority, PriorityTotals>,
+    /// The latest event of each job seen so far: tells which jobs are still running,
+    /// and which `Retried` event belongs to a run already counted by its `TimedOut`.
+    last_event: HashMap<uuid::Uuid, JobEventType>,
 }
 
 impl StatsAccumulator {
     fn add(&mut self, event: &JobEvent) {
+        let previous = self
+            .last_event
+            .insert(event.job_id, event.event_type.clone());
+        // A timed-out run that will be retried records `TimedOut` and then `Retried`:
+        // one run, already counted (as an error) by its `TimedOut` event.
+        if event.event_type == JobEventType::Retried && previous == Some(JobEventType::TimedOut) {
+            return;
+        }
         self.events += 1;
         match event.event_type {
             JobEventType::Started => self.started += 1,
@@ -252,6 +263,12 @@ impl StatsAccumulator {
         // A run is counted once, when it finishes: `Started` marks the beginning of a
         // run that is counted by its outcome event.
         let total_processed = self.events - self.started;
+        // Jobs whose latest event in the window is the start of a run.
+        let running = self
+            .last_event
+            .values()
+            .filter(|event_type| **event_type == JobEventType::Started)
+            .count() as u64;
 
         let avg_processing_time_ms = if self.timed_events > 0 {
             self.processing_time_ms as f64 / self.timed_events as f64
@@ -294,7 +311,7 @@ impl StatsAccumulator {
             failed: self.failed,
             dead: self.dead,
             timed_out: self.timed_out,
-            running: self.started,
+            running,
             avg_processing_time_ms,
             min_processing_time_ms: self.min_processing_time_ms.unwrap_or(0),
             max_processing_time_ms: self.max_processing_time_ms,
@@ -1231,5 +1248,67 @@ mod tests {
             .map(|q| (q.queue_name.as_str(), q.statistics.total_processed))
             .collect();
         assert_eq!(counts, vec![("a", 3), ("b", 1)]);
+    }
+
+    fn job_event(job_id: uuid::Uuid, event_type: JobEventType) -> JobEvent {
+        JobEvent {
+            job_id,
+            ..create_test_job_event("runs", event_type, None, None, None)
+        }
+    }
+
+    /// `running` is the number of jobs currently running: a job whose run started and
+    /// then finished is not running any more.
+    #[tokio::test]
+    async fn test_running_counts_only_unfinished_runs() {
+        let collector = InMemoryStatsCollector::new_default();
+        let finished = uuid::Uuid::new_v4();
+        let still_running = uuid::Uuid::new_v4();
+        for event in [
+            job_event(finished, JobEventType::Started),
+            job_event(still_running, JobEventType::Started),
+            job_event(finished, JobEventType::Completed),
+        ] {
+            collector.record_event(event).await.unwrap();
+        }
+        let stats = collector
+            .get_queue_statistics("runs", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(stats.running, 1);
+        let system = collector
+            .get_system_statistics(Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(system.running, 1);
+    }
+
+    /// A timed-out run that is retried emits `TimedOut` and then `Retried`; it is one
+    /// run (and one error), not two.
+    #[tokio::test]
+    async fn test_timed_out_and_retried_run_is_counted_once() {
+        let collector = InMemoryStatsCollector::new_default();
+        let job = uuid::Uuid::new_v4();
+        for event_type in [
+            JobEventType::Started,
+            JobEventType::TimedOut,
+            JobEventType::Retried,
+            JobEventType::Started,
+            JobEventType::Completed,
+        ] {
+            collector
+                .record_event(job_event(job, event_type))
+                .await
+                .unwrap();
+        }
+        let stats = collector
+            .get_queue_statistics("runs", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(stats.total_processed, 2);
+        assert_eq!(stats.timed_out, 1);
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.error_rate, 0.5);
+        assert_eq!(stats.running, 0);
     }
 }

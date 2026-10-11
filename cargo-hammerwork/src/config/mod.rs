@@ -212,6 +212,26 @@ impl Config {
         Ok(config)
     }
 
+    /// [`Config::load`], or, when the config file cannot be read or parsed, the defaults
+    /// with the environment variables applied, together with the error. A broken
+    /// `config.toml` must not also drop `DATABASE_URL` and the `HAMMERWORK_*` variables,
+    /// which take precedence over the file.
+    pub fn load_or_env() -> (Self, Option<anyhow::Error>) {
+        Self::load_or_env_with(|key| env::var(key).ok())
+    }
+
+    /// [`Config::load_or_env`] reading environment variables through `get`.
+    pub fn load_or_env_with(get: impl Fn(&str) -> Option<String>) -> (Self, Option<anyhow::Error>) {
+        match Self::load_with(&get) {
+            Ok(config) => (config, None),
+            Err(error) => {
+                let mut config = Self::default();
+                config.apply_env(&get);
+                (config, Some(error))
+            }
+        }
+    }
+
     /// Read the config file at `path`; defaults if it does not exist.
     pub fn load_from_path(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
@@ -367,6 +387,42 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_broken_config_file_keeps_the_environment_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "database_url = [oops\n").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let get = |key: &str| match key {
+            "HAMMERWORK_CONFIG" => Some(path.clone()),
+            "DATABASE_URL" => Some("postgres://from-env/db".to_string()),
+            "HAMMERWORK_LOG_LEVEL" => Some("warn".to_string()),
+            _ => None,
+        };
+
+        assert!(
+            Config::load_with(get).is_err(),
+            "the broken file is reported"
+        );
+        let (config, error) = Config::load_or_env_with(get);
+        assert!(error.unwrap().to_string().contains("Invalid config file"));
+        assert_eq!(
+            config.database_url.as_deref(),
+            Some("postgres://from-env/db")
+        );
+        assert_eq!(config.get_log_level(), "warn");
+
+        // A readable file loads without an error
+        std::fs::write(dir.path().join("config.toml"), "default_limit = 7\n").unwrap();
+        let (config, error) = Config::load_or_env_with(get);
+        assert!(error.is_none());
+        assert_eq!(config.default_limit, Some(7));
+        assert_eq!(
+            config.database_url.as_deref(),
+            Some("postgres://from-env/db")
+        );
+    }
     use std::collections::HashMap;
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {

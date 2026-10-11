@@ -498,7 +498,8 @@ pub struct KeyManagerStats {
 
 /// Main key management system
 // Key material held in memory is `SecretBytes`, wiped when dropped.
-type KeyCacheEntry = (SecretBytes, DateTime<Utc>); // (decrypted_material, cached_at)
+/// (decrypted_material, cached_at, the key's expires_at)
+type KeyCacheEntry = (SecretBytes, DateTime<Utc>, Option<DateTime<Utc>>);
 type KeyCache = Arc<Mutex<HashMap<String, KeyCacheEntry>>>;
 type RootKey = (Uuid, SecretBytes); // (derived ID, key material)
 
@@ -1195,7 +1196,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         };
 
         self.store_key(&key_record).await?;
-        self.cache_key(key_id, key_material);
+        self.cache_key(key_id, key_material, expires_at);
 
         if self.config.audit_enabled {
             self.record_audit_event(key_id, KeyOperation::Create, true, None)
@@ -1289,7 +1290,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
 
         // The caller gets its own copy; the cached one is wiped when evicted or dropped.
         let copy = key_material.to_vec();
-        self.cache_key(key_id, key_material);
+        self.cache_key(key_id, key_material, key_record.expires_at);
         self.record_key_usage(key_id).await?;
 
         if self.config.audit_enabled {
@@ -1479,7 +1480,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
             return Ok(None);
         }
 
-        self.cache_key(key_id, new_key_material);
+        self.cache_key(key_id, new_key_material, current_key.expires_at);
         self.cleanup_old_key_versions(key_id).await?;
 
         if self.config.audit_enabled {
@@ -2006,19 +2007,28 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         Ok(retired.get(&id).cloned())
     }
 
-    fn cache_key(&self, key_id: &str, key_material: SecretBytes) {
+    fn cache_key(
+        &self,
+        key_id: &str,
+        key_material: SecretBytes,
+        expires_at: Option<DateTime<Utc>>,
+    ) {
         if let Ok(mut cache) = self.key_cache.lock() {
-            cache.insert(key_id.to_string(), (key_material, Utc::now()));
+            cache.insert(key_id.to_string(), (key_material, Utc::now(), expires_at));
         }
     }
 
     fn get_cached_key(&self, key_id: &str) -> Option<Vec<u8>> {
         let cache = self.key_cache.lock().ok()?;
-        // Keys are cached for up to an hour
+        // Keys are cached for up to an hour, and never past their expiry: an expired key
+        // is loaded again, so it is refused as it would be without the cache.
+        let now = Utc::now();
         cache
             .get(key_id)
-            .filter(|(_, cached_at)| Utc::now() - *cached_at < Duration::hours(1))
-            .map(|(key_material, _)| key_material.to_vec())
+            .filter(|(_, cached_at, expires_at)| {
+                now - *cached_at < Duration::hours(1) && expires_at.is_none_or(|at| now <= at)
+            })
+            .map(|(key_material, _, _)| key_material.to_vec())
     }
 
     fn update_stats(&self, update: impl FnOnce(&mut KeyManagerStats)) {
@@ -5564,6 +5574,48 @@ mod tests {
                 .rotation_interval,
             None
         );
+    }
+
+    /// A key that expires while it is cached is refused from then on, as it is when
+    /// loaded from the database, instead of being served from the cache for up to an
+    /// hour after its expiry.
+    async fn cached_key_expires<DB: KeyManagerBackend>(pool: Pool<DB>) {
+        let mut manager = KeyManager::new(test_config(), pool).await.unwrap();
+        let key_id = format!("expiring-{}", Uuid::new_v4().simple());
+        manager
+            .generate_key_with_options(
+                &key_id,
+                EncryptionAlgorithm::AES256GCM,
+                KeyPurpose::Encryption,
+                Some(Utc::now() + Duration::milliseconds(500)),
+                None,
+            )
+            .await
+            .unwrap();
+        manager.get_key(&key_id).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        // Not `unwrap_err`, which would print the key material if the key were returned.
+        let Err(err) = manager.get_key(&key_id).await else {
+            panic!("an expired key is refused");
+        };
+        assert!(err.to_string().contains("has expired"), "{err}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_cached_key_expires_postgres() {
+        let (_db_guard, pool) = postgres_test_pool().await;
+        cached_key_expires(pool).await;
+    }
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_cached_key_expires_mysql() {
+        let (_db_guard, pool) = mysql_test_pool().await;
+        cached_key_expires(pool).await;
     }
 
     #[cfg(feature = "postgres")]

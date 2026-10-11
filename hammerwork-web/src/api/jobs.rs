@@ -358,6 +358,12 @@ where
     };
 
     let status_filter = filters.status.as_deref().map(str::to_lowercase);
+    let search_term = filters
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase);
     let wants = |names: &[&str]| {
         status_filter
             .as_deref()
@@ -380,6 +386,21 @@ where
         );
 
         for job in &queue_jobs {
+            if filters
+                .created_after
+                .is_some_and(|after| job.created_at < after)
+                || filters
+                    .created_before
+                    .is_some_and(|before| job.created_at > before)
+            {
+                continue;
+            }
+            if let Some(ref term) = search_term
+                && !job_matches_search(job, term)
+            {
+                continue;
+            }
+
             let job_info = job_info(job);
 
             // Apply status filter
@@ -400,22 +421,15 @@ where
         }
     }
 
-    // Sort jobs
-    let ascending = sort.is_ascending();
+    // Sort jobs ascending, then reverse for descending order (the default). Without a
+    // known `sort_by` the jobs are sorted by creation time, as `SortParams::get_order_by`
+    // describes, still honouring `sort_order`.
     match sort.sort_by.as_deref() {
         Some("scheduled_at") => all_jobs.sort_by_key(|j| j.scheduled_at),
         Some("priority") => all_jobs.sort_by_key(|j| priority_rank(&j.priority)),
-        Some("created_at") => all_jobs.sort_by_key(|j| j.created_at),
-        _ => {
-            // Default sort by created_at desc
-            all_jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
-        }
+        _ => all_jobs.sort_by_key(|j| j.created_at),
     }
-    let sorted_by_default = !matches!(
-        sort.sort_by.as_deref(),
-        Some("scheduled_at") | Some("priority") | Some("created_at")
-    );
-    if !ascending && !sorted_by_default {
+    if !sort.is_ascending() {
         all_jobs.reverse();
     }
 
@@ -833,6 +847,105 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Failed to get queue stats")
+        );
+    }
+
+    /// Calls `list_jobs_handler` with `query` (filter and sort parameters) and returns
+    /// the ids of the listed jobs, in order.
+    async fn listed_ids(
+        queue: Arc<hammerwork::queue::test::TestQueue>,
+        query: serde_json::Value,
+    ) -> Vec<String> {
+        let response = list_jobs_handler(
+            queue,
+            PaginationParams::default(),
+            serde_json::from_value(query.clone()).unwrap(),
+            serde_json::from_value(query).unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let (status, body) = body_json(response).await;
+        assert_eq!(status, 200, "{body}");
+        body["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Two pending jobs in queue `q`, the second created a minute after the first.
+    async fn two_jobs() -> (
+        Arc<hammerwork::queue::test::TestQueue>,
+        String,
+        String,
+        chrono::DateTime<chrono::Utc>,
+    ) {
+        use hammerwork::{Job, queue::test::TestQueue};
+        let queue = Arc::new(TestQueue::new());
+        let first = queue
+            .enqueue(Job::new("q".into(), serde_json::json!({"name": "alpha"})))
+            .await
+            .unwrap();
+        let between = queue.clock().now() + chrono::Duration::seconds(30);
+        queue.clock().advance(chrono::Duration::minutes(1));
+        let second = queue
+            .enqueue(Job::new("q".into(), serde_json::json!({"name": "beta"})))
+            .await
+            .unwrap();
+        (queue, first.to_string(), second.to_string(), between)
+    }
+
+    #[tokio::test]
+    async fn test_list_jobs_applies_created_and_search_filters() {
+        let (queue, first, second, between) = two_jobs().await;
+        let ids = |query| listed_ids(queue.clone(), query);
+
+        assert_eq!(
+            ids(serde_json::json!({"queue": "q", "created_after": between})).await,
+            vec![second.clone()]
+        );
+        assert_eq!(
+            ids(serde_json::json!({"queue": "q", "created_before": between})).await,
+            vec![first.clone()]
+        );
+        assert_eq!(
+            ids(serde_json::json!({"queue": "q", "search": "ALPHA"})).await,
+            vec![first]
+        );
+        assert!(
+            ids(serde_json::json!({"queue": "q", "search": "no such job"}))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_jobs_sort_order_applies_to_the_default_sort() {
+        let (queue, first, second, _) = two_jobs().await;
+        let ids = |query| listed_ids(queue.clone(), query);
+
+        // Newest first by default
+        assert_eq!(
+            ids(serde_json::json!({"queue": "q"})).await,
+            vec![second.clone(), first.clone()]
+        );
+        // `sort_order` without `sort_by` sorts by creation time in that order
+        assert_eq!(
+            ids(serde_json::json!({"queue": "q", "sort_order": "asc"})).await,
+            vec![first.clone(), second.clone()]
+        );
+        // An unknown field falls back to creation time, in the requested order
+        assert_eq!(
+            ids(serde_json::json!({"queue": "q", "sort_by": "attempts", "sort_order": "ASC"}))
+                .await,
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(
+            ids(serde_json::json!({"queue": "q", "sort_by": "created_at", "sort_order": "desc"}))
+                .await,
+            vec![second, first]
         );
     }
 
