@@ -8,7 +8,11 @@
 //! subscriptions:
 //!
 //! - a `JobUpdate` message (event type `job_updates`) for each job that was created,
-//!   started, completed, failed or timed out since the previous poll;
+//!   started, completed, failed or timed out since the previous poll, or that went from
+//!   `Running` back to `Pending` (retried, requeued by the stale job reaper, or released
+//!   by a batch-mode worker). Those transitions leave no timestamp behind, so the poller
+//!   tracks the running jobs (up to the per-poll limit) and reads the state of the ones
+//!   that stopped running;
 //! - a `QueueUpdate` message (event type `queue_updates`) for each queue whose statistics
 //!   changed.
 //!
@@ -24,7 +28,7 @@ use crate::api::history::JobHistory;
 use crate::websocket::{JobUpdate, QueueStats, ServerMessage, WebSocketState};
 use chrono::{DateTime, Utc};
 use hammerwork::events::{EventSubscription, JobLifecycleEvent, JobLifecycleEventType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -54,6 +58,10 @@ pub struct LiveUpdates<Q> {
     sent: HashMap<String, SentState>,
     /// Queue statistics last pushed, per queue.
     queues: HashMap<String, QueueCounts>,
+    /// The jobs `Running` at the previous poll, so a job that goes
+    /// back to `Pending` (which changes none of the timestamps the change feed reads) is
+    /// still reported.
+    running: HashSet<String>,
 }
 
 /// What one poll pushed.
@@ -76,6 +84,7 @@ impl<Q: JobHistory + 'static> LiveUpdates<Q> {
             last_poll: None,
             sent: HashMap::new(),
             queues: HashMap::new(),
+            running: HashSet::new(),
         }
     }
 
@@ -101,12 +110,33 @@ impl<Q: JobHistory + 'static> LiveUpdates<Q> {
             self.last_poll = None;
             self.sent.clear();
             self.queues.clear();
+            self.running.clear();
             return Ok(PollOutcome::default());
         }
 
         let now = self.queue.database_now().await?;
         let since = self.last_poll.unwrap_or(now) - POLL_OVERLAP;
-        let changes = self.queue.recent_job_changes(since, self.max_jobs).await?;
+        let mut changes = self.queue.recent_job_changes(since, self.max_jobs).await?;
+        let running = self.queue.running_jobs(self.max_jobs).await?;
+        // Read the state of at most `max_jobs` of the jobs that left the running set per
+        // poll; the others stay tracked for the next polls.
+        let mut left = self.left_running(&changes, &running);
+        let unchecked = left.split_off(left.len().min(self.max_jobs as usize));
+        let states = if left.is_empty() {
+            Vec::new()
+        } else {
+            self.queue.job_states(&left).await?
+        };
+        let (still_running, stopped) = Self::stopped_running(&left, states, now);
+        self.running = running
+            .iter()
+            .chain(&changes)
+            .filter(|job| job.status == "Running")
+            .map(|job| job.id.clone())
+            .chain(still_running)
+            .chain(unchecked)
+            .collect();
+        changes.extend(stopped);
         let stats = self.queue.get_all_queue_stats().await?;
         self.last_poll = Some(now);
 
@@ -139,6 +169,51 @@ impl<Q: JobHistory + 'static> LiveUpdates<Q> {
         Ok(outcome)
     }
 
+    /// The jobs tracked as `Running` that `running` (the running jobs now, up to the
+    /// per-poll limit) does not show and whose change is not in `changes`, sorted: they
+    /// stopped running without a timestamp the change feed reads, which is how a job
+    /// goes back to `Pending`, or they only fell out of the `running` window.
+    fn left_running(&self, changes: &[JobUpdate], running: &[JobUpdate]) -> Vec<String> {
+        let seen: HashSet<&str> = changes
+            .iter()
+            .chain(running)
+            .map(|job| job.id.as_str())
+            .collect();
+        let mut left: Vec<String> = self
+            .running
+            .iter()
+            .filter(|id| !seen.contains(id.as_str()))
+            .cloned()
+            .collect();
+        left.sort_unstable();
+        left
+    }
+
+    /// Splits `states`, the current state of the jobs `left` (see
+    /// [`left_running`](Self::left_running)), into the ids of those still `Running` (they
+    /// only fell out of the window) and the changes of those that stopped, reported at
+    /// `now`, when the change was seen: the timestamps they carry predate it. Jobs
+    /// missing from `states` no longer exist.
+    fn stopped_running(
+        left: &[String],
+        states: Vec<JobUpdate>,
+        now: DateTime<Utc>,
+    ) -> (Vec<String>, Vec<JobUpdate>) {
+        let left: HashSet<&str> = left.iter().map(String::as_str).collect();
+        let (running, stopped): (Vec<JobUpdate>, Vec<JobUpdate>) = states
+            .into_iter()
+            .filter(|job| left.contains(job.id.as_str()))
+            .partition(|job| job.status == "Running");
+        let stopped = stopped
+            .into_iter()
+            .map(|mut job| {
+                job.updated_at = now;
+                job
+            })
+            .collect();
+        (running.into_iter().map(|job| job.id).collect(), stopped)
+    }
+
     /// The changes not pushed yet, oldest first; remembers them and forgets the jobs
     /// pushed before `since`.
     fn fresh_changes(&mut self, changes: Vec<JobUpdate>, since: DateTime<Utc>) -> Vec<JobUpdate> {
@@ -160,8 +235,7 @@ impl<Q: JobHistory + 'static> LiveUpdates<Q> {
         &mut self,
         stats: Vec<hammerwork::stats::QueueStats>,
     ) -> Vec<(String, QueueStats)> {
-        let present: std::collections::HashSet<&str> =
-            stats.iter().map(|s| s.queue_name.as_str()).collect();
+        let present: HashSet<&str> = stats.iter().map(|s| s.queue_name.as_str()).collect();
         self.queues
             .retain(|name, _| present.contains(name.as_str()));
         let mut changed = Vec::new();
@@ -513,6 +587,127 @@ mod tests {
         );
 
         queue.delete_job(id).await.unwrap();
+    }
+
+    /// #94: a job that goes from `Running` back to `Pending` changes none of the
+    /// timestamps the change feed reads; the poller still reports it. The job is created
+    /// well before the poll window, so only the tracking of running jobs can see it.
+    async fn clients_see_running_jobs_go_back_to_pending<Q: JobHistory + 'static>(queue: Arc<Q>) {
+        use hammerwork::Job;
+        let state = new_state();
+        let mut live = LiveUpdates::new(queue.clone(), state.clone(), 100);
+        let mut jobs = connect(&state).await;
+        wait_for_connections(&state, 1).await;
+        subscribe(&mut jobs, &["job_updates"]).await;
+        live.poll_once().await.unwrap();
+        while next_json(&mut jobs).await.is_some() {}
+
+        let queue_name = format!("live_back_{}", Uuid::new_v4().simple());
+        let mut job = Job::new(queue_name.clone(), serde_json::json!({}));
+        job.created_at = Utc::now() - chrono::Duration::hours(1);
+        job.scheduled_at = job.created_at;
+        let id = queue.enqueue(job).await.unwrap();
+        let cleanup = CleanupJob {
+            queue: queue.clone(),
+            id,
+        };
+
+        let run = queue.dequeue(&queue_name).await.unwrap().expect("job");
+        wait_for(&mut live, &mut jobs, id, "Running").await;
+        assert!(queue.release_job_run(&run).await.unwrap());
+        let released = wait_for(&mut live, &mut jobs, id, "Pending").await;
+        assert_eq!(released["job"]["attempts"], 0);
+
+        // A retry of a run goes back to Pending too.
+        let run = queue.dequeue(&queue_name).await.unwrap().expect("job");
+        wait_for(&mut live, &mut jobs, id, "Running").await;
+        queue
+            .finish_job_run(
+                &run,
+                hammerwork::queue::JobOutcome::Retry {
+                    retry_at: Utc::now() + chrono::Duration::hours(1),
+                    error: "again".to_string(),
+                    timed_out: false,
+                },
+            )
+            .await
+            .unwrap();
+        let retried = wait_for(&mut live, &mut jobs, id, "Pending").await;
+        assert_eq!(retried["job"]["attempts"], 1);
+        drop(cleanup);
+    }
+
+    /// Deletes a test job when dropped, so it is removed even if the test fails.
+    struct CleanupJob<Q: JobHistory + 'static> {
+        queue: Arc<Q>,
+        id: Uuid,
+    }
+
+    impl<Q: JobHistory + 'static> Drop for CleanupJob<Q> {
+        fn drop(&mut self) {
+            let (queue, id) = (self.queue.clone(), self.id);
+            // A test's runtime may be shutting down; deleting is best effort.
+            let _ = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(queue.delete_job(id))
+            });
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires DATABASE_URL (PostgreSQL)"]
+    async fn postgres_clients_see_running_jobs_go_back_to_pending() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        clients_see_running_jobs_go_back_to_pending(Arc::new(hammerwork::JobQueue::new(pool)))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MYSQL_DATABASE_URL"]
+    async fn mysql_clients_see_running_jobs_go_back_to_pending() {
+        let url = std::env::var("MYSQL_DATABASE_URL").expect("MYSQL_DATABASE_URL");
+        let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+        clients_see_running_jobs_go_back_to_pending(Arc::new(hammerwork::JobQueue::new(pool)))
+            .await;
+    }
+
+    /// A tracked running job that the change feed and the running set no longer show is
+    /// looked up; one that went back to Pending is reported at the poll time, one still
+    /// running (out of the window) stays tracked, and a deleted one is forgotten.
+    #[tokio::test]
+    async fn jobs_that_stop_running_without_a_timestamp_are_reported() {
+        let mut live = LiveUpdates::new(
+            crate::api::test_support::unreachable_queue(),
+            new_state(),
+            10,
+        );
+        let t0 = Utc::now();
+        live.running = ["a", "b", "c", "d"].map(String::from).into_iter().collect();
+        let left = live.left_running(
+            &[change("d", "Completed", t0)],
+            &[change("c", "Running", t0)],
+        );
+        assert_eq!(left, ["a", "b"]);
+
+        let now = t0 + chrono::Duration::seconds(5);
+        let (still_running, stopped) =
+            LiveUpdates::<hammerwork::JobQueue<sqlx::Postgres>>::stopped_running(
+                &left,
+                vec![
+                    change("a", "Pending", t0 - chrono::Duration::hours(1)),
+                    change("b", "Running", t0),
+                    change("x", "Pending", t0),
+                ],
+                now,
+            );
+        assert_eq!(still_running, ["b"]);
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].id, "a");
+        assert_eq!(stopped[0].status, "Pending");
+        assert_eq!(
+            stopped[0].updated_at, now,
+            "reported when the change was seen"
+        );
     }
 
     /// Polls until `client` is told that job `id` is now `status` (the database clock may

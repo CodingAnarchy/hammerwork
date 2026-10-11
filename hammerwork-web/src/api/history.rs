@@ -251,11 +251,64 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
     /// Jobs whose state changed after `since`, newest first, at most `limit`: jobs that
     /// were created, started, completed, failed or timed out since then. Each is reported
     /// with the time of its latest such change. Rows that cannot be decoded are skipped.
+    ///
+    /// A job that goes from `Running` back to `Pending` (a retry, a stale job requeued by
+    /// the reaper, a claimed job released by a batch-mode worker) changes none of those
+    /// timestamps, so it is not reported here. The live-update poller
+    /// ([`LiveUpdates`](crate::live::LiveUpdates)) reports those transitions by tracking
+    /// the [running jobs](Self::running_jobs) and reading the [state](Self::job_states)
+    /// of the ones that stopped running.
     fn recent_job_changes(
         &self,
         since: DateTime<Utc>,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send;
+
+    /// The jobs that are `Running` now, most recently started first, at most `limit`,
+    /// each with its start time. Rows that cannot be decoded are skipped.
+    ///
+    /// The default implementation returns none, for implementations that predate this
+    /// method; live updates then miss `Running` to `Pending` transitions.
+    fn running_jobs(&self, limit: u32) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send {
+        let _ = limit;
+        async { Ok(Vec::new()) }
+    }
+
+    /// The current state of the jobs `ids` (UUIDs) that still exist, each with the time
+    /// of its latest change as in [`recent_job_changes`](Self::recent_job_changes). Ids
+    /// that are not UUIDs, jobs that no longer exist and rows that cannot be decoded are
+    /// left out.
+    ///
+    /// The default implementation reads the jobs one at a time with
+    /// [`DatabaseQueue::get_job`].
+    fn job_states(&self, ids: &[String]) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send {
+        let ids: Vec<uuid::Uuid> = ids.iter().filter_map(|id| id.parse().ok()).collect();
+        async move {
+            let mut states = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(job) = self.get_job(id).await? {
+                    let changed_at = [
+                        job.started_at,
+                        job.completed_at,
+                        job.failed_at,
+                        job.timed_out_at,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .fold(job.created_at, DateTime::max);
+                    states.push(job_change(
+                        id.to_string(),
+                        job.queue_name,
+                        job.status.as_str(),
+                        job.priority.as_i32(),
+                        job.attempts,
+                        changed_at,
+                    ));
+                }
+            }
+            Ok(states)
+        }
+    }
 
     /// Runs `operation` on each of `tables` (entries of [`HAMMERWORK_TABLES`]) that
     /// exists, one statement per table, and returns what ran. With `dry_run` nothing is
@@ -308,6 +361,56 @@ fn job_change(
         attempts,
         updated_at: changed_at,
     }
+}
+
+/// The time of a job's latest change on MySQL, where `GREATEST` is NULL if any argument
+/// is, so missing timestamps fall back to `created_at`.
+fn mysql_latest_change() -> String {
+    let latest = CHANGE_COLUMNS
+        .iter()
+        .map(|column| format!("COALESCE({column}, created_at)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("CAST(GREATEST({latest}) AS DATETIME(6))")
+}
+
+/// Job changes from PostgreSQL rows of `id, queue_name, status, priority, attempts,
+/// changed_at`, skipping rows that cannot be decoded.
+fn pg_job_changes(rows: &[sqlx::postgres::PgRow]) -> Vec<JobUpdate> {
+    decodable(rows.iter().map(|row| {
+        let id = row.try_get::<uuid::Uuid, _>("id");
+        let label = id.as_ref().map(|id| id.to_string()).unwrap_or_default();
+        let change = id.map_err(Into::into).and_then(|id| {
+            Ok(job_change(
+                id.to_string(),
+                row.try_get("queue_name")?,
+                &row.try_get::<String, _>("status")?,
+                row.try_get("priority")?,
+                row.try_get("attempts")?,
+                row.try_get("changed_at")?,
+            ))
+        });
+        (label, change)
+    }))
+}
+
+/// Job changes from MySQL rows of `id, queue_name, status, priority, attempts,
+/// changed_at`, skipping rows that cannot be decoded.
+fn mysql_job_changes(rows: &[sqlx::mysql::MySqlRow]) -> Vec<JobUpdate> {
+    decodable(rows.iter().map(|row| {
+        let label = row.try_get::<String, _>("id").unwrap_or_default();
+        let change = (|| {
+            Ok(job_change(
+                row.try_get("id")?,
+                row.try_get("queue_name")?,
+                &row.try_get::<String, _>("status")?,
+                row.try_get("priority")?,
+                row.try_get("attempts")?,
+                row.try_get("changed_at")?,
+            ))
+        })();
+        (label, change)
+    }))
 }
 
 /// A value bound to an archive filter placeholder.
@@ -649,21 +752,33 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             .bind(i64::from(limit))
             .fetch_all(&self.pool)
             .await?;
-        Ok(decodable(rows.iter().map(|row| {
-            let id = row.try_get::<uuid::Uuid, _>("id");
-            let label = id.as_ref().map(|id| id.to_string()).unwrap_or_default();
-            let change = id.map_err(Into::into).and_then(|id| {
-                Ok(job_change(
-                    id.to_string(),
-                    row.try_get("queue_name")?,
-                    &row.try_get::<String, _>("status")?,
-                    row.try_get("priority")?,
-                    row.try_get("attempts")?,
-                    row.try_get("changed_at")?,
-                ))
-            });
-            (label, change)
-        })))
+        Ok(pg_job_changes(&rows))
+    }
+
+    async fn running_jobs(&self, limit: u32) -> Result<Vec<JobUpdate>> {
+        let rows = sqlx::query(
+            "SELECT id, queue_name, status, priority, attempts, \
+             COALESCE(started_at, created_at) AS changed_at FROM hammerwork_jobs \
+             WHERE status = 'Running' ORDER BY started_at DESC LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(pg_job_changes(&rows))
+    }
+
+    async fn job_states(&self, ids: &[String]) -> Result<Vec<JobUpdate>> {
+        let ids: Vec<uuid::Uuid> = ids.iter().filter_map(|id| id.parse().ok()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, queue_name, status, priority, attempts, GREATEST({}) AS changed_at \
+             FROM hammerwork_jobs WHERE id = ANY($1)",
+            CHANGE_COLUMNS.join(", ")
+        );
+        let rows = sqlx::query(&sql).bind(&ids).fetch_all(&self.pool).await?;
+        Ok(pg_job_changes(&rows))
     }
 
     async fn table_maintenance(
@@ -863,17 +978,10 @@ impl JobHistory for JobQueue<sqlx::MySql> {
     }
 
     async fn recent_job_changes(&self, since: DateTime<Utc>, limit: u32) -> Result<Vec<JobUpdate>> {
-        // GREATEST is NULL if any argument is on MySQL, so missing timestamps fall back to
-        // `created_at`.
-        let latest = CHANGE_COLUMNS
-            .iter()
-            .map(|column| format!("COALESCE({column}, created_at)"))
-            .collect::<Vec<_>>()
-            .join(", ");
         let sql = format!(
-            "SELECT id, queue_name, status, priority, attempts, \
-             CAST(GREATEST({latest}) AS DATETIME(6)) AS changed_at \
+            "SELECT id, queue_name, status, priority, attempts, {} AS changed_at \
              FROM hammerwork_jobs WHERE {} ORDER BY changed_at DESC LIMIT ?",
+            mysql_latest_change(),
             changed_since_filter(false)
         );
         let mut query = sqlx::query(&sql);
@@ -881,20 +989,42 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             query = query.bind(since);
         }
         let rows = query.bind(i64::from(limit)).fetch_all(&self.pool).await?;
-        Ok(decodable(rows.iter().map(|row| {
-            let label = row.try_get::<String, _>("id").unwrap_or_default();
-            let change = (|| {
-                Ok(job_change(
-                    row.try_get("id")?,
-                    row.try_get("queue_name")?,
-                    &row.try_get::<String, _>("status")?,
-                    row.try_get("priority")?,
-                    row.try_get("attempts")?,
-                    row.try_get("changed_at")?,
-                ))
-            })();
-            (label, change)
-        })))
+        Ok(mysql_job_changes(&rows))
+    }
+
+    async fn running_jobs(&self, limit: u32) -> Result<Vec<JobUpdate>> {
+        let rows = sqlx::query(
+            "SELECT id, queue_name, status, priority, attempts, \
+             CAST(COALESCE(started_at, created_at) AS DATETIME(6)) AS changed_at \
+             FROM hammerwork_jobs WHERE status = 'Running' ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(mysql_job_changes(&rows))
+    }
+
+    async fn job_states(&self, ids: &[String]) -> Result<Vec<JobUpdate>> {
+        let ids: Vec<String> = ids
+            .iter()
+            .filter_map(|id| id.parse::<uuid::Uuid>().ok())
+            .map(|id| id.to_string())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, queue_name, status, priority, attempts, {} AS changed_at \
+             FROM hammerwork_jobs WHERE id IN ({})",
+            mysql_latest_change(),
+            vec!["?"; ids.len()].join(", ")
+        );
+        let mut query = sqlx::query(&sql);
+        for id in &ids {
+            query = query.bind(id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(mysql_job_changes(&rows))
     }
     async fn table_maintenance(
         &self,

@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renew the lease only, as before).
 - **A held batch job skipped because its lease was lost refunds its rate limit token**,
   as released jobs already did, so a lost claim no longer spends the rate limit.
+- **Dashboard live updates report jobs that go from `Running` back to `Pending`.** A
+  retry, a stale job requeued by the reaper and a claimed job released by a batch-mode
+  worker change none of the timestamps `JobHistory::recent_job_changes` reads, so
+  WebSocket clients subscribed to `job_updates` were never told. The live-update poller
+  now tracks the running jobs (new `JobHistory::running_jobs`) and reads the state of the
+  ones that stopped running without such a timestamp (new `JobHistory::job_states`),
+  reporting them at the poll that saw the change. No schema change is needed.
 - **Pausing a queue stops batch-mode workers from starting the jobs they hold.** A worker
   with `with_batch_size(n)` kept starting the claimed jobs of its current batch after the
   queue was paused, up to `n` more jobs, contrary to "paused queues are honoured". Before
