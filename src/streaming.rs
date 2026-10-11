@@ -1278,7 +1278,7 @@ impl StreamManager {
         }
 
         // Start processing task for this stream
-        self.start_stream_processing_task(stream_id, subscription, stop);
+        self.start_stream_processing_task(stream_id, subscription.receiver, stop);
 
         if self.config.log_operations {
             tracing::info!("Added stream: {} ({:?})", stream.name, stream.backend);
@@ -1456,7 +1456,7 @@ impl StreamManager {
         }
     }
 
-    /// Start the listener of a stream: it reads `subscription` until `stop` fires (its
+    /// Start the listener of a stream: it reads `receiver` until `stop` fires (its
     /// [`ListenerHandle`] is dropped), buffers matching events and hands full or
     /// expired buffers to batch tasks.
     ///
@@ -1468,7 +1468,7 @@ impl StreamManager {
     fn start_stream_processing_task(
         &self,
         stream_id: Uuid,
-        mut subscription: crate::events::EventSubscription,
+        mut receiver: broadcast::Receiver<JobLifecycleEvent>,
         mut stop: oneshot::Receiver<()>,
     ) {
         let streams = self.streams.clone();
@@ -1575,7 +1575,7 @@ impl StreamManager {
                 let received = tokio::select! {
                     biased;
                     _ = &mut stop => break,
-                    received = subscription.receiver.recv() => received,
+                    received = receiver.recv() => received,
                     _ = flush_due => continue,
                 };
                 match received {

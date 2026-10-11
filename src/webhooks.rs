@@ -770,7 +770,7 @@ impl WebhookManager {
                 .await?;
         }
 
-        self.start_webhook_delivery_task(webhook_id, subscription, stop);
+        self.start_webhook_delivery_task(webhook_id, subscription.receiver, stop);
 
         if self.config.log_deliveries {
             // The URL path of chat webhooks (Slack, Discord, Teams) is a credential.
@@ -906,12 +906,12 @@ impl WebhookManager {
         }
     }
 
-    /// Start the listener of a webhook: it reads `subscription` until `stop` fires (its
+    /// Start the listener of a webhook: it reads `receiver` until `stop` fires (its
     /// [`ListenerHandle`] is dropped) and starts a delivery for every matching event.
     fn start_webhook_delivery_task(
         &self,
         webhook_id: Uuid,
-        mut subscription: crate::events::EventSubscription,
+        mut receiver: broadcast::Receiver<JobLifecycleEvent>,
         mut stop: oneshot::Receiver<()>,
     ) {
         let webhooks = self.webhooks.clone();
@@ -933,7 +933,7 @@ impl WebhookManager {
                 let received = tokio::select! {
                     biased;
                     _ = &mut stop => break,
-                    received = subscription.receiver.recv() => received,
+                    received = receiver.recv() => received,
                 };
                 let mut event = match received {
                     Ok(event) => event,

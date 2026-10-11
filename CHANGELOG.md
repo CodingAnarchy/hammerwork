@@ -31,14 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   running, retrying and jobs scheduled for later, up to 200 per status and queue), not just
   the ready, dead and recurring ones. `statuses` accepts the same names as the jobs
   listing (`failed` covers `Failed`, `Dead` and `TimedOut`). The route needs `T: JobHistory`.
-- **`GET /api/system/metrics`** no longer reports `metrics_endpoint`, `custom_metrics_count`
-  and `last_scrape` (there is no `/metrics` route and the values were always null);
-  `MetricsInfo` only has `prometheus_enabled` now.
-- **`EventSubscription` unregisters itself when dropped**, and `WebhookManager::shutdown`
-  and `StreamManager::shutdown` unsubscribe their listeners, so
-  `EventManager::subscription_count` and `payload_wanted` stop counting subscribers that
-  are gone. Code that dropped a subscription and relied on it staying registered must keep
-  it alive.
+- **`GET /api/system/metrics`**: the dashboard serves no `/metrics` route. The
+  `metrics_endpoint` field is kept for compatibility but documented as not served;
+  `custom_metrics_count` and `last_scrape` are always null.
+- **`WebhookManager::shutdown` and `StreamManager::shutdown`** unsubscribe their listeners
+  from the event manager, so `EventManager::subscription_count` and `payload_wanted` stop
+  counting them. Dropping an `EventSubscription` does not unregister it: call
+  `EventManager::unsubscribe(id)` when done (now documented).
 - **Webhook statistics**: `successful_deliveries`, `failed_deliveries` and `success_rate`
   count events by final outcome (an event delivered on its third attempt is one successful
   delivery, not two failures and a success); `total_attempts` still counts every HTTP
