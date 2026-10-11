@@ -294,7 +294,6 @@ where
         .or(archive_stats)
 }
 
-/// Helper to inject queue into handlers
 /// Extract archive filter parameters from query string
 fn with_archive_filters()
 -> impl Filter<Extract = (ArchiveFilterParams,), Error = warp::Rejection> + Clone {
