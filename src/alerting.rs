@@ -678,10 +678,9 @@ impl AlertManager {
         {
             let last_alerts = self.last_alerts.read().await;
             if let Some(last_time) = last_alerts.get(&alert_key) {
+                // A cooldown too long for chrono never ends.
                 let cooldown_duration = chrono::Duration::from_std(self.config.cooldown_period)
-                    .map_err(|e| HammerworkError::Alerting {
-                        message: format!("Invalid cooldown duration: {}", e),
-                    })?;
+                    .unwrap_or(chrono::Duration::MAX);
 
                 if Utc::now() - *last_time < cooldown_duration {
                     return Ok(()); // Still in cooldown period
@@ -1097,6 +1096,18 @@ mod tests {
 
         let result = manager.check_queue_depth("test_queue", 1500).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_cooldown_too_large_for_chrono_suppresses_repeats_without_error() {
+        // `Duration::MAX` as "alert once": the repeat is suppressed, not an error.
+        let manager = AlertManager::new(AlertingConfig::new().with_cooldown(Duration::MAX));
+        for _ in 0..2 {
+            manager
+                .send_custom_alert("q", "once", "message", 1.0, 0.0, AlertSeverity::Info)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

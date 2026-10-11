@@ -137,7 +137,10 @@ pub mod serde_duration {
     }
 }
 
-/// Module for serializing chrono::Duration as human-readable strings (in days)
+/// Module for serializing chrono::Duration as human-readable strings: whole days as
+/// `"30d"` (the form earlier versions wrote), otherwise the largest unit (`h`, `m`, `s`)
+/// that represents the duration exactly, so saving and loading a configuration never
+/// changes it.
 mod chrono_duration_days {
     use chrono::Duration;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -146,11 +149,21 @@ mod chrono_duration_days {
     where
         S: Serializer,
     {
-        let days = duration.num_days();
-        if days == 0 {
-            serializer.serialize_str("0d")
+        serializer.serialize_str(&format_chrono_duration(duration))
+    }
+
+    /// `duration` in the largest of d/h/m/s that holds it exactly (sub-second parts,
+    /// which the format cannot hold, are dropped).
+    fn format_chrono_duration(duration: &Duration) -> String {
+        let secs = duration.num_seconds();
+        if secs % 86_400 == 0 {
+            format!("{}d", secs / 86_400)
+        } else if secs % 3600 == 0 {
+            format!("{}h", secs / 3600)
+        } else if secs % 60 == 0 {
+            format!("{}m", secs / 60)
         } else {
-            serializer.serialize_str(&format!("{}d", days))
+            format!("{secs}s")
         }
     }
 
@@ -164,36 +177,48 @@ mod chrono_duration_days {
         parse_chrono_duration(&s).map_err(D::Error::custom)
     }
 
-    /// Parse a duration string like "30d", "7d", etc.
+    /// Parse a duration string like "30d", "12h", "90m", "45s" or "7" (days). Negative
+    /// durations and durations too large for a `chrono::Duration` are rejected.
     pub fn parse_chrono_duration(s: &str) -> Result<Duration, String> {
         let s = s.trim();
 
-        // Handle just numbers (assume days)
-        if let Ok(days) = s.parse::<i64>() {
-            return Ok(Duration::days(days));
-        }
+        // A bare number is days; otherwise the last character is the unit.
+        let (num_str, unit_secs) = if s.parse::<i64>().is_ok() {
+            (s, 86_400)
+        } else {
+            if s.len() < 2 {
+                return Err(format!("Invalid duration format: {}", s));
+            }
+            let (num_str, suffix) = s.split_at(s.len() - 1);
+            let unit_secs = match suffix {
+                "d" => 86_400,
+                "h" => 3600,
+                "m" => 60,
+                "s" => 1,
+                _ => {
+                    return Err(format!(
+                        "Invalid duration suffix: {}. Use d, h, m or s",
+                        suffix
+                    ));
+                }
+            };
+            (num_str, unit_secs)
+        };
 
-        // Handle suffixed durations
-        if s.len() < 2 {
-            return Err(format!("Invalid duration format: {}", s));
-        }
-
-        let (num_str, suffix) = s.split_at(s.len() - 1);
         let num: i64 = num_str
             .parse()
             .map_err(|_| format!("Invalid number in duration: {}", num_str))?;
-
-        match suffix {
-            "d" => Ok(Duration::days(num)),
-            _ => Err(format!(
-                "Invalid duration suffix: {}. Use d for days",
-                suffix
-            )),
+        if num < 0 {
+            return Err(format!("Duration must not be negative: {}", s));
         }
+        num.checked_mul(unit_secs)
+            .and_then(Duration::try_seconds)
+            .ok_or_else(|| format!("Duration too large: {}", s))
     }
 }
 
-/// Module for serializing Option<chrono::Duration> as human-readable strings (in days)
+/// Module for serializing Option<chrono::Duration> as human-readable strings (see
+/// [`chrono_duration_days`])
 mod chrono_duration_days_option {
     use chrono::Duration;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -359,32 +384,42 @@ impl HammerworkConfig {
         Ok(())
     }
 
-    /// Load configuration from environment variables
+    /// Load configuration from environment variables. A variable that is set to an
+    /// invalid value (say `HAMMERWORK_JOB_TIMEOUT_SECONDS=30s`) is an error.
     pub fn from_env() -> crate::Result<Self> {
         let mut config = Self::default();
+
+        /// The value of a numeric variable, if set; an invalid value is an error.
+        fn parse_var<T: std::str::FromStr>(name: &str) -> crate::Result<Option<T>> {
+            std::env::var(name)
+                .ok()
+                .map(|value| {
+                    value.trim().parse().map_err(|_| {
+                        crate::HammerworkError::Config(format!("Invalid value for {name}: {value}"))
+                    })
+                })
+                .transpose()
+        }
 
         // Database configuration
         if let Ok(url) = std::env::var("HAMMERWORK_DATABASE_URL") {
             config.database.url = url;
         }
-        if let Ok(pool_size) = std::env::var("HAMMERWORK_DATABASE_POOL_SIZE") {
-            config.database.pool_size = pool_size.parse().unwrap_or(config.database.pool_size);
+        if let Some(pool_size) = parse_var("HAMMERWORK_DATABASE_POOL_SIZE")? {
+            config.database.pool_size = pool_size;
         }
 
         // Worker configuration
-        if let Ok(pool_size) = std::env::var("HAMMERWORK_WORKER_POOL_SIZE") {
-            config.worker.pool_size = pool_size.parse().unwrap_or(config.worker.pool_size);
+        if let Some(pool_size) = parse_var("HAMMERWORK_WORKER_POOL_SIZE")? {
+            config.worker.pool_size = pool_size;
         }
-        if let Ok(timeout) = std::env::var("HAMMERWORK_JOB_TIMEOUT_SECONDS")
-            && let Ok(seconds) = timeout.parse::<u64>()
-        {
+        if let Some(seconds) = parse_var("HAMMERWORK_JOB_TIMEOUT_SECONDS")? {
             config.worker.job_timeout = StdDuration::from_secs(seconds);
         }
 
         // Event configuration
-        if let Ok(buffer_size) = std::env::var("HAMMERWORK_EVENT_BUFFER_SIZE") {
-            config.events.max_buffer_size =
-                buffer_size.parse().unwrap_or(config.events.max_buffer_size);
+        if let Some(buffer_size) = parse_var("HAMMERWORK_EVENT_BUFFER_SIZE")? {
+            config.events.max_buffer_size = buffer_size;
         }
 
         config.encryption.apply_env()?;
@@ -1570,6 +1605,41 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn archive_durations_round_trip_through_a_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("archive.toml");
+        let path = path.to_str().unwrap();
+
+        let mut config = HammerworkConfig::default();
+        config.archive.archive_after = Duration::hours(12);
+        config.archive.delete_after = Some(Duration::minutes(90));
+        config.save_to_file(path).unwrap();
+
+        let loaded = HammerworkConfig::from_file(path).unwrap();
+        assert_eq!(loaded.archive.archive_after, Duration::hours(12));
+        assert_eq!(loaded.archive.delete_after, Some(Duration::minutes(90)));
+    }
+
+    #[test]
+    fn archive_durations_reject_negative_and_out_of_range_values() {
+        #[derive(Debug, Deserialize)]
+        struct T {
+            #[serde(with = "chrono_duration_days")]
+            d: Duration,
+        }
+        let read = |toml: &str| toml::from_str::<T>(toml).map(|t| t.d);
+        // Days, with or without a suffix, as files written by earlier versions hold them
+        assert_eq!(read(r#"d = "30d""#).unwrap(), Duration::days(30));
+        assert_eq!(read(r#"d = "7""#).unwrap(), Duration::days(7));
+        assert_eq!(read(r#"d = "0d""#).unwrap(), Duration::zero());
+        assert!(read(r#"d = "-5d""#).is_err());
+        assert!(read(r#"d = "-5""#).is_err());
+        // Too large for a chrono::Duration: an error, not a panic
+        assert!(read(r#"d = "999999999999999d""#).is_err());
+        assert!(read(r#"d = "999999999999999""#).is_err());
+    }
+
+    #[test]
     fn serde_duration_reads_every_documented_form() {
         #[derive(Deserialize)]
         struct T {
@@ -1667,6 +1737,26 @@ mod tests {
         assert_eq!(config.database.url, "postgresql://env/test");
         assert_eq!(config.worker.pool_size, 12);
         assert_eq!(config.worker.job_timeout, StdDuration::from_secs(900));
+
+        // An invalid number is an error naming the variable, not silently the default
+        // (this test owns these variables, so it checks them one after the other).
+        for (name, bad) in [
+            ("HAMMERWORK_DATABASE_POOL_SIZE", "ten"),
+            ("HAMMERWORK_WORKER_POOL_SIZE", "-1"),
+            ("HAMMERWORK_JOB_TIMEOUT_SECONDS", "30s"),
+            ("HAMMERWORK_EVENT_BUFFER_SIZE", "lots"),
+        ] {
+            let good = std::env::var(name).ok();
+            unsafe { std::env::set_var(name, bad) };
+            let err = HammerworkConfig::from_env().unwrap_err().to_string();
+            assert!(err.contains(name), "{name}={bad}: {err}");
+            unsafe {
+                match good {
+                    Some(good) => std::env::set_var(name, good),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
 
         // Clean up
         unsafe {
