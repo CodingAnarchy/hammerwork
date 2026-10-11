@@ -394,6 +394,12 @@ impl WebSocketState {
             hammerwork::archive::ArchiveEvent::JobsPurged { count, older_than } => {
                 BroadcastMessage::JobsPurged { count, older_than }
             }
+            // `ArchiveEvent` is non-exhaustive: the dashboard has no message for an event
+            // added later, so it is not forwarded.
+            other => {
+                tracing::debug!("Not forwarding archive event {other:?} to dashboard clients");
+                return Ok(());
+            }
         };
 
         // Send to the broadcast channel

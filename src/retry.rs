@@ -72,6 +72,7 @@ use std::time::Duration;
 /// let multiplicative = JitterType::Multiplicative(0.2);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum JitterType {
     /// Add a random duration between 0 and the specified value.
     ///
@@ -280,6 +281,7 @@ impl<'de> Deserialize<'de> for JitterType {
 ///     jitter: None,
 /// };
 /// ```
+#[non_exhaustive]
 pub enum RetryStrategy {
     /// Fixed delay between all retry attempts.
     ///

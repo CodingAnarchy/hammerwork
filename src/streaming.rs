@@ -297,6 +297,7 @@ pub struct StreamConfig {
 /// values of the `config` maps (they may hold SASL passwords), only their keys.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum StreamBackend {
     /// Apache Kafka backend
     Kafka {
@@ -425,6 +426,7 @@ impl std::fmt::Debug for StreamBackend {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum PartitioningStrategy {
     /// No partitioning - all events go to single partition
     None,
@@ -445,6 +447,7 @@ pub enum PartitioningStrategy {
 /// Fields that can be used for hash-based partitioning
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PartitionField {
     JobId,
     QueueName,
@@ -496,6 +499,7 @@ pub enum PartitionField {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SerializationFormat {
     /// JSON serialization
     Json,

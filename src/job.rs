@@ -230,6 +230,7 @@ impl Decode<'_, MySql> for JobStatus {
 /// let no_storage = ResultStorage::None;
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ResultStorage {
     /// Store results in the database (persistent across restarts).
     Database,

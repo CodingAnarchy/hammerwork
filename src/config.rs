@@ -1089,6 +1089,7 @@ impl Default for LoggingConfig {
 /// The same names as [`EncryptionAlgorithm`](crate::encryption::EncryptionAlgorithm),
 /// which is only available with the `encryption` feature.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PayloadEncryptionAlgorithm {
     /// AES-256-GCM
     #[default]

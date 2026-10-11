@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum HammerworkError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),

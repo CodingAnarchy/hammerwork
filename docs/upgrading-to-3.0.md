@@ -490,6 +490,51 @@ Small types that are complete by definition stay exhaustive: `queue::StaleJobRec
 `rate_limit::RateLimit` (`rate`, `per`, `burst_limit`) and the newtypes
 `tracing::TraceId`, `tracing::CorrelationId` and `config::KeySourceRef`.
 
+### Enums
+
+Enums that gain variants over time are `#[non_exhaustive]` too
+([#86](https://github.com/CodingAnarchy/hammerwork/issues/86)). Constructing their
+variants and matching specific ones is unchanged, but a `match` outside Hammerwork must
+now end with a wildcard arm, so that a variant added in a minor release does not break
+your build:
+
+```rust
+use hammerwork::events::JobLifecycleEventType;
+
+fn describe(event_type: &JobLifecycleEventType) -> &'static str {
+    match event_type {
+        JobLifecycleEventType::Completed => "done",
+        JobLifecycleEventType::Failed | JobLifecycleEventType::Dead => "failed",
+        // Before (2.x) the remaining variants could be listed exhaustively.
+        // After (3.0) a wildcard arm is required:
+        _ => "other",
+    }
+}
+# assert_eq!(describe(&JobLifecycleEventType::Completed), "done");
+```
+
+The non-exhaustive enums are:
+
+- Errors: `HammerworkError`, `encryption::EncryptionError`, `cron::CronError`,
+  `spawn::SpawnError`, `priority::PriorityError`.
+- Events: `events::JobLifecycleEventType`, `stats::JobEventType`, `archive::ArchiveEvent`,
+  `alerting::AlertType`, `encryption::KeyOperation`.
+- Backends and options: `streaming::StreamBackend`, `streaming::SerializationFormat`,
+  `streaming::PartitioningStrategy`, `streaming::PartitionField`, `alerting::AlertTarget`,
+  `alerting::SecretSource`, `webhooks::WebhookAuth`, `webhooks::HttpMethod`,
+  `encryption::KeySource`, `encryption::RetentionPolicy`,
+  `encryption::EncryptionAlgorithm`, `config::PayloadEncryptionAlgorithm`,
+  `encryption::KeyPurpose`, `archive::ArchivalReason`, `batch::PartialFailureMode`,
+  `job::ResultStorage`, `priority::PrioritySelectionStrategy`, `retry::RetryStrategy`,
+  `retry::JitterType`, `workflow::FailurePolicy`, `worker::JobHandlerType`,
+  `queue::JobTransition`, `queue::JobOutcome`.
+
+These stay exhaustive, so matching every variant keeps working: `JobStatus` and
+`JobPriority`, the other state enums (`batch::BatchStatus`, `workflow::WorkflowStatus`,
+`workflow::DependencyStatus`, `encryption::KeyStatus`), `alerting::AlertSeverity` (a
+fixed scale, like `JobPriority`) and `alerting::SmtpTls` (the three ways to connect to an
+SMTP server).
+
 ### `ArchivedJob` lists the workflow
 
 `ArchivedJob` has two new fields, `workflow_id` and `workflow_name`, filled in by

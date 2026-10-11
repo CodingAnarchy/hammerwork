@@ -464,6 +464,7 @@ impl Default for JobResult {
 
 /// Enum to support both original and enhanced job handlers
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum JobHandlerType {
     /// Original handler type that returns Result<()>
     Legacy(JobHandler),

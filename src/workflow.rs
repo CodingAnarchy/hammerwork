@@ -97,6 +97,7 @@ impl WorkflowStatus {
 /// `TimedOut`), not when a failed run is retried. See
 /// [`DatabaseQueue::fail_job_dependencies`](crate::queue::DatabaseQueue::fail_job_dependencies).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FailurePolicy {
     /// Stop the entire workflow when any job fails: its `Pending` and `Retrying` jobs
     /// (and any job depending on the failed one) become `Failed`, and the workflow

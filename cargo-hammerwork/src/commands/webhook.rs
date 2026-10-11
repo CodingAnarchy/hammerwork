@@ -433,6 +433,11 @@ pub async fn send_test_event(
         HttpMethod::Post => client.post(&webhook.url),
         HttpMethod::Put => client.put(&webhook.url),
         HttpMethod::Patch => client.patch(&webhook.url),
+        // `HttpMethod` is non-exhaustive: a method this CLI does not know yet.
+        _ => anyhow::bail!(
+            "This version of the CLI cannot send {:?} requests",
+            webhook.method
+        ),
     };
     for (key, value) in &webhook.headers {
         request = request.header(key, value);
@@ -455,6 +460,10 @@ pub async fn send_test_event(
                 request = request.header(key, value);
             }
         }
+        // `WebhookAuth` is non-exhaustive: refuse to send without credentials we cannot apply.
+        Some(_) => anyhow::bail!(
+            "This version of the CLI does not support the webhook's authentication method"
+        ),
         None => {}
     }
     if let Some(secret) = &webhook.secret {

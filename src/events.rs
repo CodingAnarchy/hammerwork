@@ -200,6 +200,7 @@ pub struct JobLifecycleEvent {
 /// Types of job lifecycle events
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum JobLifecycleEventType {
     /// Job was enqueued and is pending execution
     Enqueued,

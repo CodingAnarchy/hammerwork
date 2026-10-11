@@ -302,6 +302,7 @@ pub struct EncryptionKey {
 
 /// Purpose of an encryption key
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyPurpose {
     /// Data encryption key for encrypting job payloads
     Encryption,
@@ -355,6 +356,7 @@ pub struct KeyAuditRecord {
 
 /// Types of key operations that can be audited
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum KeyOperation {
     /// Key was created
     Create,

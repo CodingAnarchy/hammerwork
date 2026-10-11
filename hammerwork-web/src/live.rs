@@ -318,6 +318,8 @@ pub fn job_update_from_event(event: &JobLifecycleEvent) -> JobUpdate {
         E::TimedOut => "TimedOut",
         E::Cancelled => "Cancelled",
         E::Archived => "Archived",
+        // `JobLifecycleEventType` is non-exhaustive: an event type added later.
+        _ => "Unknown",
     };
     let attempts = event
         .error

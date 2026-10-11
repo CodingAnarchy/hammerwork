@@ -67,6 +67,7 @@ pub type ArchivalPolicyId = String;
 /// assert_eq!(ArchivalReason::default(), ArchivalReason::Automatic);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ArchivalReason {
     /// Job was archived due to automatic policy.
     #[default]
@@ -155,6 +156,7 @@ impl std::fmt::Display for ArchivalReason {
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ArchiveEvent {
     /// A job was archived
     JobArchived {

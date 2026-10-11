@@ -24,6 +24,7 @@ pub type BatchId = Uuid;
 
 /// Strategies for handling partial failures within a batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PartialFailureMode {
     /// Continue processing remaining jobs even if some fail.
     /// Failed jobs are tracked but don't stop batch processing.

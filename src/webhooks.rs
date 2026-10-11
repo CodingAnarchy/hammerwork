@@ -251,6 +251,7 @@ impl std::fmt::Debug for WebhookConfig {
 /// HTTP methods supported for webhooks
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
+#[non_exhaustive]
 pub enum HttpMethod {
     Post,
     Put,
@@ -273,6 +274,7 @@ impl std::fmt::Display for HttpMethod {
 /// API keys or header values.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum WebhookAuth {
     /// Bearer token authentication
     Bearer { token: String },

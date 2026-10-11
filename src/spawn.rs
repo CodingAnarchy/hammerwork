@@ -137,6 +137,7 @@ impl<DB: sqlx::Database> SpawnContext<DB> {
 
 /// Error types specific to spawn operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SpawnError {
     #[error("Spawn limit exceeded: attempted to spawn {attempted} jobs, limit is {limit}")]
     SpawnLimitExceeded { attempted: usize, limit: usize },

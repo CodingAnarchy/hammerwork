@@ -173,6 +173,7 @@ impl AlertingConfig {
 /// files. The value is read each time it is needed, so rotating the variable takes
 /// effect on the next alert.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SecretSource {
     /// The secret itself. Only for development and tests.
     Static(String),
@@ -343,6 +344,7 @@ fn single_line(value: &str) -> String {
 /// `Debug` never shows header values or the path of a webhook or Slack URL (a Slack
 /// webhook URL is itself a credential).
 #[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AlertTarget {
     /// Webhook alert target
     Webhook {
@@ -413,6 +415,7 @@ impl std::fmt::Display for AlertSeverity {
 
 /// Alert types that can be triggered
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AlertType {
     HighErrorRate,
     QueueDepthExceeded,
