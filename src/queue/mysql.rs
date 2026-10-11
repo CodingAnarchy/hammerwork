@@ -1883,12 +1883,13 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
     }
 
     async fn list_queue_names(&self) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar(
+        let names: Vec<String> = sqlx::query_scalar(
             "SELECT queue_name FROM hammerwork_jobs \
-             UNION SELECT queue_name FROM hammerwork_jobs_archive ORDER BY 1",
+             UNION SELECT queue_name FROM hammerwork_jobs_archive",
         )
         .fetch_all(&self.pool)
-        .await?)
+        .await?;
+        Ok(super::sorted_queue_names(names))
     }
 
     async fn get_archival_stats(

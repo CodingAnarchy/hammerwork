@@ -2933,14 +2933,12 @@ impl DatabaseQueue for TestQueue {
 
     async fn list_queue_names(&self) -> Result<Vec<String>> {
         let storage = self.storage.read().await;
-        let mut names: Vec<String> = storage
+        let names: Vec<String> = storage
             .jobs
             .values()
             .map(|job| job.queue_name.clone())
             .collect();
-        names.sort();
-        names.dedup();
-        Ok(names)
+        Ok(super::sorted_queue_names(names))
     }
 
     async fn get_archival_stats(

@@ -55,6 +55,7 @@ See [Upgrading from 2.x to 3.0](docs/upgrading-to-3.0.md) for what to change.
 - Building with `encryption` but no database backend (and so with `full`) no longer fails clippy with dead-code and unused-import errors.
 - Workers publish lifecycle events to an `EventManager` (`Worker::with_event_manager`) without the `webhooks` feature, so streaming-only builds and plain `EventManager` subscribers get them ([#130](https://github.com/CodingAnarchy/hammerwork/issues/130)). In 2.x this worked only because `webhooks` was a default feature.
 - `TestQueue::set_throttle_config` rejects an enabled throttle with a zero rate, as the PostgreSQL and MySQL queues do ([#130](https://github.com/CodingAnarchy/hammerwork/issues/130)).
+- `DatabaseQueue::list_queue_names` returns the names in byte (`str`) order without duplicates on every backend; PostgreSQL and MySQL sorted them by the database collation, so the two could disagree with each other and with `TestQueue` ([#130](https://github.com/CodingAnarchy/hammerwork/issues/130)).
 - The MySQL key manager writes and compares key times with `UTC_TIMESTAMP(6)` instead of the session-local `NOW(6)`, now that the columns are `DATETIME(6)` ([#130](https://github.com/CodingAnarchy/hammerwork/issues/130)).
 
 ### Changed

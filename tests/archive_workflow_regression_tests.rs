@@ -593,7 +593,8 @@ where
         .unwrap();
 }
 
-/// `list_queue_names` lists queues with live and with archived jobs.
+/// `list_queue_names` lists queues with live and with archived jobs, in byte order
+/// (whatever the database collation) and without duplicates.
 async fn queue_names_include_archived_queues<Q>(queue: Arc<Q>)
 where
     Q: DatabaseQueue + Send + Sync + 'static,

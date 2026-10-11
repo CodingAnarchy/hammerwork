@@ -407,6 +407,14 @@ pub(crate) fn pick_weighted_priority(
     None
 }
 
+/// [`DatabaseQueue::list_queue_names`] for every backend: `names` in byte order
+/// (`str` ordering), without duplicates, independent of the database collation.
+pub(crate) fn sorted_queue_names(mut names: Vec<String>) -> Vec<String> {
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// [`DatabaseQueue::dequeue`] for every backend: cap `max_jobs` at
 /// [`MAX_DEQUEUE_BATCH_SIZE`], claim nothing for 0, one job with `claim_one` for 1, and
 /// up to the capped count with `claim_many` otherwise.
@@ -567,6 +575,20 @@ mod tests {
         assert_eq!(
             route(MAX_DEQUEUE_BATCH_SIZE + 5).await,
             (3, vec![format!("many({MAX_DEQUEUE_BATCH_SIZE})")])
+        );
+    }
+
+    /// Queue names come back in byte order whatever the database collation: `_`
+    /// (0x5F) sorts after digits, unlike in PostgreSQL's and MySQL's default
+    /// collations.
+    #[test]
+    fn queue_names_are_sorted_in_byte_order_and_unique() {
+        let names = ["hunt_a", "hunt3_q", "Zeta", "alpha", "hunt3_q"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            sorted_queue_names(names),
+            ["Zeta", "alpha", "hunt3_q", "hunt_a"].map(String::from)
         );
     }
 
