@@ -39,8 +39,12 @@ async fn wait_for_completion<Q: DatabaseQueue>(
 /// Store a result on a dequeued job, then complete it: the result must still be
 /// retrievable afterwards.
 #[cfg(any(feature = "postgres", feature = "mysql"))]
-async fn assert_result_survives_job_completion<Q: DatabaseQueue>(queue: &Q) {
+async fn assert_result_survives_job_completion<Q: DatabaseQueue>(
+    queue: &Q,
+    cleanup: fn(&str) -> test_utils::QueueCleanup,
+) {
     let queue_name = format!("completion_test_{}", uuid::Uuid::new_v4());
+    let _cleanup = cleanup(&queue_name);
     let job = Job::new(queue_name.clone(), json!({"test": "completion"}))
         .with_result_storage(ResultStorage::Database);
     let job_id = queue.enqueue(job).await.unwrap();
@@ -68,12 +72,15 @@ async fn assert_result_survives_job_completion<Q: DatabaseQueue>(queue: &Q) {
 /// reads it back, it expires at its TTL, it can be deleted, and it is never written to
 /// the database (a queue with its own store, like another process, doesn't see it).
 #[cfg(any(feature = "postgres", feature = "mysql"))]
-async fn assert_worker_stores_memory_result<DB>(queue: Arc<hammerwork::JobQueue<DB>>)
-where
+async fn assert_worker_stores_memory_result<DB>(
+    queue: Arc<hammerwork::JobQueue<DB>>,
+    cleanup: fn(&str) -> test_utils::QueueCleanup,
+) where
     DB: sqlx::Database + Send + Sync + 'static,
     hammerwork::JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
 {
     let queue_name = test_utils::unique_queue("memory_result");
+    let _cleanup = cleanup(&queue_name);
     let handler: JobHandlerWithResult = Arc::new(|job| {
         Box::pin(async move { Ok(JobResult::with_data(json!({ "echo": job.payload["n"] }))) })
     });
@@ -87,7 +94,7 @@ where
     let expiring_id = queue.enqueue(expiring).await.unwrap();
     let lasting_id = queue.enqueue(lasting).await.unwrap();
 
-    let worker = Worker::new_with_result_handler(queue.clone(), queue_name, handler)
+    let worker = Worker::new_with_result_handler(queue.clone(), queue_name.clone(), handler)
         .with_poll_interval(Duration::from_millis(10));
     let mut pool = WorkerPool::new();
     pool.add_worker(worker);
@@ -152,13 +159,18 @@ mod postgres_tests {
     #[ignore] // Requires database connection
     async fn test_postgres_result_survives_job_completion() {
         let queue = test_utils::setup_postgres_queue().await;
-        assert_result_survives_job_completion(queue.as_ref()).await;
+        assert_result_survives_job_completion(queue.as_ref(), test_utils::QueueCleanup::postgres)
+            .await;
     }
 
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_worker_stores_memory_result() {
-        assert_worker_stores_memory_result(test_utils::setup_postgres_queue().await).await;
+        assert_worker_stores_memory_result(
+            test_utils::setup_postgres_queue().await,
+            test_utils::QueueCleanup::postgres,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -166,8 +178,11 @@ mod postgres_tests {
     async fn test_job_result_storage_and_retrieval() {
         let queue = test_utils::setup_postgres_queue().await;
 
+        let queue_name = test_utils::unique_queue("result_storage");
+        let _cleanup = test_utils::QueueCleanup::postgres(&queue_name);
+
         // Create a job with result storage enabled
-        let job = Job::new("test_queue".to_string(), json!({"task": "process_data"}))
+        let job = Job::new(queue_name, json!({"task": "process_data"}))
             .with_result_storage(ResultStorage::Database)
             .with_result_ttl(Duration::from_secs(3600)); // 1 hour TTL
 
@@ -202,7 +217,9 @@ mod postgres_tests {
     async fn test_result_expiration() {
         let queue = test_utils::setup_postgres_queue().await;
 
-        let job = Job::new("test_queue".to_string(), json!({"task": "short_lived"}));
+        let queue_name = test_utils::unique_queue("result_expiration");
+        let _cleanup = test_utils::QueueCleanup::postgres(&queue_name);
+        let job = Job::new(queue_name, json!({"task": "short_lived"}));
         let job_id = queue.enqueue(job).await.unwrap();
 
         let result_data = json!({"status": "completed"});
@@ -235,7 +252,8 @@ mod postgres_tests {
 
         // Create multiple jobs with different expiration times
         let mut job_ids = Vec::new();
-        let test_queue = format!("test_cleanup_{}", chrono::Utc::now().timestamp_millis());
+        let test_queue = test_utils::unique_queue("test_cleanup");
+        let _cleanup = test_utils::QueueCleanup::postgres(&test_queue);
         for i in 0..5 {
             let job = Job::new(test_queue.clone(), json!({"task": i}));
             let job_id = queue.enqueue(job).await.unwrap();
@@ -289,6 +307,7 @@ mod postgres_tests {
     async fn test_worker_automatic_result_storage() {
         let queue = test_utils::setup_postgres_queue().await;
         let unique_queue = format!("auto_result_test_{}", uuid::Uuid::new_v4());
+        let _cleanup = test_utils::QueueCleanup::postgres(&unique_queue);
 
         // Create a handler that returns result data
         let handler: JobHandlerWithResult = Arc::new(|job| {
@@ -347,6 +366,7 @@ mod postgres_tests {
     async fn test_worker_legacy_handler_compatibility() {
         let queue = test_utils::setup_postgres_queue().await;
         let unique_queue = format!("legacy_test_{}", uuid::Uuid::new_v4());
+        let _cleanup = test_utils::QueueCleanup::postgres(&unique_queue);
 
         // Create a legacy handler (returns ())
         let legacy_handler: hammerwork::worker::JobHandler = Arc::new(|_job| {
@@ -401,6 +421,7 @@ mod postgres_tests {
         });
 
         let unique_queue = format!("no_storage_test_{}", uuid::Uuid::new_v4());
+        let _cleanup = test_utils::QueueCleanup::postgres(&unique_queue);
         let worker = Worker::new_with_result_handler(queue.clone(), unique_queue.clone(), handler);
 
         // Create a job with result storage disabled
@@ -437,13 +458,18 @@ mod mysql_tests {
     #[ignore] // Requires database connection
     async fn test_mysql_result_survives_job_completion() {
         let queue = test_utils::setup_mysql_queue().await;
-        assert_result_survives_job_completion(queue.as_ref()).await;
+        assert_result_survives_job_completion(queue.as_ref(), test_utils::QueueCleanup::mysql)
+            .await;
     }
 
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_mysql_worker_stores_memory_result() {
-        assert_worker_stores_memory_result(test_utils::setup_mysql_queue().await).await;
+        assert_worker_stores_memory_result(
+            test_utils::setup_mysql_queue().await,
+            test_utils::QueueCleanup::mysql,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -451,8 +477,11 @@ mod mysql_tests {
     async fn test_mysql_result_storage() {
         let queue = test_utils::setup_mysql_queue().await;
 
+        let queue_name = test_utils::unique_queue("mysql_result_storage");
+        let _cleanup = test_utils::QueueCleanup::mysql(&queue_name);
+
         // Test basic result storage with MySQL
-        let job = Job::new("test_queue".to_string(), json!({"task": "mysql_test"}))
+        let job = Job::new(queue_name, json!({"task": "mysql_test"}))
             .with_result_storage(ResultStorage::Database);
 
         let job_id = queue.enqueue(job).await.unwrap();
@@ -491,7 +520,8 @@ mod mysql_tests {
             })
         });
 
-        let test_queue = format!("mysql_worker_{}", chrono::Utc::now().timestamp_millis());
+        let test_queue = test_utils::unique_queue("mysql_worker");
+        let _cleanup = test_utils::QueueCleanup::mysql(&test_queue);
         let worker = Worker::new_with_result_handler(queue.clone(), test_queue.clone(), handler);
 
         let job = Job::new(test_queue.clone(), json!({"test": "mysql"}))

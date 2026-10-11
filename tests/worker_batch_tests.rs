@@ -161,27 +161,34 @@ mod postgres_worker_batch_tests {
 
         let batch_id = queue.enqueue_batch(batch).await.unwrap();
 
-        // Start worker pool
-        let mut worker_pool = WorkerPool::new();
-        worker_pool.add_worker(worker);
+        // Run the worker directly (a pool owns its workers, and a clone keeps its own
+        // statistics), so its statistics can be read afterwards.
+        let worker = Arc::new(worker);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let worker_task = {
+            let worker = Arc::clone(&worker);
+            tokio::spawn(async move { worker.run(shutdown_rx).await })
+        };
 
-        let worker_task = tokio::spawn(async move {
-            let _ = timeout(Duration::from_secs(3), worker_pool.start()).await;
-        });
-
-        // Wait for processing
-        let mut attempts = 0;
+        // Wait for processing, generously for slow (instrumented) runs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
             let batch_result = queue.get_batch_status(batch_id).await.unwrap();
-            if batch_result.pending_jobs == 0 || attempts > 30 {
+            if batch_result.pending_jobs == 0 {
                 break;
             }
-            attempts += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "batch not processed: {batch_result:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-
-        // Stop worker
-        worker_task.abort();
+        shutdown_tx.send(()).await.unwrap();
+        timeout(Duration::from_secs(30), worker_task)
+            .await
+            .expect("worker stopped")
+            .unwrap()
+            .unwrap();
 
         // Both jobs in the batch should have been processed successfully
         let batch_result = queue.get_batch_status(batch_id).await.unwrap();
@@ -189,6 +196,20 @@ mod postgres_worker_batch_tests {
         assert_eq!(batch_result.pending_jobs, 0);
         assert_eq!(batch_result.completed_jobs, 2);
         assert_eq!(batch_result.failed_jobs, 0);
+
+        // The worker's batch statistics count both jobs and the finished batch. Each job
+        // sleeps 50ms, which bounds the recorded processing time from below only.
+        let stats = worker.get_batch_stats();
+        assert_eq!(stats.jobs_processed, 2, "{stats:?}");
+        assert_eq!(stats.jobs_completed, 2, "{stats:?}");
+        assert_eq!(stats.jobs_failed, 0, "{stats:?}");
+        assert_eq!(stats.batches_completed, 1, "{stats:?}");
+        assert_eq!(stats.batches_successful, 1, "{stats:?}");
+        assert_eq!(stats.success_rate(), 1.0);
+        assert_eq!(stats.batch_success_rate(), 1.0);
+        assert!(stats.total_processing_time_ms >= 100, "{stats:?}");
+        assert!(stats.average_processing_time_ms >= 50.0, "{stats:?}");
+        assert!(stats.last_processed_job.is_some());
 
         // Clean up
         queue.delete_batch(batch_id).await.unwrap();

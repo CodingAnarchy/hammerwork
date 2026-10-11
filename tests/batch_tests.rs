@@ -242,12 +242,23 @@ mod postgres_batch_tests {
         let batch_jobs = queue.get_batch_jobs(batch_id).await.unwrap();
         assert_eq!(batch_jobs.len(), 500);
 
-        // Verify jobs are correctly ordered
+        // Every job of the batch came back exactly once, with its payload, in creation
+        // order (jobs created in the same microsecond may come back in either order, so
+        // the order is checked by timestamp rather than by index).
+        let mut indices = Vec::with_capacity(batch_jobs.len());
         for job in batch_jobs.iter() {
-            let _expected_index = job.payload["batch_index"].as_u64().unwrap() as usize;
+            indices.push(job.payload["batch_index"].as_u64().unwrap() as usize);
             assert_eq!(job.batch_id, Some(batch_id));
             assert_eq!(job.queue_name, "large_queue");
         }
+        assert!(
+            batch_jobs
+                .windows(2)
+                .all(|pair| pair[0].created_at <= pair[1].created_at),
+            "batch jobs are not in creation order"
+        );
+        indices.sort_unstable();
+        assert_eq!(indices, (0..500).collect::<Vec<_>>());
 
         // Clean up
         queue.delete_batch(batch_id).await.unwrap();

@@ -148,6 +148,7 @@ mod mysql_tests {
     async fn test_mysql_concurrent_dequeue() {
         let queue = test_utils::setup_mysql_queue().await;
         let queue_name = test_utils::unique_queue("concurrent_queue");
+        let _cleanup = test_utils::QueueCleanup::mysql(&queue_name);
 
         // Create multiple jobs
         for i in 0..5 {
