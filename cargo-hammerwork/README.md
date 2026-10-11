@@ -329,7 +329,7 @@ cargo hammerwork maintenance purge-encrypted --confirm
 ```
 
 - `vacuum` deletes old completed and failed jobs (defaults: 30 and 7 days).
-- `dead-jobs` marks stale jobs (no update for `--stale-hours`, default 24) as dead. Compare `job requeue-stale`, which gives them another attempt.
+- `dead-jobs` marks stale jobs (`Running` jobs that started more than `--stale-hours` ago, default 24) as dead. Compare `job requeue-stale`, which gives them another attempt.
 - `check` inspects integrity and job consistency; `--fix` repairs minor issues.
 - There is no `maintenance cleanup` or `maintenance health`; use `vacuum` and `check`
   (or `monitor health`).

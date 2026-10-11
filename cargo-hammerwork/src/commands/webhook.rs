@@ -525,6 +525,24 @@ async fn update_webhook(
 ) -> Result<()> {
     let mut webhooks = load_webhooks_config(config)?;
 
+    // Names identify webhooks, so a rename may not take another webhook's name (as
+    // `add` refuses a duplicate).
+    if let Some(new_name) = &name {
+        let target = webhooks
+            .iter()
+            .find(|w| w.name == webhook_id || w.id.to_string() == webhook_id)
+            .map(|w| w.id);
+        if webhooks
+            .iter()
+            .any(|w| &w.name == new_name && Some(w.id) != target)
+        {
+            return Err(anyhow::anyhow!(
+                "A webhook named '{}' already exists",
+                new_name
+            ));
+        }
+    }
+
     let webhook = webhooks
         .iter_mut()
         .find(|w| w.name == webhook_id || w.id.to_string() == webhook_id);
@@ -1376,6 +1394,23 @@ mod tests {
         assert_eq!((hook.timeout_secs, hook.retry_policy.max_attempts), (2, 0));
         assert_eq!(hook.secret.as_deref(), Some("s"), "untouched fields stay");
         run(&config, &["update", "-w", "plain"]).await.unwrap(); // nothing to change is fine
+        // #94: a rename cannot take another webhook's name, as `add` refuses it; keeping
+        // its own name is fine.
+        let err = run(&config, &["update", "-w", "plain", "-n", "ci2"])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        let names: Vec<String> = read_webhooks(&file)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.name)
+            .collect();
+        assert_eq!(names.iter().filter(|n| *n == "ci2").count(), 1);
+        assert!(names.contains(&"plain".to_string()));
+        run(&config, &["update", "-w", "ci2", "-n", "ci2"])
+            .await
+            .unwrap();
         assert!(
             run(&config, &["update", "-w", "missing", "-n", "x"])
                 .await

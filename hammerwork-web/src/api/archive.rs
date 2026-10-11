@@ -322,9 +322,19 @@ where
     let config = request.config.unwrap_or_default();
 
     if request.dry_run {
-        // For dry run, return what would happen without actually archiving
+        // Count the jobs a real run would archive now; nothing is written, so the other
+        // statistics (sizes, compression, duration) stay at their defaults.
+        let would_archive = try_api!(
+            queue
+                .count_archivable(request.queue_name.as_deref(), &policy)
+                .await,
+            "Failed to count archivable jobs"
+        );
         let response = ArchiveResponse {
-            stats: ArchivalStats::default(), // In a real dry run, we'd calculate this
+            stats: ArchivalStats {
+                jobs_archived: would_archive,
+                ..ArchivalStats::default()
+            },
             dry_run: true,
             policy_used: policy,
             config_used: config,

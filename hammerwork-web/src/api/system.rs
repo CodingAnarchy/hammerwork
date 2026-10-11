@@ -152,8 +152,10 @@ impl SystemState {
         }
     }
 
+    /// Seconds since the dashboard started; never negative, even if the clock went
+    /// backwards since.
     pub fn uptime_seconds(&self) -> i64 {
-        (chrono::Utc::now() - self.started_at).num_seconds()
+        (chrono::Utc::now() - self.started_at).num_seconds().max(0)
     }
 }
 
@@ -346,7 +348,7 @@ where
         runtime_info,
         database_info,
         features,
-        uptime_seconds: state.uptime_seconds() as u64,
+        uptime_seconds: u64::try_from(state.uptime_seconds()).unwrap_or(0),
         started_at: state.started_at,
     };
 
@@ -538,6 +540,16 @@ async fn get_last_scrape_time() -> Option<chrono::DateTime<chrono::Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #94: a clock that went backwards gives zero uptime, not a wrapped `u64`.
+    #[test]
+    fn uptime_is_never_negative() {
+        let mut state = SystemState::new(crate::DashboardConfig::default(), "pg".into(), 1);
+        state.started_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert_eq!(state.uptime_seconds(), 0);
+        state.started_at = chrono::Utc::now() - chrono::Duration::seconds(90);
+        assert!(state.uptime_seconds() >= 90);
+    }
 
     #[test]
     fn test_maintenance_request_deserialization() {

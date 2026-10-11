@@ -123,7 +123,7 @@ impl BackupCommand {
                     *include_completed,
                     *include_failed,
                     format.as_deref().unwrap_or("json"),
-                    config.get_connection_pool_size(),
+                    config,
                 )
                 .await?;
             }
@@ -135,14 +135,7 @@ impl BackupCommand {
             } => {
                 let db_url = &config.resolve_database_url(database_url.as_deref())?;
 
-                restore_backup(
-                    db_url,
-                    input,
-                    *confirm,
-                    *skip_existing,
-                    config.get_connection_pool_size(),
-                )
-                .await?;
+                restore_backup(db_url, input, *confirm, *skip_existing, config).await?;
             }
             BackupCommand::List { path } => {
                 list_backups(path.clone()).await?;
@@ -308,12 +301,12 @@ async fn create_backup(
     include_completed: bool,
     include_failed: bool,
     format: &str,
-    pool_size: u32,
+    config: &Config,
 ) -> Result<()> {
     if !matches!(format, "json" | "csv") {
         anyhow::bail!("Unknown backup format '{}': use json or csv", format);
     }
-    let pool = DatabasePool::connect(database_url, pool_size).await?;
+    let pool = DatabasePool::connect_with_config(database_url, config).await?;
 
     // Read everything before creating the file, so a failure leaves no partial backup.
     let (content, total) = if format == "csv" {
@@ -371,14 +364,14 @@ async fn restore_backup(
     input: &str,
     confirm: bool,
     skip_existing: bool,
-    pool_size: u32,
+    config: &Config,
 ) -> Result<()> {
     if !confirm {
         println!("⚠️  This will restore jobs from backup. Use --confirm to proceed.");
         return Ok(());
     }
 
-    let pool = DatabasePool::connect(database_url, pool_size).await?;
+    let pool = DatabasePool::connect_with_config(database_url, config).await?;
 
     // Read backup file
     let backup_content = std::fs::read_to_string(input)
@@ -822,6 +815,29 @@ mod tests {
             assert!(
                 err.to_string().contains("Database URL is required"),
                 "{err}"
+            );
+        }
+    }
+
+    /// #94: `backup create` and `backup restore` honour `connect_timeout_secs` (default
+    /// 10s) instead of connecting with the default timeout.
+    #[tokio::test]
+    async fn create_and_restore_use_the_configured_connect_timeout() {
+        let config = Config {
+            connect_timeout_secs: Some(1),
+            ..Config::default()
+        };
+        let url = "postgres://u:p@10.255.255.1:5432/x";
+        for cmd in [
+            parse(&["create", "-u", url, "-o", "never-written.json"]),
+            parse(&["restore", "-u", url, "-i", "missing.json", "--confirm"]),
+        ] {
+            let start = std::time::Instant::now();
+            assert!(cmd.execute(&config).await.is_err());
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "{:?}",
+                start.elapsed()
             );
         }
     }

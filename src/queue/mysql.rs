@@ -1978,6 +1978,39 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn start_claimed_run(&self, run: &mut Job, lease: std::time::Duration) -> Result<bool> {
+        // MySQL has no RETURNING: read the database clock first and write that value, so
+        // the caller knows the stored start time that identifies the run from now on.
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)")
+            .fetch_one(&self.pool)
+            .await?;
+        let started = super::run_started_range(run);
+        let result = sqlx::query(&format!(
+            "UPDATE hammerwork_jobs SET started_at = ?, last_heartbeat_at = ?, \
+             lease_expires_at = LEAST(DATE_ADD(?, INTERVAL ? MICROSECOND), \
+             CAST('{TIMESTAMP_MAX_SQL}' AS DATETIME(6))) WHERE id = ? AND status = ? \
+             AND attempts = ? AND (? IS NULL OR (started_at > ? AND started_at < ?))"
+        ))
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(lease_micros(lease))
+        .bind(run.id.to_string())
+        .bind(JobStatus::Running)
+        .bind(run.attempts)
+        .bind(started.map(|(from, _)| from))
+        .bind(started.map(|(from, _)| from))
+        .bind(started.map(|(_, to)| to))
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        run.started_at = Some(now);
+        Ok(true)
+    }
+
     async fn requeue_stale_jobs(
         &self,
         older_than: std::time::Duration,

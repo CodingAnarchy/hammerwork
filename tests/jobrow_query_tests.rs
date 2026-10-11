@@ -28,6 +28,7 @@ mod jobrow_field_tests {
         async fn test_get_job_includes_all_fields() {
             let queue = test_utils::setup_postgres_queue().await;
             let unique_queue = format!("pg_get_test_{}", Uuid::new_v4());
+            let _cleanup = test_utils::QueueCleanup::postgres(&unique_queue);
 
             // Create a job with all possible fields populated
             let job = Job::new(unique_queue.clone(), json!({"test": "data"}))
@@ -60,6 +61,7 @@ mod jobrow_field_tests {
         async fn test_dequeue_includes_all_fields() {
             let queue = test_utils::setup_postgres_queue().await;
             let unique_queue = format!("pg_dequeue_test_{}", Uuid::new_v4());
+            let _cleanup = test_utils::QueueCleanup::postgres(&unique_queue);
 
             let job = Job::new(unique_queue.clone(), json!({"test": "dequeue"}))
                 .with_priority(JobPriority::Critical);
@@ -83,6 +85,7 @@ mod jobrow_field_tests {
         async fn test_dequeue_with_priority_weights_includes_all_fields() {
             let queue = test_utils::setup_postgres_queue().await;
             let unique_queue = format!("pg_priority_test_{}", Uuid::new_v4());
+            let _cleanup = test_utils::QueueCleanup::postgres(&unique_queue);
 
             let weights = hammerwork::priority::PriorityWeights::default();
 
@@ -115,6 +118,7 @@ mod jobrow_field_tests {
         async fn test_mysql_get_job_includes_all_fields() {
             let queue = test_utils::setup_mysql_queue().await;
             let unique_queue = format!("mysql_get_test_{}", Uuid::new_v4());
+            let _cleanup = test_utils::QueueCleanup::mysql(&unique_queue);
 
             let job = Job::new(unique_queue.clone(), json!({"test": "mysql"}))
                 .with_priority(JobPriority::High)
@@ -139,6 +143,7 @@ mod jobrow_field_tests {
         async fn test_mysql_dequeue_includes_all_fields() {
             let queue = test_utils::setup_mysql_queue().await;
             let unique_queue = format!("mysql_dequeue_test_{}", Uuid::new_v4());
+            let _cleanup = test_utils::QueueCleanup::mysql(&unique_queue);
 
             let job = Job::new(unique_queue.clone(), json!({"test": "dequeue"}));
             queue.enqueue(job).await.unwrap();
@@ -158,6 +163,7 @@ mod jobrow_field_tests {
         async fn test_mysql_dequeue_with_priority_weights_includes_all_fields() {
             let queue = test_utils::setup_mysql_queue().await;
             let unique_queue = format!("mysql_priority_test_{}", Uuid::new_v4());
+            let _cleanup = test_utils::QueueCleanup::mysql(&unique_queue);
 
             let weights = hammerwork::priority::PriorityWeights::default();
             let job = Job::new(unique_queue.clone(), json!({"test": "priority"}));
@@ -190,6 +196,7 @@ mod workflow_field_tests {
     async fn test_postgres_job_with_dependencies() {
         let queue = test_utils::setup_postgres_queue().await;
         let unique_queue = format!("postgres_deps_test_{}", Uuid::new_v4());
+        let _cleanup = test_utils::QueueCleanup::postgres(&unique_queue);
 
         // Create a job with dependencies
         let dependency_job = Job::new(unique_queue.clone(), json!({"step": 1}));
@@ -215,6 +222,7 @@ mod workflow_field_tests {
     async fn test_mysql_job_with_dependencies() {
         let queue = test_utils::setup_mysql_queue().await;
         let unique_queue = format!("mysql_deps_test_{}", Uuid::new_v4());
+        let _cleanup = test_utils::QueueCleanup::mysql(&unique_queue);
 
         // Create a job with dependencies
         let dependency_job = Job::new(unique_queue.clone(), json!({"step": 1}));

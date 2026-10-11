@@ -1026,6 +1026,27 @@ pub trait DatabaseQueue: Send + Sync {
         })
     }
 
+    /// Record that a claimed run is starting now, after it waited for its turn.
+    ///
+    /// `run` is the job as returned by the dequeue. A batch claim
+    /// ([`dequeue_batch_leased`](Self::dequeue_batch_leased)) stamps every job's
+    /// `started_at` with the claim time, so a job that waits in the batch would have its
+    /// wait counted as processing time. If the job is still `Running` that run (as in
+    /// [`heartbeat_job`](Self::heartbeat_job)), this sets its `started_at` to the current
+    /// time (database clock), renews its lease to `now + lease`, updates
+    /// `run.started_at` to the stored value (which identifies the run from then on), and
+    /// returns `true`. Returns `false`, and changes nothing, when the job is no longer
+    /// `Running` that run.
+    ///
+    /// Workers in batch mode call this for a held job when it starts.
+    ///
+    /// The default implementation only renews the lease with
+    /// [`heartbeat_job`](Self::heartbeat_job) and leaves `started_at` at the claim time,
+    /// for backends that predate this method.
+    async fn start_claimed_run(&self, run: &mut Job, lease: std::time::Duration) -> Result<bool> {
+        self.heartbeat_job(run, lease).await
+    }
+
     /// Reclaim jobs left in `Running` by workers that crashed or were killed.
     ///
     /// A `Running` job is stale when:

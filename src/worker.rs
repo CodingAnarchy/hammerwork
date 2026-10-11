@@ -1220,15 +1220,27 @@ where
     ///   while the worker is alive, however long the jobs ahead of it take. If a
     ///   waiting job's lease is lost anyway (an operator changed it, or heartbeats
     ///   failed for longer than the lease), the worker skips it.
+    /// - **Start time.** A claim stamps the jobs' `started_at` with the claim time. A
+    ///   job that waited for its turn records its actual start when it starts
+    ///   ([`DatabaseQueue::start_claimed_run`]), so the time it waited does not count as
+    ///   processing time in statistics.
     /// - **Throttle and rate limit.** With a throttle's `max_concurrent`, every claimed
     ///   job holds one of its permits until it finishes, so the worker never claims more
     ///   jobs than there are free permits (it waits for at least one). With a rate limit,
     ///   it claims no more jobs than it can take tokens for and hands back the tokens of
-    ///   jobs it did not get.
+    ///   jobs it did not get, or that it did not run (released, skipped because their
+    ///   lease was lost, or failed with their batch).
     /// - **Pause.** Before starting a claimed job, the worker checks whether the queue
     ///   was paused (at most once per [poll interval](Self::with_poll_interval)). If it
     ///   was, the claimed jobs that have not started are handed back to the queue as on
     ///   shutdown, and the running ones finish.
+    /// - **Fail-fast batches.** At the same checks, the worker checks whether the
+    ///   [`JobBatch`](crate::batch::JobBatch) of a claimed job that has not started has
+    ///   failed. A [`FailFast`](crate::batch::PartialFailureMode::FailFast) batch fails
+    ///   its `Pending` jobs on its first failure; the jobs this worker holds are
+    ///   `Running`, so the worker fails them the same way (`Failed`, not retried)
+    ///   instead of starting them, including when it hands jobs back on a pause or
+    ///   shutdown. Jobs of the batch that are already running finish.
     /// - **Shutdown.** Claimed jobs that have not started are handed back to the queue
     ///   at once ([`DatabaseQueue::release_job_run`]), without counting an attempt, so
     ///   other workers can run them instead of waiting for their leases to expire. Jobs
@@ -1963,17 +1975,23 @@ where
         let mut running: Vec<BatchRun<'_>> = Vec::new();
         let mut first_error = None;
         let mut shutting_down = false;
-        // The claim checked the pause; check again before starting held jobs, at most
-        // once per poll interval (as often as a single-job worker polls).
-        let pause_check_interval = self.poll_interval.max(MIN_POLL_INTERVAL);
-        let mut pause_checked_at = std::time::Instant::now();
+        // The claim checked the pause and found the jobs runnable; check again before
+        // starting held jobs, at most once per poll interval (as often as a single-job
+        // worker polls), whether the queue was paused or a job's fail-fast batch failed.
+        let check_interval = self.poll_interval.max(MIN_POLL_INTERVAL);
+        let mut checked_at = std::time::Instant::now();
+        let mut failed_batches = std::collections::HashSet::new();
+        // Jobs started right after the claim keep the claim time as their start time;
+        // the ones that waited record when they actually start.
+        let mut initial_fill = true;
 
         loop {
             if !queued.is_empty()
                 && running.len() < concurrency
-                && pause_checked_at.elapsed() >= pause_check_interval
+                && checked_at.elapsed() >= check_interval
             {
-                pause_checked_at = std::time::Instant::now();
+                checked_at = std::time::Instant::now();
+                self.find_failed_batches(&queued, &mut failed_batches).await;
                 if self.queue_is_paused().await {
                     let unstarted: Vec<Job> = queued.drain(..).map(|claimed| claimed.job).collect();
                     {
@@ -1987,7 +2005,7 @@ where
                         self.queue_name,
                         unstarted.len()
                     );
-                    self.release_unstarted(unstarted).await;
+                    self.hand_back_unstarted(unstarted, &failed_batches).await;
                 }
             }
 
@@ -2001,14 +2019,26 @@ where
                          (it is no longer Running this run)",
                         job.id
                     );
+                    self.refund_rate_token();
                     continue;
                 }
+                let batch_failed = job.batch_id.is_some_and(|id| failed_batches.contains(&id));
+                // Recording the start also renews the lease.
+                let record_start = !initial_fill || start == HeldStart::RenewThenRun;
                 running.push(Box::pin(async move {
                     // The job's throttle permit is held until it is done.
                     let _permit = permit;
+                    let mut job = job;
                     let job_id = job.id;
-                    if start == HeldStart::RenewThenRun {
-                        match self.queue.heartbeat_job(&job, self.lease_duration).await {
+                    if batch_failed {
+                        return (job_id, self.fail_held_job(&job).await);
+                    }
+                    if record_start {
+                        match self
+                            .queue
+                            .start_claimed_run(&mut job, self.lease_duration)
+                            .await
+                        {
                             Ok(true) => {}
                             Ok(false) => {
                                 warn!(
@@ -2016,16 +2046,19 @@ where
                                      while waiting (it is no longer Running this run)",
                                     job_id
                                 );
+                                self.refund_rate_token();
                                 return (job_id, Ok(()));
                             }
-                            Err(e) => {
-                                warn!("Failed to renew the lease on job {}: {}", job_id, e)
-                            }
+                            Err(e) => warn!(
+                                "Failed to record the start of job {} (and renew its lease): {}",
+                                job_id, e
+                            ),
                         }
                     }
                     (job_id, self.process_job(job).await)
                 }));
             }
+            initial_fill = false;
 
             tokio::select! {
                 biased;
@@ -2046,8 +2079,8 @@ where
         }
 
         if shutting_down {
-            self.release_unstarted(queued.drain(..).map(|claimed| claimed.job))
-                .await;
+            let unstarted = queued.drain(..).map(|claimed| claimed.job).collect();
+            self.hand_back_unstarted(unstarted, &failed_batches).await;
             if !running.is_empty() {
                 info!(
                     "Shutdown requested while {} job(s) of a batch are running; waiting up to \
@@ -2169,9 +2202,7 @@ where
             match self.queue.release_job_run(&job).await {
                 Ok(true) => {
                     released += 1;
-                    if let Some(rate_limiter) = &self.rate_limiter {
-                        rate_limiter.refund();
-                    }
+                    self.refund_rate_token();
                 }
                 Ok(false) => debug!(
                     "Job {} was no longer Running this run; nothing to release",
@@ -2189,6 +2220,110 @@ where
                 "Released {} claimed job(s) that had not started back to queue {}",
                 released, self.queue_name
             );
+        }
+    }
+
+    /// Hand back claimed jobs that never started: the ones whose batch is in
+    /// `failed_batches` are failed ([`fail_held_job`](Self::fail_held_job)), since
+    /// releasing them would let them run; the others are released to the queue.
+    async fn hand_back_unstarted(
+        &self,
+        jobs: Vec<Job>,
+        failed_batches: &std::collections::HashSet<BatchId>,
+    ) {
+        let (doomed, released): (Vec<Job>, Vec<Job>) = jobs
+            .into_iter()
+            .partition(|job| job.batch_id.is_some_and(|id| failed_batches.contains(&id)));
+        for job in doomed {
+            if let Err(e) = self.fail_held_job(&job).await {
+                warn!("Failed to fail job {} of a failed batch: {}", job.id, e);
+            }
+        }
+        self.release_unstarted(released).await;
+    }
+
+    /// Add to `failed` the batches of the `queued` jobs that have failed. A fail-fast
+    /// batch fails on its first terminal job failure, which fails its `Pending` jobs;
+    /// held jobs are `Running`, so the worker has to stop them itself. A batch whose
+    /// status cannot be read counts as not failed.
+    async fn find_failed_batches(
+        &self,
+        queued: &std::collections::VecDeque<ClaimedJob>,
+        failed: &mut std::collections::HashSet<BatchId>,
+    ) {
+        let mut batch_ids: Vec<BatchId> = queued
+            .iter()
+            .filter_map(|claimed| claimed.job.batch_id)
+            .filter(|id| !failed.contains(id))
+            .collect();
+        batch_ids.sort_unstable();
+        batch_ids.dedup();
+        for batch_id in batch_ids {
+            match self.queue.get_batch_status(batch_id).await {
+                Ok(batch) if batch.status == crate::batch::BatchStatus::Failed => {
+                    info!(
+                        "Batch {} has failed; its claimed jobs that have not started will \
+                         not run",
+                        batch_id
+                    );
+                    failed.insert(batch_id);
+                }
+                Ok(_) => {}
+                Err(e) => warn!("Failed to check the status of batch {}: {}", batch_id, e),
+            }
+        }
+    }
+
+    /// Fail a held job whose batch failed before it started, as a fail-fast batch fails
+    /// its `Pending` jobs (status `Failed`, no retry). The job did not run, so its rate
+    /// limit token is refunded. Nothing happens if the job is no longer `Running` the
+    /// run this worker claimed.
+    async fn fail_held_job(&self, job: &Job) -> Result<()> {
+        // Renewing the lease confirms this worker still holds the run, and keeps the
+        // reaper off it until it is failed.
+        match self.queue.heartbeat_job(job, self.lease_duration).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    "Job {} of a failed batch is no longer Running this run; leaving it",
+                    job.id
+                );
+                self.refund_rate_token();
+                return Ok(());
+            }
+            Err(e) => warn!("Failed to renew the lease on job {}: {}", job.id, e),
+        }
+        match self
+            .queue
+            .fail_job(
+                job.id,
+                crate::queue::lifecycle::BATCH_FAILED_BEFORE_START_MESSAGE,
+            )
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    "Failed claimed job {}: its batch failed (fail-fast) before it started",
+                    job.id
+                );
+                self.refund_rate_token();
+                Ok(())
+            }
+            // It already left Running (an operator, or the batch, finished it).
+            Err(
+                HammerworkError::InvalidJobTransition { .. } | HammerworkError::JobNotFound { .. },
+            ) => {
+                self.refund_rate_token();
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Hand back the rate limit token of a claimed job that will not run.
+    fn refund_rate_token(&self) {
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter.refund();
         }
     }
 

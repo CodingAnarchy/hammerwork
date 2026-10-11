@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed fail-fast batch no longer runs the jobs a batch-mode worker already
+  claimed.** When a `JobBatch` with `PartialFailureMode::FailFast` failed, only its
+  `Pending` jobs were failed; the jobs of it that a worker with `with_batch_size(n)` had
+  claimed but not started were `Running`, so they still ran. Before starting a held job
+  the worker now checks (at most once per poll interval, with the pause check) whether
+  its batch has failed and, if so, fails it as the batch fails its `Pending` jobs
+  (`Failed`, not retried) instead of running it. Held jobs of a failed batch are failed
+  rather than released on a pause or shutdown too.
+- **Batch-mode processing times no longer include the time a job waited in its batch.**
+  A batch claim stamps every job's `started_at` with the claim time, so durations
+  computed from `started_at` (queue statistics, dashboard and CLI averages) counted the
+  wait of held jobs as processing time. A held job that waited now records its actual
+  start when it starts, through the new `DatabaseQueue::start_claimed_run` (default:
+  renew the lease only, as before).
+- **A held batch job skipped because its lease was lost refunds its rate limit token**,
+  as released jobs already did, so a lost claim no longer spends the rate limit.
+- **Dashboard live updates report jobs that go from `Running` back to `Pending`.** A
+  retry, a stale job requeued by the reaper and a claimed job released by a batch-mode
+  worker change none of the timestamps `JobHistory::recent_job_changes` reads, so
+  WebSocket clients subscribed to `job_updates` were never told. The live-update poller
+  now tracks the running jobs (new `JobHistory::running_jobs`) and reads the state of the
+  ones that stopped running without such a timestamp (new `JobHistory::job_states`),
+  reporting them at the poll that saw the change. No schema change is needed.
+- **The dashboard's uptime no longer wraps to a huge number if the clock goes backwards**
+  (`/api/stats/overview`, `/api/system/info`); `SystemState::uptime_seconds` is never
+  negative.
+- **The dashboard's job list sorts ascending for `sort_order=ASC` (any case)**, not only
+  for lowercase `asc`, like the other endpoints.
+- **An archive dry run (`POST /api/archive/jobs` with `dry_run: true`) reports how many
+  jobs a real run would archive** in `stats.jobs_archived` (new
+  `JobHistory::count_archivable`) instead of zeroed statistics.
+- **`cargo hammerwork backup create`/`restore` and `migration status` honour
+  `connect_timeout_secs`.** They connected with the default 10-second timeout whatever
+  the configuration said.
+- **`cargo hammerwork maintenance vacuum` reports the jobs it actually deleted**, not the
+  counts taken before the deletes (jobs can change in between).
+- **`cargo hammerwork maintenance dead-jobs` describes what it selects**: `Running` jobs
+  that started more than `--stale-hours` ago, not jobs with "no update" for that long.
+- **`cargo hammerwork monitor dashboard` shows icons for `Retrying` and `TimedOut` jobs.**
+- **`cargo hammerwork webhook update --name` refuses a name another webhook already
+  has**, as `webhook add` does.
 - **Pausing a queue stops batch-mode workers from starting the jobs they hold.** A worker
   with `with_batch_size(n)` kept starting the claimed jobs of its current batch after the
   queue was paused, up to `n` more jobs, contrary to "paused queues are honoured". Before

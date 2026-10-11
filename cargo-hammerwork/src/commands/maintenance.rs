@@ -32,7 +32,7 @@ pub enum MaintenanceCommand {
         #[arg(
             long,
             default_value = "24",
-            help = "Hours without update to consider dead"
+            help = "Hours since a running job started to consider it dead"
         )]
         stale_hours: u32,
         #[arg(long, help = "Confirm the cleanup operation")]
@@ -248,18 +248,21 @@ pub fn build_vacuum_query(
     )
 }
 
+/// Delete the completed and failed jobs older than their keep windows. Returns how many
+/// completed and failed jobs were deleted, or `None` when nothing was to be deleted
+/// (no `--confirm`, or a dry run).
 async fn vacuum_jobs(
     pool: DatabasePool,
     keep_completed_days: u32,
     keep_failed_days: u32,
     confirm: bool,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<Option<(u64, u64)>> {
     if !confirm && !dry_run {
         println!(
             "⚠️  This will permanently delete old jobs. Use --confirm to proceed or --dry-run to preview."
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let completed_cutoff = chrono::Utc::now() - chrono::Duration::days(keep_completed_days as i64);
@@ -289,37 +292,33 @@ async fn vacuum_jobs(
 
     if dry_run {
         println!("\n💡 This was a dry run. Use --confirm to actually delete these jobs.");
-        return Ok(());
+        return Ok(None);
     }
 
     if completed_count == 0 && failed_count == 0 {
         println!("✨ No old jobs found. Database is clean!");
-        return Ok(());
+        return Ok(Some((0, 0)));
     }
 
     info!("Starting vacuum operation");
 
-    // Delete completed jobs
-    if completed_count > 0 {
-        let (delete_query, delete_binds) =
-            build_vacuum_query(backend, VacuumKind::Completed, true, completed_cutoff);
-        execute_binds(&pool, &delete_query, &delete_binds).await?;
-        info!("Deleted {} completed jobs", completed_count);
-    }
+    // Report the rows the deletes removed: jobs can change between the count and the
+    // delete (a retried job is no longer Failed, another vacuum got there first).
+    let (delete_query, delete_binds) =
+        build_vacuum_query(backend, VacuumKind::Completed, true, completed_cutoff);
+    let completed_deleted = execute_binds(&pool, &delete_query, &delete_binds).await?;
+    info!("Deleted {} completed jobs", completed_deleted);
 
-    // Delete failed jobs
-    if failed_count > 0 {
-        let (delete_query, delete_binds) =
-            build_vacuum_query(backend, VacuumKind::Failed, true, failed_cutoff);
-        execute_binds(&pool, &delete_query, &delete_binds).await?;
-        info!("Deleted {} failed jobs", failed_count);
-    }
+    let (delete_query, delete_binds) =
+        build_vacuum_query(backend, VacuumKind::Failed, true, failed_cutoff);
+    let failed_deleted = execute_binds(&pool, &delete_query, &delete_binds).await?;
+    info!("Deleted {} failed jobs", failed_deleted);
 
     println!("✅ Vacuum completed successfully");
-    println!("   Deleted {} completed jobs", completed_count);
-    println!("   Deleted {} failed jobs", failed_count);
+    println!("   Deleted {} completed jobs", completed_deleted);
+    println!("   Deleted {} failed jobs", failed_deleted);
 
-    Ok(())
+    Ok(Some((completed_deleted, failed_deleted)))
 }
 
 async fn cleanup_dead_jobs(
@@ -349,7 +348,7 @@ async fn cleanup_dead_jobs(
     println!("🔍 Dead Jobs Analysis");
     println!("═══════════════════════");
     println!(
-        "Stale running jobs (no update for {} hours): {}",
+        "Stale running jobs (started more than {} hours ago): {}",
         stale_hours, stale_count
     );
 
@@ -776,7 +775,15 @@ mod tests {
         run(&["vacuum"]).await.unwrap(); // refuses without --confirm
         run(&["vacuum", "--dry-run"]).await.unwrap();
         assert_eq!(remaining().await, 5, "neither deletes anything");
-        run(&["vacuum", "--confirm"]).await.unwrap();
+        assert_eq!(
+            vacuum_jobs(pool.clone(), 30, 7, false, true).await.unwrap(),
+            None
+        );
+        // #94: it reports the rows the deletes removed.
+        assert_eq!(
+            vacuum_jobs(pool.clone(), 30, 7, true, false).await.unwrap(),
+            Some((1, 1))
+        );
         assert_eq!(remaining().await, 3);
         for kept in [&new_completed, &new_failed, &pending] {
             assert!(job_column(pool, kept, "status").await.is_some());

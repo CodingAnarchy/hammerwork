@@ -1795,6 +1795,32 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn start_claimed_run(&self, run: &mut Job, lease: std::time::Duration) -> Result<bool> {
+        let started = super::run_started_range(run);
+        let restarted: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "UPDATE hammerwork_jobs SET started_at = now(), last_heartbeat_at = now(), \
+             lease_expires_at = now() + $1 WHERE id = $2 AND status = $3 AND attempts = $4 \
+             AND ($5::timestamptz IS NULL OR (started_at > $5 AND started_at < $6)) \
+             RETURNING started_at",
+        )
+        .bind(super::lease_interval(lease))
+        .bind(run.id)
+        .bind(JobStatus::Running)
+        .bind(run.attempts)
+        .bind(started.map(|(from, _)| from))
+        .bind(started.map(|(_, to)| to))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match restarted {
+            Some(started_at) => {
+                run.started_at = Some(started_at);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn requeue_stale_jobs(
         &self,
         older_than: std::time::Duration,

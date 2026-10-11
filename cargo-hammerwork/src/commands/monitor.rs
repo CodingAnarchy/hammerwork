@@ -269,12 +269,14 @@ pub async fn fetch_dashboard_data(
 }
 
 fn status_icon(status: &str) -> &'static str {
-    match status.to_lowercase().as_str() {
+    match status.trim_matches('"').to_lowercase().as_str() {
         "pending" => "🟡",
         "running" => "🔵",
         "completed" => "🟢",
         "failed" => "🔴",
         "dead" => "💀",
+        "retrying" => "🔁",
+        "timedout" | "timed_out" => "⏰",
         _ => "",
     }
 }
@@ -583,6 +585,25 @@ mod tests {
     struct TestCli {
         #[command(subcommand)]
         command: MonitorCommand,
+    }
+
+    /// #94: every job status has an icon, including `Retrying` and `TimedOut`.
+    #[test]
+    fn every_job_status_has_an_icon() {
+        use hammerwork::JobStatus;
+        for status in [
+            JobStatus::Pending,
+            JobStatus::Running,
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Dead,
+            JobStatus::TimedOut,
+            JobStatus::Retrying,
+        ] {
+            assert_ne!(status_icon(status.as_str()), "", "{status:?}");
+        }
+        assert_eq!(status_icon("\"Retrying\""), status_icon("Retrying"));
+        assert_eq!(status_icon("unknown"), "");
     }
 
     #[test]

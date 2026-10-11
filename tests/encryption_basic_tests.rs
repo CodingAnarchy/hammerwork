@@ -890,29 +890,50 @@ mod vault_kms_integration_tests {
         }
     }
 
+    /// Set in the child process that runs [`test_vault_kms_token_environment_variable`]
+    /// without `VAULT_TOKEN`.
+    const VAULT_CHILD_ENV: &str = "HAMMERWORK_TEST_VAULT_TOKEN_CHILD";
+
+    /// The engine reads `VAULT_TOKEN` from the process environment. Changing it here
+    /// would race with the other tests of this binary, which run in parallel threads of
+    /// the same process (#94), so the test re-runs itself in a child process whose
+    /// environment has no `VAULT_TOKEN`; this process's environment is never modified.
     #[tokio::test]
     async fn test_vault_kms_token_environment_variable() {
-        // Test that the integration properly checks for VAULT_TOKEN environment variable
-        let original_token = std::env::var("VAULT_TOKEN").ok();
-
-        // Clear the token temporarily
-        unsafe {
-            std::env::remove_var("VAULT_TOKEN");
+        if std::env::var_os(VAULT_CHILD_ENV).is_some() {
+            let config =
+                hammerwork::encryption::EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
+                    .with_key_source(KeySource::External(
+                        "vault://secret/test/key?addr=http://127.0.0.1:1".to_string(),
+                    ));
+            // Without a token there is no key; no deterministic fallback (#16).
+            let Err(err) = EncryptionEngine::new(config).await else {
+                panic!("must fail when no VAULT_TOKEN is set");
+            };
+            assert!(err.to_string().contains("VAULT_TOKEN"), "{err}");
+            return;
         }
 
-        let config = hammerwork::encryption::EncryptionConfig::new(EncryptionAlgorithm::AES256GCM)
-            .with_key_source(KeySource::External("vault://secret/test/key".to_string()));
-
-        let result = EncryptionEngine::new(config).await;
-
-        // Without a token (or address) there is no key; no deterministic fallback (#16)
-        assert!(result.is_err(), "Must fail when no VAULT_TOKEN is set");
-
-        // Restore original token if it existed
-        if let Some(token) = original_token {
-            unsafe {
-                std::env::set_var("VAULT_TOKEN", token);
-            }
-        }
+        // `module_path!` starts with the crate name, which the test filter leaves out.
+        let name = format!(
+            "{}::test_vault_kms_token_environment_variable",
+            module_path!().split_once("::").map_or("", |(_, path)| path)
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env_remove("VAULT_TOKEN")
+            .env(VAULT_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child test failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child did not run the test:\n{stdout}"
+        );
     }
 }

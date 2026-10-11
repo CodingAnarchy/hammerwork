@@ -39,7 +39,7 @@ impl MigrationCommand {
                 let db_url = &config.resolve_database_url(database_url.as_deref())?;
 
                 info!("Checking migration status for: {}", redact_url(db_url));
-                check_migration_status(db_url).await?;
+                check_migration_status(db_url, config).await?;
             }
         }
         Ok(())
@@ -102,8 +102,8 @@ pub async fn schema_status(pool: &DatabasePool) -> Result<SchemaStatus> {
     })
 }
 
-async fn check_migration_status(database_url: &str) -> Result<()> {
-    let pool = DatabasePool::connect(database_url, 1).await?;
+async fn check_migration_status(database_url: &str, config: &Config) -> Result<()> {
+    let pool = DatabasePool::connect_with_config(database_url, config).await?;
     let backend = match pool.backend() {
         Backend::Postgres => "PostgreSQL",
         Backend::MySql => "MySQL",
@@ -188,6 +188,26 @@ mod tests {
         assert!(
             err.to_string().contains("Unsupported database URL"),
             "{err}"
+        );
+    }
+
+    /// #94: `migration status` honours `connect_timeout_secs` (default 10s) instead of
+    /// connecting with the default timeout.
+    #[tokio::test]
+    async fn status_uses_the_configured_connect_timeout() {
+        let config = Config {
+            connect_timeout_secs: Some(1),
+            ..Config::default()
+        };
+        let start = std::time::Instant::now();
+        let result = parse(&["status", "-u", "postgres://u:p@10.255.255.1:5432/x"])
+            .execute(&config)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
         );
     }
 

@@ -88,6 +88,89 @@ pub fn unique_queue(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
 
+/// Deletes every job of a queue from a shared test database when dropped, so a test
+/// cleans up after itself even when it fails part-way.
+///
+/// The delete runs on a thread of its own with its own runtime and connection, so it
+/// works from `Drop` under any Tokio runtime flavour, including while a test panics.
+/// Cleanup is best effort: a failure is printed, never raised.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+pub struct QueueCleanup {
+    delete: fn(String, String) -> Result<(), String>,
+    url: String,
+    queue_name: String,
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl QueueCleanup {
+    /// Cleans up `queue_name` in the PostgreSQL test database.
+    #[cfg(feature = "postgres")]
+    pub fn postgres(queue_name: &str) -> Self {
+        Self {
+            delete: |url, queue_name| {
+                block_on_own_runtime(async move {
+                    use sqlx::Connection;
+                    let mut conn = sqlx::PgConnection::connect(&url).await?;
+                    sqlx::query("DELETE FROM hammerwork_jobs WHERE queue_name = $1")
+                        .bind(queue_name)
+                        .execute(&mut conn)
+                        .await?;
+                    Ok(())
+                })
+            },
+            url: postgres_url(),
+            queue_name: queue_name.to_string(),
+        }
+    }
+
+    /// Cleans up `queue_name` in the MySQL test database.
+    #[cfg(feature = "mysql")]
+    pub fn mysql(queue_name: &str) -> Self {
+        Self {
+            delete: |url, queue_name| {
+                block_on_own_runtime(async move {
+                    use sqlx::Connection;
+                    let mut conn = sqlx::MySqlConnection::connect(&url).await?;
+                    sqlx::query("DELETE FROM hammerwork_jobs WHERE queue_name = ?")
+                        .bind(queue_name)
+                        .execute(&mut conn)
+                        .await?;
+                    Ok(())
+                })
+            },
+            url: mysql_url(),
+            queue_name: queue_name.to_string(),
+        }
+    }
+}
+
+/// Runs `future` to completion on a new current-thread runtime (the caller is on a
+/// thread of its own, outside any runtime).
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn block_on_own_runtime(
+    future: impl std::future::Future<Output = Result<(), sqlx::Error>>,
+) -> Result<(), String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(future)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+impl Drop for QueueCleanup {
+    fn drop(&mut self) {
+        let (delete, url, queue_name) = (self.delete, self.url.clone(), self.queue_name.clone());
+        let cleaned = std::thread::spawn(move || delete(url, queue_name)).join();
+        match cleaned {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("cleaning up queue {}: {e}", self.queue_name),
+            Err(_) => eprintln!("cleaning up queue {} panicked", self.queue_name),
+        }
+    }
+}
+
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Serialize database tests within one test binary.

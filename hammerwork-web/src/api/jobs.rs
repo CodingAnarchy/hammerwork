@@ -401,7 +401,7 @@ where
     }
 
     // Sort jobs
-    let ascending = sort.sort_order.as_deref() == Some("asc");
+    let ascending = sort.is_ascending();
     match sort.sort_by.as_deref() {
         Some("scheduled_at") => all_jobs.sort_by_key(|j| j.scheduled_at),
         Some("priority") => all_jobs.sort_by_key(|j| priority_rank(&j.priority)),

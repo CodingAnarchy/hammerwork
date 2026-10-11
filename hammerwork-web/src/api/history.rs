@@ -228,6 +228,26 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
         older_than: Option<DateTime<Utc>>,
     ) -> impl Future<Output = Result<u64>> + Send;
 
+    /// How many jobs [`archive_jobs`](DatabaseQueue::archive_jobs) with `policy` would
+    /// archive now, optionally for one queue: the jobs of each status the policy archives
+    /// that finished longer ago than the policy keeps that status, at most
+    /// `policy.batch_size`, and none when the policy is disabled. Used for dry runs.
+    ///
+    /// The default implementation returns an error, for implementations that predate
+    /// this method.
+    fn count_archivable(
+        &self,
+        queue: Option<&str>,
+        policy: &hammerwork::archive::ArchivalPolicy,
+    ) -> impl Future<Output = Result<u64>> + Send {
+        let _ = (queue, policy);
+        async {
+            Err(hammerwork::HammerworkError::Queue {
+                message: "archive dry runs are not supported by this queue".to_string(),
+            })
+        }
+    }
+
     /// Deletes the jobs [`count_jobs`](Self::count_jobs) counts; returns how many.
     fn delete_jobs(
         &self,
@@ -251,11 +271,64 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
     /// Jobs whose state changed after `since`, newest first, at most `limit`: jobs that
     /// were created, started, completed, failed or timed out since then. Each is reported
     /// with the time of its latest such change. Rows that cannot be decoded are skipped.
+    ///
+    /// A job that goes from `Running` back to `Pending` (a retry, a stale job requeued by
+    /// the reaper, a claimed job released by a batch-mode worker) changes none of those
+    /// timestamps, so it is not reported here. The live-update poller
+    /// ([`LiveUpdates`](crate::live::LiveUpdates)) reports those transitions by tracking
+    /// the [running jobs](Self::running_jobs) and reading the [state](Self::job_states)
+    /// of the ones that stopped running.
     fn recent_job_changes(
         &self,
         since: DateTime<Utc>,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send;
+
+    /// The jobs that are `Running` now, most recently started first, at most `limit`,
+    /// each with its start time. Rows that cannot be decoded are skipped.
+    ///
+    /// The default implementation returns none, for implementations that predate this
+    /// method; live updates then miss `Running` to `Pending` transitions.
+    fn running_jobs(&self, limit: u32) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send {
+        let _ = limit;
+        async { Ok(Vec::new()) }
+    }
+
+    /// The current state of the jobs `ids` (UUIDs) that still exist, each with the time
+    /// of its latest change as in [`recent_job_changes`](Self::recent_job_changes). Ids
+    /// that are not UUIDs, jobs that no longer exist and rows that cannot be decoded are
+    /// left out.
+    ///
+    /// The default implementation reads the jobs one at a time with
+    /// [`DatabaseQueue::get_job`].
+    fn job_states(&self, ids: &[String]) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send {
+        let ids: Vec<uuid::Uuid> = ids.iter().filter_map(|id| id.parse().ok()).collect();
+        async move {
+            let mut states = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(job) = self.get_job(id).await? {
+                    let changed_at = [
+                        job.started_at,
+                        job.completed_at,
+                        job.failed_at,
+                        job.timed_out_at,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .fold(job.created_at, DateTime::max);
+                    states.push(job_change(
+                        id.to_string(),
+                        job.queue_name,
+                        job.status.as_str(),
+                        job.priority.as_i32(),
+                        job.attempts,
+                        changed_at,
+                    ));
+                }
+            }
+            Ok(states)
+        }
+    }
 
     /// Runs `operation` on each of `tables` (entries of [`HAMMERWORK_TABLES`]) that
     /// exists, one statement per table, and returns what ran. With `dry_run` nothing is
@@ -308,6 +381,120 @@ fn job_change(
         attempts,
         updated_at: changed_at,
     }
+}
+
+/// The statuses an archival policy archives, each with the timestamp its age is measured
+/// from and the policy's age for it (as `archive_jobs` selects them).
+fn archivable_statuses(
+    policy: &hammerwork::archive::ArchivalPolicy,
+) -> [(Option<Duration>, &'static str, &'static str); 4] {
+    [
+        (policy.archive_completed_after, "Completed", "completed_at"),
+        (policy.archive_failed_after, "Failed", "failed_at"),
+        (policy.archive_dead_after, "Dead", "failed_at"),
+        (policy.archive_timed_out_after, "TimedOut", "timed_out_at"),
+    ]
+}
+
+/// The count query of [`JobHistory::count_archivable`] and the cutoffs to bind after the
+/// queue name (when `queue`), or `None` when the policy archives nothing.
+fn archivable_count_query(
+    policy: &hammerwork::archive::ArchivalPolicy,
+    queue: bool,
+    now: DateTime<Utc>,
+    postgres: bool,
+) -> Option<(String, Vec<DateTime<Utc>>)> {
+    if !policy.enabled || policy.batch_size == 0 {
+        return None;
+    }
+    let mut param = 0;
+    let mut placeholder = || {
+        param += 1;
+        if postgres {
+            format!("${param}")
+        } else {
+            "?".to_string()
+        }
+    };
+    let queue_filter = if queue {
+        format!(" AND queue_name = {}", placeholder())
+    } else {
+        String::new()
+    };
+    let mut conditions = Vec::new();
+    let mut cutoffs = Vec::new();
+    for (after, status, column) in archivable_statuses(policy) {
+        if let Some(after) = after {
+            conditions.push(format!(
+                "(status = '{status}' AND {column} IS NOT NULL AND {column} <= {})",
+                placeholder()
+            ));
+            cutoffs.push(now - after);
+        }
+    }
+    if conditions.is_empty() {
+        return None;
+    }
+    Some((
+        format!(
+            "SELECT COUNT(*) FROM (SELECT id FROM hammerwork_jobs WHERE archived_at IS NULL{} \
+             AND ({}) LIMIT {}) candidates",
+            queue_filter,
+            conditions.join(" OR "),
+            policy.batch_size
+        ),
+        cutoffs,
+    ))
+}
+
+/// The time of a job's latest change on MySQL, where `GREATEST` is NULL if any argument
+/// is, so missing timestamps fall back to `created_at`.
+fn mysql_latest_change() -> String {
+    let latest = CHANGE_COLUMNS
+        .iter()
+        .map(|column| format!("COALESCE({column}, created_at)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("CAST(GREATEST({latest}) AS DATETIME(6))")
+}
+
+/// Job changes from PostgreSQL rows of `id, queue_name, status, priority, attempts,
+/// changed_at`, skipping rows that cannot be decoded.
+fn pg_job_changes(rows: &[sqlx::postgres::PgRow]) -> Vec<JobUpdate> {
+    decodable(rows.iter().map(|row| {
+        let id = row.try_get::<uuid::Uuid, _>("id");
+        let label = id.as_ref().map(|id| id.to_string()).unwrap_or_default();
+        let change = id.map_err(Into::into).and_then(|id| {
+            Ok(job_change(
+                id.to_string(),
+                row.try_get("queue_name")?,
+                &row.try_get::<String, _>("status")?,
+                row.try_get("priority")?,
+                row.try_get("attempts")?,
+                row.try_get("changed_at")?,
+            ))
+        });
+        (label, change)
+    }))
+}
+
+/// Job changes from MySQL rows of `id, queue_name, status, priority, attempts,
+/// changed_at`, skipping rows that cannot be decoded.
+fn mysql_job_changes(rows: &[sqlx::mysql::MySqlRow]) -> Vec<JobUpdate> {
+    decodable(rows.iter().map(|row| {
+        let label = row.try_get::<String, _>("id").unwrap_or_default();
+        let change = (|| {
+            Ok(job_change(
+                row.try_get("id")?,
+                row.try_get("queue_name")?,
+                &row.try_get::<String, _>("status")?,
+                row.try_get("priority")?,
+                row.try_get("attempts")?,
+                row.try_get("changed_at")?,
+            ))
+        })();
+        (label, change)
+    }))
 }
 
 /// A value bound to an archive filter placeholder.
@@ -575,6 +762,26 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
         Ok(to_u64(q.fetch_one(&self.pool).await?))
     }
 
+    async fn count_archivable(
+        &self,
+        queue: Option<&str>,
+        policy: &hammerwork::archive::ArchivalPolicy,
+    ) -> Result<u64> {
+        let Some((sql, cutoffs)) =
+            archivable_count_query(policy, queue.is_some(), Utc::now(), true)
+        else {
+            return Ok(0);
+        };
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(name) = queue {
+            q = q.bind(name.to_string());
+        }
+        for cutoff in cutoffs {
+            q = q.bind(cutoff);
+        }
+        Ok(to_u64(q.fetch_one(&self.pool).await?))
+    }
+
     async fn delete_jobs(
         &self,
         queue: Option<&str>,
@@ -649,21 +856,33 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
             .bind(i64::from(limit))
             .fetch_all(&self.pool)
             .await?;
-        Ok(decodable(rows.iter().map(|row| {
-            let id = row.try_get::<uuid::Uuid, _>("id");
-            let label = id.as_ref().map(|id| id.to_string()).unwrap_or_default();
-            let change = id.map_err(Into::into).and_then(|id| {
-                Ok(job_change(
-                    id.to_string(),
-                    row.try_get("queue_name")?,
-                    &row.try_get::<String, _>("status")?,
-                    row.try_get("priority")?,
-                    row.try_get("attempts")?,
-                    row.try_get("changed_at")?,
-                ))
-            });
-            (label, change)
-        })))
+        Ok(pg_job_changes(&rows))
+    }
+
+    async fn running_jobs(&self, limit: u32) -> Result<Vec<JobUpdate>> {
+        let rows = sqlx::query(
+            "SELECT id, queue_name, status, priority, attempts, \
+             COALESCE(started_at, created_at) AS changed_at FROM hammerwork_jobs \
+             WHERE status = 'Running' ORDER BY started_at DESC LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(pg_job_changes(&rows))
+    }
+
+    async fn job_states(&self, ids: &[String]) -> Result<Vec<JobUpdate>> {
+        let ids: Vec<uuid::Uuid> = ids.iter().filter_map(|id| id.parse().ok()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, queue_name, status, priority, attempts, GREATEST({}) AS changed_at \
+             FROM hammerwork_jobs WHERE id = ANY($1)",
+            CHANGE_COLUMNS.join(", ")
+        );
+        let rows = sqlx::query(&sql).bind(&ids).fetch_all(&self.pool).await?;
+        Ok(pg_job_changes(&rows))
     }
 
     async fn table_maintenance(
@@ -806,6 +1025,26 @@ impl JobHistory for JobQueue<sqlx::MySql> {
         Ok(to_u64(q.fetch_one(&self.pool).await?))
     }
 
+    async fn count_archivable(
+        &self,
+        queue: Option<&str>,
+        policy: &hammerwork::archive::ArchivalPolicy,
+    ) -> Result<u64> {
+        let Some((sql, cutoffs)) =
+            archivable_count_query(policy, queue.is_some(), Utc::now(), false)
+        else {
+            return Ok(0);
+        };
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(name) = queue {
+            q = q.bind(name.to_string());
+        }
+        for cutoff in cutoffs {
+            q = q.bind(cutoff);
+        }
+        Ok(to_u64(q.fetch_one(&self.pool).await?))
+    }
+
     async fn delete_jobs(
         &self,
         queue: Option<&str>,
@@ -863,17 +1102,10 @@ impl JobHistory for JobQueue<sqlx::MySql> {
     }
 
     async fn recent_job_changes(&self, since: DateTime<Utc>, limit: u32) -> Result<Vec<JobUpdate>> {
-        // GREATEST is NULL if any argument is on MySQL, so missing timestamps fall back to
-        // `created_at`.
-        let latest = CHANGE_COLUMNS
-            .iter()
-            .map(|column| format!("COALESCE({column}, created_at)"))
-            .collect::<Vec<_>>()
-            .join(", ");
         let sql = format!(
-            "SELECT id, queue_name, status, priority, attempts, \
-             CAST(GREATEST({latest}) AS DATETIME(6)) AS changed_at \
+            "SELECT id, queue_name, status, priority, attempts, {} AS changed_at \
              FROM hammerwork_jobs WHERE {} ORDER BY changed_at DESC LIMIT ?",
+            mysql_latest_change(),
             changed_since_filter(false)
         );
         let mut query = sqlx::query(&sql);
@@ -881,20 +1113,42 @@ impl JobHistory for JobQueue<sqlx::MySql> {
             query = query.bind(since);
         }
         let rows = query.bind(i64::from(limit)).fetch_all(&self.pool).await?;
-        Ok(decodable(rows.iter().map(|row| {
-            let label = row.try_get::<String, _>("id").unwrap_or_default();
-            let change = (|| {
-                Ok(job_change(
-                    row.try_get("id")?,
-                    row.try_get("queue_name")?,
-                    &row.try_get::<String, _>("status")?,
-                    row.try_get("priority")?,
-                    row.try_get("attempts")?,
-                    row.try_get("changed_at")?,
-                ))
-            })();
-            (label, change)
-        })))
+        Ok(mysql_job_changes(&rows))
+    }
+
+    async fn running_jobs(&self, limit: u32) -> Result<Vec<JobUpdate>> {
+        let rows = sqlx::query(
+            "SELECT id, queue_name, status, priority, attempts, \
+             CAST(COALESCE(started_at, created_at) AS DATETIME(6)) AS changed_at \
+             FROM hammerwork_jobs WHERE status = 'Running' ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(mysql_job_changes(&rows))
+    }
+
+    async fn job_states(&self, ids: &[String]) -> Result<Vec<JobUpdate>> {
+        let ids: Vec<String> = ids
+            .iter()
+            .filter_map(|id| id.parse::<uuid::Uuid>().ok())
+            .map(|id| id.to_string())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, queue_name, status, priority, attempts, {} AS changed_at \
+             FROM hammerwork_jobs WHERE id IN ({})",
+            mysql_latest_change(),
+            vec!["?"; ids.len()].join(", ")
+        );
+        let mut query = sqlx::query(&sql);
+        for id in &ids {
+            query = query.bind(id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(mysql_job_changes(&rows))
     }
     async fn table_maintenance(
         &self,
@@ -992,6 +1246,43 @@ mod tests {
              OR timed_out_at > $1"
         );
         assert!(changed_since_filter(false).starts_with("created_at > ? OR started_at > ?"));
+    }
+
+    /// #94: an archive dry run counts what `archive_jobs` would select.
+    #[test]
+    fn archivable_count_query_mirrors_the_archiver() {
+        use hammerwork::archive::ArchivalPolicy;
+        let now = Utc::now();
+        let policy = ArchivalPolicy::new()
+            .archive_completed_after(Duration::days(1))
+            .with_batch_size(50);
+        let (sql, cutoffs) = archivable_count_query(&policy, true, now, true).unwrap();
+        assert!(
+            sql.contains("archived_at IS NULL AND queue_name = $1"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "(status = 'Completed' AND completed_at IS NOT NULL AND completed_at <= $2)"
+            ),
+            "{sql}"
+        );
+        assert!(sql.ends_with("LIMIT 50) candidates"), "{sql}");
+        assert_eq!(cutoffs.len(), 4, "every status of the default policy");
+        assert_eq!(cutoffs[0], now - Duration::days(1));
+
+        let (sql, _) = archivable_count_query(&policy, false, now, false).unwrap();
+        assert!(!sql.contains('$') && !sql.contains("queue_name"), "{sql}");
+
+        let mut disabled = policy.clone();
+        disabled.enabled = false;
+        assert!(archivable_count_query(&disabled, false, now, true).is_none());
+        let mut nothing = ArchivalPolicy::new();
+        nothing.archive_completed_after = None;
+        nothing.archive_failed_after = None;
+        nothing.archive_dead_after = None;
+        nothing.archive_timed_out_after = None;
+        assert!(archivable_count_query(&nothing, false, now, true).is_none());
     }
 
     #[test]

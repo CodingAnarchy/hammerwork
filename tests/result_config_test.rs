@@ -22,6 +22,7 @@ async fn test_postgres_result_config_persistence() {
         max_size_bytes: Some(1024),
     };
     let queue_name = format!("test_result_config_{}", uuid::Uuid::new_v4());
+    let _cleanup = test_utils::QueueCleanup::postgres(&queue_name);
     let job = Job::new(queue_name.clone(), json!({"task": "test"})).with_result_config(config);
 
     // Enqueue the job
@@ -54,6 +55,7 @@ async fn test_mysql_result_config_persistence() {
         max_size_bytes: Some(2048),
     };
     let queue_name = format!("test_result_config_mysql_{}", uuid::Uuid::new_v4());
+    let _cleanup = test_utils::QueueCleanup::mysql(&queue_name);
     let job = Job::new(queue_name.clone(), json!({"task": "test"})).with_result_config(config);
 
     // Enqueue the job
