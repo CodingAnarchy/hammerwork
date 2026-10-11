@@ -68,7 +68,7 @@ use warp::{Filter, Reply};
 ///
 /// State-changing API requests and WebSocket handshakes that a browser sends from a page on
 /// another origin than the dashboard's own or one of `allowed_origins` are refused with 403
-/// (see [`crate::security`]).
+/// (the `security` module).
 pub fn app_routes<Q>(
     queue: Arc<Q>,
     auth_state: AuthState,
@@ -176,7 +176,7 @@ impl WebDashboard {
     /// For a dashboard embedded in the same process as the workers that publish to
     /// `event_manager`. Without it (and in the standalone binary) the dashboard still
     /// pushes job and queue changes, by polling the database every
-    /// `websocket.live_update_interval`; see [`crate::live`].
+    /// `websocket.live_update_interval`; see the `live` module.
     pub fn with_event_manager(
         mut self,
         event_manager: Arc<hammerwork::events::EventManager>,

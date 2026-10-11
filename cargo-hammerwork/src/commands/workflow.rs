@@ -590,6 +590,7 @@ impl WorkflowCommand {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn print_json_graph(&self, jobs: &[JobNode]) -> Result<()> {
         println!("{}", render_json_graph(jobs)?);
         Ok(())

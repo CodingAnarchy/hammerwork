@@ -15,7 +15,7 @@
 //!   [`MAX_JSON_BODY_BYTES`] of them.
 //!
 //! ```rust
-//! use hammerwork_web::security::{AllowedOrigins, normalize_origin};
+//! use hammerwork_web::__private::security::{AllowedOrigins, normalize_origin};
 //!
 //! assert_eq!(
 //!     normalize_origin("https://Ops.Example.com/").as_deref(),

@@ -217,11 +217,11 @@ run_tests() {
     export MYSQL_DATABASE_URL="mysql://root:${MYSQL_PASSWORD}@localhost:${MYSQL_PORT}/${DB_NAME}"
     
     print_status "Running PostgreSQL integration tests..."
-    cargo test -p cargo-hammerwork --test sql_query_tests postgres_tests -- --ignored
+    cargo test -p cargo-hammerwork --bins -- sql_query::postgres_tests --ignored
     
     if docker ps --format '{{.Names}}' | grep -q "^${MYSQL_CONTAINER}$"; then
         print_status "Running MySQL integration tests..."
-        cargo test -p cargo-hammerwork --test sql_query_tests mysql_tests -- --ignored
+        cargo test -p cargo-hammerwork --bins -- sql_query::mysql_tests --ignored
     else
         print_warning "MySQL container not running, skipping MySQL tests"
     fi

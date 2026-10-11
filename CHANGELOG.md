@@ -36,6 +36,8 @@ See [Upgrading from 2.x to 3.0](docs/upgrading-to-3.0.md) for what to change.
 - CI checks the feature combinations `full`, `postgres,full`, `mysql,full` and `test-queue`.
 - The library no longer depends on the `rsa` crate (RUSTSEC-2023-0071), which sqlx 0.9
   made optional. It stays in the lockfile only through the CLI and dashboard binaries.
+- **`cargo-hammerwork` is a binary only** ([#88](https://github.com/CodingAnarchy/hammerwork/issues/88)). The crate no longer has a library target: `cargo_hammerwork::commands`, `cargo_hammerwork::config`, `cargo_hammerwork::utils` and their glob re-exports are gone. Drive the CLI through the `cargo hammerwork` executable.
+- **`hammerwork-web` exposes only `WebDashboard`, `DashboardConfig`, `AuthConfig` and `WebSocketConfig`** ([#88](https://github.com/CodingAnarchy/hammerwork/issues/88)). The `api`, `auth`, `config`, `live`, `security`, `server` and `websocket` modules are private, so `hammerwork_web::server::app_routes` and the other building blocks are no longer public API. `WebSocketConfig` is now re-exported at the crate root (it was `hammerwork_web::config::WebSocketConfig`).
 
 ## [2.5.0] - 2026-10-11
 

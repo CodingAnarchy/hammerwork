@@ -17,7 +17,7 @@
 //! ## Archive Jobs
 //!
 //! ```rust
-//! use hammerwork_web::api::archive::{ArchiveRequest, ArchiveResponse};
+//! use hammerwork_web::__private::api::archive::{ArchiveRequest, ArchiveResponse};
 //! use hammerwork::archive::{ArchivalReason, ArchivalPolicy};
 //! use chrono::Duration;
 //!
@@ -39,7 +39,7 @@
 //! ## List Archived Jobs
 //!
 //! ```rust
-//! use hammerwork_web::api::archive::ArchivedJobInfo;
+//! use hammerwork_web::__private::api::archive::ArchivedJobInfo;
 //! use hammerwork::archive::{ArchivalReason, ArchivedJob};
 //! use hammerwork::{JobId, JobStatus};
 //! use chrono::Utc;

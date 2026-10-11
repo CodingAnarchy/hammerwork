@@ -8,7 +8,7 @@
 //! ## Basic Configuration
 //!
 //! ```rust
-//! use hammerwork_web::config::DashboardConfig;
+//! use hammerwork_web::__private::config::DashboardConfig;
 //!
 //! let config = DashboardConfig::new()
 //!     .with_bind_address("127.0.0.1", 8080)
@@ -20,7 +20,7 @@
 //! ## Configuration with Authentication
 //!
 //! ```rust
-//! use hammerwork_web::config::{DashboardConfig, AuthConfig};
+//! use hammerwork_web::__private::config::{DashboardConfig, AuthConfig};
 //! use std::time::Duration;
 //!
 //! let config = DashboardConfig::new()
@@ -35,7 +35,7 @@
 //! ## Loading from File
 //!
 //! ```rust,no_run
-//! use hammerwork_web::config::DashboardConfig;
+//! use hammerwork_web::__private::config::DashboardConfig;
 //!
 //! // Create a configuration file (dashboard.toml)
 //! let config_content = r#"
@@ -73,7 +73,7 @@ use std::time::Duration;
 /// # Examples
 ///
 /// ```rust
-/// use hammerwork_web::config::DashboardConfig;
+/// use hammerwork_web::__private::config::DashboardConfig;
 /// use std::path::PathBuf;
 ///
 /// // Create with defaults
@@ -124,7 +124,7 @@ pub struct DashboardConfig {
     /// Origins other than the dashboard's own (`scheme://host[:port]`) that may send
     /// state-changing requests and WebSocket connections, and, with
     /// [`enable_cors`](Self::enable_cors), read API responses. Browsers on any other origin
-    /// are refused (see [`crate::security`]).
+    /// are refused (the `security` module).
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 }
@@ -151,7 +151,7 @@ impl DashboardConfig {
     /// # Examples
     ///
     /// ```rust
-    /// use hammerwork_web::config::DashboardConfig;
+    /// use hammerwork_web::__private::config::DashboardConfig;
     ///
     /// let config = DashboardConfig::new();
     /// assert_eq!(config.bind_address, "127.0.0.1");
@@ -167,7 +167,7 @@ impl DashboardConfig {
     /// # Examples
     ///
     /// ```rust
-    /// use hammerwork_web::config::DashboardConfig;
+    /// use hammerwork_web::__private::config::DashboardConfig;
     ///
     /// let config = DashboardConfig::new()
     ///     .with_bind_address("0.0.0.0", 9090);
@@ -189,7 +189,7 @@ impl DashboardConfig {
     /// # Examples
     ///
     /// ```rust
-    /// use hammerwork_web::config::DashboardConfig;
+    /// use hammerwork_web::__private::config::DashboardConfig;
     ///
     /// // PostgreSQL
     /// let pg_config = DashboardConfig::new()
@@ -211,7 +211,7 @@ impl DashboardConfig {
     /// # Examples
     ///
     /// ```rust
-    /// use hammerwork_web::config::DashboardConfig;
+    /// use hammerwork_web::__private::config::DashboardConfig;
     /// use std::path::PathBuf;
     ///
     /// let config = DashboardConfig::new()
@@ -232,7 +232,7 @@ impl DashboardConfig {
     /// # Examples
     ///
     /// ```rust
-    /// use hammerwork_web::config::DashboardConfig;
+    /// use hammerwork_web::__private::config::DashboardConfig;
     ///
     /// let config = DashboardConfig::new()
     ///     .with_auth("admin", "$2b$12$hash...");
@@ -256,7 +256,7 @@ impl DashboardConfig {
     /// # Examples
     ///
     /// ```rust
-    /// use hammerwork_web::config::DashboardConfig;
+    /// use hammerwork_web::__private::config::DashboardConfig;
     ///
     /// let config = DashboardConfig::new()
     ///     .with_cors(true)
@@ -354,7 +354,7 @@ impl DashboardConfig {
 /// # Examples
 ///
 /// ```rust
-/// use hammerwork_web::config::AuthConfig;
+/// use hammerwork_web::__private::config::AuthConfig;
 /// use std::time::Duration;
 ///
 /// // Default configuration (authentication enabled)

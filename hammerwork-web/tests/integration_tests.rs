@@ -229,7 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_websocket_config_validation() {
-        use hammerwork_web::config::WebSocketConfig;
+        use hammerwork_web::__private::config::WebSocketConfig;
 
         let ws_config = WebSocketConfig {
             ping_interval: Duration::from_secs(10),
@@ -291,8 +291,8 @@ mod websocket_archive_tests {
     use super::*;
     use chrono::Utc;
     use hammerwork::archive::{ArchivalReason, ArchivalStats, ArchiveEvent};
-    use hammerwork_web::config::WebSocketConfig;
-    use hammerwork_web::websocket::{BroadcastMessage, WebSocketState};
+    use hammerwork_web::__private::config::WebSocketConfig;
+    use hammerwork_web::__private::websocket::{BroadcastMessage, WebSocketState};
     use uuid::Uuid;
 
     #[tokio::test]

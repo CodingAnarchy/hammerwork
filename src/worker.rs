@@ -466,7 +466,7 @@ impl Default for JobResult {
 pub enum JobHandlerType {
     /// Original handler type that returns Result<()>
     Legacy(JobHandler),
-    /// Enhanced handler type that returns Result<JobResult> with optional data
+    /// Enhanced handler type that returns `Result<JobResult>` with optional data
     WithResult(JobHandlerWithResult),
 }
 
@@ -1131,7 +1131,7 @@ where
     /// Applies `worker` (see [`with_config`](Self::with_config)), the throttle from
     /// `rate_limiting` that matches this worker's queue, and `alerting` (when the
     /// `alerting` feature is enabled). Events are not applied here because the
-    /// [`EventManager`](crate::events::EventManager) must be shared with any webhook or
+    /// [`EventManager`] must be shared with any webhook or
     /// stream managers: build it once with `EventManager::new(config.events.clone())`
     /// and pass it to [`with_event_manager`](Self::with_event_manager).
     ///

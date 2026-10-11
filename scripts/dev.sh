@@ -45,12 +45,12 @@ test() {
     
     # CLI unit tests
     print_status "Running CLI unit tests..."
-    cargo test -p cargo-hammerwork --lib
+    cargo test -p cargo-hammerwork --bins
     
     # CLI integration tests (non-database)
     print_status "Running CLI integration tests..."
     cargo test -p cargo-hammerwork --test integration_tests
-    cargo test -p cargo-hammerwork --test sql_query_tests unit_tests error_handling_tests
+    cargo test -p cargo-hammerwork --bins -- sql_query::unit_tests sql_query::error_handling_tests
     
     print_success "All tests completed"
 }

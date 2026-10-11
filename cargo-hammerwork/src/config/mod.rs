@@ -18,7 +18,7 @@
 //!
 //! ## Loading Configuration
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use cargo_hammerwork::config::Config;
 //!
 //! // Load configuration from file and environment
@@ -35,7 +35,7 @@
 //!
 //! ## Creating and Saving Configuration
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use cargo_hammerwork::config::Config;
 //!
 //! // Create a new configuration with custom values
@@ -51,7 +51,7 @@
 //!
 //! ## Environment Variable Override
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use std::env;
 //! use cargo_hammerwork::config::Config;
 //!
@@ -107,7 +107,7 @@ use std::path::{Path, PathBuf};
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cargo_hammerwork::config::Config;
 ///
 /// // Create configuration with defaults
@@ -191,17 +191,18 @@ impl Config {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use cargo_hammerwork::config::Config;
     ///
     /// let config = Config::load().expect("Failed to load configuration");
     /// println!("Database URL: {:?}", config.database_url);
     /// ```
+    #[cfg(test)]
     pub fn load() -> Result<Self> {
         Self::load_with(|key| env::var(key).ok())
     }
 
-    /// [`Config::load`] reading environment variables through `get`.
+    /// `Config::load` reading environment variables through `get`.
     ///
     /// A missing config file means defaults; a file that exists but cannot be read or parsed
     /// is an error, so a typo in `config.toml` is reported instead of silently ignored.
@@ -212,7 +213,7 @@ impl Config {
         Ok(config)
     }
 
-    /// [`Config::load`], or, when the config file cannot be read or parsed, the defaults
+    /// `Config::load`, or, when the config file cannot be read or parsed, the defaults
     /// with the environment variables applied, together with the error. A broken
     /// `config.toml` must not also drop `DATABASE_URL` and the `HAMMERWORK_*` variables,
     /// which take precedence over the file.
@@ -316,13 +317,14 @@ impl Config {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use cargo_hammerwork::config::Config;
     ///
     /// let mut config = Config::default();
     /// config.database_url = Some("postgresql://localhost/hammerwork".to_string());
     /// config.save().expect("Failed to save configuration");
     /// ```
+    #[cfg(test)]
     pub fn save(&self) -> Result<()> {
         self.save_to(&Self::config_file_path()?)
     }

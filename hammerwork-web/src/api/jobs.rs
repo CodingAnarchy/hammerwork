@@ -17,7 +17,7 @@
 //! ## Creating a Job
 //!
 //! ```rust
-//! use hammerwork_web::api::jobs::CreateJobRequest;
+//! use hammerwork_web::__private::api::jobs::CreateJobRequest;
 //! use serde_json::json;
 //!
 //! let create_request = CreateJobRequest {
@@ -44,7 +44,7 @@
 //! ## Job Actions
 //!
 //! ```rust
-//! use hammerwork_web::api::jobs::JobActionRequest;
+//! use hammerwork_web::__private::api::jobs::JobActionRequest;
 //!
 //! let retry_request = JobActionRequest {
 //!     action: "retry".to_string(),
@@ -63,7 +63,7 @@
 //! ## Bulk Operations
 //!
 //! ```rust
-//! use hammerwork_web::api::jobs::BulkJobActionRequest;
+//! use hammerwork_web::__private::api::jobs::BulkJobActionRequest;
 //!
 //! let bulk_delete = BulkJobActionRequest {
 //!     job_ids: vec![

@@ -101,16 +101,45 @@ compile_error!(
     "hammerwork-web needs a database backend: enable the `postgres` (default) and/or `mysql` feature"
 );
 
-pub mod api;
-pub mod auth;
-pub mod config;
-pub mod live;
-pub mod security;
-pub mod server;
-pub mod websocket;
+mod api;
+mod auth;
+mod config;
+mod live;
+mod security;
+mod server;
+mod websocket;
 
-pub use config::{AuthConfig, DashboardConfig};
+pub use config::{AuthConfig, DashboardConfig, WebSocketConfig};
 pub use server::WebDashboard;
+
+/// Internals re-exported for this crate's own integration tests and doc examples.
+///
+/// Not part of the public API: it is hidden from the documentation and may change in any
+/// release, including patch releases.
+#[doc(hidden)]
+pub mod __private {
+    pub mod api {
+        pub use crate::api::*;
+    }
+    pub mod auth {
+        pub use crate::auth::*;
+    }
+    pub mod config {
+        pub use crate::config::*;
+    }
+    pub mod live {
+        pub use crate::live::*;
+    }
+    pub mod security {
+        pub use crate::security::*;
+    }
+    pub mod server {
+        pub use crate::server::*;
+    }
+    pub mod websocket {
+        pub use crate::websocket::*;
+    }
+}
 
 /// Result type alias for consistent error handling
 pub type Result<T> = std::result::Result<T, anyhow::Error>;

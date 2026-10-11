@@ -7,7 +7,7 @@
 //!
 //! ## Creating a Job Table
 //!
-//! ```rust
+//! ```rust,ignore
 //! use cargo_hammerwork::utils::display::JobTable;
 //!
 //! let mut table = JobTable::new();
@@ -27,7 +27,7 @@
 //!
 //! ## Creating a Statistics Table
 //!
-//! ```rust
+//! ```rust,ignore
 //! use cargo_hammerwork::utils::display::StatsTable;
 //!
 //! let mut stats = StatsTable::new();
@@ -40,7 +40,7 @@
 //!
 //! ## Formatting Helpers
 //!
-//! ```rust
+//! ```rust,ignore
 //! use cargo_hammerwork::utils::display::{format_duration, format_size};
 //!
 //! // Format durations
@@ -73,7 +73,7 @@ pub fn create_table() -> Table {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cargo_hammerwork::utils::display::JobTable;
 ///
 /// let mut table = JobTable::new();
@@ -189,7 +189,7 @@ impl fmt::Display for JobTable {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cargo_hammerwork::utils::display::StatsTable;
 ///
 /// let mut stats = StatsTable::new();
@@ -254,7 +254,7 @@ impl fmt::Display for StatsTable {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cargo_hammerwork::utils::display::format_duration;
 ///
 /// assert_eq!(format_duration(Some(30)), "30s");
@@ -263,6 +263,7 @@ impl fmt::Display for StatsTable {
 /// assert_eq!(format_duration(Some(7200)), "2h 0m");
 /// assert_eq!(format_duration(None), "N/A");
 /// ```
+#[cfg(test)]
 pub fn format_duration(seconds: Option<i64>) -> String {
     match seconds {
         Some(secs) if secs < 60 => format!("{}s", secs),
@@ -276,7 +277,7 @@ pub fn format_duration(seconds: Option<i64>) -> String {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cargo_hammerwork::utils::display::format_size;
 ///
 /// assert_eq!(format_size(Some(100)), "100B");
@@ -286,6 +287,7 @@ pub fn format_duration(seconds: Option<i64>) -> String {
 /// assert_eq!(format_size(Some(1073741824)), "1.0GB");
 /// assert_eq!(format_size(None), "N/A");
 /// ```
+#[cfg(test)]
 pub fn format_size(bytes: Option<i64>) -> String {
     match bytes {
         Some(b) if b < 1024 => format!("{}B", b),
@@ -310,6 +312,17 @@ mod tests {
         assert_eq!(format_duration(Some(3600)), "1h 0m");
         assert_eq!(format_duration(Some(7260)), "2h 1m");
         assert_eq!(format_duration(None), "N/A");
+    }
+
+    #[test]
+    fn formatters_handle_the_documented_examples() {
+        assert_eq!(format_duration(Some(30)), "30s");
+        assert_eq!(format_duration(Some(90)), "1m 30s");
+        assert_eq!(format_duration(Some(3661)), "1h 1m");
+        assert_eq!(format_duration(Some(7200)), "2h 0m");
+        assert_eq!(format_size(Some(100)), "100B");
+        assert_eq!(format_size(Some(2048)), "2.0KB");
+        assert_eq!(format_size(Some(1_073_741_824)), "1.0GB");
     }
 
     #[test]
