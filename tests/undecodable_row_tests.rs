@@ -332,3 +332,85 @@ async fn mysql_undecodable_rows_do_not_block_claims() {
         .unwrap();
     undecodable_rows_do_not_block_claims(queue.as_ref(), mysql_sql(pool)).await;
 }
+
+/// A job whose row cannot be decoded does not stop the archiver: the healthy jobs of the
+/// pass are archived and the corrupt row is skipped (and left in `hammerwork_jobs`),
+/// instead of the whole pass failing and rolling back on every run.
+async fn undecodable_rows_do_not_block_archival<Q, S, F>(queue: &Q, sql: S)
+where
+    Q: DatabaseQueue + Send + Sync,
+    S: Fn(String) -> F,
+    F: Future<Output = ()>,
+{
+    let name = test_utils::unique_queue("undecodable_archiver");
+    // The corrupt job is the oldest, so it comes first in the archiver's batch.
+    let bad = queue
+        .enqueue(Job::new(name.clone(), json!({})))
+        .await
+        .unwrap();
+    let healthy = queue
+        .enqueue(Job::new(name.clone(), json!({})))
+        .await
+        .unwrap();
+    for id in [bad, healthy] {
+        queue.complete_job(id).await.unwrap();
+    }
+    sql(format!(
+        "UPDATE hammerwork_jobs SET timeout_seconds = -1 WHERE id = '{bad}'"
+    ))
+    .await;
+
+    let policy = ArchivalPolicy::new()
+        .archive_completed_after(Duration::seconds(0))
+        .enabled(true);
+    let stats = queue
+        .archive_jobs(
+            Some(&name),
+            &policy,
+            &ArchivalConfig::new(),
+            ArchivalReason::Automatic,
+            None,
+        )
+        .await
+        .expect("an undecodable row must not fail the archiver");
+    assert_eq!(stats.jobs_archived, 1);
+    let archived = queue
+        .list_archived_jobs(Some(&name), Some(10), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        archived.iter().map(|job| job.id).collect::<Vec<_>>(),
+        vec![healthy]
+    );
+
+    sql(format!(
+        "DELETE FROM hammerwork_jobs WHERE queue_name = '{name}'"
+    ))
+    .await;
+    sql(format!(
+        "DELETE FROM hammerwork_jobs_archive WHERE queue_name = '{name}'"
+    ))
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+#[ignore = "requires PostgreSQL: DATABASE_URL"]
+async fn postgres_undecodable_rows_do_not_block_archival() {
+    let queue = test_utils::setup_postgres_queue().await;
+    let pool = sqlx::PgPool::connect(&test_utils::postgres_url())
+        .await
+        .unwrap();
+    undecodable_rows_do_not_block_archival(queue.as_ref(), postgres_sql(pool)).await;
+}
+
+#[cfg(feature = "mysql")]
+#[tokio::test]
+#[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+async fn mysql_undecodable_rows_do_not_block_archival() {
+    let queue = test_utils::setup_mysql_queue().await;
+    let pool = sqlx::MySqlPool::connect(&test_utils::mysql_url())
+        .await
+        .unwrap();
+    undecodable_rows_do_not_block_archival(queue.as_ref(), mysql_sql(pool)).await;
+}

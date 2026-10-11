@@ -1789,8 +1789,11 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 
         query.push_str(" ORDER BY archived_at DESC");
 
-        if let Some(limit) = limit {
-            query.push_str(&format!(" LIMIT {}", limit));
+        // MySQL has no OFFSET without LIMIT: an offset alone takes every row after it.
+        match (limit, offset) {
+            (Some(limit), _) => query.push_str(&format!(" LIMIT {}", limit)),
+            (None, Some(_)) => query.push_str(" LIMIT 18446744073709551615"),
+            (None, None) => {}
         }
 
         if let Some(offset) = offset {
@@ -2257,8 +2260,16 @@ async fn insert_jobs(conn: &mut sqlx::MySqlConnection, jobs: &[Job]) -> Result<(
                     .push_bind(&job.timezone)
                     .push_bind(job.batch_id.map(|id| id.to_string()))
                     .push_bind(result_storage_str(&job.result_config.storage))
-                    .push_bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
-                    .push_bind(job.result_config.max_size_bytes.map(|s| s as i64))
+                    .push_bind(
+                        job.result_config
+                            .ttl
+                            .map(|d| super::saturating_i64(d.as_secs())),
+                    )
+                    .push_bind(
+                        job.result_config
+                            .max_size_bytes
+                            .map(|s| super::saturating_i64(s as u64)),
+                    )
                     .push_bind(strategy)
                     .push_bind(depends_on)
                     .push_bind(dependents)
@@ -2737,6 +2748,7 @@ impl TransitionStore for crate::queue::JobQueue<MySql> {
                 &ids,
                 &lifecycle::dependency_failed_message(current),
                 now,
+                "('waiting', 'satisfied')",
             )
             .await?;
 
@@ -2989,18 +3001,24 @@ impl crate::queue::JobQueue<MySql> {
     }
 
     /// Set `status = 'Failed'` on the (already locked) jobs `ids`, recording `error`.
-    /// Jobs still waiting on dependencies get `dependency_status = 'failed'`.
+    ///
+    /// `failed_dependencies` lists the `dependency_status` values that become `'failed'`:
+    /// a job failed because a dependency failed has its satisfied dependencies failed too
+    /// (`('waiting', 'satisfied')`), while a job cancelled by a fail-fast workflow or batch
+    /// keeps satisfied dependencies (`('waiting')`), as on PostgreSQL, so it can run if
+    /// retried.
     async fn fail_jobs_by_id(
         conn: &mut sqlx::MySqlConnection,
         ids: &[String],
         error: &str,
         now: DateTime<Utc>,
+        failed_dependencies: &str,
     ) -> Result<()> {
         for chunk in ids.chunks(ID_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let query = format!(
                 "UPDATE hammerwork_jobs SET status = 'Failed', failed_at = ?, error_message = ?, \
-                 dependency_status = CASE WHEN dependency_status IN ('waiting', 'satisfied') \
+                 dependency_status = CASE WHEN dependency_status IN {failed_dependencies} \
                  THEN 'failed' ELSE dependency_status END WHERE id IN ({placeholders})"
             );
             let mut update = sqlx::query(&query).bind(now).bind(error);
@@ -3088,7 +3106,7 @@ impl crate::queue::JobQueue<MySql> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        Self::fail_jobs_by_id(conn, &ids, error, now).await?;
+        Self::fail_jobs_by_id(conn, &ids, error, now, "('waiting')").await?;
         parse_ids(ids)
     }
 
@@ -3160,11 +3178,13 @@ impl crate::queue::JobQueue<MySql> {
         let mut thresholds = Vec::new();
         let mut status_conditions = Vec::new();
         for (after, status, column) in crate::archive::archival_candidates(policy) {
-            if let Some(after) = after {
+            if let Some(threshold) =
+                after.and_then(|after| crate::archive::age_threshold(now, after))
+            {
                 status_conditions.push(format!(
                     "(status = '{status}' AND {column} IS NOT NULL AND {column} <= ?)"
                 ));
-                thresholds.push(now - after);
+                thresholds.push(threshold);
             }
         }
         if status_conditions.is_empty() || policy.batch_size == 0 {
@@ -3201,12 +3221,28 @@ impl crate::queue::JobQueue<MySql> {
 
         let archived_at = Utc::now();
         for job_row in jobs_to_archive {
-            let job = job_row.into_job()?;
+            // A row that cannot be decoded is left where it is: failing here would roll
+            // back the whole pass, every time, and stop archival for every queue.
+            let job_id = job_row.id.to_string();
+            let job = match job_row.into_job() {
+                Ok(job) => job,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %error,
+                        "Skipping a job that cannot be decoded while archiving"
+                    );
+                    continue;
+                }
+            };
             let (final_payload, is_compressed, original_size) =
                 crate::archive::encode_archived_payload(&job.payload, policy, config)?;
-            if is_compressed {
-                total_compression_ratio += original_size as f64 / final_payload.len() as f64;
-            }
+            // original size / stored size: a payload stored uncompressed counts as 1.
+            total_compression_ratio += if is_compressed {
+                original_size as f64 / final_payload.len() as f64
+            } else {
+                1.0
+            };
 
             sqlx::query(
                 r#"

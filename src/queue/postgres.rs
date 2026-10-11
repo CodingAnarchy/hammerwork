@@ -2037,8 +2037,16 @@ async fn insert_jobs(conn: &mut sqlx::PgConnection, jobs: &[Job]) -> Result<()> 
                 .push_bind(&job.timezone)
                 .push_bind(job.batch_id)
                 .push_bind(result_storage_str(&job.result_config.storage))
-                .push_bind(job.result_config.ttl.map(|d| d.as_secs() as i64))
-                .push_bind(job.result_config.max_size_bytes.map(|s| s as i64))
+                .push_bind(
+                    job.result_config
+                        .ttl
+                        .map(|d| super::saturating_i64(d.as_secs())),
+                )
+                .push_bind(
+                    job.result_config
+                        .max_size_bytes
+                        .map(|s| super::saturating_i64(s as u64)),
+                )
                 .push_bind(strategy)
                 .push_bind(&job.depends_on)
                 .push_bind(&job.dependents)
@@ -2746,11 +2754,13 @@ impl crate::queue::JobQueue<Postgres> {
         let mut status_conditions = Vec::new();
         let mut param = if queue_name.is_some() { 2 } else { 1 };
         for (after, status, column) in crate::archive::archival_candidates(policy) {
-            if let Some(after) = after {
+            if let Some(threshold) =
+                after.and_then(|after| crate::archive::age_threshold(now, after))
+            {
                 status_conditions.push(format!(
                     "(status = '{status}' AND {column} IS NOT NULL AND {column} <= ${param})"
                 ));
-                thresholds.push(now - after);
+                thresholds.push(threshold);
                 param += 1;
             }
         }
@@ -2790,12 +2800,28 @@ impl crate::queue::JobQueue<Postgres> {
         let mut archived_ids = Vec::with_capacity(jobs_to_archive.len());
         let mut encrypted_ids = Vec::new();
         for job_row in jobs_to_archive {
-            let job = job_row.into_job()?;
+            // A row that cannot be decoded is left where it is: failing here would roll
+            // back the whole pass, every time, and stop archival for every queue.
+            let job_id = job_row.id.to_string();
+            let job = match job_row.into_job() {
+                Ok(job) => job,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %error,
+                        "Skipping a job that cannot be decoded while archiving"
+                    );
+                    continue;
+                }
+            };
             let (final_payload, is_compressed, original_size) =
                 crate::archive::encode_archived_payload(&job.payload, policy, config)?;
-            if is_compressed {
-                total_compression_ratio += original_size as f64 / final_payload.len() as f64;
-            }
+            // original size / stored size: a payload stored uncompressed counts as 1.
+            total_compression_ratio += if is_compressed {
+                original_size as f64 / final_payload.len() as f64
+            } else {
+                1.0
+            };
 
             sqlx::query(
                 r#"
