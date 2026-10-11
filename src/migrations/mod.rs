@@ -509,5 +509,19 @@ impl<DB: Database> MigrationManager<DB> {
             include_str!("018_add_job_retry_strategy.postgres.sql").to_string(),
             include_str!("018_add_job_retry_strategy.mysql.sql").to_string(),
         );
+
+        // Migration 019: Keep workflow membership in the archive
+        self.register_migration(
+            Migration {
+                id: "019_add_archive_workflow".to_string(),
+                description: "Store workflow_id and workflow_name of archived jobs".to_string(),
+                version: 19,
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-10-11T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+            include_str!("019_add_archive_workflow.postgres.sql").to_string(),
+            include_str!("019_add_archive_workflow.mysql.sql").to_string(),
+        );
     }
 }

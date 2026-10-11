@@ -172,8 +172,8 @@ fn archived_job_from_row(row: &sqlx::postgres::PgRow) -> Result<Job> {
             row.try_get::<Option<String>, _>("dependency_status")?
                 .as_deref(),
         ),
-        workflow_id: None,
-        workflow_name: None,
+        workflow_id: row.try_get("workflow_id")?,
+        workflow_name: row.try_get("workflow_name")?,
         trace_id: row.try_get("trace_id")?,
         correlation_id: row.try_get("correlation_id")?,
         parent_span_id: row.try_get("parent_span_id")?,
@@ -2340,6 +2340,48 @@ impl TransitionStore for crate::queue::JobQueue<Postgres> {
         Ok(())
     }
 
+    async fn dependency_states(
+        conn: &mut sqlx::PgConnection,
+        ids: &[JobId],
+    ) -> Result<HashMap<JobId, JobStatus>> {
+        let mut states = HashMap::new();
+        let stored: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT id, status FROM hammerwork_jobs WHERE id = ANY($1) ORDER BY id FOR SHARE",
+        )
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        for (id, status) in stored {
+            if let Some(status) = lifecycle::job_status_from_db(&status) {
+                states.insert(id, status);
+            }
+        }
+        let archived: Vec<(uuid::Uuid, String)> =
+            sqlx::query_as("SELECT id, status FROM hammerwork_jobs_archive WHERE id = ANY($1)")
+                .bind(ids)
+                .fetch_all(&mut *conn)
+                .await?;
+        for (id, status) in archived {
+            states
+                .entry(id)
+                .or_insert_with(|| crate::archive::parse_archived_status(&status));
+        }
+        Ok(states)
+    }
+
+    async fn write_dependency_status(
+        conn: &mut sqlx::PgConnection,
+        job_id: JobId,
+        status: crate::workflow::DependencyStatus,
+    ) -> Result<()> {
+        sqlx::query("UPDATE hammerwork_jobs SET dependency_status = $2 WHERE id = $1")
+            .bind(job_id)
+            .bind(status.as_str())
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
     async fn lock_workflow(
         conn: &mut sqlx::PgConnection,
         workflow_id: uuid::Uuid,
@@ -2851,11 +2893,12 @@ impl crate::queue::JobQueue<Postgres> {
                     priority_weight, cron_schedule, next_run_at, recurring, timezone,
                     batch_id, depends_on, dependency_status, result_config,
                     trace_id, correlation_id, parent_span_id, span_context,
-                    archival_reason, archived_by, original_table
+                    archival_reason, archived_by, original_table,
+                    workflow_id, workflow_name
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
-                    $31, $32, $33, $34, $35, $36, $37
+                    $31, $32, $33, $34, $35, $36, $37, $38, $39
                 )
             "#,
             )
@@ -2900,6 +2943,8 @@ impl crate::queue::JobQueue<Postgres> {
             .bind(reason.as_str())
             .bind(archived_by)
             .bind("hammerwork_jobs")
+            .bind(job.workflow_id)
+            .bind(job.workflow_name)
             .execute(&mut *tx)
             .await?;
 
@@ -2963,7 +3008,12 @@ impl crate::queue::JobQueue<Postgres> {
             id: job_id.to_string(),
         })?;
 
-        let job = crate::archive::reset_for_restore(archived_job_from_row(&archived_row)?);
+        let mut job = crate::archive::reset_for_restore(archived_job_from_row(&archived_row)?);
+        // Its dependencies may have finished (or failed) since it was archived.
+        if !job.depends_on.is_empty() {
+            let states = Self::dependency_states(&mut tx, &job.depends_on).await?;
+            job.dependency_status = lifecycle::reevaluate_dependencies(&job, &states, "restored")?;
+        }
 
         // Older versions archived a job without deleting its row from hammerwork_jobs
         // (they only set archived_at). Drop such a leftover so the restore does not

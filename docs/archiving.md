@@ -364,7 +364,16 @@ println!("Restored job {} to queue {}", restored_job.id, restored_job.queue_name
 ```
 
 Restoring moves the row back in one transaction. Restoring an id that is not in the
-archive returns `HammerworkError::JobNotFound`.
+archive returns `HammerworkError::JobNotFound`. The job keeps its workflow
+(`workflow_id` and `workflow_name`; jobs archived before migration 019 have none).
+
+A restored job that depends on other jobs has its dependency state re-evaluated from
+its dependencies, looked up in the jobs table and then in the archive: it is runnable
+when they all completed and waits while some are unfinished. When a dependency
+failed (`Failed`, `Dead` or `TimedOut`) or no longer exists, the job could never run,
+so the restore is refused with `HammerworkError::Workflow` and the job stays in the
+archive. Restore or retry the dependency first. `retry_job` treats jobs with
+dependencies the same way.
 
 ### Bulk Restoration
 

@@ -34,6 +34,7 @@ Migrations are organized chronologically and represent the evolution of Hammerwo
 16. **016_versioned_encryption_keys** - Keep every encryption key version
 17. **017_add_kms_data_keys** - Store KMS-wrapped data keys for AWS/GCP key sources
 18. **018_add_job_retry_strategy** - Add `retry_strategy` (JSON) so `Job::with_retry_strategy` is stored, and an index on `(batch_id, status)` for batch progress checks. Required: every job query reads the new column.
+19. **019_add_archive_workflow** - Add `workflow_id` and `workflow_name` to `hammerwork_jobs_archive`, so archived jobs keep their workflow and `restore_archived_job` puts it back. Required: archiving, restoring and reading archived jobs use the new columns.
 
 ## Running Migrations
 

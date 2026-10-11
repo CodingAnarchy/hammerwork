@@ -1166,12 +1166,13 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
     ) -> Result<String, EncryptionError> {
         info!("Generating new encryption key: {}", key_id);
 
+        let now = Utc::now();
+        let next_rotation_at = next_rotation_at(now, rotation_interval)?;
         let key_material = random_key_material(&algorithm);
         let key_strength = (key_material.len() * 8) as u32;
         let (master_key_id, master_key) = self.current_master_key()?;
         let encrypted_key_material = wrap_key_material(&master_key, &key_material)?;
 
-        let now = Utc::now();
         let key_record = EncryptionKey {
             id: Uuid::new_v4(),
             key_id: key_id.to_string(),
@@ -1188,7 +1189,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
             retired_at: None,
             status: KeyStatus::Active,
             rotation_interval,
-            next_rotation_at: rotation_interval.map(|interval| now + interval),
+            next_rotation_at,
             key_strength,
             master_key_id: Some(master_key_id),
             last_used_at: None,
@@ -1439,6 +1440,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         let encrypted_key_material = wrap_key_material(&master_key, &new_key_material)?;
 
         let now = Utc::now();
+        let next_rotation_at = next_rotation_at(now, current_key.rotation_interval)?;
         let new_version = current_key.version + 1;
         let new_key_record = EncryptionKey {
             id: Uuid::new_v4(),
@@ -1456,7 +1458,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
             retired_at: None,
             status: KeyStatus::Active,
             rotation_interval: current_key.rotation_interval,
-            next_rotation_at: current_key.rotation_interval.map(|interval| now + interval),
+            next_rotation_at,
             key_strength: current_key.key_strength,
             master_key_id: Some(master_key_id),
             last_used_at: None,
@@ -1806,7 +1808,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
         key_id: &str,
         rotation_interval: Option<Duration>,
     ) -> Result<(), EncryptionError> {
-        let next_rotation_at = rotation_interval.map(|interval| Utc::now() + interval);
+        let next_rotation_at = next_rotation_at(Utc::now(), rotation_interval)?;
         DB::update_rotation_schedule(&self.pool, key_id, rotation_interval, next_rotation_at)
             .await?;
         info!(
@@ -2096,6 +2098,26 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
             None => Ok(derive_master_key_id(key_material)),
         }
     }
+}
+
+/// When a key rotated (or created) at `now` is next due for rotation: one
+/// `rotation_interval` later, or `None` without an interval. An interval too large for
+/// the next rotation time to be representable is an error instead of a panic.
+fn next_rotation_at(
+    now: DateTime<Utc>,
+    rotation_interval: Option<Duration>,
+) -> Result<Option<DateTime<Utc>>, EncryptionError> {
+    rotation_interval
+        .map(|interval| {
+            now.checked_add_signed(interval).ok_or_else(|| {
+                EncryptionError::KeyManagement(format!(
+                    "Rotation interval of {} seconds is too large: the next rotation time \
+                     cannot be represented",
+                    interval.num_seconds()
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn lock_error(what: &str) -> EncryptionError {
@@ -5353,6 +5375,79 @@ mod tests {
     async fn test_kms_concurrent_first_load_mysql() {
         let (_guard, pool) = mysql_test_pool().await;
         kms_concurrent_first_load(pool).await;
+    }
+
+    /// #105: a huge rotation interval is an error, never a panic.
+    #[test]
+    fn next_rotation_at_rejects_overflowing_intervals() {
+        let now = Utc::now();
+        assert_eq!(next_rotation_at(now, None).unwrap(), None);
+        assert_eq!(
+            next_rotation_at(now, Some(Duration::days(30))).unwrap(),
+            Some(now + Duration::days(30))
+        );
+        for huge in [
+            Duration::MAX,
+            Duration::MIN,
+            Duration::days(365 * 1_000_000),
+        ] {
+            let err = next_rotation_at(now, Some(huge)).unwrap_err();
+            assert!(err.to_string().contains("too large"), "{err}");
+        }
+    }
+
+    /// #105: `generate_key_with_options` and `update_key_rotation_schedule` with a huge
+    /// rotation interval return an error (they used to panic) and store nothing.
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    async fn huge_rotation_interval_is_an_error<DB: KeyManagerBackend>(pool: Pool<DB>) {
+        let mut manager = KeyManager::new(test_config(), pool).await.unwrap();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key_id = format!("huge-rotation-{suffix}");
+        let err = manager
+            .generate_key_with_options(
+                &key_id,
+                EncryptionAlgorithm::AES256GCM,
+                KeyPurpose::Encryption,
+                None,
+                Some(Duration::MAX),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        assert!(
+            manager.load_key(&key_id).await.is_err(),
+            "nothing was stored"
+        );
+
+        manager
+            .generate_key(&key_id, EncryptionAlgorithm::AES256GCM)
+            .await
+            .unwrap();
+        let err = manager
+            .update_key_rotation_schedule(&key_id, Some(Duration::MAX))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        assert_eq!(
+            manager.load_key(&key_id).await.unwrap().rotation_interval,
+            None
+        );
+    }
+
+    #[cfg(all(feature = "encryption", feature = "postgres"))]
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn test_huge_rotation_interval_is_an_error_postgres() {
+        let (_guard, pool) = postgres_test_pool().await;
+        huge_rotation_interval_is_an_error(pool).await;
+    }
+
+    #[cfg(all(feature = "encryption", feature = "mysql"))]
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn test_huge_rotation_interval_is_an_error_mysql() {
+        let (_guard, pool) = mysql_test_pool().await;
+        huge_rotation_interval_is_an_error(pool).await;
     }
 
     #[test]

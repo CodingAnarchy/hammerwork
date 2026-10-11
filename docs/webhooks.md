@@ -32,6 +32,25 @@ Without a template, the request body is the `JobLifecycleEvent` as JSON. When a
 `secret` is set, `X-Hammerwork-Signature: sha256=<hex>` is the HMAC-SHA256 of the body
 that was actually sent (the rendered template, if one is configured).
 
+## Job payloads
+
+Events published by workers leave out the job payload unless a webhook asks for it:
+set `EventFilter::include_payload` (`EventFilter::new().include_payload()`) on the
+webhook's filter, or `EventConfig::include_payload_default` on the event manager to
+include it for every subscriber. Payloads larger than
+`EventConfig::max_payload_size_bytes` are dropped and noted in the event's
+`payload_truncated` metadata. The same applies to event streams.
+
+The payload of a job with payload encryption (an encryption config, or a queue that
+encrypts its jobs) is never included: its events always have `payload: null`, so
+neither its plaintext nor its stored ciphertext reaches webhooks or streams.
+
+All subscribers of an event manager share one channel, so when one of them asks for
+payloads the others receive events with the payload too. The webhook and stream
+managers drop it for subscribers that did not ask; code that reads an
+`EventSubscription` directly should do the same when
+`EventManager::delivers_payload(&filter)` is false.
+
 ## Delivery
 
 `add_webhook` subscribes before it returns, so an event published right after the
@@ -124,7 +143,7 @@ Rendering rules:
 | `event.processing_time_ms` | number or `null` |
 | `event.error` | error object or `null` |
 | `event.error.message`, `.error_type`, `.details`, `.retry_attempt` | error fields |
-| `event.payload` | job payload when events include it, otherwise `null` |
+| `event.payload` | job payload when events include it (see [Job payloads](#job-payloads)), otherwise `null` |
 | `event.payload.<key>.<key>...` | nested payload values. A numeric segment indexes an array (`event.payload.items.0`) |
 | `event.metadata`, `event.metadata.<key>` | event metadata |
 

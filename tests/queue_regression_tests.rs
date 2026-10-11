@@ -1,17 +1,18 @@
 //! Regressions in the database queues found after 2.2.0, run against PostgreSQL and
 //! MySQL: archive listings and statistics, extreme result settings and archival
-//! policies, and how a fail-fast workflow leaves the dependency state of the jobs it
-//! cancels.
+//! policies, how a fail-fast workflow leaves the dependency state of the jobs it
+//! cancels, and how archiving, restoring and retrying treat workflows and dependencies
+//! (#102).
 
 #![cfg(any(feature = "postgres", feature = "mysql"))]
 
 mod test_utils;
 
 use hammerwork::{
-    Job, JobStatus,
+    HammerworkError, Job, JobStatus,
     archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason},
     queue::DatabaseQueue,
-    workflow::{FailurePolicy, JobGroup},
+    workflow::{DependencyStatus, FailurePolicy, JobGroup},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -221,6 +222,179 @@ where
     }
 }
 
+/// Archiving keeps a job's workflow and restoring puts it back (#102).
+async fn archive_keeps_workflow<Q: DatabaseQueue>(queue: &Q) {
+    let _serial = ARCHIVE_TESTS.lock().await;
+    let name = test_utils::unique_queue("archive_workflow");
+    let job = Job::new(name.clone(), json!({}));
+    let id = job.id;
+    let workflow_id = queue
+        .enqueue_workflow(JobGroup::new("archived-pipeline").add_job(job))
+        .await
+        .unwrap();
+    queue.complete_job(id).await.unwrap();
+    let policy = ArchivalPolicy::new().archive_completed_after(chrono::Duration::seconds(0));
+    assert_eq!(archive_now(queue, &name, policy).await.jobs_archived, 1);
+
+    let archived = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(archived.status, JobStatus::Archived);
+    assert_eq!(archived.workflow_id, Some(workflow_id));
+    assert_eq!(archived.workflow_name.as_deref(), Some("archived-pipeline"));
+
+    let restored = queue.restore_archived_job(id).await.unwrap();
+    assert_eq!(restored.workflow_id, Some(workflow_id));
+    assert_eq!(restored.workflow_name.as_deref(), Some("archived-pipeline"));
+    let stored = queue.get_job(id).await.unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Pending);
+    assert_eq!(stored.workflow_id, Some(workflow_id));
+    assert_eq!(stored.workflow_name.as_deref(), Some("archived-pipeline"));
+
+    queue.delete_job(id).await.unwrap();
+}
+
+/// Whether `result` is the error for a job whose dependency `dependency` cannot complete.
+fn is_dependency_refusal<T: std::fmt::Debug>(
+    result: &hammerwork::Result<T>,
+    dependency: hammerwork::JobId,
+) -> bool {
+    matches!(result, Err(HammerworkError::Workflow { message })
+        if message.contains(&dependency.to_string()))
+}
+
+/// `retry_job` re-evaluates the dependencies of a job failed because a dependency
+/// failed: it refuses while the dependency is still failed, and afterwards puts the job
+/// back to wait for it instead of leaving it `Pending` forever (#102).
+async fn retry_reevaluates_dependencies<Q: DatabaseQueue>(queue: &Q) {
+    let name = test_utils::unique_queue("retry_deps");
+    let parent = Job::new(format!("{name}_parent"), json!({}));
+    let child = Job::new(format!("{name}_child"), json!({})).depends_on(&parent.id);
+    let (parent_id, child_id) = (parent.id, child.id);
+    queue.enqueue(parent).await.unwrap();
+    queue.enqueue(child).await.unwrap();
+
+    queue.fail_job(parent_id, "boom").await.unwrap();
+    let failed = queue.get_job(child_id).await.unwrap().unwrap();
+    assert_eq!(failed.status, JobStatus::Failed);
+    assert_eq!(failed.dependency_status, DependencyStatus::Failed);
+
+    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+    let refused = queue.retry_job(child_id, past).await;
+    assert!(is_dependency_refusal(&refused, parent_id), "{refused:?}");
+    assert_eq!(
+        queue.get_job(child_id).await.unwrap().unwrap().status,
+        JobStatus::Failed,
+        "a refused retry changes nothing"
+    );
+
+    // Once the dependency is retried, the job can be retried and waits for it.
+    queue.retry_job(parent_id, past).await.unwrap();
+    queue.retry_job(child_id, past).await.unwrap();
+    let waiting = queue.get_job(child_id).await.unwrap().unwrap();
+    assert_eq!(waiting.status, JobStatus::Pending);
+    assert_eq!(waiting.dependency_status, DependencyStatus::Waiting);
+    assert!(
+        queue
+            .dequeue(&format!("{name}_child"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let run = queue
+        .dequeue(&format!("{name}_parent"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.id, parent_id);
+    queue.complete_job(parent_id).await.unwrap();
+    let run = queue
+        .dequeue(&format!("{name}_child"))
+        .await
+        .unwrap()
+        .expect("released when its dependency completed");
+    assert_eq!(run.id, child_id);
+
+    // A job whose dependencies all completed is satisfied straight away.
+    queue.fail_job(child_id, "child failed").await.unwrap();
+    queue.retry_job(child_id, past).await.unwrap();
+    assert_eq!(
+        queue
+            .get_job(child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dependency_status,
+        DependencyStatus::Satisfied
+    );
+
+    // A satisfied job stays retryable after its dependency is gone (purged).
+    queue.delete_job(parent_id).await.unwrap();
+    queue.fail_job(child_id, "failed again").await.unwrap();
+    queue.retry_job(child_id, past).await.unwrap();
+    assert_eq!(
+        queue
+            .get_job(child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dependency_status,
+        DependencyStatus::Satisfied
+    );
+
+    queue.delete_job(child_id).await.unwrap();
+}
+
+/// `restore_archived_job` re-evaluates the dependencies of the restored job the same
+/// way (#102).
+async fn restore_reevaluates_dependencies<Q: DatabaseQueue>(queue: &Q) {
+    let _serial = ARCHIVE_TESTS.lock().await;
+    let name = test_utils::unique_queue("restore_deps");
+    let parent = Job::new(name.clone(), json!({}));
+    let child = Job::new(name.clone(), json!({})).depends_on(&parent.id);
+    let (parent_id, child_id) = (parent.id, child.id);
+    queue.enqueue(parent).await.unwrap();
+    queue.enqueue(child).await.unwrap();
+    queue.fail_job(parent_id, "boom").await.unwrap();
+    let policy = ArchivalPolicy::new().archive_failed_after(chrono::Duration::seconds(0));
+    assert_eq!(archive_now(queue, &name, policy).await.jobs_archived, 2);
+
+    // The dependency is archived as Failed: restoring the dependent is refused.
+    let refused = queue.restore_archived_job(child_id).await;
+    assert!(is_dependency_refusal(&refused, parent_id), "{refused:?}");
+    assert_eq!(
+        queue.get_job(child_id).await.unwrap().unwrap().status,
+        JobStatus::Archived,
+        "a refused restore leaves the job archived"
+    );
+
+    queue.restore_archived_job(parent_id).await.unwrap();
+    let restored = queue.restore_archived_job(child_id).await.unwrap();
+    assert_eq!(restored.dependency_status, DependencyStatus::Waiting);
+    assert_eq!(
+        queue
+            .get_job(child_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dependency_status,
+        DependencyStatus::Waiting
+    );
+
+    let run = queue.dequeue(&name).await.unwrap().unwrap();
+    assert_eq!(run.id, parent_id, "the dependent waits for its dependency");
+    queue.complete_job(parent_id).await.unwrap();
+    let run = queue
+        .dequeue(&name)
+        .await
+        .unwrap()
+        .expect("released when its dependency completed");
+    assert_eq!(run.id, child_id);
+
+    for id in [parent_id, child_id] {
+        queue.delete_job(id).await.unwrap();
+    }
+}
+
 #[cfg(feature = "postgres")]
 mod postgres_tests {
     use super::*;
@@ -261,6 +435,27 @@ mod postgres_tests {
     async fn fail_fast_keeps_satisfied_dependencies_postgres() {
         let queue = test_utils::setup_postgres_queue().await;
         fail_fast_keeps_satisfied_dependencies(queue).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn archive_keeps_workflow_postgres() {
+        let queue = test_utils::setup_postgres_queue().await;
+        archive_keeps_workflow(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn retry_reevaluates_dependencies_postgres() {
+        let queue = test_utils::setup_postgres_queue().await;
+        retry_reevaluates_dependencies(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL: DATABASE_URL"]
+    async fn restore_reevaluates_dependencies_postgres() {
+        let queue = test_utils::setup_postgres_queue().await;
+        restore_reevaluates_dependencies(queue.as_ref()).await;
     }
 }
 
@@ -304,5 +499,43 @@ mod mysql_tests {
     async fn fail_fast_keeps_satisfied_dependencies_mysql() {
         let queue = test_utils::setup_mysql_queue().await;
         fail_fast_keeps_satisfied_dependencies(queue).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn archive_keeps_workflow_mysql() {
+        let queue = test_utils::setup_mysql_queue().await;
+        archive_keeps_workflow(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn retry_reevaluates_dependencies_mysql() {
+        let queue = test_utils::setup_mysql_queue().await;
+        retry_reevaluates_dependencies(queue.as_ref()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MySQL: MYSQL_DATABASE_URL"]
+    async fn restore_reevaluates_dependencies_mysql() {
+        let queue = test_utils::setup_mysql_queue().await;
+        restore_reevaluates_dependencies(queue.as_ref()).await;
+    }
+}
+
+/// The in-memory `TestQueue` re-evaluates dependencies like the database backends.
+#[cfg(feature = "test")]
+mod test_queue_tests {
+    use super::*;
+    use hammerwork::queue::test::TestQueue;
+
+    #[tokio::test]
+    async fn retry_reevaluates_dependencies_test_queue() {
+        retry_reevaluates_dependencies(&TestQueue::new()).await;
+    }
+
+    #[tokio::test]
+    async fn restore_reevaluates_dependencies_test_queue() {
+        restore_reevaluates_dependencies(&TestQueue::new()).await;
     }
 }

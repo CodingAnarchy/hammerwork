@@ -38,6 +38,11 @@ streams.shutdown(Duration::from_secs(10)).await;
 # }
 ```
 
+Events carry the job payload only when the stream's filter asks for it
+(`EventFilter::include_payload`) or the event manager includes it by default
+(`EventConfig::include_payload_default`). The payload of a job with payload encryption
+is never included. See [Job payloads](webhooks.md#job-payloads).
+
 ## Delivery
 
 Each stream has a listener that buffers matching events and flushes a batch when it

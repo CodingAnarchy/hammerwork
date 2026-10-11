@@ -127,6 +127,189 @@ where
     queue.delete_job(id).await.unwrap();
 }
 
+/// A statistics collector whose `record_event` always panics.
+struct PanickingStats;
+
+#[async_trait::async_trait]
+impl hammerwork::stats::StatisticsCollector for PanickingStats {
+    async fn record_event(&self, _event: hammerwork::stats::JobEvent) -> hammerwork::Result<()> {
+        panic!("stats collector exploded");
+    }
+    async fn get_queue_statistics(
+        &self,
+        _queue_name: &str,
+        _window: Duration,
+    ) -> hammerwork::Result<hammerwork::stats::JobStatistics> {
+        Ok(Default::default())
+    }
+    async fn get_all_statistics(
+        &self,
+        _window: Duration,
+    ) -> hammerwork::Result<Vec<hammerwork::stats::QueueStats>> {
+        Ok(Vec::new())
+    }
+    async fn get_system_statistics(
+        &self,
+        _window: Duration,
+    ) -> hammerwork::Result<hammerwork::stats::JobStatistics> {
+        Ok(Default::default())
+    }
+    async fn cleanup_old_statistics(&self, _older_than: Duration) -> hammerwork::Result<u64> {
+        Ok(0)
+    }
+}
+
+/// Panicking event hooks and a panicking statistics collector must not kill the worker
+/// or leave the job `Running`: each job's outcome is recorded and the worker keeps
+/// polling (#100).
+async fn panicking_hooks_do_not_kill_worker<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+    let queue_name = test_utils::unique_queue("panic_hooks");
+    let fails = queue
+        .enqueue(Job::new(queue_name.clone(), json!({ "fail": true })).with_max_attempts(1))
+        .await
+        .unwrap();
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook = |calls: &Arc<AtomicUsize>| {
+        let calls = Arc::clone(calls);
+        move |_event: hammerwork::worker::JobHookEvent| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            panic!("hook exploded");
+        }
+    };
+    let handler: JobHandler = Arc::new(|job: Job| {
+        Box::pin(async move {
+            if job.payload["fail"].as_bool() == Some(true) {
+                return Err(HammerworkError::Worker {
+                    message: "handler failed".to_string(),
+                });
+            }
+            Ok(())
+        })
+    });
+    let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+        .with_poll_interval(Duration::from_millis(50))
+        .with_stats_collector(Arc::new(PanickingStats))
+        .on_job_start(hook(&hook_calls))
+        .on_job_complete(hook(&hook_calls))
+        .on_job_fail(hook(&hook_calls));
+
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let worker_task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+    let job = test_utils::wait_for_job(&queue, fails, Duration::from_secs(10), |job| {
+        job.status == JobStatus::Dead
+    })
+    .await;
+    assert_eq!(job.status, JobStatus::Dead, "failed run must be recorded");
+
+    let healthy = queue
+        .enqueue(Job::new(queue_name.clone(), json!({ "fail": false })))
+        .await
+        .unwrap();
+    let job = test_utils::wait_for_job(&queue, healthy, Duration::from_secs(10), |job| {
+        job.status == JobStatus::Completed
+    })
+    .await;
+    assert_eq!(
+        job.status,
+        JobStatus::Completed,
+        "worker died after a hook panic"
+    );
+    assert!(
+        !worker_task.is_finished(),
+        "worker task must still be running"
+    );
+    // start + fail for the first job, start + complete for the second.
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 4);
+
+    shutdown_tx.send(()).await.unwrap();
+    worker_task.await.unwrap().unwrap();
+    queue.delete_job(fails).await.unwrap();
+    queue.delete_job(healthy).await.unwrap();
+}
+
+/// When the last jobs of a batch finish at the same time, the worker counts the batch
+/// as completed once, not once per job that saw it finish (#105).
+async fn concurrent_final_completions_count_batch_once<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database + Send + Sync + 'static,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    const JOBS: usize = 4;
+    const BATCHES: usize = 5;
+    let queue_name = test_utils::unique_queue("batch_race");
+    let barrier = Arc::new(tokio::sync::Barrier::new(JOBS));
+    let handler_barrier = Arc::clone(&barrier);
+    let handler: JobHandler = Arc::new(move |_job: Job| {
+        let barrier = Arc::clone(&handler_barrier);
+        Box::pin(async move {
+            // Every job of the batch finishes at the same moment.
+            barrier.wait().await;
+            Ok(())
+        })
+    });
+    let worker = Arc::new(
+        Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+            .with_poll_interval(Duration::from_millis(20))
+            .with_batch_processing_enabled(true)
+            .with_batch_size(JOBS)
+            .with_batch_concurrency(JOBS),
+    );
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let running = Arc::clone(&worker);
+    let worker_task = tokio::spawn(async move { running.run(shutdown_rx).await });
+
+    let mut ids = Vec::new();
+    for round in 0..BATCHES {
+        let jobs: Vec<Job> = (0..JOBS)
+            .map(|i| Job::new(queue_name.clone(), json!({ "round": round, "i": i })))
+            .collect();
+        ids.extend(jobs.iter().map(|job| job.id));
+        let batch_id = queue
+            .enqueue_batch(hammerwork::JobBatch::new("race").with_jobs(jobs))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = queue.get_batch_status(batch_id).await.unwrap();
+            if status.pending_jobs == 0 && status.completed_jobs == JOBS as u32 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "batch {round} did not finish");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Let every job's post-completion bookkeeping run.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.get_batch_stats().jobs_completed < ((round + 1) * JOBS) as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "jobs of batch {round} not counted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    shutdown_tx.send(()).await.unwrap();
+    worker_task.await.unwrap().unwrap();
+    let stats = worker.get_batch_stats();
+    assert_eq!(stats.jobs_completed, (JOBS * BATCHES) as u64);
+    assert_eq!(
+        stats.batches_completed, BATCHES as u64,
+        "each batch must be counted once"
+    );
+    assert_eq!(stats.batches_successful, BATCHES as u64);
+    for id in ids {
+        queue.delete_job(id).await.unwrap();
+    }
+}
+
 /// `WorkerPool::shutdown` must let an in-flight job finish (within the grace period)
 /// and record its outcome, instead of cancelling it mid-run.
 async fn graceful_shutdown_completes_in_flight_job<DB>(queue: Arc<JobQueue<DB>>)
@@ -677,6 +860,8 @@ crate::test_utils::backend_tests!(
     [
         handler_panic_fails_job_and_worker_survives,
         handler_panic_is_retried,
+        panicking_hooks_do_not_kill_worker,
+        concurrent_final_completions_count_batch_once,
         graceful_shutdown_completes_in_flight_job,
         reaper_requeues_expired_leases,
         claim_lease_protects_job_from_short_reaper_window,
@@ -696,6 +881,8 @@ crate::test_utils::backend_tests!(
     [
         handler_panic_fails_job_and_worker_survives,
         handler_panic_is_retried,
+        panicking_hooks_do_not_kill_worker,
+        concurrent_final_completions_count_batch_once,
         graceful_shutdown_completes_in_flight_job,
         reaper_requeues_expired_leases,
         claim_lease_protects_job_from_short_reaper_window,
