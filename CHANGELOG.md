@@ -51,6 +51,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`KeyManager::get_key` refuses a key that has expired while cached.** Keys are cached
   for up to an hour, and the cache did not check the key's expiry, so an expired key
   could still be used for up to an hour after it expired.
+- **The first retry waits the retry strategy's first delay.** A claim already counts the
+  run in `attempts`, so after the first failed run `attempts` is 1, but the worker asked
+  the strategy for `calculate_delay(attempts + 1)`. That skipped a step:
+  `RetryStrategy::exponential(1s, 2.0, ..)` waited 2s, 4s, ... instead of 1s, 2s, ...,
+  and `max_delay` was reached one retry early. Retries now use `calculate_delay(attempts)`,
+  so the first retry is attempt 1, as `RetryStrategy` documents. **This shortens every
+  retry delay computed from a strategy by one step.**
+- **Batch-mode statistics no longer count nearly every batch as successful.**
+  `BatchResult::success_rate` is a percentage, but the worker compared it with `0.95`,
+  so a batch counted in `BatchProcessingStats::batches_successful` once 0.95% of its jobs
+  completed (and the log printed rates like "8000.0%"). The threshold is now 95%.
+- **`JobBatch::into_chunks` no longer panics with a batch size of 0**
+  (`with_batch_size(0)`); 0 is treated as unset.
+- **`JobStatistics::running` counts the jobs that are running**, not every `Started`
+  event in the window, which included runs that had finished.
+- **A timed-out run that is retried is counted once in the statistics.** It records
+  `TimedOut` then `Retried`, and both counted as finished runs: one timeout followed by
+  a successful retry reported 3 runs and a 67% error rate instead of 2 and 50%.
+- **`JobGroup::update_statistics` follows the backends' rules
+  (`WorkflowProgress::status`).** A `ContinueOnFailure` or `Manual` workflow whose jobs
+  had all finished, some failed, stayed `Running` forever; it could also overwrite
+  `Cancelled`, and made an empty workflow `Completed`.
+- **`WorkerPool::with_stats_collector` reaches the workers already in the pool.** After
+  `from_config(..)` or `from_hammerwork_config(..)`, only workers added later and
+  autoscaled clones got the collector.
+- **Workers whose jobs fail and are retried no longer raise starvation alerts.** The
+  worker's last job time moved only on completed, failed, dead and timed-out runs, so a
+  worker busy retrying jobs looked idle.
+- **A rate limit with a burst limit of 0 no longer stalls the worker forever.** The token
+  bucket had no capacity, so `RateLimiter::acquire` never returned; it now holds at least
+  one token.
+- **`PriorityWeights::total_weight` saturates** instead of overflowing (a panic in debug
+  builds) when weights sum past `u32::MAX`.
+- **`AutoscaleConfig::with_min_workers` keeps `max_workers >= min_workers`.**
+  `with_min_workers(15)` left the maximum at 10, so the pool could neither scale up past
+  10 nor scale down.
+- **Spawned jobs keep their own settings when the parent has none.**
+  `SpawnManager::prepare_spawn` copied the parent's retry strategy, timeout and trace
+  fields onto each child even when the parent had none, wiping the child's own (retry
+  strategy and trace context are inherited by default). They are now inherited only
+  when the parent has them. It also replaced the child's own dependencies with the
+  parent; the parent is now added to them.
 - **`TestQueue` behaves like the database backends** in several places where tests
   written against it could pass while the code fails in production:
   - It holds a job enqueued with `depends_on` until its dependencies complete (it handed
