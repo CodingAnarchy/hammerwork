@@ -591,7 +591,7 @@ mod tests {
         let pending = wait_for(&mut live, &mut jobs, id, "Pending").await;
         assert_eq!(pending["job"]["queue_name"], queue_name.as_str());
 
-        let run = queue.dequeue(&queue_name).await.unwrap().expect("job");
+        let run = queue.dequeue_one(&queue_name).await.unwrap().expect("job");
         queue
             .finish_job_run(&run, hammerwork::queue::JobOutcome::Completed)
             .await
@@ -628,14 +628,14 @@ mod tests {
             id,
         };
 
-        let run = queue.dequeue(&queue_name).await.unwrap().expect("job");
+        let run = queue.dequeue_one(&queue_name).await.unwrap().expect("job");
         wait_for(&mut live, &mut jobs, id, "Running").await;
         assert!(queue.release_job_run(&run).await.unwrap());
         let released = wait_for(&mut live, &mut jobs, id, "Pending").await;
         assert_eq!(released["job"]["attempts"], 0);
 
         // A retry of a run goes back to Pending too.
-        let run = queue.dequeue(&queue_name).await.unwrap().expect("job");
+        let run = queue.dequeue_one(&queue_name).await.unwrap().expect("job");
         wait_for(&mut live, &mut jobs, id, "Running").await;
         queue
             .finish_job_run(

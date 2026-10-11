@@ -28,7 +28,7 @@
 //! let job_id = queue.enqueue(job).await?;
 //!
 //! // Process the job
-//! if let Some(mut job) = queue.dequeue("test_queue").await? {
+//! if let Some(mut job) = queue.dequeue_one("test_queue").await? {
 //!     // Process the job...
 //!     queue.complete_job(job.id).await?;
 //! }
@@ -41,7 +41,7 @@ use crate::{
     batch::{BatchId, BatchResult, BatchStatus, JobBatch},
     job::{Job, JobId, JobStatus},
     priority::{JobPriority, PriorityWeights},
-    queue::{DatabaseQueue, PayloadEncryption, QueuePauseInfo, lifecycle},
+    queue::{DatabaseQueue, DequeueOptions, PayloadEncryption, QueuePauseInfo, lifecycle},
     rate_limit::ThrottleConfig,
     stats::{DeadJobSummary, QueueStats},
     workflow::{
@@ -114,13 +114,13 @@ type TestDatabaseType = sqlx::Any; // Fallback
 /// let job_id = queue.enqueue(delayed_job).await?;
 ///
 /// // Job should not be available immediately
-/// assert!(queue.dequeue("delayed_queue").await?.is_none());
+/// assert!(queue.dequeue_one("delayed_queue").await?.is_none());
 ///
 /// // Advance time by 2 hours
 /// clock.advance(Duration::hours(2));
 ///
 /// // Now the job should be available
-/// let job = queue.dequeue("delayed_queue").await?.unwrap();
+/// let job = queue.dequeue_one("delayed_queue").await?.unwrap();
 /// assert_eq!(job.id, job_id);
 /// # Ok(())
 /// # }
@@ -707,7 +707,7 @@ impl TestStorage {
     }
 
     /// Up to `max_jobs` jobs to claim at once, in claim order, chosen like the database
-    /// backends' `dequeue_batch_leased`: in strict priority order, or with weighted
+    /// backends' `dequeue` of several jobs: in strict priority order, or with weighted
     /// `weights` filled from a level picked by weight, then from the other levels.
     fn get_next_jobs(
         &self,
@@ -858,7 +858,7 @@ impl TestStorage {
 /// let job_id = queue.enqueue(job).await?;
 ///
 /// // Dequeue and process the job
-/// let job = queue.dequeue("test_queue").await?.unwrap();
+/// let job = queue.dequeue_one("test_queue").await?.unwrap();
 /// assert_eq!(job.status, JobStatus::Running);
 ///
 /// // Mark job as completed
@@ -892,11 +892,11 @@ impl TestStorage {
 /// let high_id = queue.enqueue(high_job).await?;
 ///
 /// // High priority job should be dequeued first
-/// let first_job = queue.dequeue("priority_queue").await?.unwrap();
+/// let first_job = queue.dequeue_one("priority_queue").await?.unwrap();
 /// assert_eq!(first_job.id, high_id);
 /// assert_eq!(first_job.priority, JobPriority::High);
 ///
-/// let second_job = queue.dequeue("priority_queue").await?.unwrap();
+/// let second_job = queue.dequeue_one("priority_queue").await?.unwrap();
 /// assert_eq!(second_job.id, low_id);
 /// assert_eq!(second_job.priority, JobPriority::Low);
 /// # Ok(())
@@ -922,7 +922,7 @@ impl TestStorage {
 /// // Each dequeue counts as an attempt. Like a worker, retry the job while it has
 /// // attempts left and mark it dead once they are used up.
 /// for attempt in 1..=3 {
-///     let job = queue.dequeue("retry_queue").await?.unwrap();
+///     let job = queue.dequeue_one("retry_queue").await?.unwrap();
 ///     assert_eq!(job.attempts, attempt);
 ///     if job.attempts < job.max_attempts {
 ///         queue.retry_job(job_id, queue.clock().now()).await?;
@@ -939,7 +939,7 @@ impl TestStorage {
 /// let job_id = queue
 ///     .enqueue(Job::new("retry_queue".to_string(), json!({"data": "other"})))
 ///     .await?;
-/// queue.dequeue("retry_queue").await?.unwrap();
+/// queue.dequeue_one("retry_queue").await?.unwrap();
 /// queue.fail_job(job_id, "Permanent error").await?;
 /// assert_eq!(queue.get_job(job_id).await?.unwrap().status, JobStatus::Failed);
 /// # Ok(())
@@ -1154,7 +1154,7 @@ impl TestQueue {
     /// assert_eq!(queue.get_job_count("test_queue", &JobStatus::Pending).await, 5);
     ///
     /// // Process one job
-    /// let job = queue.dequeue("test_queue").await?.unwrap();
+    /// let job = queue.dequeue_one("test_queue").await?.unwrap();
     /// queue.complete_job(job.id).await?;
     ///
     /// // Should have 4 pending and 1 completed
@@ -1288,41 +1288,9 @@ impl Default for TestQueue {
     }
 }
 
-#[async_trait]
-impl DatabaseQueue for TestQueue {
-    type Database = TestDatabaseType;
-
-    async fn enqueue(&self, mut job: Job) -> Result<JobId> {
-        job.validate_dependencies()?;
-        self.encryption.seal(std::slice::from_mut(&mut job)).await?;
-        let mut storage = self.storage.write().await;
-
-        let now = storage.clock.now();
-        TestStorage::stamp_enqueued(&mut job, now);
-        storage.settle_new_dependents(std::slice::from_mut(&mut job), now);
-
-        // Store the job
-        storage.jobs.insert(job.id, job.clone());
-        storage.add_job_to_queue(&job);
-
-        Ok(job.id)
-    }
-
-    async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
-        self.dequeue_leased(queue_name, None, super::DEFAULT_LEASE_DURATION)
-            .await
-    }
-
-    async fn dequeue_with_priority_weights(
-        &self,
-        queue_name: &str,
-        weights: &PriorityWeights,
-    ) -> Result<Option<Job>> {
-        self.dequeue_leased(queue_name, Some(weights), super::DEFAULT_LEASE_DURATION)
-            .await
-    }
-
-    async fn dequeue_leased(
+impl TestQueue {
+    /// Claim one job ([`DatabaseQueue::dequeue`] with a `max_jobs` of 1).
+    async fn claim_one(
         &self,
         queue_name: &str,
         weights: Option<&PriorityWeights>,
@@ -1348,7 +1316,8 @@ impl DatabaseQueue for TestQueue {
         }))
     }
 
-    async fn dequeue_batch_leased(
+    /// Claim up to `max_jobs` jobs ([`DatabaseQueue::dequeue`]).
+    async fn claim_many(
         &self,
         queue_name: &str,
         weights: Option<&PriorityWeights>,
@@ -1374,6 +1343,43 @@ impl DatabaseQueue for TestQueue {
             }
         }
         Ok(jobs)
+    }
+}
+
+#[async_trait]
+impl DatabaseQueue for TestQueue {
+    type Database = TestDatabaseType;
+
+    async fn enqueue(&self, mut job: Job) -> Result<JobId> {
+        job.validate_dependencies()?;
+        self.encryption.seal(std::slice::from_mut(&mut job)).await?;
+        let mut storage = self.storage.write().await;
+
+        let now = storage.clock.now();
+        TestStorage::stamp_enqueued(&mut job, now);
+        storage.settle_new_dependents(std::slice::from_mut(&mut job), now);
+
+        // Store the job
+        storage.jobs.insert(job.id, job.clone());
+        storage.add_job_to_queue(&job);
+
+        Ok(job.id)
+    }
+
+    async fn dequeue(&self, queue_name: &str, options: &DequeueOptions) -> Result<Vec<Job>> {
+        let weights = options.priority_weights.as_ref();
+        match options.max_jobs {
+            0 => Ok(Vec::new()),
+            1 => Ok(self
+                .claim_one(queue_name, weights, options.lease())
+                .await?
+                .into_iter()
+                .collect()),
+            max_jobs => {
+                self.claim_many(queue_name, weights, options.lease(), max_jobs)
+                    .await
+            }
+        }
     }
 
     async fn release_job_run(&self, run: &Job) -> Result<bool> {
@@ -3174,7 +3180,10 @@ mod tests {
             .await
             .unwrap();
 
-        let claimed = queue.dequeue_batch("batch", 2).await.unwrap();
+        let claimed = queue
+            .dequeue("batch", &DequeueOptions::batch(2))
+            .await
+            .unwrap();
         let ids: Vec<JobId> = claimed.iter().map(|job| job.id).collect();
         assert_eq!(ids, [high, normal]);
         assert!(claimed.iter().all(|job| job.attempts == 1));
@@ -3188,11 +3197,62 @@ mod tests {
 
         // Paused queues hand out nothing.
         queue.pause_queue("batch", None).await.unwrap();
-        assert!(queue.dequeue_batch("batch", 5).await.unwrap().is_empty());
+        assert!(
+            queue
+                .dequeue("batch", &DequeueOptions::batch(5))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         queue.resume_queue("batch", None).await.unwrap();
-        let rest = queue.dequeue_batch("batch", 5).await.unwrap();
+        let rest = queue
+            .dequeue("batch", &DequeueOptions::batch(5))
+            .await
+            .unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].id, low);
+    }
+
+    #[tokio::test]
+    async fn dequeue_options_choose_count_and_lease() {
+        let queue = TestQueue::new();
+        for _ in 0..3 {
+            queue
+                .enqueue(Job::new("options".to_string(), json!({})))
+                .await
+                .unwrap();
+        }
+
+        // Zero jobs claims nothing; the default claims one.
+        let none = queue
+            .dequeue("options", &DequeueOptions::batch(0))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+        let one = queue
+            .dequeue("options", &DequeueOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(queue.dequeue_one("options").await.unwrap().is_some());
+
+        // The lease option sets the claimed job's lease: once it expires, the reaper
+        // reclaims the job, while the default (5 minute) leases are still held.
+        let short = queue
+            .dequeue(
+                "options",
+                &DequeueOptions::new().with_lease_duration(std::time::Duration::from_secs(10)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(short.len(), 1);
+        queue.clock().advance(chrono::Duration::seconds(30));
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(recovery.requeued, [short[0].id]);
+        assert!(queue.dequeue_one("missing").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3202,14 +3262,25 @@ mod tests {
             .enqueue(Job::new("release".to_string(), json!({})))
             .await
             .unwrap();
-        let run = queue.dequeue_batch("release", 1).await.unwrap().remove(0);
+        let run = queue
+            .dequeue("release", &DequeueOptions::batch(1))
+            .await
+            .unwrap()
+            .remove(0);
         assert!(queue.release_job_run(&run).await.unwrap());
         let job = queue.get_job(id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending);
         assert_eq!(job.attempts, 0);
         assert_eq!(job.started_at, None);
         assert!(!queue.release_job_run(&run).await.unwrap());
-        assert_eq!(queue.dequeue_batch("release", 1).await.unwrap().len(), 1);
+        assert_eq!(
+            queue
+                .dequeue("release", &DequeueOptions::batch(1))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3227,7 +3298,7 @@ mod tests {
         );
 
         // Dequeue the job
-        let dequeued = queue.dequeue("test_queue").await.unwrap();
+        let dequeued = queue.dequeue_one("test_queue").await.unwrap();
         assert!(dequeued.is_some());
         assert_eq!(dequeued.unwrap().id, job_id);
 
@@ -3251,17 +3322,24 @@ mod tests {
             .unwrap();
 
         queue.pause_queue("paused", Some("test")).await.unwrap();
-        assert!(queue.dequeue("paused").await.unwrap().is_none());
+        assert!(queue.dequeue_one("paused").await.unwrap().is_none());
         assert!(
             queue
-                .dequeue_with_priority_weights("paused", &PriorityWeights::new())
+                .dequeue(
+                    "paused",
+                    &DequeueOptions::new().with_priority_weights(PriorityWeights::new())
+                )
                 .await
+                .map(|jobs| jobs.into_iter().next())
                 .unwrap()
                 .is_none()
         );
 
         queue.resume_queue("paused", None).await.unwrap();
-        assert_eq!(queue.dequeue("paused").await.unwrap().unwrap().id, job_id);
+        assert_eq!(
+            queue.dequeue_one("paused").await.unwrap().unwrap().id,
+            job_id
+        );
     }
 
     #[tokio::test]
@@ -3280,7 +3358,7 @@ mod tests {
         let _normal_id = queue.enqueue(normal_job).await.unwrap();
 
         // Dequeue should get the high priority job first
-        let dequeued = queue.dequeue("test_queue").await.unwrap();
+        let dequeued = queue.dequeue_one("test_queue").await.unwrap();
         assert_eq!(dequeued.unwrap().id, high_id);
     }
 
@@ -3295,14 +3373,14 @@ mod tests {
         let job_id = queue.enqueue(job).await.unwrap();
 
         // Should not be able to dequeue immediately
-        let dequeued = queue.dequeue("test_queue").await.unwrap();
+        let dequeued = queue.dequeue_one("test_queue").await.unwrap();
         assert!(dequeued.is_none());
 
         // Advance time
         clock.advance(chrono::Duration::hours(2));
 
         // Now should be able to dequeue
-        let dequeued = queue.dequeue("test_queue").await.unwrap();
+        let dequeued = queue.dequeue_one("test_queue").await.unwrap();
         assert_eq!(dequeued.unwrap().id, job_id);
     }
 
@@ -3313,7 +3391,7 @@ mod tests {
         // Enqueue and dequeue a job
         let job = Job::new("test_queue".to_string(), json!({"test": true}));
         let job_id = queue.enqueue(job).await.unwrap();
-        let _dequeued = queue.dequeue("test_queue").await.unwrap();
+        let _dequeued = queue.dequeue_one("test_queue").await.unwrap();
 
         // Complete the job
         queue.complete_job(job_id).await.unwrap();
@@ -3333,7 +3411,7 @@ mod tests {
         let job_id = queue.enqueue(job).await.unwrap();
 
         // Dequeue and fail the job: a terminal failure, not retried automatically.
-        let dequeued = queue.dequeue("test_queue").await.unwrap().unwrap();
+        let dequeued = queue.dequeue_one("test_queue").await.unwrap().unwrap();
         assert_eq!(dequeued.attempts, 1);
         queue.fail_job(job_id, "Test error").await.unwrap();
 
@@ -3375,7 +3453,7 @@ mod tests {
 
         // Process all jobs
         for _ in 0..3 {
-            if let Some(job) = queue.dequeue("batch_queue").await.unwrap() {
+            if let Some(job) = queue.dequeue_one("batch_queue").await.unwrap() {
                 queue.complete_job(job.id).await.unwrap();
             }
         }
@@ -3412,24 +3490,24 @@ mod tests {
         let workflow_id = queue.enqueue_workflow(workflow).await.unwrap();
 
         // Only job1 should be available initially
-        let dequeued = queue.dequeue("workflow_queue").await.unwrap();
+        let dequeued = queue.dequeue_one("workflow_queue").await.unwrap();
         assert_eq!(dequeued.unwrap().id, job1_id);
 
         // Job2 and job3 should not be available
-        assert!(queue.dequeue("workflow_queue").await.unwrap().is_none());
+        assert!(queue.dequeue_one("workflow_queue").await.unwrap().is_none());
 
         // Complete job1
         queue.complete_job(job1_id).await.unwrap();
 
         // Now job2 should be available
-        let dequeued = queue.dequeue("workflow_queue").await.unwrap();
+        let dequeued = queue.dequeue_one("workflow_queue").await.unwrap();
         assert_eq!(dequeued.unwrap().id, job2_id);
 
         // Complete job2
         queue.complete_job(job2_id).await.unwrap();
 
         // Now job3 should be available
-        let dequeued = queue.dequeue("workflow_queue").await.unwrap();
+        let dequeued = queue.dequeue_one("workflow_queue").await.unwrap();
         assert_eq!(dequeued.unwrap().id, job3_id);
 
         // Complete job3
@@ -3467,7 +3545,7 @@ mod tests {
         clock.advance(chrono::Duration::hours(1));
 
         // Now the job should be available for dequeue
-        let run = queue.dequeue("cron_queue").await.unwrap().unwrap();
+        let run = queue.dequeue_one("cron_queue").await.unwrap().unwrap();
         let recorded = queue
             .finish_job_run(&run, crate::queue::JobOutcome::Completed)
             .await
@@ -3548,7 +3626,7 @@ mod tests {
             .with_result_ttl(std::time::Duration::from_secs(60));
         let ttl = job.result_config.ttl.unwrap();
         let job_id = queue.enqueue(job).await.unwrap();
-        queue.dequeue("memory_results").await.unwrap().unwrap();
+        queue.dequeue_one("memory_results").await.unwrap().unwrap();
 
         // What a worker does: store the result with its TTL, then complete the job.
         let expires_at = crate::queue::saturating_add_to(clock.now(), ttl);
@@ -3587,13 +3665,13 @@ mod tests {
 
         // Process some jobs
         for _ in 0..2 {
-            if let Some(job) = queue.dequeue("stats_queue").await.unwrap() {
+            if let Some(job) = queue.dequeue_one("stats_queue").await.unwrap() {
                 queue.complete_job(job.id).await.unwrap();
             }
         }
 
         // One job runs out of attempts and dies, as a worker would record it.
-        if let Some(job) = queue.dequeue("stats_queue").await.unwrap() {
+        if let Some(job) = queue.dequeue_one("stats_queue").await.unwrap() {
             queue.mark_job_dead(job.id, "Test failure").await.unwrap();
         }
 
@@ -3627,8 +3705,9 @@ mod tests {
         let mut runs = HashMap::new();
         for _ in 0..3 {
             let run = queue
-                .dequeue_leased("stale", None, lease)
+                .dequeue("stale", &DequeueOptions::new().with_lease_duration(lease))
                 .await
+                .map(|jobs| jobs.into_iter().next())
                 .unwrap()
                 .unwrap();
             runs.insert(run.id, run);
@@ -3683,8 +3762,9 @@ mod tests {
             .unwrap();
 
         let first = queue
-            .dequeue_leased("rerun", None, lease)
+            .dequeue("rerun", &DequeueOptions::new().with_lease_duration(lease))
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap()
             .unwrap();
         clock.advance(chrono::Duration::seconds(60));
@@ -3695,8 +3775,9 @@ mod tests {
         assert_eq!(recovery.requeued, vec![id]);
 
         let second = queue
-            .dequeue_leased("rerun", None, lease)
+            .dequeue("rerun", &DequeueOptions::new().with_lease_duration(lease))
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap()
             .unwrap();
         assert_eq!(second.attempts, 2);
@@ -3726,8 +3807,9 @@ mod tests {
             .await
             .unwrap();
         let claimed = queue
-            .dequeue_leased("held", None, lease)
+            .dequeue("held", &DequeueOptions::new().with_lease_duration(lease))
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap()
             .unwrap();
         clock.advance(chrono::Duration::seconds(20));
@@ -3770,8 +3852,12 @@ mod tests {
             .await
             .unwrap();
         let run = queue
-            .dequeue_leased("forever", None, std::time::Duration::ZERO)
+            .dequeue(
+                "forever",
+                &DequeueOptions::new().with_lease_duration(std::time::Duration::ZERO),
+            )
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap()
             .unwrap();
         queue.clock().advance(chrono::Duration::days(365));
@@ -3812,7 +3898,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let run = queue.dequeue("policy").await.unwrap().unwrap();
+            let run = queue.dequeue_one("policy").await.unwrap().unwrap();
             let failed_id = run.id;
             if timed_out {
                 queue
@@ -3859,7 +3945,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let run = queue.dequeue("finish_policy").await.unwrap().unwrap();
+        let run = queue.dequeue_one("finish_policy").await.unwrap().unwrap();
         assert_eq!(run.id, a_id);
         let recorded = queue
             .finish_job_run(
@@ -3921,7 +4007,7 @@ mod tests {
             assert_eq!(stored.payload, json!({"ssn": "[ENCRYPTED]", "amount": 5}));
             assert!(stored.encrypted_payload.is_some());
 
-            let dequeued = queue.dequeue("q").await.unwrap().unwrap();
+            let dequeued = queue.dequeue_one("q").await.unwrap().unwrap();
             assert_eq!(
                 dequeued.payload, stored.payload,
                 "dequeue returns the stored form"
@@ -4041,7 +4127,7 @@ mod tests {
                 .enqueue(Job::new("q".into(), json!({"secret": 1})).with_encryption(config()))
                 .await
                 .unwrap();
-            queue.dequeue("q").await.unwrap();
+            queue.dequeue_one("q").await.unwrap();
             queue.complete_job(id).await.unwrap();
             queue.clock().advance(chrono::Duration::seconds(10));
             let stats = queue
@@ -4159,10 +4245,10 @@ mod tests {
             .await
             .unwrap();
 
-        let run = queue.dequeue("deps").await.unwrap().unwrap();
+        let run = queue.dequeue_one("deps").await.unwrap().unwrap();
         assert_eq!(run.id, parent);
         assert!(
-            queue.dequeue("deps").await.unwrap().is_none(),
+            queue.dequeue_one("deps").await.unwrap().is_none(),
             "a job ran before its dependency finished"
         );
 
@@ -4172,7 +4258,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recorded.unblocked, vec![child]);
-        let run = queue.dequeue("deps").await.unwrap().unwrap();
+        let run = queue.dequeue_one("deps").await.unwrap().unwrap();
         assert_eq!(run.id, child);
         assert_eq!(run.dependency_status, DependencyStatus::Satisfied);
 
@@ -4181,7 +4267,7 @@ mod tests {
             .enqueue(Job::new("deps".to_string(), json!({"n": 3})).depends_on(&parent))
             .await
             .unwrap();
-        assert_eq!(queue.dequeue("deps").await.unwrap().unwrap().id, late);
+        assert_eq!(queue.dequeue_one("deps").await.unwrap().unwrap().id, late);
 
         // Enqueued after its dependency failed: failed at once.
         let failed = queue
@@ -4207,7 +4293,7 @@ mod tests {
             .enqueue(Job::new("retry_err".to_string(), json!({})))
             .await
             .unwrap();
-        let run = queue.dequeue("retry_err").await.unwrap().unwrap();
+        let run = queue.dequeue_one("retry_err").await.unwrap().unwrap();
         let retry_at = Utc::now() + chrono::Duration::seconds(30);
         let recorded = queue
             .finish_job_run(
@@ -4242,7 +4328,7 @@ mod tests {
             .enqueue(Job::new("retry_clock".to_string(), json!({})))
             .await
             .unwrap();
-        let run = queue.dequeue("retry_clock").await.unwrap().unwrap();
+        let run = queue.dequeue_one("retry_clock").await.unwrap().unwrap();
         queue.clock().advance(chrono::Duration::hours(2));
         let mock_now = queue.clock().now();
         queue
@@ -4261,9 +4347,9 @@ mod tests {
         let after = (job.scheduled_at - mock_now).num_seconds();
         assert!((28..=30).contains(&after), "due {after}s after mock now");
         // Not yet due on the mock clock, due once it passes.
-        assert!(queue.dequeue("retry_clock").await.unwrap().is_none());
+        assert!(queue.dequeue_one("retry_clock").await.unwrap().is_none());
         queue.clock().advance(chrono::Duration::seconds(31));
-        assert!(queue.dequeue("retry_clock").await.unwrap().is_some());
+        assert!(queue.dequeue_one("retry_clock").await.unwrap().is_some());
     }
 
     /// Unknown ids and queues fail (or succeed) as on the database backends.
@@ -4304,7 +4390,7 @@ mod tests {
         let workflow = JobGroup::new("unblock").add_job(first).then(second);
         queue.enqueue_workflow(workflow).await.unwrap();
 
-        let run = queue.dequeue("wf_unblock").await.unwrap().unwrap();
+        let run = queue.dequeue_one("wf_unblock").await.unwrap().unwrap();
         assert_eq!(run.id, first_id);
         let recorded = queue
             .finish_job_run(&run, JobOutcome::Completed)
@@ -4313,7 +4399,7 @@ mod tests {
             .unwrap();
         assert_eq!(recorded.unblocked, vec![second_id]);
         assert_eq!(
-            queue.dequeue("wf_unblock").await.unwrap().unwrap().id,
+            queue.dequeue_one("wf_unblock").await.unwrap().unwrap().id,
             second_id
         );
     }
@@ -4338,8 +4424,12 @@ mod tests {
         clock.advance(chrono::Duration::hours(1));
         let lease = std::time::Duration::from_secs(30);
         let run = queue
-            .dequeue_leased("stale_cron", None, lease)
+            .dequeue(
+                "stale_cron",
+                &DequeueOptions::new().with_lease_duration(lease),
+            )
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap()
             .unwrap();
         assert_eq!(run.id, id);
@@ -4390,7 +4480,7 @@ mod tests {
             .enqueue(Job::new("dead_q".to_string(), json!({"n": 1})))
             .await
             .unwrap();
-        queue.dequeue("dead_q").await.unwrap().unwrap();
+        queue.dequeue_one("dead_q").await.unwrap().unwrap();
         queue.mark_job_timed_out(timed_out, "slow").await.unwrap();
         let dead = queue
             .enqueue(Job::new("dead_q".to_string(), json!({"n": 2})))
@@ -4451,8 +4541,12 @@ mod tests {
             .with_weight(JobPriority::High, 0)
             .with_weight(JobPriority::Critical, 0);
         let job = queue
-            .dequeue_with_priority_weights("zero_w", &weights)
+            .dequeue(
+                "zero_w",
+                &DequeueOptions::new().with_priority_weights(weights.clone()),
+            )
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap();
         assert_eq!(job.map(|job| job.id), Some(id));
     }
@@ -4467,8 +4561,12 @@ mod tests {
             .unwrap();
         let weights = PriorityWeights::new().with_weight(JobPriority::Normal, u32::MAX);
         let job = queue
-            .dequeue_with_priority_weights("huge_w", &weights)
+            .dequeue(
+                "huge_w",
+                &DequeueOptions::new().with_priority_weights(weights.clone()),
+            )
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap();
         assert_eq!(job.map(|job| job.id), Some(id));
     }
@@ -4555,7 +4653,11 @@ mod tests {
         let restored = queue.restore_archived_job(id).await.unwrap();
         assert_eq!(restored.scheduled_at, clock.now());
         assert_eq!(
-            queue.dequeue("restore_clock").await.unwrap().map(|j| j.id),
+            queue
+                .dequeue_one("restore_clock")
+                .await
+                .unwrap()
+                .map(|j| j.id),
             Some(id)
         );
     }

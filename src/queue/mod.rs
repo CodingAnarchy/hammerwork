@@ -42,6 +42,22 @@ mod memory_results;
 pub use memory_results::DEFAULT_MEMORY_RESULT_CAPACITY;
 pub(crate) use memory_results::MemoryResultStore;
 
+/// Seals [`DatabaseQueue`]: only types in this crate can implement [`private::Sealed`],
+/// so only they can implement the trait.
+mod private {
+    /// The supertrait that seals [`DatabaseQueue`](super::DatabaseQueue).
+    pub trait Sealed {}
+
+    #[cfg(feature = "postgres")]
+    impl Sealed for super::JobQueue<sqlx::Postgres> {}
+
+    #[cfg(feature = "mysql")]
+    impl Sealed for super::JobQueue<sqlx::MySql> {}
+
+    #[cfg(feature = "test-queue")]
+    impl Sealed for super::test::TestQueue {}
+}
+
 /// Information about a queue's pause state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuePauseInfo {
@@ -61,8 +77,21 @@ pub struct QueuePauseInfo {
 /// including job management, batch operations, statistics, and result storage.
 /// Each database backend implements this trait with optimizations specific to
 /// that database system.
+///
+/// # Sealed
+///
+/// This trait is sealed: it is implemented by [`JobQueue<Postgres>`](JobQueue) (feature
+/// `postgres`), [`JobQueue<MySql>`](JobQueue) (feature `mysql`) and
+/// [`TestQueue`](crate::queue::test::TestQueue) (feature `test-queue`), and cannot be
+/// implemented outside Hammerwork. New methods can therefore be added in minor
+/// releases. Use it as a bound (`Q: DatabaseQueue`, `&impl DatabaseQueue`) to write
+/// code that works with any of these queues.
+///
+/// To test code that uses a queue without a database, use
+/// [`TestQueue`](crate::queue::test::TestQueue), an in-memory implementation with the
+/// same behaviour as the database backends and a mock clock (see `docs/testing.md`).
 #[async_trait]
-pub trait DatabaseQueue: Send + Sync {
+pub trait DatabaseQueue: private::Sealed + Send + Sync {
     type Database: Database;
 
     // Core job operations
@@ -77,131 +106,93 @@ pub trait DatabaseQueue: Send + Sync {
     /// concurrently is applied either way.
     async fn enqueue(&self, job: Job) -> Result<JobId>;
 
-    /// Claim the next runnable job of `queue_name`: `Pending`, due (by the database
-    /// clock), not waiting on dependencies, highest priority first, then oldest.
-    /// Returns `None` when there is none or the queue is paused.
+    /// Claim up to [`max_jobs`](DequeueOptions::max_jobs) runnable jobs of `queue_name`
+    /// and hold a lease on each until `now + lease` (by the database clock).
     ///
-    /// The claim holds a lease of [`DEFAULT_LEASE_DURATION`] (see
-    /// [`dequeue_leased`](Self::dequeue_leased)).
-    async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>>;
-
-    /// Like [`dequeue`](Self::dequeue), but picks the priority level by weight among
-    /// the levels that have runnable jobs, then claims that level's oldest job (see
-    /// [`PriorityWeights`](crate::priority::PriorityWeights)). Every level with
-    /// runnable jobs and a non-zero weight is picked regularly, however many jobs of
-    /// other levels are queued.
-    async fn dequeue_with_priority_weights(
-        &self,
-        queue_name: &str,
-        weights: &crate::priority::PriorityWeights,
-    ) -> Result<Option<Job>>;
-
-    /// Claim the next runnable job of `queue_name` and hold a lease on it until
-    /// `now + lease` (by the database clock).
-    ///
-    /// Picks the job like
-    /// [`dequeue_with_priority_weights`](Self::dequeue_with_priority_weights) when
-    /// `weights` is given, otherwise like [`dequeue`](Self::dequeue). The lease
-    /// (`lease_expires_at`, with `last_heartbeat_at`) is written by the statement that
-    /// claims the job, so a claimed job is never without a lease:
+    /// A job is runnable when it is `Pending`, due (by the database clock), not waiting
+    /// on dependencies and not a disabled recurring job's held occurrence, and its queue
+    /// is not paused. Each claimed job becomes `Running`, its `attempts` is incremented,
+    /// and its lease (`lease_expires_at`, with `last_heartbeat_at`) is written by the
+    /// statement that claims it, so a claimed job is never without a lease:
     /// [`requeue_stale_jobs`](Self::requeue_stale_jobs) leaves it alone until the lease
     /// expires, and the worker extends it with [`heartbeat_job`](Self::heartbeat_job).
-    ///
-    /// A zero `lease` never expires: the reaper never reclaims the job, even if its
-    /// worker dies, so an operator has to (see
-    /// [`Worker::with_lease_duration`](crate::worker::Worker::with_lease_duration)).
-    ///
-    /// The default implementation ignores `lease`, for backends that predate leases.
-    async fn dequeue_leased(
-        &self,
-        queue_name: &str,
-        weights: Option<&crate::priority::PriorityWeights>,
-        lease: std::time::Duration,
-    ) -> Result<Option<Job>> {
-        let _ = lease;
-        match weights {
-            Some(weights) => {
-                self.dequeue_with_priority_weights(queue_name, weights)
-                    .await
-            }
-            None => self.dequeue(queue_name).await,
-        }
-    }
-
-    /// Claim up to `max_jobs` runnable jobs of `queue_name` at once, highest priority
-    /// first, then oldest, each with a lease of [`DEFAULT_LEASE_DURATION`].
-    ///
-    /// See [`dequeue_batch_leased`](Self::dequeue_batch_leased).
-    async fn dequeue_batch(&self, queue_name: &str, max_jobs: usize) -> Result<Vec<Job>> {
-        self.dequeue_batch_leased(queue_name, None, DEFAULT_LEASE_DURATION, max_jobs)
-            .await
-    }
-
-    /// Claim up to `max_jobs` runnable jobs of `queue_name` at once and hold a lease on
-    /// each until `now + lease` (by the database clock).
-    ///
-    /// Every claimed job is claimed exactly as [`dequeue_leased`](Self::dequeue_leased)
-    /// claims one: it is `Pending`, due, not waiting on dependencies and not a disabled
-    /// recurring job's held occurrence; its queue is not paused; its `attempts` is
-    /// incremented; and its lease is written by the statement that claims it.
     /// Concurrent callers never claim the same job (`FOR UPDATE SKIP LOCKED` on the
-    /// database backends). Returns fewer than `max_jobs` jobs (possibly none) when fewer
-    /// are runnable, and none for a `max_jobs` of zero.
+    /// database backends).
     ///
-    /// The jobs are returned in claim order: highest priority first, then oldest
-    /// (`priority DESC, scheduled_at ASC`). Each stays `Running` under its own lease
-    /// until its outcome is recorded with [`finish_job_run`](Self::finish_job_run) or
-    /// it is handed back with [`release_job_run`](Self::release_job_run); a caller that
-    /// holds jobs before running them must keep their leases alive with
+    /// Returns fewer than `max_jobs` jobs (possibly none) when fewer are runnable or the
+    /// queue is paused, and none for a `max_jobs` of zero. The built-in backends claim at
+    /// most [`MAX_DEQUEUE_BATCH_SIZE`] jobs per call. The jobs are returned in claim
+    /// order: highest priority first, then oldest (`priority DESC, scheduled_at ASC`).
+    /// For the common case of one job with the default options, see
+    /// [`dequeue_one`](Self::dequeue_one).
+    ///
+    /// Options (see [`DequeueOptions`]):
+    /// - **Lease.** [`lease_duration`](DequeueOptions::lease_duration), or
+    ///   [`DEFAULT_LEASE_DURATION`] when it is `None`. A zero lease never expires: the
+    ///   reaper never reclaims the job, even if its worker dies, so an operator has to
+    ///   (see
+    ///   [`Worker::with_lease_duration`](crate::worker::Worker::with_lease_duration)).
+    /// - **Priority.** Without [`priority_weights`](DequeueOptions::priority_weights), or
+    ///   with strict [`PriorityWeights`](crate::priority::PriorityWeights), jobs are
+    ///   claimed in strict priority order: the highest priority level first, then the
+    ///   next, and so on. With weighted `priority_weights`, a priority level is picked by
+    ///   weight among the levels that have runnable jobs, and its oldest jobs are
+    ///   claimed. Every level with runnable jobs and a non-zero weight is picked
+    ///   regularly, however many jobs of other levels are queued. If the picked level has
+    ///   fewer runnable jobs than there is room for (or other workers hold them all),
+    ///   another level is picked by weight among the remaining ones to fill the rest, and
+    ///   so on, so no claim comes back short while other levels have runnable jobs.
+    ///
+    /// Each claimed job stays `Running` under its own lease until its outcome is
+    /// recorded with [`finish_job_run`](Self::finish_job_run) or it is handed back with
+    /// [`release_job_run`](Self::release_job_run). A caller that holds several jobs
+    /// before running them must keep their leases alive with
     /// [`heartbeat_job`](Self::heartbeat_job), or the reaper reclaims them once their
-    /// lease expires.
+    /// lease expires, and should record each one's actual start with
+    /// [`start_claimed_run`](Self::start_claimed_run).
     ///
-    /// Priority selection:
-    /// - without `weights`, or with strict [`PriorityWeights`](crate::priority::PriorityWeights),
-    ///   jobs are claimed in strict priority order: the batch is filled from the highest
-    ///   priority level first, then the next, and so on;
-    /// - with weighted `weights`, a priority level is picked by weight among the levels
-    ///   that have runnable jobs, exactly as a single weighted claim picks one, and the
-    ///   batch is filled with that level's oldest jobs. If the level has fewer runnable
-    ///   jobs than the batch has room for, another level is picked by weight among the
-    ///   remaining ones to fill the rest, and so on. So over many batches each level gets
-    ///   batches in proportion to its weight, and no batch comes back short while other
-    ///   levels have runnable jobs.
+    /// When several jobs are claimed, a row that cannot be decoded is skipped and logged
+    /// rather than failing the claim (it stays `Running` until its lease expires), and if
+    /// a weighted claim fails after some jobs were claimed, those jobs are returned
+    /// rather than the error, so no claimed job is lost to the caller. A claim of one job
+    /// returns these errors.
     ///
-    /// Jobs with encrypted payloads come back as a single dequeue returns them (with
-    /// their stored, encrypted payload); decrypt them with
-    /// [`JobQueue::decrypt_job`](crate::queue::JobQueue::decrypt_job) before running.
+    /// Jobs with encrypted payloads come back with their stored, encrypted payload;
+    /// decrypt them with [`JobQueue::decrypt_job`](crate::queue::JobQueue::decrypt_job)
+    /// before running.
     ///
-    /// The default implementation claims the jobs one at a time with
-    /// [`dequeue_leased`](Self::dequeue_leased) (so with weights each job picks its own
-    /// level), for backends that predate batch claims. If a claim fails after some
-    /// jobs were claimed, it returns those jobs rather than the error, so no claimed
-    /// job is lost to the caller.
-    async fn dequeue_batch_leased(
-        &self,
-        queue_name: &str,
-        weights: Option<&crate::priority::PriorityWeights>,
-        lease: std::time::Duration,
-        max_jobs: usize,
-    ) -> Result<Vec<Job>> {
-        let mut jobs = Vec::new();
-        while jobs.len() < max_jobs {
-            match self.dequeue_leased(queue_name, weights, lease).await {
-                Ok(Some(job)) => jobs.push(job),
-                Ok(None) => break,
-                Err(error) if jobs.is_empty() => return Err(error),
-                Err(error) => {
-                    tracing::warn!(
-                        "claiming a job of queue {} failed after {} were claimed: {}",
-                        queue_name,
-                        jobs.len(),
-                        error
-                    );
-                    break;
-                }
-            }
-        }
-        Ok(jobs)
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use hammerwork::queue::{DatabaseQueue, DequeueOptions};
+    /// use hammerwork::PriorityWeights;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+    /// // Up to 10 jobs, picked by priority weight, each with a 1 minute lease.
+    /// let options = DequeueOptions::batch(10)
+    ///     .with_priority_weights(PriorityWeights::new())
+    ///     .with_lease_duration(Duration::from_secs(60));
+    /// for job in queue.dequeue("emails", &options).await? {
+    ///     println!("claimed {}", job.id);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn dequeue(&self, queue_name: &str, options: &DequeueOptions) -> Result<Vec<Job>>;
+
+    /// Claim the next runnable job of `queue_name` with the default
+    /// [`DequeueOptions`]: strict priority order (highest priority first, then oldest)
+    /// and a lease of [`DEFAULT_LEASE_DURATION`]. Returns `None` when there is none or
+    /// the queue is paused.
+    ///
+    /// Shorthand for [`dequeue`](Self::dequeue) with [`DequeueOptions::new`].
+    async fn dequeue_one(&self, queue_name: &str) -> Result<Option<Job>> {
+        Ok(self
+            .dequeue(queue_name, &DequeueOptions::new())
+            .await?
+            .into_iter()
+            .next())
     }
 
     /// Hand a claimed job that was never run back to its queue.
@@ -216,18 +207,7 @@ pub trait DatabaseQueue: Send + Sync {
     /// Workers in batch mode ([`Worker::with_batch_size`](crate::worker::Worker::with_batch_size))
     /// call this on shutdown for the claimed jobs they have not started, so those jobs
     /// can run elsewhere at once instead of waiting for their leases to expire.
-    ///
-    /// The default implementation records a retry due now through
-    /// [`finish_job_run`](Self::finish_job_run), for backends that predate this method:
-    /// the job is runnable again at once, but the claim still counts as an attempt.
-    async fn release_job_run(&self, run: &Job) -> Result<bool> {
-        let outcome = JobOutcome::Retry {
-            retry_at: Utc::now(),
-            error: RELEASED_JOB_MESSAGE.to_string(),
-            timed_out: false,
-        };
-        Ok(self.finish_job_run(run, outcome).await?.is_some())
-    }
+    async fn release_job_run(&self, run: &Job) -> Result<bool>;
 
     /// Manually mark a job `Completed`.
     ///
@@ -760,39 +740,20 @@ pub trait DatabaseQueue: Send + Sync {
     /// for a single queue.
     ///
     /// [`JobArchiver::run_scheduled_pass`](crate::archive::JobArchiver::run_scheduled_pass)
-    /// uses it to apply each queue's own `purge_archived_after`. The default
-    /// implementation returns an error, for backends that predate per-queue purging.
+    /// uses it to apply each queue's own `purge_archived_after`.
     async fn purge_archived_jobs_in_queue(
         &self,
         queue_name: &str,
         older_than: DateTime<Utc>,
-    ) -> Result<u64> {
-        let _ = (queue_name, older_than);
-        Err(crate::HammerworkError::Queue {
-            message: "purging the archive of a single queue is not supported by this queue \
-                      backend"
-                .to_string(),
-        })
-    }
+    ) -> Result<u64>;
 
     /// The names of the queues that have jobs, in `hammerwork_jobs` or in the archive,
     /// sorted.
     ///
     /// [`JobArchiver::run_scheduled_pass`](crate::archive::JobArchiver::run_scheduled_pass)
     /// uses it to apply the default archival policy to every queue without a policy of
-    /// its own. The default implementation lists the queues of
-    /// [`get_all_queue_stats`](Self::get_all_queue_stats) (live jobs only).
-    async fn list_queue_names(&self) -> Result<Vec<String>> {
-        let mut names: Vec<String> = self
-            .get_all_queue_stats()
-            .await?
-            .into_iter()
-            .map(|stats| stats.queue_name)
-            .collect();
-        names.sort();
-        names.dedup();
-        Ok(names)
-    }
+    /// its own.
+    async fn list_queue_names(&self) -> Result<Vec<String>>;
 
     /// Get statistics about archived jobs.
     ///
@@ -828,7 +789,7 @@ pub trait DatabaseQueue: Send + Sync {
     /// Pause job processing for a specific queue.
     ///
     /// When a queue is paused, [`dequeue`](Self::dequeue) and
-    /// [`dequeue_with_priority_weights`](Self::dequeue_with_priority_weights) return
+    /// [`dequeue_one`](Self::dequeue_one) return
     /// no jobs from it (the check is part of the dequeue query, so it also applies to
     /// callers other than workers), but jobs already in progress continue to
     /// completion. This allows for graceful queue management without interrupting
@@ -973,55 +934,11 @@ pub trait DatabaseQueue: Send + Sync {
     ///   this one, `Manual` leaves them waiting) and a `FailFast` batch fails its
     ///   pending jobs;
     /// - workflow counters and status, and batch status, are updated.
-    ///
-    /// The default implementation composes the manual methods without a transaction,
-    /// for backends that predate this method.
     async fn finish_job_run(
         &self,
         run: &Job,
         outcome: JobOutcome,
-    ) -> Result<Option<RecordedOutcome>> {
-        let Some(current) = self.get_job(run.id).await? else {
-            return Ok(None);
-        };
-        if !lifecycle::Guard::Run(run).admits(&current) {
-            return Ok(None);
-        }
-        let next_run_at = match outcome.terminal_status() {
-            Some(_) if current.recurring => lifecycle::next_cron_run(&current, Utc::now()),
-            _ => None,
-        };
-        let mut recorded = match outcome {
-            JobOutcome::Completed => {
-                if next_run_at.is_none() {
-                    self.complete_job(run.id).await?;
-                }
-                RecordedOutcome::new(crate::job::JobStatus::Completed)
-            }
-            JobOutcome::Retry { retry_at, .. } => {
-                self.retry_job(run.id, retry_at).await?;
-                RecordedOutcome::new(crate::job::JobStatus::Pending)
-            }
-            JobOutcome::Dead { error } => {
-                self.mark_job_dead(run.id, &error).await?;
-                RecordedOutcome::new(crate::job::JobStatus::Dead)
-            }
-            JobOutcome::TimedOut { error } => {
-                self.mark_job_timed_out(run.id, &error).await?;
-                RecordedOutcome::new(crate::job::JobStatus::TimedOut)
-            }
-        };
-        if let Some(next) = next_run_at {
-            self.reschedule_cron_job(run.id, next).await?;
-            recorded.status = crate::job::JobStatus::Pending;
-            recorded.next_run_at = Some(next);
-        } else if recorded.status == crate::job::JobStatus::Completed {
-            recorded.unblocked = self.resolve_job_dependencies(run.id).await?;
-        } else if recorded.status != crate::job::JobStatus::Pending {
-            recorded.cancelled = self.fail_job_dependencies(run.id).await?;
-        }
-        Ok(Some(recorded))
-    }
+    ) -> Result<Option<RecordedOutcome>>;
 
     /// Record that a run completed and enqueue the child jobs it spawned, as one unit.
     ///
@@ -1042,38 +959,17 @@ pub trait DatabaseQueue: Send + Sync {
     /// they have finished. Each child is checked against the dependency limits
     /// ([`Job::validate_dependencies`](crate::Job::validate_dependencies)) before
     /// anything is written.
-    ///
-    /// The default implementation, for backends without transactions, enqueues the
-    /// children first and then records the completion, so a failure part-way leaves the
-    /// parent `Running` (to be retried) rather than completed without its children; a
-    /// retry may then enqueue the children again. It does not change workflow totals.
     async fn complete_job_run_with_children(
         &self,
         run: &Job,
         children: Vec<Job>,
-    ) -> Result<Option<RecordedOutcome>> {
-        let Some(current) = self.get_job(run.id).await? else {
-            return Ok(None);
-        };
-        if !lifecycle::Guard::Run(run).admits(&current) {
-            return Ok(None);
-        }
-        let mut spawned = Vec::with_capacity(children.len());
-        for child in children {
-            spawned.push(self.enqueue(child).await?);
-        }
-        let recorded = self.finish_job_run(run, JobOutcome::Completed).await?;
-        Ok(recorded.map(|mut recorded| {
-            recorded.spawned = spawned;
-            recorded
-        }))
-    }
+    ) -> Result<Option<RecordedOutcome>>;
 
     // Lease / stale job recovery
 
     /// Record a heartbeat for a run of a `Running` job and extend its lease to
     /// `now + lease` (a zero `lease` never expires, as in
-    /// [`dequeue_leased`](Self::dequeue_leased)).
+    /// [`dequeue`](Self::dequeue)).
     ///
     /// `run` is the job as returned by the dequeue. Workers call this periodically while
     /// a handler runs. The lease tells [`requeue_stale_jobs`](Self::requeue_stale_jobs)
@@ -1085,18 +981,12 @@ pub trait DatabaseQueue: Send + Sync {
     /// worker is running it again: the caller has lost its lease, and its heartbeat does
     /// not extend the new run's lease.
     ///
-    /// The default implementation returns an error, for backends that predate leases.
-    async fn heartbeat_job(&self, run: &Job, lease: std::time::Duration) -> Result<bool> {
-        let _ = (run, lease);
-        Err(crate::HammerworkError::Queue {
-            message: "job leases are not supported by this queue backend".to_string(),
-        })
-    }
+    async fn heartbeat_job(&self, run: &Job, lease: std::time::Duration) -> Result<bool>;
 
     /// Record that a claimed run is starting now, after it waited for its turn.
     ///
-    /// `run` is the job as returned by the dequeue. A batch claim
-    /// ([`dequeue_batch_leased`](Self::dequeue_batch_leased)) stamps every job's
+    /// `run` is the job as returned by the dequeue. A claim of several jobs
+    /// ([`dequeue`](Self::dequeue)) stamps every job's
     /// `started_at` with the claim time, so a job that waits in the batch would have its
     /// wait counted as processing time. If the job is still `Running` that run (as in
     /// [`heartbeat_job`](Self::heartbeat_job)), this sets its `started_at` to the current
@@ -1106,19 +996,13 @@ pub trait DatabaseQueue: Send + Sync {
     /// `Running` that run.
     ///
     /// Workers in batch mode call this for a held job when it starts.
-    ///
-    /// The default implementation only renews the lease with
-    /// [`heartbeat_job`](Self::heartbeat_job) and leaves `started_at` at the claim time,
-    /// for backends that predate this method.
-    async fn start_claimed_run(&self, run: &mut Job, lease: std::time::Duration) -> Result<bool> {
-        self.heartbeat_job(run, lease).await
-    }
+    async fn start_claimed_run(&self, run: &mut Job, lease: std::time::Duration) -> Result<bool>;
 
     /// Reclaim jobs left in `Running` by workers that crashed or were killed.
     ///
     /// A `Running` job is stale when:
     /// - it has a lease from its current run and that lease has expired. Every job
-    ///   claimed by [`dequeue`](Self::dequeue) or [`dequeue_leased`](Self::dequeue_leased)
+    ///   claimed by [`dequeue`](Self::dequeue) or [`dequeue_one`](Self::dequeue_one)
     ///   holds a lease from the moment it is claimed, so it is reclaimed only once its
     ///   worker stopped renewing it, whatever `older_than` is; or
     /// - it has no lease from its current run, because it was claimed by an older
@@ -1150,17 +1034,8 @@ pub trait DatabaseQueue: Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// The default implementation returns an error, for backends that predate leases.
-    async fn requeue_stale_jobs(
-        &self,
-        older_than: std::time::Duration,
-    ) -> Result<StaleJobRecovery> {
-        let _ = older_than;
-        Err(crate::HammerworkError::Queue {
-            message: "stale job recovery is not supported by this queue backend".to_string(),
-        })
-    }
+    async fn requeue_stale_jobs(&self, older_than: std::time::Duration)
+    -> Result<StaleJobRecovery>;
 
     /// Enforces the retention policies of encrypted jobs: deletes finished encrypted jobs
     /// whose retention period has ended.
@@ -1176,14 +1051,7 @@ pub trait DatabaseQueue: Send + Sync {
     ///
     /// Run it periodically, e.g. from a cron job or with
     /// `cargo hammerwork maintenance purge-encrypted`. It needs no encryption key.
-    ///
-    /// The default implementation returns an error, for backends without encryption
-    /// support.
-    async fn purge_expired_encrypted_jobs(&self) -> Result<EncryptedJobPurge> {
-        Err(crate::HammerworkError::Queue {
-            message: "encrypted job retention is not supported by this queue backend".to_string(),
-        })
-    }
+    async fn purge_expired_encrypted_jobs(&self) -> Result<EncryptedJobPurge>;
 }
 
 /// The outcome of [`DatabaseQueue::purge_expired_encrypted_jobs`].
@@ -1227,21 +1095,99 @@ impl StaleJobRecovery {
 pub const STALE_JOB_ERROR_MESSAGE: &str =
     "Job lease expired while Running; the worker is presumed dead and the job was reclaimed";
 
-/// Error message recorded on a job handed back by the default
-/// [`DatabaseQueue::release_job_run`] (the built-in backends release a job without one).
-pub const RELEASED_JOB_MESSAGE: &str =
-    "Job was claimed but not started; released back to its queue";
-
-/// The most jobs one [`DatabaseQueue::dequeue_batch_leased`] call claims on the built-in
+/// The most jobs one [`DatabaseQueue::dequeue`] call claims on the built-in
 /// backends; larger requests are capped at this. Keeps the claim statement (and, on
 /// MySQL, its list of ids) bounded.
 pub const MAX_DEQUEUE_BATCH_SIZE: usize = 1000;
 
-/// The lease a claim holds when the caller does not choose one:
-/// [`DatabaseQueue::dequeue`] and [`DatabaseQueue::dequeue_with_priority_weights`], and
-/// workers by default
+/// The lease a claim holds when the caller does not choose one
+/// ([`DequeueOptions::lease_duration`] is `None`, as with [`DatabaseQueue::dequeue_one`]),
+/// and workers by default
 /// ([`Worker::with_lease_duration`](crate::worker::Worker::with_lease_duration)).
 pub const DEFAULT_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What [`DatabaseQueue::dequeue`] claims: how many jobs, how it picks them by priority,
+/// and the lease it holds on them.
+///
+/// The [default](DequeueOptions::new) claims one job in strict priority order with a
+/// lease of [`DEFAULT_LEASE_DURATION`]. Build other options with the constructors and
+/// `with_*` methods:
+///
+/// ```rust
+/// use hammerwork::queue::DequeueOptions;
+/// use hammerwork::PriorityWeights;
+/// use std::time::Duration;
+///
+/// let one = DequeueOptions::new();
+/// assert_eq!(one.max_jobs, 1);
+///
+/// let batch = DequeueOptions::batch(25)
+///     .with_priority_weights(PriorityWeights::new())
+///     .with_lease_duration(Duration::from_secs(60));
+/// assert_eq!(batch.max_jobs, 25);
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DequeueOptions {
+    /// Pick the priority level by weight (see [`DatabaseQueue::dequeue`]). `None`, or
+    /// strict weights, claims in strict priority order: highest priority first, then
+    /// oldest.
+    pub priority_weights: Option<crate::priority::PriorityWeights>,
+    /// The lease each claimed job holds, from the claim on. `None` uses
+    /// [`DEFAULT_LEASE_DURATION`]; zero never expires.
+    pub lease_duration: Option<std::time::Duration>,
+    /// The most jobs to claim. Zero claims none; the built-in backends claim at most
+    /// [`MAX_DEQUEUE_BATCH_SIZE`].
+    pub max_jobs: usize,
+}
+
+impl Default for DequeueOptions {
+    fn default() -> Self {
+        Self {
+            priority_weights: None,
+            lease_duration: None,
+            max_jobs: 1,
+        }
+    }
+}
+
+impl DequeueOptions {
+    /// Claim one job, in strict priority order, with a lease of
+    /// [`DEFAULT_LEASE_DURATION`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim up to `max_jobs` jobs, in strict priority order, each with a lease of
+    /// [`DEFAULT_LEASE_DURATION`].
+    pub fn batch(max_jobs: usize) -> Self {
+        Self::new().with_max_jobs(max_jobs)
+    }
+
+    /// Claim up to `max_jobs` jobs.
+    pub fn with_max_jobs(mut self, max_jobs: usize) -> Self {
+        self.max_jobs = max_jobs;
+        self
+    }
+
+    /// Pick priority levels by `weights` (see [`DatabaseQueue::dequeue`]).
+    pub fn with_priority_weights(mut self, weights: crate::priority::PriorityWeights) -> Self {
+        self.priority_weights = Some(weights);
+        self
+    }
+
+    /// Hold a lease of `lease` on each claimed job (zero never expires).
+    pub fn with_lease_duration(mut self, lease: std::time::Duration) -> Self {
+        self.lease_duration = Some(lease);
+        self
+    }
+
+    /// The lease each claimed job holds: [`lease_duration`](Self::lease_duration), or
+    /// [`DEFAULT_LEASE_DURATION`] when it is `None`.
+    pub fn lease(&self) -> std::time::Duration {
+        self.lease_duration.unwrap_or(DEFAULT_LEASE_DURATION)
+    }
+}
 
 /// Convert a `std::time::Duration` to a `chrono::Duration`, saturating on overflow.
 pub(crate) fn saturating_chrono_duration(duration: std::time::Duration) -> chrono::Duration {
@@ -1807,6 +1753,23 @@ impl JobQueue<sqlx::MySql> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dequeue_options_default_to_one_job_strict_default_lease() {
+        let options = super::DequeueOptions::default();
+        assert_eq!(options.max_jobs, 1);
+        assert!(options.priority_weights.is_none());
+        assert_eq!(options.lease_duration, None);
+        assert_eq!(options.lease(), super::DEFAULT_LEASE_DURATION);
+
+        let options = super::DequeueOptions::batch(7)
+            .with_priority_weights(crate::priority::PriorityWeights::strict())
+            .with_lease_duration(std::time::Duration::ZERO);
+        assert_eq!(options.max_jobs, 7);
+        assert!(options.priority_weights.as_ref().unwrap().is_strict());
+        assert_eq!(options.lease(), std::time::Duration::ZERO);
+        assert_eq!(options.with_max_jobs(2).max_jobs, 2);
+    }
+
     #[test]
     fn sort_in_claim_order_is_priority_then_oldest() {
         use crate::priority::JobPriority;

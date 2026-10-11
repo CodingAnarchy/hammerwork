@@ -262,9 +262,9 @@ for (job_id, error) in &result.job_errors {
 
 A worker in batch mode claims up to `batch_size` jobs per poll in one round trip instead
 of one job per round trip, then runs them `batch_concurrency` at a time (one at a time by
-default). `with_batch_size(n)` enables batch mode; `with_batch_processing_enabled(true)`
-alone keeps the default batch size of 1, so it claims one job per poll as before and only
-adds batch statistics:
+default). `with_batch_size(n)` enables batch mode; `with_batch_size(1)` claims one job
+per poll as without batch mode and only adds batch statistics. The `[worker]` settings
+`batch_size` and `batch_concurrency` (`WorkerConfig`) set the same from configuration:
 
 ```rust,no_run
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
@@ -348,13 +348,12 @@ The queue API claims batches too, for custom consumers:
 # #[allow(unused_imports)] use hammerwork::queue::DatabaseQueue;
 # #[allow(unused_variables, unused_mut, dead_code, unreachable_code)]
 # async fn doc(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler, jobs: Vec<hammerwork::Job>, worker: hammerwork::Worker<sqlx::Postgres>, batch_id: hammerwork::BatchId) -> std::result::Result<(), Box<dyn std::error::Error>> {
-use hammerwork::{JobOutcome, queue::DatabaseQueue};
+use hammerwork::{JobOutcome, queue::{DatabaseQueue, DequeueOptions}};
 use std::time::Duration;
 
 // Up to 20 jobs, strict priority order, each leased for 2 minutes.
-let jobs = queue
-    .dequeue_batch_leased("emails", None, Duration::from_secs(120), 20)
-    .await?;
+let options = DequeueOptions::batch(20).with_lease_duration(Duration::from_secs(120));
+let jobs = queue.dequeue("emails", &options).await?;
 for job in jobs {
     let run = job.clone();
     let job = queue.decrypt_job(job).await?; // a no-op for unencrypted jobs
@@ -608,7 +607,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch_id = queue.enqueue_batch(batch).await?;
     println!("Enqueued batch: {}", batch_id);
 
-    // Worker with batch processing enabled
+    // Worker in batch mode: claims up to 20 jobs per poll
     let handler: JobHandler = Arc::new(|_job: Job| {
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -617,7 +616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let worker = Worker::new(queue.clone(), "data_processing".to_string(), handler)
-        .with_batch_processing_enabled(true);
+        .with_batch_size(20);
 
     let mut worker_pool = WorkerPool::new();
     worker_pool.add_worker(worker);

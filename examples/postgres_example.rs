@@ -56,14 +56,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create and start workers with statistics collection, timeout, and rate limiting configuration
     let worker1 = Worker::new(queue.clone(), "email".to_string(), handler.clone())
         .with_poll_interval(tokio::time::Duration::from_secs(1))
-        .with_max_retries(3)
+        .with_attempt_cap(3)
         .with_default_timeout(tokio::time::Duration::from_secs(30)) // 30 second default timeout
         .with_rate_limit(RateLimit::per_second(2)) // Limit to 2 emails per second
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let worker2 = Worker::new(queue.clone(), "notifications".to_string(), handler.clone())
         .with_poll_interval(tokio::time::Duration::from_secs(2))
-        .with_max_retries(2)
+        .with_attempt_cap(2)
         .with_default_timeout(tokio::time::Duration::from_secs(60)) // 60 second default timeout
         .with_throttle_config(
             ThrottleConfig::new()

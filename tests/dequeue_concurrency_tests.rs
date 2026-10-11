@@ -7,6 +7,7 @@
 
 mod test_utils;
 
+use hammerwork::queue::DequeueOptions;
 use hammerwork::{
     Job, JobQueue, JobStatus, PriorityWeights, ResultStorage, priority::JobPriority,
     queue::DatabaseQueue,
@@ -44,8 +45,12 @@ where
             let weights = PriorityWeights::new();
             let mut claimed = Vec::new();
             while let Some(job) = queue
-                .dequeue_with_priority_weights(&queue_name, &weights)
+                .dequeue(
+                    &queue_name,
+                    &DequeueOptions::new().with_priority_weights(weights.clone()),
+                )
                 .await
+                .map(|jobs| jobs.into_iter().next())
                 .unwrap()
             {
                 assert_eq!(job.status, JobStatus::Running);
@@ -83,8 +88,12 @@ where
     let job_id = queue.enqueue(job).await.unwrap();
 
     let dequeued = queue
-        .dequeue_with_priority_weights(&queue_name, &PriorityWeights::new())
+        .dequeue(
+            &queue_name,
+            &DequeueOptions::new().with_priority_weights(PriorityWeights::new()),
+        )
         .await
+        .map(|jobs| jobs.into_iter().next())
         .unwrap()
         .expect("job should be dequeued");
 
@@ -110,13 +119,17 @@ where
     let child_id = queue.enqueue(child).await.unwrap();
 
     assert!(
-        queue.dequeue(&child_queue).await.unwrap().is_none(),
+        queue.dequeue_one(&child_queue).await.unwrap().is_none(),
         "dequeue returned a job whose dependency has not completed"
     );
     assert!(
         queue
-            .dequeue_with_priority_weights(&child_queue, &PriorityWeights::new())
+            .dequeue(
+                &child_queue,
+                &DequeueOptions::new().with_priority_weights(PriorityWeights::new())
+            )
             .await
+            .map(|jobs| jobs.into_iter().next())
             .unwrap()
             .is_none(),
         "weighted dequeue returned a job whose dependency has not completed"
@@ -182,7 +195,7 @@ mod mysql_tests {
         }
 
         let job = queue
-            .dequeue(&queue_name)
+            .dequeue_one(&queue_name)
             .await
             .expect("dequeue must recover the abandoned transaction")
             .expect("the job must be claimable once the abandoned locks are released");

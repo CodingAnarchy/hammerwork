@@ -49,7 +49,7 @@ async fn assert_result_survives_job_completion<Q: DatabaseQueue>(
         .with_result_storage(ResultStorage::Database);
     let job_id = queue.enqueue(job).await.unwrap();
 
-    let dequeued = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
     assert_eq!(dequeued.id, job_id);
     assert_eq!(dequeued.result_config.storage, ResultStorage::Database);
 

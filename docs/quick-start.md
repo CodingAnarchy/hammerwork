@@ -113,14 +113,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create workers with comprehensive configuration
     let email_worker = Worker::new(queue.clone(), "email".to_string(), handler.clone())
         .with_poll_interval(Duration::from_secs(1))
-        .with_max_retries(3)
+        .with_attempt_cap(3)
         .with_default_timeout(Duration::from_secs(30))
         .with_rate_limit(RateLimit::per_second(2))
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let data_worker = Worker::new(queue.clone(), "data_processing".to_string(), handler.clone())
         .with_poll_interval(Duration::from_secs(2))
-        .with_max_retries(2)
+        .with_attempt_cap(2)
         .with_default_timeout(Duration::from_secs(60))
         .with_stats_collector(Arc::clone(&stats_collector));
 
@@ -263,13 +263,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create workers for different job types
     let image_worker = Worker::new(queue.clone(), "image_processing".to_string(), handler.clone())
         .with_poll_interval(Duration::from_secs(1))
-        .with_max_retries(2)
+        .with_attempt_cap(2)
         .with_default_timeout(Duration::from_secs(120))  // Longer timeout for images
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let email_worker = Worker::new(queue.clone(), "email_queue".to_string(), handler.clone())
         .with_poll_interval(Duration::from_millis(500))
-        .with_max_retries(3)
+        .with_attempt_cap(3)
         .with_default_timeout(Duration::from_secs(30))
         .with_stats_collector(Arc::clone(&stats_collector));
 
@@ -329,7 +329,7 @@ let job = Job::with_delay("queue_name".to_string(), json!({"data": "value"}), ch
 # fn example(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, stats_collector: Arc<dyn StatisticsCollector>) {
 let worker = Worker::new(queue.clone(), "queue_name".to_string(), handler)
     .with_poll_interval(Duration::from_secs(1))      // How often to check for jobs
-    .with_max_retries(3)                             // Default retry attempts
+    .with_attempt_cap(3)                             // At most 3 attempts per job
     .with_default_timeout(Duration::from_secs(30))   // Default job timeout
     .with_rate_limit(RateLimit::per_second(2))       // Rate limiting
     .with_stats_collector(stats_collector);          // Statistics collection

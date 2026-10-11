@@ -335,7 +335,8 @@ pub use priority::{
     JobPriority, PriorityError, PrioritySelectionStrategy, PriorityStats, PriorityWeights,
 };
 pub use queue::{
-    EncryptedJobPurge, JobOutcome, JobQueue, JobTransition, RecordedOutcome, StaleJobRecovery,
+    DequeueOptions, EncryptedJobPurge, JobOutcome, JobQueue, JobTransition, RecordedOutcome,
+    StaleJobRecovery,
 };
 pub use rate_limit::{RateLimit, RateLimiter, ThrottleConfig};
 pub use retry::{JitterType, RetryStrategy, fibonacci};

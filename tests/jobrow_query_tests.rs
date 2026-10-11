@@ -7,6 +7,8 @@
 mod test_utils;
 
 #[cfg(any(feature = "postgres", feature = "mysql"))]
+use hammerwork::queue::DequeueOptions;
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use hammerwork::{Job, JobPriority, queue::DatabaseQueue, workflow::DependencyStatus};
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 use serde_json::json;
@@ -69,7 +71,7 @@ mod jobrow_field_tests {
             queue.enqueue(job).await.unwrap();
 
             // This should not panic with missing field errors
-            let dequeued = queue.dequeue(&unique_queue).await.unwrap();
+            let dequeued = queue.dequeue_one(&unique_queue).await.unwrap();
             assert!(dequeued.is_some());
 
             let job = dequeued.unwrap();
@@ -96,8 +98,12 @@ mod jobrow_field_tests {
 
             // This should not panic with missing field errors
             let dequeued = queue
-                .dequeue_with_priority_weights(&unique_queue, &weights)
+                .dequeue(
+                    &unique_queue,
+                    &DequeueOptions::new().with_priority_weights(weights.clone()),
+                )
                 .await
+                .map(|jobs| jobs.into_iter().next())
                 .unwrap();
             assert!(dequeued.is_some());
 
@@ -148,7 +154,7 @@ mod jobrow_field_tests {
             let job = Job::new(unique_queue.clone(), json!({"test": "dequeue"}));
             queue.enqueue(job).await.unwrap();
 
-            let dequeued = queue.dequeue(&unique_queue).await.unwrap();
+            let dequeued = queue.dequeue_one(&unique_queue).await.unwrap();
             assert!(dequeued.is_some());
 
             let job = dequeued.unwrap();
@@ -170,8 +176,12 @@ mod jobrow_field_tests {
             queue.enqueue(job).await.unwrap();
 
             let dequeued = queue
-                .dequeue_with_priority_weights(&unique_queue, &weights)
+                .dequeue(
+                    &unique_queue,
+                    &DequeueOptions::new().with_priority_weights(weights.clone()),
+                )
                 .await
+                .map(|jobs| jobs.into_iter().next())
                 .unwrap();
             assert!(dequeued.is_some());
 

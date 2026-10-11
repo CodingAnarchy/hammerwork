@@ -130,7 +130,7 @@ async fn test_jsonb_operations(
     queue.enqueue(job).await?;
     info!("✅ Complex JSONB job enqueued");
 
-    let dequeued_job = queue.dequeue("jsonb_test").await?;
+    let dequeued_job = queue.dequeue_one("jsonb_test").await?;
     assert!(dequeued_job.is_some());
     let dequeued_job = dequeued_job.unwrap();
 
@@ -175,7 +175,7 @@ async fn test_postgres_features(
     for worker_id in 0..3 {
         let queue_clone = queue.clone();
         let handle = tokio::spawn(async move {
-            let result = queue_clone.dequeue("postgres_concurrent").await;
+            let result = queue_clone.dequeue_one("postgres_concurrent").await;
             (worker_id, result)
         });
         handles.push(handle);
@@ -260,7 +260,7 @@ async fn run_performance_tests(
     let mut dequeued_count = 0;
 
     for _ in 0..job_count {
-        if let Ok(Some(job)) = queue.dequeue("performance_test").await {
+        if let Ok(Some(job)) = queue.dequeue_one("performance_test").await {
             dequeued_count += 1;
             let _ = queue.complete_job(job.id).await;
         }

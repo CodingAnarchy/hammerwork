@@ -11,6 +11,7 @@
 //! - Testing error scenarios and edge cases
 
 use chrono::Duration;
+use hammerwork::queue::DequeueOptions;
 use hammerwork::{
     Job, JobPriority, JobStatus,
     batch::JobBatch,
@@ -170,7 +171,7 @@ async fn basic_usage() -> Result<(), Box<dyn std::error::Error>> {
     println!("📊 Pending jobs: {}", pending_count);
 
     // Dequeue and process
-    if let Some(job) = queue.dequeue("email_queue").await? {
+    if let Some(job) = queue.dequeue_one("email_queue").await? {
         println!("🔄 Processing job: {}", job.id);
 
         // Simulate processing
@@ -218,8 +219,8 @@ async fn time_control_example() -> Result<(), Box<dyn std::error::Error>> {
     println!("⏳ Enqueued delayed job: {} (1 hour delay)", delayed_id);
 
     // Only immediate job should be available
-    assert!(queue.dequeue("delayed_queue").await?.is_some());
-    assert!(queue.dequeue("delayed_queue").await?.is_none());
+    assert!(queue.dequeue_one("delayed_queue").await?.is_some());
+    assert!(queue.dequeue_one("delayed_queue").await?.is_none());
     println!("✅ Only immediate job was available");
 
     // Advance time by 1 hour
@@ -227,7 +228,7 @@ async fn time_control_example() -> Result<(), Box<dyn std::error::Error>> {
     println!("🕐 Advanced time by 1 hour");
 
     // Now delayed job should be available
-    if let Some(job) = queue.dequeue("delayed_queue").await? {
+    if let Some(job) = queue.dequeue_one("delayed_queue").await? {
         assert_eq!(job.id, delayed_id);
         queue.complete_job(job.id).await?;
         println!("✅ Delayed job is now available and processed");
@@ -268,7 +269,7 @@ async fn priority_example() -> Result<(), Box<dyn std::error::Error>> {
     // Dequeue in priority order
     let order = [critical_id, high_id, normal_id, low_id];
     for (i, expected_id) in order.iter().enumerate() {
-        if let Some(job) = queue.dequeue("priority_queue").await? {
+        if let Some(job) = queue.dequeue_one("priority_queue").await? {
             assert_eq!(job.id, *expected_id);
             queue.complete_job(job.id).await?;
             println!("   {}. Processed: {} ({:?})", i + 1, job.id, job.priority);
@@ -295,8 +296,12 @@ async fn priority_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process with weighted selection
     while let Some(job) = queue
-        .dequeue_with_priority_weights("weighted_queue", &weights)
-        .await?
+        .dequeue(
+            "weighted_queue",
+            &DequeueOptions::new().with_priority_weights(weights.clone()),
+        )
+        .await
+        .map(|jobs| jobs.into_iter().next())?
     {
         println!("   Selected: {:?} priority job", job.priority);
         queue.complete_job(job.id).await?;
@@ -338,7 +343,7 @@ async fn batch_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process batch jobs
     let mut processed = 0;
-    while let Some(job) = queue.dequeue("image_queue").await? {
+    while let Some(job) = queue.dequeue_one("image_queue").await? {
         println!("🖼️  Processing image job: {}", job.id);
 
         match image_handler(job.clone()).await {
@@ -435,7 +440,7 @@ async fn workflow_example() -> Result<(), Box<dyn std::error::Error>> {
     for (i, step) in job_steps.iter().enumerate() {
         println!("\n📝 Step {}: {}", i + 1, step);
 
-        if let Some(job) = queue.dequeue("data_pipeline").await? {
+        if let Some(job) = queue.dequeue_one("data_pipeline").await? {
             let job_step = job.payload["step"].as_str().unwrap();
             assert_eq!(job_step, *step);
 
@@ -502,7 +507,7 @@ async fn error_handling_example() -> Result<(), Box<dyn std::error::Error>> {
     println!("📧 Enqueued failing job: {}", job_id);
 
     // Attempt 1
-    if let Some(job) = queue.dequeue("email_queue").await? {
+    if let Some(job) = queue.dequeue_one("email_queue").await? {
         println!("\n🔄 Attempt 1:");
         match email_handler(job.clone()).await {
             Err(e) => {
@@ -528,7 +533,7 @@ async fn error_handling_example() -> Result<(), Box<dyn std::error::Error>> {
     clock.advance(Duration::minutes(5));
 
     // Attempt 2
-    if let Some(job) = queue.dequeue("email_queue").await? {
+    if let Some(job) = queue.dequeue_one("email_queue").await? {
         println!("\n🔄 Attempt 2:");
         match email_handler(job.clone()).await {
             Err(e) => {
@@ -547,7 +552,7 @@ async fn error_handling_example() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Attempt 3 (final)
-    if let Some(job) = queue.dequeue("email_queue").await? {
+    if let Some(job) = queue.dequeue_one("email_queue").await? {
         println!("\n🔄 Attempt 3 (final):");
         match email_handler(job.clone()).await {
             Err(e) => {
@@ -608,7 +613,7 @@ async fn cron_job_example() -> Result<(), Box<dyn std::error::Error>> {
         clock.advance(Duration::hours(1));
 
         // Process the job
-        if let Some(job) = queue.dequeue("maintenance_queue").await? {
+        if let Some(job) = queue.dequeue_one("maintenance_queue").await? {
             println!("   🧹 Running maintenance task");
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             queue.complete_job(job.id).await?;
@@ -651,7 +656,7 @@ async fn result_storage_example() -> Result<(), Box<dyn std::error::Error>> {
     println!("🧮 Enqueued computation job: {}", job_id);
 
     // Process the job
-    if let Some(job) = queue.dequeue("compute_queue").await? {
+    if let Some(job) = queue.dequeue_one("compute_queue").await? {
         println!("🔄 Computing fibonacci(20)...");
 
         // Simulate computation
@@ -725,7 +730,7 @@ async fn worker_integration_example() -> Result<(), Box<dyn std::error::Error>> 
     println!("🔄 Processing jobs manually (TestQueue doesn't support Worker):");
 
     let mut processed_count = 0;
-    while let Some(job) = queue.dequeue("worker_queue").await? {
+    while let Some(job) = queue.dequeue_one("worker_queue").await? {
         let batch_id = job.payload["batch_id"].as_u64().unwrap();
         let data = job.payload["data"].as_str().unwrap();
 
@@ -789,7 +794,7 @@ async fn performance_testing_example() -> Result<(), Box<dyn std::error::Error>>
     let process_start = std::time::Instant::now();
     let mut processed = 0;
 
-    while let Some(job) = queue.dequeue("perf_queue").await? {
+    while let Some(job) = queue.dequeue_one("perf_queue").await? {
         // Minimal processing
         queue.complete_job(job.id).await?;
         processed += 1;

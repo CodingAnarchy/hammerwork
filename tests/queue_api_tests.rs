@@ -111,7 +111,11 @@ where
     queue.fail_job(failed, &error).await.unwrap();
     // Complete one job through the normal path so it has timings.
     let job = loop {
-        let job = queue.dequeue(&queue_name).await.unwrap().expect("a job");
+        let job = queue
+            .dequeue_one(&queue_name)
+            .await
+            .unwrap()
+            .expect("a job");
         if job.id == done {
             break job;
         }
@@ -266,7 +270,7 @@ where
     assert_eq!(job.next_run_at, None);
     assert_eq!(job.status, JobStatus::Pending);
     assert!(
-        queue.dequeue(&queue_name).await.unwrap().is_none(),
+        queue.dequeue_one(&queue_name).await.unwrap().is_none(),
         "a disabled recurring job ran"
     );
 
@@ -280,12 +284,16 @@ where
         "{job:?}"
     );
     assert_eq!(job.next_run_at, Some(job.scheduled_at));
-    assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+    assert!(queue.dequeue_one(&queue_name).await.unwrap().is_none());
     queue.delete_job(held).await.unwrap();
 
     // A run in progress finishes; without `recurring` it is not rescheduled.
     let finished = queue.enqueue(due_cron_job()).await.unwrap();
-    let run = queue.dequeue(&queue_name).await.unwrap().expect("due job");
+    let run = queue
+        .dequeue_one(&queue_name)
+        .await
+        .unwrap()
+        .expect("due job");
     assert_eq!(run.id, finished);
     queue.disable_recurring_job(finished).await.unwrap();
     queue
@@ -323,7 +331,11 @@ where
     assert!(queue.enable_recurring_job(plain).await.is_err());
     // A plain job (no cron schedule) is not held.
     assert_eq!(
-        queue.dequeue(&queue_name).await.unwrap().map(|job| job.id),
+        queue
+            .dequeue_one(&queue_name)
+            .await
+            .unwrap()
+            .map(|job| job.id),
         Some(plain)
     );
     queue.delete_job(plain).await.unwrap();
@@ -349,7 +361,11 @@ where
     let only_this_job = |jobs: Vec<Job>| jobs.iter().map(|j| j.id).collect::<Vec<_>>() == [id];
 
     // A successful run: the same job goes back to Pending for its next slot.
-    let run = queue.dequeue(&queue_name).await.unwrap().expect("due job");
+    let run = queue
+        .dequeue_one(&queue_name)
+        .await
+        .unwrap()
+        .expect("due job");
     assert_eq!(run.id, id);
     let recorded = queue
         .finish_job_run(&run, JobOutcome::Completed)
@@ -384,7 +400,11 @@ where
     ));
 
     // A failed run: also rescheduled in place, keeping the error until the next run.
-    let run = queue.dequeue(&queue_name).await.unwrap().expect("due job");
+    let run = queue
+        .dequeue_one(&queue_name)
+        .await
+        .unwrap()
+        .expect("due job");
     assert_eq!(run.id, id);
     let recorded = queue
         .finish_job_run(
@@ -543,7 +563,7 @@ where
     );
 
     // Completing `a` (as a worker would) and resolving makes `b` ready.
-    let job = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    let job = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
     assert_eq!(job.id, a_id);
     queue.complete_job(a_id).await.unwrap();
     queue.resolve_job_dependencies(a_id).await.unwrap();

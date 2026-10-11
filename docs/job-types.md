@@ -110,9 +110,9 @@ let job = Job::new("api_call".to_string(), json!({"url": "https://api.example.co
     .with_max_attempts(5); // At most 5 attempts in total (the first run plus 4 retries)
 
 // Worker-level retry configuration. The job's max_attempts is the limit;
-// with_max_retries only caps it for jobs processed by this worker.
+// with_attempt_cap only caps it for jobs processed by this worker.
 let worker = Worker::new(queue, "default".to_string(), handler)
-    .with_max_retries(3)
+    .with_attempt_cap(3)
     .with_retry_delay(std::time::Duration::from_secs(30)); // Wait 30s between retries
 # Ok(())
 # }

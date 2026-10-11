@@ -3,6 +3,7 @@
 #![cfg(feature = "test-queue")]
 
 use chrono::Duration;
+use hammerwork::queue::DequeueOptions;
 use hammerwork::{
     Job, JobPriority, JobStatus,
     batch::{BatchStatus, JobBatch, PartialFailureMode},
@@ -22,13 +23,13 @@ async fn test_queue_basic_operations() {
     let queue = TestQueue::new();
 
     // Test empty queue
-    assert!(queue.dequeue("empty_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("empty_queue").await.unwrap().is_none());
 
     // Enqueue and dequeue
     let job = Job::new("test_queue".to_string(), json!({"test": "data"}));
     let job_id = queue.enqueue(job.clone()).await.unwrap();
 
-    let dequeued = queue.dequeue("test_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("test_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.id, job_id);
     assert_eq!(dequeued.status, JobStatus::Running);
     assert!(dequeued.started_at.is_some());
@@ -62,23 +63,23 @@ async fn test_priority_ordering() {
 
     // Dequeue should follow priority order
     assert_eq!(
-        queue.dequeue("prio_queue").await.unwrap().unwrap().id,
+        queue.dequeue_one("prio_queue").await.unwrap().unwrap().id,
         critical_id
     );
     assert_eq!(
-        queue.dequeue("prio_queue").await.unwrap().unwrap().id,
+        queue.dequeue_one("prio_queue").await.unwrap().unwrap().id,
         high_id
     );
     assert_eq!(
-        queue.dequeue("prio_queue").await.unwrap().unwrap().id,
+        queue.dequeue_one("prio_queue").await.unwrap().unwrap().id,
         normal_id
     );
     assert_eq!(
-        queue.dequeue("prio_queue").await.unwrap().unwrap().id,
+        queue.dequeue_one("prio_queue").await.unwrap().unwrap().id,
         low_id
     );
     assert_eq!(
-        queue.dequeue("prio_queue").await.unwrap().unwrap().id,
+        queue.dequeue_one("prio_queue").await.unwrap().unwrap().id,
         background_id
     );
 }
@@ -116,8 +117,12 @@ async fn test_weighted_priority_selection() {
     // Dequeue with weights and count priorities
     let mut priority_counts = HashMap::new();
     while let Some(job) = queue
-        .dequeue_with_priority_weights("weighted_queue", &weights)
+        .dequeue(
+            "weighted_queue",
+            &DequeueOptions::new().with_priority_weights(weights.clone()),
+        )
         .await
+        .map(|jobs| jobs.into_iter().next())
         .unwrap()
     {
         *priority_counts.entry(job.priority).or_insert(0) += 1;
@@ -152,27 +157,42 @@ async fn test_delayed_jobs_with_time_control() {
 
     // Only immediate job should be available
     assert_eq!(
-        queue.dequeue("delayed_queue").await.unwrap().unwrap().id,
+        queue
+            .dequeue_one("delayed_queue")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
         immediate_id
     );
-    assert!(queue.dequeue("delayed_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("delayed_queue").await.unwrap().is_none());
 
     // Advance time by 1 hour
     clock.advance(Duration::hours(1));
 
     // Now 1h delayed job should be available
     assert_eq!(
-        queue.dequeue("delayed_queue").await.unwrap().unwrap().id,
+        queue
+            .dequeue_one("delayed_queue")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
         delayed_1h_id
     );
-    assert!(queue.dequeue("delayed_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("delayed_queue").await.unwrap().is_none());
 
     // Advance time by another hour
     clock.advance(Duration::hours(1));
 
     // Now 2h delayed job should be available
     assert_eq!(
-        queue.dequeue("delayed_queue").await.unwrap().unwrap().id,
+        queue
+            .dequeue_one("delayed_queue")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
         delayed_2h_id
     );
 }
@@ -190,7 +210,7 @@ async fn test_job_retry_mechanism() {
     // job has attempts left and mark it dead once they are used up.
 
     // First attempt - dequeue and fail
-    let dequeued = queue.dequeue("retry_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("retry_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.attempts, 1);
     assert!(dequeued.attempts < dequeued.max_attempts);
 
@@ -202,19 +222,19 @@ async fn test_job_retry_mechanism() {
     assert_eq!(job.attempts, 1);
 
     // Job should not be available immediately
-    assert!(queue.dequeue("retry_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("retry_queue").await.unwrap().is_none());
 
     // Advance time
     clock.advance(Duration::minutes(10));
 
     // Second attempt - fail again
-    let dequeued = queue.dequeue("retry_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("retry_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.id, job_id);
     assert_eq!(dequeued.attempts, 2);
     queue.retry_job(job_id, clock.now()).await.unwrap();
 
     // Third attempt - the last one: mark as dead
-    let dequeued = queue.dequeue("retry_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("retry_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.attempts, dequeued.max_attempts);
     queue.mark_job_dead(job_id, "Third failure").await.unwrap();
 
@@ -256,7 +276,7 @@ async fn test_batch_operations() {
 
     // Process jobs
     for i in 0..4 {
-        if let Some(job) = queue.dequeue("batch_queue").await.unwrap() {
+        if let Some(job) = queue.dequeue_one("batch_queue").await.unwrap() {
             if i == 2 {
                 // Fail the third job (a terminal failure)
                 queue.fail_job(job.id, "Planned failure").await.unwrap();
@@ -293,12 +313,12 @@ async fn test_batch_fail_fast() {
     let batch_id = queue.enqueue_batch(batch).await.unwrap();
 
     // Process first job successfully
-    if let Some(job) = queue.dequeue("failfast_queue").await.unwrap() {
+    if let Some(job) = queue.dequeue_one("failfast_queue").await.unwrap() {
         queue.complete_job(job.id).await.unwrap();
     }
 
     // Fail second job
-    if let Some(job) = queue.dequeue("failfast_queue").await.unwrap() {
+    if let Some(job) = queue.dequeue_one("failfast_queue").await.unwrap() {
         queue.fail_job(job.id, "Failure").await.unwrap();
     }
 
@@ -307,7 +327,7 @@ async fn test_batch_fail_fast() {
     assert_eq!(status.status, BatchStatus::Failed);
     assert_eq!(status.completed_jobs, 1);
     assert_eq!(status.failed_jobs, 2);
-    assert!(queue.dequeue("failfast_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("failfast_queue").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -341,27 +361,41 @@ async fn test_workflow_with_dependencies() {
     let workflow_id = queue.enqueue_workflow(workflow).await.unwrap();
 
     // Only A should be available
-    let dequeued = queue.dequeue("workflow_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("workflow_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.id, id_a);
-    assert!(queue.dequeue("workflow_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("workflow_queue").await.unwrap().is_none());
 
     // Complete A
     queue.complete_job(id_a).await.unwrap();
 
     // B and C should now be available
     let mut dequeued_ids = vec![];
-    dequeued_ids.push(queue.dequeue("workflow_queue").await.unwrap().unwrap().id);
-    dequeued_ids.push(queue.dequeue("workflow_queue").await.unwrap().unwrap().id);
+    dequeued_ids.push(
+        queue
+            .dequeue_one("workflow_queue")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+    );
+    dequeued_ids.push(
+        queue
+            .dequeue_one("workflow_queue")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+    );
     assert!(dequeued_ids.contains(&id_b));
     assert!(dequeued_ids.contains(&id_c));
-    assert!(queue.dequeue("workflow_queue").await.unwrap().is_none());
+    assert!(queue.dequeue_one("workflow_queue").await.unwrap().is_none());
 
     // Complete B and C
     queue.complete_job(id_b).await.unwrap();
     queue.complete_job(id_c).await.unwrap();
 
     // D should now be available
-    let dequeued = queue.dequeue("workflow_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("workflow_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.id, id_d);
 
     // Complete D
@@ -394,7 +428,7 @@ async fn test_workflow_failure_policies() {
     let workflow_id = queue.enqueue_workflow(workflow).await.unwrap();
 
     // Fail the first job (a terminal failure)
-    let dequeued = queue.dequeue("failfast_wf").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("failfast_wf").await.unwrap().unwrap();
     queue.fail_job(dequeued.id, "Test failure").await.unwrap();
 
     // Other jobs should have been failed due to fail-fast policy
@@ -445,7 +479,7 @@ async fn test_cron_job_scheduling() {
 
     // Process the first run
     clock.advance(Duration::hours(1));
-    let dequeued = queue.dequeue("cron_queue").await.unwrap().unwrap();
+    let dequeued = queue.dequeue_one("cron_queue").await.unwrap().unwrap();
     assert_eq!(dequeued.id, job_id);
     queue
         .finish_job_run(&dequeued, hammerwork::queue::JobOutcome::Completed)
@@ -497,7 +531,7 @@ async fn test_dead_job_management() {
 
         // Dequeue and mark as dead
         queue
-            .dequeue(&format!("dead_queue_{}", i % 2))
+            .dequeue_one(&format!("dead_queue_{}", i % 2))
             .await
             .unwrap();
         queue
@@ -559,7 +593,7 @@ async fn test_timeout_handling() {
     let job_id = queue.enqueue(job).await.unwrap();
 
     // Dequeue and mark as timed out
-    queue.dequeue("timeout_queue").await.unwrap();
+    queue.dequeue_one("timeout_queue").await.unwrap();
     queue
         .mark_job_timed_out(job_id, "Operation timed out")
         .await
@@ -583,7 +617,7 @@ async fn test_job_result_storage() {
     let job = Job::new("result_queue".to_string(), json!({"compute": "fibonacci"}));
     let job_id = queue.enqueue(job).await.unwrap();
 
-    queue.dequeue("result_queue").await.unwrap();
+    queue.dequeue_one("result_queue").await.unwrap();
     queue.complete_job(job_id).await.unwrap();
 
     // Store job result with expiration
@@ -682,7 +716,7 @@ async fn test_queue_statistics() {
 
     // Process some jobs
     for i in 0..5 {
-        if let Some(job) = queue.dequeue("stats_queue").await.unwrap() {
+        if let Some(job) = queue.dequeue_one("stats_queue").await.unwrap() {
             // Simulate processing time
             clock.advance(Duration::milliseconds(100 + i * 50));
 
@@ -752,7 +786,7 @@ async fn test_queue_depth() {
 
     // Process some jobs
     for _ in 0..2 {
-        if let Some(job) = queue.dequeue("depth_queue").await.unwrap() {
+        if let Some(job) = queue.dequeue_one("depth_queue").await.unwrap() {
             queue.complete_job(job.id).await.unwrap();
         }
     }
@@ -794,7 +828,7 @@ async fn test_concurrent_operations() {
     for _ in 0..5 {
         let queue_clone = queue.clone();
         let handle = tokio::spawn(async move {
-            if let Some(job) = queue_clone.dequeue("concurrent_queue").await.unwrap() {
+            if let Some(job) = queue_clone.dequeue_one("concurrent_queue").await.unwrap() {
                 // Simulate processing
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 queue_clone.complete_job(job.id).await
@@ -841,7 +875,7 @@ async fn test_workflow_cancellation() {
     let workflow_id = queue.enqueue_workflow(workflow).await.unwrap();
 
     // Process one job
-    if let Some(job) = queue.dequeue("cancel_queue").await.unwrap() {
+    if let Some(job) = queue.dequeue_one("cancel_queue").await.unwrap() {
         queue.complete_job(job.id).await.unwrap();
     }
 
@@ -883,7 +917,7 @@ async fn test_get_all_jobs() {
 
     // Process some jobs
     for _ in 0..2 {
-        if let Some(job) = queue.dequeue("queue_0").await.unwrap() {
+        if let Some(job) = queue.dequeue_one("queue_0").await.unwrap() {
             queue.complete_job(job.id).await.unwrap();
         }
     }

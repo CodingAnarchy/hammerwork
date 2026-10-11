@@ -11,7 +11,7 @@ use crate::{
     error::HammerworkError,
     job::Job,
     priority::PriorityWeights,
-    queue::{DatabaseQueue, JobOutcome, JobQueue, RecordedOutcome},
+    queue::{DatabaseQueue, DequeueOptions, JobOutcome, JobQueue, RecordedOutcome},
     rate_limit::{RateLimit, RateLimiter, ThrottleConfig},
     retry::RetryStrategy,
     stats::{JobEvent, JobEventType, StatisticsCollector},
@@ -88,9 +88,8 @@ pub const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Floor on the heartbeat interval derived from the lease duration.
 const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Default number of jobs a worker in batch mode claims per poll: one, so
-/// `with_batch_processing_enabled(true)` alone keeps claiming one job at a time (as before
-/// 2.1) and only adds batch statistics. Set a larger size with [`Worker::with_batch_size`].
+/// The batch size a worker reports ([`Worker::batch_size`]) until
+/// [`Worker::with_batch_size`] enables batch mode: one job per poll.
 pub const DEFAULT_BATCH_SIZE: usize = 1;
 
 /// Default number of claimed jobs a worker in batch mode runs at once
@@ -176,7 +175,7 @@ fn batch_counts_as_successful(result: &crate::batch::BatchResult) -> bool {
 }
 
 /// How many attempts a job gets: its own `max_attempts`, lowered by the worker's cap
-/// (`Worker::with_max_retries`) when one is set.
+/// (`Worker::with_attempt_cap`) when one is set.
 fn effective_attempt_limit(job_max_attempts: i32, worker_cap: Option<i32>) -> i32 {
     match worker_cap {
         Some(cap) => job_max_attempts.min(cap),
@@ -507,7 +506,7 @@ pub enum JobHandlerType {
 ///
 /// let worker = Worker::new(queue, "email_queue".to_string(), handler)
 ///     .with_poll_interval(std::time::Duration::from_millis(500))
-///     .with_max_retries(5);
+///     .with_attempt_cap(5);
 ///
 /// // Start processing jobs
 /// let mut pool = hammerwork::WorkerPool::new();
@@ -557,7 +556,7 @@ pub struct Worker<DB: Database> {
     /// How often to poll for new jobs
     poll_interval: Duration,
     /// Maximum number of retry attempts for failed jobs
-    max_retries: Option<i32>,
+    attempt_cap: Option<i32>,
     /// Delay between retry attempts
     retry_delay: Duration,
     /// Default retry strategy for failed jobs (overrides retry_delay if specified)
@@ -618,7 +617,7 @@ where
             queue_name: self.queue_name.clone(),
             handler: self.handler.clone(),
             poll_interval: self.poll_interval,
-            max_retries: self.max_retries,
+            attempt_cap: self.attempt_cap,
             retry_delay: self.retry_delay,
             default_retry_strategy: self.default_retry_strategy.clone(),
             default_timeout: self.default_timeout,
@@ -659,7 +658,7 @@ where
     /// - 1 second polling interval
     /// - no cap on attempts: each job runs up to its own
     ///   [`max_attempts`](crate::Job::with_max_attempts) (3 unless set); see
-    ///   [`with_max_retries`](Self::with_max_retries)
+    ///   [`with_attempt_cap`](Self::with_attempt_cap)
     /// - 30 second retry delay
     /// - a [lease](Self::with_lease_duration) of [`DEFAULT_LEASE_DURATION`] (5 minutes)
     /// - No timeout, rate limiting, or priority configuration
@@ -709,7 +708,7 @@ where
             queue_name,
             handler: JobHandlerType::Legacy(handler),
             poll_interval: Duration::from_secs(1),
-            max_retries: None,
+            attempt_cap: None,
             retry_delay: Duration::from_secs(30),
             default_retry_strategy: None,
             default_timeout: None,
@@ -788,7 +787,7 @@ where
             queue_name,
             handler: JobHandlerType::WithResult(handler),
             poll_interval: Duration::from_secs(1),
-            max_retries: None,
+            attempt_cap: None,
             retry_delay: Duration::from_secs(30),
             default_retry_strategy: None,
             default_timeout: None,
@@ -899,16 +898,13 @@ where
     /// A job's own [`max_attempts`](crate::Job::with_max_attempts) is the source of
     /// truth: a failing (or timing-out) job runs up to `max_attempts` times and then
     /// becomes `Dead` (or `TimedOut`). This setting only lowers that limit: the
-    /// effective limit is `min(job.max_attempts, max_retries)`. By default there is no
-    /// cap.
+    /// effective limit is `min(job.max_attempts, cap)`. By default there is no cap.
     ///
-    /// Previously this value replaced the job's `max_attempts` (default 3), so jobs
-    /// with `with_max_attempts(5)` stopped after 3 runs in a non-retried `Failed`
-    /// state, and `with_max_attempts(1)` still ran 3 times.
+    /// Before 3.0 this was `with_max_retries`.
     ///
     /// # Arguments
     ///
-    /// * `max_retries` - Maximum number of attempts per job on this worker
+    /// * `cap` - Maximum number of attempts per job on this worker
     ///
     /// # Examples
     ///
@@ -925,12 +921,12 @@ where
     /// // job itself allows more attempts. To give jobs *more* attempts, raise their own
     /// // limit with `Job::with_max_attempts`; this setting can only lower it.
     /// let expensive_worker = Worker::new(queue, "expensive".to_string(), handler)
-    ///     .with_max_retries(2);
+    ///     .with_attempt_cap(2);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_max_retries(mut self, max_retries: i32) -> Self {
-        self.max_retries = Some(max_retries);
+    pub fn with_attempt_cap(mut self, cap: i32) -> Self {
+        self.attempt_cap = Some(cap);
         self
     }
 
@@ -1073,8 +1069,8 @@ where
     /// Set the lease the worker holds on a running job.
     ///
     /// The lease is taken in the same statement that claims the job
-    /// ([`DatabaseQueue::dequeue_leased`]). While the handler runs, the worker records a
-    /// heartbeat and extends the lease every third of this duration (via
+    /// ([`DequeueOptions::lease_duration`]). While the handler runs, the worker records
+    /// a heartbeat and extends the lease every third of this duration (via
     /// [`DatabaseQueue::heartbeat_job`]). If the worker process dies, the lease stops
     /// being renewed and [`DatabaseQueue::requeue_stale_jobs`] reclaims the job once it
     /// expires; a reaper never reclaims a job whose lease is still valid, whatever its
@@ -1117,13 +1113,23 @@ where
     /// Apply a [`WorkerConfig`](crate::config::WorkerConfig).
     ///
     /// Sets the poll interval, default job timeout, priority weights and default retry
-    /// strategy. `pool_size` and the autoscaling settings apply to a [`WorkerPool`]; see
-    /// [`WorkerPool::from_config`].
+    /// strategy, and the batch size ([`with_batch_size`](Self::with_batch_size)) and
+    /// batch concurrency ([`with_batch_concurrency`](Self::with_batch_concurrency)) when
+    /// the configuration sets them. `pool_size` and the autoscaling settings apply to a
+    /// [`WorkerPool`]; see [`WorkerPool::from_config`].
     pub fn with_config(self, config: &crate::config::WorkerConfig) -> Self {
-        self.with_poll_interval(config.polling_interval)
+        let mut worker = self
+            .with_poll_interval(config.polling_interval)
             .with_default_timeout(config.job_timeout)
             .with_priority_weights(config.priority_weights.clone())
-            .with_default_retry_strategy(config.retry_strategy.clone())
+            .with_default_retry_strategy(config.retry_strategy.clone());
+        if let Some(size) = config.batch_size {
+            worker = worker.with_batch_size(size);
+        }
+        if let Some(concurrency) = config.batch_concurrency {
+            worker = worker.with_batch_concurrency(concurrency);
+        }
+        worker
     }
 
     /// Apply the worker-related sections of a [`HammerworkConfig`](crate::HammerworkConfig).
@@ -1274,14 +1280,21 @@ where
         self
     }
 
-    /// Enable batch processing: claim jobs in batches, and track statistics of jobs that
-    /// belong to a [`JobBatch`](crate::batch::JobBatch) ([`get_batch_stats`](Self::get_batch_stats)).
+    /// Enable batch mode: claim up to `size` jobs per poll in one round trip
+    /// ([`DatabaseQueue::dequeue`]), and track statistics of jobs that belong to a
+    /// [`JobBatch`](crate::batch::JobBatch) ([`get_batch_stats`](Self::get_batch_stats)).
     ///
-    /// In batch mode the worker claims up to [`batch_size`](Self::with_batch_size) jobs
-    /// per poll in one round trip ([`DatabaseQueue::dequeue_batch_leased`]) and runs them
-    /// [`batch_concurrency`](Self::with_batch_concurrency) at a time, one at a time by
-    /// default. Every claimed job goes through the same path as a single claim: its own
-    /// timeout, retries, hooks, events, spawning, result storage and statistics.
+    /// Without this (the default), the worker claims and runs one job at a time and
+    /// keeps no batch statistics. Values below 1 are raised to 1: `with_batch_size(1)`
+    /// keeps claiming one job at a time but adds batch statistics. The built-in backends
+    /// claim at most [`MAX_DEQUEUE_BATCH_SIZE`](crate::queue::MAX_DEQUEUE_BATCH_SIZE)
+    /// jobs at once. [`WorkerConfig::batch_size`](crate::config::WorkerConfig::batch_size)
+    /// sets it from configuration.
+    ///
+    /// The claimed jobs run [`batch_concurrency`](Self::with_batch_concurrency) at a
+    /// time, one at a time by default. Every claimed job goes through the same path as a
+    /// single claim: its own timeout, retries, hooks, events, spawning, result storage
+    /// and statistics.
     ///
     /// - **Leases.** Each claimed job holds its own lease from the moment it is claimed.
     ///   While a job waits for its turn, the worker renews its lease with heartbeats
@@ -1319,38 +1332,7 @@ where
     ///
     /// Batch claims cut the database round trips per job; holding jobs a worker has not
     /// started yet keeps them from idle workers, so keep batches small relative to the
-    /// queue when jobs are slow. With batch processing off (the default), the worker
-    /// claims and runs one job at a time.
-    ///
-    /// # Examples
-    ///
-    #[cfg_attr(feature = "postgres", doc = "```rust,no_run")]
-    #[cfg_attr(not(feature = "postgres"), doc = "```rust,ignore")]
-    /// use hammerwork::Worker;
-    /// # use std::sync::Arc;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/test").await?;
-    /// # let queue = Arc::new(hammerwork::JobQueue::new(pool));
-    /// # let handler: hammerwork::worker::JobHandler = Arc::new(|job| Box::pin(async move { Ok(()) }));
-    ///
-    /// // Keep statistics for job batches; jobs are still claimed one at a time. Use
-    /// // `with_batch_size` to claim several jobs per poll.
-    /// let worker = Worker::new(queue, "batch_queue".to_string(), handler)
-    ///     .with_batch_processing_enabled(true);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn with_batch_processing_enabled(mut self, enabled: bool) -> Self {
-        self.batch_processing_enabled = enabled;
-        self
-    }
-
-    /// Claim up to `size` jobs per poll, and enable batch processing (see
-    /// [`with_batch_processing_enabled`](Self::with_batch_processing_enabled)).
-    ///
-    /// Defaults to [`DEFAULT_BATCH_SIZE`] (1). Values below 1 are raised to 1, and the
-    /// built-in backends claim at most
-    /// [`MAX_DEQUEUE_BATCH_SIZE`](crate::queue::MAX_DEQUEUE_BATCH_SIZE) jobs at once.
+    /// queue when jobs are slow.
     ///
     /// # Examples
     ///
@@ -1388,8 +1370,7 @@ where
         self
     }
 
-    /// Whether batch processing is enabled (see
-    /// [`with_batch_processing_enabled`](Self::with_batch_processing_enabled)).
+    /// Whether batch mode is enabled (see [`with_batch_size`](Self::with_batch_size)).
     pub fn is_batch_processing_enabled(&self) -> bool {
         self.batch_processing_enabled
     }
@@ -1882,13 +1863,20 @@ where
             return Ok(None);
         }
 
-        self.queue
-            .dequeue_leased(
-                &self.queue_name,
-                self.priority_weights.as_ref(),
-                self.lease_duration,
-            )
-            .await
+        Ok(self
+            .queue
+            .dequeue(&self.queue_name, &self.dequeue_options(1))
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// The options of this worker's claims: its priority weights and lease, for up to
+    /// `max_jobs` jobs.
+    fn dequeue_options(&self, max_jobs: usize) -> DequeueOptions {
+        let mut options = DequeueOptions::batch(max_jobs).with_lease_duration(self.lease_duration);
+        options.priority_weights = self.priority_weights.clone();
+        options
     }
 
     /// Whether this worker's queue is paused, so the dequeue can be skipped. A failed
@@ -1966,12 +1954,7 @@ where
             Ok(Vec::new())
         } else {
             self.queue
-                .dequeue_batch_leased(
-                    &self.queue_name,
-                    self.priority_weights.as_ref(),
-                    self.lease_duration,
-                    capacity,
-                )
+                .dequeue(&self.queue_name, &self.dequeue_options(capacity))
                 .await
         };
         if let Some(rate_limiter) = &self.rate_limiter {
@@ -2408,9 +2391,9 @@ where
     }
 
     /// The number of attempts `job` gets on this worker: its own `max_attempts`,
-    /// lowered by [`with_max_retries`](Self::with_max_retries) when that is set.
+    /// lowered by [`with_attempt_cap`](Self::with_attempt_cap) when that is set.
     fn attempt_limit(&self, job: &Job) -> i32 {
-        effective_attempt_limit(job.max_attempts, self.max_retries)
+        effective_attempt_limit(job.max_attempts, self.attempt_cap)
     }
 
     /// When a failed or timed-out run of `job` should be retried.
@@ -3897,8 +3880,8 @@ mod tests {
         assert_eq!(worker.batch_size(), DEFAULT_BATCH_SIZE);
         assert_eq!(worker.batch_concurrency(), DEFAULT_BATCH_CONCURRENCY);
 
-        // The old builder alone enables batch mode with the default size of one job.
-        let enabled = lazy_worker("batch").with_batch_processing_enabled(true);
+        // A size of one enables batch mode (statistics) while claiming one job a poll.
+        let enabled = lazy_worker("batch").with_batch_size(1);
         assert!(enabled.is_batch_processing_enabled());
         assert_eq!(enabled.batch_size(), DEFAULT_BATCH_SIZE);
 
@@ -3917,12 +3900,26 @@ mod tests {
         assert_eq!(clone.batch_size(), 25);
         assert_eq!(clone.batch_concurrency(), 5);
         assert!(clone.is_batch_processing_enabled());
-        // Batch mode can still be switched off afterwards.
-        assert!(
-            !worker
-                .with_batch_processing_enabled(false)
-                .is_batch_processing_enabled()
-        );
+
+        // `WorkerConfig` sets batch mode only when it has a batch size.
+        let config = crate::config::WorkerConfig::default();
+        let unbatched = lazy_worker("batch").with_config(&config);
+        assert!(!unbatched.is_batch_processing_enabled());
+        assert_eq!(unbatched.batch_concurrency(), DEFAULT_BATCH_CONCURRENCY);
+        let config = crate::config::WorkerConfig {
+            batch_size: Some(40),
+            batch_concurrency: Some(4),
+            ..crate::config::WorkerConfig::default()
+        };
+        let batched = lazy_worker("batch").with_config(&config);
+        assert!(batched.is_batch_processing_enabled());
+        assert_eq!(batched.batch_size(), 40);
+        assert_eq!(batched.batch_concurrency(), 4);
+        // A configuration without batch settings leaves those set in code.
+        let kept = worker.with_config(&crate::config::WorkerConfig::default());
+        assert!(kept.is_batch_processing_enabled());
+        assert_eq!(kept.batch_size(), 25);
+        assert_eq!(kept.batch_concurrency(), 5);
     }
 
     #[tokio::test]

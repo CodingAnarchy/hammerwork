@@ -11,7 +11,8 @@ use super::row::{
     result_storage_str,
 };
 use super::{
-    DatabaseQueue, DeadJobSummary, JobOutcome, JobTransition, QueueStats, RecordedOutcome,
+    DatabaseQueue, DeadJobSummary, DequeueOptions, JobOutcome, JobTransition, QueueStats,
+    RecordedOutcome,
 };
 use crate::{
     Result,
@@ -303,45 +304,9 @@ impl crate::queue::JobQueue<Postgres> {
     }
 }
 
-#[async_trait]
-impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
-    type Database = Postgres;
-
-    async fn enqueue(&self, mut job: Job) -> Result<JobId> {
-        job.validate_dependencies()?;
-        self.seal_for_insert(std::slice::from_mut(&mut job)).await?;
-        if job.depends_on.is_empty() {
-            let mut conn = self.pool.acquire().await?;
-            insert_jobs(&mut conn, std::slice::from_ref(&job)).await?;
-            return Ok(job.id);
-        }
-        // A job with dependencies is inserted together with a check of its
-        // dependencies' current state (see `insert_dependent_jobs`).
-        super::retry_on_conflict(|| async {
-            let mut tx = self.pool.begin().await?;
-            let mut jobs = vec![job.clone()];
-            let result = insert_dependent_jobs(&mut tx, &mut jobs).await;
-            super::end_transaction(tx, result).await
-        })
-        .await?;
-        Ok(job.id)
-    }
-
-    async fn dequeue(&self, queue_name: &str) -> Result<Option<Job>> {
-        self.dequeue_leased(queue_name, None, super::DEFAULT_LEASE_DURATION)
-            .await
-    }
-
-    async fn dequeue_with_priority_weights(
-        &self,
-        queue_name: &str,
-        weights: &crate::priority::PriorityWeights,
-    ) -> Result<Option<Job>> {
-        self.dequeue_leased(queue_name, Some(weights), super::DEFAULT_LEASE_DURATION)
-            .await
-    }
-
-    async fn dequeue_leased(
+impl crate::queue::JobQueue<Postgres> {
+    /// Claim one job ([`DatabaseQueue::dequeue`] with a `max_jobs` of 1).
+    async fn claim_one(
         &self,
         queue_name: &str,
         weights: Option<&crate::priority::PriorityWeights>,
@@ -397,7 +362,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         Ok(None)
     }
 
-    async fn dequeue_batch_leased(
+    /// Claim up to `max_jobs` jobs ([`DatabaseQueue::dequeue`]).
+    async fn claim_many(
         &self,
         queue_name: &str,
         weights: Option<&crate::priority::PriorityWeights>,
@@ -423,7 +389,7 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             }
         };
 
-        // Which priority levels have a runnable job (see `dequeue_leased`).
+        // Which priority levels have a runnable job (see `claim_one`).
         let levels: Vec<i32> = sqlx::query_scalar(AssertSqlSafe(super::runnable_priorities_sql(
             RUNNABLE_IN_QUEUE_SQL,
         )))
@@ -454,6 +420,47 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
             },
         )
         .await
+    }
+}
+
+#[async_trait]
+impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
+    type Database = Postgres;
+
+    async fn enqueue(&self, mut job: Job) -> Result<JobId> {
+        job.validate_dependencies()?;
+        self.seal_for_insert(std::slice::from_mut(&mut job)).await?;
+        if job.depends_on.is_empty() {
+            let mut conn = self.pool.acquire().await?;
+            insert_jobs(&mut conn, std::slice::from_ref(&job)).await?;
+            return Ok(job.id);
+        }
+        // A job with dependencies is inserted together with a check of its
+        // dependencies' current state (see `insert_dependent_jobs`).
+        super::retry_on_conflict(|| async {
+            let mut tx = self.pool.begin().await?;
+            let mut jobs = vec![job.clone()];
+            let result = insert_dependent_jobs(&mut tx, &mut jobs).await;
+            super::end_transaction(tx, result).await
+        })
+        .await?;
+        Ok(job.id)
+    }
+
+    async fn dequeue(&self, queue_name: &str, options: &DequeueOptions) -> Result<Vec<Job>> {
+        let weights = options.priority_weights.as_ref();
+        match options.max_jobs {
+            0 => Ok(Vec::new()),
+            1 => Ok(self
+                .claim_one(queue_name, weights, options.lease())
+                .await?
+                .into_iter()
+                .collect()),
+            max_jobs => {
+                self.claim_many(queue_name, weights, options.lease(), max_jobs)
+                    .await
+            }
+        }
     }
 
     async fn release_job_run(&self, run: &Job) -> Result<bool> {

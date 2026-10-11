@@ -83,13 +83,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create workers for different types of jobs
     let report_worker = Worker::new(queue.clone(), "reports".to_string(), report_handler)
         .with_poll_interval(tokio::time::Duration::from_secs(2))
-        .with_max_retries(3)
+        .with_attempt_cap(3)
         .with_default_timeout(tokio::time::Duration::from_secs(60))
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let cleanup_worker = Worker::new(queue.clone(), "cleanup".to_string(), cleanup_handler)
         .with_poll_interval(tokio::time::Duration::from_secs(3))
-        .with_max_retries(2)
+        .with_attempt_cap(2)
         .with_default_timeout(tokio::time::Duration::from_secs(30))
         .with_stats_collector(Arc::clone(&stats_collector));
 

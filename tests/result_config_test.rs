@@ -29,7 +29,7 @@ async fn test_postgres_result_config_persistence() {
     let job_id = queue.enqueue(job).await.unwrap();
 
     // Dequeue the job to verify result_config is preserved
-    let dequeued_job = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    let dequeued_job = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
 
     assert_eq!(dequeued_job.id, job_id);
     assert_eq!(dequeued_job.result_config.storage, ResultStorage::Database);
@@ -62,7 +62,7 @@ async fn test_mysql_result_config_persistence() {
     let job_id = queue.enqueue(job).await.unwrap();
 
     // Dequeue the job to verify result_config is preserved
-    let dequeued_job = queue.dequeue(&queue_name).await.unwrap().unwrap();
+    let dequeued_job = queue.dequeue_one(&queue_name).await.unwrap().unwrap();
 
     assert_eq!(dequeued_job.id, job_id);
     assert_eq!(dequeued_job.result_config.storage, ResultStorage::Database);

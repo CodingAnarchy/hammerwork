@@ -185,3 +185,150 @@ Migrate imports as follows:
 | `hammerwork_web::config::WebSocketConfig` | `hammerwork_web::WebSocketConfig` |
 | `hammerwork_web::server::WebDashboard` | `hammerwork_web::WebDashboard` |
 | `hammerwork_web::server::app_routes`, `api::*`, `auth::*`, `security::*`, `websocket::*`, `live::*` | removed; mount the dashboard with `WebDashboard` |
+
+## DatabaseQueue is sealed
+
+`DatabaseQueue` is now a sealed trait (#87): only Hammerwork can implement it. Its
+implementations are `JobQueue<Postgres>` (feature `postgres`), `JobQueue<MySql>`
+(feature `mysql`) and the in-memory `TestQueue` (feature `test-queue`). Because no
+other implementations exist, new methods can be added in minor releases without
+default bodies, and the defaults that existed only for implementations outside the
+crate are gone. The built-in queues behave as before.
+
+Code that only *uses* a queue is unaffected: `DatabaseQueue` is still the bound for
+generic code and the trait to import for its methods.
+
+```rust
+use hammerwork::queue::DatabaseQueue;
+
+// Still works: generic over any built-in queue.
+async fn pending_count(queue: &impl DatabaseQueue, name: &str) -> hammerwork::Result<u64> {
+    Ok(queue.get_queue_stats(name).await?.pending_count)
+}
+```
+
+### What to change
+
+If you implemented `DatabaseQueue` yourself, usually as a mock for tests, that no
+longer compiles (`the trait bound ...: Sealed is not satisfied`). Use `TestQueue`
+instead. It implements the whole trait in memory, with the same claim, lease, retry,
+workflow and archive behaviour as the database backends, and a `MockClock` for
+delayed and cron jobs (see [Testing](testing.md)):
+
+```toml
+[dev-dependencies]
+hammerwork = { version = "3", features = ["test-queue"] }
+```
+
+```rust
+// Before (2.x): a hand-written mock
+// struct MockQueue { /* ... */ }
+// #[async_trait] impl DatabaseQueue for MockQueue { /* ... */ }
+
+// After (3.0)
+use hammerwork::queue::{DatabaseQueue, test::TestQueue};
+
+# async fn example() -> hammerwork::Result<()> {
+let queue = TestQueue::new();
+let id = queue
+    .enqueue(hammerwork::Job::new("emails".into(), serde_json::json!({})))
+    .await?;
+assert!(queue.get_job(id).await?.is_some());
+# Ok(())
+# }
+```
+
+`hammerwork::queue::RELEASED_JOB_MESSAGE` is removed: it was the error message of the
+`release_job_run` fallback for queues outside the crate. The built-in queues release
+a job without recording an error.
+
+## Claiming jobs and worker builders
+
+The claim API and two worker builders were consolidated (#89).
+
+### One claim method
+
+`DatabaseQueue::dequeue` now takes a [`DequeueOptions`](https://docs.rs/hammerwork/3/hammerwork/queue/struct.DequeueOptions.html)
+and returns the claimed jobs as a `Vec<Job>`. It replaces `dequeue`,
+`dequeue_with_priority_weights`, `dequeue_leased`, `dequeue_batch` and
+`dequeue_batch_leased`. For the most common call, claiming one job with the defaults,
+use `dequeue_one`, which is the 2.x `dequeue`:
+
+| 2.x | 3.0 |
+| --- | --- |
+| `dequeue(q)` | `dequeue_one(q)` |
+| `dequeue_with_priority_weights(q, &w)` | `dequeue(q, &DequeueOptions::new().with_priority_weights(w.clone()))` |
+| `dequeue_leased(q, None, lease)` | `dequeue(q, &DequeueOptions::new().with_lease_duration(lease))` |
+| `dequeue_batch(q, n)` | `dequeue(q, &DequeueOptions::batch(n))` |
+| `dequeue_batch_leased(q, Some(&w), lease, n)` | `dequeue(q, &DequeueOptions::batch(n).with_priority_weights(w.clone()).with_lease_duration(lease))` |
+
+The single-job forms returned `Option<Job>`; `dequeue` returns a `Vec<Job>` with at
+most one job when `max_jobs` is 1 (the default). Claims behave exactly as before: the
+same statements, priority selection, leases and pause checks.
+
+```rust
+use hammerwork::queue::{DatabaseQueue, DequeueOptions};
+use hammerwork::PriorityWeights;
+use std::time::Duration;
+
+# async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
+// Before (2.x):
+// let job = queue.dequeue("emails").await?;
+// let job = queue.dequeue_with_priority_weights("emails", &weights).await?;
+// let jobs = queue.dequeue_batch_leased("emails", None, Duration::from_secs(60), 20).await?;
+
+// After (3.0):
+let job = queue.dequeue_one("emails").await?;
+
+let weights = PriorityWeights::new();
+let options = DequeueOptions::new().with_priority_weights(weights);
+let job = queue.dequeue("emails", &options).await?.into_iter().next();
+
+let options = DequeueOptions::batch(20).with_lease_duration(Duration::from_secs(60));
+let jobs = queue.dequeue("emails", &options).await?;
+# let _ = (job, jobs);
+# Ok(())
+# }
+```
+
+`DequeueOptions` is `#[non_exhaustive]`: build it with `DequeueOptions::new()` (or
+`default()`) or `DequeueOptions::batch(n)` and the `with_*` methods. Its fields are
+public, so you can still read them or assign them, for example
+`options.priority_weights = maybe_weights;`.
+
+### Batch mode is set by the batch size
+
+`Worker::with_batch_processing_enabled` is removed. `with_batch_size(n)` already enabled
+batch mode and is now the only switch. To keep `with_batch_processing_enabled(true)`'s
+behaviour (batch statistics, one job claimed per poll), use `with_batch_size(1)`. To
+turn batch mode off, do not call `with_batch_size`.
+
+Batch settings can now also come from configuration: the optional `[worker]` keys
+`batch_size` and `batch_concurrency` (`WorkerConfig::batch_size` and
+`WorkerConfig::batch_concurrency`, both `Option<usize>`) are applied by
+`Worker::with_config` when set. If you build a `WorkerConfig` with a struct literal, add
+the two fields or end it with `..WorkerConfig::default()`.
+
+### `with_max_retries` is now `with_attempt_cap`
+
+`Worker::with_max_retries(n)` is renamed `Worker::with_attempt_cap(n)`. Its behaviour
+is unchanged: it caps the number of attempts this worker gives a job at
+`min(job.max_attempts, n)`, and can only lower a job's own limit. There is no
+deprecated alias.
+
+```rust,no_run
+# async fn example(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler) {
+use hammerwork::Worker;
+
+// Before (2.x):
+// let worker = Worker::new(queue, "emails".into(), handler)
+//     .with_batch_processing_enabled(true)
+//     .with_max_retries(3);
+
+// After (3.0):
+let worker = Worker::new(queue, "emails".into(), handler)
+    .with_batch_size(1)
+    .with_attempt_cap(3);
+# let _ = worker;
+# }
+```

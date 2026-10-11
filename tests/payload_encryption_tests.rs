@@ -9,6 +9,7 @@
 mod test_utils;
 
 use chrono::Utc;
+use hammerwork::queue::DequeueOptions;
 use hammerwork::{
     HammerworkError, Job, JobId, JobQueue, JobStatus, Worker, WorkerPool,
     archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason},
@@ -1385,7 +1386,7 @@ where
     let mut children = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(15);
     while children.len() < 2 && Instant::now() < deadline {
-        match queue.dequeue(&child_queue).await.unwrap() {
+        match queue.dequeue_one(&child_queue).await.unwrap() {
             Some(child) => children.push(child),
             None => tokio::time::sleep(Duration::from_millis(50)).await,
         }
@@ -1419,7 +1420,10 @@ where
         payloads.push(payload);
     }
 
-    let claimed = queue.dequeue_batch(&queue_name, 10).await.unwrap();
+    let claimed = queue
+        .dequeue(&queue_name, &DequeueOptions::batch(10))
+        .await
+        .unwrap();
     assert_eq!(claimed.len(), 3);
     let mut decrypted = Vec::new();
     for job in claimed {
