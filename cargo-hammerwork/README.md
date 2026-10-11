@@ -484,7 +484,7 @@ cargo hammerwork backup list
 cargo hammerwork backup list --path ./backups
 
 cargo hammerwork backup restore --input backup.json --confirm
-cargo hammerwork backup restore --input backup.json --skip-existing --confirm
+cargo hammerwork backup restore --input backup.json --confirm
 ```
 
 `backup create` requires `--output` and `--format` is `json` or `csv`. Without `--include-completed` and
@@ -497,8 +497,8 @@ kept. A CSV backup is an export of the main columns and cannot be restored.
 `backup restore` requires `--input` and refuses to run without `--confirm`. It recreates
 the jobs exactly as they were backed up (into PostgreSQL or MySQL, whichever the backup
 came from), and restored encrypted jobs decrypt with the same key. Jobs whose id already
-exists are never overwritten or duplicated: they are skipped and counted, with or without
-`--skip-existing`. The whole backup is checked before anything is written and the jobs are
+exists are never overwritten or duplicated: they are skipped and counted (the old
+`--skip-existing` flag is a hidden no-op). The whole backup is checked before anything is written and the jobs are
 inserted in one transaction, so a bad backup restores nothing; a backup from a newer schema
 must be restored into a database migrated at least as far. Backups from earlier versions
 (format 1.0) still restore. `backup list` only reads the `.json` and `.csv` files in a local

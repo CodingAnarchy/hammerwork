@@ -39,7 +39,7 @@ impl ConfigCommand {
     pub async fn execute_at(&self, config: &mut Config, path: &Path) -> Result<()> {
         match self {
             ConfigCommand::Show => {
-                show_config(config).await?;
+                show_config(config, path).await?;
             }
             ConfigCommand::Set { key, value } => {
                 set_config_value(config, key, value, path).await?;
@@ -58,23 +58,53 @@ impl ConfigCommand {
     }
 }
 
-/// The rows of `config show`: setting, value, source. Secrets are never shown: the
-/// database URL's password is replaced by `***`, and encryption keys are only ever
-/// referenced (`env://VAR`, a KMS URI), never stored in a configuration.
+/// Where a setting's effective value comes from: an environment variable that is set
+/// (and, for numbers, parses, as `Config::load` ignores the others) wins, then the config
+/// file, else the built-in default.
+fn source_of(in_env: bool, in_file: bool) -> &'static str {
+    if in_env {
+        "Environment"
+    } else if in_file {
+        "Config File"
+    } else {
+        "Default"
+    }
+}
+
+/// The rows of `config show`: setting, value, source. `config` is the effective
+/// configuration (file plus environment) and `file` the config file alone, which tells
+/// the two sources apart. Secrets are never shown: the database URL's password is
+/// replaced by `***`, and encryption keys are only ever referenced (`env://VAR`, a KMS
+/// URI), never stored in a configuration.
 fn config_rows(
     config: &Config,
+    file: &Config,
     env: impl Fn(&str) -> Option<String>,
 ) -> Vec<(&'static str, String, &'static str)> {
-    let from = |value: &Option<String>, var: &str| match (value, env(var)) {
-        (Some(value), _) => (value.clone(), "Config File"),
-        (None, Some(value)) => (value, "Environment"),
-        (None, None) => ("Not set".to_string(), "Default"),
+    let text = |var: &str| env(var).is_some();
+    let number = |var: &str| env(var).is_some_and(|v| v.parse::<u64>().is_ok());
+    let from = |value: &Option<String>, in_file: &Option<String>, var: &str| {
+        let in_env = env(var).is_some_and(|v| !v.is_empty());
+        (
+            value
+                .clone()
+                .or_else(|| env(var).filter(|v| !v.is_empty()))
+                .unwrap_or_else(|| "Not set".to_string()),
+            source_of(in_env, in_file.is_some()),
+        )
     };
-    let (db_url, db_source) = from(&config.database_url, "DATABASE_URL");
+    let (db_url, db_source) = from(&config.database_url, &file.database_url, "DATABASE_URL");
     let db_url = crate::utils::validation::redact_url(&db_url);
-    let (queue, queue_source) = from(&config.default_queue, "HAMMERWORK_DEFAULT_QUEUE");
-    let (encryption_config, encryption_source) =
-        from(&config.encryption_config, "HAMMERWORK_ENCRYPTION_CONFIG");
+    let (queue, queue_source) = from(
+        &config.default_queue,
+        &file.default_queue,
+        "HAMMERWORK_DEFAULT_QUEUE",
+    );
+    let (encryption_config, encryption_source) = from(
+        &config.encryption_config,
+        &file.encryption_config,
+        "HAMMERWORK_ENCRYPTION_CONFIG",
+    );
     let encryption = match config.encryption_settings() {
         Ok(settings) if settings.enabled => format!(
             "enabled ({:?}, key {} from {}, encrypted queues: {})",
@@ -96,22 +126,31 @@ fn config_rows(
         (
             "default_limit",
             config.get_default_limit().to_string(),
-            "Config File",
+            source_of(
+                number("HAMMERWORK_DEFAULT_LIMIT"),
+                file.default_limit.is_some(),
+            ),
         ),
         (
             "log_level",
             config.get_log_level().to_string(),
-            "Config File",
+            source_of(text("HAMMERWORK_LOG_LEVEL"), file.log_level.is_some()),
         ),
         (
             "connection_pool_size",
             config.get_connection_pool_size().to_string(),
-            "Config File",
+            source_of(
+                number("HAMMERWORK_POOL_SIZE"),
+                file.connection_pool_size.is_some(),
+            ),
         ),
         (
             "connect_timeout_secs",
             config.get_connect_timeout_secs().to_string(),
-            "Config File",
+            source_of(
+                number("HAMMERWORK_CONNECT_TIMEOUT"),
+                file.connect_timeout_secs.is_some(),
+            ),
         ),
         ("encryption_config", encryption_config, encryption_source),
         (
@@ -122,13 +161,16 @@ fn config_rows(
     ]
 }
 
-async fn show_config(config: &Config) -> Result<()> {
+async fn show_config(config: &Config, path: &Path) -> Result<()> {
+    // The file alone, to tell file values from environment ones; a broken file shows
+    // as all defaults (`main` already warned about it).
+    let file = Config::file_values(path);
     println!("⚙️  Hammerwork Configuration");
     println!("═══════════════════════════");
 
     let mut table = comfy_table::Table::new();
     table.set_header(vec!["Setting", "Value", "Source"]);
-    for (setting, value, source) in config_rows(config, |var| std::env::var(var).ok()) {
+    for (setting, value, source) in config_rows(config, &file, |var| std::env::var(var).ok()) {
         table.add_row(vec![setting, value.as_str(), source]);
     }
 
@@ -140,7 +182,8 @@ async fn show_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn set_config_value(config: &mut Config, key: &str, value: &str, path: &Path) -> Result<()> {
+/// Validate `value` for `key` and store it in `config`.
+fn apply_key(config: &mut Config, key: &str, value: &str) -> Result<()> {
     match key {
         "database_url" => {
             crate::utils::validation::validate_database_url(value)?;
@@ -210,8 +253,21 @@ async fn set_config_value(config: &mut Config, key: &str, value: &str, path: &Pa
         }
     }
 
-    // Save the updated configuration
-    config.save_to(path)?;
+    Ok(())
+}
+
+/// `config set`: change one key of the config file and save it. The file is loaded on its
+/// own, without the environment, so `DATABASE_URL` and the `HAMMERWORK_*` variables are
+/// never copied into it; a file that exists but cannot be parsed is an error and is left
+/// untouched rather than replaced by the defaults. The in-memory `config` gets the value
+/// too.
+async fn set_config_value(config: &mut Config, key: &str, value: &str, path: &Path) -> Result<()> {
+    let mut file = Config::load_from_path(path).map_err(|e| {
+        anyhow::anyhow!("{e}\nRefusing to overwrite it; fix or remove the file first")
+    })?;
+    apply_key(&mut file, key, value)?;
+    file.save_to(path)?;
+    apply_key(config, key, value)?;
     println!("💾 Configuration saved");
 
     Ok(())
@@ -252,8 +308,10 @@ async fn reset_config(config: &mut Config, confirm: bool, path: &Path) -> Result
         return Ok(());
     }
 
+    // Only the file is reset (and an unreadable one replaced, which is the point); the
+    // environment is never written to it.
+    Config::default().save_to(path)?;
     *config = Config::default();
-    config.save_to(path)?;
 
     println!("🔄 Configuration reset to defaults");
     info!("Configuration has been reset to defaults");
@@ -456,7 +514,7 @@ mod tests {
             database_url: Some("postgres://app:hunter2-db@db.internal/jobs".into()),
             ..Config::default()
         };
-        let rows = config_rows(&config, |_| None);
+        let rows = config_rows(&config, &config, |_| None);
         let shown = format!("{rows:?}");
         assert!(!shown.contains("hunter2-db"), "{shown}");
         assert!(
@@ -466,7 +524,7 @@ mod tests {
         assert!(!format!("{config:?}").contains("hunter2-db"));
 
         // Also when the URL comes from the environment
-        let rows = config_rows(&Config::default(), |var| {
+        let rows = config_rows(&Config::default(), &Config::default(), |var| {
             (var == "DATABASE_URL").then(|| "mysql://root:hunter2-env@db/jobs".to_string())
         });
         let (_, url, source) = &rows[0];
@@ -474,6 +532,121 @@ mod tests {
             (url.as_str(), *source),
             ("mysql://root:***@db/jobs", "Environment")
         );
+    }
+
+    #[test]
+    fn show_tells_environment_file_and_default_sources_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(Config::file_values(&path).default_limit, None, "no file");
+        std::fs::write(
+            &path,
+            "default_queue = \"from_file\"\ndefault_limit = 10\nlog_level = \"debug\"\n",
+        )
+        .unwrap();
+        let file = Config::file_values(&path);
+        assert_eq!(file.connection_pool_size, None, "only the keys in the file");
+        let env = |var: &str| match var {
+            "DATABASE_URL" => Some("postgres://u:pw@h/db".to_string()),
+            "HAMMERWORK_DEFAULT_LIMIT" => Some("99".to_string()),
+            "HAMMERWORK_POOL_SIZE" => Some("not-a-number".to_string()),
+            _ => None,
+        };
+        // the effective config is the file with the environment applied
+        let effective = Config {
+            database_url: Some("postgres://u:pw@h/db".into()),
+            default_limit: Some(99),
+            ..file.clone()
+        };
+        let rows = config_rows(&effective, &file, env);
+        let source = |name: &str| rows.iter().find(|r| r.0 == name).unwrap().2;
+        assert_eq!(source("database_url"), "Environment");
+        assert_eq!(source("default_limit"), "Environment", "env beats the file");
+        assert_eq!(source("default_queue"), "Config File");
+        assert_eq!(source("log_level"), "Config File");
+        assert_eq!(
+            source("connection_pool_size"),
+            "Default",
+            "an unparseable variable is ignored"
+        );
+        assert_eq!(source("connect_timeout_secs"), "Default");
+        assert_eq!(source("encryption_config"), "Default");
+    }
+
+    #[tokio::test]
+    async fn set_and_reset_never_write_the_environment_into_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_limit = 12\n").unwrap();
+        // what `main` hands to the command: file plus environment (a fake one, so the
+        // real process environment is left alone)
+        let path_text = path.to_string_lossy().into_owned();
+        let mut config = Config::load_with(|k| match k {
+            "HAMMERWORK_CONFIG" => Some(path_text.clone()),
+            "DATABASE_URL" => Some("postgres://app:hunter2-env@db/jobs".to_string()),
+            "HAMMERWORK_DEFAULT_QUEUE" => Some("env_queue".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            config.get_database_url().map(|u| u.contains("hunter2-env")),
+            Some(true)
+        );
+        assert_eq!(config.get_default_queue(), Some("env_queue"));
+
+        run(&["set", "log_level", "warn"], &mut config, &path)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("hunter2-env") && !text.contains("env_queue"),
+            "{text}"
+        );
+        let saved = Config::load_from_path(&path).unwrap();
+        assert_eq!(saved.get_log_level(), "warn");
+        assert_eq!(saved.get_default_limit(), 12, "other file values are kept");
+        assert_eq!(saved.database_url, None);
+
+        run(&["reset", "--confirm"], &mut config, &path)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("hunter2-env") && !text.contains("env_queue"),
+            "{text}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn set_refuses_to_overwrite_an_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_limit = = broken").unwrap();
+        let mut config = Config::default();
+        let err = run(&["set", "default_queue", "q"], &mut config, &path)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid config file"), "{err}");
+        assert!(err.contains("Refusing to overwrite"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "default_limit = = broken",
+            "the broken file is untouched"
+        );
+        assert_eq!(config.get_default_queue(), None);
+        // reset is the way out: it replaces the file with the defaults
+        run(&["reset", "--confirm"], &mut config, &path)
+            .await
+            .unwrap();
+        assert!(Config::load_from_path(&path).is_ok());
     }
 
     #[test]
@@ -491,12 +664,12 @@ mod tests {
             encryption_config: Some(app.to_string_lossy().into_owned()),
             ..Config::default()
         };
-        let rows = config_rows(&config, |_| None);
+        let rows = config_rows(&config, &config, |_| None);
         let encryption = &rows.iter().find(|r| r.0 == "encryption").unwrap().1;
         assert!(encryption.starts_with("enabled"), "{encryption}");
         assert!(encryption.contains("env://APP_KEY"), "{encryption}");
         assert!(encryption.contains("payments"), "{encryption}");
-        let rows = config_rows(&Config::default(), |_| None);
+        let rows = config_rows(&Config::default(), &Config::default(), |_| None);
         assert_eq!(
             rows.iter().find(|r| r.0 == "encryption").unwrap().1,
             "disabled"

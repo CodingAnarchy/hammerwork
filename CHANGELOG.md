@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes to check when upgrading
+
+- **`cargo hammerwork batch cancel`** cancels only `Pending` jobs by default. It used
+  to delete `Running` jobs too, out from under their workers; pass `--status running`
+  to cancel those.
+- **`cargo hammerwork maintenance dead-jobs`** marks a `Running` job dead only when it
+  was abandoned, by the rule of the library's stale-job recovery: its lease expired, or
+  it holds no lease and started more than `--stale-hours` ago. A long-running job that
+  keeps heartbeating is no longer marked dead.
+- **"Failed" includes `TimedOut` everywhere in the CLI** (one shared definition: status
+  `Failed`, `Dead` or `TimedOut`, aged by `COALESCE(failed_at, timed_out_at)`). `queue
+  health` counts timed-out jobs as recent failures, `job purge --failed` deletes them
+  (`--dead` still means `Dead` only), and `batch retry` retries them by default and
+  accepts `--status timed_out`.
+- **`webhook add/update --max-retries N`** now means N retries after the first delivery
+  (stored as N + 1 attempts); it used to give N - 1 retries. Webhooks added before keep
+  their stored attempts and `webhook list` shows `attempts - 1` as their retries.
+
+### Fixed
+
+- **`config set` and `config reset` no longer write environment variables into
+  `config.toml`.** They used to save the merged configuration, copying `DATABASE_URL`
+  (with its password) and the `HAMMERWORK_*` variables into the file. They now change
+  the file alone, and write it through a temp file with mode 0600 renamed into place.
+- **`config set` refuses to overwrite a config file that cannot be parsed** (it used to
+  replace it with the defaults plus the environment). Fix or remove the file, or run
+  `config reset --confirm`.
+- **`config show`'s Source column** tells `Environment`, `Config File` and `Default`
+  apart for every setting (it said "Config File" for environment values and defaults).
+- **`archive run --dry-run`** reports how many jobs match the policy, using the same
+  predicate as the real run, instead of only echoing the flags.
+- **`webhook`**: the webhook file is created with mode 0600 from the start, not
+  chmod-ed after it was written.
+- `backup restore --skip-existing` is hidden (it is a no-op: existing jobs are always
+  skipped), and `archive` resolves the database URL like the other commands.
+
 ## [2.4.0] - 2026-10-11
 
 A bug-fix release for #100 to #106. It is a minor version because it adds a database

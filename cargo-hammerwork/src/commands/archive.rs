@@ -6,6 +6,7 @@ use tracing::info;
 use crate::commands::backup::csv_field;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
+use crate::utils::sql::fetch_i64;
 
 #[derive(Subcommand)]
 pub enum ArchiveCommand {
@@ -219,18 +220,14 @@ impl ArchiveCommand {
     }
 
     fn get_database_url(&self, config: &Config) -> Result<String> {
-        match self {
-            ArchiveCommand::Run { database_url, .. } => database_url.as_ref(),
-            ArchiveCommand::Restore { database_url, .. } => database_url.as_ref(),
-            ArchiveCommand::List { database_url, .. } => database_url.as_ref(),
-            ArchiveCommand::Stats { database_url, .. } => database_url.as_ref(),
-            ArchiveCommand::Purge { database_url, .. } => database_url.as_ref(),
-        }
-        .cloned()
-        .or_else(|| config.get_database_url().map(|s| s.to_string()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("Database URL not provided. Use --database-url or set in config file")
-        })
+        let flag = match self {
+            ArchiveCommand::Run { database_url, .. } => database_url,
+            ArchiveCommand::Restore { database_url, .. } => database_url,
+            ArchiveCommand::List { database_url, .. } => database_url,
+            ArchiveCommand::Stats { database_url, .. } => database_url,
+            ArchiveCommand::Purge { database_url, .. } => database_url,
+        };
+        config.resolve_database_url(flag.as_deref())
     }
 }
 
@@ -278,6 +275,17 @@ async fn archive_jobs(
     let archival_reason = parse_reason(reason)?;
 
     if dry_run {
+        let candidate_count = count_archive_candidates(
+            &pool,
+            queue_name,
+            [
+                completed_after_days,
+                failed_after_days,
+                dead_after_days,
+                timed_out_after_days,
+            ],
+        )
+        .await?;
         println!("DRY RUN: Would archive jobs with the following policy:");
         println!("  Queue: {}", queue_name.unwrap_or("ALL"));
         println!("  Completed after: {} days", completed_after_days);
@@ -289,6 +297,10 @@ async fn archive_jobs(
         println!("  Compression level: {}", compression_level);
         println!("  Reason: {:?}", archival_reason);
         println!("  Archived by: {}", archived_by.unwrap_or("CLI"));
+        println!(
+            "  Jobs matching the policy: {} (archived in batches of up to {})",
+            candidate_count, batch_size
+        );
         return Ok(());
     }
 
@@ -305,6 +317,83 @@ async fn archive_jobs(
     println!("  Duration: {:?}", stats.operation_duration);
 
     Ok(())
+}
+
+/// How many jobs a real `archive run` with these ages (completed, failed, dead, timed out;
+/// in days) would select now, ignoring the batch size.
+async fn count_archive_candidates(
+    pool: &DatabasePool,
+    queue: Option<&str>,
+    days: [u32; 4],
+) -> Result<i64> {
+    let now = chrono::Utc::now();
+    let candidates = [
+        ("Completed", "completed_at", days[0]),
+        ("Failed", "failed_at", days[1]),
+        ("Dead", "failed_at", days[2]),
+        ("TimedOut", "timed_out_at", days[3]),
+    ]
+    .into_iter()
+    .filter_map(|(status, column, days)| {
+        age_threshold(now, chrono::Duration::days(i64::from(days)))
+            .map(|threshold| (status, column, threshold))
+    })
+    .collect::<Vec<_>>();
+    let (sql, binds) = build_archive_candidates_query(pool.backend(), queue, &candidates);
+    match sql {
+        Some(sql) => fetch_i64(pool, &sql, &binds, "count").await,
+        None => Ok(0),
+    }
+}
+
+/// The cutoff for an age policy: jobs whose timestamp is at or before it qualify. A zero
+/// age is "now"; an age reaching back before the Unix epoch is `None` (nothing is that
+/// old). Mirrors the library's archival policy.
+fn age_threshold(
+    now: chrono::DateTime<chrono::Utc>,
+    age: chrono::Duration,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if age <= chrono::Duration::zero() {
+        return Some(now);
+    }
+    now.checked_sub_signed(age)
+        .filter(|threshold| *threshold >= chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+}
+
+/// The count behind `archive run --dry-run`: the same predicate the real run selects with
+/// (not yet archived, in the queue, and per status the age column at or before its
+/// cutoff). `candidates` are `(status, age column, cutoff)` from constants; the queue and
+/// cutoffs are bound. `None` when no status has a usable cutoff.
+pub fn build_archive_candidates_query(
+    backend: crate::utils::sql::Backend,
+    queue: Option<&str>,
+    candidates: &[(&str, &str, chrono::DateTime<chrono::Utc>)],
+) -> (Option<String>, Vec<crate::utils::sql::Bind>) {
+    let mut params = crate::utils::sql::SqlParams::new(backend);
+    let mut queue_filter = String::new();
+    if let Some(queue) = queue {
+        queue_filter = format!(" AND queue_name = {}", params.text(queue));
+    }
+    let conditions = candidates
+        .iter()
+        .map(|(status, column, cutoff)| {
+            format!(
+                "(status = '{status}' AND {column} IS NOT NULL AND {column} <= {})",
+                params.time(*cutoff)
+            )
+        })
+        .collect::<Vec<_>>();
+    if conditions.is_empty() {
+        return (None, Vec::new());
+    }
+    (
+        Some(format!(
+            "SELECT COUNT(*) as count FROM hammerwork_jobs \
+             WHERE archived_at IS NULL{queue_filter} AND ({})",
+            conditions.join(" OR ")
+        )),
+        params.into_binds(),
+    )
 }
 
 /// The `--reason` flag: `manual`, `automatic`, `compliance` or `maintenance`.
@@ -536,6 +625,54 @@ mod tests {
     }
 
     #[test]
+    fn archive_candidates_query_binds_queue_and_cutoffs() {
+        use crate::utils::sql::{Backend, Bind};
+        let t = chrono::Utc::now();
+        let candidates = [
+            ("Completed", "completed_at", t),
+            ("TimedOut", "timed_out_at", t),
+        ];
+        let (sql, binds) = build_archive_candidates_query(
+            Backend::Postgres,
+            Some("q'; DROP TABLE x; --"),
+            &candidates,
+        );
+        assert_eq!(
+            sql.unwrap(),
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE archived_at IS NULL \
+             AND queue_name = $1 AND ((status = 'Completed' AND completed_at IS NOT NULL \
+             AND completed_at <= $2) OR (status = 'TimedOut' AND timed_out_at IS NOT NULL \
+             AND timed_out_at <= $3))"
+        );
+        assert_eq!(
+            binds,
+            vec![
+                Bind::Text("q'; DROP TABLE x; --".into()),
+                Bind::Time(t),
+                Bind::Time(t)
+            ]
+        );
+        let (sql, binds) = build_archive_candidates_query(Backend::MySql, None, &candidates);
+        assert!(sql.unwrap().contains("archived_at IS NULL AND ((status ="));
+        assert_eq!(binds.len(), 2);
+        assert_eq!(
+            build_archive_candidates_query(Backend::MySql, None, &[]),
+            (None, Vec::new())
+        );
+    }
+
+    #[test]
+    fn age_threshold_matches_the_library_policy() {
+        let now = chrono::Utc::now();
+        assert_eq!(age_threshold(now, chrono::Duration::zero()), Some(now));
+        assert_eq!(
+            age_threshold(now, chrono::Duration::days(2)),
+            Some(now - chrono::Duration::days(2))
+        );
+        assert_eq!(age_threshold(now, chrono::Duration::days(365 * 100)), None);
+    }
+
+    #[test]
     fn run_has_the_documented_defaults() {
         match parse(&["run"]) {
             ArchiveCommand::Run {
@@ -710,7 +847,7 @@ mod tests {
         let err = parse(&["restore", "x"])
             .get_database_url(&Config::default())
             .unwrap_err();
-        assert!(err.to_string().contains("Database URL not provided"));
+        assert!(err.to_string().contains("Database URL is required"));
     }
 
     #[test]
@@ -874,6 +1011,34 @@ mod tests {
 
         // dry run and bad flags change nothing
         run(&["run", "-Q", q, "--dry-run"]).await.unwrap();
+        // the dry run counts with the predicate of the real run (the archived rows below)
+        let timed_out = seed(pool, &SeedJob::new(q, "TimedOut")).await;
+        set_time(pool, &timed_out, "timed_out_at", -40 * 24 * 60).await;
+        assert_eq!(
+            count_archive_candidates(pool, Some(q), [7, 30, 30, 30])
+                .await
+                .unwrap(),
+            3,
+            "old completed, old failed and old timed out"
+        );
+        assert_eq!(
+            count_archive_candidates(pool, Some(q), [7, 90, 90, 90])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            count_archive_candidates(pool, None, [7, 30, 30, 30])
+                .await
+                .unwrap(),
+            4,
+            "without a queue filter the other queue counts too"
+        );
+        exec_sql(
+            pool,
+            &format!("DELETE FROM hammerwork_jobs WHERE id = '{timed_out}'"),
+        )
+        .await;
         for bad in [
             &["run", "-Q", q, "--compression-level", "10"][..],
             &["run", "-Q", q, "--batch-size", "0"],

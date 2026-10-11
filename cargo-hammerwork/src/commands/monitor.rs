@@ -8,7 +8,8 @@ use crate::commands::job::priority_display;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
 use crate::utils::sql::{
-    Backend, Bind, IdText, IntervalUnit, SqlParams, bind_mysql, bind_pg, fetch_i64, fetch_rows,
+    Backend, Bind, FAILURE_STATUSES_SQL, FAILURE_TIME_SQL, IdText, IntervalUnit, SqlParams,
+    bind_mysql, bind_pg, fetch_i64, fetch_rows,
 };
 
 #[derive(Subcommand)]
@@ -176,11 +177,6 @@ pub fn metrics_period_hours(period: &str) -> u32 {
     }
 }
 
-/// The statuses of jobs that failed: `Failed` (a failed dependency, a fail-fast batch or
-/// workflow, `fail_job`), `Dead` (out of retries) and `TimedOut`. A `TimedOut` job has
-/// `timed_out_at` and no `failed_at`.
-const FAILURE_STATUSES: &str = "('Failed', 'Dead', 'TimedOut')";
-
 /// Job counts by outcome within the last `hours`. The window is evaluated first and the
 /// optional queue filter last, matching the bind order.
 pub fn build_throughput_query(
@@ -198,7 +194,7 @@ pub fn build_throughput_query(
         format!(
             "SELECT COUNT(*) as total_jobs, \
              COUNT(CASE WHEN status = 'Completed' THEN 1 END) as completed_jobs, \
-             COUNT(CASE WHEN status IN {FAILURE_STATUSES} THEN 1 END) as failed_jobs \
+             COUNT(CASE WHEN status IN {FAILURE_STATUSES_SQL} THEN 1 END) as failed_jobs \
              FROM hammerwork_jobs WHERE created_at > {since}{queue_filter}"
         ),
         params.into_binds(),
@@ -337,9 +333,9 @@ pub fn build_health_count_query(backend: Backend, which: HealthCount) -> (String
     let condition = match which {
         HealthCount::Stuck => format!("status = 'Running' AND started_at < {hour_ago}"),
         HealthCount::RecentJobs => format!("created_at > {hour_ago}"),
-        HealthCount::RecentFailures => format!(
-            "status IN {FAILURE_STATUSES} AND COALESCE(failed_at, timed_out_at) > {hour_ago}"
-        ),
+        HealthCount::RecentFailures => {
+            format!("status IN {FAILURE_STATUSES_SQL} AND {FAILURE_TIME_SQL} > {hour_ago}")
+        }
     };
     (
         format!("SELECT COUNT(*) as count FROM hammerwork_jobs WHERE {condition}"),

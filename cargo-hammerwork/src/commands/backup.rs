@@ -71,7 +71,8 @@ pub enum BackupCommand {
         confirm: bool,
         #[arg(
             long,
-            help = "Skip existing jobs (always the case: existing jobs are never overwritten)"
+            hide = true,
+            help = "Deprecated no-op: existing jobs are always skipped, never overwritten"
         )]
         skip_existing: bool,
     },

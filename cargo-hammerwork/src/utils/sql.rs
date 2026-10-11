@@ -15,6 +15,18 @@ use sqlx::mysql::{MySql, MySqlArguments};
 use sqlx::postgres::{PgArguments, Postgres};
 use sqlx::query::Query;
 
+/// The statuses of jobs that failed, as stored: `Failed` (a failed dependency, a fail-fast
+/// batch or workflow, `fail_job`), `Dead` (out of retries) and `TimedOut`. Every CLI command
+/// that talks about "failed" jobs (`monitor`, `maintenance vacuum`, `queue health`,
+/// `job list/purge/retry --failed`, `batch retry`) uses this one definition.
+pub const FAILURE_STATUSES: [&str; 3] = ["Failed", "Dead", "TimedOut"];
+
+/// [`FAILURE_STATUSES`] as an SQL list of constants: `('Failed', 'Dead', 'TimedOut')`.
+pub const FAILURE_STATUSES_SQL: &str = "('Failed', 'Dead', 'TimedOut')";
+
+/// When a failed job failed: a `TimedOut` job may carry only `timed_out_at`.
+pub const FAILURE_TIME_SQL: &str = "COALESCE(failed_at, timed_out_at)";
+
 /// Which SQL dialect a statement is built for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {

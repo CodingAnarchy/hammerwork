@@ -253,6 +253,7 @@ mod error_handling_tests {
 #[cfg(test)]
 mod builder_tests {
     use super::*;
+    use cargo_hammerwork::commands::archive::build_archive_candidates_query;
     use cargo_hammerwork::commands::backup::build_backup_query;
     use cargo_hammerwork::commands::cron::build_cron_select_query;
     use cargo_hammerwork::commands::job::{build_list_jobs_query, build_purge_query};
@@ -268,8 +269,8 @@ mod builder_tests {
         build_pending_spawns_query, build_spawn_list_query, build_spawn_stats_breakdown_query,
         build_spawn_stats_total_query,
     };
-    use cargo_hammerwork::utils::job_ops::JobSelector;
-    use cargo_hammerwork::utils::sql::{Backend, Bind, bind_mysql, bind_pg};
+    use cargo_hammerwork::utils::job_ops::{JobSelector, StaleRunning};
+    use cargo_hammerwork::utils::sql::{Backend, Bind, FAILURE_STATUSES_SQL, bind_mysql, bind_pg};
     use hammerwork::{JobPriority, JobStatus};
 
     const HOSTILE: &str = "it's; DROP TABLE hammerwork_jobs --";
@@ -341,11 +342,32 @@ mod builder_tests {
                 failed_after: Some(now),
                 created_before: Some(now),
                 started_before: Some(now),
+                stale_running: Some(StaleRunning::new(now, chrono::Duration::hours(24))),
                 never_started: true,
                 attempts_exhausted: true,
             }
             .sql(backend),
         );
+        add(
+            "job_purge_failed",
+            build_purge_query(
+                backend,
+                &format!("status IN {FAILURE_STATUSES_SQL}"),
+                q,
+                Some(7),
+            ),
+        );
+        let (archive_sql, archive_binds) = build_archive_candidates_query(
+            backend,
+            q,
+            &[
+                ("Completed", "completed_at", now),
+                ("Failed", "failed_at", now),
+                ("Dead", "failed_at", now),
+                ("TimedOut", "timed_out_at", now),
+            ],
+        );
+        add("archive_candidates", (archive_sql.unwrap(), archive_binds));
         out
     }
 
@@ -443,6 +465,66 @@ mod builder_tests {
         assert!(sql.ends_with("LIMIT $2"), "{sql}");
     }
 
+    #[test]
+    fn test_failure_statuses_include_timed_out_everywhere() {
+        use cargo_hammerwork::commands::monitor::{HealthCount, build_health_count_query};
+        use cargo_hammerwork::commands::queue::{HealthMetric, build_health_query};
+
+        for backend in [Backend::Postgres, Backend::MySql] {
+            let (sql, _) = build_health_query(backend, HealthMetric::RecentFailures, None);
+            assert!(
+                sql.contains("status IN ('Failed', 'Dead', 'TimedOut')")
+                    && sql.contains("COALESCE(failed_at, timed_out_at) >"),
+                "{sql}"
+            );
+            let (sql, _) = build_health_count_query(backend, HealthCount::RecentFailures);
+            assert!(
+                sql.contains("status IN ('Failed', 'Dead', 'TimedOut')")
+                    && sql.contains("COALESCE(failed_at, timed_out_at) >"),
+                "{sql}"
+            );
+            let selector = JobSelector {
+                statuses: vec![JobStatus::TimedOut],
+                failed_after: Some(chrono::Utc::now()),
+                ..Default::default()
+            };
+            let (sql, _) = selector.sql(backend);
+            assert!(sql.contains("COALESCE(failed_at, timed_out_at) >"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_stale_running_selector_follows_the_lease_rule() {
+        let now = chrono::Utc::now();
+        let stale = StaleRunning::new(now, chrono::Duration::hours(24));
+        let selector = JobSelector {
+            statuses: vec![JobStatus::Running],
+            stale_running: Some(stale),
+            ..Default::default()
+        };
+        let (sql, binds) = selector.sql(Backend::Postgres);
+        assert!(
+            sql.contains(
+                "(last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= started_at \
+                 AND lease_expires_at < $2)"
+            ),
+            "{sql}"
+        );
+        assert!(sql.contains("AND started_at < $3))"), "{sql}");
+        assert_eq!(
+            binds,
+            vec![
+                Bind::Text("Running".into()),
+                Bind::Time(stale.now),
+                Bind::Time(stale.cutoff)
+            ]
+        );
+        assert_eq!(stale.now - stale.cutoff, chrono::Duration::hours(24));
+        let (sql, binds) = selector.sql(Backend::MySql);
+        assert_eq!(sql.matches('?').count(), 3);
+        assert_eq!(binds.len(), 3);
+    }
+
     #[tokio::test]
     #[ignore] // Requires database connection
     async fn test_postgres_builders_run_with_hostile_queue_name() -> Result<()> {
@@ -455,7 +537,7 @@ mod builder_tests {
             .into_iter()
             .chain(other_queries(Backend::Postgres));
         for (name, sql, binds) in all {
-            if name == "job_purge" || name == "vacuum" && sql.starts_with("DELETE") {
+            if name.starts_with("job_purge") || name == "vacuum" && sql.starts_with("DELETE") {
                 // Writes: run them inside a rolled-back transaction
                 let mut tx = pool.begin().await?;
                 bind_pg(sqlx::query(&sql), &binds)
@@ -489,7 +571,7 @@ mod builder_tests {
             .into_iter()
             .chain(other_queries(Backend::MySql));
         for (name, sql, binds) in all {
-            if name == "job_purge" || name == "vacuum" && sql.starts_with("DELETE") {
+            if name.starts_with("job_purge") || name == "vacuum" && sql.starts_with("DELETE") {
                 let mut tx = pool.begin().await?;
                 bind_mysql(sqlx::query(&sql), &binds)
                     .execute(&mut *tx)
