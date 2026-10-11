@@ -51,6 +51,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`KeyManager::get_key` refuses a key that has expired while cached.** Keys are cached
   for up to an hour, and the cache did not check the key's expiry, so an expired key
   could still be used for up to an hour after it expired.
+- **`TestQueue` behaves like the database backends** in several places where tests
+  written against it could pass while the code fails in production:
+  - It holds a job enqueued with `depends_on` until its dependencies complete (it handed
+    it out at once), in `enqueue`, `enqueue_batch` and `enqueue_workflow`. A job enqueued
+    after a dependency failed is enqueued as `Failed`.
+  - `finish_job_run` reports the jobs a completion released in
+    `RecordedOutcome::unblocked` (always empty for workflow jobs), and records a retried
+    run's `error_message` and `timed_out_at`.
+  - `requeue_stale_jobs` reschedules a recurring job that is out of attempts for its next
+    occurrence instead of leaving it `Dead`.
+  - `get_dead_jobs`, `get_dead_jobs_by_queue`, `get_dead_job_summary` and
+    `purge_dead_jobs` cover `Dead` jobs only (they included `TimedOut` jobs), and the
+    purge keeps jobs that died exactly at the cut-off (`failed_at < older_than`).
+  - A weighted dequeue whose candidate weights are all zero takes the highest priority
+    instead of returning nothing, and a huge weight (e.g. `u32::MAX`) no longer tries to
+    allocate gigabytes.
+  - `retry_dead_job` on a job that is not dead fails with `InvalidJobTransition`, not
+    `HammerworkError::Queue`.
 
 ## [2.2.0] - 2026-10-11
 
