@@ -168,7 +168,7 @@ other private types (`AuthState`, `SystemState`, `WebSocketState`, `AllowedOrigi
 To embed the dashboard in your own process, build a `DashboardConfig` and run a
 `WebDashboard` (optionally `with_event_manager` to forward worker events):
 
-```rust
+```rust,ignore
 use hammerwork_web::{DashboardConfig, WebDashboard};
 
 let config = DashboardConfig::new()
