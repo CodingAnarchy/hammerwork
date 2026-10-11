@@ -4154,6 +4154,13 @@ mod tests {
     async fn stale_recurring_job_out_of_attempts_is_rescheduled() {
         let queue = TestQueue::new();
         let clock = queue.clock();
+        // Half past the hour, so the run (an hour later) and the reaping five minutes
+        // after it stay before the next hourly slot whatever the wall-clock time is.
+        clock.set_time(
+            chrono::DateTime::parse_from_rfc3339("2026-01-05T10:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
         let mut job = Job::new("stale_cron".to_string(), json!({})).with_max_attempts(1);
         job.cron_schedule = Some("0 0 * * * *".to_string());
         let id = queue.enqueue_cron_job(job).await.unwrap();
