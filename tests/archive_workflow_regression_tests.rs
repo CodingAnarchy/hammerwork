@@ -96,21 +96,6 @@ where
     }
 }
 
-/// Wait until job `id` finished before `Utc::now()`. Finish times come from the
-/// database clock and archival cutoffs from the application clock, so a job archived
-/// "after 0 seconds" right after it finished could otherwise be skipped.
-async fn finished_in_the_past<Q: DatabaseQueue + ?Sized>(queue: &Q, id: JobId) {
-    let job = queue.get_job(id).await.unwrap().expect("job exists");
-    let finished = job
-        .completed_at
-        .or(job.failed_at)
-        .or(job.timed_out_at)
-        .expect("job finished");
-    while chrono::Utc::now() <= finished {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 /// A policy that archives finished jobs right away and never purges.
 fn archive_now() -> ArchivalPolicy {
     let mut policy = ArchivalPolicy::new()
@@ -159,7 +144,6 @@ where
         Job::new(queue_name.clone(), json!({ "n": 1 })).with_retry_strategy(long_retry_strategy());
     let id = queue.enqueue(job).await.unwrap();
     queue.complete_job(id).await.unwrap();
-    finished_in_the_past(queue.as_ref(), id).await;
 
     assert_eq!(archive_queue(queue.as_ref(), &queue_name).await, 1);
 
@@ -184,7 +168,6 @@ where
         .await
         .unwrap();
     queue.complete_job(id).await.unwrap();
-    finished_in_the_past(queue.as_ref(), id).await;
     let live = queue.get_job(id).await.unwrap().unwrap();
 
     assert_eq!(archive_queue(queue.as_ref(), &queue_name).await, 1);
@@ -194,6 +177,29 @@ where
     assert_eq!(archived.created_at, live.created_at);
     assert_eq!(archived.scheduled_at, live.scheduled_at);
     assert_eq!(archived.completed_at, live.completed_at);
+    queue
+        .purge_archived_jobs_in_queue(&queue_name, chrono::Utc::now() + ChronoDuration::days(1))
+        .await
+        .unwrap();
+}
+
+/// #118: age cutoffs come from the database clock that writes the finish times, so a
+/// job archived "after 0 seconds" the moment it finishes is archived every time, not
+/// only once the application clock has passed the database's finish time.
+async fn archiving_uses_the_database_clock<Q>(queue: Arc<Q>)
+where
+    Q: DatabaseQueue + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+    let queue_name = test_utils::unique_queue("archive_db_clock");
+    for n in 0..10 {
+        let id = queue
+            .enqueue(Job::new(queue_name.clone(), json!({ "n": n })))
+            .await
+            .unwrap();
+        queue.complete_job(id).await.unwrap();
+        assert_eq!(archive_queue(queue.as_ref(), &queue_name).await, 1);
+    }
     queue
         .purge_archived_jobs_in_queue(&queue_name, chrono::Utc::now() + ChronoDuration::days(1))
         .await
@@ -221,7 +227,6 @@ where
         .unwrap();
 
     queue.complete_job(first_id).await.unwrap();
-    finished_in_the_past(queue.as_ref(), first_id).await;
     assert_eq!(
         archive_queue(queue.as_ref(), &format!("{name}_first")).await,
         1
@@ -284,7 +289,6 @@ where
         .unwrap();
 
     queue.mark_job_dead(first_id, "boom").await.unwrap();
-    finished_in_the_past(queue.as_ref(), first_id).await;
     assert_eq!(
         archive_queue(queue.as_ref(), &format!("{name}_first")).await,
         1
@@ -504,7 +508,6 @@ where
             .await
             .unwrap();
         queue.complete_job(id).await.unwrap();
-        finished_in_the_past(queue.as_ref(), id).await;
         ids.push(id);
     }
 
@@ -579,7 +582,6 @@ where
         .await
         .unwrap();
     queue.complete_job(archived_id).await.unwrap();
-    finished_in_the_past(queue.as_ref(), archived_id).await;
     assert_eq!(archive_queue(queue.as_ref(), &archived).await, 1);
 
     let names = queue.list_queue_names().await.unwrap();
@@ -644,6 +646,7 @@ crate::test_utils::backend_tests!(
     [
         archiving_keeps_long_retry_strategies,
         archived_jobs_keep_their_times,
+        archiving_uses_the_database_clock,
         archived_members_count_towards_their_workflow,
         archived_failures_fail_their_workflow,
         spawned_children_raise_workflow_total,
@@ -661,6 +664,7 @@ crate::test_utils::backend_tests!(
     [
         archiving_keeps_long_retry_strategies,
         archived_jobs_keep_their_times,
+        archiving_uses_the_database_clock,
         archived_members_count_towards_their_workflow,
         archived_failures_fail_their_workflow,
         spawned_children_raise_workflow_total,
@@ -678,6 +682,7 @@ crate::test_utils::backend_tests!(
     [
         archiving_keeps_long_retry_strategies,
         archived_jobs_keep_their_times,
+        archiving_uses_the_database_clock,
         archived_members_count_towards_their_workflow,
         archived_failures_fail_their_workflow,
         spawned_children_raise_workflow_total,

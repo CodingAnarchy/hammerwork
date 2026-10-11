@@ -92,6 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Archiving measures job age on the database clock.** `archive_jobs` compared the
+  database-written `completed_at`/`failed_at`/`timed_out_at` against a cutoff taken from
+  the application clock, so clock skew could archive jobs early or late. The cutoff is now
+  read from the database inside the archive transaction (#118).
 - **`config set` and `config reset` no longer write environment variables into
   `config.toml`.** They used to save the merged configuration, copying `DATABASE_URL`
   (with its password) and the `HAMMERWORK_*` variables into the file. They now change

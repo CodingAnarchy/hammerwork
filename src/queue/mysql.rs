@@ -3326,7 +3326,13 @@ impl crate::queue::JobQueue<MySql> {
         let mut total_compression_ratio = 0.0;
 
         // One condition per job status the policy archives, each with its own age threshold.
-        let now = Utc::now();
+        // Archiving a job moves its row: insert into the archive table and delete from
+        // the main table in the same transaction.
+        let mut tx = self.pool.begin().await?;
+
+        // Age cutoffs are measured on the database clock, which writes the finish
+        // timestamps they are compared with; the application clock may be skewed.
+        let now = db_now(&mut tx).await?;
         let mut thresholds = Vec::new();
         let mut status_conditions = Vec::new();
         for (after, status, column) in crate::archive::archival_candidates(policy) {
@@ -3365,10 +3371,6 @@ impl crate::queue::JobQueue<MySql> {
                 },
             )
         };
-
-        // Archiving a job moves its row: insert into the archive table and delete from
-        // the main table in the same transaction.
-        let mut tx = self.pool.begin().await?;
 
         // A row that cannot be decoded is skipped and left where it is, and the batch is
         // topped up with the rows after it: failing would roll back every pass, and a
