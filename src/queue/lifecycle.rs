@@ -512,6 +512,8 @@ impl ParentState {
 /// dependencies (`states`, from `hammerwork_jobs` or else the archive):
 ///
 /// - no dependencies: `none`;
+/// - already `satisfied`: unchanged, since its dependencies completed and may since have
+///   been purged;
 /// - every dependency `Completed`: `satisfied`;
 /// - a dependency that failed terminally (`Failed`, `Dead`, `TimedOut`, which includes a
 ///   cancelled workflow's jobs) or that no longer exists: an error, because the job
@@ -526,6 +528,9 @@ pub(crate) fn reevaluate_dependencies(
 
     if job.depends_on.is_empty() {
         return Ok(DependencyStatus::None);
+    }
+    if job.dependency_status == DependencyStatus::Satisfied {
+        return Ok(DependencyStatus::Satisfied);
     }
     let mut all_completed = true;
     for dependency in &job.depends_on {
@@ -1208,6 +1213,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no longer exists"), "{error}");
+
+        // A job whose dependencies already completed stays runnable even after they
+        // were purged.
+        job.dependency_status = DependencyStatus::Satisfied;
+        assert_eq!(
+            reevaluate_dependencies(&job, &HashMap::new(), "retried").unwrap(),
+            DependencyStatus::Satisfied
+        );
     }
 
     #[test]
