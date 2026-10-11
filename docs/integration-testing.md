@@ -68,7 +68,7 @@ hammerwork/
 │   ├── postgres-integration/   # PostgreSQL-specific tests
 │   └── mysql-integration/      # MySQL-specific tests
 └── .github/workflows/
-    └── integration.yml          # CI/CD pipeline
+    └── ci.yml                   # CI/CD pipeline
 ```
 
 ### Test Categories
@@ -219,30 +219,27 @@ Tests measure and validate:
 
 ### GitHub Actions Workflow
 
-The CI pipeline (`.github/workflows/integration.yml`) runs:
+The CI pipeline (`.github/workflows/ci.yml`) runs:
 
-1. **Unit Tests**: Fast validation without dependencies
-2. **PostgreSQL Integration**: Full database testing
-3. **MySQL Integration**: MySQL-specific validation
-4. **Docker Tests**: Containerized scenario testing
-5. **Security Audit**: Vulnerability scanning
-6. **Performance Tests**: Benchmark execution (scheduled)
+1. **rustfmt**, **clippy** (all features) and an **MSRV** build
+2. **Feature combinations**: the library with each backend alone, no features, and the optional subsystems
+3. **Unit and doc tests** (`test`)
+4. **PostgreSQL** and **MySQL integration** suites against service containers
+5. **Coverage** with a line-coverage floor
+6. **Security audit**: vulnerability scanning
 
 ### Triggers
 
-- **Push/PR**: On master/main/develop branches
-- **Scheduled**: Daily performance benchmarks
-- **Manual**: `[benchmark]` in commit message
+- **Push** to `master`, **pull requests** against `master`, and manual runs (`workflow_dispatch`)
 
 ### Test Matrix
 
 | Job | Database | Purpose |
 |-----|----------|---------|
-| unit-tests | None | Fast validation |
-| postgres-integration | PostgreSQL 16 | Feature testing |
-| mysql-integration | MySQL 8.0 | Feature testing |
-| docker-tests | Both | Container validation |
-| performance-tests | Both | Benchmark regression |
+| test | None | Unit and doc tests |
+| postgres | PostgreSQL | Integration suite |
+| mysql | MySQL | Integration suite |
+| coverage | Both | Line-coverage floor |
 
 ## Docker Testing
 
@@ -349,7 +346,7 @@ docker system prune
    - Add feature-specific tests to `mysql-integration/src/main.rs`
 
 3. **Update CI Pipeline**:
-   - Add new test validation to `.github/workflows/integration.yml`
+   - Add new test validation to `.github/workflows/ci.yml`
 
 ### Database Schema Changes
 
@@ -358,8 +355,8 @@ docker system prune
    - Modify `config/init-mysql.sql`
 
 2. **Update Database Queue Implementations**:
-   - Modify PostgreSQL implementation in `src/queue.rs`
-   - Modify MySQL implementation in `src/queue.rs`
+   - Modify PostgreSQL implementation in `src/queue/postgres.rs`
+   - Modify MySQL implementation in `src/queue/mysql.rs`
 
 3. **Add Migration Tests**:
    - Test schema compatibility

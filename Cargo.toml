@@ -74,7 +74,6 @@ exclude = [
     "docker-compose.yml",
     "config/",
     "scripts/",
-    "test-mysql-cli.sh",
 ]
 version.workspace = true
 edition.workspace = true
