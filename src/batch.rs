@@ -373,12 +373,15 @@ impl JobBatch {
     }
 
     /// Splits the batch into chunks of [`batch_size`](Self::batch_size) jobs (1000
-    /// when unset), each a new batch with its own id.
+    /// when unset or zero), each a new batch with its own id.
     ///
     /// Enqueue the chunks one by one to write a very large batch in several
     /// transactions.
     pub fn into_chunks(self) -> Vec<JobBatch> {
-        let chunk_size = self.batch_size.unwrap_or(1000) as usize;
+        let chunk_size = match self.batch_size {
+            Some(size) if size > 0 => size as usize,
+            _ => 1000,
+        };
 
         if self.jobs.len() <= chunk_size {
             return vec![self];
@@ -761,5 +764,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A batch size of zero is treated as unset (chunks of 1000) instead of panicking
+    /// in `slice::chunks(0)`.
+    #[test]
+    fn into_chunks_with_zero_batch_size_does_not_panic() {
+        let batch = JobBatch::new("zero")
+            .with_jobs(vec![
+                Job::new("q".to_string(), json!({"i": 1})),
+                Job::new("q".to_string(), json!({"i": 2})),
+            ])
+            .with_batch_size(0);
+        let chunks = batch.into_chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].jobs.len(), 2);
     }
 }

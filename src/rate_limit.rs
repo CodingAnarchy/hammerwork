@@ -228,7 +228,9 @@ pub struct RateLimiter {
 impl RateLimiter {
     /// Create a new rate limiter
     pub fn new(rate_limit: RateLimit) -> Self {
-        let capacity = rate_limit.burst_limit as f64;
+        // A bucket must hold at least one token, or no operation could ever proceed
+        // (a burst limit of 0 made `acquire` wait forever).
+        let capacity = rate_limit.burst_limit.max(1) as f64;
         let refill_rate = rate_limit.refill_rate_per_ms();
 
         Self {
@@ -521,5 +523,16 @@ mod tests {
         let wait_time = bucket.time_until_token();
         assert!(wait_time > Duration::from_millis(0));
         assert!(wait_time <= Duration::from_millis(1));
+    }
+
+    /// A burst limit of 0 would make a bucket that can never hold a token, so
+    /// `acquire` waited forever; the bucket always holds at least one token.
+    #[tokio::test]
+    async fn test_zero_burst_limit_does_not_stall() {
+        let limiter = RateLimiter::new(RateLimit::per_second(100).with_burst_limit(0));
+        tokio::time::timeout(Duration::from_secs(2), limiter.acquire())
+            .await
+            .expect("acquire must not wait forever")
+            .unwrap();
     }
 }

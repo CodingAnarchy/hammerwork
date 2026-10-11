@@ -193,7 +193,12 @@ where
         Ok(pool)
     }
 
+    /// Record the statistics of every worker of the pool (those already added, those
+    /// added later and those started by autoscaling) in `stats_collector`.
     pub fn with_stats_collector(mut self, stats_collector: Arc<dyn StatisticsCollector>) -> Self {
+        for worker in &mut self.workers {
+            worker.stats_collector = Some(Arc::clone(&stats_collector));
+        }
         self.stats_collector = Some(stats_collector);
         self
     }
@@ -1344,5 +1349,27 @@ mod tests {
         assert!(!pool.autoscale_config.enabled);
         pool.add_worker(lazy_worker("s"));
         assert!(pool.worker_template.is_none());
+    }
+
+    /// `from_config(..).with_stats_collector(c)` is the natural order: the collector
+    /// must reach the workers the pool already has, not only workers added later.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn stats_collector_set_after_workers_reaches_them() {
+        use crate::stats::InMemoryStatsCollector;
+        let stats: Arc<dyn StatisticsCollector> = Arc::new(InMemoryStatsCollector::new_default());
+        let config = crate::config::WorkerConfig {
+            pool_size: 2,
+            ..Default::default()
+        };
+        let pool = WorkerPool::from_config(lazy_worker("late_stats"), &config)
+            .with_stats_collector(Arc::clone(&stats));
+        assert_eq!(pool.workers.len(), 2);
+        for worker in &pool.workers {
+            assert!(Arc::ptr_eq(
+                worker.stats_collector.as_ref().unwrap(),
+                &stats
+            ));
+        }
     }
 }
