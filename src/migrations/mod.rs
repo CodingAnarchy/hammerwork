@@ -99,26 +99,39 @@ pub struct MigrationRecord {
     pub execution_time_ms: u64,
 }
 
-/// Migration runner trait for database-specific implementations
+/// Seals [`MigrationRunner`]: only the runners of this crate implement
+/// [`private::Sealed`], so only they can implement the trait.
+mod private {
+    /// The supertrait that seals [`MigrationRunner`](super::MigrationRunner).
+    pub trait Sealed {}
+
+    #[cfg(feature = "postgres")]
+    impl Sealed for super::postgres::PostgresMigrationRunner {}
+
+    #[cfg(feature = "mysql")]
+    impl Sealed for super::mysql::MySqlMigrationRunner {}
+}
+
+/// The database-specific side of [`MigrationManager`].
+///
+/// Sealed: it is implemented by [`PostgresMigrationRunner`](postgres::PostgresMigrationRunner)
+/// and [`MySqlMigrationRunner`](mysql::MySqlMigrationRunner) only, because the built-in
+/// migrations exist for those two databases only. It stays usable as a bound and as a
+/// trait object (`Box<dyn MigrationRunner<DB> + Send + Sync>`).
 #[async_trait::async_trait]
-pub trait MigrationRunner<DB: Database> {
+pub trait MigrationRunner<DB: Database>: private::Sealed {
     /// Take the lock that serializes migration runs on the database, waiting while
     /// another process holds it. [`MigrationManager::run_migrations`] holds it for the
     /// whole run and releases it with
     /// [`release_migration_lock`](Self::release_migration_lock).
     ///
-    /// The built-in runners use a session lock (`pg_advisory_lock` on PostgreSQL,
-    /// `GET_LOCK` on MySQL) on a dedicated connection that also runs every statement
-    /// of the run; if the run is abandoned the connection is closed, which releases
-    /// the lock. The default implementation takes no lock.
-    async fn acquire_migration_lock(&self) -> Result<()> {
-        Ok(())
-    }
+    /// The runners use a session lock (`pg_advisory_lock` on PostgreSQL, `GET_LOCK` on
+    /// MySQL) on a dedicated connection that also runs every statement of the run; if
+    /// the run is abandoned the connection is closed, which releases the lock.
+    async fn acquire_migration_lock(&self) -> Result<()>;
 
     /// Release the lock taken by [`acquire_migration_lock`](Self::acquire_migration_lock).
-    async fn release_migration_lock(&self) -> Result<()> {
-        Ok(())
-    }
+    async fn release_migration_lock(&self) -> Result<()>;
 
     /// Run a specific migration SQL for this database type
     async fn run_migration(&self, migration: &Migration, sql: &str) -> Result<()>;

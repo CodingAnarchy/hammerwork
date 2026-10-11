@@ -1885,12 +1885,8 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         }
     }
 
-    async fn requeue_stale_jobs(
-        &self,
-        older_than: std::time::Duration,
-    ) -> Result<super::StaleJobRecovery> {
-        let recovery =
-            super::retry_on_conflict(|| self.requeue_stale_jobs_once(older_than)).await?;
+    async fn requeue_stale_jobs(&self) -> Result<super::StaleJobRecovery> {
+        let recovery = super::retry_on_conflict(|| self.requeue_stale_jobs_once()).await?;
 
         if !recovery.is_empty() {
             tracing::warn!(
@@ -1942,21 +1938,16 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 }
 
 impl crate::queue::JobQueue<Postgres> {
-    async fn requeue_stale_jobs_once(
-        &self,
-        older_than: std::time::Duration,
-    ) -> Result<super::StaleJobRecovery> {
+    async fn requeue_stale_jobs_once(&self) -> Result<super::StaleJobRecovery> {
         let mut tx = self.pool.begin().await?;
-        let result = Self::requeue_stale_jobs_in_tx(&mut tx, older_than).await;
+        let result = Self::requeue_stale_jobs_in_tx(&mut tx).await;
         super::end_transaction(tx, result).await
     }
 
     async fn requeue_stale_jobs_in_tx(
         conn: &mut sqlx::PgConnection,
-        older_than: std::time::Duration,
     ) -> Result<super::StaleJobRecovery> {
         let now = db_now(conn).await?;
-        let cutoff = super::saturating_sub_from(now, older_than);
 
         // The CTE claims stale rows with SKIP LOCKED so concurrent reapers never wait on
         // (or double-process) the same row; the outer UPDATE re-checks `status` so a row
@@ -1964,31 +1955,25 @@ impl crate::queue::JobQueue<Postgres> {
         // the pre-update row, so `attempts >= max_attempts` picks Dead vs Pending.
         //
         // A run's lease is written when it is claimed (`last_heartbeat_at = started_at`),
-        // so only its expiry counts. The `started_at` cutoff applies only to runs without
-        // a lease of their own: claimed by an older version that wrote none.
+        // so only its expiry counts. A row without a lease of its current run is left
+        // alone: only 1.x claimed jobs without one.
         let rows = sqlx::query(
             r#"
             WITH stale AS (
                 SELECT id FROM hammerwork_jobs
                 WHERE status = $1
-                  AND (
-                    (last_heartbeat_at IS NOT NULL
-                        AND last_heartbeat_at >= started_at
-                        AND lease_expires_at < $2)
-                    OR ((last_heartbeat_at IS NULL OR lease_expires_at IS NULL
-                            OR last_heartbeat_at < started_at)
-                        AND started_at < $3)
-                  )
+                  AND last_heartbeat_at >= started_at
+                  AND lease_expires_at < $2
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE hammerwork_jobs AS j
-            SET status = CASE WHEN j.attempts >= j.max_attempts THEN $4 ELSE $5 END,
+            SET status = CASE WHEN j.attempts >= j.max_attempts THEN $3 ELSE $4 END,
                 failed_at = CASE WHEN j.attempts >= j.max_attempts THEN $2 ELSE j.failed_at END,
                 scheduled_at = CASE WHEN j.attempts >= j.max_attempts
                                     THEN j.scheduled_at ELSE $2 END,
                 started_at = CASE WHEN j.attempts >= j.max_attempts
                                   THEN j.started_at ELSE NULL END,
-                error_message = $6,
+                error_message = $5,
                 last_heartbeat_at = NULL,
                 lease_expires_at = NULL
             FROM stale
@@ -1998,7 +1983,6 @@ impl crate::queue::JobQueue<Postgres> {
         )
         .bind(JobStatus::Running)
         .bind(now)
-        .bind(cutoff)
         .bind(JobStatus::Dead)
         .bind(JobStatus::Pending)
         .bind(super::STALE_JOB_ERROR_MESSAGE)

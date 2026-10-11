@@ -33,20 +33,16 @@ pub enum MaintenanceCommand {
     },
     #[command(
         about = "Mark stale running jobs as dead",
-        long_about = "Mark Running jobs as Dead when they were abandoned: their lease expired, \
-            or, for runs that hold no lease (claimed by an older version), they started \
-            more than --stale-hours ago. A long-running job that keeps heartbeating is \
-            never touched. This is the rule of the library's stale-job recovery."
+        long_about = "Mark Running jobs as Dead when they were abandoned: their lease \
+            expired. A long-running job that keeps heartbeating is never touched, and \
+            neither is a Running job without a lease (left by a Hammerwork 1.x worker; \
+            see the 3.0 upgrade guide for the one-off fix). This is the rule of the \
+            library's stale-job recovery (`job requeue-stale`), which requeues jobs \
+            that have attempts left instead of marking them all dead."
     )]
     DeadJobs {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(
-            long,
-            default_value = "24",
-            help = "Hours since a running job without a lease started to consider it dead"
-        )]
-        stale_hours: u32,
         #[arg(long, help = "Confirm the cleanup operation")]
         confirm: bool,
         #[arg(long, help = "Dry run - show what would be cleaned")]
@@ -81,7 +77,18 @@ pub enum MaintenanceCommand {
         #[arg(long, help = "Dry run - count the jobs that would be deleted")]
         dry_run: bool,
     },
-    #[command(about = "Check database integrity and job consistency")]
+    #[command(
+        about = "Check database integrity and job consistency",
+        long_about = "Check database integrity and job consistency: Running jobs without a \
+            start time, Running jobs without a lease (left by a Hammerwork 1.x worker), \
+            invalid priorities and negative attempt counts.\n\n\
+            With --fix, orphaned Running jobs are retried, invalid priorities reset to \
+            normal and negative attempts to zero. Running jobs without a lease are given \
+            a lease that has already expired, so the stale job reaper (a worker pool's, or \
+            `cargo hammerwork job requeue-stale`) reclaims them on its next pass. Only \
+            use --fix once every Hammerwork 1.x worker has stopped: a 1.x worker still \
+            running such a job would see it run a second time."
+    )]
     Check {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
@@ -113,12 +120,9 @@ impl MaintenanceCommand {
                 .await?;
             }
             MaintenanceCommand::DeadJobs {
-                stale_hours,
-                confirm,
-                dry_run,
-                ..
+                confirm, dry_run, ..
             } => {
-                cleanup_dead_jobs(pool, *stale_hours, *confirm, *dry_run).await?;
+                cleanup_dead_jobs(pool, *confirm, *dry_run).await?;
             }
             MaintenanceCommand::Reindex { confirm, .. } => {
                 reindex_database(pool, *confirm).await?;
@@ -341,12 +345,7 @@ async fn vacuum_jobs(
     Ok(Some((completed_deleted, failed_deleted)))
 }
 
-async fn cleanup_dead_jobs(
-    pool: DatabasePool,
-    stale_hours: u32,
-    confirm: bool,
-    dry_run: bool,
-) -> Result<()> {
+async fn cleanup_dead_jobs(pool: DatabasePool, confirm: bool, dry_run: bool) -> Result<()> {
     if !confirm && !dry_run {
         println!(
             "⚠️  This will mark stale jobs as dead. Use --confirm to proceed or --dry-run to preview."
@@ -354,13 +353,10 @@ async fn cleanup_dead_jobs(
         return Ok(());
     }
 
-    // Find stale running jobs: lease expired, or no lease and started before the cutoff
+    // Find stale running jobs: their lease expired. Lease-less rows (1.x) are left alone.
     let selector = JobSelector {
         statuses: vec![JobStatus::Running],
-        stale_running: Some(StaleRunning::new(
-            chrono::Utc::now(),
-            chrono::Duration::hours(stale_hours as i64),
-        )),
+        stale_running: Some(StaleRunning::new(chrono::Utc::now())),
         ..Default::default()
     };
     let stale_ids = select_job_ids(&pool, &selector).await?;
@@ -368,10 +364,7 @@ async fn cleanup_dead_jobs(
 
     println!("🔍 Dead Jobs Analysis");
     println!("═══════════════════════");
-    println!(
-        "Stale running jobs (lease expired, or no lease and started more than {} hours ago): {}",
-        stale_hours, stale_count
-    );
+    println!("Stale running jobs (lease expired): {}", stale_count);
 
     if dry_run {
         println!("\n💡 This was a dry run. Use --confirm to actually mark these jobs as dead.");
@@ -474,6 +467,23 @@ async fn analyze_database(pool: DatabasePool) -> Result<()> {
     Ok(())
 }
 
+/// `Running` rows with a start time but no lease of their current run. Every 2.x and
+/// 3.x claim writes a lease (`last_heartbeat_at = started_at`); only 1.x workers left
+/// rows like these, and `requeue_stale_jobs` never reclaims them.
+const LEASELESS_RUNNING_SQL: &str = "status = 'Running' AND started_at IS NOT NULL \
+     AND (last_heartbeat_at IS NULL OR lease_expires_at IS NULL \
+     OR last_heartbeat_at < started_at)";
+
+/// Give the rows of [`LEASELESS_RUNNING_SQL`] a lease that expired when they started,
+/// so the next stale job reaper pass reclaims them (requeued, or dead when out of
+/// attempts, with the usual side effects). The SQL of the 3.0 upgrade guide does the
+/// same.
+const EXPIRE_LEASELESS_RUNNING_SQL: &str = "UPDATE hammerwork_jobs \
+     SET last_heartbeat_at = started_at, lease_expires_at = started_at \
+     WHERE status = 'Running' AND started_at IS NOT NULL \
+     AND (last_heartbeat_at IS NULL OR lease_expires_at IS NULL \
+     OR last_heartbeat_at < started_at)";
+
 async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
     info!("Checking database integrity");
 
@@ -496,6 +506,30 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
         let wrapper = pool.clone().create_job_queue();
         let result = retry_many(&wrapper, &ids).await;
         println!("✅ Fixed {} orphaned jobs", result.succeeded);
+    }
+
+    // Running jobs without a lease of their current run: only Hammerwork 1.x claimed
+    // jobs that way, and the 3.0 reaper never reclaims them.
+    let leaseless_count = fetch_i64(
+        &pool,
+        &format!("SELECT COUNT(*) as count FROM hammerwork_jobs WHERE {LEASELESS_RUNNING_SQL}"),
+        &[],
+        "count",
+    )
+    .await?;
+
+    println!(
+        "Running jobs without a lease (left by Hammerwork 1.x): {}",
+        leaseless_count
+    );
+
+    if fix && leaseless_count > 0 {
+        let expired = execute_binds(&pool, EXPIRE_LEASELESS_RUNNING_SQL, &[]).await?;
+        println!(
+            "✅ Gave {} lease-less running jobs an expired lease; the stale job reaper \
+             (`cargo hammerwork job requeue-stale`) reclaims them",
+            expired
+        );
     }
 
     // Check for invalid priorities
@@ -531,7 +565,8 @@ async fn check_database(pool: DatabasePool, fix: bool) -> Result<()> {
         );
     }
 
-    let total_issues = orphaned_count + invalid_priority_count + negative_attempts_count;
+    let total_issues =
+        orphaned_count + leaseless_count + invalid_priority_count + negative_attempts_count;
     if total_issues == 0 {
         println!("\n✨ Database integrity check passed! No issues found.");
     } else if fix {
@@ -733,22 +768,14 @@ mod tests {
             }
             _ => panic!("expected Vacuum"),
         }
-        match parse(&["dead-jobs", "--stale-hours", "2", "--dry-run"]) {
+        match parse(&["dead-jobs", "--dry-run"]) {
             MaintenanceCommand::DeadJobs {
-                stale_hours,
-                confirm,
-                dry_run,
-                ..
-            } => assert_eq!((stale_hours, confirm, dry_run), (2, false, true)),
+                confirm, dry_run, ..
+            } => assert_eq!((confirm, dry_run), (false, true)),
             _ => panic!("expected DeadJobs"),
         }
-        assert!(matches!(
-            parse(&["dead-jobs"]),
-            MaintenanceCommand::DeadJobs {
-                stale_hours: 24,
-                ..
-            }
-        ));
+        // The 2.x age threshold for lease-less jobs is gone.
+        assert!(TestCli::try_parse_from(["test", "dead-jobs", "--stale-hours", "2"]).is_err());
         assert!(matches!(
             parse(&["reindex", "--confirm"]),
             MaintenanceCommand::Reindex { confirm: true, .. }
@@ -851,31 +878,31 @@ mod tests {
         assert_eq!(count_jobs(pool, q, Some("Pending")).await, 1);
         assert_eq!(remaining().await, 1, "pending jobs are never vacuumed");
 
-        // --- dead-jobs: stale Running jobs are marked Dead, fresh ones are left alone
+        // --- dead-jobs: Running jobs whose lease expired are marked Dead; fresh ones and
+        // lease-less ones (left by 1.x, however old) are left alone
         let mut stale = SeedJob::new(q, "Running");
         stale.started_long_ago = true;
         let stale_id = seed(pool, &stale).await;
+        set_time(pool, &stale_id, "last_heartbeat_at", -60).await;
+        set_time(pool, &stale_id, "lease_expires_at", -10).await;
+        let leaseless_id = seed(pool, &stale).await;
         let fresh_id = seed(pool, &SeedJob::new(q, "Running")).await;
         backdate(pool, &fresh_id, "started_at", 0).await;
         run(&["dead-jobs"]).await.unwrap(); // needs --confirm
-        run(&["dead-jobs", "--dry-run", "--stale-hours", "1"])
-            .await
-            .unwrap();
+        run(&["dead-jobs", "--dry-run"]).await.unwrap();
         assert_eq!(job_status(pool, &stale_id).await, "Running");
-        run(&["dead-jobs", "--confirm", "--stale-hours", "1"])
-            .await
-            .unwrap();
+        run(&["dead-jobs", "--confirm"]).await.unwrap();
         assert_eq!(job_status(pool, &stale_id).await, "Dead");
         assert_eq!(job_status(pool, &fresh_id).await, "Running");
+        assert_eq!(job_status(pool, &leaseless_id).await, "Running");
         assert!(
             job_column(pool, &stale_id, "error_message")
                 .await
                 .unwrap_or_default()
                 .contains("inactivity")
         );
-        run(&["dead-jobs", "--confirm", "--stale-hours", "1"])
-            .await
-            .unwrap(); // none left
+        run(&["dead-jobs", "--confirm"]).await.unwrap(); // none left
+        assert_eq!(job_status(pool, &leaseless_id).await, "Running");
 
         // a long-running job that keeps heartbeating is not dead, however old its start
         let heartbeating = {
@@ -890,7 +917,7 @@ mod tests {
         set_time(pool, &expired, "started_at", -30).await;
         set_time(pool, &expired, "last_heartbeat_at", -20).await;
         set_time(pool, &expired, "lease_expires_at", -10).await;
-        // a run whose lease is valid but whose start predates the cutoff: still alive
+        // a run whose lease is valid but that started long ago: still alive
         let leased_old = {
             let mut job = SeedJob::new(q, "Running");
             job.started_long_ago = true;
@@ -898,13 +925,9 @@ mod tests {
         };
         set_time(pool, &leased_old, "last_heartbeat_at", -2).await;
         set_time(pool, &leased_old, "lease_expires_at", 1).await;
-        run(&["dead-jobs", "--dry-run", "--stale-hours", "1"])
-            .await
-            .unwrap();
+        run(&["dead-jobs", "--dry-run"]).await.unwrap();
         assert_eq!(job_status(pool, &expired).await, "Running");
-        run(&["dead-jobs", "--confirm", "--stale-hours", "1"])
-            .await
-            .unwrap();
+        run(&["dead-jobs", "--confirm"]).await.unwrap();
         assert_eq!(job_status(pool, &expired).await, "Dead");
         assert_eq!(job_status(pool, &heartbeating).await, "Running");
         assert_eq!(job_status(pool, &leased_old).await, "Running");
@@ -929,11 +952,26 @@ mod tests {
             job_column(pool, &bad_priority, "priority").await.as_deref(),
             Some("9")
         );
+        assert!(
+            job_column(pool, &leaseless_id, "lease_expires_at")
+                .await
+                .is_none()
+        );
         run(&["check", "--fix"]).await.unwrap();
         assert_eq!(
             job_column(pool, &bad_priority, "priority").await.as_deref(),
             Some("2")
         );
+        // The 1.x run left without a lease now has an expired one: the reaper rule
+        // (here dead-jobs) picks it up.
+        assert_eq!(job_status(pool, &leaseless_id).await, "Running");
+        assert!(
+            job_column(pool, &leaseless_id, "lease_expires_at")
+                .await
+                .is_some()
+        );
+        run(&["dead-jobs", "--confirm"]).await.unwrap();
+        assert_eq!(job_status(pool, &leaseless_id).await, "Dead");
         assert_eq!(
             job_column(pool, &bad_attempts, "attempts").await.as_deref(),
             Some("0")

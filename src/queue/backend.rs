@@ -504,7 +504,7 @@ pub(crate) fn run_started_range(run: &Job) -> Option<(DateTime<Utc>, DateTime<Ut
     ))
 }
 
-/// The longest lease or staleness window passed to the database as an interval;
+/// The longest lease passed to the database as an interval;
 /// longer durations are clamped to it (100 years).
 pub(crate) fn clamp_interval(duration: std::time::Duration) -> chrono::Duration {
     const MAX: std::time::Duration = std::time::Duration::from_secs(100 * 365 * 24 * 3600);

@@ -162,23 +162,16 @@ pub enum JobCommand {
         long_about = "Reclaim jobs left in Running by workers that crashed or were killed.\n\n\
             A Running job is stale when its lease has expired. Workers take the lease \
             when they claim a job and renew it with heartbeats, so a job whose worker \
-            is alive is never reclaimed, whatever --older-than-secs is. Only a job \
-            without a lease (claimed by an older Hammerwork version) is reclaimed by \
-            age, when it started more than --older-than-secs ago. Stale jobs with \
-            attempts left go back to Pending; \
-            the rest are marked Dead. Safe to run while workers and other reapers are \
-            running. Requires migration 015_add_job_leases.\n\n\
-            Example: cargo hammerwork job requeue-stale --older-than-secs 3600"
+            is alive is never reclaimed, however long it runs. A Running job without a \
+            lease (left by a Hammerwork 1.x worker) is never reclaimed; see the 3.0 \
+            upgrade guide for the one-off fix. Stale jobs with attempts left go back to \
+            Pending; the rest are marked Dead. Safe to run while workers and other \
+            reapers are running.\n\n\
+            Example: cargo hammerwork job requeue-stale"
     )]
     RequeueStale {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
-        #[arg(
-            long,
-            default_value_t = 3600,
-            help = "For jobs without a lease (claimed by older versions): reclaim if started more than N seconds ago"
-        )]
-        older_than_secs: u64,
     },
 }
 
@@ -283,10 +276,8 @@ impl JobCommand {
                 )
                 .await?;
             }
-            JobCommand::RequeueStale {
-                older_than_secs, ..
-            } => {
-                requeue_stale_jobs(pool, *older_than_secs).await?;
+            JobCommand::RequeueStale { .. } => {
+                requeue_stale_jobs(pool).await?;
             }
         }
         Ok(())
@@ -726,10 +717,9 @@ fn delayed_schedule(
         .ok_or_else(|| anyhow::anyhow!("--delay {} seconds is out of range", delay_secs))
 }
 
-async fn requeue_stale_jobs(pool: DatabasePool, older_than_secs: u64) -> Result<()> {
-    let older_than = std::time::Duration::from_secs(older_than_secs);
+async fn requeue_stale_jobs(pool: DatabasePool) -> Result<()> {
     let recovery = with_queue!(pool.create_job_queue(), |queue| {
-        queue.requeue_stale_jobs(older_than).await?
+        queue.requeue_stale_jobs().await?
     });
 
     for id in &recovery.requeued {
@@ -930,41 +920,26 @@ mod tests {
     }
 
     #[test]
-    fn test_requeue_stale_parses_with_default_threshold() {
+    fn test_requeue_stale_parses() {
         let cli = TestCli::try_parse_from(["test", "requeue-stale"]).unwrap();
         match cli.command {
-            JobCommand::RequeueStale {
-                database_url,
-                older_than_secs,
-            } => {
-                assert!(database_url.is_none());
-                assert_eq!(older_than_secs, 3600);
-            }
+            JobCommand::RequeueStale { database_url } => assert!(database_url.is_none()),
             _ => panic!("expected RequeueStale"),
         }
 
-        let cli = TestCli::try_parse_from([
-            "test",
-            "requeue-stale",
-            "--older-than-secs",
-            "120",
-            "-u",
-            "postgres://localhost/db",
-        ])
-        .unwrap();
+        let cli =
+            TestCli::try_parse_from(["test", "requeue-stale", "-u", "postgres://localhost/db"])
+                .unwrap();
         match cli.command {
-            JobCommand::RequeueStale {
-                database_url,
-                older_than_secs,
-            } => {
+            JobCommand::RequeueStale { database_url } => {
                 assert_eq!(database_url.as_deref(), Some("postgres://localhost/db"));
-                assert_eq!(older_than_secs, 120);
             }
             _ => panic!("expected RequeueStale"),
         }
 
+        // The 2.x age threshold for lease-less jobs is gone.
         assert!(
-            TestCli::try_parse_from(["test", "requeue-stale", "--older-than-secs", "-5"]).is_err()
+            TestCli::try_parse_from(["test", "requeue-stale", "--older-than-secs", "60"]).is_err()
         );
     }
 
@@ -1618,23 +1593,28 @@ mod tests {
         run(&["cancel", "--all-pending"]).await.unwrap();
         assert_eq!(count_jobs(pool, &q, None).await, 0);
 
-        // --- requeue-stale: a stale job with attempts left goes back to Pending, an exhausted one dies
+        // --- requeue-stale: a job whose lease expired goes back to Pending (or dies when
+        // exhausted); a job without a lease (left by 1.x) is never reclaimed
         let mut stale = SeedJob::new(&q, "Running");
         stale.started_long_ago = true;
         let retryable = seed(pool, &stale).await;
         let exhausted = seed(pool, &stale).await;
+        for id in [&retryable, &exhausted] {
+            set_time(pool, id, "last_heartbeat_at", -60).await;
+            set_time(pool, id, "lease_expires_at", -10).await;
+        }
         exec_sql(
             pool,
             &format!("UPDATE hammerwork_jobs SET attempts = max_attempts WHERE id = '{exhausted}'"),
         )
         .await;
+        let leaseless = seed(pool, &stale).await;
         let fresh = seed(pool, &SeedJob::new(&q, "Running")).await;
         backdate(pool, &fresh, "started_at", 0).await;
-        run(&["requeue-stale", "--older-than-secs", "3600"])
-            .await
-            .unwrap();
+        run(&["requeue-stale"]).await.unwrap();
         assert_eq!(job_status(pool, &retryable).await, "Pending");
         assert_eq!(job_status(pool, &exhausted).await, "Dead");
+        assert_eq!(job_status(pool, &leaseless).await, "Running");
         assert_eq!(job_status(pool, &fresh).await, "Running");
         run(&["requeue-stale"]).await.unwrap();
 

@@ -115,7 +115,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_poll_interval(Duration::from_secs(1))
         .with_attempt_cap(3)
         .with_default_timeout(Duration::from_secs(30))
-        .with_rate_limit(RateLimit::per_second(2))
+        .with_rate_limit(RateLimit::per_second(2)?)
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let data_worker = Worker::new(queue.clone(), "data_processing".to_string(), handler.clone())
@@ -326,13 +326,14 @@ let job = Job::with_delay("queue_name".to_string(), json!({"data": "value"}), ch
 ```rust
 # use hammerwork::{Worker, JobQueue, rate_limit::RateLimit, stats::StatisticsCollector, worker::JobHandler};
 # use std::{sync::Arc, time::Duration};
-# fn example(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, stats_collector: Arc<dyn StatisticsCollector>) {
+# fn example(queue: Arc<JobQueue<sqlx::Postgres>>, handler: JobHandler, stats_collector: Arc<dyn StatisticsCollector>) -> hammerwork::Result<()> {
 let worker = Worker::new(queue.clone(), "queue_name".to_string(), handler)
     .with_poll_interval(Duration::from_secs(1))      // How often to check for jobs
     .with_attempt_cap(3)                             // At most 3 attempts per job
     .with_default_timeout(Duration::from_secs(30))   // Default job timeout
-    .with_rate_limit(RateLimit::per_second(2))       // Rate limiting
+    .with_rate_limit(RateLimit::per_second(2)?)       // Rate limiting
     .with_stats_collector(stats_collector);          // Statistics collection
+# Ok(())
 # }
 ```
 

@@ -536,7 +536,7 @@ pub enum JobHandlerType {
 ///     .with_weight(hammerwork::JobPriority::Critical, 50)
 ///     .with_weight(hammerwork::JobPriority::High, 20);
 ///
-/// let rate_limit = RateLimit::per_second(10).with_burst_limit(20);
+/// let rate_limit = RateLimit::per_second(10)?.with_burst_limit(20);
 ///
 /// let worker = Worker::new(queue, "api_queue".to_string(), handler)
 ///     .with_priority_weights(priority_weights)
@@ -1076,8 +1076,7 @@ where
     /// a heartbeat and extends the lease every third of this duration (via
     /// [`DatabaseQueue::heartbeat_job`]). If the worker process dies, the lease stops
     /// being renewed and [`DatabaseQueue::requeue_stale_jobs`] reclaims the job once it
-    /// expires; a reaper never reclaims a job whose lease is still valid, whatever its
-    /// own staleness window. Shorter leases recover crashed jobs faster at the cost of
+    /// expires; a reaper never reclaims a job whose lease is still valid. Shorter leases recover crashed jobs faster at the cost of
     /// more heartbeat writes for long-running jobs; jobs that finish within a third of
     /// the lease never write one.
     ///
@@ -1157,15 +1156,18 @@ where
     /// let handler: hammerwork::worker::JobHandler = Arc::new(|_job| Box::pin(async { Ok(()) }));
     ///
     /// let worker = Worker::new(queue, "email".to_string(), handler)
-    ///     .with_hammerwork_config(&config);
+    ///     .with_hammerwork_config(&config)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_hammerwork_config(mut self, config: &crate::HammerworkConfig) -> Self {
+    ///
+    /// Fails with [`HammerworkError::Config`] when the matching throttle is invalid (see
+    /// [`with_throttle_config`](Self::with_throttle_config)).
+    pub fn with_hammerwork_config(mut self, config: &crate::HammerworkConfig) -> Result<Self> {
         self = self.with_config(&config.worker);
 
         if let Some(throttle) = config.rate_limiting.throttle_for(&self.queue_name) {
-            self = self.with_throttle_config(throttle);
+            self = self.with_throttle_config(throttle)?;
         }
 
         #[cfg(feature = "alerting")]
@@ -1173,7 +1175,7 @@ where
             self = self.with_alerting_config(config.alerting.clone());
         }
 
-        self
+        Ok(self)
     }
 
     /// Configure priority weights for job selection
@@ -1208,12 +1210,15 @@ where
     ///
     /// The limits are shared by every clone of this worker, so they apply to a whole
     /// [`WorkerPool`] built from it. A throttle with `enabled == false` is ignored.
-    pub fn with_throttle_config(mut self, throttle_config: ThrottleConfig) -> Self {
+    ///
+    /// Fails with [`HammerworkError::Config`] when `rate_per_minute` is zero, which
+    /// would never let a job through ([`ThrottleConfig::validate`]).
+    pub fn with_throttle_config(mut self, throttle_config: ThrottleConfig) -> Result<Self> {
         if !throttle_config.enabled {
-            return self;
+            return Ok(self);
         }
         // If the throttle config has a rate limit, create a rate limiter
-        if let Some(rate_limit) = throttle_config.to_rate_limit() {
+        if let Some(rate_limit) = throttle_config.to_rate_limit()? {
             self.rate_limiter = Some(RateLimiter::new(rate_limit));
         }
         self.concurrency_limit = throttle_config.max_concurrent.map(|max| {
@@ -1223,7 +1228,7 @@ where
             Arc::new(tokio::sync::Semaphore::new(permits))
         });
         self.throttle_config = Some(throttle_config);
-        self
+        Ok(self)
     }
 
     /// Configure Prometheus metrics collection for this worker
@@ -3376,20 +3381,20 @@ mod tests {
         use crate::rate_limit::RateLimit;
 
         // Test rate limit configuration
-        let rate_limit = RateLimit::per_second(10).with_burst_limit(20);
+        let rate_limit = RateLimit::per_second(10).unwrap().with_burst_limit(20);
 
-        assert_eq!(rate_limit.rate, 10);
-        assert_eq!(rate_limit.burst_limit, 20);
-        assert_eq!(rate_limit.per, Duration::from_secs(1));
+        assert_eq!(rate_limit.rate(), 10);
+        assert_eq!(rate_limit.burst_limit(), 20);
+        assert_eq!(rate_limit.per(), Duration::from_secs(1));
 
         // Test different time windows
-        let per_minute = RateLimit::per_minute(60);
-        assert_eq!(per_minute.rate, 60);
-        assert_eq!(per_minute.per, Duration::from_secs(60));
+        let per_minute = RateLimit::per_minute(60).unwrap();
+        assert_eq!(per_minute.rate(), 60);
+        assert_eq!(per_minute.per(), Duration::from_secs(60));
 
-        let per_hour = RateLimit::per_hour(3600);
-        assert_eq!(per_hour.rate, 3600);
-        assert_eq!(per_hour.per, Duration::from_secs(3600));
+        let per_hour = RateLimit::per_hour(3600).unwrap();
+        assert_eq!(per_hour.rate(), 3600);
+        assert_eq!(per_hour.per(), Duration::from_secs(3600));
     }
 
     #[test]
@@ -3411,16 +3416,16 @@ mod tests {
         assert!(throttle_config.enabled);
 
         // Test rate limit conversion
-        let rate_limit = throttle_config.to_rate_limit().unwrap();
-        assert_eq!(rate_limit.rate, 100);
-        assert_eq!(rate_limit.per, Duration::from_secs(60));
+        let rate_limit = throttle_config.to_rate_limit().unwrap().unwrap();
+        assert_eq!(rate_limit.rate(), 100);
+        assert_eq!(rate_limit.per(), Duration::from_secs(60));
     }
 
     #[tokio::test]
     async fn test_rate_limiter_integration() {
         use crate::rate_limit::{RateLimit, RateLimiter};
 
-        let rate_limit = RateLimit::per_second(5); // 5 operations per second
+        let rate_limit = RateLimit::per_second(5).unwrap(); // 5 operations per second
         let rate_limiter = RateLimiter::new(rate_limit);
 
         // Should initially allow operations
@@ -3469,7 +3474,7 @@ mod tests {
     async fn test_rate_limiter_token_availability() {
         use crate::rate_limit::{RateLimit, RateLimiter};
 
-        let rate_limit = RateLimit::per_second(10); // 10 tokens per second
+        let rate_limit = RateLimit::per_second(10).unwrap(); // 10 tokens per second
         let rate_limiter = RateLimiter::new(rate_limit);
 
         // Check initial token availability
@@ -3490,18 +3495,18 @@ mod tests {
         use crate::rate_limit::RateLimit;
 
         // Test very low rate
-        let low_rate = RateLimit::per_hour(1);
-        assert_eq!(low_rate.rate, 1);
-        assert_eq!(low_rate.per, Duration::from_secs(3600));
+        let low_rate = RateLimit::per_hour(1).unwrap();
+        assert_eq!(low_rate.rate(), 1);
+        assert_eq!(low_rate.per(), Duration::from_secs(3600));
 
         // Test very high rate
-        let high_rate = RateLimit::per_second(1000);
-        assert_eq!(high_rate.rate, 1000);
-        assert_eq!(high_rate.burst_limit, 1000);
+        let high_rate = RateLimit::per_second(1000).unwrap();
+        assert_eq!(high_rate.rate(), 1000);
+        assert_eq!(high_rate.burst_limit(), 1000);
 
         // Test custom burst limit
-        let custom_burst = RateLimit::per_second(10).with_burst_limit(50);
-        assert_eq!(custom_burst.burst_limit, 50);
+        let custom_burst = RateLimit::per_second(10).unwrap().with_burst_limit(50);
+        assert_eq!(custom_burst.burst_limit(), 50);
     }
 
     #[test]
@@ -3655,7 +3660,9 @@ mod tests {
                 .backoff_on_error(Duration::from_secs(5)),
         );
 
-        let emails = lazy_worker("emails").with_hammerwork_config(&config);
+        let emails = lazy_worker("emails")
+            .with_hammerwork_config(&config)
+            .unwrap();
         assert_eq!(emails.poll_interval, Duration::from_millis(100));
         assert_eq!(
             emails.throttle_config.as_ref().unwrap().max_concurrent,
@@ -3673,7 +3680,9 @@ mod tests {
         assert_eq!(emails.error_backoff_base(), Duration::from_secs(5));
 
         // Other queues get the default throttle: a rate limit only.
-        let other = lazy_worker("other").with_hammerwork_config(&config);
+        let other = lazy_worker("other")
+            .with_hammerwork_config(&config)
+            .unwrap();
         assert_eq!(
             other.throttle_config.as_ref().unwrap().rate_per_minute,
             Some(600)
@@ -3687,7 +3696,9 @@ mod tests {
 
         // With rate limiting disabled no throttle applies.
         config.rate_limiting.enabled = false;
-        let unthrottled = lazy_worker("emails").with_hammerwork_config(&config);
+        let unthrottled = lazy_worker("emails")
+            .with_hammerwork_config(&config)
+            .unwrap();
         assert!(unthrottled.throttle_config.is_none());
         assert!(unthrottled.rate_limiter.is_none());
     }
@@ -3697,7 +3708,9 @@ mod tests {
     async fn with_hammerwork_config_applies_alerting() {
         let mut config = crate::HammerworkConfig::new();
         config.alerting = AlertingConfig::new().alert_on_queue_depth(17);
-        let worker = lazy_worker("alerts").with_hammerwork_config(&config);
+        let worker = lazy_worker("alerts")
+            .with_hammerwork_config(&config)
+            .unwrap();
         let manager = worker.alert_manager.as_ref().expect("an alert manager");
         assert_eq!(manager.config().queue_depth_threshold, Some(17));
     }
@@ -3710,13 +3723,15 @@ mod tests {
             .rate_per_minute(1)
             .backoff_on_error(Duration::from_secs(9));
         disabled.enabled = false;
-        let worker = lazy_worker("t").with_throttle_config(disabled);
+        let worker = lazy_worker("t").with_throttle_config(disabled).unwrap();
         assert!(worker.throttle_config.is_none());
         assert!(worker.rate_limiter.is_none());
         assert!(worker.concurrency_limit.is_none());
         assert_eq!(worker.error_backoff_base(), worker.poll_interval);
 
-        let worker = lazy_worker("t").with_throttle_config(ThrottleConfig::new().max_concurrent(0));
+        let worker = lazy_worker("t")
+            .with_throttle_config(ThrottleConfig::new().max_concurrent(0))
+            .unwrap();
         assert_eq!(
             worker
                 .concurrency_limit
@@ -3733,6 +3748,37 @@ mod tests {
             worker.concurrency_limit.as_ref().unwrap(),
             clone.concurrency_limit.as_ref().unwrap()
         ));
+    }
+
+    /// A zero rate would never let a job through: the worker rejects the throttle,
+    /// directly and through a `HammerworkConfig`, unless the throttle is disabled.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn zero_rate_throttle_is_rejected() {
+        let zero = ThrottleConfig::new().rate_per_minute(0);
+        assert!(matches!(
+            lazy_worker("t").with_throttle_config(zero.clone()),
+            Err(HammerworkError::Config(_))
+        ));
+        assert!(
+            lazy_worker("t")
+                .with_throttle_config(zero.clone().enabled(false))
+                .is_ok()
+        );
+
+        let mut config = crate::HammerworkConfig::new();
+        config.rate_limiting.enabled = true;
+        config
+            .rate_limiting
+            .queue_throttles
+            .insert("emails".to_string(), zero);
+        assert!(matches!(
+            lazy_worker("emails").with_hammerwork_config(&config),
+            Err(HammerworkError::Config(_))
+        ));
+        assert!(config.rate_limiting.validate().is_err());
+        // Other queues use the (valid) default throttle.
+        assert!(lazy_worker("other").with_hammerwork_config(&config).is_ok());
     }
 
     /// #105: a finished batch is counted once, and the memory of finished batches is

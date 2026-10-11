@@ -362,12 +362,13 @@ impl HammerworkConfig {
         config.worker.validate()?;
         config.archive.validate()?;
         config.encryption.validate()?;
+        config.rate_limiting.validate()?;
         config.validate_delivery_targets()?;
         Ok(config)
     }
 
     /// Reject alert and webhook settings that could never deliver anything (an email
-    /// alert target without SMTP settings, an invalid webhook payload template), so
+    /// alert target with invalid SMTP settings, an invalid webhook payload template), so
     /// they fail when the file is loaded instead of when the first alert or event fires.
     fn validate_delivery_targets(&self) -> crate::Result<()> {
         #[cfg(feature = "alerting")]
@@ -964,6 +965,24 @@ impl RateLimitingConfig {
             .get(queue_name)
             .unwrap_or(&self.default_throttle);
         throttle.enabled.then(|| throttle.clone())
+    }
+
+    /// Reject throttles that could never let a job through (an enabled throttle with
+    /// `rate_per_minute = 0`; see [`ThrottleConfig::validate`]). Called when a
+    /// configuration is loaded and by
+    /// [`WorkerPool::from_hammerwork_config`](crate::WorkerPool::from_hammerwork_config).
+    pub fn validate(&self) -> crate::Result<()> {
+        self.default_throttle.validate().map_err(|e| {
+            crate::HammerworkError::Config(format!("rate_limiting.default_throttle: {e}"))
+        })?;
+        for (queue_name, throttle) in &self.queue_throttles {
+            throttle.validate().map_err(|e| {
+                crate::HammerworkError::Config(format!(
+                    "rate_limiting.queue_throttles.{queue_name}: {e}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -2545,26 +2564,19 @@ service_name = "hammerwork"
         let path = dir.path().join("hammerwork.toml");
         let path = path.to_str().unwrap();
 
-        // An email alert target without SMTP settings.
+        // An email alert target with invalid SMTP settings.
         let mut config = HammerworkConfig::default();
-        config
-            .alerting
-            .targets
-            .push(crate::alerting::AlertTarget::Email {
-                recipient: "oncall@example.com".to_string(),
-                smtp: None,
-            });
-        config.save_to_file(path).unwrap();
-        let err = HammerworkConfig::from_file(path).unwrap_err();
-        assert!(err.to_string().contains("no SMTP settings"), "{err}");
-
-        // With SMTP settings it loads.
         config.alerting.targets = vec![crate::alerting::AlertTarget::Email {
             recipient: "oncall@example.com".to_string(),
-            smtp: Some(crate::alerting::SmtpConfig::new(
-                "smtp.example.com",
-                "alerts@example.com",
-            )),
+            smtp: crate::alerting::SmtpConfig::new("smtp.example.com", "not an address"),
+        }];
+        config.save_to_file(path).unwrap();
+        assert!(HammerworkConfig::from_file(path).is_err());
+
+        // With valid SMTP settings it loads.
+        config.alerting.targets = vec![crate::alerting::AlertTarget::Email {
+            recipient: "oncall@example.com".to_string(),
+            smtp: crate::alerting::SmtpConfig::new("smtp.example.com", "alerts@example.com"),
         }];
         config.save_to_file(path).unwrap();
         HammerworkConfig::from_file(path).unwrap();

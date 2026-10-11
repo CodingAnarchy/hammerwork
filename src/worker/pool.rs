@@ -61,9 +61,6 @@ pub struct WorkerPool<DB: Database> {
     supervisor_done: Option<watch::Receiver<bool>>,
     /// How often the stale job reaper runs (`None` disables it)
     reaper_interval: Option<Duration>,
-    /// Fallback staleness threshold for jobs without a lease (`None`: the longest
-    /// worker lease duration)
-    reaper_older_than: Option<Duration>,
     /// How often encrypted jobs whose retention ended are purged (`None`: never)
     encrypted_job_purge_interval: Option<Duration>,
     /// Automatic archival and purge of archived jobs (`None`: off)
@@ -99,7 +96,6 @@ where
             shutdown_signal: None,
             supervisor_done: None,
             reaper_interval: Some(DEFAULT_STALE_JOB_REAPER_INTERVAL),
-            reaper_older_than: None,
             encrypted_job_purge_interval: None,
             archival: None,
             result_cleanup_interval: Some(DEFAULT_RESULT_CLEANUP_INTERVAL),
@@ -159,6 +155,7 @@ where
         config.encryption.validate()?;
         config.worker.validate()?;
         config.archive.validate()?;
+        config.rate_limiting.validate()?;
         let rotation = &config.encryption.key_rotation;
         #[cfg(feature = "encryption")]
         let key_rotation = if rotation.enabled {
@@ -226,21 +223,19 @@ where
 
     /// Configure the stale job reaper.
     ///
-    /// Every `interval` the pool calls
-    /// [`DatabaseQueue::requeue_stale_jobs`]`(older_than)`, which moves `Running` jobs
-    /// whose lease expired back to `Pending` (or to `Dead` when they have no attempts
-    /// left). Workers take their lease when they claim a job, so a job whose worker is
-    /// alive is never reclaimed, whatever this pool's settings or those of other pools.
-    /// `older_than` only applies to running jobs without a lease of their own (claimed
-    /// by an older Hammerwork version); by default it is the longest
-    /// [lease duration](Worker::with_lease_duration) of the pool's workers. The reaper
-    /// is enabled by default with a 60 second interval.
+    /// Every `interval` the pool calls [`DatabaseQueue::requeue_stale_jobs`], which
+    /// moves `Running` jobs whose lease expired back to `Pending` (or to `Dead` when
+    /// they have no attempts left). Workers take their lease when they claim a job, so
+    /// a job whose worker is alive is never reclaimed, whatever this pool's settings or
+    /// those of other pools. How soon a crashed worker's job is reclaimed depends on the
+    /// worker's [lease duration](Worker::with_lease_duration) plus this interval. The
+    /// reaper is enabled by default with a 60 second interval
+    /// ([`DEFAULT_STALE_JOB_REAPER_INTERVAL`](crate::worker::DEFAULT_STALE_JOB_REAPER_INTERVAL)).
     ///
-    /// Requires migration `015_add_job_leases`. Running reapers in several pools or
-    /// processes at once, with different settings, is safe.
-    pub fn with_stale_job_reaper(mut self, interval: Duration, older_than: Duration) -> Self {
+    /// Running reapers in several pools or processes at once, with different
+    /// intervals, is safe.
+    pub fn with_stale_job_reaper(mut self, interval: Duration) -> Self {
         self.reaper_interval = Some(interval);
-        self.reaper_older_than = Some(older_than);
         self
     }
 
@@ -667,17 +662,8 @@ where
         signal_rx: watch::Receiver<bool>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let interval = self.reaper_interval?;
-        let older_than = self.reaper_older_than.unwrap_or_else(|| {
-            workers
-                .iter()
-                .map(|worker| worker.lease_duration)
-                .max()
-                .filter(|lease| !lease.is_zero())
-                .unwrap_or(DEFAULT_LEASE_DURATION)
-        });
-
-        spawn_queue_task(workers, interval, signal_rx, move |queue| async move {
-            match queue.requeue_stale_jobs(older_than).await {
+        spawn_queue_task(workers, interval, signal_rx, |queue| async move {
+            match queue.requeue_stale_jobs().await {
                 Ok(recovery) if !recovery.is_empty() => info!(
                     "Stale job reaper requeued {} and marked {} dead",
                     recovery.requeued.len(),
@@ -721,7 +707,7 @@ where
             return None;
         }
         let archiver = Arc::new(
-            crate::archive::JobArchiver::new(queue.pool.clone())
+            crate::archive::JobArchiver::new()
                 .with_default_policy(archival.policy)
                 .with_config(archival.config),
         );

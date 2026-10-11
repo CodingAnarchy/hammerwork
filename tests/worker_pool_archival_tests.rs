@@ -225,7 +225,7 @@ where
     }
 
     let archiver = || {
-        JobArchiver::new(queue.pool.clone())
+        JobArchiver::new()
             .with_default_policy({
                 let mut value = policy();
                 value.purge_archived_after = None;

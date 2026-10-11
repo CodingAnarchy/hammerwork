@@ -258,8 +258,8 @@ where
     );
 }
 
-/// Every job of a batch holds its own lease from the claim: a reaper with any
-/// staleness window leaves it alone, and the lease can be renewed per job.
+/// Every job of a batch holds its own lease from the claim: the reaper leaves it
+/// alone, and the lease can be renewed per job.
 async fn batch_claims_hold_leases<Q>(queue: Arc<Q>)
 where
     Q: DatabaseQueue + Send + Sync + 'static,
@@ -282,7 +282,7 @@ where
         .unwrap();
     assert_eq!(claimed.len(), 3);
 
-    let recovery = queue.requeue_stale_jobs(Duration::ZERO).await.unwrap();
+    let recovery = queue.requeue_stale_jobs().await.unwrap();
     for job in &claimed {
         assert!(
             !recovery.requeued.contains(&job.id) && !recovery.dead.contains(&job.id),
@@ -642,10 +642,7 @@ mod worker {
 
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let recovery = queue
-                .requeue_stale_jobs(Duration::from_secs(3600))
-                .await
-                .unwrap();
+            let recovery = queue.requeue_stale_jobs().await.unwrap();
             for id in &ids {
                 assert!(
                     !recovery.requeued.contains(id) && !recovery.dead.contains(id),
@@ -946,7 +943,7 @@ mod worker {
         };
         let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
             .with_poll_interval(Duration::from_millis(20))
-            .with_rate_limit(RateLimit::per_hour(2))
+            .with_rate_limit(RateLimit::per_hour(2).unwrap())
             .with_batch_size(2)
             .with_batch_concurrency(1);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -1008,6 +1005,7 @@ mod worker {
         let template = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
             .with_poll_interval(Duration::from_millis(20))
             .with_throttle_config(ThrottleConfig::new().max_concurrent(2))
+            .unwrap()
             .with_batch_size(10)
             .with_batch_concurrency(10);
         // Two clones share the throttle.
@@ -1073,7 +1071,7 @@ mod worker {
         };
         let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
             .with_poll_interval(Duration::from_millis(20))
-            .with_rate_limit(RateLimit::per_second(3))
+            .with_rate_limit(RateLimit::per_second(3).unwrap())
             .with_batch_size(10)
             .with_batch_concurrency(10);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);

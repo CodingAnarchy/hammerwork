@@ -89,10 +89,10 @@ async fn test_multiple_archivers_shared_pool_comprehensive() {
     let queue_b_name = test_utils::unique_queue("queue_b");
     let queue_c_name = test_utils::unique_queue("queue_c");
 
-    // Create multiple archivers using the public pool field
-    let mut archiver1 = JobArchiver::new(queue.pool.clone());
-    let mut archiver2 = JobArchiver::new(queue.pool.clone());
-    let mut archiver3 = JobArchiver::new(queue.pool.clone());
+    // Create multiple archivers
+    let mut archiver1 = JobArchiver::new();
+    let mut archiver2 = JobArchiver::new();
+    let mut archiver3 = JobArchiver::new();
 
     // Configure different policies
     archiver1.set_policy(
@@ -211,8 +211,8 @@ async fn test_jobarchiver_event_publishing_comprehensive() {
     let _serial = test_utils::serial().await;
     let queue_name = test_utils::unique_queue("event_test");
 
-    // Create archiver using public pool field
-    let mut archiver = JobArchiver::new(queue.pool.clone());
+    // Create the archiver
+    let mut archiver = JobArchiver::new();
 
     // Set up comprehensive event tracking
     let events: Arc<Mutex<Vec<ArchiveEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -341,7 +341,7 @@ async fn test_jobarchiver_progress_tracking_comprehensive() {
         Arc::new(Mutex::new(Vec::new()));
     let progress_clone = Arc::clone(&progress_updates);
 
-    let mut archiver = JobArchiver::new(queue.pool.clone());
+    let mut archiver = JobArchiver::new();
     archiver.set_policy(
         queue_name.as_str(),
         ArchivalPolicy::new()
@@ -437,7 +437,7 @@ async fn test_archive_error_handling_comprehensive() {
     let queue = test_utils::setup_postgres_queue().await;
     let _serial = test_utils::serial().await;
 
-    let archiver = JobArchiver::new(queue.pool.clone());
+    let archiver = JobArchiver::new();
 
     // Test archiving with no matching jobs
     let (operation_id, stats) = archiver
@@ -551,16 +551,12 @@ fn test_archive_event_edge_cases() {
     }
 }
 
-/// Test JobArchiver configuration management with public pool
+/// Test JobArchiver configuration management
 ///
-/// Uses a lazily-connected pool, so no database is required.
-#[cfg(feature = "postgres")]
-#[tokio::test]
-async fn test_jobarchiver_configuration_comprehensive() {
-    let queue = Arc::new(hammerwork::JobQueue::new(test_utils::lazy_postgres_pool()));
-
-    // Test creating archiver with public pool field
-    let mut archiver = JobArchiver::new(queue.pool.clone());
+/// No database is required.
+#[test]
+fn test_jobarchiver_configuration_comprehensive() {
+    let mut archiver = JobArchiver::new();
 
     // Test comprehensive policy configuration
     let policy = ArchivalPolicy::new()

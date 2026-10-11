@@ -1129,7 +1129,7 @@ mod tests {
             next_cron_run(&job, at("2026-03-10T12:05:00Z")),
             Some(at("2026-03-11T00:00:00Z"))
         );
-        // Old rows without next_run_at use scheduled_at
+        // Without next_run_at (a disabled recurring job, or one set up by hand) the slot is scheduled_at
         let mut job = daily_job(at("2026-03-10T00:00:00Z"));
         job.next_run_at = None;
         assert_eq!(

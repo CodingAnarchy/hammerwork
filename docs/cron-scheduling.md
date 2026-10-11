@@ -503,7 +503,7 @@ let frequent_job = Job::new("frequent_task".to_string(), payload.clone())
     .with_cron(CronSchedule::new("0 * * * * *")?)?; // every minute
 
 let worker = Worker::new(queue, "frequent_queue".to_string(), handler)
-    .with_rate_limit(RateLimit::per_minute(10));
+    .with_rate_limit(RateLimit::per_minute(10)?);
 # Ok(())
 # }
 ```

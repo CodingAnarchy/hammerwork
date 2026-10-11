@@ -232,21 +232,11 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
     /// archive now, optionally for one queue: the jobs of each status the policy archives
     /// that finished longer ago than the policy keeps that status, at most
     /// `policy.batch_size`, and none when the policy is disabled. Used for dry runs.
-    ///
-    /// The default implementation returns an error, for implementations that predate
-    /// this method.
     fn count_archivable(
         &self,
         queue: Option<&str>,
         policy: &hammerwork::archive::ArchivalPolicy,
-    ) -> impl Future<Output = Result<u64>> + Send {
-        let _ = (queue, policy);
-        async {
-            Err(hammerwork::HammerworkError::Queue {
-                message: "archive dry runs are not supported by this queue".to_string(),
-            })
-        }
-    }
+    ) -> impl Future<Output = Result<u64>> + Send;
 
     /// Deletes the jobs [`count_jobs`](Self::count_jobs) counts; returns how many.
     fn delete_jobs(
@@ -286,70 +276,24 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
 
     /// The jobs that are `Running` now, most recently started first, at most `limit`,
     /// each with its start time. Rows that cannot be decoded are skipped.
-    ///
-    /// The default implementation returns none, for implementations that predate this
-    /// method; live updates then miss `Running` to `Pending` transitions.
-    fn running_jobs(&self, limit: u32) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send {
-        let _ = limit;
-        async { Ok(Vec::new()) }
-    }
+    fn running_jobs(&self, limit: u32) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send;
 
     /// Jobs with exactly `status` (a status as stored: `Pending`, `Running`, `Completed`,
     /// `Failed`, `Dead`, `TimedOut`, `Retrying`), optionally for one queue, newest first,
     /// at most `limit`. Pending jobs scheduled for later are included. Rows that cannot
     /// be decoded are skipped.
-    ///
-    /// The default implementation returns an error, for implementations that predate
-    /// this method.
     fn jobs_with_status(
         &self,
         queue: Option<&str>,
         status: &str,
         limit: u32,
-    ) -> impl Future<Output = Result<Vec<hammerwork::Job>>> + Send {
-        let _ = (queue, status, limit);
-        async {
-            Err(hammerwork::HammerworkError::Queue {
-                message: "listing jobs by status is not supported by this queue".to_string(),
-            })
-        }
-    }
+    ) -> impl Future<Output = Result<Vec<hammerwork::Job>>> + Send;
 
     /// The current state of the jobs `ids` (UUIDs) that still exist, each with the time
     /// of its latest change as in [`recent_job_changes`](Self::recent_job_changes). Ids
     /// that are not UUIDs, jobs that no longer exist and rows that cannot be decoded are
     /// left out.
-    ///
-    /// The default implementation reads the jobs one at a time with
-    /// [`DatabaseQueue::get_job`].
-    fn job_states(&self, ids: &[String]) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send {
-        let ids: Vec<uuid::Uuid> = ids.iter().filter_map(|id| id.parse().ok()).collect();
-        async move {
-            let mut states = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(job) = self.get_job(id).await? {
-                    let changed_at = [
-                        job.started_at,
-                        job.completed_at,
-                        job.failed_at,
-                        job.timed_out_at,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .fold(job.created_at, DateTime::max);
-                    states.push(job_change(
-                        id.to_string(),
-                        job.queue_name,
-                        job.status.as_str(),
-                        job.priority.as_i32(),
-                        job.attempts,
-                        changed_at,
-                    ));
-                }
-            }
-            Ok(states)
-        }
-    }
+    fn job_states(&self, ids: &[String]) -> impl Future<Output = Result<Vec<JobUpdate>>> + Send;
 
     /// Runs `operation` on each of `tables` (entries of [`HAMMERWORK_TABLES`]) that
     /// exists, one statement per table, and returns what ran. With `dry_run` nothing is
@@ -384,7 +328,7 @@ fn changed_since_filter(postgres: bool) -> String {
 }
 
 /// A changed job as sent to dashboard clients.
-fn job_change(
+pub(crate) fn job_change(
     id: String,
     queue_name: String,
     status: &str,
@@ -406,7 +350,7 @@ fn job_change(
 
 /// The statuses an archival policy archives, each with the timestamp its age is measured
 /// from and the policy's age for it (as `archive_jobs` selects them).
-fn archivable_statuses(
+pub(crate) fn archivable_statuses(
     policy: &hammerwork::archive::ArchivalPolicy,
 ) -> [(Option<Duration>, &'static str, &'static str); 4] {
     [
