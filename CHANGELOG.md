@@ -111,6 +111,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     allocate gigabytes.
   - `retry_dead_job` on a job that is not dead fails with `InvalidJobTransition`, not
     `HammerworkError::Queue`.
+  - `get_queue_stats` reports `statistics.failed` as the `Failed` jobs only (it added the
+    `Dead` ones, which are in `statistics.dead`).
+- **`[archive]` durations survive saving a configuration, and invalid ones are
+  rejected.** `archive_after` and `delete_after` were written as whole days, so
+  `HammerworkConfig::save_to_file` turned `archive_after = 12h` into `"0d"`, and
+  reloading it archived every finished job at once. They are now written in the largest
+  exact unit (`"30d"`, `"12h"`, `"90m"`, `"45s"`), and `h`, `m` and `s` are read as well
+  as `d` and bare numbers (days). A negative duration (which made every finished job
+  eligible) or one too large for `chrono::Duration` (which panicked) is rejected when the
+  file loads. Files written by this version with sub-day durations cannot be read by
+  older versions.
+- **`HammerworkConfig::from_env` rejects invalid numbers** in
+  `HAMMERWORK_DATABASE_POOL_SIZE`, `HAMMERWORK_WORKER_POOL_SIZE`,
+  `HAMMERWORK_JOB_TIMEOUT_SECONDS` and `HAMMERWORK_EVENT_BUFFER_SIZE`, naming the
+  variable, as the encryption variables already did. They fell back to the defaults
+  silently, so `HAMMERWORK_JOB_TIMEOUT_SECONDS=30s` meant 5 minutes.
+- **`webhooks::verify_hmac_signature` accepts the signature webhooks send, and compares
+  in constant time.** Deliveries send `X-Hammerwork-Signature: sha256=<hex>`, but the
+  verifier only accepted bare hex, so verifying a received header always failed; and the
+  comparison stopped at the first differing byte despite claiming to be constant-time.
+  It now accepts both forms and compares with `Mac::verify_slice`.
+- **A webhook with `retry_policy.max_attempts = 0` is delivered once.** The delivery
+  loop made no attempt at all, so every event was dropped without a log or statistic.
+  `max_attempts` is documented as counting every attempt, including the first.
+- **An alert cooldown too long for `chrono` suppresses repeats instead of failing.**
+  With `with_cooldown(Duration::MAX)` ("alert once"), every later check of the same alert
+  returned `Err(Alerting("Invalid cooldown duration"))`.
+- **Huge durations no longer time jobs out at once or panic.** `Job::should_timeout`
+  treated a timeout too large for `chrono` as zero, so such a job timed out as soon as it
+  started; `Job::with_delay` panicked on a delay past the representable range (it now
+  saturates); and `RetentionPolicy::calculate_deletion_time` panicked when the deletion
+  time fell past it (it now keeps the data, as for durations `chrono` cannot hold).
+- **`cargo hammerwork monitor metrics` and `monitor health` count dead and timed-out
+  jobs as failures.** They counted only `Failed` jobs, but a job out of retries ends
+  `Dead` and a timed-out one `TimedOut`, so the failure rate and the recent-failures
+  health check missed the usual ways a job fails.
+- **`cargo hammerwork job list --failed` includes timed-out jobs**, as `job retry` does,
+  and `queue stats` shows an icon for `TimedOut` jobs.
+- **A `cargo hammerwork` config file that cannot be parsed no longer drops the
+  environment variables.** The CLI fell back to the built-in defaults, losing
+  `DATABASE_URL` and the `HAMMERWORK_*` variables; it now warns and applies the
+  environment to the defaults.
+- **`cargo hammerwork` uses the configured `log_level`** (config file or
+  `HAMMERWORK_LOG_LEVEL`) when neither `--verbose` nor `--quiet` is given. It was
+  documented but ignored, because logging was set up before the configuration loaded.
+- **The dashboard's job lists apply the `created_after`, `created_before` and `search`
+  filters** (`GET /api/jobs`, `/api/queues/{name}/jobs`), which were parsed but ignored,
+  **and honour `sort_order` without `sort_by`** (or with an unknown one), which always
+  listed newest first.
+- **The dashboard counts jobs in `Failed` as failed.** REST (`failed_count` in
+  `/api/queues`, `failed_total`, and the overview's `failed_jobs`, `total_jobs` and
+  `overall_error_rate`) counted only `Dead` and `TimedOut` jobs, while the WebSocket
+  `failed_count` counted only `Failed`. Both now count `Failed`, `Dead` and `TimedOut`
+  jobs (`dead_count` is still `Dead` alone), and a change in `Failed` jobs alone pushes a
+  queue update.
+- **Dashboard pagination metadata describes the page served when `offset` is given.**
+  `/api/queues` and `/api/archive/jobs` reported `page=1`, `has_prev=false` and
+  `has_next=true` for `?offset=100&limit=50` of 120 items.
+- **The `hammerwork-web` documentation lists the real endpoints**: job actions are
+  `POST /api/jobs/{id}/actions` (not `POST /api/jobs/{id}/retry` or
+  `DELETE /api/jobs/{id}`), trends take `?hours=N`, archive purge is
+  `DELETE /api/archive/purge`, and there are no `/api/archive/policies` endpoints.
 
 ## [2.2.0] - 2026-10-11
 
