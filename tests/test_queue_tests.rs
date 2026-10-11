@@ -1,6 +1,6 @@
 //! Integration tests for the TestQueue implementation
 
-#![cfg(feature = "test")]
+#![cfg(feature = "test-queue")]
 
 use chrono::Duration;
 use hammerwork::{

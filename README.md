@@ -32,36 +32,46 @@ A high-performance, database-driven job queue for Rust with comprehensive featur
 
 ### Core Library
 
+No features are enabled by default: Hammerwork 3.0 gives you the queue, worker, job, retry, cron, batch, workflow and priority APIs, without the HTTP, SMTP, Prometheus, OpenTelemetry or encryption dependencies. You always pick a database backend, and opt in to the subsystems you use.
+
 ```toml
 [dependencies]
-# Default features include metrics and alerting
+# A queue on PostgreSQL (or MySQL): the lightest build
 hammerwork = { version = "2.5", features = ["postgres"] }
-# or
 hammerwork = { version = "2.5", features = ["mysql"] }
 
-# With encryption for PII protection
-hammerwork = { version = "2.5", features = ["postgres", "encryption"] }
+# Everything that is not a backend, a key source or an event sink:
+# metrics, alerting, webhooks, streaming, tracing and encryption
+hammerwork = { version = "2.5", features = ["postgres", "full"] }
 
-# With AWS KMS integration for enterprise key management
-hammerwork = { version = "2.5", features = ["postgres", "encryption", "aws-kms"] }
+# Or pick subsystems one by one
+hammerwork = { version = "2.5", features = ["postgres", "metrics", "alerting", "webhooks"] }
 
-# With Google Cloud KMS integration for enterprise key management
-hammerwork = { version = "2.5", features = ["postgres", "encryption", "gcp-kms"] }
+# With encryption for PII protection, and a KMS key source
+hammerwork = { version = "2.5", features = ["postgres", "encryption", "aws-kms"] }    # or "gcp-kms", "vault-kms", "azure-kms"
 
-# With HashiCorp Vault KMS integration for enterprise key management
-hammerwork = { version = "2.5", features = ["postgres", "encryption", "vault-kms"] }
-
-# With distributed tracing
-hammerwork = { version = "2.5", features = ["postgres", "tracing"] }
-
-# Full feature set
-hammerwork = { version = "2.5", features = ["postgres", "encryption", "aws-kms", "gcp-kms", "vault-kms", "tracing"] }
-
-# Minimal installation
-hammerwork = { version = "2.5", features = ["postgres"], default-features = false }
+# In-memory TestQueue for your tests
+[dev-dependencies]
+hammerwork = { version = "2.5", features = ["test-queue"] }
 ```
 
-**Feature Flags**: `postgres`, `mysql`, `metrics` (default), `alerting` (default), `encryption` (optional), `aws-kms` (optional), `gcp-kms` (optional), `vault-kms` (optional), `tracing` (optional), `test` (for TestQueue)
+**Feature flags**
+
+| Feature | Enables |
+|---|---|
+| `postgres`, `mysql` | database backends (pick at least one to use a real queue) |
+| `metrics` | Prometheus metrics and the metrics HTTP endpoint |
+| `alerting` | alert delivery by webhook and email |
+| `webhooks` | signed webhook delivery of job events |
+| `streaming` | event streaming (MessagePack, Avro, Protobuf) |
+| `tracing` | OpenTelemetry tracing |
+| `encryption` | payload encryption and key management |
+| `aws-kms`, `gcp-kms`, `vault-kms`, `azure-kms` | KMS key sources for `encryption` |
+| `kafka`, `google-pubsub`, `kinesis` | event stream sinks for `streaming` |
+| `test-queue` | the in-memory `TestQueue` |
+| `full` | `metrics`, `alerting`, `webhooks`, `streaming`, `tracing` and `encryption` |
+
+`full` does not include a database backend, a KMS key source, an event stream sink (these pull in cloud SDKs or native libraries) or `test-queue`. Upgrading from 2.x: see [Upgrading to 3.0](docs/upgrading-to-3.0.md).
 
 ### Web Dashboard (Optional)
 

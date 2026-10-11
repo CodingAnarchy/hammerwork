@@ -219,17 +219,20 @@ metrics_collector.observe_custom_histogram("custom_histogram_1", "queue_name", 1
 # }
 ```
 
-## Disabling Monitoring
+## Enabling Monitoring
 
-If you want to disable monitoring features:
+Monitoring is opt-in: no feature is enabled by default.
 
 ```toml
-# Disable all monitoring
-hammerwork = { version = "0.6", features = ["postgres"], default-features = false }
+# The queue only, no monitoring
+hammerwork = { version = "2.5", features = ["postgres"] }
 
-# Enable only metrics
-hammerwork = { version = "0.6", features = ["postgres", "metrics"], default-features = false }
+# Only metrics
+hammerwork = { version = "2.5", features = ["postgres", "metrics"] }
 
-# Enable only alerting
-hammerwork = { version = "0.6", features = ["postgres", "alerting"], default-features = false }
+# Only alerting
+hammerwork = { version = "2.5", features = ["postgres", "alerting"] }
+
+# Metrics, alerting and the other optional subsystems
+hammerwork = { version = "2.5", features = ["postgres", "full"] }
 ```

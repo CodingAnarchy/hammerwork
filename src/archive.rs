@@ -1528,7 +1528,7 @@ mod tests {
     /// A scheduled pass whose policy ages are too large to subtract from now (say
     /// `Duration::MAX` for "never purge") archives and purges nothing instead of
     /// panicking.
-    #[cfg(all(feature = "test", feature = "postgres"))]
+    #[cfg(all(feature = "test-queue", feature = "postgres"))]
     #[tokio::test]
     async fn scheduled_pass_with_huge_ages_does_not_panic() {
         let queue = crate::queue::test::TestQueue::new();

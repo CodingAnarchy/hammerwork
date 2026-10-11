@@ -54,7 +54,7 @@
 //! # }
 //! ```
 
-#[cfg(feature = "azure-kv")]
+#[cfg(feature = "azure-kms")]
 mod azure;
 pub mod engine;
 mod envelope;
@@ -991,7 +991,7 @@ impl EncryptionStats {
 ///
 /// # Arguments
 ///
-/// * `service_prefix` - Service-specific prefix (e.g., "aws-kms-data-key", "azure-kv-master-key")
+/// * `service_prefix` - Service-specific prefix (e.g., "aws-kms-data-key", "azure-kms-master-key")
 /// * `inputs` - Variable number of string inputs that will be hashed together
 ///
 /// # Returns
@@ -1010,7 +1010,7 @@ impl EncryptionStats {
 /// assert_eq!(key.len(), 32); // SHA-256 produces 32 bytes
 ///
 /// // Different inputs give a different key
-/// let key = generate_deterministic_key("azure-kv-master-key", &["vault-url", "key-name"]);
+/// let key = generate_deterministic_key("azure-kms-master-key", &["vault-url", "key-name"]);
 /// assert_eq!(key.len(), 32);
 /// # }
 /// ```

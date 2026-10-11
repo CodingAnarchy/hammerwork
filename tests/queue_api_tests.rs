@@ -4,7 +4,7 @@
 //! information, workflow dependency helpers and the in-place rescheduling of recurring
 //! jobs.
 
-#![cfg(any(feature = "postgres", feature = "mysql", feature = "test"))]
+#![cfg(any(feature = "postgres", feature = "mysql", feature = "test-queue"))]
 
 mod test_utils;
 
@@ -653,7 +653,7 @@ crate::test_utils::backend_tests!(
     ]
 );
 
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 crate::test_utils::backend_tests!(
     test_queue_tests,
     test_utils::test_queue,

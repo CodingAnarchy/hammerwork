@@ -1,6 +1,6 @@
 # Webhooks
 
-`WebhookManager` (module `hammerwork::webhooks`, feature `webhooks`, on by default)
+`WebhookManager` (module `hammerwork::webhooks`, feature `webhooks`, included in `full`)
 delivers job lifecycle events to HTTP endpoints, with retries, authentication and
 HMAC signatures. (Alert notifications are a separate system; see
 [Monitoring & Alerting](monitoring.md).)

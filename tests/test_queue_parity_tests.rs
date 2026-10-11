@@ -404,7 +404,7 @@ crate::test_utils::backend_tests!(
     ]
 );
 
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 crate::test_utils::backend_tests!(
     test_queue_tests,
     test_utils::test_queue,

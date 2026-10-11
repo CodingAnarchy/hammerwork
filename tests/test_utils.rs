@@ -183,7 +183,7 @@ pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 /// A fresh in-memory [`TestQueue`](hammerwork::queue::test::TestQueue).
-#[cfg(feature = "test")]
+#[cfg(feature = "test-queue")]
 pub async fn test_queue() -> std::sync::Arc<hammerwork::queue::test::TestQueue> {
     std::sync::Arc::new(hammerwork::queue::test::TestQueue::new())
 }

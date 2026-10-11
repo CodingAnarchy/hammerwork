@@ -154,7 +154,7 @@ or `--pii-field <field>` (repeatable) encrypt a job on any queue. The CLI never 
 plaintext by mistake: with encryption enabled but the key unavailable, these commands fail,
 and without any settings they still refuse to write a plaintext job to a queue that already
 holds encrypted jobs. KMS key sources need the matching cargo feature of `cargo-hammerwork`
-(`aws-kms`, `gcp-kms`, `vault-kms`, `azure-kv`).
+(`aws-kms`, `gcp-kms`, `vault-kms`, `azure-kms`).
 
 ### Job Management Commands
 

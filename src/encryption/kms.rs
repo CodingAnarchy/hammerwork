@@ -31,7 +31,7 @@ pub(crate) fn parse_service_config<'a>(
         feature = "aws-kms",
         feature = "gcp-kms",
         feature = "vault-kms",
-        feature = "azure-kv"
+        feature = "azure-kms"
     ),
     allow(dead_code)
 )]
@@ -114,7 +114,7 @@ pub(crate) fn exact_vault_key(
 
 /// Key material of exactly `expected_size` bytes, or a configuration error naming `what`.
 #[cfg_attr(
-    not(any(feature = "vault-kms", feature = "azure-kv")),
+    not(any(feature = "vault-kms", feature = "azure-kms")),
     allow(dead_code)
 )]
 pub(crate) fn exact_size(

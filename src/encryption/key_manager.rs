@@ -107,7 +107,7 @@
 //! ## Azure Key Vault Master Key Integration
 //!
 //! ```rust,no_run
-//! # #[cfg(all(feature = "encryption", feature = "azure-kv", feature = "postgres"))]
+//! # #[cfg(all(feature = "encryption", feature = "azure-kms", feature = "postgres"))]
 //! # {
 //! use hammerwork::encryption::{KeyManager, KeyManagerConfig, KeySource};
 //!
@@ -144,7 +144,9 @@ use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use sqlx::{Database, Pool, Row};
+#[cfg(any(test, feature = "postgres", feature = "mysql"))]
+use sqlx::Row;
+use sqlx::{Database, Pool};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -972,7 +974,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
     ///
     /// Loads the master key from `config.master_key_source` and fails if it cannot be
     /// loaded. There is no fallback key: an unreachable KMS, missing credentials, or a KMS
-    /// source whose cargo feature (`aws-kms`, `gcp-kms`, `vault-kms`, `azure-kv`) is not
+    /// source whose cargo feature (`aws-kms`, `gcp-kms`, `vault-kms`, `azure-kms`) is not
     /// enabled are all errors.
     ///
     /// If a key-encryption key was created earlier with [`KeyManager::generate_master_key`],
@@ -2081,6 +2083,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
 
     /// ID of the active key-encryption key in the database, if any
     #[cfg(test)]
+    #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
     async fn find_master_key_id_in_database(&self) -> Result<Option<Uuid>, EncryptionError> {
         Ok(DB::load_active_master_key(&self.pool)
             .await?
@@ -2089,6 +2092,7 @@ impl<DB: KeyManagerBackend> KeyManager<DB> {
 
     /// The active key-encryption key's ID, or an ID derived from `key_material`
     #[cfg(test)]
+    #[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
     async fn get_or_create_master_key_id(
         &self,
         key_material: &[u8],
@@ -2197,6 +2201,7 @@ fn unwrap_key_material(
         .map_err(|e| EncryptionError::DecryptionFailed(format!("Key decryption failed: {}", e)))
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 /// Label stored in the `key_source` column. Only the kind of source is stored, never its
 /// detail: for [`KeySource::Static`] the detail is the key itself.
 fn key_source_label(source: &KeySource) -> &'static str {
@@ -2208,6 +2213,7 @@ fn key_source_label(source: &KeySource) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 fn db_error(context: &str) -> impl FnOnce(sqlx::Error) -> EncryptionError + '_ {
     move |e| EncryptionError::DatabaseError(format!("{}: {}", context, e))
 }
@@ -2237,6 +2243,7 @@ fn audit_context(
     .collect()
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 fn column<'r, R, T>(row: &'r R, name: &str) -> Result<T, EncryptionError>
 where
     R: Row,
@@ -2248,11 +2255,13 @@ where
     })
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 fn to_i32(value: u32, what: &str) -> Result<i32, EncryptionError> {
     i32::try_from(value)
         .map_err(|_| EncryptionError::KeyManagement(format!("{} {} is out of range", what, value)))
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 fn to_u32(value: i32, what: &str) -> Result<u32, EncryptionError> {
     u32::try_from(value)
         .map_err(|_| EncryptionError::KeyManagement(format!("{} {} is out of range", what, value)))
@@ -2359,13 +2368,13 @@ async fn load_master_key_from_azure(service_config: &str) -> Result<SecretBytes,
         vault_url, key_name
     );
 
-    #[cfg(not(feature = "azure-kv"))]
+    #[cfg(not(feature = "azure-kms"))]
     {
         let _ = (vault_url, key_name);
-        Err(kms::kms_feature_disabled("azure://", "azure-kv"))
+        Err(kms::kms_feature_disabled("azure://", "azure-kms"))
     }
 
-    #[cfg(feature = "azure-kv")]
+    #[cfg(feature = "azure-kms")]
     {
         let key_material = super::azure::fetch_key_material(&vault_url, &key_name)
             .await
@@ -3895,6 +3904,7 @@ impl std::fmt::Display for KeyOperation {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
 mod tests {
     use super::*;
 
@@ -4599,7 +4609,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "azure-kv"))]
+    #[cfg(not(feature = "azure-kms"))]
     #[tokio::test]
     async fn test_azure_master_key_without_feature_fails() {
         let err = load_master_key_from_azure("azure://my-vault.vault.azure.net/keys/master-key")
@@ -4609,7 +4619,7 @@ mod tests {
             matches!(err, EncryptionError::InvalidConfiguration(_)),
             "{err}"
         );
-        assert!(err.to_string().contains("azure-kv"), "{err}");
+        assert!(err.to_string().contains("azure-kms"), "{err}");
     }
 
     /// `KeyManager::new` must fail when the master key cannot be loaded, before it
@@ -4634,6 +4644,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
     #[test]
     fn test_key_source_label_never_contains_key() {
         let label = key_source_label(&KeySource::Static("c2VjcmV0".to_string()));

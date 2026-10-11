@@ -400,7 +400,7 @@ pub type Result<T> = std::result::Result<T, HammerworkError>;
     doctest,
     feature = "postgres",
     feature = "mysql",
-    feature = "test",
+    feature = "test-queue",
     feature = "encryption",
     feature = "tracing",
     feature = "streaming",
