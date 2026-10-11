@@ -36,10 +36,10 @@ fn test_cron_presets() {
     assert_eq!(daily.expression, "0 0 0 * * *");
 
     let weekdays = presets::weekdays_at_9am();
-    assert_eq!(weekdays.expression, "0 0 9 * * 1-5");
+    assert_eq!(weekdays.expression, "0 0 9 * * Mon-Fri");
 
     let mondays = presets::mondays_at_noon();
-    assert_eq!(mondays.expression, "0 0 12 * * 1");
+    assert_eq!(mondays.expression, "0 0 12 * * Mon");
 }
 
 #[test]
