@@ -83,6 +83,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   widens `hammerwork_jobs_archive.retry_strategy` from `VARCHAR(50)` to `TEXT` and turns
   the archive's timestamps into `TIMESTAMP(6)`, like `hammerwork_jobs`. It is idempotent.
   Run it before upgrading: on MySQL, archiving a job with a retry strategy needs it.
+  On MySQL the column changes rebuild `hammerwork_jobs_archive`, which takes a while on a
+  large archive; run it off-peak (purge old archived jobs first to make it quicker).
 - Migration 012 (PostgreSQL) no longer runs its own `BEGIN;`/`COMMIT;`: the runner
   already wraps each migration in a transaction, and the script's `COMMIT` ended it
   early. MySQL migrations 010, 018 and 019 no longer use double-quoted string literals,
