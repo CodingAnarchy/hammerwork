@@ -161,7 +161,7 @@ async fn batch_worker_demo(
         .with_batch_size(10) // Claim up to 10 jobs per poll (enables batch processing)
         .with_batch_concurrency(4) // and run up to 4 of them at once
         .with_poll_interval(Duration::from_millis(100))
-        .with_attempt_cap(3)
+        .with_attempt_cap(3)?
         .with_stats_collector(stats_collector.clone())
         .with_priority_weights(
             hammerwork::PriorityWeights::new()

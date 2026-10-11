@@ -1,8 +1,9 @@
 //! Migration 021 converts the MySQL `TIMESTAMP` columns to `DATETIME(6)` (#91).
 //!
 //! The test builds a database at migration 020 (the 2.x schema), fills it, runs migration
-//! 021 and checks that every value, nullability and default survived, that jobs scheduled
-//! beyond 2038 can be stored, and that running the migration again changes nothing.
+//! 021 and checks that every value and nullability survived, that `CURRENT_TIMESTAMP`
+//! defaults became UTC (#130), that jobs scheduled beyond 2038 can be stored, and that
+//! running the migration again changes nothing.
 
 #![cfg(feature = "mysql")]
 
@@ -97,6 +98,29 @@ fn normalize(value: &str) -> String {
         .replace("current_timestamp(6)", "current_timestamp")
         .replace("current_timestamp()", "current_timestamp")
 }
+
+/// The default and `extra` a column should have after migration 021, given its 2.x
+/// ones: a `CURRENT_TIMESTAMP` default (session-local time on a `DATETIME`) becomes
+/// `(UTC_TIMESTAMP(6))`, and the `ON UPDATE CURRENT_TIMESTAMP` clause is dropped.
+fn expected_default(before: &str) -> String {
+    let before = normalize(before).replace(" on update current_timestamp", "");
+    match before.strip_prefix("current_timestamp|") {
+        Some(extra) => format!("utc_timestamp(6)|{extra}"),
+        None => before,
+    }
+}
+
+/// The 2.x-style `CURRENT_TIMESTAMP` defaults and `ON UPDATE` clause that the first
+/// (pre-release) version of migration 021 kept, to check that 021 converges a schema
+/// converted by it.
+const PRE_RELEASE_021_DEFAULTS: [&str; 2] = [
+    "ALTER TABLE hammerwork_queue_pause
+        MODIFY COLUMN `paused_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        MODIFY COLUMN `updated_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+            ON UPDATE CURRENT_TIMESTAMP(6)",
+    "ALTER TABLE hammerwork_workflows
+        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+];
 
 #[tokio::test]
 #[ignore] // Requires a MySQL server on which the user may CREATE DATABASE
@@ -202,7 +226,46 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
             .await
             .unwrap();
         migrate(&offset_pool).await;
+
+        // Column defaults are UTC whatever the session time zone (#130): a row written
+        // without times from the +05:00 session gets the current UTC time.
+        sqlx::query("INSERT INTO hammerwork_queue_pause (queue_name) VALUES ('dt_default')")
+            .execute(&offset_pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO hammerwork_key_audit_log (key_id, operation, success)
+             VALUES ('dt-default-key', 'Access', TRUE)",
+        )
+        .execute(&offset_pool)
+        .await
+        .unwrap();
         offset_pool.close().await;
+        let defaulted: Vec<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT paused_at FROM hammerwork_queue_pause WHERE queue_name = 'dt_default'
+             UNION ALL SELECT created_at FROM hammerwork_queue_pause
+                       WHERE queue_name = 'dt_default'
+             UNION ALL SELECT updated_at FROM hammerwork_queue_pause
+                       WHERE queue_name = 'dt_default'
+             UNION ALL SELECT `timestamp` FROM hammerwork_key_audit_log
+                       WHERE key_id = 'dt-default-key'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(defaulted.len(), 4);
+        for at in defaulted {
+            let skew = (Utc::now() - at).num_seconds().abs();
+            assert!(skew < 600, "default {at} is not the current UTC time");
+        }
+        sqlx::query("DELETE FROM hammerwork_queue_pause WHERE queue_name = 'dt_default'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM hammerwork_key_audit_log WHERE key_id = 'dt-default-key'")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let after_columns = column_snapshot(&pool).await;
         assert_eq!(before_columns.len(), after_columns.len());
@@ -214,7 +277,7 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
                 assert_eq!(after.2, "datetime", "{} {}", after.0, after.1);
                 assert_eq!(before.3, after.3, "nullability of {} {}", after.0, after.1);
                 assert_eq!(
-                    normalize(&before.4),
+                    expected_default(&before.4),
                     normalize(&after.4),
                     "default of {} {}",
                     after.0,
@@ -287,7 +350,8 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
         .await
         .unwrap();
         assert_eq!(scheduled_for_later, 1);
-        // hammerwork_queue_pause.updated_at keeps its ON UPDATE clause
+        // hammerwork_queue_pause.updated_at has no ON UPDATE clause (it would write the
+        // session's local time); pausing again writes it explicitly.
         assert!(queue.is_queue_paused("dt_paused").await.unwrap());
         sqlx::query("UPDATE hammerwork_queue_pause SET updated_at = '2020-01-01 00:00:00'")
             .execute(&pool)
@@ -297,13 +361,33 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
             .execute(&pool)
             .await
             .unwrap();
-        let touched: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM hammerwork_queue_pause WHERE updated_at > '2025-01-01'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let touched_sql =
+            "SELECT COUNT(*) FROM hammerwork_queue_pause WHERE updated_at > '2025-01-01'";
+        let touched: i64 = sqlx::query_scalar(touched_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(touched, 0);
+        queue.pause_queue("dt_paused", Some("tester")).await.unwrap();
+        let touched: i64 = sqlx::query_scalar(touched_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(touched, 1);
+
+        // A schema converted by the pre-release version of 021 (which kept the
+        // CURRENT_TIMESTAMP defaults and the ON UPDATE clause) converges as well.
+        for sql in PRE_RELEASE_021_DEFAULTS {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        assert_ne!(column_snapshot(&pool).await, after_columns);
+        sqlx::query("DELETE FROM hammerwork_migrations WHERE migration_id = ?")
+            .bind(MIGRATION_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        migrate(&pool).await;
+        assert_eq!(column_snapshot(&pool).await, after_columns);
 
         // Running the migration again changes nothing
         sqlx::query("DELETE FROM hammerwork_migrations WHERE migration_id = ?")

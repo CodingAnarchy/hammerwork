@@ -326,43 +326,46 @@ impl crate::queue::JobQueue<Postgres> {
             }
         };
 
-        // Which priority levels have a runnable job: one index probe per level, so
-        // every level is considered however many jobs of other levels are queued.
+        // Pick a level by weight and claim its oldest runnable job. If other workers
+        // hold all of that level's jobs (SKIP LOCKED found none), try another level.
+        let candidates = self.runnable_levels(queue_name).await?;
+        let claimed = super::fill_weighted_batch(
+            queue_name,
+            candidates,
+            weights,
+            1,
+            |priority, _room| async move {
+                let row = sqlx::query_as::<_, JobRow>(AssertSqlSafe(claim_sql(true)))
+                    .bind(queue_name)
+                    .bind(lease)
+                    .bind(priority.as_i32())
+                    .fetch_optional(&self.pool)
+                    .await?;
+                Ok(row.map(JobRow::into_job).transpose()?.into_iter().collect())
+            },
+        )
+        .await?;
+        Ok(claimed.into_iter().next())
+    }
+
+    /// The priority levels of `queue_name` that have a runnable job: one index probe
+    /// per level, so every level is considered however many jobs of other levels are
+    /// queued.
+    async fn runnable_levels(&self, queue_name: &str) -> Result<Vec<JobPriority>> {
         let levels: Vec<i32> = sqlx::query_scalar(AssertSqlSafe(super::runnable_priorities_sql(
             RUNNABLE_IN_QUEUE_SQL,
         )))
         .bind(queue_name)
         .fetch_all(&self.pool)
         .await?;
-        let mut candidates: Vec<JobPriority> = levels
+        Ok(levels
             .into_iter()
             .filter_map(|level| JobPriority::from_i32(level).ok())
-            .collect();
-
-        // Pick a level by weight and claim its oldest runnable job. If other workers
-        // hold all of that level's jobs (SKIP LOCKED found none), try another level.
-        let mut attempt = 0;
-        while let Some(priority) = super::pick_weighted_priority(
-            &candidates,
-            weights,
-            super::weighted_seed(queue_name, attempt),
-        ) {
-            let claimed = sqlx::query_as::<_, JobRow>(AssertSqlSafe(claim_sql(true)))
-                .bind(queue_name)
-                .bind(lease)
-                .bind(priority.as_i32())
-                .fetch_optional(&self.pool)
-                .await?;
-            if let Some(row) = claimed {
-                return row.into_job().map(Some);
-            }
-            candidates.retain(|candidate| *candidate != priority);
-            attempt += 1;
-        }
-        Ok(None)
+            .collect())
     }
 
-    /// Claim up to `max_jobs` jobs ([`DatabaseQueue::dequeue`]).
+    /// Claim up to `max_jobs` jobs ([`DatabaseQueue::dequeue`], which caps `max_jobs`
+    /// at [`MAX_DEQUEUE_BATCH_SIZE`](super::MAX_DEQUEUE_BATCH_SIZE)).
     async fn claim_many(
         &self,
         queue_name: &str,
@@ -370,10 +373,6 @@ impl crate::queue::JobQueue<Postgres> {
         lease: std::time::Duration,
         max_jobs: usize,
     ) -> Result<Vec<Job>> {
-        let max_jobs = max_jobs.min(super::MAX_DEQUEUE_BATCH_SIZE);
-        if max_jobs == 0 {
-            return Ok(Vec::new());
-        }
         let lease = super::lease_interval(lease);
         let weights = match weights {
             Some(weights) if !weights.is_strict() => weights,
@@ -389,17 +388,7 @@ impl crate::queue::JobQueue<Postgres> {
             }
         };
 
-        // Which priority levels have a runnable job (see `claim_one`).
-        let levels: Vec<i32> = sqlx::query_scalar(AssertSqlSafe(super::runnable_priorities_sql(
-            RUNNABLE_IN_QUEUE_SQL,
-        )))
-        .bind(queue_name)
-        .fetch_all(&self.pool)
-        .await?;
-        let candidates: Vec<JobPriority> = levels
-            .into_iter()
-            .filter_map(|level| JobPriority::from_i32(level).ok())
-            .collect();
+        let candidates = self.runnable_levels(queue_name).await?;
 
         // Pick a level by weight and fill the batch with its oldest runnable jobs. If it
         // runs out first, pick another of the remaining levels by weight for the rest.
@@ -449,18 +438,13 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 
     async fn dequeue(&self, queue_name: &str, options: &DequeueOptions) -> Result<Vec<Job>> {
         let weights = options.priority_weights.as_ref();
-        match options.max_jobs {
-            0 => Ok(Vec::new()),
-            1 => Ok(self
-                .claim_one(queue_name, weights, options.lease())
-                .await?
-                .into_iter()
-                .collect()),
-            max_jobs => {
-                self.claim_many(queue_name, weights, options.lease(), max_jobs)
-                    .await
-            }
-        }
+        let lease = options.lease();
+        super::dispatch_dequeue(
+            options.max_jobs,
+            || self.claim_one(queue_name, weights, lease),
+            |max_jobs| self.claim_many(queue_name, weights, lease, max_jobs),
+        )
+        .await
     }
 
     async fn release_job_run(&self, run: &Job) -> Result<bool> {

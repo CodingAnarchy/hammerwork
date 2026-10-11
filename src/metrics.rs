@@ -49,15 +49,12 @@ where
     Ok(Duration::from_secs(secs))
 }
 
-#[cfg(feature = "metrics")]
 use prometheus::{CounterVec, Encoder, GaugeVec, HistogramVec, Registry, TextEncoder};
 
-#[cfg(feature = "metrics")]
 use warp::Filter;
 
 /// The shortest monitoring interval [`PrometheusMetricsCollector::update_interval`]
 /// returns (a zero interval would make the monitoring task spin).
-#[cfg(feature = "metrics")]
 const MIN_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Configuration for metrics collection
@@ -142,7 +139,6 @@ impl MetricsConfig {
 }
 
 /// Prometheus metrics collector for job queue metrics
-#[cfg(feature = "metrics")]
 pub struct PrometheusMetricsCollector {
     config: MetricsConfig,
     registry: Registry,
@@ -159,7 +155,6 @@ pub struct PrometheusMetricsCollector {
     server_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-#[cfg(feature = "metrics")]
 impl PrometheusMetricsCollector {
     /// Create a new Prometheus metrics collector
     ///
@@ -564,68 +559,11 @@ impl PrometheusMetricsCollector {
     }
 }
 
-#[cfg(feature = "metrics")]
 impl Drop for PrometheusMetricsCollector {
     fn drop(&mut self) {
         if let Some(handle) = self.server_handle.take() {
             handle.abort();
         }
-    }
-}
-
-/// No-op metrics collector when metrics feature is disabled
-#[cfg(not(feature = "metrics"))]
-pub struct PrometheusMetricsCollector {
-    _config: MetricsConfig,
-}
-
-#[cfg(not(feature = "metrics"))]
-impl PrometheusMetricsCollector {
-    pub fn new(config: MetricsConfig) -> Result<Self> {
-        Ok(Self { _config: config })
-    }
-
-    pub async fn start_exposition_server(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    pub async fn record_job_event(&self, _event: &JobEvent) -> Result<()> {
-        Ok(())
-    }
-
-    pub async fn update_queue_depth(&self, _queue_name: &str, _depth: u64) -> Result<()> {
-        Ok(())
-    }
-
-    pub async fn update_worker_utilization(
-        &self,
-        _queue_name: &str,
-        _worker_id: &str,
-        _utilization: f64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn get_metrics_text(&self) -> Result<String> {
-        Ok("# Metrics collection disabled\n".to_string())
-    }
-
-    pub async fn update_custom_gauge(
-        &self,
-        _metric_name: &str,
-        _queue_name: &str,
-        _value: f64,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    pub async fn observe_custom_histogram(
-        &self,
-        _metric_name: &str,
-        _queue_name: &str,
-        _value: f64,
-    ) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -635,7 +573,6 @@ mod tests {
     use crate::stats::{JobEvent, JobEventType};
     use std::time::Duration;
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_exposition_server_reports_bind_failure() {
         // Occupy a port, then ask the collector to bind the very same address.
@@ -653,7 +590,6 @@ mod tests {
         assert!(err.to_string().contains(&addr.to_string()), "{err}");
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_exposition_server_serves_when_bind_succeeds() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -700,7 +636,6 @@ mod tests {
         assert_eq!(config.custom_labels, labels);
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_prometheus_collector_creation() {
         let config = MetricsConfig::new();
@@ -708,7 +643,6 @@ mod tests {
         assert!(collector.is_ok());
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_metrics_recording() {
         let config = MetricsConfig::new();
@@ -734,7 +668,6 @@ mod tests {
         assert!(text.contains("hammerwork_jobs_total"));
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_queue_depth_update() {
         let config = MetricsConfig::new();
@@ -747,7 +680,6 @@ mod tests {
         assert!(metrics_text.contains("hammerwork_queue_depth"));
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_worker_utilization_update() {
         let config = MetricsConfig::new();
@@ -760,20 +692,6 @@ mod tests {
 
         let metrics_text = collector.get_metrics_text().unwrap();
         assert!(metrics_text.contains("hammerwork_worker_utilization"));
-    }
-
-    #[cfg(not(feature = "metrics"))]
-    #[tokio::test]
-    async fn test_noop_collector() {
-        let config = MetricsConfig::new();
-        let collector = PrometheusMetricsCollector::new(config).unwrap();
-
-        // All operations should succeed but do nothing
-        let result = collector.update_queue_depth("test_queue", 42).await;
-        assert!(result.is_ok());
-
-        let metrics_text = collector.get_metrics_text().unwrap();
-        assert!(metrics_text.contains("disabled"));
     }
 
     #[test]
@@ -826,7 +744,6 @@ mod tests {
         assert!(serde_json::from_value::<MetricsConfig>(bad).is_err());
     }
 
-    #[cfg(feature = "metrics")]
     fn event(event_type: JobEventType, error: Option<&str>, ms: Option<u64>) -> JobEvent {
         JobEvent {
             job_id: uuid::Uuid::new_v4(),
@@ -840,7 +757,6 @@ mod tests {
     }
 
     /// The value of the sample line starting with `prefix` and containing `labels`.
-    #[cfg(feature = "metrics")]
     fn sample(text: &str, prefix: &str, labels: &[&str]) -> Option<f64> {
         text.lines()
             .filter(|line| !line.starts_with('#'))
@@ -851,7 +767,6 @@ mod tests {
             .and_then(|value| value.parse().ok())
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_record_job_event_counts_every_outcome() {
         let collector = PrometheusMetricsCollector::new(MetricsConfig::new()).unwrap();
@@ -907,7 +822,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_collect_histograms_false_skips_durations() {
         let collector = PrometheusMetricsCollector::new(MetricsConfig {
@@ -930,7 +844,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_gauges_and_custom_metrics_are_exported() {
         let collector = PrometheusMetricsCollector::new(
@@ -983,7 +896,6 @@ mod tests {
     /// `new` is synchronous: registering custom metrics must not need (or block) a
     /// Tokio runtime. It used `block_in_place`, which panics outside a multi-threaded
     /// runtime.
-    #[cfg(feature = "metrics")]
     #[test]
     fn test_custom_metrics_without_a_runtime() {
         let collector = PrometheusMetricsCollector::new(
@@ -995,7 +907,6 @@ mod tests {
         assert!(collector.get_metrics_text().is_ok());
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test(flavor = "current_thread")]
     async fn test_custom_metrics_on_a_current_thread_runtime() {
         let collector =
@@ -1006,7 +917,6 @@ mod tests {
         assert_eq!(sample(&text, "hammerwork_g", &["queue=\"q\""]), Some(2.0));
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_custom_labels_apply_to_every_metric() {
         let labels = HashMap::from([("service".to_string(), "billing".to_string())]);
@@ -1030,7 +940,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "metrics")]
     #[test]
     fn test_invalid_names_are_rejected() {
         for config in [
@@ -1047,7 +956,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_exposition_server_serves_metrics_over_http() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1087,7 +995,6 @@ mod tests {
             .expect("the server stops with the collector");
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_exposition_server_without_address_is_a_noop() {
         let mut collector = PrometheusMetricsCollector::new(MetricsConfig::new()).unwrap();

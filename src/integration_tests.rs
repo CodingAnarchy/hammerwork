@@ -60,7 +60,7 @@ mod tests {
 
         // Set up webhook manager
         let webhook_config = WebhookManagerConfig::default();
-        let webhook_manager = WebhookManager::new(event_manager.clone(), webhook_config);
+        let webhook_manager = WebhookManager::new(event_manager.clone(), webhook_config).unwrap();
 
         // Create and add a webhook
         let webhook = WebhookConfig {
@@ -218,7 +218,7 @@ mod tests {
         let event_manager = Arc::new(EventManager::new_default());
 
         let webhook_manager =
-            WebhookManager::new(event_manager.clone(), WebhookManagerConfig::default());
+            WebhookManager::new(event_manager.clone(), WebhookManagerConfig::default()).unwrap();
 
         let stream_manager =
             StreamManager::new(event_manager.clone(), StreamManagerConfig::default());
@@ -393,7 +393,7 @@ mod tests {
     async fn test_event_filtering_across_systems() {
         let event_manager = Arc::new(EventManager::new_default());
         let webhook_manager =
-            WebhookManager::new(event_manager.clone(), WebhookManagerConfig::default());
+            WebhookManager::new(event_manager.clone(), WebhookManagerConfig::default()).unwrap();
         let stream_manager =
             StreamManager::new(event_manager.clone(), StreamManagerConfig::default());
 
@@ -516,10 +516,9 @@ mod tests {
     ))]
     async fn test_concurrent_event_processing() {
         let event_manager = Arc::new(EventManager::new_default());
-        let webhook_manager = Arc::new(WebhookManager::new(
-            event_manager.clone(),
-            WebhookManagerConfig::default(),
-        ));
+        let webhook_manager = Arc::new(
+            WebhookManager::new(event_manager.clone(), WebhookManagerConfig::default()).unwrap(),
+        );
         let stream_manager = Arc::new(StreamManager::new(
             event_manager.clone(),
             StreamManagerConfig::default(),
@@ -616,7 +615,7 @@ mod tests {
     async fn test_system_resilience_with_failures() {
         let event_manager = Arc::new(EventManager::new_default());
         let webhook_manager =
-            WebhookManager::new(event_manager.clone(), WebhookManagerConfig::default());
+            WebhookManager::new(event_manager.clone(), WebhookManagerConfig::default()).unwrap();
         let stream_manager =
             StreamManager::new(event_manager.clone(), StreamManagerConfig::default());
 

@@ -4,7 +4,6 @@
 //! decrypting job payloads using various algorithms and key management strategies.
 
 use super::envelope::{self, DbStore, EnvelopeKey, KmsKeyWrapper, PoolStore, WrappedKeyStore};
-#[cfg(feature = "encryption")]
 use super::key_manager::KeyManagerBackend;
 use super::{
     EncryptedPayload, EncryptionAlgorithm, EncryptionConfig, EncryptionError, EncryptionMetadata,
@@ -17,7 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{info, warn};
 
-#[cfg(feature = "encryption")]
 use {
     aes_gcm::{
         Aes256Gcm, Key, KeyInit, Nonce,
@@ -405,36 +403,23 @@ fn kms_key_name(key_id: &str) -> String {
 // Constructors and key loading.
 impl EncryptionEngine {
     /// Create an engine with the key named by `config.key_source`.
-    async fn from_config(
-        #[cfg_attr(not(feature = "encryption"), allow(unused_variables))] config: EncryptionConfig,
-    ) -> Result<Self, EncryptionError> {
-        #[cfg(not(feature = "encryption"))]
-        {
-            return Err(EncryptionError::InvalidConfiguration(
-                "Encryption feature is not enabled. Enable the 'encryption' feature flag."
-                    .to_string(),
-            ));
-        }
+    async fn from_config(config: EncryptionConfig) -> Result<Self, EncryptionError> {
+        let mut keys = HashMap::new();
+        let key_id = config
+            .key_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
 
-        #[cfg(feature = "encryption")]
-        {
-            let mut keys = HashMap::new();
-            let key_id = config
-                .key_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+        // Load the encryption key
+        let key = Self::load_key(&config.key_source, config.key_size_bytes()).await?;
+        keys.insert(key_id, KeyVersions::single(key));
 
-            // Load the encryption key
-            let key = Self::load_key(&config.key_source, config.key_size_bytes()).await?;
-            keys.insert(key_id, KeyVersions::single(key));
-
-            Ok(Self {
-                config,
-                keys: Arc::new(Mutex::new(keys)),
-                kms: None,
-                stats: Arc::new(Mutex::new(EncryptionStats::new())),
-            })
-        }
+        Ok(Self {
+            config,
+            keys: Arc::new(Mutex::new(keys)),
+            kms: None,
+            stats: Arc::new(Mutex::new(EncryptionStats::new())),
+        })
     }
 
     /// The key for [`KeySource::Generated`]`(location)`.
@@ -445,7 +430,6 @@ impl EncryptionEngine {
     /// generated and stored. `stdout://` always generates a key and prints it (for
     /// initial setup). A stored value that is not a valid key is an error; it is never
     /// overwritten.
-    #[cfg(feature = "encryption")]
     fn load_or_generate_key(
         location: &str,
         expected_size: usize,
@@ -541,7 +525,6 @@ impl EncryptionEngine {
         }
     }
 
-    #[cfg(feature = "encryption")]
     async fn load_key(
         key_source: &KeySource,
         expected_size: usize,
@@ -1208,7 +1191,6 @@ impl EncryptionEngine {
         }
     }
 
-    #[cfg(feature = "encryption")]
     fn decrypt_data(
         &self,
         ciphertext: &[u8],
@@ -1276,7 +1258,6 @@ impl EncryptionEngine {
         }
     }
 
-    #[cfg(feature = "encryption")]
     fn compress_data(&self, data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         use flate2::{Compression, write::GzEncoder};
         use std::io::Write;
@@ -1290,7 +1271,6 @@ impl EncryptionEngine {
         })
     }
 
-    #[cfg(feature = "encryption")]
     fn decompress_data(&self, data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         use flate2::read::GzDecoder;
         use std::io::Read;
@@ -1303,7 +1283,6 @@ impl EncryptionEngine {
         Ok(decompressed)
     }
 
-    #[cfg(feature = "encryption")]
     fn calculate_payload_hash(&self, data: &[u8]) -> String {
         let mut hasher = Sha256::new();
         hasher.update(data);
@@ -1506,7 +1485,6 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_encryption_engine_creation() {
         // Set up a test key in environment
@@ -1524,7 +1502,6 @@ mod tests {
         assert!(engine.is_ok());
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_payload_encryption_decryption() {
         unsafe {
@@ -1583,7 +1560,6 @@ mod tests {
         assert!(!pii_fields.contains(&"amount".to_string()));
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_encryption_with_compression() {
         unsafe {
@@ -1614,7 +1590,6 @@ mod tests {
         assert!(encrypted.metadata.compressed);
     }
 
-    #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn test_encryption_stats() {
         unsafe {

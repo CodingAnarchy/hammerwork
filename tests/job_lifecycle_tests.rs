@@ -242,7 +242,7 @@ where
         let runs = Arc::new(AtomicUsize::new(0));
         let mut w = worker(&queue, &queue_name, failing_handler(Arc::clone(&runs)));
         if let Some(cap) = worker_cap {
-            w = w.with_attempt_cap(cap);
+            w = w.with_attempt_cap(cap).unwrap();
         }
         let running = RunningWorker::start(w);
         let job = test_utils::wait_for_job(&queue, id, Duration::from_secs(15), |job| {

@@ -132,7 +132,7 @@
 //!     let webhook_manager = WebhookManager::new(
 //!         event_manager.clone(),
 //!         Default::default()
-//!     );
+//!     )?;
 //!
 //!     let webhook = WebhookConfig::new(
 //!         "completion_hook".to_string(),

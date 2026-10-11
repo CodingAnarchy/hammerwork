@@ -12,7 +12,7 @@ use hammerwork::webhooks::{WebhookConfig, WebhookManager};
 use std::{sync::Arc, time::Duration};
 
 let events = Arc::new(EventManager::new_default());
-let webhooks = WebhookManager::new_default(events.clone());
+let webhooks = WebhookManager::new_default(events.clone())?;
 
 let hook = WebhookConfig::new(
     "failures".to_string(),

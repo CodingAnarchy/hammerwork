@@ -3227,7 +3227,7 @@ mod mysql_backend {
             sqlx::query(
                 r#"
                 UPDATE hammerwork_encryption_keys
-                SET status = 'Retired', retired_at = NOW(6)
+                SET status = 'Retired', retired_at = UTC_TIMESTAMP(6)
                 WHERE key_id = ? AND key_version = ? AND status = 'Active'
                 "#,
             )
@@ -3257,7 +3257,7 @@ mod mysql_backend {
                     r#"
                     SELECT COUNT(*) FROM hammerwork_encryption_keys
                     WHERE key_id = ? AND key_version = ? AND status = 'Active'
-                      AND next_rotation_at IS NOT NULL AND next_rotation_at <= NOW(6)
+                      AND next_rotation_at IS NOT NULL AND next_rotation_at <= UTC_TIMESTAMP(6)
                     "#,
                 )
                 .bind(&key.key_id)
@@ -3280,7 +3280,7 @@ mod mysql_backend {
             sqlx::query(
                 r#"
                 UPDATE hammerwork_encryption_keys
-                SET status = 'Retired', retired_at = NOW(6)
+                SET status = 'Retired', retired_at = UTC_TIMESTAMP(6)
                 WHERE key_id = ? AND key_version = ? AND status = 'Active'
                 "#,
             )
@@ -3344,7 +3344,7 @@ mod mysql_backend {
             sqlx::query(
                 r#"
                 UPDATE hammerwork_encryption_keys
-                SET status = 'Retired', retired_at = NOW(6)
+                SET status = 'Retired', retired_at = UTC_TIMESTAMP(6)
                 WHERE key_purpose = 'KEK' AND status = 'Active'
                 "#,
             )
@@ -3440,7 +3440,7 @@ mod mysql_backend {
             sqlx::query(
                 r#"
                 UPDATE hammerwork_encryption_keys
-                SET last_used_at = NOW(6), usage_count = usage_count + 1
+                SET last_used_at = UTC_TIMESTAMP(6), usage_count = usage_count + 1
                 WHERE key_id = ? AND status = 'Active'
                 "#,
             )
@@ -3461,7 +3461,7 @@ mod mysql_backend {
             sqlx::query(
                 r#"
                 INSERT INTO hammerwork_key_audit_log (id, key_id, operation, success, error_message, timestamp)
-                VALUES (?, ?, ?, ?, ?, NOW(6))
+                VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(6))
                 "#,
             )
             .bind(Uuid::new_v4().to_string())
@@ -3483,7 +3483,7 @@ mod mysql_backend {
                 WHERE status = 'Active'
                   AND key_purpose <> 'KEK'
                   AND next_rotation_at IS NOT NULL
-                  AND next_rotation_at <= NOW(6)
+                  AND next_rotation_at <= UTC_TIMESTAMP(6)
                 ORDER BY key_id
                 "#,
             )
@@ -3504,7 +3504,7 @@ mod mysql_backend {
                 WHERE key_id = ?
                   AND status = 'Active'
                   AND next_rotation_at IS NOT NULL
-                  AND next_rotation_at <= NOW(6)
+                  AND next_rotation_at <= UTC_TIMESTAMP(6)
                 "#,
             )
             .bind(key_id)
@@ -3622,7 +3622,7 @@ mod mysql_backend {
             sqlx::query(
                 r#"
                 UPDATE hammerwork_kms_data_keys
-                SET status = 'Retired', retired_at = NOW(6)
+                SET status = 'Retired', retired_at = UTC_TIMESTAMP(6)
                 WHERE key_name = ? AND kms_provider = ? AND kms_key_id = ?
                   AND status = 'Active'
                 "#,
@@ -3688,15 +3688,15 @@ mod mysql_backend {
                     COUNT(CASE WHEN status = 'Revoked' THEN 1 END) AS revoked_keys,
                     COUNT(CASE WHEN status = 'Expired' THEN 1 END) AS expired_keys,
                     CAST(COALESCE(AVG(CASE WHEN status IN ('Active', 'Retired')
-                        THEN TIMESTAMPDIFF(SECOND, created_at, NOW(6)) END) / 86400, 0) AS DOUBLE)
+                        THEN TIMESTAMPDIFF(SECOND, created_at, UTC_TIMESTAMP(6)) END) / 86400, 0) AS DOUBLE)
                         AS avg_age_days,
                     COUNT(CASE WHEN status = 'Active'
                         AND expires_at IS NOT NULL
-                        AND expires_at <= DATE_ADD(NOW(6), INTERVAL 7 DAY) THEN 1 END)
+                        AND expires_at <= DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 7 DAY) THEN 1 END)
                         AS expiring_soon,
                     COUNT(CASE WHEN status = 'Active'
                         AND next_rotation_at IS NOT NULL
-                        AND next_rotation_at <= NOW(6) THEN 1 END) AS due_for_rotation
+                        AND next_rotation_at <= UTC_TIMESTAMP(6) THEN 1 END) AS due_for_rotation
                 FROM hammerwork_encryption_keys
                 "#,
             )

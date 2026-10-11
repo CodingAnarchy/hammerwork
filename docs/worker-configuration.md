@@ -13,7 +13,7 @@ use std::time::Duration;
 
 let worker = Worker::new(queue, "email_queue".to_string(), handler)
     .with_poll_interval(Duration::from_millis(500))  // Check for jobs every 500ms
-    .with_attempt_cap(3)                             // At most 3 attempts per job (job max_attempts still applies)
+    .with_attempt_cap(3)?                             // At most 3 attempts per job (job max_attempts still applies)
     .with_retry_delay(Duration::from_secs(30));      // Wait 30s between retries
 # Ok(())
 # }
@@ -126,7 +126,7 @@ See the [priority system guide](priority-system.md) for details.
 use hammerwork::{RateLimit, Worker};
 
 // Limit to 10 jobs per second with a burst of 20
-let rate_limit = RateLimit::per_second(10)?.with_burst_limit(20);
+let rate_limit = RateLimit::per_second(10)?.with_burst_limit(20)?;
 
 let worker = Worker::new(queue, "api_queue".to_string(), handler)
     .with_rate_limit(rate_limit);
@@ -495,7 +495,7 @@ let background_worker = Worker::new(queue.clone(), "cleanup".to_string(), handle
 
 // Email worker with retry configuration
 let email_worker = Worker::new(queue.clone(), "email".to_string(), handler.clone())
-    .with_attempt_cap(5)
+    .with_attempt_cap(5)?
     .with_retry_delay(Duration::from_secs(60));
 
 let mut pool = WorkerPool::new();
@@ -574,7 +574,7 @@ use hammerwork::Worker;
 use std::time::Duration;
 
 let worker = Worker::new(queue, "retry_queue".to_string(), handler)
-    .with_attempt_cap(5)                        // Never more than 5 attempts per job
+    .with_attempt_cap(5)?                        // Never more than 5 attempts per job
     .with_retry_delay(Duration::from_secs(30))  // Wait 30s between attempts
     .with_default_timeout(Duration::from_secs(300)); // 5 minute timeout per attempt
 # Ok(())
@@ -705,7 +705,7 @@ let worker = Worker::new(queue, "heavy_processing".to_string(), handler)
     .with_poll_interval(Duration::from_secs(5))      // Check less frequently
     .with_rate_limit(RateLimit::per_minute(10)?)      // Limit load
     .with_default_timeout(Duration::from_secs(1800)) // 30 minute timeout
-    .with_attempt_cap(1);                            // One attempt per job, no retries
+    .with_attempt_cap(1)?;                            // One attempt per job, no retries
 # Ok(())
 # }
 ```
@@ -757,8 +757,8 @@ use hammerwork::{RateLimit, Worker};
 use std::time::Duration;
 
 let api_worker = Worker::new(queue, "api_calls".to_string(), handler)
-    .with_rate_limit(RateLimit::per_second(5)?.with_burst_limit(10))
-    .with_attempt_cap(3)
+    .with_rate_limit(RateLimit::per_second(5)?.with_burst_limit(10)?)
+    .with_attempt_cap(3)?
     .with_retry_delay(Duration::from_secs(60))
     .with_default_timeout(Duration::from_secs(30));
 # Ok(())
@@ -802,7 +802,7 @@ use std::time::Duration;
 let critical_worker = Worker::new(queue, "system".to_string(), handler)
     .with_strict_priority()
     .with_poll_interval(Duration::from_millis(100))
-    .with_attempt_cap(5)
+    .with_attempt_cap(5)?
     .with_retry_delay(Duration::from_secs(5))
     .with_default_timeout(Duration::from_secs(120));
 # Ok(())

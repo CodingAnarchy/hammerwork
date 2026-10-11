@@ -567,7 +567,7 @@ async fn setup_backup_system(
 
     let backup_worker = Worker::new(queue, "backup".to_string(), backup_handler)
         .with_default_timeout(Duration::from_secs(4 * 60 * 60))
-        .with_attempt_cap(2)
+        .with_attempt_cap(2)?
         .with_retry_delay(Duration::from_secs(30 * 60));
 
     let mut pool = WorkerPool::new();

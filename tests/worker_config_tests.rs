@@ -1084,7 +1084,6 @@ where
 }
 
 /// A worker with an event manager publishes lifecycle events for its jobs.
-#[cfg(feature = "webhooks")]
 async fn worker_publishes_lifecycle_events<DB>(queue: Arc<JobQueue<DB>>)
 where
     DB: sqlx::Database + Send + Sync + 'static,
@@ -1171,7 +1170,6 @@ mod postgres_tests {
         test_postgres_hanging_alert_target_does_not_block_jobs => hanging_alert_target_does_not_block_jobs,
         #[cfg(feature = "metrics")]
         test_postgres_worker_records_prometheus_metrics => worker_records_prometheus_metrics,
-        #[cfg(feature = "webhooks")]
         test_postgres_worker_publishes_lifecycle_events => worker_publishes_lifecycle_events,
     );
 
@@ -1218,7 +1216,6 @@ mod mysql_tests {
         test_mysql_hanging_alert_target_does_not_block_jobs => hanging_alert_target_does_not_block_jobs,
         #[cfg(feature = "metrics")]
         test_mysql_worker_records_prometheus_metrics => worker_records_prometheus_metrics,
-        #[cfg(feature = "webhooks")]
         test_mysql_worker_publishes_lifecycle_events => worker_publishes_lifecycle_events,
     );
 
