@@ -154,7 +154,7 @@ async fn test_mysql_migration_021_converts_timestamps_to_datetime() {
         let scheduled_id = queue.enqueue(scheduled).await.unwrap();
         let job = queue.enqueue(Job::new(queue_name.to_string(), json!({"n": 2}))).await;
         let running_id = job.unwrap();
-        let claimed = queue.dequeue(queue_name).await.unwrap().expect("a due job");
+        let claimed = queue.dequeue_one(queue_name).await.unwrap().expect("a due job");
         assert!(claimed.id == running_id || claimed.id == scheduled_id);
         queue.pause_queue("dt_paused", Some("tester")).await.unwrap();
         for (id, created, scheduled, completed) in [

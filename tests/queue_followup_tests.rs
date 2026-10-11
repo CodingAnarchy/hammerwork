@@ -728,7 +728,7 @@ mod mysql_tests {
         let stored = queue.get_job(late_id).await.unwrap().unwrap();
         assert_eq!(stored.scheduled_at, after_2038);
         // Not due yet, so it is not dequeued
-        assert!(queue.dequeue(&queue_name).await.unwrap().is_none());
+        assert!(queue.dequeue_one(&queue_name).await.unwrap().is_none());
 
         let too_late = DateTime::from_timestamp(253_402_300_800, 0).unwrap(); // year 10000
         let mut beyond = job(&queue_name, "beyond");
