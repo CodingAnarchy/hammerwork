@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-10-11
+
+A bug-fix release (#99, 47 fixes) with a small docs and dashboard cleanup (#98). It is a
+minor version because several fixes change observable behaviour (see below) and
+`cargo-hammerwork` adds `Config::load_or_env` and `Config::load_or_env_with`. No public
+signatures change.
+
 ### Behaviour changes to check when upgrading
 
 These are all bug fixes (details under **Fixed**), but each changes something you can
