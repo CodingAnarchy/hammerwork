@@ -7,7 +7,7 @@
 //!
 //! ## Creating a Job Table
 //!
-//! ```rust,ignore
+//! ```text
 //! use cargo_hammerwork::utils::display::JobTable;
 //!
 //! let mut table = JobTable::new();
@@ -27,7 +27,7 @@
 //!
 //! ## Creating a Statistics Table
 //!
-//! ```rust,ignore
+//! ```text
 //! use cargo_hammerwork::utils::display::StatsTable;
 //!
 //! let mut stats = StatsTable::new();
@@ -40,7 +40,7 @@
 //!
 //! ## Formatting Helpers
 //!
-//! ```rust,ignore
+//! ```text
 //! use cargo_hammerwork::utils::display::{format_duration, format_size};
 //!
 //! // Format durations
@@ -73,7 +73,7 @@ pub fn create_table() -> Table {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```text
 /// use cargo_hammerwork::utils::display::JobTable;
 ///
 /// let mut table = JobTable::new();
@@ -189,7 +189,7 @@ impl fmt::Display for JobTable {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```text
 /// use cargo_hammerwork::utils::display::StatsTable;
 ///
 /// let mut stats = StatsTable::new();
@@ -254,7 +254,7 @@ impl fmt::Display for StatsTable {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```text
 /// use cargo_hammerwork::utils::display::format_duration;
 ///
 /// assert_eq!(format_duration(Some(30)), "30s");
@@ -277,7 +277,7 @@ pub fn format_duration(seconds: Option<i64>) -> String {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```text
 /// use cargo_hammerwork::utils::display::format_size;
 ///
 /// assert_eq!(format_size(Some(100)), "100B");

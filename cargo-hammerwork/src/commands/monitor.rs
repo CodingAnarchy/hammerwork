@@ -7,6 +7,7 @@ use tokio::time::interval;
 use crate::commands::job::priority_display;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
+use crate::utils::job_ops::StaleRunning;
 use crate::utils::sql::{
     Backend, Bind, FAILURE_STATUSES_SQL, FAILURE_TIME_SQL, IdText, IntervalUnit, SqlParams,
     bind_mysql, bind_pg, fetch_i64, fetch_rows,
@@ -317,8 +318,11 @@ async fn display_dashboard_data(pool: &DatabasePool, queue: &Option<String>) -> 
 /// The counts behind `monitor health`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthCount {
-    /// Jobs `Running` for more than an hour.
+    /// `Running` jobs whose lease expired: the jobs `requeue-stale` would reclaim.
     Stuck,
+    /// `Running` jobs without a lease (left by a Hammerwork 1.x worker), which the lease
+    /// rule can neither call stuck nor reclaim.
+    Leaseless,
     /// Jobs created in the last hour.
     RecentJobs,
     /// Jobs that failed (`Failed`, `Dead` or `TimedOut`) in the last hour.
@@ -326,15 +330,28 @@ pub enum HealthCount {
 }
 
 /// `COUNT(*) as count` for one health figure; the one-hour window is a bound parameter on
-/// the database clock.
-pub fn build_health_count_query(backend: Backend, which: HealthCount) -> (String, Vec<Bind>) {
+/// the database clock, and a `Running` job is stuck by the lease rule at `now`.
+pub fn build_health_count_query(
+    backend: Backend,
+    which: HealthCount,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (String, Vec<Bind>) {
     let mut params = SqlParams::new(backend);
-    let hour_ago = params.ago(1, IntervalUnit::Hour);
     let condition = match which {
-        HealthCount::Stuck => format!("status = 'Running' AND started_at < {hour_ago}"),
-        HealthCount::RecentJobs => format!("created_at > {hour_ago}"),
+        HealthCount::Stuck => format!(
+            "status = 'Running' AND {}",
+            StaleRunning::new(now).condition(&mut params)
+        ),
+        HealthCount::Leaseless => format!(
+            "status = 'Running' AND {}",
+            StaleRunning::leaseless_condition()
+        ),
+        HealthCount::RecentJobs => format!("created_at > {}", params.ago(1, IntervalUnit::Hour)),
         HealthCount::RecentFailures => {
-            format!("status IN {FAILURE_STATUSES_SQL} AND {FAILURE_TIME_SQL} > {hour_ago}")
+            format!(
+                "status IN {FAILURE_STATUSES_SQL} AND {FAILURE_TIME_SQL} > {}",
+                params.ago(1, IntervalUnit::Hour)
+            )
         }
     };
     (
@@ -375,11 +392,14 @@ pub struct HealthCheck {
     pub value: String,
 }
 
-/// Grade the measurements: any stuck job is a warning (critical from five); the failure rate
-/// of the last hour is a warning from 5% and critical from 15%.
+/// Grade the measurements: any stuck job (a `Running` job whose lease expired) is a warning
+/// (critical from five); `Running` jobs without a lease are a separate warning, since the
+/// lease rule cannot judge them; the failure rate of the last hour is a warning from 5% and
+/// critical from 15%.
 pub fn evaluate_health(
     database: std::result::Result<(), String>,
     stuck: i64,
+    leaseless: i64,
     recent_jobs: i64,
     recent_failures: i64,
 ) -> Vec<HealthCheck> {
@@ -428,7 +448,20 @@ pub fn evaluate_health(
         name: "Failure Rate",
         value: format!("{rate:.1}%"),
     };
-    vec![database, stuck_check, failure_check]
+    let leaseless_check = if leaseless == 0 {
+        HealthCheck {
+            level: HealthLevel::Healthy,
+            name: "Lease-less Running Jobs",
+            value: "None".to_string(),
+        }
+    } else {
+        HealthCheck {
+            level: HealthLevel::Warning,
+            name: "Lease-less Running Jobs",
+            value: format!("{leaseless} jobs (no lease; see the 3.0 upgrade guide)"),
+        }
+    };
+    vec![database, stuck_check, leaseless_check, failure_check]
 }
 
 /// The report for `format` (`json` or a table).
@@ -468,18 +501,20 @@ async fn check_health(pool: DatabasePool, format: Option<String>) -> Result<()> 
     .map_err(|e| e.to_string());
 
     let backend = pool.backend();
-    let mut counts = [0i64; 3];
+    let now = chrono::Utc::now();
+    let mut counts = [0i64; 4];
     for (slot, which) in counts.iter_mut().zip([
         HealthCount::Stuck,
+        HealthCount::Leaseless,
         HealthCount::RecentJobs,
         HealthCount::RecentFailures,
     ]) {
-        let (sql, binds) = build_health_count_query(backend, which);
+        let (sql, binds) = build_health_count_query(backend, which, now);
         *slot = fetch_i64(&pool, &sql, &binds, "count").await?;
     }
-    let [stuck, recent_jobs, recent_failures] = counts;
+    let [stuck, leaseless, recent_jobs, recent_failures] = counts;
 
-    let checks = evaluate_health(database, stuck, recent_jobs, recent_failures);
+    let checks = evaluate_health(database, stuck, leaseless, recent_jobs, recent_failures);
     println!(
         "{}",
         render_health(&checks, format.as_deref(), chrono::Utc::now())?
@@ -794,18 +829,21 @@ mod tests {
 
     #[test]
     fn health_query_windows_use_the_database_clock() {
-        let (sql, binds) = build_health_count_query(Backend::Postgres, HealthCount::Stuck);
+        let now = chrono::Utc::now();
+        let (sql, binds) =
+            build_health_count_query(Backend::Postgres, HealthCount::RecentJobs, now);
         assert_eq!(
             sql,
-            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Running' AND started_at < NOW() - make_interval(hours => $1::int)"
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE created_at > NOW() - make_interval(hours => $1::int)"
         );
         assert_eq!(binds, vec![Bind::Int(1)]);
-        let (sql, _) = build_health_count_query(Backend::MySql, HealthCount::RecentJobs);
+        let (sql, _) = build_health_count_query(Backend::MySql, HealthCount::RecentJobs, now);
         assert!(
             sql.ends_with("created_at > DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? HOUR)"),
             "{sql}"
         );
-        let (sql, binds) = build_health_count_query(Backend::MySql, HealthCount::RecentFailures);
+        let (sql, binds) =
+            build_health_count_query(Backend::MySql, HealthCount::RecentFailures, now);
         assert!(
             sql.ends_with(
                 "status IN ('Failed', 'Dead', 'TimedOut') AND COALESCE(failed_at, timed_out_at) > DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? HOUR)"
@@ -816,26 +854,60 @@ mod tests {
     }
 
     #[test]
+    fn stuck_jobs_follow_the_lease_rule_not_the_start_time() {
+        let now = chrono::Utc::now();
+        let (sql, binds) = build_health_count_query(Backend::Postgres, HealthCount::Stuck, now);
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE status = 'Running' AND (last_heartbeat_at >= started_at AND lease_expires_at < $1)"
+        );
+        assert_eq!(binds, vec![Bind::Time(now)]);
+        assert!(!sql.contains("INTERVAL") && !sql.contains("make_interval"));
+
+        let (sql, binds) = build_health_count_query(Backend::MySql, HealthCount::Stuck, now);
+        assert!(sql.ends_with("lease_expires_at < ?)"), "{sql}");
+        assert_eq!(binds.len(), 1);
+
+        let (sql, binds) = build_health_count_query(Backend::Postgres, HealthCount::Leaseless, now);
+        assert!(
+            sql.contains("status = 'Running' AND (last_heartbeat_at IS NULL"),
+            "{sql}"
+        );
+        assert!(sql.contains("lease_expires_at IS NULL"), "{sql}");
+        assert!(binds.is_empty());
+    }
+
+    #[test]
     fn health_levels_follow_the_thresholds() {
         let level = |checks: &[HealthCheck], name: &str| {
             checks.iter().find(|c| c.name == name).unwrap().level
         };
-        let ok = evaluate_health(Ok(()), 0, 0, 0);
+        let ok = evaluate_health(Ok(()), 0, 0, 0, 0);
         assert!(ok.iter().all(|c| c.level == HealthLevel::Healthy));
         assert_eq!(ok[1].value, "None");
-        assert_eq!(ok[2].value, "0.0%");
+        assert_eq!(ok[2].value, "None");
+        assert_eq!(ok[3].value, "0.0%");
 
-        let stuck = evaluate_health(Ok(()), 3, 100, 4);
+        let stuck = evaluate_health(Ok(()), 3, 0, 100, 4);
         assert_eq!(level(&stuck, "Stuck Jobs"), HealthLevel::Warning);
         assert_eq!(level(&stuck, "Failure Rate"), HealthLevel::Healthy);
         assert_eq!(stuck[1].value, "3 jobs");
 
-        let bad = evaluate_health(Ok(()), 5, 100, 5);
+        let bad = evaluate_health(Ok(()), 5, 0, 100, 5);
         assert_eq!(level(&bad, "Stuck Jobs"), HealthLevel::Critical);
         assert_eq!(level(&bad, "Failure Rate"), HealthLevel::Warning);
-        assert_eq!(bad[2].value, "5.0%");
+        assert_eq!(bad[3].value, "5.0%");
 
-        let worst = evaluate_health(Err("boom".into()), 0, 10, 2);
+        // Running jobs without a lease are their own warning, never "stuck"
+        let leaseless = evaluate_health(Ok(()), 0, 2, 100, 0);
+        assert_eq!(level(&leaseless, "Stuck Jobs"), HealthLevel::Healthy);
+        assert_eq!(
+            level(&leaseless, "Lease-less Running Jobs"),
+            HealthLevel::Warning
+        );
+        assert!(leaseless[2].value.starts_with("2 jobs"));
+
+        let worst = evaluate_health(Err("boom".into()), 0, 0, 10, 2);
         assert_eq!(level(&worst, "Database"), HealthLevel::Critical);
         assert_eq!(worst[0].value, "Connection Failed: boom");
         assert_eq!(level(&worst, "Failure Rate"), HealthLevel::Critical);
@@ -843,7 +915,7 @@ mod tests {
 
     #[test]
     fn health_renders_as_a_table_or_json() {
-        let checks = evaluate_health(Ok(()), 1, 10, 1);
+        let checks = evaluate_health(Ok(()), 1, 2, 10, 1);
         let ts = chrono::DateTime::parse_from_rfc3339("2030-01-02T03:04:05Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -856,12 +928,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["timestamp"], "2030-01-02T03:04:05+00:00");
         let list = parsed["checks"].as_array().unwrap();
-        assert_eq!(list.len(), 3);
+        assert_eq!(list.len(), 4);
         assert_eq!(list[0]["check"], "Database");
         assert_eq!(list[0]["status"], "healthy");
         assert_eq!(list[1]["status"], "warning");
+        assert_eq!(list[2]["check"], "Lease-less Running Jobs");
         assert_eq!(list[2]["status"], "warning");
-        assert_eq!(list[2]["value"], "10.0%");
+        assert_eq!(list[3]["status"], "warning");
+        assert_eq!(list[3]["value"], "10.0%");
     }
 
     #[test]
@@ -971,14 +1045,52 @@ mod tests {
             None
         );
 
-        // health counts: our long-running job is stuck, our failure is recent
+        // health counts: a long-running job with no lease is lease-less, not stuck; only a
+        // job whose lease expired is stuck, and one that keeps heartbeating never is
+        let count = |which: HealthCount| {
+            let pool = pool.clone();
+            async move {
+                let (sql, binds) =
+                    build_health_count_query(pool.backend(), which, chrono::Utc::now());
+                fetch_i64(&pool, &sql, &binds, "count").await.unwrap()
+            }
+        };
+        let mut expired = SeedJob::new(&queue, "Running");
+        expired.started_long_ago = true;
+        let expired_id = seed(&pool, &expired).await;
+        set_time(&pool, &expired_id, "last_heartbeat_at", -60).await;
+        set_time(&pool, &expired_id, "lease_expires_at", -10).await;
+        let mut alive = SeedJob::new(&queue, "Running");
+        alive.started_long_ago = true;
+        let alive_id = seed(&pool, &alive).await;
+        set_time(&pool, &alive_id, "last_heartbeat_at", -1).await;
+        set_time(&pool, &alive_id, "lease_expires_at", 10).await;
+        // the counts are database-wide (other tests share the database): ours are lower
+        // bounds, and the shared predicate is checked exactly within our queue
+        assert!(count(HealthCount::Stuck).await >= 1);
+        assert!(count(HealthCount::Leaseless).await >= 1);
+        use crate::utils::job_ops::{JobSelector, select_job_ids};
+        let in_queue = |stale: bool| JobSelector {
+            queue: Some(queue.clone()),
+            stale_running: stale.then(|| StaleRunning::new(chrono::Utc::now())),
+            leaseless_running: !stale,
+            statuses: vec![hammerwork::JobStatus::Running],
+            ..Default::default()
+        };
+        let stuck_ids = select_job_ids(&pool, &in_queue(true)).await.unwrap();
+        assert_eq!(stuck_ids.len(), 1);
+        assert_eq!(stuck_ids[0].to_string(), expired_id);
+        let leaseless_ids = select_job_ids(&pool, &in_queue(false)).await.unwrap();
+        assert_eq!(
+            leaseless_ids.len(),
+            1,
+            "only the first seeded job has no lease"
+        );
         for (which, minimum) in [
-            (HealthCount::Stuck, 1),
             (HealthCount::RecentJobs, 5),
             (HealthCount::RecentFailures, 1),
         ] {
-            let (sql, binds) = build_health_count_query(pool.backend(), which);
-            let n = fetch_i64(&pool, &sql, &binds, "count").await.unwrap();
+            let n = count(which).await;
             assert!(n >= minimum, "{which:?}: {n}");
         }
 

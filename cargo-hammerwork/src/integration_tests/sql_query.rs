@@ -305,9 +305,13 @@ mod builder_tests {
         for metric in [
             HealthMetric::Total,
             HealthMetric::RecentFailures,
-            HealthMetric::LongRunning,
+            HealthMetric::Stuck,
+            HealthMetric::Leaseless,
         ] {
-            add("health", build_health_query(backend, metric, q));
+            add(
+                "health",
+                build_health_query(backend, metric, q, chrono::Utc::now()),
+            );
         }
         add("backup", build_backup_query(backend, q, false, false));
         add("spawn_list", build_spawn_list_query(backend, q, true, 20));
@@ -343,6 +347,7 @@ mod builder_tests {
                 created_before: Some(now),
                 started_before: Some(now),
                 stale_running: Some(StaleRunning::new(now)),
+                leaseless_running: true,
                 never_started: true,
                 attempts_exhausted: true,
             }
@@ -471,13 +476,19 @@ mod builder_tests {
         use crate::commands::queue::{HealthMetric, build_health_query};
 
         for backend in [Backend::Postgres, Backend::MySql] {
-            let (sql, _) = build_health_query(backend, HealthMetric::RecentFailures, None);
+            let (sql, _) = build_health_query(
+                backend,
+                HealthMetric::RecentFailures,
+                None,
+                chrono::Utc::now(),
+            );
             assert!(
                 sql.contains("status IN ('Failed', 'Dead', 'TimedOut')")
                     && sql.contains("COALESCE(failed_at, timed_out_at) >"),
                 "{sql}"
             );
-            let (sql, _) = build_health_count_query(backend, HealthCount::RecentFailures);
+            let (sql, _) =
+                build_health_count_query(backend, HealthCount::RecentFailures, chrono::Utc::now());
             assert!(
                 sql.contains("status IN ('Failed', 'Dead', 'TimedOut')")
                     && sql.contains("COALESCE(failed_at, timed_out_at) >"),
@@ -491,6 +502,19 @@ mod builder_tests {
             let (sql, _) = selector.sql(backend);
             assert!(sql.contains("COALESCE(failed_at, timed_out_at) >"), "{sql}");
         }
+    }
+
+    #[test]
+    fn test_leaseless_running_selector_is_the_complement_of_the_lease_rule() {
+        let selector = JobSelector {
+            statuses: vec![JobStatus::Running],
+            leaseless_running: true,
+            ..Default::default()
+        };
+        let (sql, binds) = selector.sql(Backend::Postgres);
+        assert!(sql.contains("last_heartbeat_at IS NULL"), "{sql}");
+        assert!(sql.contains("lease_expires_at IS NULL"), "{sql}");
+        assert_eq!(binds, vec![Bind::Text("Running".into())]);
     }
 
     #[test]

@@ -267,6 +267,18 @@ impl<DB: Database> MigrationManager<DB> {
         Ok(())
     }
 
+    /// The migrations this version of the library registers, in version order, whether or
+    /// not they were applied. Reads no database state.
+    pub fn registered_migrations(&self) -> Vec<Migration> {
+        let mut migrations: Vec<_> = self
+            .migrations
+            .values()
+            .map(|(migration, _, _)| migration.clone())
+            .collect();
+        migrations.sort_by_key(|migration| migration.version);
+        migrations
+    }
+
     /// Get status of all migrations
     pub async fn get_migration_status(&self) -> Result<Vec<(Migration, bool)>> {
         let executed = self.runner.get_executed_migrations().await?;

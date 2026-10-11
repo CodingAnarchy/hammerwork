@@ -11,6 +11,7 @@ use crate::commands::monitor::build_status_counts_query;
 use crate::config::Config;
 use crate::utils::database::DatabasePool;
 use crate::utils::display::StatsTable;
+use crate::utils::job_ops::StaleRunning;
 use crate::utils::sql::{
     Backend, Bind, FAILURE_STATUSES_SQL, FAILURE_TIME_SQL, IntervalUnit, SqlParams, execute_binds,
     fetch_i64, fetch_rows,
@@ -274,7 +275,10 @@ pub fn build_detailed_stats_query(backend: Backend, queue: Option<&str>) -> (Str
 pub enum HealthMetric {
     Total,
     RecentFailures,
-    LongRunning,
+    /// `Running` jobs whose lease expired (what `job requeue-stale` reclaims).
+    Stuck,
+    /// `Running` jobs without a lease (left by a Hammerwork 1.x worker).
+    Leaseless,
 }
 
 /// A `COUNT(*) as count` query for one health metric, optionally for one queue.
@@ -282,6 +286,7 @@ pub fn build_health_query(
     backend: Backend,
     metric: HealthMetric,
     queue: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> (String, Vec<Bind>) {
     let mut params = SqlParams::new(backend);
     let mut conditions = Vec::new();
@@ -298,12 +303,15 @@ pub fn build_health_query(
                 params.ago(1, IntervalUnit::Hour)
             ));
         }
-        HealthMetric::LongRunning => {
+        HealthMetric::Stuck => {
+            // The lease rule of `requeue_stale_jobs`: a long-running job that keeps
+            // heartbeating is healthy.
             conditions.push("status = 'Running'".to_string());
-            conditions.push(format!(
-                "started_at < {}",
-                params.ago(1, IntervalUnit::Hour)
-            ));
+            conditions.push(StaleRunning::new(now).condition(&mut params));
+        }
+        HealthMetric::Leaseless => {
+            conditions.push("status = 'Running'".to_string());
+            conditions.push(StaleRunning::leaseless_condition().to_string());
         }
     }
     let where_clause = if conditions.is_empty() {
@@ -458,16 +466,18 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
     health_table.set_header(vec!["Metric", "Value", "Status"]);
 
     let backend = pool.backend();
-    let mut counts = [0i64; 3];
+    let now = chrono::Utc::now();
+    let mut counts = [0i64; 4];
     for (slot, metric) in counts.iter_mut().zip([
         HealthMetric::Total,
         HealthMetric::RecentFailures,
-        HealthMetric::LongRunning,
+        HealthMetric::Stuck,
+        HealthMetric::Leaseless,
     ]) {
-        let (sql, binds) = build_health_query(backend, metric, queue.as_deref());
+        let (sql, binds) = build_health_query(backend, metric, queue.as_deref(), now);
         *slot = fetch_i64(&pool, &sql, &binds, "count").await?;
     }
-    let [total_jobs, recent_failures, long_running] = counts;
+    let [total_jobs, recent_failures, stuck, leaseless] = counts;
 
     health_table.add_row(vec![
         "Total Jobs".to_string(),
@@ -494,14 +504,25 @@ async fn show_queue_health(pool: DatabasePool, queue: Option<String>) -> Result<
     ]);
 
     health_table.add_row(vec![
-        "Long-running Jobs (>1h)".to_string(),
-        long_running.to_string(),
-        if long_running == 0 {
+        "Stuck Jobs (lease expired)".to_string(),
+        stuck.to_string(),
+        if stuck == 0 {
             "🟢 Good"
-        } else if long_running < 5 {
+        } else if stuck < 5 {
             "🟡 Moderate"
         } else {
             "🔴 High"
+        }
+        .to_string(),
+    ]);
+
+    health_table.add_row(vec![
+        "Lease-less Running Jobs".to_string(),
+        leaseless.to_string(),
+        if leaseless == 0 {
+            "🟢 Good"
+        } else {
+            "🟡 No lease (see the 3.0 upgrade guide)"
         }
         .to_string(),
     ]);
@@ -581,10 +602,12 @@ mod tests {
 
     #[test]
     fn test_health_queries_bind_queue_then_window() {
+        let now = chrono::Utc::now();
         let (sql, binds) = build_health_query(
             Backend::Postgres,
             HealthMetric::RecentFailures,
             Some(HOSTILE_QUEUE),
+            now,
         );
         assert_eq!(
             sql,
@@ -594,24 +617,38 @@ mod tests {
 
         let (sql, binds) = build_health_query(
             Backend::MySql,
-            HealthMetric::LongRunning,
+            HealthMetric::Stuck,
             Some(HOSTILE_QUEUE),
+            now,
         );
         assert_eq!(
             sql,
-            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE queue_name = ? AND status = 'Running' AND started_at < DATE_SUB(UTC_TIMESTAMP(6), INTERVAL ? HOUR)"
+            "SELECT COUNT(*) as count FROM hammerwork_jobs WHERE queue_name = ? AND status = 'Running' AND (last_heartbeat_at >= started_at AND lease_expires_at < ?)"
         );
-        assert_eq!(binds.len(), 2);
+        assert_eq!(
+            binds,
+            vec![Bind::Text(HOSTILE_QUEUE.into()), Bind::Time(now)]
+        );
 
-        let (sql, binds) = build_health_query(Backend::Postgres, HealthMetric::Total, None);
+        let (sql, binds) = build_health_query(Backend::Postgres, HealthMetric::Total, None, now);
         assert_eq!(sql, "SELECT COUNT(*) as count FROM hammerwork_jobs");
         assert!(binds.is_empty());
 
-        let (sql, binds) = build_health_query(Backend::Postgres, HealthMetric::LongRunning, None);
+        // "stuck" is the lease rule, not the age of the run
+        let (sql, binds) = build_health_query(Backend::Postgres, HealthMetric::Stuck, None, now);
         assert!(sql.contains(
-            "WHERE status = 'Running' AND started_at < NOW() - make_interval(hours => $1::int)"
+            "WHERE status = 'Running' AND (last_heartbeat_at >= started_at AND lease_expires_at < $1)"
         ));
-        assert_eq!(binds, vec![Bind::Int(1)]);
+        assert!(!sql.contains("make_interval"));
+        assert_eq!(binds, vec![Bind::Time(now)]);
+
+        let (sql, binds) =
+            build_health_query(Backend::Postgres, HealthMetric::Leaseless, Some("q"), now);
+        assert!(
+            sql.contains("queue_name = $1 AND status = 'Running' AND (last_heartbeat_at IS NULL"),
+            "{sql}"
+        );
+        assert_eq!(binds, vec![Bind::Text("q".into())]);
     }
 
     async fn queue_roundtrip(pool: DatabasePool) {
@@ -630,19 +667,39 @@ mod tests {
         let (sql, binds) = build_queue_total_query(backend, Some(&hostile));
         assert_eq!(fetch_i64(&pool, &sql, &binds, "total").await.unwrap(), 3);
 
-        let (sql, binds) = build_health_query(backend, HealthMetric::Total, Some(&hostile));
-        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 3);
-        let (sql, binds) =
-            build_health_query(backend, HealthMetric::RecentFailures, Some(&hostile));
-        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 1);
-        let (sql, binds) = build_health_query(backend, HealthMetric::LongRunning, Some(&hostile));
-        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 1);
+        let now = chrono::Utc::now();
+        let count = |metric: HealthMetric| {
+            let (sql, binds) = build_health_query(backend, metric, Some(&hostile), now);
+            let pool = pool.clone();
+            async move { fetch_i64(&pool, &sql, &binds, "count").await.unwrap() }
+        };
+        assert_eq!(count(HealthMetric::Total).await, 3);
+        assert_eq!(count(HealthMetric::RecentFailures).await, 1);
+        // the seeded Running job started two hours ago and has no lease: it is lease-less,
+        // not stuck, however long it has run
+        assert_eq!(count(HealthMetric::Stuck).await, 0);
+        assert_eq!(count(HealthMetric::Leaseless).await, 1);
+        let mut expired = SeedJob::new(&hostile, "Running");
+        expired.started_long_ago = true;
+        let expired_id = seed(&pool, &expired).await;
+        set_time(&pool, &expired_id, "last_heartbeat_at", -60).await;
+        set_time(&pool, &expired_id, "lease_expires_at", -10).await;
+        let mut alive = SeedJob::new(&hostile, "Running");
+        alive.started_long_ago = true;
+        let alive_id = seed(&pool, &alive).await;
+        set_time(&pool, &alive_id, "last_heartbeat_at", -1).await;
+        set_time(&pool, &alive_id, "lease_expires_at", 10).await;
+        assert_eq!(
+            count(HealthMetric::Stuck).await,
+            1,
+            "only the expired lease"
+        );
+        assert_eq!(count(HealthMetric::Leaseless).await, 1);
+        assert_eq!(count(HealthMetric::Total).await, 5);
         // a TimedOut job has no failed_at, and still counts as a recent failure
         let timed_out = seed(&pool, &SeedJob::new(&hostile, "TimedOut")).await;
         set_time(&pool, &timed_out, "timed_out_at", -5).await;
-        let (sql, binds) =
-            build_health_query(backend, HealthMetric::RecentFailures, Some(&hostile));
-        assert_eq!(fetch_i64(&pool, &sql, &binds, "count").await.unwrap(), 2);
+        assert_eq!(count(HealthMetric::RecentFailures).await, 2);
 
         let (sql, binds) = build_detailed_stats_query(backend, Some(&hostile));
         let statuses = column_strings(&pool, &sql, &binds, "status").await;

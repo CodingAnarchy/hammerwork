@@ -11,55 +11,6 @@
 //! - `POST /api/archive/jobs/{id}/restore` - Restore an archived job
 //! - `DELETE /api/archive/purge` - Purge old archived jobs
 //! - `GET /api/archive/stats` - Get archival statistics
-//!
-//! # Examples
-//!
-//! ## Archive Jobs
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::archive::{ArchiveRequest, ArchiveResponse};
-//! use hammerwork::archive::{ArchivalReason, ArchivalPolicy};
-//! use chrono::Duration;
-//!
-//! let request = ArchiveRequest {
-//!     queue_name: Some("completed_jobs".to_string()),
-//!     reason: ArchivalReason::Automatic,
-//!     archived_by: Some("scheduler".to_string()),
-//!     dry_run: false,
-//!     policy: Some(ArchivalPolicy::new()
-//!         .archive_completed_after(Duration::days(7))),
-//!     config: None,
-//! };
-//!
-//! // This would be sent to POST /api/archive/jobs
-//! assert_eq!(request.queue_name, Some("completed_jobs".to_string()));
-//! assert!(!request.dry_run);
-//! ```
-//!
-//! ## List Archived Jobs
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::archive::ArchivedJobInfo;
-//! use hammerwork::archive::{ArchivalReason, ArchivedJob};
-//! use hammerwork::{JobId, JobStatus};
-//! use chrono::Utc;
-//! use uuid::Uuid;
-//!
-//! let archived_job = ArchivedJobInfo {
-//!     id: Uuid::new_v4(),
-//!     queue_name: "email_queue".to_string(),
-//!     status: JobStatus::Completed,
-//!     created_at: Utc::now(),
-//!     archived_at: Utc::now(),
-//!     archival_reason: ArchivalReason::Automatic,
-//!     original_payload_size: Some(1024),
-//!     payload_compressed: true,
-//!     archived_by: Some("system".to_string()),
-//! };
-//!
-//! assert_eq!(archived_job.queue_name, "email_queue");
-//! assert!(archived_job.payload_compressed);
-//! ```
 
 use super::history::JobHistory;
 use super::{
@@ -121,6 +72,7 @@ pub struct ArchiveResponse {
 /// Request to restore an archived job
 #[derive(Debug, Deserialize)]
 pub struct RestoreRequest {
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     /// Optional reason for restoration
     pub reason: Option<String>,
     /// Who initiated the restoration
@@ -145,6 +97,7 @@ pub struct PurgeRequest {
     pub older_than: chrono::DateTime<chrono::Utc>,
     /// Whether this is a dry run
     pub dry_run: bool,
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     /// Who initiated the purge
     pub purged_by: Option<String>,
 }
@@ -576,5 +529,54 @@ mod tests {
 
         assert!(request.dry_run);
         assert_eq!(request.purged_by, Some("admin".to_string()));
+    }
+}
+
+/// Examples that used to be doctests (moved in-crate when `hammerwork_web::__private` was removed).
+#[cfg(test)]
+mod doc_examples {
+
+    #[test]
+    fn example_1() {
+        use crate::api::archive::ArchiveRequest;
+        use chrono::Duration;
+        use hammerwork::archive::{ArchivalPolicy, ArchivalReason};
+
+        let request = ArchiveRequest {
+            queue_name: Some("completed_jobs".to_string()),
+            reason: ArchivalReason::Automatic,
+            archived_by: Some("scheduler".to_string()),
+            dry_run: false,
+            policy: Some(ArchivalPolicy::new().archive_completed_after(Duration::days(7))),
+            config: None,
+        };
+
+        // This would be sent to POST /api/archive/jobs
+        assert_eq!(request.queue_name, Some("completed_jobs".to_string()));
+        assert!(!request.dry_run);
+    }
+
+    #[test]
+    fn example_2() {
+        use crate::api::archive::ArchivedJobInfo;
+        use chrono::Utc;
+        use hammerwork::JobStatus;
+        use hammerwork::archive::ArchivalReason;
+        use uuid::Uuid;
+
+        let archived_job = ArchivedJobInfo {
+            id: Uuid::new_v4(),
+            queue_name: "email_queue".to_string(),
+            status: JobStatus::Completed,
+            created_at: Utc::now(),
+            archived_at: Utc::now(),
+            archival_reason: ArchivalReason::Automatic,
+            original_payload_size: Some(1024),
+            payload_compressed: true,
+            archived_by: Some("system".to_string()),
+        };
+
+        assert_eq!(archived_job.queue_name, "email_queue");
+        assert!(archived_job.payload_compressed);
     }
 }

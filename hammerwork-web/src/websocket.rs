@@ -8,37 +8,6 @@
 //!
 //! The WebSocket API supports several message types for different events:
 //!
-//! ```rust
-//! use hammerwork_web::__private::websocket::{ClientMessage, ServerMessage, AlertSeverity};
-//! use serde_json::json;
-//!
-//! // Client messages (sent from browser to server)
-//! let subscribe_msg = ClientMessage::Subscribe {
-//!     event_types: vec!["queue_updates".to_string(), "job_updates".to_string()],
-//! };
-//!
-//! let ping_msg = ClientMessage::Ping;
-//!
-//! // Server messages (sent from server to browser)
-//! let alert_msg = ServerMessage::SystemAlert {
-//!     message: "High error rate detected".to_string(),
-//!     severity: AlertSeverity::Warning,
-//! };
-//!
-//! let pong_msg = ServerMessage::Pong;
-//! ```
-//!
-//! # Connection Management
-//!
-//! ```rust
-//! use hammerwork_web::__private::websocket::WebSocketState;
-//! use hammerwork_web::__private::config::WebSocketConfig;
-//!
-//! let config = WebSocketConfig::default();
-//! let ws_state = WebSocketState::new(config);
-//!
-//! assert_eq!(ws_state.connection_count(), 0);
-//! ```
 
 use crate::config::WebSocketConfig;
 use chrono::{DateTime, Utc};
@@ -111,6 +80,7 @@ pub struct WebSocketState {
     config: WebSocketConfig,
     connections: HashMap<Uuid, mpsc::Sender<Message>>,
     subscriptions: HashMap<Uuid, Subscription>,
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     broadcast_sender: mpsc::UnboundedSender<BroadcastMessage>,
     broadcast_receiver: Option<mpsc::UnboundedReceiver<BroadcastMessage>>,
 }
@@ -308,6 +278,7 @@ impl WebSocketState {
         Ok(())
     }
 
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     /// Broadcast a message to all connected clients
     pub async fn broadcast_to_all(&self, message: ServerMessage) -> crate::Result<()> {
         let json_message = serde_json::to_string(&message)?;
@@ -344,6 +315,7 @@ impl WebSocketState {
         Ok(())
     }
 
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     /// Publish an archive event to all connected clients
     pub async fn publish_archive_event(
         &self,
@@ -585,6 +557,7 @@ pub enum ServerMessage {
     Pong,
 }
 
+#[allow(dead_code)] // not reached from the running dashboard; exercised by tests
 /// Internal broadcast messages
 #[derive(Debug)]
 pub enum BroadcastMessage {
@@ -653,6 +626,7 @@ pub struct JobUpdate {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[allow(dead_code)] // not reached from the running dashboard; exercised by tests
 /// Alert severity levels
 #[derive(Debug, Serialize)]
 pub enum AlertSeverity {
@@ -1268,5 +1242,41 @@ mod tests {
             assert!(serde_json::from_str::<ClientMessage>(text).is_ok());
         }
         assert!(serde_json::from_str::<ClientMessage>(r#"{"type": "Subscribe"}"#).is_err());
+    }
+}
+
+/// Examples that used to be doctests (moved in-crate when `hammerwork_web::__private` was removed).
+#[cfg(test)]
+mod doc_examples {
+
+    #[test]
+    fn example_1() {
+        use crate::websocket::{AlertSeverity, ClientMessage, ServerMessage};
+
+        // Client messages (sent from browser to server)
+        let _subscribe_msg = ClientMessage::Subscribe {
+            event_types: vec!["queue_updates".to_string(), "job_updates".to_string()],
+        };
+
+        let _ping_msg = ClientMessage::Ping;
+
+        // Server messages (sent from server to browser)
+        let _alert_msg = ServerMessage::SystemAlert {
+            message: "High error rate detected".to_string(),
+            severity: AlertSeverity::Warning,
+        };
+
+        let _pong_msg = ServerMessage::Pong;
+    }
+
+    #[test]
+    fn example_2() {
+        use crate::config::WebSocketConfig;
+        use crate::websocket::WebSocketState;
+
+        let config = WebSocketConfig::default();
+        let ws_state = WebSocketState::new(config);
+
+        assert_eq!(ws_state.connection_count(), 0);
     }
 }

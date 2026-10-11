@@ -13,20 +13,6 @@
 //! - [`json_body`] only accepts bodies sent as `Content-Type: application/json`, which a page
 //!   on another origin cannot send without a CORS preflight, and at most
 //!   [`MAX_JSON_BODY_BYTES`] of them.
-//!
-//! ```rust
-//! use hammerwork_web::__private::security::{AllowedOrigins, normalize_origin};
-//!
-//! assert_eq!(
-//!     normalize_origin("https://Ops.Example.com/").as_deref(),
-//!     Some("https://ops.example.com")
-//! );
-//! assert!(normalize_origin("https://ops.example.com/path").is_none());
-//!
-//! let allowed = AllowedOrigins::new(["https://ops.example.com"]).unwrap();
-//! assert!(allowed.contains("https://ops.example.com"));
-//! assert!(!allowed.contains("https://evil.example"));
-//! ```
 
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -475,5 +461,25 @@ mod tests {
             .reply(&any)
             .await;
         assert_eq!(get.status(), 403, "same_origin checks every method");
+    }
+}
+
+/// Examples that used to be doctests (moved in-crate when `hammerwork_web::__private` was removed).
+#[cfg(test)]
+mod doc_examples {
+
+    #[test]
+    fn example_1() {
+        use crate::security::{AllowedOrigins, normalize_origin};
+
+        assert_eq!(
+            normalize_origin("https://Ops.Example.com/").as_deref(),
+            Some("https://ops.example.com")
+        );
+        assert!(normalize_origin("https://ops.example.com/path").is_none());
+
+        let allowed = AllowedOrigins::new(["https://ops.example.com"]).unwrap();
+        assert!(allowed.contains("https://ops.example.com"));
+        assert!(!allowed.contains("https://evil.example"));
     }
 }

@@ -273,8 +273,9 @@ fn db_flow(url: &str) {
 
     let (code, out) = cli(&["migration", "status"]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("tables exist"), "{out}");
-    assert!(out.contains("queue_name"), "{out}");
+    assert!(out.contains("0 pending"), "{out}");
+    assert!(out.contains("021_"), "{out}");
+    assert!(out.contains("hammerwork_jobs table:"), "{out}");
 
     // enqueue, list and show
     let (code, out) = cli(&[

@@ -44,7 +44,7 @@ The `cargo-hammerwork` crate provides a modular CLI for managing Hammerwork-base
 # Run migrations to set up the database schema
 cargo hammerwork migration run --database-url postgres://localhost/mydb
 
-# Check migration status
+# Show applied and pending migrations (from the hammerwork_migrations table)
 cargo hammerwork migration status --database-url postgres://localhost/mydb
 ```
 
@@ -183,6 +183,8 @@ cargo hammerwork job purge --completed --older-than-days 30 --confirm
 cargo hammerwork job purge --queue emails --dead --failed --confirm
 
 cargo hammerwork job requeue-stale
+cargo hammerwork job requeue-stale --dry-run            # count only, change nothing
+cargo hammerwork job requeue-stale --queue emails       # one queue only
 ```
 
 - `job enqueue` requires `--queue` and `--payload`; `--payload` must be valid JSON,
@@ -198,7 +200,9 @@ cargo hammerwork job requeue-stale
   reclaimed, however long it runs. A `Running` job without a lease (left by a
   Hammerwork 1.x worker) is never reclaimed; `maintenance check --fix` gives such jobs an
   expired lease once every 1.x worker has stopped (see the 3.0 upgrade guide). It is
-  safe to run alongside workers. (3.0 removed `--older-than-secs`.)
+  safe to run alongside workers. `--dry-run` counts what would be reclaimed without
+  changing anything, and `--queue` limits the reclaim to one queue. (3.0 removed
+  `--older-than-secs`.)
 - `job show` prints the redacted payload of an encrypted job (the CLI never decrypts)
   together with its key id, algorithm and retention.
 
@@ -254,6 +258,11 @@ cargo hammerwork monitor metrics --period 24h --queue emails
 
 `--refresh` is in seconds (default 5). `--format` is `table` or `json`; `--period` is
 `1h`, `24h` or `7d`.
+
+`monitor health` and `queue health` call a `Running` job stuck only when its lease has
+expired, the rule `job requeue-stale` uses; a long-running job that keeps heartbeating is
+healthy. `Running` jobs without a lease (left by a Hammerwork 1.x worker) get their own
+`Lease-less Running Jobs` row.
 
 ### Batch Operation Commands
 

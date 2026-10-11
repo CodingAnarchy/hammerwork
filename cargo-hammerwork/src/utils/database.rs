@@ -8,7 +8,7 @@
 //!
 //! ## Connecting to a Database
 //!
-//! ```rust,ignore
+//! ```text
 //! use cargo_hammerwork::utils::database::DatabasePool;
 //!
 //! # #[tokio::main]
@@ -30,7 +30,7 @@
 //!
 //! ## Running Migrations
 //!
-//! ```rust,ignore
+//! ```text
 //! use cargo_hammerwork::utils::database::DatabasePool;
 //!
 //! # #[tokio::main]
@@ -48,7 +48,7 @@
 //!
 //! ## Creating a Job Queue
 //!
-//! ```rust,ignore
+//! ```text
 //! use cargo_hammerwork::utils::database::DatabasePool;
 //!
 //! # #[tokio::main]
@@ -116,7 +116,7 @@ fn connect_error(err: sqlx::Error, timeout: Duration) -> anyhow::Error {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```text
 /// use cargo_hammerwork::utils::database::DatabasePool;
 ///
 /// # #[tokio::main]
@@ -149,7 +149,7 @@ impl DatabasePool {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```text
     /// use cargo_hammerwork::utils::database::DatabasePool;
     ///
     /// # #[tokio::main]
@@ -238,7 +238,7 @@ impl DatabasePool {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```text
     /// use cargo_hammerwork::utils::database::DatabasePool;
     ///
     /// # #[tokio::main]
@@ -308,7 +308,7 @@ impl DatabasePool {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```text
     /// use cargo_hammerwork::utils::database::DatabasePool;
     ///
     /// # #[tokio::main]
@@ -377,7 +377,7 @@ impl DatabasePool {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```text
 /// use cargo_hammerwork::utils::database::{DatabasePool, JobQueueWrapper};
 ///
 /// # #[tokio::main]
