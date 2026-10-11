@@ -2857,6 +2857,24 @@ impl DatabaseQueue for TestQueue {
         Ok(true)
     }
 
+    async fn start_claimed_run(&self, run: &mut Job, lease: std::time::Duration) -> Result<bool> {
+        let mut storage = self.storage.write().await;
+        let now = storage.clock.now();
+        let Some(job) = storage
+            .jobs
+            .get_mut(&run.id)
+            .filter(|job| job.status == JobStatus::Running && lifecycle::is_same_run(job, run))
+        else {
+            return Ok(false);
+        };
+        job.started_at = Some(now);
+        storage
+            .leases
+            .insert(run.id, (now, lease_expiry(now, lease)));
+        run.started_at = Some(now);
+        Ok(true)
+    }
+
     async fn requeue_stale_jobs(
         &self,
         older_than: std::time::Duration,
@@ -3510,6 +3528,54 @@ mod tests {
         assert_eq!(recovery.requeued, vec![id]);
     }
 
+    /// #94: starting a claimed run that waited moves its start time to now; the run is
+    /// identified by the new start time from then on.
+    #[tokio::test]
+    async fn start_claimed_run_records_the_actual_start() {
+        let queue = TestQueue::new();
+        let clock = queue.clock();
+        let lease = std::time::Duration::from_secs(30);
+        let id = queue
+            .enqueue(Job::new("held".to_string(), json!({})))
+            .await
+            .unwrap();
+        let claimed = queue
+            .dequeue_leased("held", None, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        clock.advance(chrono::Duration::seconds(20));
+
+        let mut run = claimed.clone();
+        assert!(queue.start_claimed_run(&mut run, lease).await.unwrap());
+        let started = run.started_at.unwrap();
+        assert_eq!(
+            started - claimed.started_at.unwrap(),
+            chrono::Duration::seconds(20)
+        );
+        assert_eq!(
+            queue.get_job(id).await.unwrap().unwrap().started_at,
+            Some(started)
+        );
+        // The lease was renewed from the new start.
+        clock.advance(chrono::Duration::seconds(20));
+        let recovery = queue
+            .requeue_stale_jobs(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(recovery.requeued.is_empty());
+
+        // The claim as first dequeued no longer identifies the run.
+        let mut stale = claimed.clone();
+        assert!(!queue.start_claimed_run(&mut stale, lease).await.unwrap());
+        assert_eq!(stale.started_at, claimed.started_at);
+        let recorded = queue
+            .finish_job_run(&run, crate::queue::JobOutcome::Completed)
+            .await
+            .unwrap();
+        assert!(recorded.is_some());
+    }
+
     #[tokio::test]
     async fn test_zero_lease_never_expires() {
         let queue = TestQueue::new();
@@ -3624,7 +3690,7 @@ mod tests {
         // A second report for the same run is discarded.
         assert!(
             queue
-                .finish_job_run(&run, JobOutcome::Completed)
+                .finish_job_run(&run, crate::queue::JobOutcome::Completed)
                 .await
                 .unwrap()
                 .is_none()

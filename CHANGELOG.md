@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed fail-fast batch no longer runs the jobs a batch-mode worker already
+  claimed.** When a `JobBatch` with `PartialFailureMode::FailFast` failed, only its
+  `Pending` jobs were failed; the jobs of it that a worker with `with_batch_size(n)` had
+  claimed but not started were `Running`, so they still ran. Before starting a held job
+  the worker now checks (at most once per poll interval, with the pause check) whether
+  its batch has failed and, if so, fails it as the batch fails its `Pending` jobs
+  (`Failed`, not retried) instead of running it. Held jobs of a failed batch are failed
+  rather than released on a pause or shutdown too.
+- **Batch-mode processing times no longer include the time a job waited in its batch.**
+  A batch claim stamps every job's `started_at` with the claim time, so durations
+  computed from `started_at` (queue statistics, dashboard and CLI averages) counted the
+  wait of held jobs as processing time. A held job that waited now records its actual
+  start when it starts, through the new `DatabaseQueue::start_claimed_run` (default:
+  renew the lease only, as before).
+- **A held batch job skipped because its lease was lost refunds its rate limit token**,
+  as released jobs already did, so a lost claim no longer spends the rate limit.
 - **Pausing a queue stops batch-mode workers from starting the jobs they hold.** A worker
   with `with_batch_size(n)` kept starting the claimed jobs of its current batch after the
   queue was paused, up to `n` more jobs, contrary to "paused queues are honoured". Before

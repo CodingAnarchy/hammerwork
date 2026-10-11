@@ -760,6 +760,180 @@ mod worker {
         worker_task.await.unwrap().unwrap();
     }
 
+    /// #94: when a fail-fast batch fails, the jobs of it that a batch-mode worker has
+    /// claimed but not started are failed like its `Pending` jobs instead of run.
+    pub async fn fail_fast_batch_fails_held_jobs<DB>(queue: Arc<JobQueue<DB>>)
+    where
+        DB: sqlx::Database + Send + Sync + 'static,
+        JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    {
+        use hammerwork::batch::{BatchStatus, JobBatch, PartialFailureMode};
+
+        let queue_name = test_utils::unique_queue("batch_failfast");
+        let jobs: Vec<Job> = (0..4)
+            .map(|i| Job::new(queue_name.clone(), json!({ "i": i })).with_max_attempts(1))
+            .collect();
+        let batch_id = queue
+            .enqueue_batch(
+                JobBatch::new("failfast")
+                    .with_jobs(jobs)
+                    .with_partial_failure_handling(PartialFailureMode::FailFast),
+            )
+            .await
+            .unwrap();
+
+        // Every run fails, after a pause much longer than the poll interval so that the
+        // worker checks the batch before it starts the next held job.
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let handler: JobHandler = {
+            let runs = Arc::clone(&runs);
+            Arc::new(move |job: Job| {
+                let runs = Arc::clone(&runs);
+                Box::pin(async move {
+                    runs.lock().unwrap().push(job.id);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Err(HammerworkError::Processing("boom".to_string()))
+                })
+            })
+        };
+        let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+            .with_poll_interval(Duration::from_millis(50))
+            .with_batch_size(4)
+            .with_batch_concurrency(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let worker_task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+        // The first job dies; the three held ones are failed without running.
+        wait_for_status(&queue, &queue_name, "Failed", 3, Duration::from_secs(30)).await;
+        wait_for_status(&queue, &queue_name, "Dead", 1, Duration::from_secs(30)).await;
+        let started = runs.lock().unwrap().clone();
+        assert_eq!(started.len(), 1, "a held job of a failed batch ran");
+        for job in queue.get_batch_jobs(batch_id).await.unwrap() {
+            if job.id == started[0] {
+                assert_eq!(job.status, JobStatus::Dead);
+            } else {
+                assert_eq!(job.status, JobStatus::Failed);
+                assert!(
+                    job.error_message
+                        .as_deref()
+                        .is_some_and(|message| message.starts_with("Batch failed")),
+                    "unexpected error: {:?}",
+                    job.error_message
+                );
+            }
+        }
+        assert_eq!(
+            queue.get_batch_status(batch_id).await.unwrap().status,
+            BatchStatus::Failed
+        );
+
+        shutdown_tx.send(()).await.unwrap();
+        worker_task.await.unwrap().unwrap();
+    }
+
+    /// #94: a job that waited in a claimed batch records when it actually started, so
+    /// its wait is not counted as processing time: each job of a sequential batch
+    /// starts after the previous one completed.
+    pub async fn held_jobs_record_their_actual_start<DB>(queue: Arc<JobQueue<DB>>)
+    where
+        DB: sqlx::Database + Send + Sync + 'static,
+        JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    {
+        let queue_name = test_utils::unique_queue("batch_start");
+        enqueue_jobs(&queue, &queue_name, 3).await;
+        let runs = Arc::new(Mutex::new(HashMap::new()));
+        let worker = Worker::new(
+            Arc::clone(&queue),
+            queue_name.clone(),
+            counting_handler(Arc::clone(&runs), Duration::from_millis(200)),
+        )
+        .with_poll_interval(Duration::from_millis(20))
+        .with_batch_size(3)
+        .with_batch_concurrency(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let worker_task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+        wait_for_status(&queue, &queue_name, "Completed", 3, Duration::from_secs(30)).await;
+        shutdown_tx.send(()).await.unwrap();
+        worker_task.await.unwrap().unwrap();
+
+        let mut jobs = Vec::new();
+        for id in runs.lock().unwrap().keys() {
+            jobs.push(*id);
+        }
+        let mut finished = Vec::new();
+        for id in jobs {
+            let job = queue.get_job(id).await.unwrap().unwrap();
+            assert_eq!(job.attempts, 1);
+            finished.push((job.started_at.unwrap(), job.completed_at.unwrap()));
+        }
+        finished.sort();
+        for pair in finished.windows(2) {
+            let ((_, previous_completed), (started, _)) = (pair[0], pair[1]);
+            assert!(
+                started >= previous_completed,
+                "a held job's start time ({started}) is before the previous job of its \
+                 sequential batch completed ({previous_completed}): its wait counted as \
+                 processing time"
+            );
+        }
+    }
+
+    /// #94: a held job skipped because its lease was lost refunds its rate limit
+    /// token. With a 2-token burst that refills once per half hour, the worker can only
+    /// claim the lost job again with the refunded token.
+    pub async fn lost_held_job_refunds_its_rate_limit_token<DB>(queue: Arc<JobQueue<DB>>)
+    where
+        DB: sqlx::Database + Send + Sync + 'static,
+        JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+    {
+        let queue_name = test_utils::unique_queue("batch_lost_token");
+        let ids = enqueue_jobs(&queue, &queue_name, 2).await;
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let handler: JobHandler = {
+            let (runs, gate) = (Arc::clone(&runs), Arc::clone(&gate));
+            Arc::new(move |job: Job| {
+                let (runs, gate) = (Arc::clone(&runs), Arc::clone(&gate));
+                Box::pin(async move {
+                    runs.lock().unwrap().push(job.id);
+                    gate.acquire().await.unwrap().forget();
+                    Ok::<(), HammerworkError>(())
+                })
+            })
+        };
+        let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
+            .with_poll_interval(Duration::from_millis(20))
+            .with_rate_limit(RateLimit::per_hour(2))
+            .with_batch_size(2)
+            .with_batch_concurrency(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let worker_task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+        // Both jobs are claimed with the two tokens, and the first starts.
+        wait_for_status(&queue, &queue_name, "Running", 2, Duration::from_secs(20)).await;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while runs.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "no job started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first = runs.lock().unwrap()[0];
+        let held = *ids.iter().find(|id| **id != first).unwrap();
+
+        // An operator requeues the held job, so this worker's claim of it is lost.
+        queue.retry_job(held, Utc::now()).await.unwrap();
+        gate.add_permits(10);
+
+        // The worker skips its stale claim and, with the refunded token, claims and
+        // runs the job again.
+        wait_for_status(&queue, &queue_name, "Completed", 2, Duration::from_secs(30)).await;
+        let runs = runs.lock().unwrap().clone();
+        assert_eq!(runs.iter().filter(|id| **id == held).count(), 1);
+
+        shutdown_tx.send(()).await.unwrap();
+        worker_task.await.unwrap().unwrap();
+    }
+
     /// A throttle's `max_concurrent` bounds the jobs a batch-mode pool holds (claims or
     /// runs) at once, whatever the batch size and concurrency.
     pub async fn batch_worker_respects_throttle<DB>(queue: Arc<JobQueue<DB>>)
@@ -1005,6 +1179,9 @@ mod worker {
             held_jobs_are_not_reaped_while_waiting,
             shutdown_releases_unstarted_jobs,
             pause_releases_unstarted_jobs,
+            fail_fast_batch_fails_held_jobs,
+            held_jobs_record_their_actual_start,
+            lost_held_job_refunds_its_rate_limit_token,
             batch_worker_respects_throttle,
             batch_worker_respects_rate_limit,
             batch_vs_single_claim_throughput,
@@ -1022,6 +1199,9 @@ mod worker {
             held_jobs_are_not_reaped_while_waiting,
             shutdown_releases_unstarted_jobs,
             pause_releases_unstarted_jobs,
+            fail_fast_batch_fails_held_jobs,
+            held_jobs_record_their_actual_start,
+            lost_held_job_refunds_its_rate_limit_token,
             batch_worker_respects_throttle,
             batch_worker_respects_rate_limit,
             batch_vs_single_claim_throughput,

@@ -403,6 +403,11 @@ pub(crate) fn batch_failed_message(failed: JobId) -> String {
     format!("Batch failed: job {failed} failed (fail-fast mode)")
 }
 
+/// Error message for a job of a fail-fast batch that a batch-mode worker had claimed
+/// but not started when the batch failed.
+pub(crate) const BATCH_FAILED_BEFORE_START_MESSAGE: &str =
+    "Batch failed (fail-fast mode) before this claimed job started";
+
 /// The statuses that count as "not finished yet" for workflow and batch progress.
 pub(crate) const UNFINISHED_STATUS_SQL: &str = "'Pending', 'Running', 'Retrying'";
 
