@@ -5595,11 +5595,10 @@ mod tests {
         manager.get_key(&key_id).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        let err = manager
-            .get_key(&key_id)
-            .await
-            .err()
-            .expect("an expired key is refused");
+        // Not `unwrap_err`, which would print the key material if the key were returned.
+        let Err(err) = manager.get_key(&key_id).await else {
+            panic!("an expired key is refused");
+        };
         assert!(err.to_string().contains("has expired"), "{err}");
     }
 
