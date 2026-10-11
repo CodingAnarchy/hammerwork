@@ -228,6 +228,26 @@ pub trait JobHistory: DatabaseQueue + Send + Sync {
         older_than: Option<DateTime<Utc>>,
     ) -> impl Future<Output = Result<u64>> + Send;
 
+    /// How many jobs [`archive_jobs`](DatabaseQueue::archive_jobs) with `policy` would
+    /// archive now, optionally for one queue: the jobs of each status the policy archives
+    /// that finished longer ago than the policy keeps that status, at most
+    /// `policy.batch_size`, and none when the policy is disabled. Used for dry runs.
+    ///
+    /// The default implementation returns an error, for implementations that predate
+    /// this method.
+    fn count_archivable(
+        &self,
+        queue: Option<&str>,
+        policy: &hammerwork::archive::ArchivalPolicy,
+    ) -> impl Future<Output = Result<u64>> + Send {
+        let _ = (queue, policy);
+        async {
+            Err(hammerwork::HammerworkError::Queue {
+                message: "archive dry runs are not supported by this queue".to_string(),
+            })
+        }
+    }
+
     /// Deletes the jobs [`count_jobs`](Self::count_jobs) counts; returns how many.
     fn delete_jobs(
         &self,
@@ -361,6 +381,70 @@ fn job_change(
         attempts,
         updated_at: changed_at,
     }
+}
+
+/// The statuses an archival policy archives, each with the timestamp its age is measured
+/// from and the policy's age for it (as `archive_jobs` selects them).
+fn archivable_statuses(
+    policy: &hammerwork::archive::ArchivalPolicy,
+) -> [(Option<Duration>, &'static str, &'static str); 4] {
+    [
+        (policy.archive_completed_after, "Completed", "completed_at"),
+        (policy.archive_failed_after, "Failed", "failed_at"),
+        (policy.archive_dead_after, "Dead", "failed_at"),
+        (policy.archive_timed_out_after, "TimedOut", "timed_out_at"),
+    ]
+}
+
+/// The count query of [`JobHistory::count_archivable`] and the cutoffs to bind after the
+/// queue name (when `queue`), or `None` when the policy archives nothing.
+fn archivable_count_query(
+    policy: &hammerwork::archive::ArchivalPolicy,
+    queue: bool,
+    now: DateTime<Utc>,
+    postgres: bool,
+) -> Option<(String, Vec<DateTime<Utc>>)> {
+    if !policy.enabled || policy.batch_size == 0 {
+        return None;
+    }
+    let mut param = 0;
+    let mut placeholder = || {
+        param += 1;
+        if postgres {
+            format!("${param}")
+        } else {
+            "?".to_string()
+        }
+    };
+    let queue_filter = if queue {
+        format!(" AND queue_name = {}", placeholder())
+    } else {
+        String::new()
+    };
+    let mut conditions = Vec::new();
+    let mut cutoffs = Vec::new();
+    for (after, status, column) in archivable_statuses(policy) {
+        if let Some(after) = after {
+            conditions.push(format!(
+                "(status = '{status}' AND {column} IS NOT NULL AND {column} <= {})",
+                placeholder()
+            ));
+            cutoffs.push(now - after);
+        }
+    }
+    if conditions.is_empty() {
+        return None;
+    }
+    Some((
+        format!(
+            "SELECT COUNT(*) FROM (SELECT id FROM hammerwork_jobs WHERE archived_at IS NULL{} \
+             AND ({}) LIMIT {}) candidates",
+            queue_filter,
+            conditions.join(" OR "),
+            policy.batch_size
+        ),
+        cutoffs,
+    ))
 }
 
 /// The time of a job's latest change on MySQL, where `GREATEST` is NULL if any argument
@@ -678,6 +762,26 @@ impl JobHistory for JobQueue<sqlx::Postgres> {
         Ok(to_u64(q.fetch_one(&self.pool).await?))
     }
 
+    async fn count_archivable(
+        &self,
+        queue: Option<&str>,
+        policy: &hammerwork::archive::ArchivalPolicy,
+    ) -> Result<u64> {
+        let Some((sql, cutoffs)) =
+            archivable_count_query(policy, queue.is_some(), Utc::now(), true)
+        else {
+            return Ok(0);
+        };
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(name) = queue {
+            q = q.bind(name.to_string());
+        }
+        for cutoff in cutoffs {
+            q = q.bind(cutoff);
+        }
+        Ok(to_u64(q.fetch_one(&self.pool).await?))
+    }
+
     async fn delete_jobs(
         &self,
         queue: Option<&str>,
@@ -921,6 +1025,26 @@ impl JobHistory for JobQueue<sqlx::MySql> {
         Ok(to_u64(q.fetch_one(&self.pool).await?))
     }
 
+    async fn count_archivable(
+        &self,
+        queue: Option<&str>,
+        policy: &hammerwork::archive::ArchivalPolicy,
+    ) -> Result<u64> {
+        let Some((sql, cutoffs)) =
+            archivable_count_query(policy, queue.is_some(), Utc::now(), false)
+        else {
+            return Ok(0);
+        };
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(name) = queue {
+            q = q.bind(name.to_string());
+        }
+        for cutoff in cutoffs {
+            q = q.bind(cutoff);
+        }
+        Ok(to_u64(q.fetch_one(&self.pool).await?))
+    }
+
     async fn delete_jobs(
         &self,
         queue: Option<&str>,
@@ -1122,6 +1246,43 @@ mod tests {
              OR timed_out_at > $1"
         );
         assert!(changed_since_filter(false).starts_with("created_at > ? OR started_at > ?"));
+    }
+
+    /// #94: an archive dry run counts what `archive_jobs` would select.
+    #[test]
+    fn archivable_count_query_mirrors_the_archiver() {
+        use hammerwork::archive::ArchivalPolicy;
+        let now = Utc::now();
+        let policy = ArchivalPolicy::new()
+            .archive_completed_after(Duration::days(1))
+            .with_batch_size(50);
+        let (sql, cutoffs) = archivable_count_query(&policy, true, now, true).unwrap();
+        assert!(
+            sql.contains("archived_at IS NULL AND queue_name = $1"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "(status = 'Completed' AND completed_at IS NOT NULL AND completed_at <= $2)"
+            ),
+            "{sql}"
+        );
+        assert!(sql.ends_with("LIMIT 50) candidates"), "{sql}");
+        assert_eq!(cutoffs.len(), 4, "every status of the default policy");
+        assert_eq!(cutoffs[0], now - Duration::days(1));
+
+        let (sql, _) = archivable_count_query(&policy, false, now, false).unwrap();
+        assert!(!sql.contains('$') && !sql.contains("queue_name"), "{sql}");
+
+        let mut disabled = policy.clone();
+        disabled.enabled = false;
+        assert!(archivable_count_query(&disabled, false, now, true).is_none());
+        let mut nothing = ArchivalPolicy::new();
+        nothing.archive_completed_after = None;
+        nothing.archive_failed_after = None;
+        nothing.archive_dead_after = None;
+        nothing.archive_timed_out_after = None;
+        assert!(archivable_count_query(&nothing, false, now, true).is_none());
     }
 
     #[test]

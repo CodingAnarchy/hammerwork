@@ -246,12 +246,17 @@ pub struct SortParams {
 }
 
 impl SortParams {
+    /// Whether `sort_order` asks for ascending order (`asc`, in any case); anything else
+    /// is descending.
+    pub fn is_ascending(&self) -> bool {
+        self.sort_order
+            .as_deref()
+            .is_some_and(|order| order.trim().eq_ignore_ascii_case("asc"))
+    }
+
     pub fn get_order_by(&self) -> (String, String) {
         let field = self.sort_by.as_deref().unwrap_or("created_at").to_string();
-        let direction = match self.sort_order.as_deref() {
-            Some("asc") | Some("ASC") => "ASC".to_string(),
-            _ => "DESC".to_string(),
-        };
+        let direction = if self.is_ascending() { "ASC" } else { "DESC" }.to_string();
         (field, direction)
     }
 }
@@ -442,6 +447,24 @@ mod tests {
         let (field, direction) = params.get_order_by();
         assert_eq!(field, "created_at");
         assert_eq!(direction, "DESC");
+    }
+
+    /// #94: `asc` selects ascending order in any case (the jobs list only accepted
+    /// lowercase); everything else is descending.
+    #[test]
+    fn sort_order_is_case_insensitive() {
+        let order = |order: Option<&str>| SortParams {
+            sort_by: Some("created_at".to_string()),
+            sort_order: order.map(str::to_string),
+        };
+        for ascending in ["asc", "ASC", "Asc", " asc "] {
+            assert!(order(Some(ascending)).is_ascending(), "{ascending}");
+            assert_eq!(order(Some(ascending)).get_order_by().1, "ASC");
+        }
+        for descending in [None, Some("desc"), Some("DESC"), Some("ascending")] {
+            assert!(!order(descending).is_ascending(), "{descending:?}");
+            assert_eq!(order(descending).get_order_by().1, "DESC");
+        }
     }
 
     #[test]

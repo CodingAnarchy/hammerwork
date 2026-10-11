@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now tracks the running jobs (new `JobHistory::running_jobs`) and reads the state of the
   ones that stopped running without such a timestamp (new `JobHistory::job_states`),
   reporting them at the poll that saw the change. No schema change is needed.
+- **The dashboard's uptime no longer wraps to a huge number if the clock goes backwards**
+  (`/api/stats/overview`, `/api/system/info`); `SystemState::uptime_seconds` is never
+  negative.
+- **The dashboard's job list sorts ascending for `sort_order=ASC` (any case)**, not only
+  for lowercase `asc`, like the other endpoints.
+- **An archive dry run (`POST /api/archive/jobs` with `dry_run: true`) reports how many
+  jobs a real run would archive** in `stats.jobs_archived` (new
+  `JobHistory::count_archivable`) instead of zeroed statistics.
 - **`cargo hammerwork backup create`/`restore` and `migration status` honour
   `connect_timeout_secs`.** They connected with the default 10-second timeout whatever
   the configuration said.

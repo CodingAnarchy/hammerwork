@@ -297,7 +297,8 @@ where
 {
     match queue.get_all_queue_stats().await {
         Ok(all_stats) => {
-            let uptime_seconds = system_state.read().await.uptime_seconds() as u64;
+            let uptime_seconds =
+                u64::try_from(system_state.read().await.uptime_seconds()).unwrap_or(0);
             let overview = generate_overview_from_stats(&all_stats, uptime_seconds);
             Ok(json_reply(&ApiResponse::success(overview)))
         }
@@ -367,7 +368,8 @@ where
             );
             let performance_metrics = calculate_performance_metrics(&all_stats, db_ms);
 
-            let uptime_seconds = system_state.read().await.uptime_seconds().max(0) as u64;
+            let uptime_seconds =
+                u64::try_from(system_state.read().await.uptime_seconds()).unwrap_or(0);
             let overview = generate_overview_from_stats(&all_stats, uptime_seconds);
 
             let detailed = DetailedStats {

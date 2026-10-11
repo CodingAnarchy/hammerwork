@@ -1100,6 +1100,8 @@ async fn archive_endpoints<Q: JobHistory + 'static>(app: &App<Q>) {
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["data"]["dry_run"], true);
+    // #94: a dry run reports how many jobs a real run would archive.
+    assert_eq!(body["data"]["stats"]["jobs_archived"], 1, "{body}");
     let (_, job) = app.get(&format!("/api/jobs/{completed}")).await;
     assert_eq!(
         job["data"]["status"], "Completed",
