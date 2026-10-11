@@ -75,6 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   works through the queues one at a time, using the new (defaulted) `DatabaseQueue`
   methods `list_queue_names` and `purge_archived_jobs_in_queue`.
   `WorkerPool::with_archival` (a single policy) is unchanged.
+- **`TestQueue` matches the database backends** in four places (see Fixed), so tests
+  written against it may need their expectations updated: `get_batch_status` reports
+  `Pending` for a batch none of whose jobs has finished (it said `Processing`) and
+  `Failed` when every job failed (it said `PartiallyFailed`), with `error_summary` worded
+  "N of M jobs failed"; `get_ready_jobs` returns jobs by priority, then `scheduled_at`;
+  and a restored job starts over with no attempts. (#112)
 
 ### Database
 
@@ -143,6 +149,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   batch-counter comment in both backends is accurate again, `get_priority_stats` decodes
   priorities with `JobPriority::from_i32`, and a worker no longer reads a batch's status
   twice after a job's final failure. (#111)
+- **`TestQueue` diverged from PostgreSQL and MySQL** (#112):
+  - `restore_archived_job` only set the job back to `Pending`; it now resets attempts,
+    times, error and result like the backends (scheduled at the mock clock's now), so a
+    restored dead job no longer dies after one run.
+  - `get_batch_status` tallies with the backends' rule and counts archived members with
+    the status they were archived with (it ignored them).
+  - `get_ready_jobs` returned jobs still waiting on their dependencies (outside
+    workflows) and in no particular order; it now filters on `dependency_status`
+    (`none` or `satisfied`) and orders by priority, then `scheduled_at`.
+  - `cancel_workflow` skipped `Retrying` jobs, left the dependency status of waiting
+    jobs at `waiting`, kept their leases and overwrote the workflow's `failed_at`; it
+    now fails every unfinished job as the backends do (`waiting` becomes `failed`) and
+    keeps an earlier `failed_at`.
 
 
 ## [2.4.0] - 2026-10-11
