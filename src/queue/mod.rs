@@ -1001,32 +1001,33 @@ pub trait DatabaseQueue: private::Sealed + Send + Sync {
 
     /// Reclaim jobs left in `Running` by workers that crashed or were killed.
     ///
-    /// A `Running` job is stale when:
-    /// - it has a lease from its current run and that lease has expired. Every job
-    ///   claimed by [`dequeue`](Self::dequeue) or [`dequeue_one`](Self::dequeue_one)
-    ///   holds a lease from the moment it is claimed, so it is reclaimed only once its
-    ///   worker stopped renewing it, whatever `older_than` is; or
-    /// - it has no lease from its current run, because it was claimed by an older
-    ///   Hammerwork version that did not write one at claim time, and it started more
-    ///   than `older_than` ago. Choose `older_than` longer than such jobs run.
+    /// A `Running` job is stale when the lease of its current run has expired. Every
+    /// job claimed by [`dequeue`](Self::dequeue) or [`dequeue_one`](Self::dequeue_one)
+    /// holds a lease from the moment it is claimed, renewed by its worker's heartbeats
+    /// ([`heartbeat_job`](Self::heartbeat_job)), so it is reclaimed only once its worker
+    /// stopped renewing it, however long it has been running.
+    ///
+    /// A `Running` job without a lease of its current run is never reclaimed. Only
+    /// Hammerwork 1.x claimed jobs without one; 3.0 requires that no 1.x worker is
+    /// left, and the 3.0 upgrade guide has the one-off fix for rows a 1.x worker left
+    /// behind.
     ///
     /// Stale jobs whose `attempts` have reached `max_attempts` are moved to `Dead`;
     /// the others go back to `Pending` and are scheduled immediately. The interrupted
     /// run already counted as an attempt when the job was dequeued.
     ///
-    /// Safe to call from several pools or processes at once, with different
-    /// `older_than` values: rows are claimed with row locks (`FOR UPDATE SKIP LOCKED`)
-    /// and only updated while still `Running`, so each stale job is reclaimed exactly
-    /// once, and a job whose lease is still valid is never reclaimed.
+    /// Safe to call from several pools or processes at once: rows are claimed with row
+    /// locks (`FOR UPDATE SKIP LOCKED`) and only updated while still `Running`, so each
+    /// stale job is reclaimed exactly once, and a job whose lease is still valid is
+    /// never reclaimed.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// use hammerwork::queue::DatabaseQueue;
-    /// use std::time::Duration;
     ///
     /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
-    /// let recovery = queue.requeue_stale_jobs(Duration::from_secs(300)).await?;
+    /// let recovery = queue.requeue_stale_jobs().await?;
     /// println!(
     ///     "requeued {} jobs, marked {} dead",
     ///     recovery.requeued.len(),
@@ -1035,8 +1036,7 @@ pub trait DatabaseQueue: private::Sealed + Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    async fn requeue_stale_jobs(&self, older_than: std::time::Duration)
-    -> Result<StaleJobRecovery>;
+    async fn requeue_stale_jobs(&self) -> Result<StaleJobRecovery>;
 
     /// Enforces the retention policies of encrypted jobs: deletes finished encrypted jobs
     /// whose retention period has ended.
@@ -1193,19 +1193,6 @@ impl DequeueOptions {
 /// Convert a `std::time::Duration` to a `chrono::Duration`, saturating on overflow.
 pub(crate) fn saturating_chrono_duration(duration: std::time::Duration) -> chrono::Duration {
     chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
-}
-
-/// `now - duration`, saturating at the minimum representable timestamp.
-#[cfg_attr(
-    not(any(feature = "postgres", feature = "mysql", feature = "test-queue")),
-    allow(dead_code)
-)]
-pub(crate) fn saturating_sub_from(
-    now: DateTime<Utc>,
-    duration: std::time::Duration,
-) -> DateTime<Utc> {
-    now.checked_sub_signed(saturating_chrono_duration(duration))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 /// `now + duration`, saturating at the maximum representable timestamp.
@@ -1503,6 +1490,7 @@ impl<DB: Database> JobQueue<DB> {
     /// # }
     /// ```
     pub async fn set_throttle(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
+        config.validate()?;
         let mut configs = self.throttle_configs.write().await;
         configs.insert(queue_name.to_string(), config);
         Ok(())
@@ -1962,28 +1950,6 @@ mod tests {
             // Uncommenting the next line should cause a compilation error
             // let _configs = &queue.throttle_configs;  // Should be private
         }
-    }
-
-    /// Test documentation examples compile correctly
-    #[test]
-    fn test_pool_documentation_examples() {
-        // This test ensures that the documentation examples in the pool-related methods compile
-
-        // Example: Creating a JobArchiver with the pool (from archive module docs)
-        #[cfg(feature = "postgres")]
-        #[allow(dead_code)]
-        async fn _example_archive_integration()
-        -> std::result::Result<(), Box<dyn std::error::Error>> {
-            let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
-            let queue = std::sync::Arc::new(JobQueue::new(pool.clone()));
-
-            // This pattern should work with the public pool field
-            let _archiver = crate::archive::JobArchiver::new(queue.pool.clone());
-
-            Ok(())
-        }
-
-        // Test that the example compiles (even though it won't run without a database)
     }
 
     #[test]

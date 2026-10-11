@@ -1,29 +1,30 @@
+//! `JobArchiver` tests. The archiver holds no database connection; every operation
+//! takes the queue it works on.
+
 mod test_utils;
 
 #[cfg(feature = "postgres")]
 use chrono::{Duration, Utc};
 #[cfg(feature = "postgres")]
 use hammerwork::{
-    Job, JobQueue,
+    Job,
     archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason, JobArchiver},
     queue::DatabaseQueue,
 };
 #[cfg(feature = "postgres")]
 use serde_json::json;
-#[cfg(feature = "postgres")]
-use std::sync::Arc;
 
-/// Test JobArchiver creation with public pool field from JobQueue
+/// An archiver created with `JobArchiver::new()` works alongside the queue it is given.
 #[cfg(feature = "postgres")]
 #[tokio::test]
 #[ignore] // Requires database connection
-async fn test_jobarchiver_with_public_pool_field() {
+async fn test_jobarchiver_new_with_queue() {
     let queue = test_utils::setup_postgres_queue().await;
     let _serial = test_utils::serial().await;
     let queue_name = test_utils::unique_queue("pool_test");
 
-    // Test that we can create a JobArchiver using the public pool field
-    let archiver = JobArchiver::new(queue.pool.clone());
+    // The archiver needs no pool: it works on the queue passed to each operation.
+    let archiver = JobArchiver::new();
 
     // Verify the archiver was created successfully
     assert!(archiver.get_config().compression_level > 0);
@@ -39,7 +40,7 @@ async fn test_jobarchiver_with_public_pool_field() {
         .enabled(true);
     let config = ArchivalConfig::new();
 
-    // Test archiving with the archiver created from the public pool
+    // Archive through the queue the archiver would work on
     let stats = queue
         .archive_jobs(
             Some(queue_name.as_str()),
@@ -58,19 +59,19 @@ async fn test_jobarchiver_with_public_pool_field() {
     queue.purge_archived_jobs(cutoff).await.unwrap();
 }
 
-/// Test multiple JobArchivers sharing the same pool
+/// Several archivers, each with its own policies, working on the same queue
 #[cfg(feature = "postgres")]
 #[tokio::test]
 #[ignore] // Requires database connection
-async fn test_multiple_archivers_shared_pool() {
+async fn test_multiple_archivers_same_queue() {
     let queue = test_utils::setup_postgres_queue().await;
     let _serial = test_utils::serial().await;
     let queue1_name = test_utils::unique_queue("queue1");
     let queue2_name = test_utils::unique_queue("queue2");
 
-    // Create multiple archivers from the same pool
-    let mut archiver1 = JobArchiver::new(queue.pool.clone());
-    let mut archiver2 = JobArchiver::new(queue.pool.clone());
+    // Create multiple independent archivers
+    let mut archiver1 = JobArchiver::new();
+    let mut archiver2 = JobArchiver::new();
 
     // Configure different policies for each archiver
     archiver1.set_policy(
@@ -96,7 +97,7 @@ async fn test_multiple_archivers_shared_pool() {
     queue.complete_job(job1.id).await.unwrap();
     queue.complete_job(job2.id).await.unwrap();
 
-    // Test that each archiver can work independently with the shared pool
+    // Each archiver works independently on the same queue
     let (op_id1, stats1) = archiver1
         .archive_jobs_with_progress(
             queue.as_ref(),
@@ -130,17 +131,17 @@ async fn test_multiple_archivers_shared_pool() {
     queue.purge_archived_jobs(cutoff).await.unwrap();
 }
 
-/// Test JobArchiver policy management with public pool
+/// JobArchiver policy management
 #[cfg(feature = "postgres")]
 #[tokio::test]
 #[ignore] // Requires database connection
-async fn test_jobarchiver_policy_management_with_public_pool() {
+async fn test_jobarchiver_policy_management() {
     let queue = test_utils::setup_postgres_queue().await;
     let _serial = test_utils::serial().await;
     let queue_name = test_utils::unique_queue("policy_test");
 
-    // Create archiver with public pool
-    let mut archiver = JobArchiver::new(queue.pool.clone());
+    // Create the archiver
+    let mut archiver = JobArchiver::new();
 
     // Test policy management
     let policy1 = ArchivalPolicy::new()
@@ -199,16 +200,12 @@ async fn test_jobarchiver_policy_management_with_public_pool() {
     queue.purge_archived_jobs(cutoff).await.unwrap();
 }
 
-/// Test JobArchiver configuration management with public pool
-///
-/// Uses a lazily-connected pool, so no database is required.
+/// JobArchiver configuration management (no database required)
 #[cfg(feature = "postgres")]
-#[tokio::test]
-async fn test_jobarchiver_config_management_with_public_pool() {
-    let queue = Arc::new(JobQueue::new(test_utils::lazy_postgres_pool()));
-
-    // Create archiver with public pool
-    let mut archiver = JobArchiver::new(queue.pool.clone());
+#[test]
+fn test_jobarchiver_config_management() {
+    // Create the archiver
+    let mut archiver = JobArchiver::new();
 
     // Test default configuration
     let default_config = archiver.get_config();
@@ -227,33 +224,11 @@ async fn test_jobarchiver_config_management_with_public_pool() {
     assert!(!updated_config.verify_compression);
 }
 
-/// Test pool sharing between JobQueue and JobArchiver
-///
-/// Uses a lazily-connected pool, so no database is required.
-#[cfg(feature = "postgres")]
-#[tokio::test]
-async fn test_pool_sharing_pattern() {
-    // Create pool
-    let pool = test_utils::lazy_postgres_pool();
-
-    // Create queue
-    let queue = Arc::new(JobQueue::new(pool.clone()));
-
-    // Create archiver using the public pool field
-    let _archiver = JobArchiver::new(queue.pool.clone());
-
-    // The queue's pool is a handle to the same underlying pool: closing it
-    // through the queue closes it for every other holder.
-    assert!(!pool.is_closed());
-    queue.pool.close().await;
-    assert!(pool.is_closed());
-}
-
-/// Benchmark test for JobArchiver with public pool
+/// Benchmark test for JobArchiver
 #[cfg(feature = "postgres")]
 #[tokio::test]
 #[ignore] // Requires database connection
-async fn test_jobarchiver_performance_with_public_pool() {
+async fn test_jobarchiver_performance() {
     let queue = test_utils::setup_postgres_queue().await;
     let _serial = test_utils::serial().await;
     let queue_name = test_utils::unique_queue("perf_test");
@@ -270,8 +245,8 @@ async fn test_jobarchiver_performance_with_public_pool() {
         queue.complete_job(job.id).await.unwrap();
     }
 
-    // Create archiver with public pool
-    let mut archiver = JobArchiver::new(queue.pool.clone());
+    // Create the archiver
+    let mut archiver = JobArchiver::new();
     archiver.set_policy(
         queue_name.as_str(),
         ArchivalPolicy::new()
@@ -324,4 +299,33 @@ async fn test_jobarchiver_performance_with_public_pool() {
     // Clean up
     let cutoff = Utc::now() + Duration::seconds(1);
     queue.purge_archived_jobs(cutoff).await.unwrap();
+}
+
+/// `JobArchiver::new()` takes no arguments and starts with no per-queue policies, the
+/// default policy and the default configuration, like `JobArchiver::default()`.
+#[test]
+fn test_jobarchiver_new_has_defaults() {
+    use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, JobArchiver};
+
+    let archiver = JobArchiver::new();
+    assert!(archiver.get_policy("any_queue").is_none());
+    let default_policy = ArchivalPolicy::default();
+    assert_eq!(
+        archiver.default_policy().archive_completed_after,
+        default_policy.archive_completed_after
+    );
+    assert_eq!(archiver.default_policy().enabled, default_policy.enabled);
+    let config = ArchivalConfig::default();
+    assert_eq!(
+        archiver.get_config().compression_level,
+        config.compression_level
+    );
+    assert_eq!(
+        archiver.get_config().verify_compression,
+        config.verify_compression
+    );
+    assert_eq!(
+        format!("{archiver:?}"),
+        format!("{:?}", JobArchiver::default())
+    );
 }

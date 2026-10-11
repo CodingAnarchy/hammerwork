@@ -357,8 +357,9 @@ pub(crate) mod test_support {
         Arc::new(JobQueue::new(pool))
     }
 
-    /// The mock queue as a `JobHistory`, for handler tests that need no database: only
-    /// `jobs_with_status` does anything.
+    /// The mock queue as a `JobHistory`, for handler tests that need no database. The
+    /// aggregate queries (activity, error groups, finished-job counts, archive listing,
+    /// table maintenance) report nothing; the per-job queries read the mock's jobs.
     impl super::history::JobHistory for hammerwork::queue::test::TestQueue {
         async fn hourly_activity(
             &self,
@@ -425,6 +426,99 @@ pub(crate) mod test_support {
             Ok(Vec::new())
         }
 
+        async fn count_archivable(
+            &self,
+            queue: Option<&str>,
+            policy: &hammerwork::archive::ArchivalPolicy,
+        ) -> hammerwork::Result<u64> {
+            if !policy.enabled {
+                return Ok(0);
+            }
+            let now = self.clock().now();
+            let archivable = self
+                .get_all_jobs()
+                .await
+                .into_iter()
+                .filter(|job| queue.is_none_or(|name| job.queue_name == name))
+                .filter(|job| {
+                    super::history::archivable_statuses(policy).into_iter().any(
+                        |(after, status, column)| {
+                            let finished_at = match column {
+                                "completed_at" => job.completed_at,
+                                "timed_out_at" => job.timed_out_at,
+                                _ => job.failed_at,
+                            };
+                            match (after, finished_at) {
+                                (Some(after), Some(at)) => {
+                                    job.status.as_str() == status && at <= now - after
+                                }
+                                _ => false,
+                            }
+                        },
+                    )
+                })
+                .count();
+            Ok((archivable as u64).min(policy.batch_size as u64))
+        }
+
+        async fn running_jobs(
+            &self,
+            limit: u32,
+        ) -> hammerwork::Result<Vec<crate::websocket::JobUpdate>> {
+            let mut running: Vec<_> = self
+                .get_all_jobs()
+                .await
+                .into_iter()
+                .filter(|job| job.status == hammerwork::JobStatus::Running)
+                .filter_map(|job| job.started_at.map(|started_at| (started_at, job)))
+                .collect();
+            running.sort_by_key(|(started_at, _)| std::cmp::Reverse(*started_at));
+            running.truncate(limit as usize);
+            Ok(running
+                .into_iter()
+                .map(|(started_at, job)| {
+                    super::history::job_change(
+                        job.id.to_string(),
+                        job.queue_name,
+                        job.status.as_str(),
+                        job.priority.as_i32(),
+                        job.attempts,
+                        started_at,
+                    )
+                })
+                .collect())
+        }
+
+        async fn job_states(
+            &self,
+            ids: &[String],
+        ) -> hammerwork::Result<Vec<crate::websocket::JobUpdate>> {
+            use hammerwork::queue::DatabaseQueue;
+            let mut states = Vec::with_capacity(ids.len());
+            for id in ids.iter().filter_map(|id| id.parse::<uuid::Uuid>().ok()) {
+                if let Some(job) = self.get_job(id).await? {
+                    let changed_at = [
+                        job.started_at,
+                        job.completed_at,
+                        job.failed_at,
+                        job.timed_out_at,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .fold(job.created_at, chrono::DateTime::max);
+                    states.push(super::history::job_change(
+                        id.to_string(),
+                        job.queue_name,
+                        job.status.as_str(),
+                        job.priority.as_i32(),
+                        job.attempts,
+                        changed_at,
+                    ));
+                }
+            }
+            Ok(states)
+        }
+
         async fn jobs_with_status(
             &self,
             queue: Option<&str>,
@@ -462,6 +556,59 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::body_json;
     use super::*;
+
+    /// The mock queue implements every `JobHistory` method itself (there are no
+    /// default bodies any more): running jobs, job states and archivable counts come
+    /// from its jobs.
+    #[tokio::test]
+    async fn test_queue_job_history_reads_its_jobs() {
+        use super::history::JobHistory;
+        use hammerwork::queue::{DatabaseQueue, test::TestQueue};
+
+        let queue = TestQueue::new();
+        let running = queue
+            .enqueue(hammerwork::Job::new("h".into(), serde_json::json!({})))
+            .await
+            .unwrap();
+        let done = queue
+            .enqueue(hammerwork::Job::new("h".into(), serde_json::json!({})))
+            .await
+            .unwrap();
+        queue.dequeue_one("h").await.unwrap().unwrap();
+        queue.dequeue_one("h").await.unwrap().unwrap();
+        queue.complete_job(done).await.unwrap();
+
+        let jobs = queue.running_jobs(10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, running.to_string());
+        assert_eq!(jobs[0].status, "Running");
+
+        let states = queue
+            .job_states(&[running.to_string(), done.to_string(), "not-a-uuid".into()])
+            .await
+            .unwrap();
+        let statuses: Vec<_> = states.iter().map(|s| s.status.as_str()).collect();
+        assert_eq!(statuses, ["Running", "Completed"]);
+
+        let policy = hammerwork::archive::ArchivalPolicy::new()
+            .archive_completed_after(chrono::Duration::zero())
+            .enabled(true);
+        assert_eq!(queue.count_archivable(Some("h"), &policy).await.unwrap(), 1);
+        assert_eq!(
+            queue
+                .count_archivable(Some("other"), &policy)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            queue
+                .count_archivable(None, &policy.clone().enabled(false))
+                .await
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn test_api_response_success() {

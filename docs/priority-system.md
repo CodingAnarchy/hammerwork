@@ -401,7 +401,7 @@ let worker = Worker::new(queue, "priority_limited".to_string(), handler)
             .with_weight(JobPriority::Low, 5)
             .with_weight(JobPriority::Background, 1)
     )
-    .with_rate_limit(RateLimit::per_second(10)); // Overall rate limit
+    .with_rate_limit(RateLimit::per_second(10)?); // Overall rate limit
 
 // Consider different rate limits for different priority levels in your handler
 let priority_aware_handler: JobHandler = Arc::new(|job: Job| {

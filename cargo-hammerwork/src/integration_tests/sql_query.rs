@@ -342,7 +342,7 @@ mod builder_tests {
                 failed_after: Some(now),
                 created_before: Some(now),
                 started_before: Some(now),
-                stale_running: Some(StaleRunning::new(now, chrono::Duration::hours(24))),
+                stale_running: Some(StaleRunning::new(now)),
                 never_started: true,
                 attempts_exhausted: true,
             }
@@ -496,7 +496,7 @@ mod builder_tests {
     #[test]
     fn test_stale_running_selector_follows_the_lease_rule() {
         let now = chrono::Utc::now();
-        let stale = StaleRunning::new(now, chrono::Duration::hours(24));
+        let stale = StaleRunning::new(now);
         let selector = JobSelector {
             statuses: vec![JobStatus::Running],
             stale_running: Some(stale),
@@ -504,25 +504,18 @@ mod builder_tests {
         };
         let (sql, binds) = selector.sql(Backend::Postgres);
         assert!(
-            sql.contains(
-                "(last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= started_at \
-                 AND lease_expires_at < $2)"
-            ),
+            sql.contains("(last_heartbeat_at >= started_at AND lease_expires_at < $2)"),
             "{sql}"
         );
-        assert!(sql.contains("AND started_at < $3))"), "{sql}");
+        // Lease only: no age fallback for runs without a lease.
+        assert!(!sql.contains("IS NULL"), "{sql}");
         assert_eq!(
             binds,
-            vec![
-                Bind::Text("Running".into()),
-                Bind::Time(stale.now),
-                Bind::Time(stale.cutoff)
-            ]
+            vec![Bind::Text("Running".into()), Bind::Time(stale.now)]
         );
-        assert_eq!(stale.now - stale.cutoff, chrono::Duration::hours(24));
         let (sql, binds) = selector.sql(Backend::MySql);
-        assert_eq!(sql.matches('?').count(), 3);
-        assert_eq!(binds.len(), 3);
+        assert_eq!(sql.matches('?').count(), 2);
+        assert_eq!(binds.len(), 2);
     }
 
     #[tokio::test]

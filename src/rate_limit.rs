@@ -23,49 +23,86 @@ where
     Ok(secs.map(Duration::from_secs))
 }
 
-/// Rate limiting configuration for job processing
-#[derive(Debug, Clone)]
+/// Rate limiting configuration for job processing: at most `rate` operations per `per`,
+/// with bursts of up to `burst_limit`.
+///
+/// Built with [`per_second`](Self::per_second), [`per_minute`](Self::per_minute) or
+/// [`per_hour`](Self::per_hour), which reject a rate of zero: a limiter that never
+/// refills would block every operation forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateLimit {
-    /// Maximum number of operations per time window
-    pub rate: u64,
+    /// Maximum number of operations per time window (never zero)
+    rate: u64,
     /// Time window for the rate limit
-    pub per: Duration,
+    per: Duration,
     /// Maximum burst capacity (tokens that can be consumed at once)
-    pub burst_limit: u64,
+    burst_limit: u64,
 }
 
 impl RateLimit {
-    /// Create a rate limit of X operations per second
-    pub fn per_second(rate: u64) -> Self {
-        Self {
-            rate,
-            per: Duration::from_secs(1),
-            burst_limit: rate,
+    fn try_new(rate: u64, per: Duration, unit: &str) -> crate::Result<Self> {
+        if rate == 0 {
+            return Err(HammerworkError::Config(format!(
+                "rate limit must allow at least one operation per {unit} (got 0)"
+            )));
         }
+        Ok(Self {
+            rate,
+            per,
+            burst_limit: rate,
+        })
     }
 
-    /// Create a rate limit of X operations per minute
-    pub fn per_minute(rate: u64) -> Self {
-        Self {
-            rate,
-            per: Duration::from_secs(60),
-            burst_limit: rate,
-        }
+    /// A rate limit of `rate` operations per second, with bursts of up to `rate`.
+    ///
+    /// Fails with [`HammerworkError::Config`] when `rate` is zero.
+    ///
+    /// ```
+    /// use hammerwork::RateLimit;
+    ///
+    /// let limit = RateLimit::per_second(10)?.with_burst_limit(20);
+    /// assert_eq!(limit.rate(), 10);
+    /// assert!(RateLimit::per_second(0).is_err());
+    /// # Ok::<(), hammerwork::HammerworkError>(())
+    /// ```
+    pub fn per_second(rate: u64) -> crate::Result<Self> {
+        Self::try_new(rate, Duration::from_secs(1), "second")
     }
 
-    /// Create a rate limit of X operations per hour
-    pub fn per_hour(rate: u64) -> Self {
-        Self {
-            rate,
-            per: Duration::from_secs(3600),
-            burst_limit: rate,
-        }
+    /// A rate limit of `rate` operations per minute, with bursts of up to `rate`.
+    ///
+    /// Fails with [`HammerworkError::Config`] when `rate` is zero.
+    pub fn per_minute(rate: u64) -> crate::Result<Self> {
+        Self::try_new(rate, Duration::from_secs(60), "minute")
     }
 
-    /// Set the burst limit (maximum tokens that can be consumed at once)
+    /// A rate limit of `rate` operations per hour, with bursts of up to `rate`.
+    ///
+    /// Fails with [`HammerworkError::Config`] when `rate` is zero.
+    pub fn per_hour(rate: u64) -> crate::Result<Self> {
+        Self::try_new(rate, Duration::from_secs(3600), "hour")
+    }
+
+    /// Set the burst limit (maximum tokens that can be consumed at once). A limiter
+    /// always holds at least one token, so a burst limit of 0 acts as 1.
     pub fn with_burst_limit(mut self, burst_limit: u64) -> Self {
         self.burst_limit = burst_limit;
         self
+    }
+
+    /// Maximum number of operations per time window; never zero.
+    pub fn rate(&self) -> u64 {
+        self.rate
+    }
+
+    /// The time window of the rate.
+    pub fn per(&self) -> Duration {
+        self.per
+    }
+
+    /// Maximum burst capacity.
+    pub fn burst_limit(&self) -> u64 {
+        self.burst_limit
     }
 
     /// Calculate the refill rate in tokens per millisecond
@@ -80,7 +117,8 @@ impl RateLimit {
 pub struct ThrottleConfig {
     /// Maximum number of concurrent jobs for this queue
     pub max_concurrent: Option<u64>,
-    /// Rate limit for this queue
+    /// Rate limit for this queue, in jobs per minute. Zero is invalid (see
+    /// [`validate`](Self::validate)).
     pub rate_per_minute: Option<u64>,
     /// Backoff duration when errors occur (in seconds)
     #[serde(
@@ -111,7 +149,13 @@ impl ThrottleConfig {
         self
     }
 
-    /// Set rate per minute
+    /// Set rate per minute.
+    ///
+    /// A rate of zero would never let a job through; [`validate`](Self::validate),
+    /// [`to_rate_limit`](Self::to_rate_limit) and everything that applies a throttle
+    /// ([`Worker::with_throttle_config`](crate::Worker::with_throttle_config),
+    /// [`JobQueue::set_throttle`](crate::JobQueue::set_throttle), loading a
+    /// configuration file) reject it.
     pub fn rate_per_minute(mut self, rate: u64) -> Self {
         self.rate_per_minute = Some(rate);
         self
@@ -129,9 +173,21 @@ impl ThrottleConfig {
         self
     }
 
-    /// Convert to RateLimit if rate_per_minute is set
-    pub fn to_rate_limit(&self) -> Option<RateLimit> {
-        self.rate_per_minute.map(RateLimit::per_minute)
+    /// Reject a throttle that could never let a job through: an enabled throttle with
+    /// `rate_per_minute` set to zero. A disabled throttle is ignored, so it is not
+    /// checked. Fails with [`HammerworkError::Config`].
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.enabled {
+            self.to_rate_limit()?;
+        }
+        Ok(())
+    }
+
+    /// The [`RateLimit`] for `rate_per_minute`, or `None` when it is not set.
+    ///
+    /// Fails with [`HammerworkError::Config`] when `rate_per_minute` is zero.
+    pub fn to_rate_limit(&self) -> crate::Result<Option<RateLimit>> {
+        self.rate_per_minute.map(RateLimit::per_minute).transpose()
     }
 }
 
@@ -232,6 +288,7 @@ impl RateLimiter {
         // A bucket must hold at least one token, or no operation could ever proceed
         // (a burst limit of 0 made `acquire` wait forever).
         let capacity = rate_limit.burst_limit.max(1) as f64;
+        // Never zero: the constructors of `RateLimit` reject a zero rate.
         let refill_rate = rate_limit.refill_rate_per_ms();
 
         Self {
@@ -311,15 +368,15 @@ mod tests {
 
     #[test]
     fn test_rate_limit_creation() {
-        let rate_limit = RateLimit::per_second(10);
-        assert_eq!(rate_limit.rate, 10);
-        assert_eq!(rate_limit.per, Duration::from_secs(1));
-        assert_eq!(rate_limit.burst_limit, 10);
+        let rate_limit = RateLimit::per_second(10).unwrap();
+        assert_eq!(rate_limit.rate(), 10);
+        assert_eq!(rate_limit.per(), Duration::from_secs(1));
+        assert_eq!(rate_limit.burst_limit(), 10);
 
-        let rate_limit = RateLimit::per_minute(60).with_burst_limit(100);
-        assert_eq!(rate_limit.rate, 60);
-        assert_eq!(rate_limit.per, Duration::from_secs(60));
-        assert_eq!(rate_limit.burst_limit, 100);
+        let rate_limit = RateLimit::per_minute(60).unwrap().with_burst_limit(100);
+        assert_eq!(rate_limit.rate(), 60);
+        assert_eq!(rate_limit.per(), Duration::from_secs(60));
+        assert_eq!(rate_limit.burst_limit(), 100);
     }
 
     #[test]
@@ -334,9 +391,9 @@ mod tests {
         assert_eq!(config.backoff_on_error, Some(Duration::from_secs(30)));
         assert!(config.enabled);
 
-        let rate_limit = config.to_rate_limit().unwrap();
-        assert_eq!(rate_limit.rate, 100);
-        assert_eq!(rate_limit.per, Duration::from_secs(60));
+        let rate_limit = config.to_rate_limit().unwrap().unwrap();
+        assert_eq!(rate_limit.rate(), 100);
+        assert_eq!(rate_limit.per(), Duration::from_secs(60));
     }
 
     #[test]
@@ -380,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_refund_returns_an_unused_permit() {
-        let limiter = RateLimiter::new(RateLimit::per_hour(1));
+        let limiter = RateLimiter::new(RateLimit::per_hour(1).unwrap());
         assert!(limiter.try_acquire());
         assert!(!limiter.try_acquire());
         // The permit was not used (an empty poll): hand it back.
@@ -410,16 +467,16 @@ mod tests {
 
     #[test]
     fn test_rate_limiter_creation() {
-        let rate_limit = RateLimit::per_second(10);
+        let rate_limit = RateLimit::per_second(10).unwrap();
         let limiter = RateLimiter::new(rate_limit);
 
-        assert_eq!(limiter.rate_limit().rate, 10);
+        assert_eq!(limiter.rate_limit().rate(), 10);
         assert!(limiter.available_tokens() > 0.0);
     }
 
     #[tokio::test]
     async fn test_rate_limiter_check() {
-        let rate_limit = RateLimit::per_second(2); // 2 operations per second
+        let rate_limit = RateLimit::per_second(2).unwrap(); // 2 operations per second
         let limiter = RateLimiter::new(rate_limit);
 
         // Should initially allow operations
@@ -432,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_acquire() {
-        let rate_limit = RateLimit::per_second(1000); // High rate for fast test
+        let rate_limit = RateLimit::per_second(1000).unwrap(); // High rate for fast test
         let limiter = RateLimiter::new(rate_limit);
 
         // Should acquire immediately
@@ -446,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_try_acquire() {
-        let rate_limit = RateLimit::per_second(1);
+        let rate_limit = RateLimit::per_second(1).unwrap();
         let limiter = RateLimiter::new(rate_limit);
 
         // Should initially succeed
@@ -458,13 +515,13 @@ mod tests {
 
     #[test]
     fn test_rate_limit_refill_calculation() {
-        let rate_limit = RateLimit::per_second(10);
+        let rate_limit = RateLimit::per_second(10).unwrap();
         let refill_rate = rate_limit.refill_rate_per_ms();
 
         // 10 tokens per 1000ms = 0.01 tokens per ms
         assert!((refill_rate - 0.01).abs() < 0.001);
 
-        let rate_limit = RateLimit::per_minute(60);
+        let rate_limit = RateLimit::per_minute(60).unwrap();
         let refill_rate = rate_limit.refill_rate_per_ms();
 
         // 60 tokens per 60000ms = 0.001 tokens per ms
@@ -473,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_clone() {
-        let rate_limit = RateLimit::per_second(2);
+        let rate_limit = RateLimit::per_second(2).unwrap();
         let limiter1 = RateLimiter::new(rate_limit);
         let limiter2 = limiter1.clone();
 
@@ -497,17 +554,13 @@ mod tests {
 
     #[test]
     fn test_rate_limit_edge_cases() {
-        // Zero rate should still work
-        let rate_limit = RateLimit::per_second(0);
-        assert_eq!(rate_limit.rate, 0);
-
         // Very high rate
-        let rate_limit = RateLimit::per_second(1_000_000);
-        assert_eq!(rate_limit.rate, 1_000_000);
+        let rate_limit = RateLimit::per_second(1_000_000).unwrap();
+        assert_eq!(rate_limit.rate(), 1_000_000);
 
         // Very long duration
-        let rate_limit = RateLimit::per_hour(1);
-        assert_eq!(rate_limit.per, Duration::from_secs(3600));
+        let rate_limit = RateLimit::per_hour(1).unwrap();
+        assert_eq!(rate_limit.per(), Duration::from_secs(3600));
     }
 
     #[tokio::test]
@@ -530,10 +583,44 @@ mod tests {
     /// `acquire` waited forever; the bucket always holds at least one token.
     #[tokio::test]
     async fn test_zero_burst_limit_does_not_stall() {
-        let limiter = RateLimiter::new(RateLimit::per_second(100).with_burst_limit(0));
+        let limiter = RateLimiter::new(RateLimit::per_second(100).unwrap().with_burst_limit(0));
         tokio::time::timeout(Duration::from_secs(2), limiter.acquire())
             .await
             .expect("acquire must not wait forever")
             .unwrap();
+    }
+
+    /// A zero rate would never refill, so `acquire` would wait forever: every
+    /// constructor rejects it, and so does a throttle with `rate_per_minute(0)`.
+    #[test]
+    fn test_zero_rate_is_rejected() {
+        for result in [
+            RateLimit::per_second(0),
+            RateLimit::per_minute(0),
+            RateLimit::per_hour(0),
+        ] {
+            match result {
+                Err(HammerworkError::Config(message)) => {
+                    assert!(message.contains("at least one operation"), "{message}")
+                }
+                other => panic!("expected a configuration error, got {other:?}"),
+            }
+        }
+
+        let throttle = ThrottleConfig::new().rate_per_minute(0);
+        assert!(matches!(
+            throttle.to_rate_limit(),
+            Err(HammerworkError::Config(_))
+        ));
+        assert!(matches!(
+            throttle.validate(),
+            Err(HammerworkError::Config(_))
+        ));
+        // A disabled throttle is ignored, so it is not rejected.
+        assert!(throttle.clone().enabled(false).validate().is_ok());
+        // Without a rate there is nothing to reject.
+        assert!(ThrottleConfig::new().validate().is_ok());
+        assert_eq!(ThrottleConfig::new().to_rate_limit().unwrap(), None);
+        assert!(ThrottleConfig::new().rate_per_minute(1).validate().is_ok());
     }
 }

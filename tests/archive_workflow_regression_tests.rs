@@ -514,15 +514,8 @@ where
 }
 
 /// An archiver for `run_scheduled_pass`, which only uses the queue it is given.
-#[cfg(feature = "postgres")]
-fn archiver() -> JobArchiver<sqlx::Postgres> {
-    JobArchiver::new(test_utils::lazy_postgres_pool())
-}
-
-/// An archiver for `run_scheduled_pass`, which only uses the queue it is given.
-#[cfg(not(feature = "postgres"))]
-fn archiver() -> JobArchiver<sqlx::MySql> {
-    JobArchiver::new(sqlx::MySqlPool::connect_lazy(&test_utils::mysql_url()).unwrap())
+fn archiver() -> JobArchiver {
+    JobArchiver::new()
 }
 
 /// #111 (5): `run_scheduled_pass` archives (and purges) each queue with its own

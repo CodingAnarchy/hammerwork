@@ -182,7 +182,7 @@ cargo hammerwork job cancel --all-pending
 cargo hammerwork job purge --completed --older-than-days 30 --confirm
 cargo hammerwork job purge --queue emails --dead --failed --confirm
 
-cargo hammerwork job requeue-stale --older-than-secs 3600
+cargo hammerwork job requeue-stale
 ```
 
 - `job enqueue` requires `--queue` and `--payload`; `--payload` must be valid JSON,
@@ -195,10 +195,10 @@ cargo hammerwork job requeue-stale --older-than-secs 3600
 - `job requeue-stale` moves `Running` jobs whose lease has expired (their worker crashed
   or was killed) back to `Pending`, or to `Dead` when they have no attempts left. Workers
   take the lease when they claim a job, so a job whose worker is alive is never
-  reclaimed, whatever `--older-than-secs` is. Only jobs without a lease (claimed by an
-  older Hammerwork version) are reclaimed by age, once they started more than
-  `--older-than-secs` ago (default 3600). It is safe to run alongside workers, and needs
-  migration `015_add_job_leases`.
+  reclaimed, however long it runs. A `Running` job without a lease (left by a
+  Hammerwork 1.x worker) is never reclaimed; `maintenance check --fix` gives such jobs an
+  expired lease once every 1.x worker has stopped (see the 3.0 upgrade guide). It is
+  safe to run alongside workers. (3.0 removed `--older-than-secs`.)
 - `job show` prints the redacted payload of an encrypted job (the CLI never decrypts)
   together with its key id, algorithm and retention.
 
@@ -319,8 +319,8 @@ Cleanup and database upkeep.
 cargo hammerwork maintenance vacuum --dry-run
 cargo hammerwork maintenance vacuum --keep-completed-days 30 --keep-failed-days 7 --confirm
 
-cargo hammerwork maintenance dead-jobs --stale-hours 24 --dry-run
-cargo hammerwork maintenance dead-jobs --stale-hours 24 --confirm
+cargo hammerwork maintenance dead-jobs --dry-run
+cargo hammerwork maintenance dead-jobs --confirm
 
 cargo hammerwork maintenance reindex --confirm
 cargo hammerwork maintenance analyze
@@ -336,8 +336,14 @@ cargo hammerwork maintenance purge-encrypted --confirm
 - `vacuum` deletes old completed and failed jobs (defaults: 30 and 7 days). "Failed" means
   `Failed`, `Dead` or `TimedOut`, as in `job list --failed` and `monitor`; their age is
   measured from `failed_at` (or `timed_out_at` when that is unset).
-- `dead-jobs` marks stale jobs (`Running` jobs that started more than `--stale-hours` ago, default 24) as dead. Compare `job requeue-stale`, which gives them another attempt.
-- `check` inspects integrity and job consistency; `--fix` repairs minor issues.
+- `dead-jobs` marks stale jobs (`Running` jobs whose lease expired) as dead, by the same
+  rule as `job requeue-stale`, which gives them another attempt instead. `Running` jobs
+  without a lease (left by Hammerwork 1.x) are not touched. (3.0 removed `--stale-hours`,
+  which applied only to such jobs.)
+- `check` inspects integrity and job consistency; `--fix` repairs minor issues. It also
+  reports `Running` jobs without a lease (left by Hammerwork 1.x workers); `--fix` gives
+  them a lease that has already expired, so the stale job reaper reclaims them. Run it
+  only once every 1.x worker has stopped.
 - There is no `maintenance cleanup` or `maintenance health`; use `vacuum` and `check`
   (or `monitor health`).
 

@@ -401,12 +401,28 @@ where
     claimed
 }
 
-/// Raw access the generic scenarios need to simulate rows written by older versions.
+/// The one-off fix of `docs/upgrading-to-3.0.md` ("Removed legacy compatibility") for
+/// `Running` rows a 1.x worker left without a lease: give them a lease that has already
+/// expired, so the next reaper pass reclaims them. Portable between PostgreSQL and MySQL;
+/// keep it identical to the guide.
+const UPGRADE_EXPIRE_LEASELESS_RUNS_SQL: &str = "\
+UPDATE hammerwork_jobs
+SET started_at = COALESCE(started_at, created_at),
+    last_heartbeat_at = COALESCE(started_at, created_at),
+    lease_expires_at = COALESCE(started_at, created_at)
+WHERE status = 'Running'
+  AND (started_at IS NULL OR last_heartbeat_at IS NULL OR lease_expires_at IS NULL
+       OR last_heartbeat_at < started_at)";
+
+/// Raw access the generic scenarios need to simulate rows written by 1.x.
 #[async_trait::async_trait]
 trait LegacyRows {
-    /// Remove the lease of a `Running` job, as left by a version that claimed jobs
+    /// Remove the lease of a `Running` job, as left by a 1.x worker, which claimed jobs
     /// without writing one.
     async fn forget_lease(&self, id: JobId);
+
+    /// Run [`UPGRADE_EXPIRE_LEASELESS_RUNS_SQL`]; returns the number of rows it changed.
+    async fn expire_leaseless_runs(&self) -> u64;
 }
 
 #[cfg(feature = "postgres")]
@@ -421,6 +437,14 @@ impl LegacyRows for JobQueue<sqlx::Postgres> {
         .execute(self.get_pool())
         .await
         .unwrap();
+    }
+
+    async fn expire_leaseless_runs(&self) -> u64 {
+        sqlx::query(UPGRADE_EXPIRE_LEASELESS_RUNS_SQL)
+            .execute(self.get_pool())
+            .await
+            .unwrap()
+            .rows_affected()
     }
 }
 
@@ -437,10 +461,19 @@ impl LegacyRows for JobQueue<sqlx::MySql> {
         .await
         .unwrap();
     }
+
+    async fn expire_leaseless_runs(&self) -> u64 {
+        sqlx::query(UPGRADE_EXPIRE_LEASELESS_RUNS_SQL)
+            .execute(self.get_pool())
+            .await
+            .unwrap()
+            .rows_affected()
+    }
 }
 
 /// Jobs whose lease expired go back to `Pending` (or `Dead` when out of attempts);
-/// jobs with a live lease, or without a lease but younger than `older_than`, stay.
+/// jobs with a live lease stay, and so do `Running` jobs without a lease (left by a 1.x
+/// worker) until the upgrade guide's one-off fix gives them an expired one.
 async fn reaper_requeues_expired_leases<DB>(queue: Arc<JobQueue<DB>>)
 where
     DB: sqlx::Database,
@@ -449,6 +482,10 @@ where
     let _serial = test_utils::serial().await;
     let hour = Duration::from_secs(3600);
     let short = Duration::from_millis(500);
+
+    // Reclaim anything earlier tests left behind, so the fix below changes only our row.
+    queue.expire_leaseless_runs().await;
+    queue.requeue_stale_jobs().await.unwrap();
 
     let expiring = start_job(
         &queue,
@@ -480,7 +517,7 @@ where
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let recovery = queue.requeue_stale_jobs(hour).await.unwrap();
+    let recovery = queue.requeue_stale_jobs().await.unwrap();
     assert!(recovery.requeued.contains(&expiring.id), "{recovery:?}");
     assert!(recovery.dead.contains(&exhausted.id), "{recovery:?}");
     for id in [live.id, unleased.id] {
@@ -511,24 +548,35 @@ where
             .unwrap()
     );
 
-    // Without a lease (claimed by an older version), `older_than` (measured from
-    // `started_at`) decides.
-    let recovery = queue
-        .requeue_stale_jobs(Duration::from_millis(500))
-        .await
-        .unwrap();
+    // A row without a lease is never reclaimed, however long ago it started.
+    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    assert!(
+        !recovery.requeued.contains(&unleased.id) && !recovery.dead.contains(&unleased.id),
+        "{recovery:?}"
+    );
+    assert_eq!(
+        queue.get_job(unleased.id).await.unwrap().unwrap().status,
+        JobStatus::Running
+    );
+
+    // The upgrade guide's one-off fix gives it an expired lease (and leaves leased
+    // runs alone); the next pass reclaims it.
+    assert!(queue.expire_leaseless_runs().await >= 1);
+    let recovery = queue.requeue_stale_jobs().await.unwrap();
     assert!(recovery.requeued.contains(&unleased.id), "{recovery:?}");
     assert!(!recovery.requeued.contains(&live.id), "{recovery:?}");
+    let job = queue.get_job(unleased.id).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Pending);
+    assert!(job.error_message.unwrap().contains("lease expired"));
 
     for id in [expiring.id, exhausted.id, live.id, unleased.id] {
         queue.delete_job(id).await.unwrap();
     }
 }
 
-/// #64 C1: a job is leased from the moment it is claimed, so a reaper with a short
-/// staleness window (another pool's, or `cargo hammerwork job requeue-stale
-/// --older-than-secs 1`) never reclaims it while its lease is valid, even before the
-/// worker's first heartbeat. Once the lease expires it is reclaimed.
+/// #64 C1: a job is leased from the moment it is claimed, so a reaper (another pool's,
+/// or `cargo hammerwork job requeue-stale`) never reclaims it while its lease is valid,
+/// even before the worker's first heartbeat. Once the lease expires it is reclaimed.
 async fn claim_lease_protects_job_from_short_reaper_window<DB>(queue: Arc<JobQueue<DB>>)
 where
     DB: sqlx::Database,
@@ -560,24 +608,16 @@ where
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
-    // Reapers with any window, down to zero, leave valid leases alone.
-    for older_than in [
-        Duration::ZERO,
-        Duration::from_millis(1),
-        Duration::from_secs(1),
-    ] {
-        let recovery = queue.requeue_stale_jobs(older_than).await.unwrap();
-        for run in [&long, &default] {
-            assert!(
-                !recovery.requeued.contains(&run.id) && !recovery.dead.contains(&run.id),
-                "job {} was reclaimed while its lease is valid: {recovery:?}",
-                run.id
-            );
-        }
-        if older_than.is_zero() {
-            assert!(recovery.requeued.contains(&short.id), "{recovery:?}");
-        }
+    // The reaper leaves valid leases alone and reclaims the expired one.
+    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    for run in [&long, &default] {
+        assert!(
+            !recovery.requeued.contains(&run.id) && !recovery.dead.contains(&run.id),
+            "job {} was reclaimed while its lease is valid: {recovery:?}",
+            run.id
+        );
     }
+    assert!(recovery.requeued.contains(&short.id), "{recovery:?}");
     for run in [&long, &default] {
         let job = queue.get_job(run.id).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Running);
@@ -616,10 +656,7 @@ where
     )
     .await;
     tokio::time::sleep(Duration::from_millis(900)).await;
-    let recovery = queue
-        .requeue_stale_jobs(Duration::from_secs(3600))
-        .await
-        .unwrap();
+    let recovery = queue.requeue_stale_jobs().await.unwrap();
     assert!(recovery.requeued.contains(&first.id), "{recovery:?}");
 
     let second = queue
@@ -645,10 +682,7 @@ where
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     // So the new run's lease expired on schedule.
-    let recovery = queue
-        .requeue_stale_jobs(Duration::from_secs(3600))
-        .await
-        .unwrap();
+    let recovery = queue.requeue_stale_jobs().await.unwrap();
     assert!(
         recovery.requeued.contains(&second.id),
         "the stale heartbeat extended the new run's lease: {recovery:?}"
@@ -676,13 +710,13 @@ where
     )
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let recovery = queue.requeue_stale_jobs(Duration::ZERO).await.unwrap();
+    let recovery = queue.requeue_stale_jobs().await.unwrap();
     assert!(
         !recovery.requeued.contains(&run.id) && !recovery.dead.contains(&run.id),
         "{recovery:?}"
     );
     assert!(queue.heartbeat_job(&run, Duration::ZERO).await.unwrap());
-    let recovery = queue.requeue_stale_jobs(Duration::ZERO).await.unwrap();
+    let recovery = queue.requeue_stale_jobs().await.unwrap();
     assert!(!recovery.requeued.contains(&run.id), "{recovery:?}");
     assert_eq!(
         queue.get_job(run.id).await.unwrap().unwrap().status,
@@ -691,8 +725,8 @@ where
     queue.delete_job(run.id).await.unwrap();
 }
 
-/// #64 C1 scenario A: a worker with a long lease runs a job while another pool's reaper
-/// uses a tiny staleness window. The job runs once.
+/// #64 C1 scenario A: a worker with a long lease runs a job while another pool runs an
+/// aggressive reaper (every 100ms). The job runs once.
 async fn other_pools_reaper_does_not_rerun_live_job<DB>(queue: Arc<JobQueue<DB>>)
 where
     DB: sqlx::Database + Send + Sync + 'static,
@@ -726,8 +760,7 @@ where
     service_a.add_worker(worker);
     // Service B: no workers on this queue, only an aggressive reaper.
     let idle_handler: JobHandler = Arc::new(|_job: Job| Box::pin(async { Ok(()) }));
-    let mut service_b = WorkerPool::new()
-        .with_stale_job_reaper(Duration::from_millis(100), Duration::from_millis(1));
+    let mut service_b = WorkerPool::new().with_stale_job_reaper(Duration::from_millis(100));
     service_b.add_worker(Worker::new(
         Arc::clone(&queue),
         test_utils::unique_queue("lease_other_service"),
@@ -778,10 +811,7 @@ where
     for _ in 0..8 {
         let queue = Arc::clone(&queue);
         reapers.push(tokio::spawn(async move {
-            queue
-                .requeue_stale_jobs(Duration::from_secs(3600))
-                .await
-                .unwrap()
+            queue.requeue_stale_jobs().await.unwrap()
         }));
     }
 
@@ -838,10 +868,7 @@ where
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let recovery = queue
-            .requeue_stale_jobs(Duration::from_secs(3600))
-            .await
-            .unwrap();
+        let recovery = queue.requeue_stale_jobs().await.unwrap();
         assert!(
             !recovery.requeued.contains(&id) && !recovery.dead.contains(&id),
             "a live, heartbeating job was reclaimed"

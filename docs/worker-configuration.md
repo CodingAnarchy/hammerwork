@@ -126,7 +126,7 @@ See the [priority system guide](priority-system.md) for details.
 use hammerwork::{RateLimit, Worker};
 
 // Limit to 10 jobs per second with a burst of 20
-let rate_limit = RateLimit::per_second(10).with_burst_limit(20);
+let rate_limit = RateLimit::per_second(10)?.with_burst_limit(20);
 
 let worker = Worker::new(queue, "api_queue".to_string(), handler)
     .with_rate_limit(rate_limit);
@@ -155,10 +155,16 @@ let throttle_config = ThrottleConfig::new()
     .backoff_on_error(Duration::from_secs(60));
 
 let worker = Worker::new(queue, "throttled_queue".to_string(), handler)
-    .with_throttle_config(throttle_config);
+    .with_throttle_config(throttle_config)?;
 # Ok(())
 # }
 ```
+
+A rate of zero would never let a job through, so it is rejected with
+`HammerworkError::Config`: by `RateLimit::per_second`/`per_minute`/`per_hour(0)`, and,
+for an enabled `ThrottleConfig` with `rate_per_minute(0)`, by `Worker::with_throttle_config`,
+`Worker::with_hammerwork_config`, `JobQueue::set_throttle`, `ThrottleConfig::validate` and
+when a configuration file with `rate_per_minute = 0` is loaded.
 
 ## Statistics Collection
 
@@ -378,16 +384,15 @@ Hammerwork recovers these jobs with leases (requires migration `015_add_job_leas
 - A heartbeat only extends the run it belongs to (same attempt and start time): a
   worker whose job was reclaimed and picked up by another worker cannot keep the new
   run's lease alive.
-- `DatabaseQueue::requeue_stale_jobs(older_than)` reclaims `Running` jobs whose lease
-  has expired. A job whose lease is valid is never reclaimed, whatever `older_than` is,
-  so pools with different lease durations (or `cargo hammerwork job requeue-stale
-  --older-than-secs 1`) can share a database safely. `older_than` only applies to jobs
-  claimed by an older Hammerwork version that did not take a lease at claim time:
-  they count as stale once they started more than `older_than` ago.
+- `DatabaseQueue::requeue_stale_jobs()` reclaims `Running` jobs whose lease has
+  expired. A job whose lease is valid is never reclaimed, so pools with different lease
+  durations (or `cargo hammerwork job requeue-stale`) can share a database safely. A
+  `Running` job without a lease is never reclaimed: only Hammerwork 1.x claimed jobs
+  without one (see [Upgrading to 3.0](upgrading-to-3.0.md#removed-legacy-compatibility)).
 - A reclaimed job goes back to `Pending` and runs again immediately. The interrupted
   run already counted as an attempt; a job with no attempts left is moved to `Dead`.
-- Every `WorkerPool` runs this reaper every 60 seconds, with `older_than` set to the
-  longest lease of its workers. Several pools or processes can reap at once safely.
+- Every `WorkerPool` runs this reaper every 60 seconds. Several pools or processes can
+  reap at once safely.
 - `with_lease_duration(Duration::ZERO)` takes a lease that never expires and sends no
   heartbeats: the reaper never reclaims that worker's jobs, so if it dies an operator
   has to re-run them (`cargo hammerwork job retry`).
@@ -403,8 +408,8 @@ let worker = Worker::new(queue.clone(), "video".to_string(), handler)
     .with_lease_duration(Duration::from_secs(60)); // detect crashed workers within ~1 min
 
 let pool: WorkerPool<sqlx::Postgres> = WorkerPool::new()
-    // Reap every 30s; jobs without a lease are stale after 10 minutes
-    .with_stale_job_reaper(Duration::from_secs(30), Duration::from_secs(600));
+    // Reap every 30s
+    .with_stale_job_reaper(Duration::from_secs(30));
 
 // Or turn it off and run `cargo hammerwork job requeue-stale` from a scheduler:
 let pool: WorkerPool<sqlx::Postgres> = WorkerPool::new().without_stale_job_reaper();
@@ -486,7 +491,7 @@ let urgent_worker = Worker::new(queue.clone(), "urgent".to_string(), handler.clo
 // Background worker for cleanup tasks
 let background_worker = Worker::new(queue.clone(), "cleanup".to_string(), handler.clone())
     .with_poll_interval(Duration::from_secs(30))
-    .with_rate_limit(RateLimit::per_minute(10));
+    .with_rate_limit(RateLimit::per_minute(10)?);
 
 // Email worker with retry configuration
 let email_worker = Worker::new(queue.clone(), "email".to_string(), handler.clone())
@@ -631,7 +636,7 @@ use std::time::Duration;
 
 let worker = Worker::new(queue, "high_volume".to_string(), handler)
     .with_poll_interval(Duration::from_millis(100))  // Check very frequently
-    .with_rate_limit(RateLimit::per_second(100))     // Allow high throughput
+    .with_rate_limit(RateLimit::per_second(100)?)     // Allow high throughput
     .with_default_timeout(Duration::from_secs(30));  // Short timeouts
 # Ok(())
 # }
@@ -655,7 +660,7 @@ let worker = Worker::new(queue, "notifications".to_string(), handler)
     .with_batch_size(20)                    // Claim up to 20 jobs per poll
     .with_batch_concurrency(5)              // Run up to 5 of them at once
     .with_lease_duration(Duration::from_secs(60))
-    .with_throttle_config(ThrottleConfig::new().max_concurrent(50));
+    .with_throttle_config(ThrottleConfig::new().max_concurrent(50))?;
 assert_eq!(worker.batch_size(), 20);
 # Ok(())
 # }
@@ -698,7 +703,7 @@ use std::time::Duration;
 
 let worker = Worker::new(queue, "heavy_processing".to_string(), handler)
     .with_poll_interval(Duration::from_secs(5))      // Check less frequently
-    .with_rate_limit(RateLimit::per_minute(10))      // Limit load
+    .with_rate_limit(RateLimit::per_minute(10)?)      // Limit load
     .with_default_timeout(Duration::from_secs(1800)) // 30 minute timeout
     .with_attempt_cap(1);                            // One attempt per job, no retries
 # Ok(())
@@ -752,7 +757,7 @@ use hammerwork::{RateLimit, Worker};
 use std::time::Duration;
 
 let api_worker = Worker::new(queue, "api_calls".to_string(), handler)
-    .with_rate_limit(RateLimit::per_second(5).with_burst_limit(10))
+    .with_rate_limit(RateLimit::per_second(5)?.with_burst_limit(10))
     .with_attempt_cap(3)
     .with_retry_delay(Duration::from_secs(60))
     .with_default_timeout(Duration::from_secs(30));

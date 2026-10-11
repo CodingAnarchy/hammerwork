@@ -140,11 +140,11 @@ password = { Environment = "SMTP_PASSWORD" }
 tls = "start_tls"
 ```
 
-An email target without SMTP settings is a configuration error:
+The `smtp` table is required: a configuration file with an email target without it
+fails to load. Invalid SMTP settings or recipient addresses are a configuration error:
 `AlertingConfig::validate()`, `AlertManager::try_new` and `HammerworkConfig::from_file`
-reject it. (`AlertingConfig::email(recipient)` is deprecated because it creates such a
-target. `AlertManager::new` does not fail; it logs the error and every alert to that
-target fails.)
+reject them. (`AlertManager::new` does not fail; it logs the error and every alert to
+that target fails.)
 
 #### Delivery failures
 

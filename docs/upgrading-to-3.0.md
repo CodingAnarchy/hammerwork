@@ -581,3 +581,162 @@ unchanged. Serialized statistics without the field read it as 0.
 or `last_scrape`. The dashboard serves no `/metrics` route and keeps no metrics registry,
 so they were always `"/metrics"`, `null` and `null`. Only `prometheus_enabled` (always
 `false`) remains.
+
+## Removed legacy compatibility
+
+3.0 drops code that only existed for Hammerwork 1.x and for APIs deprecated in 2.0
+([#90](https://github.com/CodingAnarchy/hammerwork/issues/90)).
+
+### Stop every 1.x worker first
+
+The stale job reaper now relies on leases alone. Every 2.x and 3.x claim writes a lease
+in the statement that claims the job, and the reaper reclaims a `Running` job only once
+that lease has expired. Hammerwork 1.x claimed jobs without a lease; 2.x reclaimed such
+jobs by age (the `older_than` window), 3.0 never reclaims them.
+
+So before you start any 3.0 worker:
+
+1. Stop every Hammerwork 1.x worker (and anything else built on 1.x that claims jobs).
+2. Fix the jobs those workers left `Running` without a lease, once. Either run
+
+   ```bash
+   cargo hammerwork maintenance check --fix --database-url <url>
+   ```
+
+   or run this SQL (it works on PostgreSQL and MySQL):
+
+   ```sql
+   UPDATE hammerwork_jobs
+   SET started_at = COALESCE(started_at, created_at),
+       last_heartbeat_at = COALESCE(started_at, created_at),
+       lease_expires_at = COALESCE(started_at, created_at)
+   WHERE status = 'Running'
+     AND (started_at IS NULL OR last_heartbeat_at IS NULL OR lease_expires_at IS NULL
+          OR last_heartbeat_at < started_at);
+   ```
+
+   Both give each such job a lease that expired when it started; they leave jobs with a
+   lease of their own alone. (`check --fix` retries `Running` jobs without a start time
+   instead of giving them a lease.)
+3. Let the reaper reclaim them: a `WorkerPool` does within a minute of starting, or run
+   `cargo hammerwork job requeue-stale`. Jobs with attempts left go back to `Pending`,
+   the others to `Dead`, with the usual side effects (recurring jobs are rescheduled,
+   dependents, workflows and batches see the failure).
+
+Do step 2 only after step 1: a 1.x worker still running one of these jobs would see it
+run a second time. If you skip step 2, the jobs stay `Running` until you retry or delete
+them by hand; `cargo hammerwork maintenance check` reports how many there are.
+
+### Stale job API
+
+`DatabaseQueue::requeue_stale_jobs` and `WorkerPool::with_stale_job_reaper` lose their
+`older_than` argument, which only applied to lease-less jobs:
+
+```rust,no_run
+# async fn example(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>) -> hammerwork::Result<()> {
+use hammerwork::{WorkerPool, queue::DatabaseQueue};
+use std::time::Duration;
+
+// Before (2.x):
+// let recovery = queue.requeue_stale_jobs(Duration::from_secs(3600)).await?;
+// let pool = WorkerPool::new().with_stale_job_reaper(Duration::from_secs(30), Duration::from_secs(600));
+
+// After (3.0):
+let recovery = queue.requeue_stale_jobs().await?;
+let pool: WorkerPool<sqlx::Postgres> =
+    WorkerPool::new().with_stale_job_reaper(Duration::from_secs(30));
+# let _ = (recovery, pool);
+# Ok(())
+# }
+```
+
+In the CLI, `job requeue-stale --older-than-secs` and `maintenance dead-jobs
+--stale-hours` are removed; drop the flags from scripts. Both commands apply the lease
+rule, and neither touches lease-less jobs.
+
+### `AlertingConfig::email` is removed
+
+`AlertingConfig::email(recipient)`, deprecated since 2.0.0, created an email target
+without SMTP settings, which could not send. Use `email_via_smtp`. `AlertTarget::Email`
+now holds a required `smtp: SmtpConfig` (it was an `Option`), so a configuration file
+whose email target has no `[alerting.targets.Email.smtp]` table fails to load.
+
+```rust
+use hammerwork::alerting::{AlertingConfig, SmtpConfig};
+
+// Before (2.x): AlertingConfig::new().email("oncall@example.com")
+let config = AlertingConfig::new().email_via_smtp(
+    "oncall@example.com",
+    SmtpConfig::new("smtp.example.com", "alerts@example.com"),
+);
+# let _ = config;
+```
+
+### `JobArchiver::new` takes no pool
+
+`JobArchiver` kept the pool it was created with but never used it: every operation takes
+the queue it works on. `JobArchiver::new()` takes no argument, and `JobArchiver` is no
+longer generic (`JobArchiver<sqlx::Postgres>` is now `JobArchiver`).
+
+```rust
+use hammerwork::archive::JobArchiver;
+
+// Before (2.x): let archiver = JobArchiver::new(queue.pool.clone());
+let archiver = JobArchiver::new();
+# let _ = archiver;
+```
+
+### Zero rates are rejected
+
+A rate limit of zero never refilled, so a worker using one waited forever.
+`RateLimit::per_second`, `per_minute` and `per_hour` now return
+`hammerwork::Result<RateLimit>` and fail with `HammerworkError::Config` for zero, and
+`RateLimit`'s fields are private (`rate()`, `per()`, `burst_limit()`). An enabled
+`ThrottleConfig` with `rate_per_minute(0)` is rejected by `ThrottleConfig::validate`,
+`Worker::with_throttle_config` and `Worker::with_hammerwork_config` (both now return a
+`Result`), `JobQueue::set_throttle`, `HammerworkConfig::from_file` and
+`WorkerPool::from_hammerwork_config`. `ThrottleConfig::to_rate_limit` returns
+`Result<Option<RateLimit>>`.
+
+```rust,no_run
+# async fn example(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler) -> hammerwork::Result<()> {
+use hammerwork::{RateLimit, ThrottleConfig, Worker};
+
+// Before (2.x):
+// let worker = Worker::new(queue, "emails".into(), handler)
+//     .with_rate_limit(RateLimit::per_second(10))
+//     .with_throttle_config(ThrottleConfig::new().max_concurrent(5));
+
+// After (3.0):
+let worker = Worker::new(queue, "emails".into(), handler)
+    .with_rate_limit(RateLimit::per_second(10)?)
+    .with_throttle_config(ThrottleConfig::new().max_concurrent(5))?;
+# let _ = worker;
+# Ok(())
+# }
+```
+
+### `MigrationRunner` is sealed
+
+Hammerwork's migrations are written for PostgreSQL and MySQL only, so `MigrationRunner`
+can no longer be implemented outside the crate; `PostgresMigrationRunner` and
+`MySqlMigrationRunner` implement it. `MigrationManager::new` still takes a
+`Box<dyn MigrationRunner<DB> + Send + Sync>`. The no-op default bodies of
+`acquire_migration_lock` and `release_migration_lock` are gone.
+
+### What stays
+
+Some code that reads data older versions wrote is kept, because that data can still be
+in your database after the upgrade and removing the code would need a data migration:
+
+- Status columns stored JSON-quoted (`"\"Pending\""`) by early versions are still
+  decoded, for jobs, batches and archive reasons, and the `Retrying` status is still read.
+- A job that an older version archived without deleting its `hammerwork_jobs` row is
+  still handled when restoring and counted once in workflow statistics.
+- Archived jobs without workflow fields, and encrypted payloads written before payload
+  binding or without a key version, still load.
+- Configuration files still load with keys of settings removed in 2.0 (they are ignored),
+  and archive durations still accept a bare number of days (`"7"`).
+- CLI aliases from the 2.0 command-line cleanup (`-Q` for `-n/--queue`,
+  `archive --queue-name`, `batch enqueue --progress-every`, `archive run --compress false`)
+  still work.

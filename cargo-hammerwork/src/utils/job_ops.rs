@@ -40,36 +40,25 @@ pub struct JobSelector {
 }
 
 /// The library's stale-run rule (`DatabaseQueue::requeue_stale_jobs`) for a `Running` job:
-/// its lease expired, or, when it holds no lease of its own (claimed by an older version),
-/// it started before `cutoff`. A run that keeps heartbeating is never stale, however long
-/// it has been running.
+/// the lease of its current run expired. A run that keeps heartbeating is never stale,
+/// however long it has been running, and a run without a lease of its own (left by a
+/// Hammerwork 1.x worker) is never stale either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaleRunning {
     /// The current time: leases that expired before it are stale.
     pub now: DateTime<Utc>,
-    /// Lease-less runs that started before this are stale.
-    pub cutoff: DateTime<Utc>,
 }
 
 impl StaleRunning {
-    /// A rule evaluated at `now` for runs older than `older_than`.
-    pub fn new(now: DateTime<Utc>, older_than: chrono::Duration) -> Self {
-        Self {
-            now,
-            cutoff: now - older_than,
-        }
+    /// The rule evaluated at `now`.
+    pub fn new(now: DateTime<Utc>) -> Self {
+        Self { now }
     }
 
-    /// The SQL condition, with `now` and `cutoff` bound as parameters.
+    /// The SQL condition, with `now` bound as a parameter.
     pub fn condition(&self, params: &mut SqlParams) -> String {
         let now = params.time(self.now);
-        let cutoff = params.time(self.cutoff);
-        format!(
-            "((last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= started_at \
-             AND lease_expires_at < {now}) \
-             OR ((last_heartbeat_at IS NULL OR lease_expires_at IS NULL \
-             OR last_heartbeat_at < started_at) AND started_at < {cutoff}))"
-        )
+        format!("(last_heartbeat_at >= started_at AND lease_expires_at < {now})")
     }
 }
 

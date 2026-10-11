@@ -124,7 +124,7 @@ assert!(!config.with_compression_verification(false).verify_compression);
 use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason, JobArchiver};
 use chrono::Duration;
 
-let mut archiver = JobArchiver::new(queue.pool.clone());
+let mut archiver = JobArchiver::new();
 archiver.set_policy("critical_queue", ArchivalPolicy::new().archive_completed_after(Duration::days(180)));
 archiver.set_policy("logs_queue", ArchivalPolicy::new().archive_completed_after(Duration::days(1)));
 archiver.set_config(ArchivalConfig::new().with_compression_level(9));

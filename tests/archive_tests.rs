@@ -1021,7 +1021,7 @@ mod websocket_archive_event_tests {
         let queue_name = test_utils::unique_queue("websocket_test");
 
         // Create a test job archiver
-        let mut archiver = JobArchiver::new(queue.pool.clone());
+        let mut archiver = JobArchiver::new();
 
         // Set up event tracking
         let events: Arc<Mutex<Vec<ArchiveEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1113,7 +1113,7 @@ mod websocket_archive_event_tests {
         let progress_updates: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
         let progress_clone = Arc::clone(&progress_updates);
 
-        let mut archiver = JobArchiver::new(queue.pool.clone());
+        let mut archiver = JobArchiver::new();
         archiver.set_policy(
             queue_name.as_str(),
             ArchivalPolicy::new()

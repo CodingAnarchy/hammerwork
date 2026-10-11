@@ -154,7 +154,8 @@ where
         queue_name.clone(),
         concurrency.handler(Duration::from_millis(300)),
     )
-    .with_hammerwork_config(&config);
+    .with_hammerwork_config(&config)
+    .unwrap();
     let mut pool = WorkerPool::from_hammerwork_config(worker, &config)
         .unwrap()
         .without_stale_job_reaper();
@@ -217,7 +218,8 @@ where
         })
     });
     let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
-        .with_hammerwork_config(&config);
+        .with_hammerwork_config(&config)
+        .unwrap();
     let mut pool = WorkerPool::from_hammerwork_config(worker, &config)
         .unwrap()
         .without_stale_job_reaper();
@@ -307,7 +309,8 @@ where
         Box::pin(async { Ok(()) })
     });
     let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
-        .with_hammerwork_config(&config);
+        .with_hammerwork_config(&config)
+        .unwrap();
     let mut pool = WorkerPool::from_hammerwork_config(worker, &config)
         .unwrap()
         .without_stale_job_reaper();
@@ -353,7 +356,8 @@ where
         queue_name.clone(),
         concurrency.handler(Duration::from_millis(200)),
     )
-    .with_hammerwork_config(&config);
+    .with_hammerwork_config(&config)
+    .unwrap();
     let mut pool = WorkerPool::from_hammerwork_config(worker, &config)
         .unwrap()
         .without_stale_job_reaper();
@@ -393,7 +397,8 @@ where
         queue_name.clone(),
         concurrency.handler(Duration::ZERO),
     )
-    .with_hammerwork_config(&config);
+    .with_hammerwork_config(&config)
+    .unwrap();
     let mut pool = WorkerPool::from_hammerwork_config(worker, &config)
         .unwrap()
         .without_stale_job_reaper();
@@ -428,7 +433,7 @@ where
         concurrency.handler(Duration::ZERO),
     )
     .with_poll_interval(Duration::from_millis(10))
-    .with_rate_limit(hammerwork::RateLimit::per_hour(3));
+    .with_rate_limit(hammerwork::RateLimit::per_hour(3).unwrap());
     let mut pool = WorkerPool::new().without_stale_job_reaper();
     pool.add_worker(worker);
 
@@ -753,7 +758,8 @@ where
         handler,
     )
     .with_poll_interval(Duration::from_millis(10))
-    .with_throttle_config(ThrottleConfig::new().backoff_on_error(Duration::from_secs(60)));
+    .with_throttle_config(ThrottleConfig::new().backoff_on_error(Duration::from_secs(60)))
+    .unwrap();
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
@@ -861,7 +867,8 @@ where
     let worker = Worker::new(Arc::clone(&queue), deep.clone(), Arc::clone(&noop))
         .with_poll_interval(Duration::from_millis(20))
         .with_monitoring_interval(Duration::from_millis(50))
-        .with_hammerwork_config(&config);
+        .with_hammerwork_config(&config)
+        .unwrap();
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
     let alert = next_alert(&mut alerts, "QueueDepthExceeded").await;

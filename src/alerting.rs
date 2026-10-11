@@ -94,27 +94,11 @@ impl AlertingConfig {
         self
     }
 
-    /// Add an email alert target without SMTP settings.
-    ///
-    /// Such a target cannot send anything: [`validate`](Self::validate) and
-    /// [`AlertManager::try_new`] reject it. Use [`email_via_smtp`](Self::email_via_smtp).
-    #[deprecated(
-        since = "2.0.0",
-        note = "email targets need SMTP settings; use `email_via_smtp`"
-    )]
-    pub fn email(mut self, recipient: &str) -> Self {
-        self.targets.push(AlertTarget::Email {
-            recipient: recipient.to_string(),
-            smtp: None,
-        });
-        self
-    }
-
     /// Add an email alert target delivered through the SMTP server in `smtp`.
     pub fn email_via_smtp(mut self, recipient: &str, smtp: SmtpConfig) -> Self {
         self.targets.push(AlertTarget::Email {
             recipient: recipient.to_string(),
-            smtp: Some(smtp),
+            smtp,
         });
         self
     }
@@ -142,8 +126,8 @@ impl AlertingConfig {
 
     /// Check the alert targets without contacting them.
     ///
-    /// Fails with a configuration error for an email target without SMTP settings,
-    /// with invalid SMTP settings, or with an invalid recipient address.
+    /// Fails with a configuration error for an email target with invalid SMTP settings
+    /// or an invalid recipient address.
     pub fn validate(&self) -> Result<()> {
         for target in &self.targets {
             if let AlertTarget::Email { recipient, smtp } = target {
@@ -152,12 +136,6 @@ impl AlertingConfig {
                         "email alert target: invalid recipient address {e}"
                     ))
                 })?;
-                let Some(smtp) = smtp else {
-                    return Err(HammerworkError::Config(format!(
-                        "email alert target '{recipient}' has no SMTP settings \
-                         (set `smtp`, or use AlertingConfig::email_via_smtp)"
-                    )));
-                };
                 smtp.validate().map_err(|e| {
                     HammerworkError::Config(format!("email alert target '{recipient}': {e}"))
                 })?;
@@ -352,14 +330,7 @@ pub enum AlertTarget {
         headers: HashMap<String, String>,
     },
     /// Email alert target, sent through the SMTP server in `smtp`.
-    ///
-    /// `smtp` is required; a target without it is rejected by
-    /// [`AlertingConfig::validate`].
-    Email {
-        recipient: String,
-        #[serde(default)]
-        smtp: Option<SmtpConfig>,
-    },
+    Email { recipient: String, smtp: SmtpConfig },
     /// Slack alert target
     Slack {
         webhook_url: String,
@@ -755,12 +726,9 @@ impl AlertManager {
             AlertTarget::Webhook { url, headers } => {
                 self.send_webhook_alert(alert, url, headers).await
             }
-            AlertTarget::Email { recipient, smtp } => match smtp {
-                Some(smtp) => self.send_email_alert(alert, recipient, smtp).await,
-                None => Err(HammerworkError::Alerting {
-                    message: format!("email alert target '{recipient}' has no SMTP settings"),
-                }),
-            },
+            AlertTarget::Email { recipient, smtp } => {
+                self.send_email_alert(alert, recipient, smtp).await
+            }
             AlertTarget::Slack {
                 webhook_url,
                 channel,
@@ -1175,7 +1143,7 @@ mod tests {
 
         let email = AlertTarget::Email {
             recipient: "test@example.com".to_string(),
-            smtp: None,
+            smtp: SmtpConfig::new("smtp.example.com", "alerts@example.com"),
         };
 
         let slack = AlertTarget::Slack {
@@ -1467,25 +1435,14 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn test_email_target_without_smtp_is_a_configuration_error() {
-        let config = AlertingConfig::new().email("oncall@example.com");
-        match AlertManager::try_new(config) {
-            Err(HammerworkError::Config(message)) => {
-                assert!(message.contains("no SMTP settings"), "{message}");
-            }
-            Err(e) => panic!("unexpected error: {e}"),
-            Ok(_) => panic!("an email target without SMTP settings must be rejected"),
-        }
-
-        // Also when loaded from a configuration file.
-        let target: AlertTarget =
-            serde_json::from_str(r#"{"Email": {"recipient": "oncall@example.com"}}"#).unwrap();
-        let config = AlertingConfig {
-            targets: vec![target],
-            ..Default::default()
-        };
-        assert!(config.validate().is_err());
+    fn test_email_target_without_smtp_does_not_load() {
+        // `smtp` is required: a configuration without it fails to load instead of
+        // producing a target that cannot send.
+        let err = serde_json::from_str::<AlertTarget>(
+            r#"{"Email": {"recipient": "oncall@example.com"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("smtp"), "{err}");
     }
 
     #[test]
@@ -1548,7 +1505,7 @@ mod tests {
             "{:?}",
             AlertTarget::Email {
                 recipient: "ops@example.com".to_string(),
-                smtp: None,
+                smtp: SmtpConfig::new("smtp.example.com", "alerts@example.com"),
             }
         );
         assert!(debug.contains("ops@example.com"), "{debug}");
@@ -1607,7 +1564,7 @@ mod tests {
         match &parsed.targets[..] {
             [AlertTarget::Email { recipient, smtp }] => {
                 assert_eq!(recipient, "admin@example.com");
-                assert_eq!(smtp.as_ref().unwrap().tls, SmtpTls::Implicit);
+                assert_eq!(smtp.tls, SmtpTls::Implicit);
             }
             other => panic!("unexpected targets: {other:?}"),
         }

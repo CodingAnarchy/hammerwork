@@ -58,7 +58,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_poll_interval(tokio::time::Duration::from_secs(1))
         .with_attempt_cap(3)
         .with_default_timeout(tokio::time::Duration::from_secs(30)) // 30 second default timeout
-        .with_rate_limit(RateLimit::per_second(2)) // Limit to 2 emails per second
+        .with_rate_limit(RateLimit::per_second(2)?) // Limit to 2 emails per second
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let worker2 = Worker::new(queue.clone(), "notifications".to_string(), handler.clone())
@@ -69,14 +69,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             ThrottleConfig::new()
                 .rate_per_minute(30) // Max 30 notifications per minute
                 .backoff_on_error(tokio::time::Duration::from_secs(10)), // 10 second backoff on errors
-        )
+        )?
         .with_stats_collector(Arc::clone(&stats_collector));
 
     // Create a high-throughput worker for API calls with burst support
     let api_worker = Worker::new(queue.clone(), "api_calls".to_string(), handler.clone())
         .with_poll_interval(tokio::time::Duration::from_millis(100))
         .with_rate_limit(
-            RateLimit::per_second(10) // 10 calls per second
+            RateLimit::per_second(10)? // 10 calls per second
                 .with_burst_limit(50), // Allow bursts up to 50 calls
         )
         .with_stats_collector(Arc::clone(&stats_collector));

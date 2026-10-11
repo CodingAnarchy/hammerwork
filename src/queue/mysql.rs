@@ -2084,12 +2084,8 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         Ok(true)
     }
 
-    async fn requeue_stale_jobs(
-        &self,
-        older_than: std::time::Duration,
-    ) -> Result<super::StaleJobRecovery> {
-        let recovery =
-            super::retry_on_conflict(|| self.requeue_stale_jobs_once(older_than)).await?;
+    async fn requeue_stale_jobs(&self) -> Result<super::StaleJobRecovery> {
+        let recovery = super::retry_on_conflict(|| self.requeue_stale_jobs_once()).await?;
 
         if !recovery.is_empty() {
             tracing::warn!(
@@ -2141,48 +2137,36 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 }
 
 impl crate::queue::JobQueue<MySql> {
-    async fn requeue_stale_jobs_once(
-        &self,
-        older_than: std::time::Duration,
-    ) -> Result<super::StaleJobRecovery> {
+    async fn requeue_stale_jobs_once(&self) -> Result<super::StaleJobRecovery> {
         let mut conn = self.pool.acquire().await?;
         // READ COMMITTED, like the dequeue: no gap locks on the Running range.
         let mut tx = Self::begin_claim_transaction(&mut conn).await?;
-        let result = Self::requeue_stale_jobs_in_tx(&mut tx, older_than).await;
+        let result = Self::requeue_stale_jobs_in_tx(&mut tx).await;
         super::end_transaction(tx, result).await
     }
 
     async fn requeue_stale_jobs_in_tx(
         conn: &mut sqlx::MySqlConnection,
-        older_than: std::time::Duration,
     ) -> Result<super::StaleJobRecovery> {
         let now = db_now(conn).await?;
-        let cutoff = super::saturating_sub_from(now, older_than);
 
         // Claim stale rows with SKIP LOCKED so concurrent reapers never wait on (or
         // double-process) the same row. Each UPDATE re-checks `status` as well.
         //
         // A run's lease is written when it is claimed (`last_heartbeat_at = started_at`),
-        // so only its expiry counts. The `started_at` cutoff applies only to runs without
-        // a lease of their own: claimed by an older version that wrote none.
+        // so only its expiry counts. A row without a lease of its current run is left
+        // alone: only 1.x claimed jobs without one.
         let candidates = sqlx::query_as::<_, JobRow>(AssertSqlSafe(format!(
             r#"
             SELECT {JOB_SELECT_FIELDS} FROM hammerwork_jobs
             WHERE status = ?
-              AND (
-                (last_heartbeat_at IS NOT NULL
-                    AND last_heartbeat_at >= started_at
-                    AND lease_expires_at < ?)
-                OR ((last_heartbeat_at IS NULL OR lease_expires_at IS NULL
-                        OR last_heartbeat_at < started_at)
-                    AND started_at < ?)
-              )
+              AND last_heartbeat_at >= started_at
+              AND lease_expires_at < ?
             FOR UPDATE SKIP LOCKED
             "#
         )))
         .bind(JobStatus::Running)
         .bind(now)
-        .bind(cutoff)
         .fetch_all(&mut *conn)
         .await?;
 

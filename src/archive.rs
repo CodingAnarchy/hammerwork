@@ -720,14 +720,8 @@ pub const MAX_ARCHIVAL_BATCHES_PER_OPERATION: usize = 10_000;
 ///
 /// The `JobArchiver` provides methods to archive jobs based on policies,
 /// restore archived jobs, and manage archival configuration.
-#[derive(Debug)]
-pub struct JobArchiver<DB>
-where
-    DB: sqlx::Database,
-{
-    /// Database connection pool.
-    #[allow(dead_code)]
-    pool: sqlx::Pool<DB>,
+#[derive(Debug, Default)]
+pub struct JobArchiver {
     /// Archival policies by queue name.
     policies: HashMap<String, ArchivalPolicy>,
     /// Policy for queues without one of their own, and for operations over all queues.
@@ -748,74 +742,30 @@ pub struct ScheduledArchivalPass {
     pub stopped_early: bool,
 }
 
-impl<DB> JobArchiver<DB>
-where
-    DB: sqlx::Database,
-{
-    /// Creates a new job archiver with the given database pool.
+impl JobArchiver {
+    /// Creates a job archiver with no per-queue policies, the default policy
+    /// ([`ArchivalPolicy::default`]) and the default configuration
+    /// ([`ArchivalConfig::default`]).
     ///
-    /// # Arguments
-    ///
-    /// * `pool` - Database connection pool
+    /// The archiver holds no database connection: every operation takes the queue it
+    /// works on (any [`DatabaseQueue`](crate::queue::DatabaseQueue)), so one archiver
+    /// can serve several queues or backends.
     ///
     /// # Examples
     ///
-    /// ## Basic Usage
+    /// ```rust
+    /// use hammerwork::archive::{ArchivalPolicy, JobArchiver};
+    /// use chrono::Duration;
     ///
-    /// ```rust,no_run
-    /// use hammerwork::archive::JobArchiver;
-    /// use sqlx::PgPool;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let pool = PgPool::connect("postgresql://localhost/hammerwork").await?;
-    /// let archiver = JobArchiver::new(pool);
-    /// # Ok(())
-    /// # }
+    /// let mut archiver = JobArchiver::new();
+    /// archiver.set_policy(
+    ///     "logs_queue",
+    ///     ArchivalPolicy::new().archive_completed_after(Duration::days(1)),
+    /// );
+    /// assert!(archiver.get_policy("logs_queue").is_some());
     /// ```
-    ///
-    /// ## Integration with JobQueue (using public pool field)
-    ///
-    /// ```rust,no_run
-    /// use hammerwork::{JobQueue, archive::JobArchiver};
-    /// use std::sync::Arc;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
-    /// let queue = Arc::new(JobQueue::new(pool.clone()));
-    ///
-    /// // Access the public pool field to create an archiver
-    /// let archiver = JobArchiver::new(queue.pool.clone());
-    ///
-    /// // Both the queue and archiver share the same database connection pool
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// ## Multiple Archivers with Shared Pool
-    ///
-    /// ```rust,no_run
-    /// use hammerwork::{JobQueue, archive::JobArchiver};
-    /// use std::sync::Arc;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let pool = sqlx::PgPool::connect("postgresql://localhost/hammerwork").await?;
-    /// let queue = Arc::new(JobQueue::new(pool.clone()));
-    ///
-    /// // Create multiple archivers sharing the same pool
-    /// let archiver1 = JobArchiver::new(queue.pool.clone());
-    /// let archiver2 = JobArchiver::new(queue.pool.clone());
-    ///
-    /// // All components share the same connection pool for efficiency
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn new(pool: sqlx::Pool<DB>) -> Self {
-        Self {
-            pool,
-            policies: HashMap::new(),
-            default_policy: ArchivalPolicy::default(),
-            config: ArchivalConfig::default(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Sets the policy used for queues without a policy of their own and for operations
@@ -1052,7 +1002,7 @@ where
     /// use std::sync::Arc;
     ///
     /// # async fn example(queue: Arc<JobQueue<sqlx::Postgres>>) -> hammerwork::Result<()> {
-    /// let mut archiver = JobArchiver::new(queue.pool.clone());
+    /// let mut archiver = JobArchiver::new();
     ///
     /// let (operation_id, stats) = archiver.archive_jobs_with_progress(
     ///     queue.as_ref(),
@@ -1579,12 +1529,11 @@ mod tests {
     /// A scheduled pass whose policy ages are too large to subtract from now (say
     /// `Duration::MAX` for "never purge") archives and purges nothing instead of
     /// panicking.
-    #[cfg(all(feature = "test-queue", feature = "postgres"))]
+    #[cfg(feature = "test-queue")]
     #[tokio::test]
     async fn scheduled_pass_with_huge_ages_does_not_panic() {
         let queue = crate::queue::test::TestQueue::new();
-        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
-        let mut archiver = JobArchiver::new(pool);
+        let mut archiver = JobArchiver::new();
         archiver.set_default_policy(
             ArchivalPolicy::new()
                 .archive_completed_after(Duration::MAX)
