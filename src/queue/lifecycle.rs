@@ -16,7 +16,7 @@
 //!
 //! Both kinds apply their side effects in the same transaction as the status change:
 //! on completion, dependents whose dependencies have all completed become runnable;
-//! on a terminal failure, the workflow's [`FailurePolicy`](crate::workflow::FailurePolicy)
+//! on a terminal failure, the workflow's [`FailurePolicy`]
 //! and the batch's [`PartialFailureMode`](crate::batch::PartialFailureMode) are applied;
 //! and workflow and batch counters are updated. A worker run of a recurring job that
 //! ends (successfully or not) is rescheduled for its next cron occurrence instead.

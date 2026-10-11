@@ -6,6 +6,10 @@
 //! job management, worker lease visibility, queue operations, and monitoring of Hammerwork
 //! job processing systems.
 //!
+//! Rust examples in the doc comments of the internal modules are marked `ignore`: this is a
+//! binary crate, so rustdoc does not compile or run them. The behaviour they describe is
+//! covered by unit tests next to the code.
+//!
 //! ## Installation
 //!
 //! ```bash

@@ -18,7 +18,7 @@
 //!
 //! ## Loading Configuration
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use cargo_hammerwork::config::Config;
 //!
 //! // Load configuration from file and environment
@@ -35,7 +35,7 @@
 //!
 //! ## Creating and Saving Configuration
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use cargo_hammerwork::config::Config;
 //!
 //! // Create a new configuration with custom values
@@ -51,7 +51,7 @@
 //!
 //! ## Environment Variable Override
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use std::env;
 //! use cargo_hammerwork::config::Config;
 //!
@@ -107,7 +107,7 @@ use std::path::{Path, PathBuf};
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cargo_hammerwork::config::Config;
 ///
 /// // Create configuration with defaults
@@ -191,7 +191,7 @@ impl Config {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use cargo_hammerwork::config::Config;
     ///
     /// let config = Config::load().expect("Failed to load configuration");
@@ -317,7 +317,7 @@ impl Config {
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use cargo_hammerwork::config::Config;
     ///
     /// let mut config = Config::default();
