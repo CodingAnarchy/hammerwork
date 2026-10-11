@@ -536,7 +536,6 @@ async fn get_priority_breakdown<T>(
 where
     T: DatabaseQueue + Send + Sync,
 {
-    // Use the new get_priority_stats method
     let priority_stats = queue.get_priority_stats(queue_name).await?;
     let mut breakdown = std::collections::HashMap::new();
     for (priority, count) in priority_stats.job_counts {

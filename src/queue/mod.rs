@@ -1211,7 +1211,6 @@ pub(crate) fn saturating_add_to(
 /// # }
 /// ```
 pub struct JobQueue<DB: Database> {
-    #[allow(dead_code)] // Used in database-specific implementations
     pub pool: Pool<DB>,
     pub(crate) _phantom: PhantomData<DB>,
     pub(crate) throttle_configs: Arc<RwLock<HashMap<String, ThrottleConfig>>>,

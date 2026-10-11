@@ -99,19 +99,6 @@ pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     SERIAL.lock().await
 }
 
-/// Whether to skip a test that is `#[ignore]`d because it exposes a known library bug.
-///
-/// CI runs the suite with `--include-ignored`, which would also run these tests.
-/// They return early unless `HAMMERWORK_TEST_KNOWN_BUGS` is set, so the bug can be
-/// reproduced with `HAMMERWORK_TEST_KNOWN_BUGS=1 cargo test ... -- --include-ignored`.
-pub fn skip_known_bug() -> bool {
-    if std::env::var_os("HAMMERWORK_TEST_KNOWN_BUGS").is_some() {
-        return false;
-    }
-    eprintln!("skipping known-bug test; set HAMMERWORK_TEST_KNOWN_BUGS=1 to run it");
-    true
-}
-
 /// A fresh in-memory [`TestQueue`](hammerwork::queue::test::TestQueue).
 #[cfg(feature = "test")]
 pub async fn test_queue() -> std::sync::Arc<hammerwork::queue::test::TestQueue> {

@@ -607,7 +607,7 @@ impl WorkflowCommand {
 
         for job in jobs {
             if !visited.contains(&job.id) {
-                Self::calculate_job_level(job, &job_map, &mut levels, &mut visited, 0);
+                Self::calculate_job_level(job, &job_map, &mut levels, &mut visited);
             }
         }
 
@@ -632,7 +632,6 @@ impl WorkflowCommand {
         job_map: &HashMap<String, &JobNode>,
         levels: &mut HashMap<String, usize>,
         visited: &mut HashSet<String>,
-        _current_level: usize,
     ) {
         if visited.contains(&job.id) {
             return;
@@ -647,13 +646,7 @@ impl WorkflowCommand {
             .filter_map(|dep_id| {
                 if let Some(dep_job) = job_map.get(dep_id) {
                     if !visited.contains(dep_id) {
-                        Self::calculate_job_level(
-                            dep_job,
-                            job_map,
-                            levels,
-                            visited,
-                            _current_level,
-                        );
+                        Self::calculate_job_level(dep_job, job_map, levels, visited);
                     }
                     levels.get(dep_id).copied()
                 } else {
