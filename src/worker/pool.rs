@@ -663,7 +663,7 @@ where
     ) -> Option<tokio::task::JoinHandle<()>> {
         let interval = self.reaper_interval?;
         spawn_queue_task(workers, interval, signal_rx, |queue| async move {
-            match queue.requeue_stale_jobs().await {
+            match queue.requeue_stale_jobs(None).await {
                 Ok(recovery) if !recovery.is_empty() => info!(
                     "Stale job reaper requeued {} and marked {} dead",
                     recovery.requeued.len(),

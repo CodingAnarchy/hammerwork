@@ -2,64 +2,6 @@
 //!
 //! This module provides comprehensive configuration options for the web dashboard,
 //! including server settings, authentication, WebSocket configuration, and more.
-//!
-//! # Examples
-//!
-//! ## Basic Configuration
-//!
-//! ```rust
-//! use hammerwork_web::__private::config::DashboardConfig;
-//!
-//! let config = DashboardConfig::new()
-//!     .with_bind_address("127.0.0.1", 8080)
-//!     .with_database_url("postgresql://localhost/hammerwork");
-//!
-//! assert_eq!(config.bind_addr(), "127.0.0.1:8080");
-//! ```
-//!
-//! ## Configuration with Authentication
-//!
-//! ```rust
-//! use hammerwork_web::__private::config::{DashboardConfig, AuthConfig};
-//! use std::time::Duration;
-//!
-//! let config = DashboardConfig::new()
-//!     .with_auth("admin", "$2b$12$hash...")
-//!     .with_cors(true);
-//!
-//! assert!(config.auth.enabled);
-//! assert_eq!(config.auth.username, "admin");
-//! assert!(config.enable_cors);
-//! ```
-//!
-//! ## Loading from File
-//!
-//! ```rust,no_run
-//! use hammerwork_web::__private::config::DashboardConfig;
-//!
-//! // Create a configuration file (dashboard.toml)
-//! let config_content = r#"
-//! bind_address = "0.0.0.0"
-//! port = 9090
-//! database_url = "postgresql://localhost/hammerwork"
-//! enable_cors = true
-//!
-//! [auth]
-//! enabled = true
-//! username = "admin"
-//! "#;
-//!
-//! std::fs::write("dashboard.toml", config_content)?;
-//!
-//! // Load the configuration
-//! let config = DashboardConfig::from_file("dashboard.toml")?;
-//! assert_eq!(config.port, 9090);
-//! assert!(config.enable_cors);
-//!
-//! // Clean up
-//! std::fs::remove_file("dashboard.toml")?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -70,26 +12,6 @@ use std::time::Duration;
 /// This struct contains all configuration options for the Hammerwork web dashboard,
 /// including server settings, database connection, authentication, and WebSocket options.
 ///
-/// # Examples
-///
-/// ```rust
-/// use hammerwork_web::__private::config::DashboardConfig;
-/// use std::path::PathBuf;
-///
-/// // Create with defaults
-/// let config = DashboardConfig::default();
-/// assert_eq!(config.bind_address, "127.0.0.1");
-/// assert_eq!(config.port, 8080);
-///
-/// // Use builder pattern
-/// let config = DashboardConfig::new()
-///     .with_bind_address("0.0.0.0", 9090)
-///     .with_database_url("postgresql://localhost/hammerwork")
-///     .with_cors(true);
-///
-/// assert_eq!(config.bind_addr(), "0.0.0.0:9090");
-/// assert!(config.enable_cors);
-/// ```
 ///
 /// `Debug` shows `database_url` with its password replaced by `***`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -149,34 +71,12 @@ impl Default for DashboardConfig {
 impl DashboardConfig {
     /// Create a new configuration with defaults.
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use hammerwork_web::__private::config::DashboardConfig;
-    ///
-    /// let config = DashboardConfig::new();
-    /// assert_eq!(config.bind_address, "127.0.0.1");
-    /// assert_eq!(config.port, 8080);
-    /// assert_eq!(config.database_url, "postgresql://localhost/hammerwork");
-    /// ```
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the server bind address and port.
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use hammerwork_web::__private::config::DashboardConfig;
-    ///
-    /// let config = DashboardConfig::new()
-    ///     .with_bind_address("0.0.0.0", 9090);
-    ///
-    /// assert_eq!(config.bind_address, "0.0.0.0");
-    /// assert_eq!(config.port, 9090);
-    /// assert_eq!(config.bind_addr(), "0.0.0.0:9090");
-    /// ```
     pub fn with_bind_address(mut self, address: &str, port: u16) -> Self {
         self.bind_address = address.to_string();
         self.port = port;
@@ -187,21 +87,6 @@ impl DashboardConfig {
     ///
     /// Supports both PostgreSQL and MySQL database URLs.
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use hammerwork_web::__private::config::DashboardConfig;
-    ///
-    /// // PostgreSQL
-    /// let pg_config = DashboardConfig::new()
-    ///     .with_database_url("postgresql://user:pass@localhost/hammerwork");
-    /// assert_eq!(pg_config.database_url, "postgresql://user:pass@localhost/hammerwork");
-    ///
-    /// // MySQL
-    /// let mysql_config = DashboardConfig::new()
-    ///     .with_database_url("mysql://root:password@localhost/hammerwork");
-    /// assert_eq!(mysql_config.database_url, "mysql://root:password@localhost/hammerwork");
-    /// ```
     pub fn with_database_url(mut self, url: &str) -> Self {
         self.database_url = url.to_string();
         self
@@ -209,17 +94,6 @@ impl DashboardConfig {
 
     /// Set the static assets directory.
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use hammerwork_web::__private::config::DashboardConfig;
-    /// use std::path::PathBuf;
-    ///
-    /// let config = DashboardConfig::new()
-    ///     .with_static_dir(PathBuf::from("/var/www/dashboard"));
-    ///
-    /// assert_eq!(config.static_dir, PathBuf::from("/var/www/dashboard"));
-    /// ```
     pub fn with_static_dir(mut self, dir: PathBuf) -> Self {
         self.static_dir = dir;
         self
@@ -230,18 +104,6 @@ impl DashboardConfig {
     /// The password should be a bcrypt hash for security. When authentication is enabled,
     /// all API endpoints and WebSocket connections will require basic authentication.
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use hammerwork_web::__private::config::DashboardConfig;
-    ///
-    /// let config = DashboardConfig::new()
-    ///     .with_auth("admin", "$2b$12$hash...");
-    ///
-    /// assert!(config.auth.enabled);
-    /// assert_eq!(config.auth.username, "admin");
-    /// assert_eq!(config.auth.password_hash, "$2b$12$hash...");
-    /// ```
     pub fn with_auth(mut self, username: &str, password_hash: &str) -> Self {
         self.auth.enabled = true;
         self.auth.username = username.to_string();
@@ -254,23 +116,6 @@ impl DashboardConfig {
     /// When enabled, browsers on the origins in [`allowed_origins`](Self::allowed_origins)
     /// may call the API; [`validate`](Self::validate) requires at least one of them.
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use hammerwork_web::__private::config::DashboardConfig;
-    ///
-    /// let config = DashboardConfig::new()
-    ///     .with_cors(true)
-    ///     .with_allowed_origin("https://ops.example.com");
-    ///
-    /// assert!(config.enable_cors);
-    /// assert_eq!(config.allowed_origins, ["https://ops.example.com"]);
-    ///
-    /// let config = DashboardConfig::new()
-    ///     .with_cors(false);
-    ///
-    /// assert!(!config.enable_cors);
-    /// ```
     pub fn with_cors(mut self, enabled: bool) -> Self {
         self.enable_cors = enabled;
         self
@@ -352,30 +197,6 @@ impl DashboardConfig {
 /// Controls authentication behavior including credentials, session management,
 /// and security policies like rate limiting and account lockout.
 ///
-/// # Examples
-///
-/// ```rust
-/// use hammerwork_web::__private::config::AuthConfig;
-/// use std::time::Duration;
-///
-/// // Default configuration (authentication enabled)
-/// let auth_config = AuthConfig::default();
-/// assert!(auth_config.enabled);
-/// assert_eq!(auth_config.username, "admin");
-/// assert_eq!(auth_config.max_failed_attempts, 5);
-///
-/// // Custom configuration
-/// let auth_config = AuthConfig::default()
-///     .with_enabled(true)
-///     .with_username("dashboard_admin".to_string())
-///     .with_password_hash("$2b$12$hash...".to_string())
-///     .with_session_timeout(Duration::from_secs(4 * 60 * 60)) // 4 hours
-///     .with_max_failed_attempts(3)
-///     .with_lockout_duration(Duration::from_secs(30 * 60)); // 30 minutes
-///
-/// assert_eq!(auth_config.username, "dashboard_admin");
-/// assert_eq!(auth_config.max_failed_attempts, 3);
-/// ```
 ///
 /// `Debug` never shows `password_hash`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -392,7 +213,7 @@ pub struct AuthConfig {
     pub password_hash: String,
 
     /// Upper bound on how long a successful credential check is remembered (at most
-    /// [`crate::auth::VERIFIED_CREDENTIALS_TTL`]); zero re-verifies every request.
+    /// 60 seconds, the `VERIFIED_CREDENTIALS_TTL` of the auth module); zero re-verifies every request.
     #[serde(with = "hammerwork::config::serde_duration")]
     pub session_timeout: Duration,
 
@@ -846,5 +667,156 @@ mod tests {
         assert_eq!(config.auth.username, "ops");
         assert_eq!(config.websocket.max_connections, 3);
         assert_eq!(config.allowed_origins, ["https://ops.example.com"]);
+    }
+}
+
+/// Examples that used to be doctests (moved in-crate when `hammerwork_web::__private` was removed).
+#[cfg(test)]
+mod doc_examples {
+
+    #[test]
+    fn example_1() {
+        use crate::config::DashboardConfig;
+
+        let config = DashboardConfig::new()
+            .with_bind_address("127.0.0.1", 8080)
+            .with_database_url("postgresql://localhost/hammerwork");
+
+        assert_eq!(config.bind_addr(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn example_2() {
+        use crate::config::DashboardConfig;
+
+        let config = DashboardConfig::new()
+            .with_auth("admin", "$2b$12$hash...")
+            .with_cors(true);
+
+        assert!(config.auth.enabled);
+        assert_eq!(config.auth.username, "admin");
+        assert!(config.enable_cors);
+    }
+
+    #[test]
+    fn example_3() {
+        use crate::config::DashboardConfig;
+
+        // Create with defaults
+        let config = DashboardConfig::default();
+        assert_eq!(config.bind_address, "127.0.0.1");
+        assert_eq!(config.port, 8080);
+
+        // Use builder pattern
+        let config = DashboardConfig::new()
+            .with_bind_address("0.0.0.0", 9090)
+            .with_database_url("postgresql://localhost/hammerwork")
+            .with_cors(true);
+
+        assert_eq!(config.bind_addr(), "0.0.0.0:9090");
+        assert!(config.enable_cors);
+    }
+
+    #[test]
+    fn example_4() {
+        use crate::config::DashboardConfig;
+
+        let config = DashboardConfig::new();
+        assert_eq!(config.bind_address, "127.0.0.1");
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.database_url, "postgresql://localhost/hammerwork");
+    }
+
+    #[test]
+    fn example_5() {
+        use crate::config::DashboardConfig;
+
+        let config = DashboardConfig::new().with_bind_address("0.0.0.0", 9090);
+
+        assert_eq!(config.bind_address, "0.0.0.0");
+        assert_eq!(config.port, 9090);
+        assert_eq!(config.bind_addr(), "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn example_6() {
+        use crate::config::DashboardConfig;
+
+        // PostgreSQL
+        let pg_config =
+            DashboardConfig::new().with_database_url("postgresql://user:pass@localhost/hammerwork");
+        assert_eq!(
+            pg_config.database_url,
+            "postgresql://user:pass@localhost/hammerwork"
+        );
+
+        // MySQL
+        let mysql_config =
+            DashboardConfig::new().with_database_url("mysql://root:password@localhost/hammerwork");
+        assert_eq!(
+            mysql_config.database_url,
+            "mysql://root:password@localhost/hammerwork"
+        );
+    }
+
+    #[test]
+    fn example_7() {
+        use crate::config::DashboardConfig;
+        use std::path::PathBuf;
+
+        let config = DashboardConfig::new().with_static_dir(PathBuf::from("/var/www/dashboard"));
+
+        assert_eq!(config.static_dir, PathBuf::from("/var/www/dashboard"));
+    }
+
+    #[test]
+    fn example_8() {
+        use crate::config::DashboardConfig;
+
+        let config = DashboardConfig::new().with_auth("admin", "$2b$12$hash...");
+
+        assert!(config.auth.enabled);
+        assert_eq!(config.auth.username, "admin");
+        assert_eq!(config.auth.password_hash, "$2b$12$hash...");
+    }
+
+    #[test]
+    fn example_9() {
+        use crate::config::DashboardConfig;
+
+        let config = DashboardConfig::new()
+            .with_cors(true)
+            .with_allowed_origin("https://ops.example.com");
+
+        assert!(config.enable_cors);
+        assert_eq!(config.allowed_origins, ["https://ops.example.com"]);
+
+        let config = DashboardConfig::new().with_cors(false);
+
+        assert!(!config.enable_cors);
+    }
+
+    #[test]
+    fn example_10() {
+        use crate::config::AuthConfig;
+        use std::time::Duration;
+
+        // Default configuration (authentication enabled)
+        let auth_config = AuthConfig::default();
+        assert!(auth_config.enabled);
+        assert_eq!(auth_config.username, "admin");
+        assert_eq!(auth_config.max_failed_attempts, 5);
+
+        // Custom configuration
+        let auth_config = AuthConfig::default()
+            .with_enabled(true)
+            .with_username("dashboard_admin".to_string())
+            .with_password_hash("$2b$12$hash...".to_string())
+            .with_session_timeout(Duration::from_secs(4 * 60 * 60)) // 4 hours
+            .with_max_failed_attempts(3)
+            .with_lockout_duration(Duration::from_secs(30 * 60)); // 30 minutes
+
+        assert_eq!(auth_config.username, "dashboard_admin");
+        assert_eq!(auth_config.max_failed_attempts, 3);
     }
 }

@@ -9,105 +9,6 @@
 //! - `GET /api/stats/detailed` - Detailed statistics with historical trends
 //! - `GET /api/stats/trends` - Hourly/daily trend analysis
 //! - `GET /api/stats/health` - System health check and alerts
-//!
-//! # Examples
-//!
-//! ## System Overview
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::stats::{SystemOverview, SystemHealth, SystemAlert};
-//! use chrono::Utc;
-//!
-//! let overview = SystemOverview {
-//!     total_queues: 5,
-//!     total_jobs: 10000,
-//!     pending_jobs: 50,
-//!     running_jobs: 10,
-//!     completed_jobs: 9800,
-//!     failed_jobs: 125,
-//!     dead_jobs: 15,
-//!     overall_throughput: 150.5,
-//!     overall_error_rate: 0.0125,
-//!     avg_processing_time_ms: 250.0,
-//!     system_health: SystemHealth {
-//!         status: "healthy".to_string(),
-//!         database_healthy: true,
-//!         high_error_rate: false,
-//!         queue_backlog: false,
-//!         slow_processing: false,
-//!         alerts: vec![],
-//!     },
-//!     uptime_seconds: 86400,
-//!     last_updated: Utc::now(),
-//! };
-//!
-//! assert_eq!(overview.total_queues, 5);
-//! assert_eq!(overview.overall_error_rate, 0.0125);
-//! assert_eq!(overview.system_health.status, "healthy");
-//! ```
-//!
-//! ## Statistics Queries
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::stats::{StatsQuery, TimeRange};
-//! use chrono::{Utc, Duration};
-//!
-//! let time_range = TimeRange {
-//!     start: Utc::now() - Duration::hours(24),
-//!     end: Utc::now(),
-//! };
-//!
-//! let query = StatsQuery {
-//!     time_range: Some(time_range),
-//!     queues: Some(vec!["email".to_string(), "notifications".to_string()]),
-//!     granularity: Some("hour".to_string()),
-//!     hours: None,
-//! };
-//!
-//! assert!(query.time_range.is_some());
-//! assert_eq!(query.queues.as_ref().unwrap().len(), 2);
-//! assert_eq!(query.granularity, Some("hour".to_string()));
-//! ```
-//!
-//! ## System Alerts
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::stats::SystemAlert;
-//! use chrono::Utc;
-//!
-//! let alert = SystemAlert {
-//!     severity: "warning".to_string(),
-//!     message: "Queue backlog detected".to_string(),
-//!     queue: Some("image_processing".to_string()),
-//!     metric: Some("pending_count".to_string()),
-//!     value: Some(1500.0),
-//!     threshold: Some(1000.0),
-//!     timestamp: Utc::now(),
-//! };
-//!
-//! assert_eq!(alert.severity, "warning");
-//! assert_eq!(alert.queue, Some("image_processing".to_string()));
-//! assert_eq!(alert.value, Some(1500.0));
-//! ```
-//!
-//! ## Performance Metrics
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::stats::PerformanceMetrics;
-//!
-//! let metrics = PerformanceMetrics {
-//!     database_response_time_ms: Some(5.2),
-//!     average_queue_depth: 15.5,
-//!     jobs_per_second: 8.3,
-//!     memory_usage_mb: Some(512.0),
-//!     cpu_usage_percent: Some(45.2),
-//!     active_workers: None, // not tracked: there is no worker registry
-//!     worker_utilization: None,
-//! };
-//!
-//! assert_eq!(metrics.database_response_time_ms, Some(5.2));
-//! assert_eq!(metrics.active_workers, None);
-//! ```
 
 use super::history::{ErrorGroup, JobHistory, MAX_BUCKETS, hour_floor};
 use super::{ApiResponse, error_reply, json_reply, with_shared};
@@ -1316,5 +1217,103 @@ mod tests {
         let json = serde_json::to_string(&alert).unwrap();
         assert!(json.contains("warning"));
         assert!(json.contains("High error rate"));
+    }
+}
+
+/// Examples that used to be doctests (moved in-crate when `hammerwork_web::__private` was removed).
+#[cfg(test)]
+mod doc_examples {
+
+    #[test]
+    fn example_1() {
+        use crate::api::stats::{SystemHealth, SystemOverview};
+        use chrono::Utc;
+
+        let overview = SystemOverview {
+            total_queues: 5,
+            total_jobs: 10000,
+            pending_jobs: 50,
+            running_jobs: 10,
+            completed_jobs: 9800,
+            failed_jobs: 125,
+            dead_jobs: 15,
+            overall_throughput: 150.5,
+            overall_error_rate: 0.0125,
+            avg_processing_time_ms: 250.0,
+            system_health: SystemHealth {
+                status: "healthy".to_string(),
+                database_healthy: true,
+                high_error_rate: false,
+                queue_backlog: false,
+                slow_processing: false,
+                alerts: vec![],
+            },
+            uptime_seconds: 86400,
+            last_updated: Utc::now(),
+        };
+
+        assert_eq!(overview.total_queues, 5);
+        assert_eq!(overview.overall_error_rate, 0.0125);
+        assert_eq!(overview.system_health.status, "healthy");
+    }
+
+    #[test]
+    fn example_2() {
+        use crate::api::stats::{StatsQuery, TimeRange};
+        use chrono::{Duration, Utc};
+
+        let time_range = TimeRange {
+            start: Utc::now() - Duration::hours(24),
+            end: Utc::now(),
+        };
+
+        let query = StatsQuery {
+            time_range: Some(time_range),
+            queues: Some(vec!["email".to_string(), "notifications".to_string()]),
+            granularity: Some("hour".to_string()),
+            hours: None,
+        };
+
+        assert!(query.time_range.is_some());
+        assert_eq!(query.queues.as_ref().unwrap().len(), 2);
+        assert_eq!(query.granularity, Some("hour".to_string()));
+    }
+
+    #[test]
+    fn example_3() {
+        use crate::api::stats::SystemAlert;
+        use chrono::Utc;
+
+        let alert = SystemAlert {
+            severity: "warning".to_string(),
+            message: "Queue backlog detected".to_string(),
+            queue: Some("image_processing".to_string()),
+            metric: Some("pending_count".to_string()),
+            value: Some(1500.0),
+            threshold: Some(1000.0),
+            timestamp: Utc::now(),
+        };
+
+        assert_eq!(alert.severity, "warning");
+        assert_eq!(alert.queue, Some("image_processing".to_string()));
+        assert_eq!(alert.value, Some(1500.0));
+    }
+
+    #[test]
+    fn example_4() {
+        use crate::api::stats::PerformanceMetrics;
+
+        let metrics = PerformanceMetrics {
+            database_response_time_ms: Some(5.2),
+            average_queue_depth: 15.5,
+            jobs_per_second: 8.3,
+            memory_usage_mb: Some(512.0),
+            cpu_usage_percent: Some(45.2),
+            active_workers: None, // not tracked: there is no worker registry
+            worker_utilization: None,
+        };
+
+        assert_eq!(metrics.database_response_time_ms, Some(5.2));
+        assert_eq!(metrics.active_workers, None);
     }
 }

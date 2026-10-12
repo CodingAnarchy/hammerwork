@@ -33,6 +33,9 @@ pub struct JobSelector {
     pub started_before: Option<DateTime<Utc>>,
     /// Only `Running` jobs that `requeue_stale_jobs` would reclaim (see [`StaleRunning`]).
     pub stale_running: Option<StaleRunning>,
+    /// Only `Running` jobs without a lease of their current run (see
+    /// [`StaleRunning::leaseless_condition`]).
+    pub leaseless_running: bool,
     /// Only jobs with no `started_at`.
     pub never_started: bool,
     /// Only jobs that used all their attempts.
@@ -59,6 +62,16 @@ impl StaleRunning {
     pub fn condition(&self, params: &mut SqlParams) -> String {
         let now = params.time(self.now);
         format!("(last_heartbeat_at >= started_at AND lease_expires_at < {now})")
+    }
+
+    /// The SQL condition for a `Running` job that has no lease of its current run (left
+    /// by a Hammerwork 1.x worker). The library never reclaims such a job, so it is
+    /// neither stale nor stuck by the lease rule; it needs the one-off fix in the 3.0
+    /// upgrade guide. The complement of "has a lease": a heartbeat at or after the start,
+    /// and an expiry.
+    pub fn leaseless_condition() -> &'static str {
+        "(last_heartbeat_at IS NULL OR started_at IS NULL OR last_heartbeat_at < started_at \
+         OR lease_expires_at IS NULL)"
     }
 }
 
@@ -94,6 +107,9 @@ impl JobSelector {
         }
         if let Some(stale) = &self.stale_running {
             conditions.push(stale.condition(&mut params));
+        }
+        if self.leaseless_running {
+            conditions.push(StaleRunning::leaseless_condition().to_string());
         }
         if self.never_started {
             conditions.push("started_at IS NULL".to_string());

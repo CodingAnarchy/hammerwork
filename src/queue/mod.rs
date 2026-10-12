@@ -1017,6 +1017,11 @@ pub trait DatabaseQueue: private::Sealed + Send + Sync {
     /// the others go back to `Pending` and are scheduled immediately. The interrupted
     /// run already counted as an attempt when the job was dequeued.
     ///
+    /// With `queue_name` set, only the stale jobs of that queue are reclaimed; the
+    /// queue filter is part of the same atomic statement (or transaction) as the lease
+    /// check, so a job whose worker renews its lease meanwhile is never touched. `None`
+    /// reclaims every queue.
+    ///
     /// Safe to call from several pools or processes at once: rows are claimed with row
     /// locks (`FOR UPDATE SKIP LOCKED`) and only updated while still `Running`, so each
     /// stale job is reclaimed exactly once, and a job whose lease is still valid is
@@ -1028,7 +1033,7 @@ pub trait DatabaseQueue: private::Sealed + Send + Sync {
     /// use hammerwork::queue::DatabaseQueue;
     ///
     /// # async fn example(queue: &impl DatabaseQueue) -> hammerwork::Result<()> {
-    /// let recovery = queue.requeue_stale_jobs().await?;
+    /// let recovery = queue.requeue_stale_jobs(None).await?;
     /// println!(
     ///     "requeued {} jobs, marked {} dead",
     ///     recovery.requeued.len(),
@@ -1037,7 +1042,7 @@ pub trait DatabaseQueue: private::Sealed + Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    async fn requeue_stale_jobs(&self) -> Result<StaleJobRecovery>;
+    async fn requeue_stale_jobs(&self, queue_name: Option<&str>) -> Result<StaleJobRecovery>;
 
     /// Enforces the retention policies of encrypted jobs: deletes finished encrypted jobs
     /// whose retention period has ended.

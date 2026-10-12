@@ -98,44 +98,19 @@ compile_error!(
 );
 
 mod api;
+#[cfg(test)]
+mod api_tests;
 mod auth;
 mod config;
 mod live;
 mod security;
 mod server;
 mod websocket;
+#[cfg(test)]
+mod websocket_archive_tests;
 
 pub use config::{AuthConfig, DashboardConfig, WebSocketConfig};
 pub use server::WebDashboard;
-
-/// Internals re-exported for this crate's own integration tests and doc examples.
-///
-/// Not part of the public API: it is hidden from the documentation and may change in any
-/// release, including patch releases.
-#[doc(hidden)]
-pub mod __private {
-    pub mod api {
-        pub use crate::api::*;
-    }
-    pub mod auth {
-        pub use crate::auth::*;
-    }
-    pub mod config {
-        pub use crate::config::*;
-    }
-    pub mod live {
-        pub use crate::live::*;
-    }
-    pub mod security {
-        pub use crate::security::*;
-    }
-    pub mod server {
-        pub use crate::server::*;
-    }
-    pub mod websocket {
-        pub use crate::websocket::*;
-    }
-}
 
 /// Result type alias for consistent error handling
 pub type Result<T> = std::result::Result<T, anyhow::Error>;

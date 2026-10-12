@@ -60,8 +60,8 @@ hammerwork/
 │   ├── setup-db.sh             # Database management
 │   └── cleanup.sh              # Environment cleanup
 ├── config/
-│   ├── init-postgres.sql       # PostgreSQL initialization
-│   └── init-mysql.sql          # MySQL initialization
+│   ├── init-postgres.sql       # PostgreSQL initialization (no schema)
+│   └── init-mysql.sql          # MySQL initialization (user permissions)
 ├── integrations/
 │   ├── shared/
 │   │   └── test_scenarios.rs   # Common test scenarios
@@ -350,9 +350,10 @@ docker system prune
 
 ### Database Schema Changes
 
-1. **Update Initialization Scripts**:
-   - Modify `config/init-postgres.sql`
-   - Modify `config/init-mysql.sql`
+1. **Add a Migration**:
+   - Add the versioned migration files under `src/migrations/` and register them. The
+     schema is created by `cargo hammerwork migration run`, never by
+     `config/init-postgres.sql` or `config/init-mysql.sql`, which set up no tables
 
 2. **Update Database Queue Implementations**:
    - Modify PostgreSQL implementation in `src/queue/postgres.rs`

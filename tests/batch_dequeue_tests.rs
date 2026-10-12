@@ -282,7 +282,7 @@ where
         .unwrap();
     assert_eq!(claimed.len(), 3);
 
-    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
     for job in &claimed {
         assert!(
             !recovery.requeued.contains(&job.id) && !recovery.dead.contains(&job.id),
@@ -642,7 +642,7 @@ mod worker {
 
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let recovery = queue.requeue_stale_jobs().await.unwrap();
+            let recovery = queue.requeue_stale_jobs(None).await.unwrap();
             for id in &ids {
                 assert!(
                     !recovery.requeued.contains(id) && !recovery.dead.contains(id),

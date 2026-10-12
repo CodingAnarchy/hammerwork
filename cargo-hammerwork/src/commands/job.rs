@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::utils::database::{DatabasePool, JobQueueWrapper};
 use crate::utils::display::JobTable;
 use crate::utils::job_ops::{
-    JobSelector, cancel_many, cancel_one, retry_many, retry_one, select_job_ids,
+    JobSelector, StaleRunning, cancel_many, cancel_one, retry_many, retry_one, select_job_ids,
 };
 use crate::utils::sql::{
     Backend, Bind, FAILURE_STATUSES, FAILURE_STATUSES_SQL, IdText, IntervalUnit, SqlParams,
@@ -167,11 +167,26 @@ pub enum JobCommand {
             upgrade guide for the one-off fix. Stale jobs with attempts left go back to \
             Pending; the rest are marked Dead. Safe to run while workers and other \
             reapers are running.\n\n\
-            Example: cargo hammerwork job requeue-stale"
+            Use --dry-run to count what would be reclaimed without changing anything, \
+            and --queue to reclaim (or count) one queue only.\n\n\
+            Examples:\n  cargo hammerwork job requeue-stale --dry-run\n  \
+            cargo hammerwork job requeue-stale --queue emails"
     )]
     RequeueStale {
         #[arg(short = 'u', long, help = "Database connection URL")]
         database_url: Option<String>,
+        #[arg(
+            short = 'n',
+            short_alias = 'Q',
+            long,
+            help = "Only reclaim jobs in this queue"
+        )]
+        queue: Option<String>,
+        #[arg(
+            long,
+            help = "Count the jobs that would be reclaimed without changing them"
+        )]
+        dry_run: bool,
     },
 }
 
@@ -276,8 +291,8 @@ impl JobCommand {
                 )
                 .await?;
             }
-            JobCommand::RequeueStale { .. } => {
-                requeue_stale_jobs(pool).await?;
+            JobCommand::RequeueStale { queue, dry_run, .. } => {
+                requeue_stale_jobs(pool, queue.as_deref(), *dry_run).await?;
             }
         }
         Ok(())
@@ -717,9 +732,38 @@ fn delayed_schedule(
         .ok_or_else(|| anyhow::anyhow!("--delay {} seconds is out of range", delay_secs))
 }
 
-async fn requeue_stale_jobs(pool: DatabasePool) -> Result<()> {
-    let recovery = with_queue!(pool.create_job_queue(), |queue| {
-        queue.requeue_stale_jobs().await?
+/// The `Running` jobs `requeue_stale_jobs` would reclaim (their lease expired), optionally
+/// in one queue. The same lease-only rule the library applies.
+fn stale_selector(queue: Option<&str>) -> JobSelector {
+    JobSelector {
+        statuses: vec![JobStatus::Running],
+        queue: queue.map(str::to_string),
+        stale_running: Some(StaleRunning::new(chrono::Utc::now())),
+        ..Default::default()
+    }
+}
+
+async fn requeue_stale_jobs(pool: DatabasePool, queue: Option<&str>, dry_run: bool) -> Result<()> {
+    let scope = queue.map_or_else(|| "all queues".to_string(), |q| format!("queue '{q}'"));
+
+    if dry_run {
+        let ids = select_job_ids(&pool, &stale_selector(queue)).await?;
+        for id in &ids {
+            info!("Would reclaim stale job {}", id);
+        }
+        info!(
+            "🔍 Dry run: {} stale job(s) in {} would be reclaimed (lease expired). Nothing was changed.",
+            ids.len(),
+            scope
+        );
+        return Ok(());
+    }
+
+    // One atomic reclaim in the library, scoped to the queue when given: the queue filter
+    // sits in the same statement as the lease check, so a job whose worker renews its
+    // lease meanwhile is never touched.
+    let recovery = with_queue!(pool.create_job_queue(), |q| {
+        q.requeue_stale_jobs(queue).await?
     });
 
     for id in &recovery.requeued {
@@ -729,8 +773,9 @@ async fn requeue_stale_jobs(pool: DatabasePool) -> Result<()> {
         info!("💀 Marked stale job {} dead (no attempts left)", id);
     }
     info!(
-        "✅ Reclaimed {} stale jobs ({} requeued, {} dead)",
+        "✅ Reclaimed {} stale jobs in {} ({} requeued, {} dead)",
         recovery.total(),
+        scope,
         recovery.requeued.len(),
         recovery.dead.len()
     );
@@ -923,24 +968,61 @@ mod tests {
     fn test_requeue_stale_parses() {
         let cli = TestCli::try_parse_from(["test", "requeue-stale"]).unwrap();
         match cli.command {
-            JobCommand::RequeueStale { database_url } => assert!(database_url.is_none()),
-            _ => panic!("expected RequeueStale"),
-        }
-
-        let cli =
-            TestCli::try_parse_from(["test", "requeue-stale", "-u", "postgres://localhost/db"])
-                .unwrap();
-        match cli.command {
-            JobCommand::RequeueStale { database_url } => {
-                assert_eq!(database_url.as_deref(), Some("postgres://localhost/db"));
+            JobCommand::RequeueStale {
+                database_url,
+                queue,
+                dry_run,
+            } => {
+                assert!(database_url.is_none() && queue.is_none());
+                assert!(!dry_run);
             }
             _ => panic!("expected RequeueStale"),
         }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "requeue-stale",
+            "-u",
+            "postgres://localhost/db",
+            "--queue",
+            "emails",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            JobCommand::RequeueStale {
+                database_url,
+                queue,
+                dry_run,
+            } => {
+                assert_eq!(database_url.as_deref(), Some("postgres://localhost/db"));
+                assert_eq!(queue.as_deref(), Some("emails"));
+                assert!(dry_run);
+            }
+            _ => panic!("expected RequeueStale"),
+        }
+        assert!(TestCli::try_parse_from(["test", "requeue-stale", "-n", "q"]).is_ok());
 
         // The 2.x age threshold for lease-less jobs is gone.
         assert!(
             TestCli::try_parse_from(["test", "requeue-stale", "--older-than-secs", "60"]).is_err()
         );
+    }
+
+    #[test]
+    fn test_stale_selector_is_lease_only_and_scoped_by_bound_queue() {
+        let (sql, binds) = stale_selector(Some(HOSTILE_QUEUE)).sql(Backend::Postgres);
+        assert_eq!(
+            sql,
+            "SELECT id FROM hammerwork_jobs WHERE status IN ($1) AND queue_name = $2 AND (last_heartbeat_at >= started_at AND lease_expires_at < $3) ORDER BY created_at"
+        );
+        assert_eq!(binds.len(), 3);
+        assert_eq!(binds[1], Bind::Text(HOSTILE_QUEUE.into()));
+        assert!(!sql.contains("DROP"));
+
+        let (sql, binds) = stale_selector(None).sql(Backend::MySql);
+        assert!(!sql.contains("queue_name"));
+        assert_eq!(binds.len(), 2);
     }
 
     #[test]
@@ -1611,8 +1693,44 @@ mod tests {
         let leaseless = seed(pool, &stale).await;
         let fresh = seed(pool, &SeedJob::new(&q, "Running")).await;
         backdate(pool, &fresh, "started_at", 0).await;
-        run(&["requeue-stale"]).await.unwrap();
+        // another queue's stale job, to prove --queue scopes the reclaim
+        let other_queue = format!("{q}_other");
+        let mut other_stale = SeedJob::new(&other_queue, "Running");
+        other_stale.started_long_ago = true;
+        let other = seed(pool, &other_stale).await;
+        set_time(pool, &other, "last_heartbeat_at", -60).await;
+        set_time(pool, &other, "lease_expires_at", -10).await;
+        let stale_count = |queue: Option<&str>| {
+            let selector = stale_selector(queue);
+            async move { select_job_ids(pool, &selector).await.unwrap().len() }
+        };
+        assert_eq!(stale_count(Some(&q)).await, 2);
+        assert_eq!(stale_count(Some(&other_queue)).await, 1);
+
+        // --dry-run counts the same jobs and changes nothing
+        run(&["requeue-stale", "--dry-run"]).await.unwrap();
+        run(&["requeue-stale", "--dry-run", "--queue", &q])
+            .await
+            .unwrap();
+        assert_eq!(job_status(pool, &retryable).await, "Running");
+        assert_eq!(job_status(pool, &other).await, "Running");
+        assert_eq!(stale_count(Some(&q)).await, 2);
+
+        // --queue reclaims that queue only: retryable goes back to Pending, exhausted dies
+        run(&["requeue-stale", "--queue", &q]).await.unwrap();
+        assert_eq!(job_status(pool, &other).await, "Running");
+        assert_eq!(job_status(pool, &leaseless).await, "Running");
+        assert_eq!(job_status(pool, &fresh).await, "Running");
         assert_eq!(job_status(pool, &retryable).await, "Pending");
+        assert_eq!(job_status(pool, &exhausted).await, "Dead");
+        assert_eq!(stale_count(Some(&q)).await, 0);
+        assert_eq!(stale_count(Some(&other_queue)).await, 1);
+
+        // without --queue every queue is reclaimed
+        run(&["requeue-stale"]).await.unwrap();
+        assert_eq!(job_status(pool, &other).await, "Pending");
+        assert_eq!(job_status(pool, &retryable).await, "Pending");
+        assert_eq!(job_status(pool, &exhausted).await, "Dead");
         assert_eq!(job_status(pool, &exhausted).await, "Dead");
         assert_eq!(job_status(pool, &leaseless).await, "Running");
         assert_eq!(job_status(pool, &fresh).await, "Running");

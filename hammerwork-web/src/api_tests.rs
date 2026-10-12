@@ -2,16 +2,16 @@
 //! static files) served over a real database, once per backend, with authentication on and
 //! off. Every endpoint is exercised for its success and its error paths.
 
+use crate::api::history::JobHistory;
+use crate::api::system::SystemState;
+use crate::auth::AuthState;
+use crate::config::{AuthConfig, DashboardConfig};
+use crate::security::AllowedOrigins;
+use crate::server::app_routes;
+use crate::websocket::WebSocketState;
 use hammerwork::archive::{ArchivalConfig, ArchivalPolicy, ArchivalReason};
 use hammerwork::queue::DatabaseQueue;
 use hammerwork::{Job, JobPriority, JobQueue};
-use hammerwork_web::__private::api::history::JobHistory;
-use hammerwork_web::__private::api::system::SystemState;
-use hammerwork_web::__private::auth::AuthState;
-use hammerwork_web::__private::config::{AuthConfig, DashboardConfig};
-use hammerwork_web::__private::security::AllowedOrigins;
-use hammerwork_web::__private::server::app_routes;
-use hammerwork_web::__private::websocket::WebSocketState;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -41,9 +41,11 @@ impl<Q: JobHistory + 'static> App<Q> {
         std::fs::create_dir(static_dir.path().join("assets")).unwrap();
         std::fs::write(static_dir.path().join("asset.txt"), "static file").unwrap();
 
-        let mut config = DashboardConfig::default();
-        config.static_dir = static_dir.path().to_path_buf();
-        config.auth = auth.clone();
+        let config = DashboardConfig {
+            static_dir: static_dir.path().to_path_buf(),
+            auth: auth.clone(),
+            ..DashboardConfig::default()
+        };
         let system_state = Arc::new(RwLock::new(SystemState::new(
             config.clone(),
             database_type.to_string(),
@@ -1487,7 +1489,7 @@ async fn request_hardening<Q: JobHistory + 'static>(app: &App<Q>) {
     )
     .await;
     assert_eq!(status, 413);
-    let ids: Vec<String> = (0..=hammerwork_web::__private::api::jobs::MAX_BULK_JOB_IDS)
+    let ids: Vec<String> = (0..=crate::api::jobs::MAX_BULK_JOB_IDS)
         .map(|_| uuid::Uuid::new_v4().to_string())
         .collect();
     let (status, body) = app

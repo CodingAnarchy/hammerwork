@@ -19,43 +19,6 @@
 //!   addresses. After `max_failed_attempts` failures the client is refused for
 //!   `lockout_duration`; afterwards the count starts over, and a successful login resets it.
 //!   At most [`MAX_TRACKED_CLIENTS`] clients are tracked.
-//!
-//! # Examples
-//!
-//! ## Basic Authentication Setup
-//!
-//! ```rust
-//! use hammerwork_web::__private::auth::AuthState;
-//! use hammerwork_web::__private::config::AuthConfig;
-//!
-//! let auth_config = AuthConfig::default()
-//!     .with_enabled(true)
-//!     .with_username("admin".to_string())
-//!     // A bcrypt hash, for example from `bcrypt::hash(password, bcrypt::DEFAULT_COST)`.
-//!     .with_password_hash(
-//!         "$2b$12$abcdefghijklmnopqrstuuJ0Y7gZ8z5d0FQqfJb8yX3QZpGQ0lW6e".to_string(),
-//!     );
-//!
-//! let auth_state = AuthState::new(auth_config);
-//! assert!(auth_state.is_enabled());
-//! ```
-//!
-//! ## Extracting Basic Auth Credentials
-//!
-//! ```rust
-//! use hammerwork_web::__private::auth::extract_basic_auth;
-//!
-//! // "admin:password" in base64 is "YWRtaW46cGFzc3dvcmQ="
-//! let auth_header = "Basic YWRtaW46cGFzc3dvcmQ=";
-//! let (username, password) = extract_basic_auth(auth_header).unwrap();
-//!
-//! assert_eq!(username, "admin");
-//! assert_eq!(password, "password");
-//!
-//! // Invalid format returns None
-//! let result = extract_basic_auth("Bearer token123");
-//! assert!(result.is_none());
-//! ```
 
 use crate::config::AuthConfig;
 use crate::security::RequestRefused;
@@ -198,6 +161,7 @@ impl AuthState {
         self.inner.config.enabled
     }
 
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     /// Verify credentials from an unknown client address.
     ///
     /// Equivalent to [`check`](Self::check) with no client address, returning whether the
@@ -313,11 +277,13 @@ impl AuthState {
         verified.insert(credentials, now + ttl);
     }
 
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     /// Whether `username` is locked out when connecting from an unknown address.
     pub async fn is_locked_out(&self, username: &str) -> bool {
         self.is_locked_out_from(None, username).await
     }
 
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     /// Whether `username` is locked out when connecting from `client`.
     pub async fn is_locked_out_from(&self, client: Option<IpAddr>, username: &str) -> bool {
         self.key_locked_out(self.attempt_key(client, username))
@@ -372,6 +338,7 @@ impl AuthState {
         lock(&self.inner.verified).retain(|_, expires| *expires > now);
     }
 
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     /// The number of clients with failure records (for tests and monitoring).
     pub fn tracked_clients(&self) -> usize {
         lock(&self.inner.failed_attempts).len()
@@ -384,21 +351,6 @@ impl AuthState {
 /// The header format should be: `Basic <base64-encoded-credentials>`
 /// where credentials are in the format `username:password`.
 ///
-/// # Examples
-///
-/// ```rust
-/// use hammerwork_web::__private::auth::extract_basic_auth;
-///
-/// // Valid basic auth header
-/// let auth_header = "Basic YWRtaW46cGFzc3dvcmQ="; // admin:password
-/// let (username, password) = extract_basic_auth(auth_header).unwrap();
-/// assert_eq!(username, "admin");
-/// assert_eq!(password, "password");
-///
-/// // Invalid format returns None
-/// assert!(extract_basic_auth("Bearer token123").is_none());
-/// assert!(extract_basic_auth("Basic invalid_base64").is_none());
-/// ```
 ///
 /// # Returns
 ///
@@ -1114,5 +1066,58 @@ mod tests {
 
         let custom = warp::test::request().path("/fail").reply(&filter).await;
         assert_eq!(custom.status(), 400);
+    }
+}
+
+/// Examples that used to be doctests (moved in-crate when `hammerwork_web::__private` was removed).
+#[cfg(test)]
+mod doc_examples {
+
+    #[test]
+    fn example_1() {
+        use crate::auth::AuthState;
+        use crate::config::AuthConfig;
+
+        let auth_config = AuthConfig::default()
+            .with_enabled(true)
+            .with_username("admin".to_string())
+            // A bcrypt hash, for example from `bcrypt::hash(password, bcrypt::DEFAULT_COST)`.
+            .with_password_hash(
+                "$2b$12$abcdefghijklmnopqrstuuJ0Y7gZ8z5d0FQqfJb8yX3QZpGQ0lW6e".to_string(),
+            );
+
+        let auth_state = AuthState::new(auth_config);
+        assert!(auth_state.is_enabled());
+    }
+
+    #[test]
+    fn example_2() {
+        use crate::auth::extract_basic_auth;
+
+        // "admin:password" in base64 is "YWRtaW46cGFzc3dvcmQ="
+        let auth_header = "Basic YWRtaW46cGFzc3dvcmQ=";
+        let (username, password) = extract_basic_auth(auth_header).unwrap();
+
+        assert_eq!(username, "admin");
+        assert_eq!(password, "password");
+
+        // Invalid format returns None
+        let result = extract_basic_auth("Bearer token123");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn example_3() {
+        use crate::auth::extract_basic_auth;
+
+        // Valid basic auth header
+        let auth_header = "Basic YWRtaW46cGFzc3dvcmQ="; // admin:password
+        let (username, password) = extract_basic_auth(auth_header).unwrap();
+        assert_eq!(username, "admin");
+        assert_eq!(password, "password");
+
+        // Invalid format returns None
+        assert!(extract_basic_auth("Bearer token123").is_none());
+        assert!(extract_basic_auth("Basic invalid_base64").is_none());
     }
 }

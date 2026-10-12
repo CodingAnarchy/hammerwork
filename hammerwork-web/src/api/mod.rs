@@ -8,45 +8,9 @@
 //!
 //! All API endpoints return responses in a consistent format:
 //!
-//! ```rust
-//! use hammerwork_web::__private::api::ApiResponse;
-//! use serde_json::json;
-//!
-//! // Success response
-//! let success_response = ApiResponse::success(json!({"count": 42}));
-//! assert!(success_response.success);
-//! assert!(success_response.data.is_some());
-//! assert!(success_response.error.is_none());
-//!
-//! // Error response
-//! let error_response: ApiResponse<()> = ApiResponse::error("Something went wrong".to_string());
-//! assert!(!error_response.success);
-//! assert!(error_response.data.is_none());
-//! assert!(error_response.error.is_some());
-//! ```
-//!
 //! # Pagination
 //!
 //! Many endpoints support pagination using query parameters:
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::{PaginationParams, PaginationMeta};
-//!
-//! let params = PaginationParams {
-//!     page: Some(2),
-//!     limit: Some(50),
-//!     offset: None,
-//! };
-//!
-//! assert_eq!(params.get_limit(), 50);
-//! assert_eq!(params.get_offset(), 50); // (page-1) * limit
-//!
-//! let meta = PaginationMeta::new(&params, 200); // 200 total items
-//! assert_eq!(meta.page, 2);
-//! assert_eq!(meta.total_pages, 4);
-//! assert!(meta.has_next);
-//! assert!(meta.has_prev);
-//! ```
 
 /// Unwrap a `Result` inside a warp handler returning `Ok(reply)`; on error log it
 /// and return a `500` JSON error response instead of swallowing the failure.
@@ -272,6 +236,7 @@ impl SortParams {
             .is_some_and(|order| order.trim().eq_ignore_ascii_case("asc"))
     }
 
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     pub fn get_order_by(&self) -> (String, String) {
         let field = self.sort_by.as_deref().unwrap_or("created_at").to_string();
         let direction = if self.is_ascending() { "ASC" } else { "DESC" }.to_string();
@@ -279,6 +244,7 @@ impl SortParams {
     }
 }
 
+#[allow(dead_code)] // not reached from the running dashboard; exercised by tests
 /// Common error handling for API endpoints
 pub async fn handle_api_error(
     err: warp::Rejection,
@@ -966,5 +932,49 @@ mod undecodable_row_tests {
             }
         };
         listings_skip_undecodable_rows(queue, sql, true).await;
+    }
+}
+
+/// Examples that used to be doctests (moved in-crate when `hammerwork_web::__private` was removed).
+#[cfg(test)]
+mod doc_examples {
+
+    #[test]
+    fn example_1() {
+        use crate::api::ApiResponse;
+        use serde_json::json;
+
+        // Success response
+        let success_response = ApiResponse::success(json!({"count": 42}));
+        assert!(success_response.success);
+        assert!(success_response.data.is_some());
+        assert!(success_response.error.is_none());
+
+        // Error response
+        let error_response: ApiResponse<()> =
+            ApiResponse::error("Something went wrong".to_string());
+        assert!(!error_response.success);
+        assert!(error_response.data.is_none());
+        assert!(error_response.error.is_some());
+    }
+
+    #[test]
+    fn example_2() {
+        use crate::api::{PaginationMeta, PaginationParams};
+
+        let params = PaginationParams {
+            page: Some(2),
+            limit: Some(50),
+            offset: None,
+        };
+
+        assert_eq!(params.get_limit(), 50);
+        assert_eq!(params.get_offset(), 50); // (page-1) * limit
+
+        let meta = PaginationMeta::new(&params, 200); // 200 total items
+        assert_eq!(meta.page, 2);
+        assert_eq!(meta.total_pages, 4);
+        assert!(meta.has_next);
+        assert!(meta.has_prev);
     }
 }

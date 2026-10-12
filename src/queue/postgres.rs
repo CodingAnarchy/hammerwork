@@ -1870,8 +1870,12 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
         }
     }
 
-    async fn requeue_stale_jobs(&self) -> Result<super::StaleJobRecovery> {
-        let recovery = super::retry_on_conflict(|| self.requeue_stale_jobs_once()).await?;
+    async fn requeue_stale_jobs(
+        &self,
+        queue_name: Option<&str>,
+    ) -> Result<super::StaleJobRecovery> {
+        let recovery =
+            super::retry_on_conflict(|| self.requeue_stale_jobs_once(queue_name)).await?;
 
         if !recovery.is_empty() {
             tracing::warn!(
@@ -1923,14 +1927,18 @@ impl DatabaseQueue for crate::queue::JobQueue<Postgres> {
 }
 
 impl crate::queue::JobQueue<Postgres> {
-    async fn requeue_stale_jobs_once(&self) -> Result<super::StaleJobRecovery> {
+    async fn requeue_stale_jobs_once(
+        &self,
+        queue_name: Option<&str>,
+    ) -> Result<super::StaleJobRecovery> {
         let mut tx = self.pool.begin().await?;
-        let result = Self::requeue_stale_jobs_in_tx(&mut tx).await;
+        let result = Self::requeue_stale_jobs_in_tx(&mut tx, queue_name).await;
         super::end_transaction(tx, result).await
     }
 
     async fn requeue_stale_jobs_in_tx(
         conn: &mut sqlx::PgConnection,
+        queue_name: Option<&str>,
     ) -> Result<super::StaleJobRecovery> {
         let now = db_now(conn).await?;
 
@@ -1949,6 +1957,7 @@ impl crate::queue::JobQueue<Postgres> {
                 WHERE status = $1
                   AND last_heartbeat_at >= started_at
                   AND lease_expires_at < $2
+                  AND ($6::text IS NULL OR queue_name = $6)
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE hammerwork_jobs AS j
@@ -1971,6 +1980,7 @@ impl crate::queue::JobQueue<Postgres> {
         .bind(JobStatus::Dead)
         .bind(JobStatus::Pending)
         .bind(super::STALE_JOB_ERROR_MESSAGE)
+        .bind(queue_name)
         .fetch_all(&mut *conn)
         .await?;
 

@@ -200,7 +200,7 @@ where
     // Another test's reaper may reclaim some of them first; either way they end up
     // reclaimed and this call succeeds.
     queue
-        .requeue_stale_jobs()
+        .requeue_stale_jobs(None)
         .await
         .expect("an undecodable stale row must not fail the reaper");
     let counts = queue.get_job_counts_by_status(&name).await.unwrap();

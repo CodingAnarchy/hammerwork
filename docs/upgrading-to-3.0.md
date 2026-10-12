@@ -4,6 +4,27 @@ Hammerwork 3.0 is a major release. This guide lists each breaking change, what i
 affects and what you need to change in your code, configuration or deployment. Read
 it together with the `3.0.0` entry in the [CHANGELOG](../CHANGELOG.md).
 
+## Upgrade order
+
+Do the upgrade in this order. Each step links to the section with the details.
+
+1. **Stop every Hammerwork 1.x worker**, and anything else built on 1.x that claims
+   jobs. 3.0 never reclaims a `Running` job that has no lease, and 1.x workers claimed
+   jobs without one ([Stop every 1.x worker first](#stop-every-1x-worker-first)).
+2. **Update your code and build.** Use Rust 1.94 and sqlx 0.9
+   ([sqlx 0.9 and Rust 1.94](#sqlx-09-and-rust-194)), name the Cargo features you use
+   ([Feature flags](#feature-flags)), and fix the breaking API changes this guide lists.
+3. **Drain the 2.x workers, back up the database and run `cargo hammerwork migration
+   run` off-peak.** On MySQL, migration 021 rewrites every table and blocks writes to it
+   while it does ([MySQL timestamps](#mysql-timestamps-migration-021)). Confirm the
+   result with `cargo hammerwork migration status`, which lists the applied and
+   pending migrations.
+4. **Run `cargo hammerwork maintenance check --fix`** to give the `Running` jobs a 1.x
+   worker left behind a lease. Preview what the reaper would reclaim with
+   `cargo hammerwork job requeue-stale --dry-run` (add `--queue <name>` to look at one
+   queue).
+5. **Start the 3.0 workers.**
+
 ## sqlx 0.9 and Rust 1.94
 
 Hammerwork 3.0 depends on [sqlx](https://crates.io/crates/sqlx) 0.9 instead of 0.8,
@@ -106,7 +127,7 @@ For other sqlx 0.9 changes that may affect your own sqlx code (`RawSql`,
 Three changes to the Cargo features of `hammerwork` (#92):
 
 1. **No default features.** In 2.x, `default = ["metrics", "alerting", "webhooks"]`. In 3.0, `default = []`, so a plain `hammerwork` dependency builds only the queue, worker and job APIs, without `warp`, `reqwest`, `lettre` or `prometheus`.
-2. **`azure-kv` is now `azure-kms`**, like `aws-kms`, `gcp-kms` and `vault-kms`. There is no alias.
+2. **`azure-kv` is now `azure-kms`**, like `aws-kms`, `gcp-kms` and `vault-kms`. There is no alias. The `cargo-hammerwork` crate renames its own `azure-kv` feature the same way, so `cargo install cargo-hammerwork --features azure-kv` becomes `--features azure-kms`.
 3. **`test` is now `test-queue`.** There is no alias.
 
 New: a `full` feature that enables `metrics`, `alerting`, `webhooks`, `streaming`, `tracing` and `encryption`. It does not include a database backend (`postgres`, `mysql`), a KMS key source, an event stream sink (`kafka`, `google-pubsub`, `kinesis`) or `test-queue`.
@@ -181,6 +202,20 @@ on. Use the CLI through the `cargo hammerwork` executable. If you need job, queu
 migration operations from Rust code, use the `hammerwork` crate (`DatabaseQueue`,
 `JobQueue`) directly.
 
+#### CLI behavior changes
+
+- `job requeue-stale` takes `--queue <name>` and `--dry-run`. The dry run counts the
+  jobs the lease rule would reclaim and changes nothing.
+- `monitor health` and `queue health` no longer call a `Running` job stuck because it
+  started more than an hour ago. A job is stuck when its lease expired, the rule the
+  reaper uses; a long-running job that keeps heartbeating is healthy. `Running` jobs
+  without a lease (left by a 1.x worker) are reported on their own row
+  (`Lease-less Running Jobs`) and are not counted as stuck. The JSON output of
+  `monitor health` gains that check.
+- `migration status` lists the migrations this version registers as applied or pending,
+  from the `hammerwork_migrations` table, instead of the columns of `hammerwork_jobs`.
+  Applied migrations this version does not know are listed separately.
+
 ### hammerwork-web
 
 The public API is `WebDashboard`, `DashboardConfig`, `AuthConfig` and `WebSocketConfig`,
@@ -208,6 +243,13 @@ Migrate imports as follows:
 | `hammerwork_web::config::WebSocketConfig` | `hammerwork_web::WebSocketConfig` |
 | `hammerwork_web::server::WebDashboard` | `hammerwork_web::WebDashboard` |
 | `hammerwork_web::server::app_routes`, `api::*`, `auth::*`, `security::*`, `websocket::*`, `live::*` | removed; mount the dashboard with `WebDashboard` |
+
+### Dashboard metrics endpoint
+
+`GET /api/system/metrics` no longer returns `metrics_endpoint`, `custom_metrics_count`
+or `last_scrape`. The dashboard serves no `/metrics` route and keeps no metrics registry,
+so they were always `"/metrics"`, `null` and `null`. Only `prometheus_enabled` (always
+`false`) remains.
 
 ## DatabaseQueue is sealed
 
@@ -376,8 +418,7 @@ column of every Hammerwork table (39 columns in `hammerwork_jobs`,
 `hammerwork_migrations`) to `DATETIME(6)`, which holds years 1000 to 9999. The three
 second-precision `DATETIME` columns of `hammerwork_workflows` (`created_at`,
 `completed_at`, `failed_at`) also become `DATETIME(6)`, so every MySQL time keeps
-microseconds. The 2038 checks
-are gone, and a new install gets the same schema by running all migrations.
+microseconds. The 2038 checks are gone, and a new install gets the same schema by running all migrations.
 
 What the migration keeps:
 
@@ -432,8 +473,8 @@ migration has finished. 2.x only ever binds UTC `DateTime<Utc>` values and write
 ignores the migration record it does not know. What 2.x does not gain is the longer
 range: it still rejects times after 2038 itself.
 
-The migration blocks writes while it runs, so 2.x workers will stall (and may time out
-waiting on locks) during the conversion, so stop them or let them drain first.
+The migration blocks writes while it runs, so 2.x workers stall (and may time out
+waiting on locks) during the conversion. Stop them or let them drain first.
 
 ## Non-exhaustive structs and enums
 
@@ -570,13 +611,13 @@ These stay exhaustive, so matching every variant keeps working: `JobStatus` and
 fixed scale, like `JobPriority`) and `alerting::SmtpTls` (the three ways to connect to an
 SMTP server).
 
-### `ArchivedJob` lists the workflow
+## `ArchivedJob` lists the workflow
 
 `ArchivedJob` has two new fields, `workflow_id` and `workflow_name`, filled in by
 `list_archived_jobs` on PostgreSQL, MySQL and `TestQueue` (the archive has stored them
 since migration 019). Both are `None` for a job outside a workflow.
 
-### Event subscriptions unregister when dropped
+## Event subscriptions unregister when dropped
 
 Dropping an `EventSubscription` now unregisters it from its `EventManager`: its filter
 stops counting toward `subscription_count` and `payload_wanted` without a call to
@@ -603,19 +644,12 @@ drop(subscription); // unregisters
 # }
 ```
 
-### Webhook statistics count failed attempts
+## Webhook statistics count failed attempts
 
 `WebhookStats` and `WebhookManagerStats` have a new `failed_attempts` counter: HTTP
 delivery attempts that failed, retries included, next to `total_attempts`. The
 per-delivery counters (`successful_deliveries`, `failed_deliveries`, `success_rate`) are
 unchanged. Serialized statistics without the field read it as 0.
-
-### Dashboard metrics endpoint
-
-`GET /api/system/metrics` no longer returns `metrics_endpoint`, `custom_metrics_count`
-or `last_scrape`. The dashboard serves no `/metrics` route and keeps no metrics registry,
-so they were always `"/metrics"`, `null` and `null`. Only `prometheus_enabled` (always
-`false`) remains.
 
 ## Removed legacy compatibility
 
@@ -654,7 +688,8 @@ So before you start any 3.0 worker:
    lease of their own alone. (`check --fix` retries `Running` jobs without a start time
    instead of giving them a lease.)
 3. Let the reaper reclaim them: a `WorkerPool` does within a minute of starting, or run
-   `cargo hammerwork job requeue-stale`. Jobs with attempts left go back to `Pending`,
+   `cargo hammerwork job requeue-stale` (`--dry-run` counts what it would reclaim
+   without changing anything, `--queue <name>` limits it to one queue). Jobs with attempts left go back to `Pending`,
    the others to `Dead`, with the usual side effects (recurring jobs are rescheduled,
    dependents, workflows and batches see the failure).
 
@@ -665,7 +700,10 @@ them by hand; `cargo hammerwork maintenance check` reports how many there are.
 ### Stale job API
 
 `DatabaseQueue::requeue_stale_jobs` and `WorkerPool::with_stale_job_reaper` lose their
-`older_than` argument, which only applied to lease-less jobs:
+`older_than` argument, which only applied to lease-less jobs. `requeue_stale_jobs` takes
+an optional queue name instead: `None` reclaims every queue, as before, and
+`Some("emails")` reclaims that queue only, inside the same atomic statement as the lease
+check:
 
 ```rust,no_run
 # async fn example(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>) -> hammerwork::Result<()> {
@@ -677,10 +715,11 @@ use std::time::Duration;
 // let pool = WorkerPool::new().with_stale_job_reaper(Duration::from_secs(30), Duration::from_secs(600));
 
 // After (3.0):
-let recovery = queue.requeue_stale_jobs().await?;
+let recovery = queue.requeue_stale_jobs(None).await?;
+let emails_only = queue.requeue_stale_jobs(Some("emails")).await?;
 let pool: WorkerPool<sqlx::Postgres> =
     WorkerPool::new().with_stale_job_reaper(Duration::from_secs(30));
-# let _ = (recovery, pool);
+# let _ = (recovery, emails_only, pool);
 # Ok(())
 # }
 ```

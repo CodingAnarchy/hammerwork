@@ -11,72 +11,6 @@
 //! - `POST /api/jobs/{id}/actions` - Perform actions on a job (retry, cancel, delete)
 //! - `POST /api/jobs/bulk` - Perform bulk actions on multiple jobs
 //! - `POST /api/jobs/search` - Search jobs with full-text queries
-//!
-//! # Examples
-//!
-//! ## Creating a Job
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::jobs::CreateJobRequest;
-//! use serde_json::json;
-//!
-//! let create_request = CreateJobRequest {
-//!     queue_name: "email_queue".to_string(),
-//!     payload: json!({
-//!         "to": "user@example.com",
-//!         "subject": "Welcome!",
-//!         "template": "welcome_email"
-//!     }),
-//!     priority: Some("high".to_string()),
-//!     scheduled_at: None,
-//!     max_attempts: Some(3),
-//!     cron_schedule: None,
-//!     trace_id: Some("trace-123".to_string()),
-//!     correlation_id: Some("corr-456".to_string()),
-//! };
-//!
-//! // This would be sent as JSON in a POST request to /api/jobs
-//! let json_payload = serde_json::to_string(&create_request).unwrap();
-//! assert!(json_payload.contains("email_queue"));
-//! assert!(json_payload.contains("high"));
-//! ```
-//!
-//! ## Job Actions
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::jobs::JobActionRequest;
-//!
-//! let retry_request = JobActionRequest {
-//!     action: "retry".to_string(),
-//!     reason: Some("Network issue resolved".to_string()),
-//! };
-//!
-//! let cancel_request = JobActionRequest {
-//!     action: "cancel".to_string(),
-//!     reason: Some("No longer needed".to_string()),
-//! };
-//!
-//! assert_eq!(retry_request.action, "retry");
-//! assert_eq!(cancel_request.action, "cancel");
-//! ```
-//!
-//! ## Bulk Operations
-//!
-//! ```rust
-//! use hammerwork_web::__private::api::jobs::BulkJobActionRequest;
-//!
-//! let bulk_delete = BulkJobActionRequest {
-//!     job_ids: vec![
-//!         "550e8400-e29b-41d4-a716-446655440000".to_string(),
-//!         "550e8400-e29b-41d4-a716-446655440001".to_string(),
-//!     ],
-//!     action: "delete".to_string(),
-//!     reason: Some("Cleanup old failed jobs".to_string()),
-//! };
-//!
-//! assert_eq!(bulk_delete.job_ids.len(), 2);
-//! assert_eq!(bulk_delete.action, "delete");
-//! ```
 
 use super::history::JobHistory;
 use super::{
@@ -130,6 +64,7 @@ pub struct CreateJobRequest {
 #[derive(Debug, Deserialize)]
 pub struct JobActionRequest {
     pub action: String, // "retry", "cancel", "delete"
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     pub reason: Option<String>,
 }
 
@@ -141,6 +76,7 @@ pub const MAX_BULK_JOB_IDS: usize = 1000;
 pub struct BulkJobActionRequest {
     pub job_ids: Vec<String>,
     pub action: String,
+    #[allow(dead_code)] // not reached from the running dashboard; exercised by tests
     pub reason: Option<String>,
 }
 
@@ -1176,5 +1112,71 @@ mod tests {
         let request: BulkJobActionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.job_ids.len(), 3);
         assert_eq!(request.action, "delete");
+    }
+}
+
+/// Examples that used to be doctests (moved in-crate when `hammerwork_web::__private` was removed).
+#[cfg(test)]
+mod doc_examples {
+
+    #[test]
+    fn example_1() {
+        use crate::api::jobs::CreateJobRequest;
+        use serde_json::json;
+
+        let create_request = CreateJobRequest {
+            queue_name: "email_queue".to_string(),
+            payload: json!({
+                "to": "user@example.com",
+                "subject": "Welcome!",
+                "template": "welcome_email"
+            }),
+            priority: Some("high".to_string()),
+            scheduled_at: None,
+            max_attempts: Some(3),
+            cron_schedule: None,
+            trace_id: Some("trace-123".to_string()),
+            correlation_id: Some("corr-456".to_string()),
+        };
+
+        // This would be sent as JSON in a POST request to /api/jobs
+        let json_payload = serde_json::to_string(&create_request).unwrap();
+        assert!(json_payload.contains("email_queue"));
+        assert!(json_payload.contains("high"));
+    }
+
+    #[test]
+    fn example_2() {
+        use crate::api::jobs::JobActionRequest;
+
+        let retry_request = JobActionRequest {
+            action: "retry".to_string(),
+            reason: Some("Network issue resolved".to_string()),
+        };
+
+        let cancel_request = JobActionRequest {
+            action: "cancel".to_string(),
+            reason: Some("No longer needed".to_string()),
+        };
+
+        assert_eq!(retry_request.action, "retry");
+        assert_eq!(cancel_request.action, "cancel");
+    }
+
+    #[test]
+    fn example_3() {
+        use crate::api::jobs::BulkJobActionRequest;
+
+        let bulk_delete = BulkJobActionRequest {
+            job_ids: vec![
+                "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            ],
+            action: "delete".to_string(),
+            reason: Some("Cleanup old failed jobs".to_string()),
+        };
+
+        assert_eq!(bulk_delete.job_ids.len(), 2);
+        assert_eq!(bulk_delete.action, "delete");
     }
 }

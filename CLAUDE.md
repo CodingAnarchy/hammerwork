@@ -8,9 +8,9 @@ Hammerwork is a high-performance, database-driven job queue library for Rust wit
 
 ## Development Notes
 
-- SQLx compile-time query checking requires database connections
+- Queries are built at run time with `sqlx::query` and bound parameters (no compile-time `query!` macros, so building needs no database)
 - PostgreSQL uses `FOR UPDATE SKIP LOCKED` for efficient job polling
-- MySQL implementation uses transaction-based locking (less optimal)
+- MySQL (8.0+) also claims jobs with `FOR UPDATE SKIP LOCKED`, inside a transaction
 - Priority-aware queries use `ORDER BY priority DESC, scheduled_at ASC`
 - Weighted selection uses hash-based algorithms for Send compatibility
 - Tracing is integrated for observability
@@ -67,10 +67,15 @@ cargo clippy -- -D warnings
 ```
 
 ### Feature Flags
-The project uses feature flags for database support:
-- `postgres`: Enable PostgreSQL support
-- `mysql`: Enable MySQL support
-- `default`: No database features enabled by default
+`default` is empty: a plain `hammerwork` dependency has only the queue, worker and job APIs. Opt in to:
+- `postgres`, `mysql`: the database backends (at least one is needed for a `JobQueue`)
+- `metrics`, `alerting`, `webhooks`, `streaming`, `tracing`, `encryption`: subsystems; `full` enables all six (not the backends, KMS sources, event sinks or `test-queue`)
+- `aws-kms`, `gcp-kms`, `vault-kms`, `azure-kms`: encryption key sources
+- `kafka`, `google-pubsub`, `kinesis`: event stream sinks
+- `test-queue`: the in-memory `TestQueue`
+
+A configuration file section for a feature that is not enabled is rejected by `HammerworkConfig::from_file`.
+`cargo-hammerwork` and `hammerwork-web` enable the features they need; `hammerwork-web` has a `postgres` (default), `mysql` and `auth` (default) feature.
 
 ## Architecture
 
@@ -80,18 +85,18 @@ The codebase follows a modular architecture with clear separation of concerns:
 
 1. **Job (`src/job.rs`)**
    - Defines the `Job` struct with UUID, payload, status, priority, retry logic
-   - Job statuses: Pending, Running, Completed, Failed, Retrying, Dead, TimedOut
+   - Job statuses: Pending, Running, Completed, Failed, Dead, TimedOut, Archived (`Retrying` is only read from rows older versions wrote; a retry goes back to `Pending`)
    - Job priorities: Background, Low, Normal, High, Critical
    - Supports delayed execution, configurable retry attempts, and priority levels
 
 2. **Queue (`src/queue/`)**
-   - `mod.rs`: the `DatabaseQueue` trait (the interface for database operations) and the generic `JobQueue<DB>` wrapping a connection pool
+   - `mod.rs`: the sealed `DatabaseQueue` trait (the interface for database operations; only Hammerwork implements it) and the generic `JobQueue<DB>` wrapping a connection pool. Jobs are claimed with `dequeue(queue, &DequeueOptions)` (batch size, priority weights, lease) or the one-job shortcut `dequeue_one(queue)`; a `Running` job holds a lease that heartbeats renew, and `requeue_stale_jobs(queue_name: Option<&str>)` reclaims jobs whose lease expired (one queue or all)
    - `postgres.rs` / `mysql.rs`: the dialect-specific implementations (SQL, row types, locking)
    - `backend.rs`: helpers shared by both backends (transactions and conflict retries, column encoding, cron and dequeue helpers)
    - `row.rs`: dialect-independent row decoding (column lists, status, result config and encryption columns)
    - `lifecycle.rs`: the job lifecycle state machine (manual transitions and worker run outcomes)
    - `payload_encryption.rs`, `memory_results.rs`: payload sealing and in-memory result storage
-   - `test.rs`: the in-memory `TestQueue` (feature `test`)
+   - `test.rs`: the in-memory `TestQueue` (feature `test-queue`)
    - Priority-aware job selection with weighted algorithms; atomic transitions in transactions
 
 3. **Worker (`src/worker.rs` and `src/worker/`)**
@@ -146,13 +151,13 @@ Both PostgreSQL and MySQL implementations use a single table `hammerwork_jobs` w
 
 ```bash
 # 1. Format code according to Rust standards
-cargo fmt
+cargo fmt --all
 
-# 2. Run all linting checks with strict warnings
-cargo clippy --all-features -- -D warnings
+# 2. Run all linting checks with strict warnings (as CI does)
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 
-# 3. Run complete test suite with all features
-cargo test --all-features
+# 3. Run the complete test suite with all features (the whole workspace)
+cargo test --workspace --all-features
 
 # 4. Test CLI crate specifically
 cargo test -p cargo-hammerwork
