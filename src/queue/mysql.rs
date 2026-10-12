@@ -2061,8 +2061,12 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
         Ok(true)
     }
 
-    async fn requeue_stale_jobs(&self) -> Result<super::StaleJobRecovery> {
-        let recovery = super::retry_on_conflict(|| self.requeue_stale_jobs_once()).await?;
+    async fn requeue_stale_jobs(
+        &self,
+        queue_name: Option<&str>,
+    ) -> Result<super::StaleJobRecovery> {
+        let recovery =
+            super::retry_on_conflict(|| self.requeue_stale_jobs_once(queue_name)).await?;
 
         if !recovery.is_empty() {
             tracing::warn!(
@@ -2114,16 +2118,20 @@ impl DatabaseQueue for crate::queue::JobQueue<MySql> {
 }
 
 impl crate::queue::JobQueue<MySql> {
-    async fn requeue_stale_jobs_once(&self) -> Result<super::StaleJobRecovery> {
+    async fn requeue_stale_jobs_once(
+        &self,
+        queue_name: Option<&str>,
+    ) -> Result<super::StaleJobRecovery> {
         let mut conn = self.pool.acquire().await?;
         // READ COMMITTED, like the dequeue: no gap locks on the Running range.
         let mut tx = Self::begin_claim_transaction(&mut conn).await?;
-        let result = Self::requeue_stale_jobs_in_tx(&mut tx).await;
+        let result = Self::requeue_stale_jobs_in_tx(&mut tx, queue_name).await;
         super::end_transaction(tx, result).await
     }
 
     async fn requeue_stale_jobs_in_tx(
         conn: &mut sqlx::MySqlConnection,
+        queue_name: Option<&str>,
     ) -> Result<super::StaleJobRecovery> {
         let now = db_now(conn).await?;
 
@@ -2139,11 +2147,14 @@ impl crate::queue::JobQueue<MySql> {
             WHERE status = ?
               AND last_heartbeat_at >= started_at
               AND lease_expires_at < ?
+              AND (? IS NULL OR queue_name = ?)
             FOR UPDATE SKIP LOCKED
             "#
         )))
         .bind(JobStatus::Running)
         .bind(now)
+        .bind(queue_name)
+        .bind(queue_name)
         .fetch_all(&mut *conn)
         .await?;
 

@@ -3052,7 +3052,10 @@ impl DatabaseQueue for TestQueue {
         Ok(true)
     }
 
-    async fn requeue_stale_jobs(&self) -> Result<super::StaleJobRecovery> {
+    async fn requeue_stale_jobs(
+        &self,
+        queue_name: Option<&str>,
+    ) -> Result<super::StaleJobRecovery> {
         let mut storage = self.storage.write().await;
         let now = storage.clock.now();
 
@@ -3060,6 +3063,7 @@ impl DatabaseQueue for TestQueue {
             .jobs
             .values()
             .filter(|job| job.status == JobStatus::Running)
+            .filter(|job| queue_name.is_none_or(|name| job.queue_name == name))
             .filter_map(|job| {
                 let started_at = job.started_at?;
                 // Only a lease of the current run counts; a row without one is left alone.
@@ -3182,7 +3186,7 @@ mod tests {
         assert!(claimed.iter().all(|job| job.attempts == 1));
         assert_eq!(queue.get_job_count("batch", &JobStatus::Running).await, 2);
         // Leased: the reaper leaves them alone.
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert!(recovery.is_empty());
 
         // Paused queues hand out nothing.
@@ -3237,7 +3241,7 @@ mod tests {
             .unwrap();
         assert_eq!(short.len(), 1);
         queue.clock().advance(chrono::Duration::seconds(30));
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert_eq!(recovery.requeued, [short[0].id]);
         assert!(queue.dequeue_one("missing").await.unwrap().is_none());
     }
@@ -3672,6 +3676,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scoped_requeue_stale_jobs_leaves_other_queues_alone() {
+        let queue = TestQueue::new();
+        let clock = queue.clock();
+        let lease = std::time::Duration::from_secs(30);
+        let mut ids = Vec::new();
+        for name in ["mine", "other", "mine"] {
+            let id = queue
+                .enqueue(Job::new(name.to_string(), json!({})))
+                .await
+                .unwrap();
+            queue
+                .dequeue(name, &DequeueOptions::new().with_lease_duration(lease))
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        // The second "mine" job keeps its lease alive.
+        clock.advance(chrono::Duration::seconds(40));
+        let run = queue.get_job(ids[2]).await.unwrap().unwrap();
+        queue.storage.write().await.leases.insert(
+            run.id,
+            (clock.now(), clock.now() + chrono::Duration::seconds(3600)),
+        );
+
+        let recovery = queue.requeue_stale_jobs(Some("mine")).await.unwrap();
+        assert_eq!(recovery.requeued, vec![ids[0]]);
+        assert_eq!(
+            queue.get_job(ids[1]).await.unwrap().unwrap().status,
+            JobStatus::Running
+        );
+        assert_eq!(
+            queue.get_job(ids[2]).await.unwrap().unwrap().status,
+            JobStatus::Running
+        );
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
+        assert_eq!(recovery.requeued, vec![ids[1]]);
+        assert!(
+            queue
+                .requeue_stale_jobs(Some("nothing"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn test_requeue_stale_jobs_uses_leases_only() {
         let queue = TestQueue::new();
         let clock = queue.clock();
@@ -3703,18 +3753,18 @@ mod tests {
         queue.storage.write().await.leases.remove(&unleased);
 
         // Nothing is stale yet.
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert!(recovery.is_empty());
 
         // A heartbeat keeps a lease alive.
         clock.advance(chrono::Duration::seconds(10));
         assert!(queue.heartbeat_job(&runs[&leased], lease).await.unwrap());
-        assert!(queue.requeue_stale_jobs().await.unwrap().is_empty());
+        assert!(queue.requeue_stale_jobs(None).await.unwrap().is_empty());
 
         // Once the leases expire, the leased jobs are reclaimed; the lease-less one is
         // not, however long ago it started.
         clock.advance(chrono::Duration::days(30));
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert_eq!(recovery.requeued, vec![leased]);
         assert_eq!(recovery.dead, vec![exhausted]);
         assert_eq!(
@@ -3750,7 +3800,7 @@ mod tests {
             .unwrap()
             .unwrap();
         clock.advance(chrono::Duration::seconds(60));
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert_eq!(recovery.requeued, vec![id]);
 
         let second = queue
@@ -3767,7 +3817,7 @@ mod tests {
         // Its heartbeats did not keep the second run alive.
         clock.advance(chrono::Duration::seconds(60));
         assert!(!queue.heartbeat_job(&first, lease).await.unwrap());
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert_eq!(recovery.requeued, vec![id]);
     }
 
@@ -3803,7 +3853,7 @@ mod tests {
         );
         // The lease was renewed from the new start.
         clock.advance(chrono::Duration::seconds(20));
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert!(recovery.requeued.is_empty());
 
         // The claim as first dequeued no longer identifies the run.
@@ -3834,7 +3884,7 @@ mod tests {
             .unwrap()
             .unwrap();
         queue.clock().advance(chrono::Duration::days(365));
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert!(recovery.is_empty(), "{recovery:?}");
         assert!(
             queue
@@ -4405,7 +4455,7 @@ mod tests {
         assert_eq!(run.id, id);
 
         clock.advance(chrono::Duration::minutes(5));
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert_eq!(recovery.dead, vec![id]);
 
         let job = queue.get_job(id).await.unwrap().unwrap();

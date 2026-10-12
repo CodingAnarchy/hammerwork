@@ -90,7 +90,7 @@ The codebase follows a modular architecture with clear separation of concerns:
    - Supports delayed execution, configurable retry attempts, and priority levels
 
 2. **Queue (`src/queue/`)**
-   - `mod.rs`: the sealed `DatabaseQueue` trait (the interface for database operations; only Hammerwork implements it) and the generic `JobQueue<DB>` wrapping a connection pool. Jobs are claimed with `dequeue(queue, &DequeueOptions)` (batch size, priority weights, lease) or the one-job shortcut `dequeue_one(queue)`; a `Running` job holds a lease that heartbeats renew, and `requeue_stale_jobs()` reclaims jobs whose lease expired
+   - `mod.rs`: the sealed `DatabaseQueue` trait (the interface for database operations; only Hammerwork implements it) and the generic `JobQueue<DB>` wrapping a connection pool. Jobs are claimed with `dequeue(queue, &DequeueOptions)` (batch size, priority weights, lease) or the one-job shortcut `dequeue_one(queue)`; a `Running` job holds a lease that heartbeats renew, and `requeue_stale_jobs(queue_name: Option<&str>)` reclaims jobs whose lease expired (one queue or all)
    - `postgres.rs` / `mysql.rs`: the dialect-specific implementations (SQL, row types, locking)
    - `backend.rs`: helpers shared by both backends (transactions and conflict retries, column encoding, cron and dequeue helpers)
    - `row.rs`: dialect-independent row decoding (column lists, status, result config and encryption columns)

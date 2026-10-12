@@ -759,21 +759,12 @@ async fn requeue_stale_jobs(pool: DatabasePool, queue: Option<&str>, dry_run: bo
         return Ok(());
     }
 
-    let recovery = match queue {
-        // Unscoped: the library's atomic reclaim.
-        None => with_queue!(pool.create_job_queue(), |queue| {
-            queue.requeue_stale_jobs().await?
-        }),
-        // Scoped: the library reclaims every queue at once, so find this queue's stale jobs
-        // and send each through the guarded transitions with the library's own outcome
-        // (Pending while attempts remain, Dead otherwise).
-        Some(name) => {
-            let ids = select_job_ids(&pool, &stale_selector(Some(name))).await?;
-            with_queue!(pool.create_job_queue(), |q| {
-                reclaim_stale_in_queue(&q, &ids).await?
-            })
-        }
-    };
+    // One atomic reclaim in the library, scoped to the queue when given: the queue filter
+    // sits in the same statement as the lease check, so a job whose worker renews its
+    // lease meanwhile is never touched.
+    let recovery = with_queue!(pool.create_job_queue(), |q| {
+        q.requeue_stale_jobs(queue).await?
+    });
 
     for id in &recovery.requeued {
         info!("↩️  Requeued stale job {}", id);
@@ -789,41 +780,6 @@ async fn requeue_stale_jobs(pool: DatabasePool, queue: Option<&str>, dry_run: bo
         recovery.dead.len()
     );
     Ok(())
-}
-
-/// Reclaim the given stale `Running` jobs one by one: a job with attempts left goes back to
-/// `Pending`, an exhausted one is marked `Dead`, as `requeue_stale_jobs` does. A job that
-/// is no longer `Running` (finished or reclaimed meanwhile) is skipped.
-async fn reclaim_stale_in_queue<Q: DatabaseQueue + ?Sized>(
-    queue: &Q,
-    ids: &[hammerwork::JobId],
-) -> Result<hammerwork::queue::StaleJobRecovery> {
-    let mut recovery = hammerwork::queue::StaleJobRecovery::default();
-    for &id in ids {
-        let Some(job) = queue.get_job(id).await? else {
-            continue;
-        };
-        if job.status != JobStatus::Running {
-            continue;
-        }
-        let outcome = if job.attempts >= job.max_attempts {
-            queue
-                .mark_job_dead(id, hammerwork::queue::STALE_JOB_ERROR_MESSAGE)
-                .await
-                .map(|()| true)
-        } else {
-            queue
-                .retry_job(id, chrono::Utc::now())
-                .await
-                .map(|()| false)
-        };
-        match outcome {
-            Ok(true) => recovery.dead.push(id),
-            Ok(false) => recovery.requeued.push(id),
-            Err(e) => tracing::warn!("Skipped stale job {}: {}", id, e),
-        }
-    }
-    Ok(recovery)
 }
 
 async fn retry_jobs(

@@ -487,7 +487,7 @@ where
 
     // Reclaim anything earlier tests left behind, so the fix below changes only our row.
     queue.expire_leaseless_runs().await;
-    queue.requeue_stale_jobs().await.unwrap();
+    queue.requeue_stale_jobs(None).await.unwrap();
 
     let expiring = start_job(
         &queue,
@@ -519,7 +519,7 @@ where
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
     assert!(recovery.requeued.contains(&expiring.id), "{recovery:?}");
     assert!(recovery.dead.contains(&exhausted.id), "{recovery:?}");
     for id in [live.id, unleased.id] {
@@ -551,7 +551,7 @@ where
     );
 
     // A row without a lease is never reclaimed, however long ago it started.
-    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
     assert!(
         !recovery.requeued.contains(&unleased.id) && !recovery.dead.contains(&unleased.id),
         "{recovery:?}"
@@ -564,7 +564,7 @@ where
     // The upgrade guide's one-off fix gives it an expired lease (and leaves leased
     // runs alone); the next pass reclaims it.
     assert!(queue.expire_leaseless_runs().await >= 1);
-    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
     assert!(recovery.requeued.contains(&unleased.id), "{recovery:?}");
     assert!(!recovery.requeued.contains(&live.id), "{recovery:?}");
     let job = queue.get_job(unleased.id).await.unwrap().unwrap();
@@ -611,7 +611,7 @@ where
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
     // The reaper leaves valid leases alone and reclaims the expired one.
-    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
     for run in [&long, &default] {
         assert!(
             !recovery.requeued.contains(&run.id) && !recovery.dead.contains(&run.id),
@@ -658,7 +658,7 @@ where
     )
     .await;
     tokio::time::sleep(Duration::from_millis(900)).await;
-    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
     assert!(recovery.requeued.contains(&first.id), "{recovery:?}");
 
     let second = queue
@@ -684,7 +684,7 @@ where
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     // So the new run's lease expired on schedule.
-    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
     assert!(
         recovery.requeued.contains(&second.id),
         "the stale heartbeat extended the new run's lease: {recovery:?}"
@@ -696,6 +696,48 @@ where
             .unwrap()
     );
     queue.delete_job(first.id).await.unwrap();
+}
+
+/// `requeue_stale_jobs(Some(queue))` reclaims that queue's expired leases only; another
+/// queue's stale job and a live lease in the same queue are left alone.
+async fn scoped_reaper_leaves_other_queues_alone<DB>(queue: Arc<JobQueue<DB>>)
+where
+    DB: sqlx::Database,
+    JobQueue<DB>: DatabaseQueue<Database = DB> + Send + Sync + 'static,
+{
+    let _serial = test_utils::serial().await;
+    let short = Duration::from_millis(300);
+    let mine = test_utils::unique_queue("scoped_mine");
+    let other = test_utils::unique_queue("scoped_other");
+    let stale_mine = start_job(&queue, Job::new(mine.clone(), json!({})), short).await;
+    let stale_other = start_job(&queue, Job::new(other.clone(), json!({})), short).await;
+    let live_mine = start_job(
+        &queue,
+        Job::new(mine.clone(), json!({})),
+        Duration::from_secs(3600),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let recovery = queue.requeue_stale_jobs(Some(&mine)).await.unwrap();
+    assert_eq!(recovery.requeued, vec![stale_mine.id], "{recovery:?}");
+    assert!(recovery.dead.is_empty(), "{recovery:?}");
+    let status = |id| {
+        let queue = queue.clone();
+        async move { queue.get_job(id).await.unwrap().unwrap().status }
+    };
+    assert_eq!(status(stale_mine.id).await, JobStatus::Pending);
+    assert_eq!(status(stale_other.id).await, JobStatus::Running);
+    assert_eq!(status(live_mine.id).await, JobStatus::Running);
+
+    // Unscoped, the other queue's job is reclaimed too.
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
+    assert!(recovery.requeued.contains(&stale_other.id), "{recovery:?}");
+    assert_eq!(status(stale_other.id).await, JobStatus::Pending);
+    assert_eq!(status(live_mine.id).await, JobStatus::Running);
+    for id in [stale_mine.id, stale_other.id, live_mine.id] {
+        queue.delete_job(id).await.unwrap();
+    }
 }
 
 /// A zero lease never expires: the reaper never reclaims the job.
@@ -712,13 +754,13 @@ where
     )
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
     assert!(
         !recovery.requeued.contains(&run.id) && !recovery.dead.contains(&run.id),
         "{recovery:?}"
     );
     assert!(queue.heartbeat_job(&run, Duration::ZERO).await.unwrap());
-    let recovery = queue.requeue_stale_jobs().await.unwrap();
+    let recovery = queue.requeue_stale_jobs(None).await.unwrap();
     assert!(!recovery.requeued.contains(&run.id), "{recovery:?}");
     assert_eq!(
         queue.get_job(run.id).await.unwrap().unwrap().status,
@@ -813,7 +855,7 @@ where
     for _ in 0..8 {
         let queue = Arc::clone(&queue);
         reapers.push(tokio::spawn(async move {
-            queue.requeue_stale_jobs().await.unwrap()
+            queue.requeue_stale_jobs(None).await.unwrap()
         }));
     }
 
@@ -870,7 +912,7 @@ where
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let recovery = queue.requeue_stale_jobs().await.unwrap();
+        let recovery = queue.requeue_stale_jobs(None).await.unwrap();
         assert!(
             !recovery.requeued.contains(&id) && !recovery.dead.contains(&id),
             "a live, heartbeating job was reclaimed"
@@ -904,6 +946,7 @@ crate::test_utils::backend_tests!(
         claim_lease_protects_job_from_short_reaper_window,
         stale_heartbeat_cannot_extend_new_run,
         zero_lease_is_never_reclaimed,
+        scoped_reaper_leaves_other_queues_alone,
         other_pools_reaper_does_not_rerun_live_job,
         concurrent_reapers_never_double_requeue,
         worker_heartbeat_keeps_long_job_leased,
@@ -925,6 +968,7 @@ crate::test_utils::backend_tests!(
         claim_lease_protects_job_from_short_reaper_window,
         stale_heartbeat_cannot_extend_new_run,
         zero_lease_is_never_reclaimed,
+        scoped_reaper_leaves_other_queues_alone,
         other_pools_reaper_does_not_rerun_live_job,
         concurrent_reapers_never_double_requeue,
         worker_heartbeat_keeps_long_job_leased,

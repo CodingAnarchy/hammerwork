@@ -384,7 +384,7 @@ Hammerwork recovers these jobs with leases (requires migration `015_add_job_leas
 - A heartbeat only extends the run it belongs to (same attempt and start time): a
   worker whose job was reclaimed and picked up by another worker cannot keep the new
   run's lease alive.
-- `DatabaseQueue::requeue_stale_jobs()` reclaims `Running` jobs whose lease has
+- `DatabaseQueue::requeue_stale_jobs(None)` reclaims (`Some(queue)` limits it to one queue) `Running` jobs whose lease has
   expired. A job whose lease is valid is never reclaimed, so pools with different lease
   durations (or `cargo hammerwork job requeue-stale`) can share a database safely. A
   `Running` job without a lease is never reclaimed: only Hammerwork 1.x claimed jobs

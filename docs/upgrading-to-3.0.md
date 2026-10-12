@@ -700,7 +700,10 @@ them by hand; `cargo hammerwork maintenance check` reports how many there are.
 ### Stale job API
 
 `DatabaseQueue::requeue_stale_jobs` and `WorkerPool::with_stale_job_reaper` lose their
-`older_than` argument, which only applied to lease-less jobs:
+`older_than` argument, which only applied to lease-less jobs. `requeue_stale_jobs` takes
+an optional queue name instead: `None` reclaims every queue, as before, and
+`Some("emails")` reclaims that queue only, inside the same atomic statement as the lease
+check:
 
 ```rust,no_run
 # async fn example(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>) -> hammerwork::Result<()> {
@@ -712,10 +715,11 @@ use std::time::Duration;
 // let pool = WorkerPool::new().with_stale_job_reaper(Duration::from_secs(30), Duration::from_secs(600));
 
 // After (3.0):
-let recovery = queue.requeue_stale_jobs().await?;
+let recovery = queue.requeue_stale_jobs(None).await?;
+let emails_only = queue.requeue_stale_jobs(Some("emails")).await?;
 let pool: WorkerPool<sqlx::Postgres> =
     WorkerPool::new().with_stale_job_reaper(Duration::from_secs(30));
-# let _ = (recovery, pool);
+# let _ = (recovery, emails_only, pool);
 # Ok(())
 # }
 ```
