@@ -19,7 +19,7 @@ The trace fields (`with_trace_id`, `with_correlation_id`, ...) are available on 
 
 ```toml
 [dependencies]
-hammerwork = { version = "2.5", features = ["postgres", "tracing"] }
+hammerwork = { version = "3", features = ["postgres", "tracing"] }
 ```
 
 ### Initialize Tracing

@@ -21,16 +21,16 @@ Add Hammerwork to your `Cargo.toml`:
 ```toml
 [dependencies]
 # PostgreSQL support (no features are on by default; the queue only)
-hammerwork = { version = "2.5", features = ["postgres"] }
+hammerwork = { version = "3", features = ["postgres"] }
 
 # MySQL support
-hammerwork = { version = "2.5", features = ["mysql"] }
+hammerwork = { version = "3", features = ["mysql"] }
 
 # With distributed tracing
-hammerwork = { version = "2.5", features = ["postgres", "tracing"] }
+hammerwork = { version = "3", features = ["postgres", "tracing"] }
 
 # Metrics, alerting, webhooks, streaming, tracing and encryption together
-hammerwork = { version = "2.5", features = ["postgres", "full"] }
+hammerwork = { version = "3", features = ["postgres", "full"] }
 
 # Additional dependencies for examples. Your sqlx must be the same major
 # version as Hammerwork's (0.9), since you pass Hammerwork a sqlx pool.
