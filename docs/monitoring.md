@@ -223,14 +223,14 @@ Monitoring is opt-in: no feature is enabled by default.
 
 ```toml
 # The queue only, no monitoring
-hammerwork = { version = "2.5", features = ["postgres"] }
+hammerwork = { version = "3", features = ["postgres"] }
 
 # Only metrics
-hammerwork = { version = "2.5", features = ["postgres", "metrics"] }
+hammerwork = { version = "3", features = ["postgres", "metrics"] }
 
 # Only alerting
-hammerwork = { version = "2.5", features = ["postgres", "alerting"] }
+hammerwork = { version = "3", features = ["postgres", "alerting"] }
 
 # Metrics, alerting and the other optional subsystems
-hammerwork = { version = "2.5", features = ["postgres", "full"] }
+hammerwork = { version = "3", features = ["postgres", "full"] }
 ```

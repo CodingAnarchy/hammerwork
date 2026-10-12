@@ -37,22 +37,22 @@ No features are enabled by default: Hammerwork 3.0 gives you the queue, worker, 
 ```toml
 [dependencies]
 # A queue on PostgreSQL (or MySQL): the lightest build
-hammerwork = { version = "2.5", features = ["postgres"] }
-hammerwork = { version = "2.5", features = ["mysql"] }
+hammerwork = { version = "3", features = ["postgres"] }
+hammerwork = { version = "3", features = ["mysql"] }
 
 # Everything that is not a backend, a key source or an event sink:
 # metrics, alerting, webhooks, streaming, tracing and encryption
-hammerwork = { version = "2.5", features = ["postgres", "full"] }
+hammerwork = { version = "3", features = ["postgres", "full"] }
 
 # Or pick subsystems one by one
-hammerwork = { version = "2.5", features = ["postgres", "metrics", "alerting", "webhooks"] }
+hammerwork = { version = "3", features = ["postgres", "metrics", "alerting", "webhooks"] }
 
 # With encryption for PII protection, and a KMS key source
-hammerwork = { version = "2.5", features = ["postgres", "encryption", "aws-kms"] }    # or "gcp-kms", "vault-kms", "azure-kms"
+hammerwork = { version = "3", features = ["postgres", "encryption", "aws-kms"] }    # or "gcp-kms", "vault-kms", "azure-kms"
 
 # In-memory TestQueue for your tests
 [dev-dependencies]
-hammerwork = { version = "2.5", features = ["test-queue"] }
+hammerwork = { version = "3", features = ["test-queue"] }
 ```
 
 **Feature flags**
@@ -81,7 +81,7 @@ cargo install hammerwork-web --features postgres
 
 # Or add to your project
 [dependencies]
-hammerwork-web = { version = "2.5", features = ["postgres"] }
+hammerwork-web = { version = "3", features = ["postgres"] }
 ```
 
 Start the dashboard:

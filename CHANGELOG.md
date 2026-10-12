@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-10-11
+
+A major release. Read [Upgrading from 2.x to 3.0](docs/upgrading-to-3.0.md) before
+upgrading; it starts with the order to do things in. In short:
+
+- **Dependencies:** sqlx 0.9 (your own sqlx must move too) and Rust 1.94.0.
+- **Features:** no default features (add the ones you use, or `full`); `azure-kv` is
+  `azure-kms` and `test` is `test-queue`.
+- **API:** `DatabaseQueue` and `MigrationRunner` are sealed; one `dequeue(&DequeueOptions)`
+  replaces the five claim methods; configuration, statistics and growing enums are
+  `#[non_exhaustive]` with builders; zero rates and other invalid settings are rejected
+  by fallible constructors; `cargo-hammerwork` is binary-only and `hammerwork-web` exposes
+  only the dashboard types.
+- **Database:** migration 021 moves MySQL to `DATETIME(6)` (no year-2038 limit; MySQL
+  8.0.13+), rewriting every table. Stop 1.x workers first: the stale-job reaper now
+  relies on leases alone (`cargo hammerwork maintenance check --fix` repairs rows 1.x
+  left behind).
+
 ### Breaking changes
 
 See [Upgrading from 2.x to 3.0](docs/upgrading-to-3.0.md) for what to change.
