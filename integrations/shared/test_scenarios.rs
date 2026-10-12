@@ -191,7 +191,7 @@ where
             handler.clone(),
         )
         .with_poll_interval(Duration::from_millis(100))
-        .with_attempt_cap(2);
+        .with_attempt_cap(2)?;
 
         let worker2 = Worker::new(
             self.queue.clone(),
@@ -199,7 +199,7 @@ where
             handler.clone(),
         )
         .with_poll_interval(Duration::from_millis(100))
-        .with_attempt_cap(2);
+        .with_attempt_cap(2)?;
 
         // Enqueue test jobs
         for i in 0..5 {
@@ -457,7 +457,7 @@ where
         // Create worker with stats collector
         let worker = Worker::new(self.queue.clone(), "stats_test".to_string(), handler)
             .with_poll_interval(Duration::from_millis(100))
-            .with_attempt_cap(2)
+            .with_attempt_cap(2)?
             .with_stats_collector(Arc::clone(&stats_collector));
 
         // Enqueue test jobs (mix of successful and failing)

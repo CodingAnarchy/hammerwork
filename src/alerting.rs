@@ -434,12 +434,10 @@ type LastAlertsStorage = Arc<RwLock<HashMap<(String, AlertType), DateTime<Utc>>>
 
 /// The HTTP client for webhook and Slack alerts: every request is bounded by
 /// [`ALERT_HTTP_TIMEOUT`], so a hanging endpoint cannot stall the caller.
-#[cfg(feature = "alerting")]
 fn alert_http_client() -> reqwest::Client {
     alert_http_client_with_timeout(ALERT_HTTP_TIMEOUT)
 }
 
-#[cfg(feature = "alerting")]
 fn alert_http_client_with_timeout(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(timeout)
@@ -457,7 +455,6 @@ pub struct AlertManager {
     last_alerts: LastAlertsStorage,
     /// When each alert last failed to reach any target
     failed_alerts: LastAlertsStorage,
-    #[cfg(feature = "alerting")]
     http_client: reqwest::Client,
 }
 
@@ -475,7 +472,6 @@ impl AlertManager {
             config,
             last_alerts: Arc::new(RwLock::new(HashMap::new())),
             failed_alerts: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(feature = "alerting")]
             http_client: alert_http_client(),
         }
     }
@@ -737,7 +733,6 @@ impl AlertManager {
     }
 
     /// Send webhook alert
-    #[cfg(feature = "alerting")]
     async fn send_webhook_alert(
         &self,
         alert: &Alert,
@@ -774,17 +769,6 @@ impl AlertManager {
             });
         }
 
-        Ok(())
-    }
-
-    #[cfg(not(feature = "alerting"))]
-    async fn send_webhook_alert(
-        &self,
-        _alert: &Alert,
-        _url: &str,
-        _headers: &HashMap<String, String>,
-    ) -> Result<()> {
-        tracing::info!("Webhook alerting disabled (alerting feature not enabled)");
         Ok(())
     }
 
@@ -863,7 +847,6 @@ impl AlertManager {
     }
 
     /// Send Slack alert
-    #[cfg(feature = "alerting")]
     async fn send_slack_alert(
         &self,
         alert: &Alert,
@@ -924,22 +907,6 @@ impl AlertManager {
             });
         }
 
-        Ok(())
-    }
-
-    #[cfg(not(feature = "alerting"))]
-    async fn send_slack_alert(
-        &self,
-        alert: &Alert,
-        _webhook_url: &str,
-        _channel: &str,
-    ) -> Result<()> {
-        tracing::info!(
-            "Slack alert: {} - {} ({})",
-            alert.alert_type,
-            alert.message,
-            alert.severity
-        );
         Ok(())
     }
 

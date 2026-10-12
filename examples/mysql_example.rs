@@ -87,13 +87,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Create workers for different queues with statistics collection and timeout configuration
     let image_worker = Worker::new(queue.clone(), "image_processing".to_string(), image_handler)
         .with_poll_interval(tokio::time::Duration::from_secs(1))
-        .with_attempt_cap(2)
+        .with_attempt_cap(2)?
         .with_default_timeout(tokio::time::Duration::from_secs(120)) // 2-minute timeout for image processing
         .with_stats_collector(Arc::clone(&stats_collector));
 
     let email_worker = Worker::new(queue.clone(), "email_queue".to_string(), email_handler)
         .with_poll_interval(tokio::time::Duration::from_millis(500))
-        .with_attempt_cap(3)
+        .with_attempt_cap(3)?
         .with_default_timeout(tokio::time::Duration::from_secs(30)) // 30-second timeout for emails
         .with_stats_collector(Arc::clone(&stats_collector));
 

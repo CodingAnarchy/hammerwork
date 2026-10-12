@@ -15,11 +15,14 @@
 -- hammerwork_workflows was DATETIME (no fractional seconds) already; it becomes DATETIME(6)
 -- too, so every MySQL time keeps microseconds.
 --
--- Nullability and defaults are kept; CURRENT_TIMESTAMP defaults become
--- CURRENT_TIMESTAMP(6) (DATETIME(6) requires the precision to match). The only ON UPDATE
--- clause is hammerwork_queue_pause.updated_at, which keeps it. Each ALTER runs only
--- while its table still has a TIMESTAMP column (MySQL DDL auto-commits, so the
--- migration can be re-run after a partial failure).
+-- Nullability is kept. CURRENT_TIMESTAMP defaults become the expression default
+-- (UTC_TIMESTAMP(6)) (MySQL 8.0.13+): a DATETIME default of CURRENT_TIMESTAMP is the
+-- session's local time, not UTC. The only ON UPDATE clause,
+-- hammerwork_queue_pause.updated_at, is dropped for the same reason; Hammerwork writes
+-- updated_at itself. Each ALTER runs only while its table still has a TIMESTAMP column
+-- or a CURRENT_TIMESTAMP default or ON UPDATE clause (MySQL DDL auto-commits, so the
+-- migration can be re-run after a partial failure, and it also converges a schema
+-- converted by a pre-release version of this migration that kept those).
 
 SET @hammerwork_previous_time_zone = @@SESSION.time_zone;
 SET SESSION time_zone = '+00:00';
@@ -52,7 +55,9 @@ DEALLOCATE PREPARE stmt;
 SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_jobs_archive'
-       AND data_type = 'timestamp') > 0,
+       AND (data_type = 'timestamp'
+            OR LOWER(column_default) LIKE 'current_timestamp%'
+            OR LOWER(extra) LIKE '%on update%')) > 0,
     'ALTER TABLE hammerwork_jobs_archive
         MODIFY COLUMN `created_at` DATETIME(6) NOT NULL,
         MODIFY COLUMN `scheduled_at` DATETIME(6) NOT NULL,
@@ -60,7 +65,7 @@ SET @sql = IF(
         MODIFY COLUMN `completed_at` DATETIME(6) NULL,
         MODIFY COLUMN `failed_at` DATETIME(6) NULL,
         MODIFY COLUMN `timed_out_at` DATETIME(6) NULL,
-        MODIFY COLUMN `archived_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        MODIFY COLUMN `archived_at` DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
         MODIFY COLUMN `result_ttl` DATETIME(6) NULL,
         MODIFY COLUMN `next_run_at` DATETIME(6) NULL,
         MODIFY COLUMN `retention_delete_at` DATETIME(6) NULL,
@@ -87,9 +92,11 @@ DEALLOCATE PREPARE stmt;
 SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_encryption_keys'
-       AND data_type = 'timestamp') > 0,
+       AND (data_type = 'timestamp'
+            OR LOWER(column_default) LIKE 'current_timestamp%'
+            OR LOWER(extra) LIKE '%on update%')) > 0,
     'ALTER TABLE hammerwork_encryption_keys
-        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
         MODIFY COLUMN `expires_at` DATETIME(6) NULL,
         MODIFY COLUMN `rotated_at` DATETIME(6) NULL,
         MODIFY COLUMN `retired_at` DATETIME(6) NULL,
@@ -104,9 +111,11 @@ DEALLOCATE PREPARE stmt;
 SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_key_audit_log'
-       AND data_type = 'timestamp') > 0,
+       AND (data_type = 'timestamp'
+            OR LOWER(column_default) LIKE 'current_timestamp%'
+            OR LOWER(extra) LIKE '%on update%')) > 0,
     'ALTER TABLE hammerwork_key_audit_log
-        MODIFY COLUMN `timestamp` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)',
+        MODIFY COLUMN `timestamp` DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6))',
     'SELECT 1'
 );
 PREPARE stmt FROM @sql;
@@ -116,9 +125,11 @@ DEALLOCATE PREPARE stmt;
 SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_kms_data_keys'
-       AND data_type = 'timestamp') > 0,
+       AND (data_type = 'timestamp'
+            OR LOWER(column_default) LIKE 'current_timestamp%'
+            OR LOWER(extra) LIKE '%on update%')) > 0,
     'ALTER TABLE hammerwork_kms_data_keys
-        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
         MODIFY COLUMN `retired_at` DATETIME(6) NULL',
     'SELECT 1'
 );
@@ -129,11 +140,13 @@ DEALLOCATE PREPARE stmt;
 SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_queue_pause'
-       AND data_type = 'timestamp') > 0,
+       AND (data_type = 'timestamp'
+            OR LOWER(column_default) LIKE 'current_timestamp%'
+            OR LOWER(extra) LIKE '%on update%')) > 0,
     'ALTER TABLE hammerwork_queue_pause
-        MODIFY COLUMN `paused_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-        MODIFY COLUMN `updated_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)',
+        MODIFY COLUMN `paused_at` DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
+        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
+        MODIFY COLUMN `updated_at` DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6))',
     'SELECT 1'
 );
 PREPARE stmt FROM @sql;
@@ -155,9 +168,10 @@ DEALLOCATE PREPARE stmt;
 SET @sql = IF(
     (SELECT COUNT(*) FROM information_schema.columns
      WHERE table_schema = DATABASE() AND table_name = 'hammerwork_workflows'
-       AND column_name = 'created_at' AND data_type = 'datetime' AND datetime_precision = 0) > 0,
+       AND column_name = 'created_at'
+       AND (datetime_precision = 0 OR LOWER(column_default) LIKE 'current_timestamp%')) > 0,
     'ALTER TABLE hammerwork_workflows
-        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        MODIFY COLUMN `created_at` DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
         MODIFY COLUMN `completed_at` DATETIME(6) NULL,
         MODIFY COLUMN `failed_at` DATETIME(6) NULL',
     'SELECT 1'

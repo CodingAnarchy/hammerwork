@@ -279,26 +279,56 @@ pub struct HammerworkConfig {
     /// Event system configuration
     pub events: EventConfig,
 
-    /// Webhook configurations
+    /// Webhook configurations (`[webhooks]`, optional in TOML files).
     #[cfg(feature = "webhooks")]
+    #[serde(default)]
     pub webhooks: WebhookConfigs,
 
-    /// Streaming configurations
+    /// Detects a `[webhooks]` section in a build without the `webhooks` feature, so
+    /// that loading the file fails instead of silently ignoring it.
+    #[cfg(not(feature = "webhooks"))]
+    #[serde(rename = "webhooks", default, skip_serializing)]
+    webhooks_section: Option<serde::de::IgnoredAny>,
+
+    /// Streaming configurations (`[streaming]`, optional in TOML files).
     #[cfg(any(
         feature = "streaming",
         feature = "kafka",
         feature = "google-pubsub",
         feature = "kinesis"
     ))]
+    #[serde(default)]
     pub streaming: StreamingConfigs,
 
-    /// Alerting configuration
+    /// Detects a `[streaming]` section in a build without a streaming feature.
+    #[cfg(not(any(
+        feature = "streaming",
+        feature = "kafka",
+        feature = "google-pubsub",
+        feature = "kinesis"
+    )))]
+    #[serde(rename = "streaming", default, skip_serializing)]
+    streaming_section: Option<serde::de::IgnoredAny>,
+
+    /// Alerting configuration (`[alerting]`, optional in TOML files).
     #[cfg(feature = "alerting")]
+    #[serde(default)]
     pub alerting: AlertingConfig,
 
-    /// Metrics configuration
+    /// Detects an `[alerting]` section in a build without the `alerting` feature.
+    #[cfg(not(feature = "alerting"))]
+    #[serde(rename = "alerting", default, skip_serializing)]
+    alerting_section: Option<serde::de::IgnoredAny>,
+
+    /// Metrics configuration (`[metrics]`, optional in TOML files).
     #[cfg(feature = "metrics")]
+    #[serde(default)]
     pub metrics: MetricsConfig,
+
+    /// Detects a `[metrics]` section in a build without the `metrics` feature.
+    #[cfg(not(feature = "metrics"))]
+    #[serde(rename = "metrics", default, skip_serializing)]
+    metrics_section: Option<serde::de::IgnoredAny>,
 
     /// Archive configuration
     pub archive: ArchiveConfig,
@@ -359,12 +389,40 @@ impl HammerworkConfig {
     pub fn from_file(path: &str) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
+        config.reject_compiled_out_sections()?;
         config.worker.validate()?;
         config.archive.validate()?;
         config.encryption.validate()?;
         config.rate_limiting.validate()?;
         config.validate_delivery_targets()?;
         Ok(config)
+    }
+
+    /// Reject a section (`[webhooks]`, `[streaming]`, `[alerting]`, `[metrics]`) whose
+    /// feature this build of Hammerwork does not have, rather than silently ignoring it.
+    fn reject_compiled_out_sections(&self) -> crate::Result<()> {
+        // (section, set in the file); each section is named after its feature.
+        let compiled_out: &[(&str, bool)] = &[
+            #[cfg(not(feature = "webhooks"))]
+            ("webhooks", self.webhooks_section.is_some()),
+            #[cfg(not(any(
+                feature = "streaming",
+                feature = "kafka",
+                feature = "google-pubsub",
+                feature = "kinesis"
+            )))]
+            ("streaming", self.streaming_section.is_some()),
+            #[cfg(not(feature = "alerting"))]
+            ("alerting", self.alerting_section.is_some()),
+            #[cfg(not(feature = "metrics"))]
+            ("metrics", self.metrics_section.is_some()),
+        ];
+        match compiled_out.iter().find(|(_, set)| *set) {
+            Some((section, _)) => Err(crate::HammerworkError::Config(format!(
+                "[{section}] is set but hammerwork was built without the `{section}` feature"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Reject alert and webhook settings that could never deliver anything (an email
@@ -670,7 +728,9 @@ impl WorkerConfig {
     /// Reject settings that cannot work: a zero `polling_interval` (idle workers would
     /// poll in a tight loop), a zero `job_timeout` (every job would time out before
     /// its handler ran) or a zero `result_cleanup_interval` with result cleanup enabled
-    /// (the pool would clean up in a tight loop). Called when a configuration is loaded
+    /// (the pool would clean up in a tight loop), a `batch_size` of 0 or above
+    /// [`MAX_DEQUEUE_BATCH_SIZE`](crate::queue::MAX_DEQUEUE_BATCH_SIZE), or a
+    /// `batch_concurrency` of 0. Called when a configuration is loaded
     /// ([`HammerworkConfig::from_file`], [`HammerworkConfig::from_env`]) and by
     /// [`WorkerPool::from_hammerwork_config`](crate::WorkerPool::from_hammerwork_config).
     pub fn validate(&self) -> crate::Result<()> {
@@ -687,6 +747,19 @@ impl WorkerConfig {
         if self.result_cleanup_enabled && self.result_cleanup_interval.is_zero() {
             return Err(crate::HammerworkError::Config(
                 "worker.result_cleanup_interval must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(size) = self.batch_size
+            && !(1..=crate::queue::MAX_DEQUEUE_BATCH_SIZE).contains(&size)
+        {
+            return Err(crate::HammerworkError::Config(format!(
+                "worker.batch_size must be between 1 and {} (got {size})",
+                crate::queue::MAX_DEQUEUE_BATCH_SIZE
+            )));
+        }
+        if self.batch_concurrency == Some(0) {
+            return Err(crate::HammerworkError::Config(
+                "worker.batch_concurrency must be greater than zero".to_string(),
             ));
         }
         Ok(())
@@ -784,32 +857,6 @@ pub struct StreamingConfigs {
 
     /// Global streaming settings  
     pub global_settings: StreamingGlobalSettings,
-}
-
-/// Simple event filter for when webhooks feature is disabled
-#[cfg(not(feature = "webhooks"))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct SimpleEventFilter {
-    /// Event types to include
-    pub event_types: Vec<String>,
-
-    /// Queue names to include
-    pub queue_names: Vec<String>,
-
-    /// Whether to include payload data
-    pub include_payload: bool,
-}
-
-#[cfg(not(feature = "webhooks"))]
-impl Default for SimpleEventFilter {
-    fn default() -> Self {
-        Self {
-            event_types: vec!["completed".to_string(), "failed".to_string()],
-            queue_names: Vec::new(),
-            include_payload: false,
-        }
-    }
 }
 
 /// Global streaming settings
@@ -1774,15 +1821,6 @@ with_setters! {
     }
 }
 
-#[cfg(not(feature = "webhooks"))]
-with_setters! {
-    SimpleEventFilter {
-        with_event_types(event_types): Vec<String>,
-        with_queue_names(queue_names): Vec<String>,
-        with_include_payload(include_payload): bool,
-    }
-}
-
 with_setters! {
     ArchiveConfig {
         with_enabled(enabled): bool,
@@ -2650,6 +2688,70 @@ service_name = "hammerwork"
         assert_eq!(loaded.encryption, PayloadEncryptionConfig::default());
     }
 
+    /// #130: the feature sections are optional, so a file saved by a build without a
+    /// feature (which writes no section for it) loads in a build with it.
+    #[test]
+    fn test_feature_sections_are_optional() {
+        let mut value = toml::Value::try_from(HammerworkConfig::default()).unwrap();
+        let table = value.as_table_mut().unwrap();
+        for section in ["webhooks", "streaming", "alerting", "metrics"] {
+            table.remove(section);
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), toml::to_string(&value).unwrap()).unwrap();
+        let loaded = HammerworkConfig::from_file(file.path().to_str().unwrap()).unwrap();
+        #[cfg(feature = "webhooks")]
+        assert!(loaded.webhooks.webhooks.is_empty());
+        #[cfg(feature = "streaming")]
+        assert!(loaded.streaming.streams.is_empty());
+        #[cfg(feature = "alerting")]
+        assert!(loaded.alerting.targets.is_empty());
+        #[cfg(feature = "metrics")]
+        assert_eq!(
+            loaded.metrics.collect_histograms,
+            crate::metrics::MetricsConfig::default().collect_histograms
+        );
+        let _ = loaded;
+    }
+
+    /// #130: a build without a feature writes no section for it and refuses to load a
+    /// file that sets one, instead of silently ignoring the settings.
+    #[test]
+    fn test_sections_of_compiled_out_features_are_rejected() {
+        let saved = toml::to_string(&HammerworkConfig::default()).unwrap();
+        let compiled_out: &[&str] = &[
+            #[cfg(not(feature = "webhooks"))]
+            "webhooks",
+            #[cfg(not(any(
+                feature = "streaming",
+                feature = "kafka",
+                feature = "google-pubsub",
+                feature = "kinesis"
+            )))]
+            "streaming",
+            #[cfg(not(feature = "alerting"))]
+            "alerting",
+            #[cfg(not(feature = "metrics"))]
+            "metrics",
+        ];
+        for section in compiled_out {
+            assert!(!saved.contains(&format!("[{section}")), "{saved}");
+
+            let text = format!("{saved}\n[{section}]\nenabled = true\n");
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), text).unwrap();
+            let err = HammerworkConfig::from_file(file.path().to_str().unwrap()).unwrap_err();
+            assert!(matches!(err, crate::HammerworkError::Config(_)), "{err}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Configuration error: [{section}] is set but hammerwork was built \
+                     without the `{section}` feature"
+                )
+            );
+        }
+    }
+
     #[test]
     fn test_encryption_section_rejects_keys_and_typos() {
         let key = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=";
@@ -2915,6 +3017,45 @@ service_name = "hammerwork"
         std::fs::write(&path, "[encryption]\nenabled = \"yes\"\n").unwrap();
         let err = PayloadEncryptionConfig::load(Some(&path)).unwrap_err();
         assert!(err.to_string().contains("hammerwork.toml"), "{err}");
+    }
+
+    /// #130: `batch_size = 0` used to enable batch mode (raised to 1); it and sizes
+    /// above the claim cap are rejected, as is `batch_concurrency = 0`.
+    #[test]
+    fn test_worker_batch_settings_are_validated() {
+        let max = crate::queue::MAX_DEQUEUE_BATCH_SIZE;
+        for size in [1, 50, max] {
+            WorkerConfig::default()
+                .with_batch_size(size)
+                .validate()
+                .unwrap();
+        }
+        for size in [0, max + 1] {
+            let err = WorkerConfig::default()
+                .with_batch_size(size)
+                .validate()
+                .unwrap_err();
+            assert!(err.to_string().contains("worker.batch_size"), "{err}");
+        }
+        let err = WorkerConfig::default()
+            .with_batch_concurrency(0)
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("worker.batch_concurrency"),
+            "{err}"
+        );
+        WorkerConfig::default()
+            .with_batch_concurrency(1)
+            .validate()
+            .unwrap();
+
+        // Loading a file applies the same checks.
+        let mut config = HammerworkConfig::default();
+        config.worker.batch_size = Some(0);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), toml::to_string(&config).unwrap()).unwrap();
+        assert!(HammerworkConfig::from_file(file.path().to_str().unwrap()).is_err());
     }
 
     /// A `[worker]` section written before 2.1 (without the result cleanup keys) loads

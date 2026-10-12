@@ -23,7 +23,6 @@ use crate::metrics::PrometheusMetricsCollector;
 #[cfg(feature = "alerting")]
 use crate::alerting::{AlertManager, AlertingConfig};
 
-#[cfg(feature = "webhooks")]
 use crate::events::{EventManager, JobError, JobLifecycleEvent, JobLifecycleEventType};
 
 use chrono::{DateTime, Utc};
@@ -273,7 +272,6 @@ fn job_event(
 /// The payload to put in a lifecycle event of `job`: `None` for a job with payload
 /// encryption, so that an encrypted job's payload (sealed or redacted as stored, or its
 /// plaintext) never reaches events, webhooks or streams.
-#[cfg(feature = "webhooks")]
 fn event_payload(job: &Job) -> Option<serde_json::Value> {
     if job.is_encrypted || job.has_encryption() {
         None
@@ -509,7 +507,7 @@ pub enum JobHandlerType {
 ///
 /// let worker = Worker::new(queue, "email_queue".to_string(), handler)
 ///     .with_poll_interval(std::time::Duration::from_millis(500))
-///     .with_attempt_cap(5);
+///     .with_attempt_cap(5)?;
 ///
 /// // Start processing jobs
 /// let mut pool = hammerwork::WorkerPool::new();
@@ -536,7 +534,7 @@ pub enum JobHandlerType {
 ///     .with_weight(hammerwork::JobPriority::Critical, 50)
 ///     .with_weight(hammerwork::JobPriority::High, 20);
 ///
-/// let rate_limit = RateLimit::per_second(10)?.with_burst_limit(20);
+/// let rate_limit = RateLimit::per_second(10)?.with_burst_limit(20)?;
 ///
 /// let worker = Worker::new(queue, "api_queue".to_string(), handler)
 ///     .with_priority_weights(priority_weights)
@@ -599,7 +597,6 @@ pub struct Worker<DB: Database> {
     /// Spawn manager for dynamic job spawning
     spawn_manager: Option<Arc<crate::spawn::SpawnManager<DB>>>,
     /// Event manager for publishing job lifecycle events
-    #[cfg(feature = "webhooks")]
     event_manager: Option<Arc<crate::events::EventManager>>,
     /// How long to wait for an in-flight job to finish after shutdown is requested
     shutdown_grace_period: Duration,
@@ -642,7 +639,6 @@ where
             finished_batches: Default::default(),
             event_hooks: self.event_hooks.clone(),
             spawn_manager: self.spawn_manager.clone(),
-            #[cfg(feature = "webhooks")]
             event_manager: self.event_manager.clone(),
             shutdown_grace_period: self.shutdown_grace_period,
             lease_duration: self.lease_duration,
@@ -732,7 +728,6 @@ where
             finished_batches: Default::default(),
             event_hooks: JobEventHooks::default(),
             spawn_manager: None,
-            #[cfg(feature = "webhooks")]
             event_manager: None,
             shutdown_grace_period: DEFAULT_SHUTDOWN_GRACE_PERIOD,
             lease_duration: DEFAULT_LEASE_DURATION,
@@ -811,7 +806,6 @@ where
             finished_batches: Default::default(),
             event_hooks: JobEventHooks::default(),
             spawn_manager: None,
-            #[cfg(feature = "webhooks")]
             event_manager: None,
             shutdown_grace_period: DEFAULT_SHUTDOWN_GRACE_PERIOD,
             lease_duration: DEFAULT_LEASE_DURATION,
@@ -903,6 +897,9 @@ where
     /// becomes `Dead` (or `TimedOut`). This setting only lowers that limit: the
     /// effective limit is `min(job.max_attempts, cap)`. By default there is no cap.
     ///
+    /// Fails with [`HammerworkError::Config`] when `cap` is less than 1: every claimed
+    /// job gets at least the attempt it is running, so such a cap cannot be honoured.
+    ///
     /// Before 3.0 this was `with_max_retries`.
     ///
     /// # Arguments
@@ -924,13 +921,18 @@ where
     /// // job itself allows more attempts. To give jobs *more* attempts, raise their own
     /// // limit with `Job::with_max_attempts`; this setting can only lower it.
     /// let expensive_worker = Worker::new(queue, "expensive".to_string(), handler)
-    ///     .with_attempt_cap(2);
+    ///     .with_attempt_cap(2)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_attempt_cap(mut self, cap: i32) -> Self {
+    pub fn with_attempt_cap(mut self, cap: i32) -> Result<Self> {
+        if cap < 1 {
+            return Err(HammerworkError::Config(format!(
+                "worker attempt cap must be at least 1 (got {cap})"
+            )));
+        }
         self.attempt_cap = Some(cap);
-        self
+        Ok(self)
     }
 
     /// Sets the delay between retry attempts.
@@ -1161,9 +1163,11 @@ where
     /// # }
     /// ```
     ///
-    /// Fails with [`HammerworkError::Config`] when the matching throttle is invalid (see
-    /// [`with_throttle_config`](Self::with_throttle_config)).
+    /// Fails with [`HammerworkError::Config`] when the `worker` section is invalid (see
+    /// [`WorkerConfig::validate`](crate::config::WorkerConfig::validate)) or the
+    /// matching throttle is (see [`with_throttle_config`](Self::with_throttle_config)).
     pub fn with_hammerwork_config(mut self, config: &crate::HammerworkConfig) -> Result<Self> {
+        config.worker.validate()?;
         self = self.with_config(&config.worker);
 
         if let Some(throttle) = config.rate_limiting.throttle_for(&self.queue_name) {
@@ -1282,7 +1286,6 @@ where
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "webhooks")]
     pub fn with_event_manager(mut self, event_manager: Arc<EventManager>) -> Self {
         self.event_manager = Some(event_manager);
         self
@@ -3018,7 +3021,6 @@ where
     }
 
     /// Convert a JobEvent to a JobLifecycleEvent for external publishing
-    #[cfg(feature = "webhooks")]
     fn convert_to_lifecycle_event(
         &self,
         event: &JobEvent,
@@ -3146,7 +3148,6 @@ where
 
     /// Record `event` of `job` (the job as stored, never a decrypted copy) with the
     /// statistics and metrics collectors and publish it to the event manager.
-    #[cfg_attr(not(feature = "webhooks"), allow(unused_variables))]
     async fn record_event(&self, job: &Job, event: JobEvent) {
         // Record to statistics collector
         if let Some(stats_collector) = &self.stats_collector
@@ -3168,7 +3169,6 @@ where
         }
 
         // Publish to event manager for external integrations
-        #[cfg(feature = "webhooks")]
         if let Some(event_manager) = &self.event_manager {
             let payload = if event_manager.payload_wanted().await {
                 event_payload(job)
@@ -3381,7 +3381,10 @@ mod tests {
         use crate::rate_limit::RateLimit;
 
         // Test rate limit configuration
-        let rate_limit = RateLimit::per_second(10).unwrap().with_burst_limit(20);
+        let rate_limit = RateLimit::per_second(10)
+            .unwrap()
+            .with_burst_limit(20)
+            .unwrap();
 
         assert_eq!(rate_limit.rate(), 10);
         assert_eq!(rate_limit.burst_limit(), 20);
@@ -3505,7 +3508,10 @@ mod tests {
         assert_eq!(high_rate.burst_limit(), 1000);
 
         // Test custom burst limit
-        let custom_burst = RateLimit::per_second(10).unwrap().with_burst_limit(50);
+        let custom_burst = RateLimit::per_second(10)
+            .unwrap()
+            .with_burst_limit(50)
+            .unwrap();
         assert_eq!(custom_burst.burst_limit(), 50);
     }
 
@@ -3618,6 +3624,18 @@ mod tests {
             queue_name.to_string(),
             handler,
         )
+    }
+
+    /// #130: an attempt cap below 1 cannot be honoured (a claimed job always runs once).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn attempt_cap_below_one_is_rejected() {
+        for cap in [0, -1, i32::MIN] {
+            let err = lazy_worker("cap").with_attempt_cap(cap).err().unwrap();
+            assert!(matches!(err, HammerworkError::Config(_)), "{err}");
+        }
+        let worker = lazy_worker("cap").with_attempt_cap(1).unwrap();
+        assert_eq!(worker.attempt_cap, Some(1));
     }
 
     #[cfg(feature = "postgres")]
@@ -3798,7 +3816,6 @@ mod tests {
     }
 
     /// #101: a plain job's events carry its payload; an encrypted job's never do.
-    #[cfg(feature = "webhooks")]
     #[test]
     fn event_payload_is_withheld_for_encrypted_jobs() {
         let job = Job::new("events".to_string(), serde_json::json!({"a": 1}));
@@ -3817,7 +3834,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "postgres", feature = "webhooks"))]
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn lifecycle_events_carry_the_job_event_details() {
         let worker = lazy_worker("events");

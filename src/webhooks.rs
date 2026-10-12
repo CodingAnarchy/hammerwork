@@ -42,7 +42,7 @@
 //! let webhook_manager = WebhookManager::new(
 //!     event_manager.clone(),
 //!     WebhookManagerConfig::default()
-//! );
+//! )?;
 //!
 //! let webhook = WebhookConfig::new(
 //!     "job_completion_hook".to_string(),
@@ -502,7 +502,7 @@ pub struct WebhookManagerStats {
 ///     .with_default_timeout_secs(30)
 ///     .with_max_pending_deliveries(1_000)
 ///     .with_user_agent("MyApp/1.0".to_string());
-/// let webhook_manager = WebhookManager::new(event_manager, config);
+/// let webhook_manager = WebhookManager::new(event_manager, config)?;
 ///
 /// // Add a webhook
 /// let webhook = WebhookConfig::new(
@@ -659,24 +659,13 @@ fn response_body_text(mut body: Vec<u8>, truncated: bool) -> String {
 impl WebhookManager {
     /// Create a new webhook manager.
     ///
-    /// # Panics
-    ///
-    /// Panics if the HTTP client cannot be built (for example when
-    /// `config.user_agent` is not a valid header value). Use
-    /// [`WebhookManager::try_new`] to handle that error instead.
-    pub fn new(event_manager: Arc<EventManager>, config: WebhookManagerConfig) -> Self {
-        match Self::try_new(event_manager, config) {
-            Ok(manager) => manager,
-            Err(e) => panic!("Failed to create webhook manager: {e}"),
-        }
-    }
-
-    /// Create a new webhook manager, returning an error instead of panicking when
-    /// the HTTP client cannot be built (invalid `user_agent`, TLS backend failure).
+    /// Fails with [`HammerworkError::Webhook`](crate::HammerworkError::Webhook) when the
+    /// HTTP client cannot be built (for example when `config.user_agent` is not a valid
+    /// header value, or the TLS backend fails to initialise).
     ///
     /// `max_concurrent_deliveries` is clamped to `1..=Semaphore::MAX_PERMITS`: `0`
     /// would make every delivery wait forever and a huge value would panic.
-    pub fn try_new(
+    pub fn new(
         event_manager: Arc<EventManager>,
         config: WebhookManagerConfig,
     ) -> crate::Result<Self> {
@@ -735,8 +724,9 @@ impl WebhookManager {
         self.listeners.panic_count() + self.deliveries.panic_count()
     }
 
-    /// Create a new webhook manager with default configuration
-    pub fn new_default(event_manager: Arc<EventManager>) -> Self {
+    /// Create a new webhook manager with default configuration. Fails like
+    /// [`new`](Self::new).
+    pub fn new_default(event_manager: Arc<EventManager>) -> crate::Result<Self> {
         Self::new(event_manager, WebhookManagerConfig::default())
     }
 
@@ -746,7 +736,7 @@ impl WebhookManager {
         event_manager: Arc<EventManager>,
         config: &crate::config::WebhookConfigs,
     ) -> crate::Result<Self> {
-        let manager = Self::try_new(event_manager, (&config.global_settings).into())?;
+        let manager = Self::new(event_manager, (&config.global_settings).into())?;
         for webhook in &config.webhooks {
             manager.add_webhook(webhook.clone()).await?;
         }
@@ -1683,7 +1673,6 @@ impl PayloadTemplate {
 /// - Use a cryptographically secure random secret of at least 32 characters
 /// - Always compare signatures using constant-time comparison to prevent timing attacks
 /// - Rotate secrets periodically for enhanced security
-#[cfg(feature = "webhooks")]
 pub fn generate_hmac_signature(secret: &str, payload: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -1737,7 +1726,6 @@ pub fn generate_hmac_signature(secret: &str, payload: &[u8]) -> String {
 /// - Always verify signatures before processing webhook payloads
 /// - Use the same secret that was used to generate the signature
 /// - This function uses constant-time comparison to prevent timing attacks
-#[cfg(feature = "webhooks")]
 pub fn verify_hmac_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -2006,27 +1994,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_new_with_extreme_concurrency_does_not_panic() {
+    async fn test_new_with_extreme_concurrency_does_not_panic() {
         for value in [0, usize::MAX] {
             let config = WebhookManagerConfig {
                 max_concurrent_deliveries: value,
                 ..Default::default()
             };
             let manager =
-                WebhookManager::try_new(Arc::new(EventManager::new_default()), config).unwrap();
+                WebhookManager::new(Arc::new(EventManager::new_default()), config).unwrap();
             let permits = manager.delivery_semaphore.available_permits();
             assert!((1..=Semaphore::MAX_PERMITS).contains(&permits));
         }
     }
 
     #[test]
-    fn test_try_new_rejects_invalid_user_agent() {
+    fn test_new_rejects_invalid_user_agent() {
         let config = WebhookManagerConfig {
             user_agent: "bad\nagent".to_string(),
             ..Default::default()
         };
-        let result = WebhookManager::try_new(Arc::new(EventManager::new_default()), config);
-        assert!(result.is_err());
+        // #130: an error, not a panic.
+        let result = WebhookManager::new(Arc::new(EventManager::new_default()), config);
+        assert!(matches!(
+            result,
+            Err(crate::HammerworkError::Webhook { .. })
+        ));
     }
 
     #[test]
@@ -2042,7 +2034,7 @@ mod tests {
     async fn test_webhook_manager_creation() {
         let config = WebhookManagerConfig::default();
         let event_manager = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new(event_manager, config);
+        let manager = WebhookManager::new(event_manager, config).unwrap();
 
         let stats = manager.get_stats().await;
         assert_eq!(stats.total_webhooks, 0);
@@ -2053,7 +2045,7 @@ mod tests {
     async fn test_webhook_manager_add_remove_webhook() {
         let config = WebhookManagerConfig::default();
         let event_manager = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new(event_manager, config);
+        let manager = WebhookManager::new(event_manager, config).unwrap();
 
         let webhook_config = WebhookConfig {
             id: Uuid::new_v4(),
@@ -2091,7 +2083,7 @@ mod tests {
     async fn test_webhook_manager_enable_disable() {
         let config = WebhookManagerConfig::default();
         let event_manager = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new(event_manager, config);
+        let manager = WebhookManager::new(event_manager, config).unwrap();
 
         let webhook_config = WebhookConfig {
             id: Uuid::new_v4(),
@@ -2462,7 +2454,7 @@ mod tests {
     async fn test_shutdown_waits_for_in_flight_delivery() {
         let (url, received) = slow_http_server(Duration::from_millis(300)).await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let webhook = WebhookConfig::new("slow".to_string(), url);
         let webhook_id = webhook.id;
         manager.add_webhook(webhook).await.unwrap();
@@ -2481,7 +2473,7 @@ mod tests {
     async fn test_shutdown_aborts_deliveries_after_grace_period() {
         let (url, received) = slow_http_server(Duration::from_secs(30)).await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         manager
             .add_webhook(WebhookConfig::new("stuck".to_string(), url))
             .await
@@ -2499,7 +2491,7 @@ mod tests {
     async fn test_no_deliveries_after_shutdown() {
         let (url, received) = slow_http_server(Duration::ZERO).await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         manager
             .add_webhook(WebhookConfig::new("late".to_string(), url))
             .await
@@ -2515,7 +2507,7 @@ mod tests {
     async fn test_listener_delivers_every_event_in_a_burst() {
         let (url, received) = slow_http_server(Duration::ZERO).await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         manager
             .add_webhook(WebhookConfig::new("burst".to_string(), url))
             .await
@@ -2538,7 +2530,7 @@ mod tests {
             max_buffer_size: 4,
             ..Default::default()
         }));
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let webhook = WebhookConfig::new("lagging".to_string(), url);
         let id = webhook.id;
         manager.add_webhook(webhook).await.unwrap();
@@ -2570,7 +2562,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_panicking_background_task_is_observed() {
-        let manager = WebhookManager::new_default(Arc::new(EventManager::new_default()));
+        let manager = WebhookManager::new_default(Arc::new(EventManager::new_default())).unwrap();
         assert_eq!(manager.task_panics(), 0);
 
         manager.deliveries.spawn("delivery", async {
@@ -2731,7 +2723,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_webhook_rejects_invalid_template() {
-        let manager = WebhookManager::new_default(Arc::new(EventManager::new_default()));
+        let manager = WebhookManager::new_default(Arc::new(EventManager::new_default())).unwrap();
         let webhook = WebhookConfig::new("bad".to_string(), "http://127.0.0.1:1/".to_string())
             .with_payload_template(r#"{"a": "{{event.unknown}}"}"#);
         match manager.add_webhook(webhook).await {
@@ -2815,7 +2807,7 @@ mod tests {
     async fn test_delivery_sends_rendered_template() {
         let (url, mut bodies) = capturing_http_server().await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let webhook = WebhookConfig::new("templated".to_string(), url).with_payload_template(
             r#"{"text": "{{event.queue_name}} job {{event.job_id}}", "job_id": "{{event.job_id}}"}"#,
         );
@@ -2927,7 +2919,7 @@ mod tests {
         url_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Recorded>,
     ) -> Recorded {
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         manager.add_webhook(webhook).await.unwrap();
         events.publish_event(completed_event()).await.unwrap();
         let recorded = next_recorded(url_rx).await;
@@ -3030,7 +3022,7 @@ mod tests {
         // 404 is not in retry_on_status_codes: one attempt only.
         let (url, mut rx) = recording_http_server(404, Duration::ZERO).await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let webhook = WebhookConfig::new("404".to_string(), url).with_retry_policy(RetryPolicy {
             max_attempts: 3,
             initial_delay_secs: 0,
@@ -3050,7 +3042,7 @@ mod tests {
 
         // An endpoint slower than the webhook timeout fails the delivery.
         let (url, mut rx) = recording_http_server(200, Duration::from_secs(5)).await;
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let webhook = WebhookConfig::new("slow".to_string(), url)
             .with_timeout_secs(1)
             .with_retry_policy(no_retries());
@@ -3080,7 +3072,7 @@ mod tests {
     async fn test_enable_disable_update_webhook() {
         let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let webhook =
             WebhookConfig::new("toggle".to_string(), url.clone()).with_retry_policy(no_retries());
         let id = webhook.id;
@@ -3187,7 +3179,7 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_unsubscribes_listeners() {
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         for name in ["a", "b"] {
             manager
                 .add_webhook(WebhookConfig::new(
@@ -3208,7 +3200,7 @@ mod tests {
     async fn test_event_published_right_after_add_is_delivered() {
         let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let event = completed_event();
         manager
             .add_webhook(WebhookConfig::new("immediate".to_string(), url))
@@ -3227,7 +3219,7 @@ mod tests {
     async fn test_updates_do_not_duplicate_delivery() {
         let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let webhook =
             WebhookConfig::new("updated".to_string(), url.clone()).with_retry_policy(no_retries());
         let id = webhook.id;
@@ -3279,7 +3271,7 @@ mod tests {
     async fn test_update_keeps_stats_and_applies_new_filter() {
         let (url, mut rx) = recording_http_server(200, Duration::ZERO).await;
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let webhook =
             WebhookConfig::new("filtered".to_string(), url).with_retry_policy(no_retries());
         let id = webhook.id;
@@ -3366,7 +3358,8 @@ mod tests {
                 max_pending_deliveries: 2,
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         let webhook = WebhookConfig::new("stuck".to_string(), url).with_retry_policy(no_retries());
         let id = webhook.id;
         manager.add_webhook(webhook).await.unwrap();
@@ -3421,7 +3414,7 @@ mod tests {
         });
 
         let events = Arc::new(EventManager::new_default());
-        let manager = WebhookManager::new_default(events.clone());
+        let manager = WebhookManager::new_default(events.clone()).unwrap();
         let webhook = WebhookConfig::new("stalling".to_string(), url)
             .with_timeout_secs(1)
             .with_retry_policy(no_retries());

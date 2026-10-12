@@ -452,6 +452,24 @@ where
             .unwrap()
             .is_none()
     );
+    // Every backend rejects a throttle that could never let a job through (#130).
+    let err = DatabaseQueue::set_throttle_config(
+        queue.as_ref(),
+        &queue_name,
+        ThrottleConfig::new().rate_per_minute(0),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, hammerwork::HammerworkError::Config(_)),
+        "{err}"
+    );
+    assert!(
+        DatabaseQueue::get_throttle_config(queue.as_ref(), &queue_name)
+            .await
+            .unwrap()
+            .is_none()
+    );
     DatabaseQueue::set_throttle_config(
         queue.as_ref(),
         &queue_name,

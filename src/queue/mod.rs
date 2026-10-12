@@ -749,7 +749,8 @@ pub trait DatabaseQueue: private::Sealed + Send + Sync {
     ) -> Result<u64>;
 
     /// The names of the queues that have jobs, in `hammerwork_jobs` or in the archive,
-    /// sorted.
+    /// without duplicates and sorted in byte order (`str` ordering), whatever the
+    /// database collation, so every backend returns the same order.
     ///
     /// [`JobArchiver::run_scheduled_pass`](crate::archive::JobArchiver::run_scheduled_pass)
     /// uses it to apply the default archival policy to every queue without a policy of

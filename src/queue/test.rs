@@ -1316,7 +1316,8 @@ impl TestQueue {
         }))
     }
 
-    /// Claim up to `max_jobs` jobs ([`DatabaseQueue::dequeue`]).
+    /// Claim up to `max_jobs` jobs ([`DatabaseQueue::dequeue`], which caps `max_jobs`
+    /// at [`MAX_DEQUEUE_BATCH_SIZE`](super::MAX_DEQUEUE_BATCH_SIZE)).
     async fn claim_many(
         &self,
         queue_name: &str,
@@ -1327,7 +1328,6 @@ impl TestQueue {
         // One lock for the whole batch: concurrent callers never see the same job as
         // claimable, like `FOR UPDATE SKIP LOCKED` on the database backends.
         let mut storage = self.storage.write().await;
-        let max_jobs = max_jobs.min(super::MAX_DEQUEUE_BATCH_SIZE);
         let ids = storage.get_next_jobs(queue_name, weights, max_jobs);
         let now = storage.clock.now();
         let mut jobs = Vec::with_capacity(ids.len());
@@ -1368,18 +1368,13 @@ impl DatabaseQueue for TestQueue {
 
     async fn dequeue(&self, queue_name: &str, options: &DequeueOptions) -> Result<Vec<Job>> {
         let weights = options.priority_weights.as_ref();
-        match options.max_jobs {
-            0 => Ok(Vec::new()),
-            1 => Ok(self
-                .claim_one(queue_name, weights, options.lease())
-                .await?
-                .into_iter()
-                .collect()),
-            max_jobs => {
-                self.claim_many(queue_name, weights, options.lease(), max_jobs)
-                    .await
-            }
-        }
+        let lease = options.lease();
+        super::dispatch_dequeue(
+            options.max_jobs,
+            || self.claim_one(queue_name, weights, lease),
+            |max_jobs| self.claim_many(queue_name, weights, lease, max_jobs),
+        )
+        .await
     }
 
     async fn release_job_run(&self, run: &Job) -> Result<bool> {
@@ -2352,6 +2347,7 @@ impl DatabaseQueue for TestQueue {
 
     // Throttling configuration
     async fn set_throttle_config(&self, queue_name: &str, config: ThrottleConfig) -> Result<()> {
+        config.validate()?;
         let mut storage = self.storage.write().await;
         storage
             .throttle_configs
@@ -2937,14 +2933,12 @@ impl DatabaseQueue for TestQueue {
 
     async fn list_queue_names(&self) -> Result<Vec<String>> {
         let storage = self.storage.read().await;
-        let mut names: Vec<String> = storage
+        let names: Vec<String> = storage
             .jobs
             .values()
             .map(|job| job.queue_name.clone())
             .collect();
-        names.sort();
-        names.dedup();
-        Ok(names)
+        Ok(super::sorted_queue_names(names))
     }
 
     async fn get_archival_stats(

@@ -407,6 +407,35 @@ pub(crate) fn pick_weighted_priority(
     None
 }
 
+/// [`DatabaseQueue::list_queue_names`] for every backend: `names` in byte order
+/// (`str` ordering), without duplicates, independent of the database collation.
+pub(crate) fn sorted_queue_names(mut names: Vec<String>) -> Vec<String> {
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// [`DatabaseQueue::dequeue`] for every backend: cap `max_jobs` at
+/// [`MAX_DEQUEUE_BATCH_SIZE`], claim nothing for 0, one job with `claim_one` for 1, and
+/// up to the capped count with `claim_many` otherwise.
+pub(crate) async fn dispatch_dequeue<One, OneFut, Many, ManyFut>(
+    max_jobs: usize,
+    claim_one: One,
+    claim_many: Many,
+) -> Result<Vec<Job>>
+where
+    One: FnOnce() -> OneFut,
+    OneFut: std::future::Future<Output = Result<Option<Job>>>,
+    Many: FnOnce(usize) -> ManyFut,
+    ManyFut: std::future::Future<Output = Result<Vec<Job>>>,
+{
+    match max_jobs.min(MAX_DEQUEUE_BATCH_SIZE) {
+        0 => Ok(Vec::new()),
+        1 => Ok(claim_one().await?.into_iter().collect()),
+        max_jobs => claim_many(max_jobs).await,
+    }
+}
+
 /// Fill a weighted batch claim of up to `max_jobs` jobs of `queue_name`
 /// ([`DatabaseQueue::dequeue`] of several jobs with weights): pick one of `candidates` (the
 /// levels with runnable jobs) by weight, claim up to the room left with
@@ -515,6 +544,53 @@ pub(crate) fn clamp_interval(duration: std::time::Duration) -> chrono::Duration 
 mod tests {
     use super::*;
     use crate::priority::JobPriority;
+
+    /// Every backend's `dequeue` claims nothing for 0, one job for 1, and up to
+    /// `MAX_DEQUEUE_BATCH_SIZE` jobs for more.
+    #[tokio::test]
+    async fn dequeue_dispatch_caps_and_routes_the_job_count() {
+        let job = || Job::new("dispatch".to_string(), serde_json::json!({}));
+        let route = |max_jobs: usize| async move {
+            let calls = std::sync::Mutex::new(Vec::new());
+            let calls_ref = &calls;
+            let jobs = dispatch_dequeue(
+                max_jobs,
+                || async {
+                    calls.lock().unwrap().push("one".to_string());
+                    Ok(Some(job()))
+                },
+                |n| async move {
+                    calls_ref.lock().unwrap().push(format!("many({n})"));
+                    Ok((0..n.min(3)).map(|_| job()).collect())
+                },
+            )
+            .await
+            .unwrap();
+            let calls = calls.into_inner().unwrap();
+            (jobs.len(), calls)
+        };
+        assert_eq!(route(0).await, (0, vec![]));
+        assert_eq!(route(1).await, (1, vec!["one".to_string()]));
+        assert_eq!(route(2).await, (2, vec!["many(2)".to_string()]));
+        assert_eq!(
+            route(MAX_DEQUEUE_BATCH_SIZE + 5).await,
+            (3, vec![format!("many({MAX_DEQUEUE_BATCH_SIZE})")])
+        );
+    }
+
+    /// Queue names come back in byte order whatever the database collation: `_`
+    /// (0x5F) sorts after digits, unlike in PostgreSQL's and MySQL's default
+    /// collations.
+    #[test]
+    fn queue_names_are_sorted_in_byte_order_and_unique() {
+        let names = ["hunt_a", "hunt3_q", "Zeta", "alpha", "hunt3_q"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            sorted_queue_names(names),
+            ["Zeta", "alpha", "hunt3_q", "hunt_a"].map(String::from)
+        );
+    }
 
     #[test]
     fn stored_priorities_decode_with_a_normal_fallback() {

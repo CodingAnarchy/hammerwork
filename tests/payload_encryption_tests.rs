@@ -308,7 +308,6 @@ where
 
 /// Worker-published events carry the payload when a subscriber asks for it (#101),
 /// except for an encrypted job: its events never carry its payload, plaintext or not.
-#[cfg(feature = "webhooks")]
 async fn worker_events_never_carry_encrypted_payloads<DB>(plain: Arc<JobQueue<DB>>)
 where
     DB: Inspect + Send + Sync + 'static,
@@ -1494,7 +1493,6 @@ mod postgres {
         test_postgres_worker_pool_purges_expired_jobs => worker_pool_purges_expired_jobs,
     );
 
-    #[cfg(feature = "webhooks")]
     crate::test_utils::scenario_tests!(
         test_utils::setup_postgres_queue;
         test_postgres_worker_events_never_carry_encrypted_payloads => worker_events_never_carry_encrypted_payloads,
@@ -1538,7 +1536,6 @@ mod mysql {
         test_mysql_worker_pool_purges_expired_jobs => worker_pool_purges_expired_jobs,
     );
 
-    #[cfg(feature = "webhooks")]
     crate::test_utils::scenario_tests!(
         test_utils::setup_mysql_queue;
         test_mysql_worker_events_never_carry_encrypted_payloads => worker_events_never_carry_encrypted_payloads,

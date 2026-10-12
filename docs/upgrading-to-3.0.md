@@ -146,6 +146,27 @@ A compile error such as `unresolved import hammerwork::metrics`, `hammerwork::al
 
 If you gate your own code with `cfg(feature = "...")` on features that you forward to hammerwork, rename them in the same way.
 
+### Configuration sections and worker events
+
+The `[webhooks]`, `[streaming]`, `[alerting]` and `[metrics]` sections of a
+`HammerworkConfig` file follow the features (#130):
+
+- With the feature enabled, the section is optional (it was required): a file saved by
+  a build without the feature, which writes no such section, loads.
+- Without the feature, `HammerworkConfig::from_file` now fails with a
+  `HammerworkError::Config` such as "[alerting] is set but hammerwork was built without
+  the \`alerting\` feature" instead of silently ignoring the section (`[streaming]` is
+  accepted with any of `streaming`, `kafka`, `google-pubsub` or `kinesis`). Enable the
+  feature, or delete the section.
+
+`Worker::with_event_manager` no longer needs the `webhooks` feature: workers publish
+lifecycle events to an `EventManager` in every build, so streaming-only builds (and
+plain `EventManager` subscribers) get them too. In 2.x this worked only because
+`webhooks` was a default feature.
+
+`config::SimpleEventFilter`, which existed only in builds without `webhooks` and was
+never used, is removed. Use `events::EventFilter`.
+
 ## cargo-hammerwork and hammerwork-web as libraries
 
 In 2.x both companion crates exported their internals as library API. In 3.0 they do not,
@@ -311,16 +332,22 @@ Batch settings can now also come from configuration: the optional `[worker]` key
 `Worker::with_config` when set. `WorkerConfig` is now `#[non_exhaustive]` (see
 [below](#non-exhaustive-structs-and-enums)): build it with
 `WorkerConfig::default().with_batch_size(n).with_batch_concurrency(m)`.
+`WorkerConfig::validate` (run by `HammerworkConfig::from_file`/`from_env`,
+`WorkerPool::from_hammerwork_config` and now `Worker::with_hammerwork_config`) rejects
+`batch_size = 0` (which would have turned batch mode on), a `batch_size` above
+`queue::MAX_DEQUEUE_BATCH_SIZE` (1000) and `batch_concurrency = 0` (#130).
 
 ### `with_max_retries` is now `with_attempt_cap`
 
 `Worker::with_max_retries(n)` is renamed `Worker::with_attempt_cap(n)`. Its behaviour
 is unchanged: it caps the number of attempts this worker gives a job at
 `min(job.max_attempts, n)`, and can only lower a job's own limit. There is no
-deprecated alias.
+deprecated alias. It now returns `hammerwork::Result<Worker>` and rejects a cap below 1
+with `HammerworkError::Config`, instead of silently treating it as 1 (a claimed job
+always runs once).
 
 ```rust,no_run
-# async fn example(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler) {
+# async fn example(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler) -> hammerwork::Result<()> {
 use hammerwork::Worker;
 
 // Before (2.x):
@@ -331,8 +358,9 @@ use hammerwork::Worker;
 // After (3.0):
 let worker = Worker::new(queue, "emails".into(), handler)
     .with_batch_size(1)
-    .with_attempt_cap(3);
+    .with_attempt_cap(3)?;
 # let _ = worker;
+# Ok(())
 # }
 ```
 
@@ -358,9 +386,15 @@ What the migration keeps:
   for the conversion (and restores it afterwards), so every existing value keeps its
   UTC reading whatever your connection's time zone is. Hammerwork has always written
   UTC (`UTC_TIMESTAMP(6)`, UTC values bound by sqlx).
-- **`NULL` / `NOT NULL` and defaults.** `CURRENT_TIMESTAMP` defaults become
-  `CURRENT_TIMESTAMP(6)`, as `DATETIME(6)` requires. The one `ON UPDATE` clause,
-  `hammerwork_queue_pause.updated_at`, is kept.
+- **`NULL` / `NOT NULL`.** Nullability is unchanged.
+- **Defaults are UTC.** On a `DATETIME` column `CURRENT_TIMESTAMP` is the session's
+  local time, not UTC, so the `CURRENT_TIMESTAMP` defaults become the expression
+  default `(UTC_TIMESTAMP(6))`, which needs **MySQL 8.0.13 or later**. The one
+  `ON UPDATE CURRENT_TIMESTAMP` clause, on `hammerwork_queue_pause.updated_at`, is
+  dropped for the same reason; Hammerwork (2.x included) writes `updated_at` itself.
+  If your own SQL inserts into these tables without the time columns, it now gets UTC;
+  if it updates `hammerwork_queue_pause` and relies on `updated_at` changing by itself,
+  set it explicitly (`updated_at = UTC_TIMESTAMP(6)`).
 - Second-precision columns (the queue pause table, `hammerwork_workflows`, and `hammerwork_jobs.archived_at`) now
   carry microseconds.
 
@@ -386,7 +420,8 @@ Before upgrading:
    if the table is much bigger than it needs to be.
 3. If a statement fails part-way (for example the disk fills up), fix the cause and run
    the migrations again. Each `ALTER` only runs while its table still has a `TIMESTAMP`
-   column, so completed tables are skipped.
+   column (or a `CURRENT_TIMESTAMP` default or `ON UPDATE` clause), so completed tables
+   are skipped.
 
 ### 2.x workers and the converted schema
 
@@ -441,7 +476,7 @@ Every public field of these types has a `with_<field>` method unless noted other
 | Module | Types | How to build them |
 | --- | --- | --- |
 | `config` | `HammerworkConfig` | `new()` / `default()`, one setter per section (`with_database`, `with_worker`, `with_events`, `with_webhooks`, `with_streaming`, `with_alerting`, `with_metrics`, `with_archive`, `with_rate_limiting`, `with_logging`, `with_encryption`) and the existing shortcuts |
-| `config` | `DatabaseConfig`, `WorkerConfig`, `WebhookConfigs`, `WebhookGlobalSettings`, `StreamingConfigs`, `StreamingGlobalSettings`, `SimpleEventFilter`, `ArchiveConfig`, `RateLimitingConfig`, `LoggingConfig`, `PayloadEncryptionConfig`, `KeyRotationConfig` | `default()` and the new `with_*` setters; also `RateLimitingConfig::with_queue_throttle(queue, throttle)` and `PayloadEncryptionConfig::with_decryption_key(key_id, source)` |
+| `config` | `DatabaseConfig`, `WorkerConfig`, `WebhookConfigs`, `WebhookGlobalSettings`, `StreamingConfigs`, `StreamingGlobalSettings`, `ArchiveConfig`, `RateLimitingConfig`, `LoggingConfig`, `PayloadEncryptionConfig`, `KeyRotationConfig` | `default()` and the new `with_*` setters; also `RateLimitingConfig::with_queue_throttle(queue, throttle)` and `PayloadEncryptionConfig::with_decryption_key(key_id, source)` |
 | `events` | `EventConfig` | `default()` and the new setters |
 | `events` | `EventFilter` | `new()` and its existing builders |
 | `events` | `JobLifecycleEvent` | the `JobLifecycleEventBuilder` constructors (`enqueued`, `failed`, ...) or the new `JobLifecycleEvent::new(job_id, queue, event_type, priority)`, then `with_timestamp`, `with_processing_time_ms`, `with_error`, `with_payload`, `with_metadata` |
@@ -696,7 +731,12 @@ A rate limit of zero never refilled, so a worker using one waited forever.
 `Worker::with_throttle_config` and `Worker::with_hammerwork_config` (both now return a
 `Result`), `JobQueue::set_throttle`, `HammerworkConfig::from_file` and
 `WorkerPool::from_hammerwork_config`. `ThrottleConfig::to_rate_limit` returns
-`Result<Option<RateLimit>>`.
+`Result<Option<RateLimit>>`. `TestQueue::set_throttle_config` applies the same check as
+the database backends (#130).
+
+A burst limit of zero is rejected the same way (#130): `RateLimit::with_burst_limit`
+returns `hammerwork::Result<RateLimit>` and fails for 0 (2.x treated it as 1), so add a
+`?`: `RateLimit::per_second(10)?.with_burst_limit(20)?`.
 
 ```rust,no_run
 # async fn example(queue: std::sync::Arc<hammerwork::JobQueue<sqlx::Postgres>>, handler: hammerwork::worker::JobHandler) -> hammerwork::Result<()> {
@@ -715,6 +755,14 @@ let worker = Worker::new(queue, "emails".into(), handler)
 # Ok(())
 # }
 ```
+
+### `WebhookManager::new` returns a `Result`
+
+`WebhookManager::new` panicked when the HTTP client could not be built (an invalid
+`user_agent`, a TLS backend failure); `try_new` was the fallible variant. In 3.0
+`WebhookManager::new` and `WebhookManager::new_default` return
+`hammerwork::Result<WebhookManager>` and `try_new` is removed (#130): add a `?` to
+`new`, and rename `try_new` to `new`.
 
 ### `MigrationRunner` is sealed
 

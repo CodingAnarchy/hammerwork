@@ -58,7 +58,8 @@ mod postgres_worker_batch_tests {
             .with_stats_collector(stats_collector.clone())
             .with_poll_interval(Duration::from_millis(50))
             // Fail for good on the first attempt instead of waiting out retry delays
-            .with_attempt_cap(1);
+            .with_attempt_cap(1)
+            .unwrap();
 
         // Verify initial batch stats
         let initial_stats = worker.get_batch_stats();

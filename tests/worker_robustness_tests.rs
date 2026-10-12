@@ -49,7 +49,8 @@ where
     });
     let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
         .with_poll_interval(Duration::from_millis(50))
-        .with_attempt_cap(1);
+        .with_attempt_cap(1)
+        .unwrap();
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
     let worker_task = tokio::spawn(async move { worker.run(shutdown_rx).await });
@@ -106,6 +107,7 @@ where
     let worker = Worker::new(Arc::clone(&queue), queue_name.clone(), handler)
         .with_poll_interval(Duration::from_millis(50))
         .with_attempt_cap(5)
+        .unwrap()
         .with_retry_delay(Duration::from_secs(3600));
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);

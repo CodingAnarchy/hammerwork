@@ -60,7 +60,7 @@ impl RateLimit {
     /// ```
     /// use hammerwork::RateLimit;
     ///
-    /// let limit = RateLimit::per_second(10)?.with_burst_limit(20);
+    /// let limit = RateLimit::per_second(10)?.with_burst_limit(20)?;
     /// assert_eq!(limit.rate(), 10);
     /// assert!(RateLimit::per_second(0).is_err());
     /// # Ok::<(), hammerwork::HammerworkError>(())
@@ -83,11 +83,18 @@ impl RateLimit {
         Self::try_new(rate, Duration::from_secs(3600), "hour")
     }
 
-    /// Set the burst limit (maximum tokens that can be consumed at once). A limiter
-    /// always holds at least one token, so a burst limit of 0 acts as 1.
-    pub fn with_burst_limit(mut self, burst_limit: u64) -> Self {
+    /// Set the burst limit (maximum tokens that can be consumed at once).
+    ///
+    /// Fails with [`HammerworkError::Config`] when `burst_limit` is zero: a bucket that
+    /// can never hold a token would never let an operation through.
+    pub fn with_burst_limit(mut self, burst_limit: u64) -> crate::Result<Self> {
+        if burst_limit == 0 {
+            return Err(HammerworkError::Config(
+                "rate limit burst limit must be at least 1 (got 0)".to_string(),
+            ));
+        }
         self.burst_limit = burst_limit;
-        self
+        Ok(self)
     }
 
     /// Maximum number of operations per time window; never zero.
@@ -285,9 +292,8 @@ pub struct RateLimiter {
 impl RateLimiter {
     /// Create a new rate limiter
     pub fn new(rate_limit: RateLimit) -> Self {
-        // A bucket must hold at least one token, or no operation could ever proceed
-        // (a burst limit of 0 made `acquire` wait forever).
-        let capacity = rate_limit.burst_limit.max(1) as f64;
+        // At least one: `with_burst_limit` rejects 0, and the default is the rate.
+        let capacity = rate_limit.burst_limit as f64;
         // Never zero: the constructors of `RateLimit` reject a zero rate.
         let refill_rate = rate_limit.refill_rate_per_ms();
 
@@ -373,7 +379,10 @@ mod tests {
         assert_eq!(rate_limit.per(), Duration::from_secs(1));
         assert_eq!(rate_limit.burst_limit(), 10);
 
-        let rate_limit = RateLimit::per_minute(60).unwrap().with_burst_limit(100);
+        let rate_limit = RateLimit::per_minute(60)
+            .unwrap()
+            .with_burst_limit(100)
+            .unwrap();
         assert_eq!(rate_limit.rate(), 60);
         assert_eq!(rate_limit.per(), Duration::from_secs(60));
         assert_eq!(rate_limit.burst_limit(), 100);
@@ -580,14 +589,19 @@ mod tests {
     }
 
     /// A burst limit of 0 would make a bucket that can never hold a token, so
-    /// `acquire` waited forever; the bucket always holds at least one token.
-    #[tokio::test]
-    async fn test_zero_burst_limit_does_not_stall() {
-        let limiter = RateLimiter::new(RateLimit::per_second(100).unwrap().with_burst_limit(0));
-        tokio::time::timeout(Duration::from_secs(2), limiter.acquire())
-            .await
-            .expect("acquire must not wait forever")
+    /// `acquire` would wait forever: `with_burst_limit` rejects it (#130).
+    #[test]
+    fn test_zero_burst_limit_is_rejected() {
+        let err = RateLimit::per_second(100)
+            .unwrap()
+            .with_burst_limit(0)
+            .unwrap_err();
+        assert!(matches!(err, HammerworkError::Config(_)), "{err}");
+        let limit = RateLimit::per_second(100)
+            .unwrap()
+            .with_burst_limit(1)
             .unwrap();
+        assert_eq!(limit.burst_limit(), 1);
     }
 
     /// A zero rate would never refill, so `acquire` would wait forever: every
